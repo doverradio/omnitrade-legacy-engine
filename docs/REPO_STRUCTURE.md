@@ -138,6 +138,7 @@ packages/shared/
 
 ```
 docs/
+├── PROJECT_CONSTITUTION.md
 ├── adr/
 │   ├── README.md
 │   ├── ADR-0001-four-core-engines.md

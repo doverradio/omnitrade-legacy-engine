@@ -2,6 +2,8 @@
 
 ## OmniTrade Legacy Engine — Project Vision
 
+> This document describes the platform's mission and long-term direction. Its permanent governing principles — the standard this vision is pursued within — are defined in `PROJECT_CONSTITUTION.md`.
+
 ### 1. Mission Statement
 
 OmniTrade Legacy Engine is a web-based, AI-assisted trading research and paper-trading platform. Its purpose is to help a family (and eventually a small circle of trusted users) research markets, design and validate trading strategies, and practice disciplined execution in a simulated environment — with a deliberate, staged path toward live trading only after rigorous validation.

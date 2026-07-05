@@ -6,6 +6,8 @@ This folder holds the permanent record of *why* OmniTrade Legacy Engine's archit
 
 This is a direct extension of the project's core philosophy (`PROJECT_VISION.md` §2): the platform preserves *why*, not just *what*, for the decisions it makes about markets (`DECISION_INTELLIGENCE_ENGINE.md`) and for the decisions made about the platform itself. An ADR is to the architecture what a Decision Record is to a trade — a structured, permanent, explainable record of a choice and the reasoning behind it.
 
+This ADR system exists in service of `PROJECT_CONSTITUTION.md`'s Article VI (Architectural Stability) and Article X (Stewardship) — an ADR is the mechanism by which architectural evolution stays intentional and documented rather than accumulating as undocumented exception.
+
 ## What Requires an ADR
 
 An ADR is required for any decision that:

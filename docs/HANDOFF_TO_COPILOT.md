@@ -9,19 +9,22 @@ Paste the block below verbatim into GitHub Copilot Chat (agent mode, with repo c
 ```
 You are implementing OmniTrade Legacy Engine, a paper-trading research platform. Before writing any code, read these files in this repo, in this order:
 
-1. docs/PROJECT_VISION.md
-2. docs/SYSTEM_ARCHITECTURE.md
-3. docs/DATABASE_SCHEMA.md
-4. docs/REPO_STRUCTURE.md
-5. docs/ENVIRONMENT_SETUP.md
-6. docs/API_CONTRACTS.md
-7. docs/RISK_AND_AUDIT_API_CONTRACTS.md
-8. docs/SMALL_ACCOUNT_MODE.md
-9. docs/FRONTEND_PAGE_SPECS.md
-10. docs/BACKEND_MODULE_SPECS.md
-11. docs/SECURITY_AND_SAFETY.md
-12. docs/adr/README.md
-13. docs/COPILOT_PHASE_0_PROMPTS.md
+1. docs/PROJECT_CONSTITUTION.md
+2. docs/PROJECT_VISION.md
+3. docs/SYSTEM_ARCHITECTURE.md
+4. docs/DATABASE_SCHEMA.md
+5. docs/REPO_STRUCTURE.md
+6. docs/ENVIRONMENT_SETUP.md
+7. docs/API_CONTRACTS.md
+8. docs/RISK_AND_AUDIT_API_CONTRACTS.md
+9. docs/SMALL_ACCOUNT_MODE.md
+10. docs/FRONTEND_PAGE_SPECS.md
+11. docs/BACKEND_MODULE_SPECS.md
+12. docs/SECURITY_AND_SAFETY.md
+13. docs/adr/README.md
+14. docs/COPILOT_PHASE_0_PROMPTS.md
+
+Note: docs/PROJECT_CONSTITUTION.md is the project's permanent governing document — its principles (explainability, decision quality over profit, safety, stewardship, and the rest) outrank every other document in this list if a genuine conflict ever arises. It changes far less often than anything else here; if something you're about to build seems to contradict it, stop and flag the conflict rather than proceeding.
 
 Note: docs/RISK_AND_AUDIT_API_CONTRACTS.md is a bridge document — read it alongside docs/API_CONTRACTS.md, not instead of it. Together they define the full API surface (markets/strategies/backtests/signals/paper endpoints in API_CONTRACTS.md; risk, audit, settings, and AI review/explanation endpoints in RISK_AND_AUDIT_API_CONTRACTS.md).
 
@@ -52,7 +55,7 @@ Your task right now is Phase 0 only, exactly as specified in docs/COPILOT_PHASE_
 Work through docs/COPILOT_PHASE_0_PROMPTS.md prompt by prompt, in order (Prompt 0.1 through Prompt 0.6). After completing each prompt, stop, show me a summary of what you created or changed, and wait for my confirmation before proceeding to the next prompt. Do not run multiple prompts' worth of changes in a single turn.
 
 Before your first change, confirm back to me in plain language:
-1. That you've read all 13 files listed above.
+1. That you've read all 14 files listed above.
 2. A one-sentence summary of what Phase 0 will produce.
 3. Any conflicts or ambiguities you noticed between the docs that I should resolve before you start.
 
