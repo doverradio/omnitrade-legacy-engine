@@ -159,6 +159,13 @@ function installFetchMock(backtestDetailStatus: BacktestStatus, warningDetail?: 
               executed_at: "2025-02-11T14:00:00Z",
               reason: "fast MA crossed above slow MA",
             },
+            {
+              side: "sell",
+              quantity: "0.00038",
+              price: "65000.00",
+              executed_at: "2025-02-11T16:00:00Z",
+              reason: "fast MA crossed below slow MA",
+            },
           ],
         },
       });
@@ -242,13 +249,54 @@ describe("BacktestsPage", () => {
     await user.click(screen.getByRole("button", { name: "Run Backtest" }));
 
     await waitFor(() => {
-      expect(screen.getByText("Backtest Results")).toBeInTheDocument();
+      expect(screen.getByText("Run Summary")).toBeInTheDocument();
     });
 
-    expect(screen.getByText(/\+\$4.12/)).toBeInTheDocument();
-    expect(screen.getByText("Fee Drag")).toBeInTheDocument();
+    expect(screen.getAllByText("Backtest Starting Capital").length).toBeGreaterThan(0);
+    expect(screen.getAllByText("$25.00").length).toBeGreaterThan(0);
+    expect(screen.getByText("Ending Equity")).toBeInTheDocument();
+    const endingEquity = screen.getByTestId("ending-equity-value");
+    expect(endingEquity).toHaveTextContent("$29.12");
+    expect(endingEquity.className).toContain("text-emerald-300");
+    expect(screen.getByText("Net Profit / Loss")).toBeInTheDocument();
+    const netProfit = screen.getByTestId("net-profit-value");
+    expect(netProfit).toHaveTextContent("+$4.12");
+    expect(netProfit.className).toContain("text-emerald-300");
+    expect(screen.getByText("Total Return %")).toBeInTheDocument();
+    expect(screen.getByText("16.50%")).toBeInTheDocument();
+
+    expect(screen.getAllByText("Fee Drag").length).toBeGreaterThan(0);
     expect(screen.getByText("42")).toBeInTheDocument();
+    expect(screen.getByText("Estimated Trade Value")).toBeInTheDocument();
     expect(screen.getByText("fast MA crossed above slow MA")).toBeInTheDocument();
+    expect(screen.getByText("fast MA crossed below slow MA")).toBeInTheDocument();
+    expect(screen.getByText("BUY")).toBeInTheDocument();
+    expect(screen.getByText("SELL")).toBeInTheDocument();
+
+    expect(screen.getByText("Account Timeline")).toBeInTheDocument();
+    expect(screen.getByText("Start")).toBeInTheDocument();
+    expect(screen.getByText("Finish")).toBeInTheDocument();
+
+    expect(screen.getByTestId("account-timeline-scroll-wrapper")).toBeInTheDocument();
+    expect(screen.getByTestId("trades-table-scroll-wrapper")).toBeInTheDocument();
+
+    expect(
+      screen.getByText(
+        "Each BUY uses part of the backtest starting capital to open a simulated position. Each SELL closes a simulated position and returns cash to the backtest balance.",
+      ),
+    ).toBeInTheDocument();
+
+    expect(
+      screen.getByText(
+        "No equity curve data is available for this run yet. Metrics and trades are still available.",
+      ),
+    ).toBeInTheDocument();
+
+    expect(
+      screen.getByText(
+        "Backtest history is read-only in this phase. Delete/rename/export actions are planned for a later phase.",
+      ),
+    ).toBeInTheDocument();
   });
 
   it("renders the small account warning when present", async () => {

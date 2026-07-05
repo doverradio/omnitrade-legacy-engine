@@ -289,6 +289,14 @@ export default function BacktestsPage() {
     return mapping;
   }, [strategies]);
 
+  const activeHistoryItem = useMemo(() => {
+    if (!activeBacktestId) {
+      return null;
+    }
+
+    return history.find((item) => item.id === activeBacktestId) ?? null;
+  }, [activeBacktestId, history]);
+
   return (
     <div className="space-y-6">
       <div>
@@ -314,11 +322,22 @@ export default function BacktestsPage() {
       />
 
       <div className="grid gap-4 xl:grid-cols-[2fr_minmax(0,1fr)]">
-        <BacktestResultPanel backtest={activeBacktest} isPolling={isPolling} />
+        <BacktestResultPanel
+          backtest={activeBacktest}
+          isPolling={isPolling}
+          strategyLabel={activeBacktest ? strategyLabelById.get(activeBacktest.strategy_id) : undefined}
+          assetLabel={activeBacktest ? assetSymbolById.get(activeBacktest.asset_id) : undefined}
+          interval={activeHistoryItem?.interval}
+          startTime={activeHistoryItem?.start_time}
+          endTime={activeHistoryItem?.end_time}
+        />
 
         <aside className="space-y-4">
           <section className="rounded-xl border border-border bg-muted/30 p-4">
             <h2 className="text-sm font-semibold uppercase tracking-wide text-foreground/85">Backtest History</h2>
+            <p className="mt-2 text-xs text-foreground/70">
+              Backtest history is read-only in this phase. Delete/rename/export actions are planned for a later phase.
+            </p>
             {history.length === 0 ? (
               <p className="mt-2 text-sm text-foreground/70">No historical runs yet.</p>
             ) : (
@@ -337,7 +356,7 @@ export default function BacktestsPage() {
                           void loadBacktest(item.id);
                         }}
                         className={[
-                          "w-full rounded-md border px-3 py-2 text-left text-sm",
+                          "w-full rounded-md border px-3 py-2 text-left text-sm sm:px-3 sm:py-2",
                           isSelected ? "border-accent bg-accent/20" : "border-border bg-background/20 hover:bg-foreground/10",
                         ].join(" ")}
                       >
