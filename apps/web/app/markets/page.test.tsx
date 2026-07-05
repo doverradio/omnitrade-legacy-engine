@@ -61,8 +61,8 @@ describe("markets remaining Prompt 1.10 criteria", () => {
     render(React.createElement(MarketsPage));
 
     await screen.findByRole("heading", { name: "BTCUSDT", level: 2 });
-    expect(await screen.findByText("No candle data available for this range yet")).toBeInTheDocument();
-    expect(screen.queryByText(/Failed to load candles:/)).not.toBeInTheDocument();
+    expect(await screen.findByText("No candle data available.")).toBeInTheDocument();
+    expect(screen.queryByText("We could not load candle data right now.")).not.toBeInTheDocument();
   });
 
   it("shows page-level asset error when assets API fails", async () => {
@@ -95,7 +95,8 @@ describe("markets remaining Prompt 1.10 criteria", () => {
 
     render(React.createElement(MarketsPage));
 
-    expect(await screen.findByText("Failed to load candles: candles endpoint boom")).toBeInTheDocument();
+    expect(await screen.findByText("We could not load candle data right now.")).toBeInTheDocument();
+    expect(screen.getByText("Please try again. candles endpoint boom")).toBeInTheDocument();
     expect(screen.queryByText(/Could not load assets\./)).not.toBeInTheDocument();
 
     const ethButton = await screen.findByRole("button", { name: /ETHUSDT/ });
@@ -107,7 +108,76 @@ describe("markets remaining Prompt 1.10 criteria", () => {
     expect(
       getMarketCandlesMock.mock.calls.some((call) => call[0]?.assetId === "asset-eth")
     ).toBe(true);
-    expect(screen.getByText("Failed to load candles: candles endpoint boom")).toBeInTheDocument();
+    expect(screen.getByText("We could not load candle data right now.")).toBeInTheDocument();
     expect(screen.queryByText(/Could not load assets\./)).not.toBeInTheDocument();
+  });
+
+  it("reuses in-memory candles when returning to a previous asset/interval", async () => {
+    getMarketsAssetsMock.mockResolvedValue([
+      {
+        id: "asset-btc",
+        symbol: "BTCUSDT",
+        asset_class: "crypto",
+        exchange: "binance_us",
+        is_active: true,
+      },
+      {
+        id: "asset-eth",
+        symbol: "ETHUSDT",
+        asset_class: "crypto",
+        exchange: "binance_us",
+        is_active: true,
+      },
+    ]);
+
+    getMarketCandlesMock.mockImplementation(async (params: { assetId: string; interval: string }) => {
+      if (params.assetId === "asset-btc" && params.interval === "1m") {
+        return [
+          {
+            open_time: "2026-07-05T00:00:00Z",
+            open: "1",
+            high: "2",
+            low: "0.5",
+            close: "1.5",
+            volume: "10",
+          },
+        ];
+      }
+
+      if (params.assetId === "asset-eth" && params.interval === "1m") {
+        return [
+          {
+            open_time: "2026-07-05T00:00:00Z",
+            open: "2",
+            high: "3",
+            low: "1.5",
+            close: "2.5",
+            volume: "20",
+          },
+        ];
+      }
+
+      return [];
+    });
+
+    render(React.createElement(MarketsPage));
+
+    await screen.findByRole("heading", { name: "BTCUSDT", level: 2 });
+    await waitFor(() => {
+      expect(getMarketCandlesMock).toHaveBeenCalledWith(expect.objectContaining({ assetId: "asset-btc", interval: "1m" }));
+    });
+
+    await userEvent.click(await screen.findByRole("button", { name: /ETHUSDT/ }));
+    await waitFor(() => {
+      expect(getMarketCandlesMock).toHaveBeenCalledWith(expect.objectContaining({ assetId: "asset-eth", interval: "1m" }));
+    });
+
+    const callsBeforeSwitchBack = getMarketCandlesMock.mock.calls.length;
+    await userEvent.click(await screen.findByRole("button", { name: /BTCUSDT/ }));
+
+    await waitFor(() => {
+      expect(screen.getByRole("heading", { name: "BTCUSDT", level: 2 })).toBeInTheDocument();
+    });
+    expect(getMarketCandlesMock.mock.calls.length).toBe(callsBeforeSwitchBack);
   });
 });

@@ -21,7 +21,7 @@ export default function AssetList({ selectedAssetId, onSelectAsset, onErrorChang
     async function loadAssets() {
       setLoading(true);
       try {
-        const items = await getMarketsAssets({ assetClass: "crypto", isActive: true });
+        const items = await getMarketsAssets({ isActive: true });
         if (!isMounted) {
           return;
         }

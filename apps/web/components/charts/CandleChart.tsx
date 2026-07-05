@@ -4,6 +4,8 @@ import { useEffect, useRef } from "react";
 import {
   CandlestickSeries,
   ColorType,
+  CrosshairMode,
+  LineSeries,
   createChart,
   type IChartApi,
   type ISeriesApi,
@@ -18,14 +20,22 @@ export type CandleChartPoint = {
   close: number;
 };
 
-type CandleChartProps = {
-  candles: CandleChartPoint[];
+export type CandleChartLinePoint = {
+  time: UTCTimestamp;
+  value: number;
 };
 
-export default function CandleChart({ candles }: CandleChartProps) {
+type CandleChartProps = {
+  candles: CandleChartPoint[];
+  smaPoints: CandleChartLinePoint[];
+  showSma: boolean;
+};
+
+export default function CandleChart({ candles, smaPoints, showSma }: CandleChartProps) {
   const containerRef = useRef<HTMLDivElement | null>(null);
   const chartRef = useRef<IChartApi | null>(null);
   const seriesRef = useRef<ISeriesApi<"Candlestick"> | null>(null);
+  const smaSeriesRef = useRef<ISeriesApi<"Line"> | null>(null);
 
   useEffect(() => {
     const container = containerRef.current;
@@ -35,14 +45,28 @@ export default function CandleChart({ candles }: CandleChartProps) {
 
     const chart = createChart(container, {
       width: container.clientWidth,
-      height: 420,
+      height: container.clientHeight,
       layout: {
         background: { type: ColorType.Solid, color: "#111827" },
         textColor: "#e5e7eb",
       },
+      crosshair: {
+        mode: CrosshairMode.Normal,
+      },
       grid: {
         vertLines: { color: "rgba(148, 163, 184, 0.15)" },
         horzLines: { color: "rgba(148, 163, 184, 0.15)" },
+      },
+      handleScroll: {
+        mouseWheel: true,
+        pressedMouseMove: true,
+        horzTouchDrag: true,
+        vertTouchDrag: true,
+      },
+      handleScale: {
+        axisPressedMouseMove: true,
+        mouseWheel: true,
+        pinch: true,
       },
       rightPriceScale: {
         borderColor: "rgba(148, 163, 184, 0.35)",
@@ -65,11 +89,19 @@ export default function CandleChart({ candles }: CandleChartProps) {
       wickDownColor: "#ef4444",
     });
 
+    const smaSeries = chart.addSeries(LineSeries, {
+      color: "#f59e0b",
+      lineWidth: 2,
+      lastValueVisible: false,
+      priceLineVisible: false,
+    });
+
     chartRef.current = chart;
     seriesRef.current = series;
+    smaSeriesRef.current = smaSeries;
 
     const observer = new ResizeObserver(() => {
-      chart.applyOptions({ width: container.clientWidth });
+      chart.applyOptions({ width: container.clientWidth, height: container.clientHeight });
     });
     observer.observe(container);
 
@@ -78,17 +110,20 @@ export default function CandleChart({ candles }: CandleChartProps) {
       chart.remove();
       chartRef.current = null;
       seriesRef.current = null;
+      smaSeriesRef.current = null;
     };
   }, []);
 
   useEffect(() => {
-    if (!chartRef.current || !seriesRef.current) {
+    if (!chartRef.current || !seriesRef.current || !smaSeriesRef.current) {
       return;
     }
 
     seriesRef.current.setData(candles);
+    smaSeriesRef.current.applyOptions({ visible: showSma });
+    smaSeriesRef.current.setData(showSma ? smaPoints : []);
     chartRef.current.timeScale().fitContent();
-  }, [candles]);
+  }, [candles, showSma, smaPoints]);
 
-  return <div ref={containerRef} className="h-[420px] w-full" />;
+  return <div ref={containerRef} className="h-[360px] w-full sm:h-[420px]" />;
 }
