@@ -12,17 +12,11 @@ class PlaceholderStrategy(Strategy):
     slug: str
     default_params: dict[str, Any]
 
-    def generate_signal(
-        self,
-        candles: Any,
-        params: dict[str, Any],
-        context: StrategyContext,
-    ) -> Signal:
+    def generate_signal(self, context: StrategyContext) -> Signal:
         raise NotImplementedError(f"Strategy '{self.slug}' has not been implemented yet.")
 
 
 PLACEHOLDER_STRATEGIES: dict[str, dict[str, Any]] = {
-    "ma_crossover": {"fast_period": 10, "slow_period": 50, "ma_type": "sma"},
     "rsi_mean_reversion": {"rsi_period": 14, "oversold": 30, "overbought": 70},
     "breakout": {"lookback": 20, "volume_confirmation": True, "min_volume_multiple": 1.5},
     "volatility_filter": {"atr_period": 14, "min_atr_pct": 0.2, "max_atr_pct": 5.0},

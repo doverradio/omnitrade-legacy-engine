@@ -3,6 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from datetime import datetime
 from decimal import Decimal
+from math import isnan
 from types import MappingProxyType
 from typing import Any, Literal, Protocol, runtime_checkable
 
@@ -68,15 +69,48 @@ class Signal(BaseModel):
         return value
 
 
+def build_indicator_snapshot(
+    *,
+    fast_ma: Decimal | None,
+    slow_ma: Decimal | None,
+    previous_fast_ma: Decimal | None,
+    previous_slow_ma: Decimal | None,
+) -> dict[str, str | None]:
+    def serialize(value: Decimal | None) -> str | None:
+        if value is None:
+            return None
+        return str(value)
+
+    return {
+        "fast_ma": serialize(fast_ma),
+        "slow_ma": serialize(slow_ma),
+        "previous_fast_ma": serialize(previous_fast_ma),
+        "previous_slow_ma": serialize(previous_slow_ma),
+    }
+
+
+def coerce_decimal(value: Any) -> Decimal | None:
+    if value is None:
+        return None
+
+    if isinstance(value, float) and isnan(value):
+        return None
+
+    try:
+        numeric_value = Decimal(str(value))
+    except Exception:
+        return None
+
+    if numeric_value.is_nan():
+        return None
+
+    return numeric_value
+
+
 @runtime_checkable
 class Strategy(Protocol):
     slug: str
     default_params: dict[str, Any]
 
-    def generate_signal(
-        self,
-        candles: Any,
-        params: dict[str, Any],
-        context: StrategyContext,
-    ) -> Signal:
+    def generate_signal(self, context: StrategyContext) -> Signal:
         ...

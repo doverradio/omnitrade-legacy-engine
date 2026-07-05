@@ -9,6 +9,9 @@ from app.services.strategies.registry import StrategyLookupError, StrategyRegist
 def test_registry_registration_and_lookup() -> None:
     registry = StrategyRegistry()
     register_placeholder_strategies(registry)
+    from app.services.strategies.ma_crossover import register_ma_crossover_strategy
+
+    register_ma_crossover_strategy(registry)
 
     strategy = registry.get("ma_crossover")
 
@@ -26,6 +29,9 @@ def test_registry_invalid_lookup_raises_clear_error() -> None:
 def test_registry_registers_all_documented_placeholder_strategies() -> None:
     registry = StrategyRegistry()
     register_placeholder_strategies(registry)
+    from app.services.strategies.ma_crossover import register_ma_crossover_strategy
+
+    register_ma_crossover_strategy(registry)
 
     assert registry.registered_slugs() == (
         "breakout",

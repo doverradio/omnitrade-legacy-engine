@@ -13,12 +13,12 @@ class ExampleStrategy:
     slug = "example"
     default_params = {"window": 5}
 
-    def generate_signal(self, candles, params, context: StrategyContext) -> Signal:
+    def generate_signal(self, context: StrategyContext) -> Signal:
         return Signal(
             action="hold",
             strength=Decimal("0.5"),
             reason="Waiting for confirmation.",
-            indicators={"window": params["window"]},
+            indicators={"window": context.strategy_parameters["window"]},
             timestamp=datetime(2026, 7, 5, tzinfo=timezone.utc),
         )
 
@@ -37,7 +37,7 @@ def test_strategy_protocol_behavior() -> None:
     strategy = ExampleStrategy()
 
     assert isinstance(strategy, Strategy)
-    signal = strategy.generate_signal([], {"window": 5}, build_context())
+    signal = strategy.generate_signal(build_context())
     assert signal.action == "hold"
 
 
