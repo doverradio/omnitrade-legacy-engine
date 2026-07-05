@@ -2,6 +2,7 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
 from app.api.routes.health import router as health_router
+from app.api.routes.markets import router as markets_router
 from app.core.errors import register_error_handlers
 from app.core.logging import setup_logging
 
@@ -21,6 +22,7 @@ def create_app() -> FastAPI:
 
     register_error_handlers(app)
     app.include_router(health_router)
+    app.include_router(markets_router)
 
     return app
 
