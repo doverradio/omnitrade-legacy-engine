@@ -24,6 +24,7 @@ Its four jobs:
 - **Input:** The raw `Signal` from a strategy (or ensemble), current regime classification, recent strategy performance (win rate, recent drawdown), and volatility context.
 - **Output:** `ai_confidence` (0.0–1.0) written to `signals.ai_confidence`, plus the specific factors that drove the score (e.g., "regime favorable: +0.15, strategy recent win rate 62%: +0.05, high volatility: -0.10").
 - **Purpose:** Downstream, the risk engine and position sizing can use `ai_confidence` to scale position size within pre-approved bounds — it can only ever scale **down** from a strategy's base sizing, never grant permission to exceed hard risk limits (see `RISK_ENGINE.md`).
+- **Future calibration input:** Once the Decision Intelligence Engine's Counterfactual Outcome Ledger is implemented (`DECISION_INTELLIGENCE_ENGINE.md` §8), its per-horizon comparison between stated confidence and hindsight-best action (surfaced as `confidence_overestimated`/`confidence_underestimated` lesson tags) becomes a direct calibration signal for this scorer — reviewed and applied through the same versioned retraining process as any other model change (§6), never automatically.
 
 #### 2.3 Strategy Allocator
 - **Input:** Recent per-strategy performance metrics, current regime, and correlation between active strategies' recent signals.
@@ -40,6 +41,7 @@ Its four jobs:
 - **Input:** Trade outcome vs. the original signal's stated rationale and confidence.
 - **Output:** A structured review noting whether the trade's outcome was consistent with its stated rationale, and flags patterns (e.g., "this strategy underperforms its backtest in `high_volatility` regime by X%") for human attention on the AI Review dashboard page.
 - **Important boundary:** The review engine can **recommend** parameter or allocation changes for human approval; it cannot automatically apply them. This keeps a human in the loop for anything that changes future trading behavior (see §4).
+- **Distinction from the Counterfactual Outcome Ledger:** This engine reviews the trade that was actually taken. The Decision Intelligence Engine's COL (`DECISION_INTELLIGENCE_ENGINE.md` §8) is a separate, complementary mechanism that additionally tracks what would have happened under the actions *not* taken — including for signals this engine never sees because no trade resulted. The two are expected to eventually share findings (e.g., a rejected-trade lesson tag from the COL informing this engine's pattern-flagging), but are architecturally distinct: this engine reviews realized trades, the COL evaluates all decisions, taken or not.
 
 ### 3. Data Flow
 

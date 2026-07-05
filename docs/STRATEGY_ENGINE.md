@@ -78,8 +78,10 @@ Rules:
 1. **Defined** — code + default params committed to repo, registered in `strategies` table.
 2. **Backtested** — one or more `backtests` rows produced across different `parameter_sets`; must meet minimum criteria (see `MVP_BUILD_PLAN.md` Phase 3) before activation.
 3. **Paper-active** — `strategies.is_active = true`; strategy participates in scheduled signal generation against paper accounts.
-4. **Under review** — AI post-trade review engine (`AI_LAYER.md`) periodically evaluates live paper performance vs. backtest expectations; large divergence flags the strategy for human review.
+4. **Under review** — AI post-trade review engine (`AI_LAYER.md`) periodically evaluates live paper performance vs. backtest expectations; large divergence flags the strategy for human review. Once implemented (future phase), the Decision Intelligence Engine's Counterfactual Outcome Ledger (`DECISION_INTELLIGENCE_ENGINE.md` §8) adds a complementary signal here — lesson tags like `trend_filter_incorrect` or `confidence_overestimated` accumulated across a strategy's decisions, taken or not, become additional evidence for this review step.
 5. **Retired** — set `is_active = false`; historical data remains for audit/research.
+
+> **Backtesting vs. the Counterfactual Outcome Ledger — not the same mechanism.** The backtesting engine (§ above, `BACKEND_MODULE_SPECS.md`) answers "how would this strategy have performed historically under different parameters" by replaying arbitrary historical windows. The COL (`DECISION_INTELLIGENCE_ENGINE.md` §8) answers a narrower, different question — "was the specific real-time recommendation this strategy just made actually the best action available" — for decisions the live/paper platform is currently making, evaluated forward from the decision point at a few fixed horizons, not backward across history. The COL is not a substitute for backtesting and must not be extended into one (`DECISION_INTELLIGENCE_ENGINE.md` §8.6).
 
 ### 4. Parameter Adjustment from the Web UI
 

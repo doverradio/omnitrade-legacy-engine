@@ -58,8 +58,13 @@
 **Responsibility:** `regime_classifier.py`, `signal_scorer.py`, `allocator.py`, `explainer.py`, `post_trade_review.py` per `AI_LAYER.md` §2. Each writes its inputs/outputs/explanation to `model_outputs` via `app/models/model_output.py`.
 **Must not contain:** any direct order placement or risk-limit bypass — outputs from this module are always advisory inputs to `app/services/risk/`, never a path directly to `app/services/paper/`.
 
+### `app/services/decisions/` (future phase — architectural placeholder)
+**Responsibility:** The Decision Intelligence Engine's recording and retrieval layer, per `DECISION_INTELLIGENCE_ENGINE.md`. Anticipated contents: `recorder.py` (writes a Decision Record from the outputs of `strategies/`, `ai/`, and `risk/` at the point `signals/` orchestrates a decision — see `DECISION_INTELLIGENCE_ENGINE.md` §3), `outcome_tracker.py` (appends realized outcomes once a position closes), `reflection.py` (later hindsight-informed AI commentary passes), `query.py` (supports the search/analysis patterns in `DECISION_INTELLIGENCE_ENGINE.md` §6), and a `counterfactual/` subpackage implementing the Counterfactual Outcome Ledger (COL) per `DECISION_INTELLIGENCE_ENGINE.md` §8: `shadow_tracker.py` (spawns shadow BUY/SELL/WAIT outcomes at decision time), `horizon_evaluator.py` (the scheduled background job that revisits shadow outcomes at each configured horizon and computes hindsight-best action), and `lesson_tagger.py` (derives lesson tags from the horizon comparison).
+**Must not contain:** any logic that influences a decision in real time — this module is purely observational, writing after `app/services/risk/` has already acted, never before or in place of it. The `counterfactual/` subpackage specifically must not evolve into a second backtesting engine (no arbitrary historical replay, no alternate-parameter simulation) — see `DECISION_INTELLIGENCE_ENGINE.md` §8.6; that functionality belongs in `app/services/backtesting/`.
+**Note:** This module is documented here as an architectural placeholder only. It is not scheduled for implementation in the current MVP phases (`MVP_BUILD_PLAN.md`) and should not be scaffolded until a dedicated phase is defined for it. If/when it is scheduled, COL's version 1 scope is explicitly narrow (BTC only, once-per-minute evaluation, 3 horizons, small feature snapshot, no heavy compute) — implementation should not exceed that scope without a deliberate version-2 decision.
+
 ### `app/api/routes/`
-**Responsibility:** Thin HTTP layer — one router module per resource area (`health.py`, `markets.py`, `backtests.py`, `strategies.py`, `signals.py`, `paper.py`, and later `risk.py`, `settings.py`, `audit.py`). Each route: validates input via `app/schemas/`, calls the relevant `app/services/*` function(s), and returns a schema-typed response. Auth dependency (`app/core/security.py`) applied per-router.
+**Responsibility:** Thin HTTP layer — one router module per resource area (`health.py`, `markets.py`, `backtests.py`, `strategies.py`, `signals.py`, `paper.py`, and later `risk.py`, `settings.py`, `audit.py`, and (future phase) `decisions.py` per `DECISION_INTELLIGENCE_ENGINE.md` §9). Each route: validates input via `app/schemas/`, calls the relevant `app/services/*` function(s), and returns a schema-typed response. Auth dependency (`app/core/security.py`) applied per-router.
 **Must not contain:** business logic, direct SQLAlchemy queries beyond simple pass-through fetches, or cross-service orchestration beyond what's needed to call 1-2 services and shape the response.
 
 ### `app/core/`
@@ -81,5 +86,6 @@ api/routes  →  services/*  →  models/  →  db/
 ```
 
 - `services/` modules may depend on other `services/` modules only in the direction: `signals` → `strategies`, `ai`, `risk`, `paper`. Reverse dependencies (e.g., `risk` importing from `signals`) are not allowed — this keeps the risk engine testable in isolation.
+- `services/decisions/` (future phase) may depend on `strategies`, `ai`, `risk`, and `paper` for read access to their outputs, but none of those modules may depend on `services/decisions/` — the DIE observes and records; it is never a dependency of the decision-making path itself.
 - `models/` never import from `services/` or `api/`.
 - `config.py` may be imported anywhere; nothing should re-implement env var loading elsewhere.

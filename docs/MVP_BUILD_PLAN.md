@@ -75,6 +75,12 @@ No phase begins until the previous phase's exit criteria are met. Every phase pr
 - Health-check and basic uptime monitoring in place.
 - **Exit criteria:** The full pipeline (ingestion → chart UI → backtesting → paper trading → AI review → risk gating) runs unattended in a deployed "production" (still paper-only) environment for at least one full week without manual intervention, with all audit logs intact and reviewable.
 
+### Future Phase — Decision Intelligence Engine (Not Scheduled)
+**Goal:** Not yet scheduled into a numbered MVP phase. The Decision Intelligence Engine (`DECISION_INTELLIGENCE_ENGINE.md`) is a permanent foundational subsystem, but its dedicated implementation work — Decision Record schema, recording/query services, and the Decision Explorer/Timeline/Detail UI pages — begins only after Phase 8's MVP is validated and a dedicated phase is explicitly planned.
+- In the meantime, Phases 5–7 should continue populating `signals`, `model_outputs`, and `risk_events` completely and consistently (per `DATABASE_SCHEMA.md` §3a), since these are the most likely source data the DIE's Decision Records will be built from once implemented.
+- The DIE's Counterfactual Outcome Ledger (COL, `DECISION_INTELLIGENCE_ENGINE.md` §8) is included in this same future, unscheduled phase — it is a core subsystem of the DIE, not a separate feature with its own timeline. When this future phase is eventually planned, COL's version 1 should be scoped narrowly and lightly: BTC only, evaluated once per minute, three horizons (15 minutes, 1 hour, 24 hours), a small feature snapshot, and no heavy compute — expansion to more assets, more horizons, higher frequency, and richer features is explicitly deferred to later versions (`DECISION_INTELLIGENCE_ENGINE.md` §8.7–§8.8).
+- No Copilot prompts, schema migrations, or endpoints for the DIE or the COL should be generated until this future phase is formally scheduled.
+
 ---
 
 ### Explicit Constraints Across All Phases
@@ -85,3 +91,4 @@ No phase begins until the previous phase's exit criteria are met. Every phase pr
 - **Every signal must be logged** — including `hold` and `risk_rejected` signals, per `DATABASE_SCHEMA.md` §2.7 and `UI_SPEC.md` §2.6.
 - **Every strategy must be backtested before paper trading** — enforced by the Phase 3 minimum activation criteria feeding into Phase 5.
 - **Prioritize correctness, safety, and extensibility over speed** — reflected in the exit criteria above requiring multi-day unattended runs and deliberate failure-mode testing before a phase is considered complete.
+- **Every decision leaves a trace the future Decision Intelligence Engine can build from** — MVP phases don't implement the DIE itself, but Phases 3/5/6/7 must not take shortcuts that would make `signals`, `model_outputs`, or `risk_events` incomplete or inconsistent, since that data is the DIE's eventual foundation (`DECISION_INTELLIGENCE_ENGINE.md` §8).

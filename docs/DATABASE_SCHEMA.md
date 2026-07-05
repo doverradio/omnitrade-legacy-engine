@@ -215,6 +215,14 @@ CREATE INDEX idx_audit_log_entity ON audit_log (entity_type, entity_id);
 - `risk_events` link back to `signals`/`paper_accounts` for full traceability of every block/resize/kill decision
 - `audit_log` is polymorphic (via `entity_type` + `entity_id`) and covers everything above
 
+### 3a. Future Schema: Decision Intelligence Engine (Architectural Placeholder)
+
+The Decision Intelligence Engine (`DECISION_INTELLIGENCE_ENGINE.md`) is a permanent foundational subsystem that will introduce its own tables in a future implementation phase: **Decision Records**, **Decision Evidence**, **Decision Outcomes**, **Decision Reviews**, **AI Reflections**, and **Human Reviews** (see `DECISION_INTELLIGENCE_ENGINE.md` §9 for their responsibilities). These are expected to relate closely to — and likely partially consume or reference — the existing `signals`, `model_outputs`, and `risk_events` tables above, weaving them into a single coherent per-decision record rather than requiring manual joins across tables after the fact.
+
+The DIE's Counterfactual Outcome Ledger (COL), a core subsystem within it (`DECISION_INTELLIGENCE_ENGINE.md` §8), additionally anticipates **Shadow Outcomes** (one row per shadow BUY/SELL/WAIT action per decision) and **Counterfactual Evaluations** (one row per decision-horizon pair, storing hindsight-best action and lesson tags) tables. COL's version 1 scope is explicitly narrow — BTC only, evaluated once per minute, three horizons, a small feature snapshot — so even once implemented, its data volume is intentionally modest at first and should not be assumed to require heavy-write infrastructure from day one.
+
+No new tables, columns, or migrations are introduced by this note. This section exists so the current schema is read with the DIE's future shape in mind — in particular, `signals`, `model_outputs`, and `risk_events` should continue to be populated completely and consistently, since they are the most likely source data the DIE's Decision Records and the COL's shadow evaluations will be built from. Full column-level schema for the DIE's and COL's tables is deferred to a future revision of this document at implementation time.
+
 ### 4. Notes on Row-Level Security (Supabase)
 
 - Enable RLS on `paper_accounts`, `trades`, `parameter_sets` created by users, and any user-owned data — restrict to `owner_user_id = auth.uid()` (directly or via join).

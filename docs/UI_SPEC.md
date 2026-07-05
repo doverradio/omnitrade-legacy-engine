@@ -63,9 +63,13 @@
 - Notification preferences (e.g., email/webhook on kill-switch trips, daily loss limit breaches).
 - Audit log viewer (searchable/filterable table over `audit_log`) — read-only.
 
+#### 2.10 Decision Intelligence Pages (Future Phase — Not Part of MVP)
+The Decision Intelligence Engine (`DECISION_INTELLIGENCE_ENGINE.md`) anticipates a future page set — Decision Explorer, Decision Timeline, Decision Detail, Decision Compare, Decision Search, AI Reflection Viewer, Confidence Analytics, and a **Counterfactual Viewer** (a Decision Detail sub-view showing shadow BUY/SELL/WAIT outcomes, hindsight-best action, and lesson tags per decision — see `DECISION_INTELLIGENCE_ENGINE.md` §8, §10) — not scheduled into the current 9-page MVP navigation. They're noted here so the Signals (§2.6) and AI Review (§2.8) pages above are built with an eye toward this later expansion (e.g., not assuming a signal's explanation data only ever needs a single inline drawer), without requiring any MVP work to build them now.
+
 ### 3. Design Constraints
 
 - Every page that shows a trade, signal, or AI decision must have a path to that decision's full explanation — no orphaned numbers without a "why" available.
 - Any destructive or state-changing action (kill switch, parameter promotion, risk loosening) requires a confirmation step and is immediately reflected in the audit log viewer.
 - Charts must clearly indicate data source and any known limitations (e.g., "IEX feed, not full consolidated tape") per `DATA_SOURCES.md` §5.
 - Every result surface showing a return, P&L, or performance figure shows both dollar and percentage values together, and every balance figure is labeled with its type (paper balance / backtest starting capital) — per `SMALL_ACCOUNT_MODE.md` §3 and §7.
+- Explanation and evidence data surfaced on the Signals and AI Review pages (supporting/opposing evidence, confidence factors, risk adjustments) should be structured consistently with the Decision Record schema in `DECISION_INTELLIGENCE_ENGINE.md` §4, even though the DIE itself is a future-phase subsystem — this avoids rework when Decision Intelligence pages are eventually built on top of the same underlying data.

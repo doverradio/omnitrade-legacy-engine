@@ -4,6 +4,8 @@
 
 ### 1. High-Level Overview
 
+> This architecture is organized around four permanent foundational engines: **Market Intelligence** (ingestion/indicators/regime, §2.3/§2.7 in part), **Strategy Evolution** (§2.4/§2.6), **Decision Intelligence** (§2.7a — the platform's permanent memory and reasoning system, see `DECISION_INTELLIGENCE_ENGINE.md`), and **Portfolio Intelligence** (§2.5/§2.9 in part). The diagram below shows these as they map onto concrete services; the four-engine framing is the conceptual lens for how they relate.
+
 ```
                          ┌─────────────────────────┐
                          │        Frontend          │
@@ -41,7 +43,15 @@
                   │   Risk Engine       │◄──────────────┘
                   │  (gatekeeper for     │
                   │  every trade/signal) │
-                  └───────────────────┘
+                  └─────────┬───────────┘
+                            ▼
+                  ┌───────────────────────┐
+                  │ Decision Intelligence   │
+                  │ Engine (DIE)            │
+                  │ (records reasoning,     │
+                  │  evidence, outcome —    │
+                  │  after every decision)  │
+                  └───────────────────────┘
 ```
 
 ### 2. Component Breakdown
@@ -62,7 +72,7 @@ Reasoning:
 - FastAPI gives async I/O (good for concurrent exchange API calls), automatic OpenAPI schema (useful for the typed frontend client), and Pydantic validation (useful for strict input validation on every trade/signal endpoint).
 
 Backend responsibilities:
-- Expose REST endpoints for: assets, candles, strategies, backtests, signals, trades, paper accounts, risk status, AI review, audit log.
+- Expose REST endpoints for: assets, candles, strategies, backtests, signals, trades, paper accounts, risk status, AI review, audit log, and (future phase) decision records — see `DECISION_INTELLIGENCE_ENGINE.md` §9.
 - Own the strategy engine, backtesting engine, risk engine, and orchestration of the AI layer.
 - Own all writes to Postgres — the frontend never writes directly to the DB.
 - Deployed as a container on Railway/Fly.io/Render.
@@ -91,6 +101,9 @@ See `STRATEGY_ENGINE.md`. Runs as pluggable modules behind a common interface (`
 #### 2.7 AI Layer
 See `AI_LAYER.md`. Sits alongside — not inside — the strategy engine. It consumes strategy outputs and market context, and produces regime classifications, confidence scores, strategy weight recommendations, and natural-language explanations. It cannot directly place trades; it can only annotate/weight signals that flow through the risk engine.
 
+#### 2.7a Decision Intelligence Engine (DIE)
+See `DECISION_INTELLIGENCE_ENGINE.md`. A permanent foundational engine, standing alongside the Market Intelligence, Strategy Evolution, and Portfolio Intelligence engines. Consumes the output of every decision point — strategy evaluations, AI scoring, and risk engine outcomes — and writes a structured Decision Record for it, whether or not a trade resulted. It is observational, not participatory: it never influences a decision in real time, it only records after the risk engine has acted, and later enriches that record with outcomes, post-trade review, and AI reflection. Its core subsystems are Decision Records and the **Counterfactual Outcome Ledger (COL)** — a lightweight, continuously-running background process that tracks hypothetical shadow BUY/SELL/WAIT outcomes for every decision and revisits them at fixed horizons, so the platform learns from rejected trades and inaction, not only executed ones (`DECISION_INTELLIGENCE_ENGINE.md` §8). Full architecture, schema, and lifecycle are documented separately; this entry establishes its place in the request flow (see §3).
+
 #### 2.8 Risk Engine
 See `RISK_ENGINE.md`. A mandatory gatekeeper: every signal, whether from a rules-based strategy or AI-adjusted, must pass through the risk engine before it can become an order. The risk engine can veto, resize, or delay any trade, and can trip a global kill switch.
 
@@ -114,9 +127,12 @@ See `DATABASE_SCHEMA.md`. Single source of truth for assets, candles, strategies
 2. Strategy engine computes indicators and emits a raw `Signal` (buy/sell/hold + strength).
 3. AI layer scores the signal's confidence and tags the current market regime; writes an explanation.
 4. Risk engine evaluates the (strategy signal + AI score) against account state, position limits, drawdown limits, and cooldown state.
-5. If approved, the paper execution engine places a simulated/paper order and records a `trade` row.
-6. All of steps 2–5 write to `audit_log` and (for AI steps) `model_outputs`.
-7. Frontend polls/subscribes to updated account, trade, and signal data to update the dashboard.
+5. The Decision Intelligence Engine records a Decision Record capturing the market context, evidence, confidence, and risk engine outcome from steps 2–4 — regardless of whether the risk engine approved, resized, or rejected the signal (see `DECISION_INTELLIGENCE_ENGINE.md` §3).
+6. If approved, the paper execution engine places a simulated/paper order and records a `trade` row; the DIE's Decision Record is linked to this trade for later outcome tracking.
+7. All of steps 2–6 write to `audit_log` and (for AI steps) `model_outputs`.
+8. Frontend polls/subscribes to updated account, trade, and signal data to update the dashboard.
+9. (Asynchronous, later) Once a position is closed, outcome data, post-trade review findings, and eventually AI reflection are appended to the same Decision Record.
+10. (Asynchronous, parallel to steps 6–9, future phase) The Counterfactual Outcome Ledger spawns shadow BUY/SELL/WAIT outcomes for the decision at step 5, independent of whether execution happened, and background jobs revisit them at fixed horizons to compute hindsight-best action and lesson tags (`DECISION_INTELLIGENCE_ENGINE.md` §8).
 
 ### 4. Environments
 

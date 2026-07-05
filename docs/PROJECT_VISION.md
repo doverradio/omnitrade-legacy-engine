@@ -8,12 +8,16 @@ OmniTrade Legacy Engine is a web-based, AI-assisted trading research and paper-t
 
 This is **not** a signal-selling product, a "set and forget" bot, or a get-rich-quick scheme. It is infrastructure: a durable, auditable, extensible system meant to outlive any single strategy, market cycle, or contributor.
 
+The platform is built around four permanent foundational engines: the **Market Intelligence Engine** (ingestion, indicators, regime detection), the **Strategy Evolution Engine** (strategy modules, backtesting, allocation), the **Decision Intelligence Engine** (the platform's permanent memory and reasoning system — see `DECISION_INTELLIGENCE_ENGINE.md`), and the **Portfolio Intelligence Engine** (account state, positions, performance). These are architectural constants, not features — every capability described in this doc set is understood to live within one of these four engines.
+
 ### 2. Philosophy
 
 - **Process over prediction.** No model can reliably predict markets. The system's job is to enforce a repeatable process: hypothesize → backtest → paper trade → review → (maybe) go live, in that order, every time.
 - **Boring is good.** Reliability, clear logs, and reproducibility matter more than clever features. A boring system that never silently loses money is worth more than an exciting one that occasionally does.
 - **Everything is a hypothesis.** Every strategy, every AI output, every parameter set is treated as a falsifiable hypothesis with a paper trail, not as truth.
 - **Transparency over black boxes.** Every AI-generated signal, weight, or recommendation must come with a human-readable explanation grounded in observable inputs — not just a score.
+- **Memory over history.** The platform should not merely log what happened — it should preserve why, as structured, queryable Decision Records (see `DECISION_INTELLIGENCE_ENGINE.md`) that let it learn from both its trades and the trades it correctly or incorrectly avoided.
+- **The best decision, not just the taken decision.** The platform should not only ask "did our trade make money?" — it should ask what actually would have been the best action available at that moment, including for the trades it didn't take. This is the governing question behind the Decision Intelligence Engine's Counterfactual Outcome Ledger (`DECISION_INTELLIGENCE_ENGINE.md` §8).
 - **Family legacy, not a startup pitch.** The system is built to be understood and maintained by non-specialists over years/decades: clear docs, simple deploys, no exotic infra dependencies.
 
 ### 3. Non-Goals
@@ -44,6 +48,8 @@ OmniTrade Legacy Engine is intended to grow across several horizons:
 - **Horizon 1 (MVP, 0–6 months):** Historical backtesting, crypto + stock paper trading, dashboard, first strategy modules, basic AI signal scoring, and full risk/audit infrastructure.
 - **Horizon 2 (6–18 months):** Multi-strategy ensembles, richer AI regime classification, deeper post-trade review/learning loop, more asset classes, optional small-scale live trading with strict caps.
 - **Horizon 3 (18+ months):** Multi-user/family access with role-based permissions, richer reporting for tax/record-keeping, potential mobile companion views, and a documented "playbook" so the system can be handed down and understood by the next generation of maintainers — not just used, but modified safely.
+
+Over this same span, the Decision Intelligence Engine's accumulated Decision Record store (`DECISION_INTELLIGENCE_ENGINE.md`) is expected to become one of the platform's most valuable assets in its own right — not the strategies, not any single year's returns, but the structured record of what the platform believed, why, and what it learned, compounding across every horizon above.
 
 Success is not measured by short-term returns. Success is measured by:
 - Whether the system's decisions are always explainable after the fact.
