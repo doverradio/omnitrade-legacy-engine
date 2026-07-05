@@ -169,6 +169,26 @@
 
 ---
 
+### `GET /parameter-sets`
+**Purpose:** List saved parameter sets for strategies, for backtest configuration and future Strategy Lab flows.
+**Request (query params):** none.
+**Response 200:**
+```json
+{
+  "items": [
+    {
+      "id": "uuid",
+      "strategy_id": "uuid",
+      "name": "conservative-v1",
+      "parameters": {"fast_period": 10, "slow_period": 50}
+    }
+  ]
+}
+```
+**Errors:** none beyond standard `401`/`500` envelope behavior.
+
+---
+
 ### `GET /signals`
 **Purpose:** List generated signals for the Signals page feed.
 **Request (query params):** `strategy_id` (optional), `asset_id` (optional), `action` (optional: `buy|sell|hold`), `status` (optional: `generated|risk_approved|risk_rejected|executed|expired`), `limit` (default 50), `cursor` (optional).
