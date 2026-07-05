@@ -22,20 +22,24 @@ Approximately 15%
 
 # Current Goal
 
-Finish Phase 1 completely before beginning any work on:
+Complete Phase 2 (Chart UI) according to the project architecture and documentation.
 
-- Strategy Engine
-- AI Layer implementation
-- Risk Engine implementation
-- Decision Intelligence Engine implementation
-- Paper Trading
-- Deployment
+Before beginning Phase 3 (Backtesting), ensure that:
 
-The project philosophy is:
+- Phase 2 implementation is complete.
+- Phase 2 validation checklist passes.
+- All code is committed.
+- Documentation is updated.
+- No known regressions remain.
+
+Project philosophy:
 
 Build one layer.
+
 Validate it.
+
 Commit it.
+
 Only then move to the next layer.
 
 No skipping phases.
@@ -44,8 +48,10 @@ No skipping phases.
 
 # Phase Progress
 
-✅ Phase 0 — Repository Scaffold
-Status: COMPLETE
+## ✅ Phase 0 — Repository Scaffold
+
+Status:
+COMPLETE
 
 Completed:
 
@@ -61,12 +67,14 @@ Completed:
 
 Validated against:
 
-VALIDATION_CHECKLIST.md
+- VALIDATION_CHECKLIST.md
 
 ---
 
-🟨 Phase 1 — Data Ingestion
-Status: COMPLETE
+## ✅ Phase 1 — Data Ingestion
+
+Status:
+COMPLETE
 
 Completed:
 
@@ -79,85 +87,82 @@ Completed:
 - Candlestick chart rendering with real market data
 - Phase 1 validation completed
 
----
+Validated against:
 
-⬜ Phase 2
-
-Current Phase
-
-Chart UI
+- VALIDATION_CHECKLIST.md
 
 ---
 
-⬜ Phase 3
+## 🟨 Phase 2 — Chart UI
 
+Status:
+IN PROGRESS
+
+Current Focus:
+
+- Phase 2 prompt creation
+- Chart UI refinement
+- Chart interactions
+- Validation planning
+
+---
+
+## ⬜ Phase 3 — Backtesting
+
+Status:
 Not Started
 
-Backtesting
-
 ---
 
-⬜ Phase 4
+## ⬜ Phase 4 — Strategy Lab
 
+Status:
 Not Started
 
-Strategy Lab
-
 ---
 
-⬜ Phase 5
+## ⬜ Phase 5 — Paper Trading
 
+Status:
 Not Started
 
-Paper Trading
-
 ---
 
-⬜ Phase 6
+## ⬜ Phase 6 — AI Layer
 
+Status:
 Not Started
 
-AI Layer
-
 ---
 
-⬜ Phase 7
+## ⬜ Phase 7 — Risk Engine
 
+Status:
 Not Started
 
-Risk Engine
-
 ---
 
-⬜ Phase 8
+## ⬜ Phase 8 — Deployment
 
+Status:
 Not Started
 
-Deployment
-
 ---
 
-⬜ Future Phase
+## ⬜ Future Phase
 
 Decision Intelligence Engine
 
 Includes:
 
-Decision Records
-
-Decision Snapshot
-
-Counterfactual Outcome Ledger
-
-Decision Quality Engine
-
-Decision Explorer
-
-Decision Timeline
-
-Decision Compare
-
-Confidence Analytics
+- Decision Records
+- Decision Snapshot
+- Counterfactual Outcome Ledger
+- Decision Quality Engine
+- Decision Explorer
+- Decision Timeline
+- Decision Compare
+- Confidence Analytics
 
 ---
 
@@ -184,36 +189,41 @@ Do not revisit them without creating an ADR.
 
 # Current Priority
 
-Begin Phase 2 while maintaining architectural discipline. Do not implement Phase 3 or later systems early.
+Complete Phase 2 while maintaining architectural discipline.
+
+Do not implement any Phase 3 or later systems until Phase 2 has been completed, validated, documented, and committed.
 
 ---
 
-# Known Future Work
+# Upcoming Roadmap
 
-After Phase 1:
+After Phase 2:
 
-Phase 2
-Charts
+## Phase 3
 
-Phase 3
 Backtesting
 
-Phase 4
+## Phase 4
+
 Strategy Lab
 
-Phase 5
+## Phase 5
+
 Paper Trading
 
-Phase 6
+## Phase 6
+
 AI Layer
 
-Phase 7
+## Phase 7
+
 Risk Engine
 
-Phase 8
+## Phase 8
+
 Deployment
 
-Future
+## Future
 
 Decision Intelligence Engine
 
@@ -221,19 +231,20 @@ Decision Intelligence Engine
 
 # Definition of Done
 
-A phase is only complete when:
+A phase is considered complete only when:
 
-- All prompts are complete
-- Validation checklist passes
-- Code is committed
-- Documentation updated
-- No known regressions
+- All Copilot prompts for the phase are complete.
+- Validation checklist passes.
+- Code is committed.
+- Documentation is updated.
+- PROJECT_STATUS.md is updated.
+- No known regressions remain.
 
-Only then may the next phase begin.
+Only then may work begin on the next phase.
 
 ---
 
-# Guiding Principle
+# Guiding Principles
 
 Slow is smooth.
 
@@ -243,4 +254,4 @@ Architecture first.
 
 Quality over speed.
 
-Decision quality over profits.
+Decision quality over profit.
