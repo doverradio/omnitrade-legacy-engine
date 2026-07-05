@@ -10,24 +10,24 @@ Project Stage:
 Pre-MVP
 
 Current Phase:
-Phase 3 — Backtesting
+Phase 4 — Strategy Lab
 
 Current Prompt:
-Pending Phase 3 prompt creation/approval
+Pending Phase 4 prompt creation
 
 Overall Completion:
-Approximately 20%
+Approximately 30%
 
 ---
 
 # Current Goal
 
-Complete Phase 3 (Backtesting) according to the documented architecture.
+Prepare Phase 4 (Strategy Lab) prompt and implementation plan after Phase 3 completion.
 
 Do not begin Phase 4 (Strategy Lab) until:
 
-- Phase 3 implementation is complete.
-- Phase 3 validation passes.
+- Phase 3 implementation is complete. (Complete)
+- Phase 3 validation passes. (Complete)
 - Documentation is updated.
 - PROJECT_STATUS.md is updated.
 - Code is committed.
@@ -122,18 +122,24 @@ Validated against:
 
 ---
 
-## 🟨 Phase 3 — Backtesting
+## ✅ Phase 3 — Backtesting
 
 Status:
-IN PROGRESS
+COMPLETE
 
-Current Focus:
+Completed:
 
-- Backtesting engine
-- Strategy execution framework
-- Historical simulation
-- Performance metrics
-- Validation planning
+- Backtesting database models and migrations
+- Strategy interface and registry
+- MA Crossover strategy and remaining MVP strategy/filter modules
+- Event-driven backtesting engine
+- Fill simulation and metrics engine (including fee drag and small-account warning support)
+- Backtest persistence service
+- Backtest API endpoints (`/backtests/run`, `/backtests`, `/backtests/{id}`, `/backtests/{id}/trades`)
+- Backtests page UI with running/completed/failed/empty states
+- Metadata support endpoint for backtests UI (`GET /parameter-sets`) while preserving documented `GET /strategies` contract
+- Documented `GET /strategies` endpoint implemented for end-to-end manual validation
+- Phase 3 validation completed (backend tests, frontend tests, manual backtest/API/UI validation)
 
 ---
 
@@ -212,9 +218,9 @@ Do not revisit them without creating an ADR.
 
 # Current Priority
 
-Complete Phase 3 while maintaining architectural discipline.
+Begin Phase 4 prompt creation while maintaining architectural discipline.
 
-Do not implement any Phase 4 or later systems until Phase 3 has been completed, validated, documented, and committed.
+Do not implement any Phase 5 or later systems until Phase 4 has been completed, validated, documented, and committed.
 
 ---
 
@@ -242,20 +248,26 @@ Phase 2
 - Frontend tests passing
 - Production build verified
 
+Phase 3
+
+- Complete
+- Backend tests passing (`pytest`)
+- Frontend tests passing (`pnpm test`)
+- Manual MA Crossover backtest run completed against real BTCUSDT candles
+- Backtest persistence verified (`backtests`, `backtest_trades`, populated metrics)
+- API verification completed (`GET /backtests`, `GET /backtests/{id}`, `GET /backtests/{id}/trades`, `GET /strategies`)
+- Backtests UI states manually verified (running/completed/failed/empty)
+
 Known developer environment issue:
 
 Docker may leave root-owned .next artifacts causing local EACCES errors during lint/build.
-This is a local development environment issue and is NOT considered a Phase 2 functional blocker.
+This is a local development environment issue and is NOT considered a Phase 3 functional blocker.
 
 ---
 
 # Upcoming Roadmap
 
-After Phase 2:
-
-## Phase 3
-
-Backtesting
+After Phase 3:
 
 ## Phase 4
 
