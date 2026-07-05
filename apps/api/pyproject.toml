@@ -1,0 +1,23 @@
+[build-system]
+requires = ["setuptools>=68.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "omnitrade-legacy-api"
+version = "0.1.0"
+description = "OmniTrade Legacy Engine backend scaffold"
+requires-python = ">=3.11"
+dependencies = [
+  "fastapi",
+  "uvicorn[standard]",
+  "sqlalchemy[asyncio]",
+  "asyncpg",
+  "alembic",
+  "pydantic-settings",
+  "httpx",
+  "pytest",
+  "pytest-asyncio"
+]
+
+[tool.setuptools.packages.find]
+include = ["app*"]
