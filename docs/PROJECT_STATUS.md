@@ -10,26 +10,27 @@ Project Stage:
 Pre-MVP
 
 Current Phase:
-Phase 2 — Chart UI
+Phase 3 — Backtesting
 
 Current Prompt:
-Pending Phase 2 prompt creation/approval
+Pending Phase 3 prompt creation/approval
 
 Overall Completion:
-Approximately 15%
+Approximately 20%
 
 ---
 
 # Current Goal
 
-Complete Phase 2 (Chart UI) according to the project architecture and documentation.
+Complete Phase 3 (Backtesting) according to the documented architecture.
 
-Before beginning Phase 3 (Backtesting), ensure that:
+Do not begin Phase 4 (Strategy Lab) until:
 
-- Phase 2 implementation is complete.
-- Phase 2 validation checklist passes.
-- All code is committed.
+- Phase 3 implementation is complete.
+- Phase 3 validation passes.
 - Documentation is updated.
+- PROJECT_STATUS.md is updated.
+- Code is committed.
 - No known regressions remain.
 
 Project philosophy:
@@ -42,7 +43,7 @@ Commit it.
 
 Only then move to the next layer.
 
-No skipping phases.
+Never skip phases.
 
 ---
 
@@ -93,24 +94,46 @@ Validated against:
 
 ---
 
-## 🟨 Phase 2 — Chart UI
+## ✅ Phase 2 — Chart UI
+
+Status:
+COMPLETE
+
+Completed:
+
+- Markets page completed
+- Asset selector
+- Interval selector
+- TradingView Lightweight Charts integration
+- Responsive candlestick chart
+- Crosshair
+- Zoom and pan
+- SMA overlay
+- In-memory candle caching
+- Loading state
+- Empty state
+- Error state
+- Responsive resizing
+- Frontend validation completed
+
+Validated against:
+
+- VALIDATION_CHECKLIST.md
+
+---
+
+## 🟨 Phase 3 — Backtesting
 
 Status:
 IN PROGRESS
 
 Current Focus:
 
-- Phase 2 prompt creation
-- Chart UI refinement
-- Chart interactions
+- Backtesting engine
+- Strategy execution framework
+- Historical simulation
+- Performance metrics
 - Validation planning
-
----
-
-## ⬜ Phase 3 — Backtesting
-
-Status:
-Not Started
 
 ---
 
@@ -189,9 +212,40 @@ Do not revisit them without creating an ADR.
 
 # Current Priority
 
-Complete Phase 2 while maintaining architectural discipline.
+Complete Phase 3 while maintaining architectural discipline.
 
-Do not implement any Phase 3 or later systems until Phase 2 has been completed, validated, documented, and committed.
+Do not implement any Phase 4 or later systems until Phase 3 has been completed, validated, documented, and committed.
+
+---
+
+# Phase Validation Summary
+
+Phase 0
+
+- Complete
+- Validated
+
+Phase 1
+
+- Complete
+- Backend tests passing
+- Frontend tests passing
+- Production build verified
+
+Phase 2
+
+- Complete
+- Markets UI manually verified
+- Candlestick rendering verified
+- Interval switching verified
+- SMA overlay verified
+- Frontend tests passing
+- Production build verified
+
+Known developer environment issue:
+
+Docker may leave root-owned .next artifacts causing local EACCES errors during lint/build.
+This is a local development environment issue and is NOT considered a Phase 2 functional blocker.
 
 ---
 
