@@ -10,19 +10,21 @@ No phase begins until the previous phase's exit criteria are met. Every phase pr
 
 ### Phase 0 — Repo Scaffold
 **Goal:** A running skeleton with no business logic.
-- Monorepo structure (`/frontend`, `/backend`, `/workers`) per `COPILOT_PROMPT_PACK.md` Prompt 1.
-- Database schema + migrations fully implemented per `DATABASE_SCHEMA.md` (Prompt 2).
+- Monorepo structure (`apps/web`, `apps/api`, `packages/shared`) per `REPO_STRUCTURE.md` and `COPILOT_PHASE_0_PROMPTS.md` Prompts 0.1–0.3.
+- Migration pipeline proven end-to-end with an initial empty baseline migration (no tables yet) per `COPILOT_PHASE_0_PROMPTS.md` Prompt 0.4 — full schema implementation against `DATABASE_SCHEMA.md` begins in Phase 1 (`COPILOT_PHASE_1_PROMPTS.md` Prompt 1.1 onward) and continues incrementally as each phase needs its tables.
 - Local dev environment (docker-compose or equivalent) runs frontend + backend + Postgres.
 - `.env.example` complete; secrets strategy documented (env vars only, per `SYSTEM_ARCHITECTURE.md` §2.11).
-- **Exit criteria:** `docker-compose up` (or equivalent) yields a frontend that can hit a backend health endpoint backed by a real Postgres schema.
+- **Exit criteria:** `docker-compose up` (or equivalent) yields a frontend that can hit a backend health endpoint backed by a real Postgres connection (schema itself is still empty at this point — see migration note above).
 
 ### Phase 1 — Data Ingestion
 **Goal:** Real market data flowing into the database.
-- Binance/Binance.US client + Alpaca client implemented per `DATA_SOURCES.md` (Prompt 3).
+- `assets` and `candles` tables implemented via migration, and Binance/Binance.US client + Alpaca client implemented per `DATA_SOURCES.md` and `COPILOT_PHASE_1_PROMPTS.md` Prompts 1.1–1.9.
 - Historical backfill script functional for at least 2 crypto pairs and 2 stocks.
 - Scheduled recent-candle ingestion job running reliably.
 - Ingestion failures visibly logged to `audit_log`.
 - **Exit criteria:** `candles` table contains at least 1 year of daily data and 30 days of intraday (e.g., 15m) data for the seed assets, with no duplicate rows and documented data-source labels.
+
+> **Note on "(Prompt N)" references below (Phases 2–8):** These point to `COPILOT_PROMPT_PACK.md`, the original prompt pack written before `REPO_STRUCTURE.md` and the per-phase `COPILOT_PHASE_0_PROMPTS.md`/`COPILOT_PHASE_1_PROMPTS.md` pattern were introduced. Phases 0 and 1 now have dedicated, up-to-date prompt files and no longer rely on `COPILOT_PROMPT_PACK.md`. Phases 2–8 have not been implemented yet and still only have `COPILOT_PROMPT_PACK.md`'s original prompts to work from — before starting each of those phases, a dedicated `COPILOT_PHASE_N_PROMPTS.md` should be authored following the Phase 0/1 pattern, using `apps/web`/`apps/api` (per `REPO_STRUCTURE.md`) rather than `COPILOT_PROMPT_PACK.md`'s original `/frontend`/`/backend`/`/workers` folder references, which are superseded. This document is not the place to generate those prompts (see `HANDOFF_TO_COPILOT.md`); the note exists so the "(Prompt N)" citations below aren't mistaken for current, ready-to-use instructions.
 
 ### Phase 2 — Chart UI
 **Goal:** Users can see real market data in the browser.

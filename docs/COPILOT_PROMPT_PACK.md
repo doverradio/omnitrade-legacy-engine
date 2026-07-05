@@ -2,6 +2,8 @@
 
 ## OmniTrade Legacy Engine — GitHub Copilot Implementation Prompt Pack
 
+> **Status note (added after Phase 0/1 completion):** Prompts 1–3 below (Phases 0–1) are **superseded** by `COPILOT_PHASE_0_PROMPTS.md` and `COPILOT_PHASE_1_PROMPTS.md`, which reflect the actual `apps/web`/`apps/api` repo structure (`REPO_STRUCTURE.md`) and Small Account Mode requirements added after this pack was originally written — use those files instead for Phases 0–1, not the prompts below. Prompts 4–10 (Phases 2–8) have not yet been superseded and remain the best available reference for those phases' intent, but their folder-path references (`/frontend`, `/backend`, `/workers`) are outdated and should be read as `apps/web`, `apps/api` respectively. Before starting each of Phases 2–8, author a dedicated `COPILOT_PHASE_N_PROMPTS.md` following the Phase 0/1 pattern rather than pasting Prompts 4–10 directly.
+
 This file contains ready-to-use prompts for GitHub Copilot (Chat/agent mode) to scaffold and implement the MVP, phase by phase, referencing the other `.md` files in this repo as ground truth. Paste each prompt in order; do not skip ahead — later prompts assume earlier scaffolding exists.
 
 **General instruction to prepend to every session:**

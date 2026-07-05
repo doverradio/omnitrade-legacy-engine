@@ -98,7 +98,7 @@
 - `SignalTable`: signal_time, asset, action, strategy, ai_confidence, status — with color-coded status badges.
 - `SignalDetailDrawer` (expand-on-click): raw strategy signal, regime tag, AI confidence breakdown, allocator weight, risk engine decision, final explanation text.
 
-**Required API calls:** `GET /signals` (with filters + cursor pagination), detail drawer may need a `GET /signals/:id` (implied — add to `API_CONTRACTS.md` when implemented) if the list response doesn't include full explanation payloads.
+**Required API calls:** `GET /signals` (with filters + cursor pagination) for the table; `GET /ai/explanations/:signal_id` (fully defined in `RISK_AND_AUDIT_API_CONTRACTS.md`) for `SignalDetailDrawer`'s regime tag, AI confidence breakdown, allocator weight, and risk engine decision — the list response is not expected to carry the full explanation payload inline.
 
 **Loading state:** Table skeleton rows (8 placeholder rows); filter bar remains interactive during load.
 
@@ -120,7 +120,7 @@
 - `ResetAccountButton` (dev/testing utility, confirmation-gated, calls `POST /paper/reset`).
 - `SmallAccountWarningBanner`: renders when an active strategy is flagged as a poor fit for this account's current balance (`SMALL_ACCOUNT_MODE.md` §11).
 
-**Required API calls:** `GET /paper/account`, `GET /paper/trades`, `POST /paper/reset`, (account creation — implied `POST /paper/account`, add to `API_CONTRACTS.md` when implemented).
+**Required API calls:** `GET /paper/account`, `GET /paper/trades`, `POST /paper/account` (account creation, defined in `API_CONTRACTS.md`), `POST /paper/reset`, `GET /ai/explanations/:signal_id` (for expandable trade rows' explanation detail, defined in `RISK_AND_AUDIT_API_CONTRACTS.md`).
 
 **Loading state:** Skeleton positions/trade rows; equity chart skeleton.
 
@@ -137,10 +137,10 @@
 **Components:**
 - `KillSwitchControl` (global + per-account), each with confirmation modal.
 - `RiskLimitUsageCard` (one per limit type): current usage vs. configured limit, progress-bar style.
-- `RiskEventLogTable`: filterable by event type/account.
+- `RiskEventLogTable`: filterable by event type/account. MVP data source is `GET /risk/status`'s `active_cooldowns`/`active_no_trade_zones` (current active state only); a full historical log requires a future `GET /risk/events` endpoint (see note below) — until then this table shows "currently active" risk events rather than full history.
 - `RiskParameterEditor`: per-account and system-default limit editing, with loosening changes visually flagged (red/amber styling) per `RISK_ENGINE.md` §4.
 
-**Required API calls:** (Risk-specific endpoints are not yet in `API_CONTRACTS.md`'s initial 12 — flag for addition: `GET /risk/status`, `POST /risk/kill-switch/global`, `POST /risk/kill-switch/account/:id`, `GET /risk/events`, `GET/PATCH /risk/parameters`. Note this gap explicitly in this page's implementation ticket.)
+**Required API calls:** `GET /risk/status` (status strip + per-limit usage cards, polled or refreshed on relevant actions), `POST /risk/kill-switch/enable` and `POST /risk/kill-switch/disable` (`KillSwitchControl`, both scopes), `GET /risk/rules` and `PATCH /risk/rules` (`RiskParameterEditor`). All five are fully defined in `RISK_AND_AUDIT_API_CONTRACTS.md`. The risk event log currently reuses `GET /risk/status`'s `active_cooldowns`/`active_no_trade_zones` arrays for its live state; a dedicated paginated `GET /risk/events` history endpoint is not yet defined and should be flagged separately if a full historical event log (beyond current active state) is needed before Phase 7 implementation.
 
 **Loading state:** Status strip shows a neutral/gray "checking..." badge instead of green/red until the first status fetch resolves — never default to a false "safe" green state while loading.
 
@@ -160,7 +160,7 @@
 - `NotificationPreferencesForm` (kill-switch trips, daily loss breaches).
 - `AuditLogViewer`: searchable/filterable read-only table.
 
-**Required API calls:** connection status (implied `GET /settings/connections`, add to `API_CONTRACTS.md`), `GET /audit-log` (implied, add to `API_CONTRACTS.md`), notification prefs (implied `GET/PATCH /settings/notifications`).
+**Required API calls:** `GET /settings` (data connection status + notification preferences), `PATCH /settings` (notification preference updates only — credentials are never editable via this endpoint), `GET /audit-log` (`AuditLogViewer`, with filters/cursor pagination). All three are fully defined in `RISK_AND_AUDIT_API_CONTRACTS.md`.
 
 **Loading state:** Each section loads independently with its own skeleton — a slow audit log query should not block the profile section from rendering.
 

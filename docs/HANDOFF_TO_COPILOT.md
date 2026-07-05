@@ -41,6 +41,7 @@ Hard rules, non-negotiable, apply to everything you generate in this repo:
 - Every AI explanation response must be tied to a real, existing signal record — never synthesized without a backing signals.id, per docs/RISK_AND_AUDIT_API_CONTRACTS.md.
 - Every destructive or state-changing UI action requires a confirmation step, per docs/FRONTEND_PAGE_SPECS.md.
 - Paper account and backtest starting balances must support a $25 minimum, enforced at the database, API, and UI layers — per docs/SMALL_ACCOUNT_MODE.md. This is the default proving ground for the platform, not an edge case to handle later.
+- OmniTrade's permanent architecture has four core engines — Market Intelligence, Strategy Evolution, Decision Intelligence, and Portfolio Intelligence (docs/PROJECT_VISION.md, docs/SYSTEM_ARCHITECTURE.md §1). The Decision Intelligence Engine and its Counterfactual Outcome Ledger subsystem (docs/DECISION_INTELLIGENCE_ENGINE.md) are not scheduled for implementation in Phase 0 or Phase 1 — do not build them now. But do not take shortcuts in `signals`, `model_outputs`, or `risk_events` completeness either, since that data is what the Decision Intelligence Engine will be built from later (docs/DATABASE_SCHEMA.md §3a).
 
 Your task right now is Phase 0 only, exactly as specified in docs/COPILOT_PHASE_0_PROMPTS.md. Do not jump ahead to Phase 1 or any later phase. Do not implement any strategy, AI, risk, or execution logic in Phase 0 — that comes later.
 
@@ -60,7 +61,7 @@ Then begin with Prompt 0.1 from docs/COPILOT_PHASE_0_PROMPTS.md.
 
 1. Run through `VALIDATION_CHECKLIST.md`'s Phase 0 section yourself (not just Copilot) before proceeding.
 2. Once Phase 0 passes validation, start a **new** Copilot Chat session (fresh context) and paste an equivalent handoff block referencing `docs/COPILOT_PHASE_1_PROMPTS.md` instead, keeping the same hard-rules section unchanged.
-3. Repeat this pattern for each subsequent phase using the prompt packs in `COPILOT_PROMPT_PACK.md` (Phases 3–8) — starting each phase in a fresh session with the docs re-read keeps Copilot's context grounded in the actual current state of the docs rather than a stale in-session memory of them.
+3. Repeat this pattern for each subsequent phase. Phases 2–8 do not yet have a dedicated `COPILOT_PHASE_N_PROMPTS.md` file — author one for each phase, following the Phase 0/1 pattern, before starting that phase (see `COPILOT_PROMPT_PACK.md`'s status note for what those phases were originally intended to cover, translated to the current `apps/web`/`apps/api` structure). Starting each phase in a fresh session with the docs re-read keeps Copilot's context grounded in the actual current state of the docs rather than a stale in-session memory of them.
 
 ### Why a Fresh Session Per Phase
 

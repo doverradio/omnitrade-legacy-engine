@@ -11,7 +11,7 @@ OmniTrade Legacy Engine is built around four permanent foundational engines:
 3. **Decision Intelligence Engine (DIE)** — the subject of this document: the platform's permanent memory and reasoning system.
 4. **Portfolio Intelligence Engine** — paper account state, positions, risk posture, equity/performance tracking (spans `RISK_ENGINE.md`, `paper_accounts`/`trades` in `DATABASE_SCHEMA.md`).
 
-This document defines the Decision Intelligence Engine (DIE) as a permanent architectural layer of OmniTrade Legacy Engine, standing alongside — not beneath — the Market Intelligence, Strategy Evolution, and Portfolio Intelligence engines described elsewhere in this doc set. The DIE's major subsystems, both covered in full below, are **Decision Records** (§1–§7, §9–§13) — the platform's structured memory of the decisions it actually made — and the **Counterfactual Outcome Ledger** (§8) — the platform's structured memory of what would have happened under the decisions it didn't make. Neither is optional; both are core to what "decision intelligence" means for this platform.
+This document defines the Decision Intelligence Engine (DIE) as a permanent architectural layer of OmniTrade Legacy Engine, standing alongside — not beneath — the Market Intelligence, Strategy Evolution, and Portfolio Intelligence engines described elsewhere in this doc set. The DIE's major subsystems, both covered in full below, are **Decision Records** (§1–§7, §9–§13) — the platform's structured memory of the decisions it actually made, anchored by an immutable **Decision Snapshot** of the exact state that produced each one (§4a) — and the **Counterfactual Outcome Ledger** (§8) — the platform's structured memory of what would have happened under the decisions it didn't make. Neither is optional; both are core to what "decision intelligence" means for this platform.
 
 ---
 
@@ -69,9 +69,10 @@ Strategy Evaluations
 Risk Engine
       │  (approve / resize / reject, per RISK_ENGINE.md §3 evaluation order)
       ▼
-Decision Intelligence Record Created
-      │  (the moment reasoning, evidence, and risk adjustments are frozen into a record —
-      │   this happens for every outcome of the risk engine step, not only approvals)
+Decision Record Created
+      │  (the moment reasoning, evidence, and risk adjustments are frozen into a record,
+      │   alongside an immutable Decision Snapshot of the exact state that produced it —
+      │   see §4a; this happens for every outcome of the risk engine step, not only approvals)
       ├──────────────────────────────────────────┐
       ▼                                          ▼
 Execution                          Counterfactual Outcome Ledger (COL)
@@ -107,7 +108,7 @@ Two properties of this lifecycle are load-bearing:
 
 ### 4. Decision Record Schema (Architectural, Not SQL)
 
-A Decision Record is the unit of knowledge the DIE produces. Conceptually, one record aggregates data that in `DATABASE_SCHEMA.md`'s existing tables is currently spread across `signals`, `model_outputs`, `risk_events`, and `trades` — the DIE's job is to weave these into one coherent, retrievable narrative per decision, not necessarily to duplicate their storage (see §8 for how this reconciles with the existing schema).
+A Decision Record is the unit of knowledge the DIE produces. Conceptually, one record aggregates data that in `DATABASE_SCHEMA.md`'s existing tables is currently spread across `signals`, `model_outputs`, `risk_events`, and `trades` — the DIE's job is to weave these into one coherent, retrievable narrative per decision, not necessarily to duplicate their storage (see §9 for how this reconciles with the existing schema).
 
 **Core identity**
 - `decision_id` — unique identifier for this record.
@@ -153,7 +154,66 @@ A Decision Record is the unit of knowledge the DIE produces. Conceptually, one r
 - `review_status` — where this record stands in human review (e.g., `unreviewed`, `reviewed`, `flagged`).
 - `human_notes` — free-text human annotation, distinct from AI-generated content.
 
-This schema is intentionally described at the field/architecture level, not as SQL — see §8 for how it maps onto actual tables.
+This schema is intentionally described at the field/architecture level, not as SQL — see §9 for how it maps onto actual tables.
+
+---
+
+### 4a. Decision Snapshot (Immutable Context Preservation)
+
+**Status:** A formal, core concept within the Decision Intelligence Engine — the mechanism that makes every Decision Record reproducible.
+
+#### 4a.1 Purpose
+
+A Decision Record (§4) captures the reasoning, evidence, and outcome of a decision. On its own, that's still not quite enough for rigorous future learning: reasoning references things — "regime was trending_up," "RSI was 28," "position sized at 1.5% of equity" — that are themselves computed from a specific state of the world at a specific instant. If that underlying state isn't preserved exactly as it was, later analysis is reconstructing an approximation, not replaying the original moment.
+
+The **Decision Snapshot** is the fix: an **immutable, point-in-time capture of the exact state that produced the decision**, stored alongside (and referenced by) the Decision Record. The platform should not merely remember *that* a decision happened, or even just *why* — it must preserve the precise context so the decision can later be analyzed, replayed, compared, and learned from with full fidelity, not from a best-effort reconstruction pieced together from other tables after the fact.
+
+This directly serves the reproducibility requirement behind future AI training (§6, §7): a supervised dataset is only as trustworthy as its inputs are exact. If "what the model saw" has to be inferred or approximated after the fact, any pattern mined from it is suspect.
+
+#### 4a.2 What a Decision Snapshot Contains
+
+A Decision Snapshot is captured at the moment a Decision Record is created (§3) and never modified afterward. It includes:
+
+**Identity & timing**
+- `timestamp` — the exact moment this snapshot was captured.
+- `asset` — the asset the decision concerns.
+- `exchange` — the specific exchange/venue the market data was sourced from.
+- `timeframe` — the interval/timeframe the decision was evaluated on.
+
+**Market context**
+- `ohlcv_context` — the relevant candle window (not just the latest candle) that fed the decision.
+- `indicators` — the specific indicator values computed at this moment.
+- `generated_features` — any derived/engineered features consumed by strategies or the AI layer, beyond raw indicators.
+- `market_regime` — the regime classification in effect at this moment.
+- `volatility` — the volatility measure(s) in effect (e.g., realized volatility, ATR).
+- `spread_liquidity_context` — bid/ask spread and liquidity depth, where available from the data source (per `DATA_SOURCES.md`'s documented feed limitations — this field is honestly null/absent when the feed doesn't provide it, never estimated).
+
+**Decision inputs**
+- `strategy_inputs` — the specific parameter set and raw signal(s) each strategy produced.
+- `risk_inputs` — the account/portfolio state the risk engine evaluated against (see below).
+
+**Portfolio & position state**
+- `current_position_state` — any existing position in this asset at decision time.
+- `open_trades` — all open trades across the account at decision time, not just this asset.
+- `portfolio_exposure` — aggregate exposure/equity state at decision time.
+
+**Version pins** — the exact version of every moving part that could change the decision if re-run later:
+- `parameter_set_version` — which parameter set was in effect.
+- `strategy_version` — the strategy module's `module_version` (per `DATABASE_SCHEMA.md` §2.3).
+- `ai_model_version` — the AI layer model version(s) involved (per `AI_LAYER.md` §6).
+- `decision_engine_version` — the DIE's own schema/logic version producing this snapshot (mirroring the Decision Record's `version` field in §4).
+- `configuration_version` — the risk parameter configuration version in effect (per `RISK_ENGINE.md` §4).
+
+#### 4a.3 Design Rules
+
+- **Immutability is absolute.** A Decision Snapshot is written once, at decision time, and never updated — even if later analysis reveals the indicators were computed from since-corrected or since-revised source data. If source data is later found to be wrong, that's itself a fact worth recording (e.g., as a note on the related Decision Record), not a reason to silently edit the snapshot.
+- **Snapshot, not reference.** Values are captured by value at decision time, not stored as live references to current indicator/candle tables — an indicator recalculation methodology changing next year must never retroactively alter what a two-year-old Decision Snapshot says the indicator value was.
+- **Every version field is mandatory, not optional.** A Decision Snapshot missing any of the five version-pin fields in §4a.2 is not reproducible and should be treated as incomplete — this is what makes "replay this exact decision against today's code" or "compare how this decision would differ under the current model version" answerable questions rather than guesses.
+- **The snapshot is read-heavy, write-once.** It supports replay, comparison, and training-set construction (§6, §7) — it is never read by, or fed back into, any real-time decision path. Like the rest of the DIE (§2), it is purely observational.
+
+#### 4a.4 Relationship to the Decision Record
+
+The Decision Snapshot is not a replacement for the Decision Record's `indicators` and `market_regime` fields already listed in §4 — it is the fuller, immutable superset those summary fields are drawn from. In practice, a Decision Record's lighter-weight fields (used for everyday display and querying) and its linked Decision Snapshot (used for reproducibility, replay, and training-set construction) are expected to be implemented as a one-to-one pair: every Decision Record has exactly one Decision Snapshot, captured at the same moment.
 
 ---
 
@@ -316,6 +376,7 @@ None of this is scheduled into MVP phases (see `MVP_BUILD_PLAN.md`'s Future Phas
 The DIE introduces the following new conceptual tables, described at the architecture level. Exact column-level schema (including how these relate to or absorb the existing `signals`, `model_outputs`, and `risk_events` tables) is deferred to a future `DATABASE_SCHEMA.md` revision at implementation time.
 
 - **Decision Records** — the central table implementing the schema in §4; one row per decision lifecycle instance (§3), whether or not it resulted in a trade.
+- **Decision Snapshots** — one immutable row per Decision Record (one-to-one), implementing the schema in §4a: the full point-in-time market/portfolio/version context that produced the decision, captured by value and never modified afterward.
 - **Decision Evidence** — supporting and opposing evidence entries linked to a Decision Record (one-to-many), capturing which strategies/signals argued which way and by how much.
 - **Decision Outcomes** — outcome data (P&L, duration, categorical outcome) linked to a Decision Record, populated once known — kept as a related table rather than inline columns since outcomes are populated asynchronously, often long after the record is first created.
 - **Decision Reviews** — human review state and notes linked to a Decision Record (`review_status`, `human_notes`), separate from AI-generated content so human judgment is always distinguishable from AI judgment in the data.

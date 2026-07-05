@@ -90,3 +90,4 @@ Post-Trade Review Engine (async, after outcome known)
 
 - Every model has a `model_version`; all `model_outputs` rows are tagged with the exact version that produced them, so historical decisions can always be traced back to the exact model logic that made them, even after later retraining.
 - Model changes go through the same rigor as strategy changes: backtest/validate → stage → human review → promote.
+- This versioning discipline is what the Decision Intelligence Engine's **Decision Snapshot** (`DECISION_INTELLIGENCE_ENGINE.md` §4a) relies on: every Decision Snapshot pins the exact `ai_model_version` in effect at decision time, alongside the strategy, parameter-set, and configuration versions, so a future analysis can know precisely which model logic produced a given confidence score or regime tag — not just which model is currently deployed.

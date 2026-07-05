@@ -277,3 +277,9 @@
 | `internal_error` | 500 | Unexpected server error (always logged, never exposes internals to the client) |
 
 > Note: risk-engine rejection reasons such as `position_below_minimum_order_size` (see `RISK_ENGINE.md` §2.1a, relevant to Small Account Mode) surface within signal/trade-related response bodies rather than as top-level HTTP error codes, since a risk rejection is a valid, expected outcome of signal evaluation — not a request-processing failure.
+
+---
+
+### Future API Surface: Decision Intelligence Engine (Architectural Placeholder)
+
+The Decision Intelligence Engine (`DECISION_INTELLIGENCE_ENGINE.md`) — one of the platform's four permanent core engines — will introduce its own endpoint family in a future implementation phase: `GET /decisions`, `GET /decisions/{id}`, `GET /decisions/search`, `GET /decisions/outcomes`, `GET /decisions/explanations`, `GET /decisions/reviews`, `POST /decisions/review`, `GET /decisions/{id}/counterfactuals`, and `GET /counterfactuals/lesson-tags` (see `DECISION_INTELLIGENCE_ENGINE.md` §10 for the full list and rationale, including the Counterfactual Outcome Ledger's contribution to it). These are named here only to reserve their place in the API surface; none are part of the current MVP contract, and none should be implemented until a dedicated phase and full request/response specification exist. `GET /ai/explanations/:signal_id` (in `RISK_AND_AUDIT_API_CONTRACTS.md`) is expected to eventually be superseded or subsumed by `GET /decisions/explanations`, but remains the authoritative MVP contract until that transition is explicitly planned.
