@@ -1,0 +1,65 @@
+services:
+  postgres:
+    image: postgres:16
+    container_name: omnitrade-postgres
+    environment:
+      POSTGRES_DB: omnitrade
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d omnitrade"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+
+  api:
+    build:
+      context: ../../apps/api
+      dockerfile: ../../infra/docker/api.Dockerfile
+    container_name: omnitrade-api
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      DATABASE_URL: postgresql+asyncpg://postgres:postgres@postgres:5432/omnitrade
+      SUPABASE_URL: http://localhost:54321
+      SUPABASE_SERVICE_ROLE_KEY: dev-placeholder-service-role-key
+      SUPABASE_JWT_SECRET: dev-placeholder-jwt-secret
+      BINANCE_US_API_BASE: https://api.binance.us
+      ALPACA_API_KEY_ID: dev-placeholder-alpaca-key-id
+      ALPACA_API_SECRET_KEY: dev-placeholder-alpaca-secret
+      ALPACA_BASE_URL: https://paper-api.alpaca.markets
+      ENVIRONMENT: local
+      LOG_LEVEL: INFO
+      GLOBAL_KILL_SWITCH_DEFAULT: "false"
+    ports:
+      - "8000:8000"
+    volumes:
+      - ../../apps/api:/app
+
+  web:
+    build:
+      context: ../../apps/web
+      dockerfile: ../../infra/docker/web.Dockerfile
+    container_name: omnitrade-web
+    depends_on:
+      api:
+        condition: service_started
+    environment:
+      NEXT_PUBLIC_API_BASE_URL: http://localhost:8000
+      NEXT_PUBLIC_SUPABASE_URL: http://localhost:54321
+      NEXT_PUBLIC_SUPABASE_ANON_KEY: dev-placeholder-anon-key
+      NEXT_PUBLIC_ENVIRONMENT: local
+    ports:
+      - "3000:3000"
+    volumes:
+      - ../../apps/web:/app
+      - web_node_modules:/app/node_modules
+
+volumes:
+  postgres_data:
+  web_node_modules:
