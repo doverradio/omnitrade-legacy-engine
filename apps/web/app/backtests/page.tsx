@@ -47,6 +47,44 @@ function getErrorMessage(error: unknown, fallback: string): string {
   return error instanceof ApiRequestError ? error.message : fallback;
 }
 
+function formatDate(value: string): string {
+  const date = new Date(value);
+  if (Number.isNaN(date.getTime())) {
+    return "Unknown date";
+  }
+
+  return date.toLocaleDateString();
+}
+
+function formatDateTime(value: string | null | undefined): string {
+  if (!value) {
+    return "Unavailable from /backtests response";
+  }
+
+  const date = new Date(value);
+  if (Number.isNaN(date.getTime())) {
+    return "Unavailable from /backtests response";
+  }
+
+  return date.toLocaleString();
+}
+
+function formatReturnLine(item: BacktestListItem): string {
+  if (!item.metrics) {
+    return "Return: n/a";
+  }
+
+  const returnUsd = Number(item.metrics.total_return_usd);
+  const returnPct = Number(item.metrics.total_return_pct);
+  if (!Number.isFinite(returnUsd) || !Number.isFinite(returnPct)) {
+    return "Return: n/a";
+  }
+
+  const usdSign = returnUsd >= 0 ? "+" : "";
+  const pctSign = returnPct >= 0 ? "+" : "";
+  return `Return: ${usdSign}$${returnUsd.toFixed(2)} (${pctSign}${(returnPct * 100).toFixed(2)}%)`;
+}
+
 export default function BacktestsPage() {
   const [strategies, setStrategies] = useState<StrategyItem[]>([]);
   const [parameterSets, setParameterSets] = useState<ParameterSetItem[]>([]);
@@ -235,6 +273,22 @@ export default function BacktestsPage() {
     return history.slice(0, 2).map((item) => item.id);
   }, [history]);
 
+  const assetSymbolById = useMemo(() => {
+    const mapping = new Map<string, string>();
+    for (const asset of assets) {
+      mapping.set(asset.id, asset.symbol);
+    }
+    return mapping;
+  }, [assets]);
+
+  const strategyLabelById = useMemo(() => {
+    const mapping = new Map<string, string>();
+    for (const strategy of strategies) {
+      mapping.set(strategy.id, strategy.name || strategy.slug);
+    }
+    return mapping;
+  }, [strategies]);
+
   return (
     <div className="space-y-6">
       <div>
@@ -271,6 +325,9 @@ export default function BacktestsPage() {
               <ul className="mt-3 space-y-2">
                 {history.map((item) => {
                   const isSelected = activeBacktestId === item.id;
+                  const assetLabel = assetSymbolById.get(item.asset_id) ?? `Asset ID: ${item.asset_id.slice(0, 8)}...`;
+                  const strategyLabel = strategyLabelById.get(item.strategy_id) ?? `Strategy ID: ${item.strategy_id.slice(0, 8)}...`;
+                  const createdAt = formatDateTime((item as BacktestListItem & { created_at?: string }).created_at);
                   return (
                     <li key={item.id}>
                       <button
@@ -284,9 +341,11 @@ export default function BacktestsPage() {
                           isSelected ? "border-accent bg-accent/20" : "border-border bg-background/20 hover:bg-foreground/10",
                         ].join(" ")}
                       >
-                        <p className="font-medium">{item.id.slice(0, 8)}...</p>
-                        <p className="text-xs text-foreground/70">
-                          {item.status} • Backtest Starting Capital ${Number(item.initial_capital).toFixed(2)}
+                        <p className="font-medium">{assetLabel} · {strategyLabel} · {item.interval}</p>
+                        <p className="text-xs text-foreground/70">{formatDate(item.start_time)} → {formatDate(item.end_time)}</p>
+                        <p className="mt-0.5 text-xs text-foreground/70">Created: {createdAt}</p>
+                        <p className="mt-1 text-xs text-foreground/75">
+                          {item.status.charAt(0).toUpperCase() + item.status.slice(1)} · Starting Capital: ${Number(item.initial_capital).toFixed(2)} · {formatReturnLine(item)}
                         </p>
                       </button>
                     </li>
