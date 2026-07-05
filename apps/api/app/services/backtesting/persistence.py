@@ -32,7 +32,12 @@ class PersistedBacktestResult:
     strategy_id: str
     parameter_set_id: str
     asset_id: str
+    interval: str
+    start_time: datetime
+    end_time: datetime
     initial_capital: str
+    fee_bps: str
+    slippage_bps: str
     metrics: dict[str, Any] | None
     small_account_warning: dict[str, Any] | None
     trades: tuple[PersistedBacktestTrade, ...]
@@ -143,6 +148,34 @@ async def run_backtest_and_persist(
         return await mark_backtest_failed(session, backtest_id, error_detail=str(exc))
 
 
+async def get_persisted_backtest(session: AsyncSession, backtest_id: uuid.UUID) -> PersistedBacktestResult | None:
+    result = await session.execute(select(Backtest).where(Backtest.id == backtest_id))
+    backtest = result.scalar_one_or_none()
+    if backtest is None:
+        return None
+    trades = await _fetch_trades(session, backtest.id)
+    return _serialize_backtest(backtest, trades=trades)
+
+
+async def list_persisted_backtests(session: AsyncSession) -> tuple[PersistedBacktestResult, ...]:
+    result = await session.execute(select(Backtest).order_by(Backtest.created_at.desc()))
+    backtests = result.scalars().all()
+    serialized: list[PersistedBacktestResult] = []
+    for backtest in backtests:
+        serialized.append(_serialize_backtest(backtest, trades=()))
+    return tuple(serialized)
+
+
+async def list_persisted_backtest_trades(
+    session: AsyncSession, backtest_id: uuid.UUID
+) -> tuple[PersistedBacktestTrade, ...] | None:
+    result = await session.execute(select(Backtest.id).where(Backtest.id == backtest_id))
+    exists = result.scalar_one_or_none()
+    if exists is None:
+        return None
+    return await _fetch_trades(session, backtest_id)
+
+
 def _serialize_metrics(metrics: BacktestMetrics) -> dict[str, Any]:
     return {
         "total_return_usd": str(metrics.total_return_usd),
@@ -200,7 +233,12 @@ def _serialize_backtest(
         strategy_id=str(backtest.strategy_id),
         parameter_set_id=str(backtest.parameter_set_id),
         asset_id=str(backtest.asset_id),
+        interval=backtest.interval,
+        start_time=backtest.start_time,
+        end_time=backtest.end_time,
         initial_capital=str(backtest.initial_capital),
+        fee_bps=str(backtest.fee_bps),
+        slippage_bps=str(backtest.slippage_bps),
         metrics=backtest.metrics,
         small_account_warning=backtest.small_account_warning,
         trades=trades,
