@@ -11,7 +11,7 @@ OmniTrade Legacy Engine is built around four permanent foundational engines:
 3. **Decision Intelligence Engine (DIE)** — the subject of this document: the platform's permanent memory and reasoning system.
 4. **Portfolio Intelligence Engine** — paper account state, positions, risk posture, equity/performance tracking (spans `RISK_ENGINE.md`, `paper_accounts`/`trades` in `DATABASE_SCHEMA.md`).
 
-This document defines the Decision Intelligence Engine (DIE) as a permanent architectural layer of OmniTrade Legacy Engine, standing alongside — not beneath — the Market Intelligence, Strategy Evolution, and Portfolio Intelligence engines described elsewhere in this doc set. The DIE's major subsystems, both covered in full below, are **Decision Records** (§1–§7, §9–§13) — the platform's structured memory of the decisions it actually made, anchored by an immutable **Decision Snapshot** of the exact state that produced each one (§4a) — and the **Counterfactual Outcome Ledger** (§8) — the platform's structured memory of what would have happened under the decisions it didn't make. Neither is optional; both are core to what "decision intelligence" means for this platform.
+This document defines the Decision Intelligence Engine (DIE) as a permanent architectural layer of OmniTrade Legacy Engine, standing alongside — not beneath — the Market Intelligence, Strategy Evolution, and Portfolio Intelligence engines described elsewhere in this doc set. The DIE's major subsystems, all covered in full below, are **Decision Records** (§1–§7, §9–§13) — the platform's structured memory of the decisions it actually made, anchored by an immutable **Decision Snapshot** of the exact state that produced each one (§4a) — the **Counterfactual Outcome Ledger** (§8) — the platform's structured memory of what would have happened under the decisions it didn't make — and the **Decision Quality Engine** (§8a) — the platform's structured judgment of how *good* a decision was, independent of how it happened to turn out. None of the three is optional; all are core to what "decision intelligence" means for this platform.
 
 ---
 
@@ -371,6 +371,71 @@ None of this is scheduled into MVP phases (see `MVP_BUILD_PLAN.md`'s Future Phas
 
 ---
 
+### 8a. Decision Quality Engine (DQE)
+
+**Status:** A core subsystem inside the Decision Intelligence Engine — not a fifth core engine, and not a replacement for the Counterfactual Outcome Ledger (§8), which supplies most of its raw material.
+
+#### 8a.1 Purpose
+
+Everything measured elsewhere in this document eventually gets compared against P&L. That's necessary, but P&L alone is a misleading proxy for whether the platform is deciding well:
+
+> **A bad decision can accidentally make money. A good decision can occasionally lose money.**
+
+A strategy that overrides its own risk sizing and gets lucky once looks identical to a well-reasoned trade in a raw P&L ledger — until it isn't lucky. Conversely, a well-reasoned WAIT that respects volatility limits and later turns out to have missed a small gain is not a failure of judgment, even though it shows up as "money left on the table." If OmniTrade only ever asks "did this make money," it will systematically reward luck and punish discipline. The Decision Quality Engine exists to ask the other question: **was this a good decision, independent of how it happened to turn out?**
+
+This is the natural next step once the Counterfactual Outcome Ledger (§8) exists: COL tells you what would have happened under each action. The DQE is what turns that comparison, plus the rest of a Decision Record's evidence and risk context, into a single, structured judgment about the quality of the decision-making itself.
+
+#### 8a.2 Relationship to the Rest of the DIE
+
+The DQE does not generate signals, evaluate risk, or execute trades — like the rest of the DIE (§2), it is purely observational and runs after the fact. It specifically depends on:
+- The **Decision Record** (§4) and its linked **Decision Snapshot** (§4a) for the original reasoning, confidence, and risk context.
+- The **Counterfactual Outcome Ledger**'s (§8) shadow outcomes and per-horizon hindsight-best-action evaluations, since a Decision Quality Score cannot be computed responsibly until counterfactual outcomes are available for the relevant horizon(s).
+
+Because of this dependency, a decision's Decision Quality Score is necessarily computed **after** the fact — typically once at least one COL horizon has resolved — never at decision time. It is written back as an addition to the same Decision Record, in the same spirit as `lessons_learned` and `ai_reflection` (§4).
+
+#### 8a.3 What the Decision Quality Score Considers
+
+The score is a composite judgment, not a single formula reducible to P&L. It considers:
+
+- **Whether BUY, SELL, or WAIT was best in hindsight** — the COL's per-horizon hindsight-best-action comparison (§8.4).
+- **Confidence calibration** — whether the AI layer's stated confidence (`AI_LAYER.md` §2.2) matched how the decision actually played out, not just whether the decision was directionally right.
+- **Market regime accuracy** — whether the regime classification in effect at decision time (`AI_LAYER.md` §2.1) was itself accurate in hindsight, since a well-reasoned decision built on a wrong regime call is a different failure mode than a poorly-reasoned decision built on a correct one.
+- **Whether risk management improved or worsened the outcome** — did a risk-engine resize, stop-loss, or rejection (`RISK_ENGINE.md`) make the outcome better or worse than the unadjusted signal would have produced.
+- **Whether the engine overreacted** — a large position or high-confidence call on thin, weak, or contradictory evidence, regardless of outcome.
+- **Whether the engine hesitated too long** — a correct directional read that was acted on late enough to lose most of its value (related to the `entered_too_early`/`exited_too_early`-style lesson tags in §8.5, but framed here as a scored dimension rather than a tag).
+- **Whether fees/slippage erased the apparent edge** — a decision can be directionally correct and still be a poor decision if its expected edge was smaller than the realistic cost of executing it (`SMALL_ACCOUNT_MODE.md` §10's fee drag concept, generalized beyond just small accounts).
+- **Whether position sizing was appropriate** — given the confidence, evidence, and risk context, was the size taken (or the size of the rejected/reduced position) actually the right size, not just "within limits."
+
+These dimensions are deliberately independent of the pure BUY/SELL/WAIT correctness question — a decision can be judged well on process even when hindsight-best-action disagrees with it, and judged poorly even when it happens to match hindsight-best-action.
+
+#### 8a.4 Worked Examples
+
+- **A WAIT with 72% confidence, where BUY in hindsight made slightly more money, may still score *high*.** If the risk context (e.g., elevated volatility, thin supporting evidence, a recent string of losses triggering a cooldown-adjacent caution) made the small additional upside not worth the additional risk, the WAIT was the disciplined decision even though it wasn't the hindsight-best one. The DQE is specifically designed to recognize this case rather than penalize every WAIT that "missed" a smaller gain.
+- **A BUY with 94% confidence that loses badly, where SELL would have won, should score *low*.** High stated confidence combined with a bad outcome and a hindsight-best action pointing the opposite direction is close to the clearest possible signal of either a confidence-calibration failure or a regime-classification failure (or both) — this is exactly the pattern `confidence_overestimated` (§8.5) is meant to catch, and the DQE should weight it accordingly rather than let a single lucky counterexample elsewhere offset it.
+
+#### 8a.5 Future Dashboard Metrics
+
+Once implemented, the DQE is expected to power an aggregate, account/strategy/regime-sliceable view (a future addition to the AI Review or Confidence Analytics pages, §11) with metrics including:
+
+- **Overall Decision Quality** — an aggregate score across all evaluated decisions.
+- **Correct BUY Decisions**, **Correct SELL Decisions**, **Correct WAIT Decisions** — hindsight-agreement rate broken out per action type, since a platform can be well-calibrated on one action and poorly calibrated on another.
+- **False Positives** — high-confidence actions that hindsight judged wrong.
+- **Missed Opportunities** — WAIT/rejected decisions where hindsight judged an action would have clearly won, and the process-quality dimensions (§8a.3) don't excuse the miss.
+- **Confidence Calibration** — the aggregate gap between stated confidence and realized/hindsight outcome.
+- **Market Regime Accuracy** — how often the regime classification in effect matched what hindsight analysis suggests the regime actually was.
+- **Risk Override Success Rate** — how often a risk-engine adjustment (resize, reject, stop-loss) measurably improved the outcome versus the unadjusted signal.
+- **Counterfactual Agreement Rate** — how often the platform's real recommendation matched the COL's hindsight-best action, tracked separately from the process-quality score so "agreement with hindsight" and "quality of reasoning" remain visibly distinct metrics rather than being collapsed into one number.
+
+These are named here as forward-looking targets; exact computation methodology, weighting between the §8a.3 dimensions, and dashboard placement are implementation-phase decisions, not fixed by this document.
+
+#### 8a.6 Design Constraints
+
+- **The DQE never overrides or bypasses the risk engine, and never automatically changes strategy behavior.** Like every other AI-adjacent output in this platform (`AI_LAYER.md` §5), Decision Quality Scores and their aggregate metrics are recommendations and diagnostics for human review — they can inform a future decision to adjust a strategy's allocation or a risk parameter, but only through the same human-approved promotion path already used everywhere else.
+- **The DQE must not become a second confidence scorer that quietly replaces `AI_LAYER.md`'s Signal Confidence Scorer.** It evaluates the quality of past decisions after the fact, using information (counterfactual outcomes) that isn't available at decision time — it is not a real-time model and must not be pressed into that role.
+- **A Decision Quality Score is only computed once relevant counterfactual data exists.** A decision with no resolved COL horizon yet has no Decision Quality Score, not a placeholder or default one — an unscored decision must be visibly distinguishable from a decision scored as neutral/average.
+
+---
+
 ### 9. Database Impact (Architecture Only — No SQL)
 
 The DIE introduces the following new conceptual tables, described at the architecture level. Exact column-level schema (including how these relate to or absorb the existing `signals`, `model_outputs`, and `risk_events` tables) is deferred to a future `DATABASE_SCHEMA.md` revision at implementation time.
@@ -384,6 +449,7 @@ The DIE introduces the following new conceptual tables, described at the archite
 - **Human Reviews** — a dedicated table for structured human review actions (e.g., approve/flag/annotate), distinct from free-text `human_notes`, to support the same human-in-the-loop review pattern already established for AI recommendations elsewhere in the platform (`AI_LAYER.md` §2.5, `RISK_AND_AUDIT_API_CONTRACTS.md`'s `GET /ai/review`).
 - **Shadow Outcomes** — one row per shadow action (BUY/SELL/WAIT) per decision, linked to the originating Decision Record, per §8.3.
 - **Counterfactual Evaluations** — one row per (decision, horizon) pair, linked to a Decision Record and its Shadow Outcomes, storing the per-horizon computed outcomes, hindsight-best action, correctness assessment, and lesson tags, per §8.4/§8.5.
+- **Decision Quality Scores** — one row per scored decision, linked to a Decision Record and the Counterfactual Evaluations it depended on, storing the composite score and its per-dimension breakdown (§8a.3), populated only once relevant counterfactual data exists (§8a.6).
 
 This is expected to relate closely to, and likely partially subsume or reference, the existing `signals`, `model_outputs`, and `risk_events` tables from `DATABASE_SCHEMA.md` — the DIE is not necessarily a wholesale replacement of that schema, but the layer that ties those existing records together into the coherent per-decision narrative described in §4/§5. Reconciling this precisely is implementation-phase work, not an MVP architecture decision to finalize now.
 
@@ -402,6 +468,8 @@ The following endpoints are anticipated for a future phase and are documented he
 - `POST /decisions/review` — submit a human review action on a Decision Record.
 - `GET /decisions/{id}/counterfactuals` — fetch the shadow outcomes and per-horizon counterfactual evaluations for a single decision, per §8.
 - `GET /counterfactuals/lesson-tags` — aggregate/browse view over lesson tag frequency (e.g., "how often does `volatility_filter_saved_trade` occur"), supporting the kind of pattern-mining described in §6.
+- `GET /decisions/{id}/quality` — fetch the Decision Quality Score and per-dimension breakdown for a single decision, per §8a.
+- `GET /decisions/quality-metrics` — aggregate dashboard metrics (Overall Decision Quality, Correct BUY/SELL/WAIT Decisions, False Positives, Missed Opportunities, Confidence Calibration, Market Regime Accuracy, Risk Override Success Rate, Counterfactual Agreement Rate — see §8a.5), filterable by account/strategy/regime.
 
 These are named and scoped now so future implementation work has a stable target; full contracts (request/response shapes, error states) will be defined in a dedicated `DECISION_INTELLIGENCE_API_CONTRACTS.md` when this engine moves from architecture to implementation.
 
@@ -419,6 +487,7 @@ The following pages are anticipated for a future phase, extending the page set d
 - **AI Reflection Viewer** — surfaces hindsight-informed AI commentary distinctly from original real-time explanations.
 - **Confidence Analytics** — visualizes confidence calibration over time, regimes, and strategies (directly surfacing the §6 calibration analysis).
 - **Counterfactual Viewer** — a Decision Detail sub-view (or standalone page) showing the three shadow outcomes, their per-horizon results, the hindsight-best action, and accumulated lesson tags for a given decision, per §8.
+- **Decision Quality Dashboard** — surfaces the §8a.5 aggregate metrics (Overall Decision Quality, per-action correctness rates, False Positives, Missed Opportunities, Confidence Calibration, Market Regime Accuracy, Risk Override Success Rate, Counterfactual Agreement Rate), filterable by account/strategy/regime, likely as an extension of Confidence Analytics rather than a fully separate page.
 
 These pages are not part of the MVP page set (`FRONTEND_PAGE_SPECS.md`'s 8 pages) and are not scheduled into `MVP_BUILD_PLAN.md`'s phases at this time — they are recorded here so the eventual UI work has an architectural home to build toward, and so that MVP pages (particularly Signals and AI Review) are built in a way that doesn't preclude this later expansion.
 
@@ -428,11 +497,12 @@ These pages are not part of the MVP page set (`FRONTEND_PAGE_SPECS.md`'s 8 pages
 
 - **Market Intelligence Engine** — supplies the market snapshot, features, and regime classification that seed each Decision Record (§3, steps 1–3), and the ongoing candle/price data the COL's background jobs read at each evaluation horizon (§8.4).
 - **Strategy Evolution Engine** — supplies the strategy evaluations, supporting/opposing evidence, and (via the allocator) the weighting context behind "why this strategy was selected" (§5).
-- **Risk Engine** — supplies every risk adjustment, rejection reason, and sizing decision recorded in a Decision Record (§3, step 5; §4's risk & sizing fields), and is itself a subject of COL lesson tags such as `volatility_filter_saved_trade`/`trend_filter_incorrect` (§8.5).
+- **Risk Engine** — supplies every risk adjustment, rejection reason, and sizing decision recorded in a Decision Record (§3, step 5; §4's risk & sizing fields), and is itself a subject of COL lesson tags such as `volatility_filter_saved_trade`/`trend_filter_incorrect` (§8.5) and of the Decision Quality Engine's "did risk management improve or worsen the outcome" dimension (§8a.3).
 - **Portfolio Intelligence Engine** — supplies account-level context (equity, existing positions) relevant to sizing and risk decisions, and consumes Decision Outcomes to update its own performance views.
 - **Paper Trading** — the current execution venue for decisions that are accepted; supplies `execution_details`/`exit_details`. The COL's shadow outcomes are explicitly never routed through Paper Trading's execution path — they are computed, not executed (§8.1).
 - **Backtesting** — historical backtests are themselves a valuable (if lower-fidelity, since no real-time risk/AI pipeline runs during a vectorized backtest) source of Decision-Record-like data; a future enhancement could have the backtesting engine emit simplified Decision Records so backtested and live paper decisions live in the same queryable knowledge base. The COL itself remains scoped to live/paper decisions only (§8.6) and is not a backtesting mechanism.
-- **Future Live Trading** — when live trading is eventually enabled (`RISK_ENGINE.md` §5), the same Decision Record schema and lifecycle apply unchanged — live trading does not get a separate reasoning/memory system, it inherits this one, including the COL's shadow-outcome tracking.
+- **AI Layer** — the Decision Quality Engine (§8a) directly evaluates the AI layer's own outputs after the fact (confidence calibration, regime accuracy), making it a feedback mechanism for `AI_LAYER.md`'s versioned retraining process (`AI_LAYER.md` §6) — but, consistent with §8a.6, only ever as a human-reviewed input, never an automatic adjustment.
+- **Future Live Trading** — when live trading is eventually enabled (`RISK_ENGINE.md` §5), the same Decision Record schema and lifecycle apply unchanged — live trading does not get a separate reasoning/memory system, it inherits this one, including the COL's shadow-outcome tracking and the DQE's quality scoring.
 
 ---
 
@@ -447,3 +517,4 @@ These pages are not part of the MVP page set (`FRONTEND_PAGE_SPECS.md`'s 8 pages
 - **The right question is not "did our trade make money," but "what was actually the best decision that could have been made."** The Counterfactual Outcome Ledger exists specifically to make this question answerable with real, computed data rather than intuition — every decision, taken or not, becomes a labeled example of what was actually possible at that moment.
 - **Inaction is a decision, and it deserves the same scrutiny as action.** A WAIT that avoided a loss and a WAIT that missed a gain are both informative; the COL ensures neither is invisible to the platform's learning process.
 - **Lightweight and continuous beats heavy and occasional.** The COL is designed to run forever in the background at low cost, not to become a periodic heavy analysis job — this is what allows every single decision, not just a sampled subset, to become a permanent labeled training example.
+- **A good decision and a profitable decision are not the same thing.** A bad decision can accidentally make money; a good decision can occasionally lose money. The Decision Quality Engine exists specifically to keep these two judgments visibly separate, so the platform never learns to reward luck or punish discipline.

@@ -5,7 +5,7 @@
 **Scope:** Asset registry, Binance/Binance.US candle ingestion, candle storage schema, candle-fetch endpoint, basic market chart page, seed script for BTC/ETH/SOL, graceful handling of exchange failures. No strategies, no AI, no risk, no execution.
 
 **Prepend this to your first Copilot Chat message in this phase:**
-> "Read docs/DATABASE_SCHEMA.md sections 2.1-2.2, docs/DATA_SOURCES.md, docs/API_CONTRACTS.md (markets endpoints), docs/BACKEND_MODULE_SPECS.md (services/data section), and docs/SMALL_ACCOUNT_MODE.md sections 5-6 (fractional quantity precision requirements) before making changes. Phase 0 scaffolding already exists — extend it, don't recreate it. Do not implement strategies, AI, risk, or execution logic in this phase."
+> "Read docs/DATABASE_SCHEMA.md sections 2.1-2.2, docs/DATA_SOURCES.md, docs/API_CONTRACTS.md (markets endpoints), docs/BACKEND_MODULE_SPECS.md (services/data section), and docs/SMALL_ACCOUNT_MODE.md sections 5-6 (fractional quantity precision requirements) before making changes. Phase 0 scaffolding already exists — extend it, don't recreate it. Do not implement strategies, AI, risk, or execution logic in this phase. Before starting each prompt below, check whether it would introduce or change an architectural decision (see docs/adr/README.md for the criteria) — if it would, stop and ask before writing code. None of the Phase 1 prompts below are expected to require a new ADR, but this check applies regardless."
 
 Run these prompts **in order**, one at a time, reviewing/committing after each.
 

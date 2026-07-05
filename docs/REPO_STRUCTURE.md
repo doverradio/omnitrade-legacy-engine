@@ -138,6 +138,15 @@ packages/shared/
 
 ```
 docs/
+├── adr/
+│   ├── README.md
+│   ├── ADR-0001-four-core-engines.md
+│   ├── ADR-0002-decision-intelligence-engine.md
+│   ├── ADR-0003-counterfactual-outcome-ledger.md
+│   ├── ADR-0004-decision-snapshot.md
+│   ├── ADR-0005-small-account-mode.md
+│   ├── ADR-0006-fastapi-backend.md
+│   └── ADR-0007-decision-quality-engine.md
 ├── PROJECT_VISION.md
 ├── SYSTEM_ARCHITECTURE.md
 ├── DATA_SOURCES.md
