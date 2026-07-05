@@ -1,0 +1,16 @@
+{
+  "name": "omnitrade-legacy-engine",
+  "private": true,
+  "version": "0.1.0",
+  "description": "AI-assisted trading research and paper-trading platform",
+  "packageManager": "pnpm@9.0.0",
+  "workspaces": [
+    "apps/web",
+    "packages/shared"
+  ],
+  "scripts": {
+    "dev:web": "pnpm --filter web dev",
+    "build:web": "pnpm --filter web build",
+    "lint:web": "pnpm --filter web lint"
+  }
+}
