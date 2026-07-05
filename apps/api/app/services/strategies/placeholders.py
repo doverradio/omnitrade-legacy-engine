@@ -16,13 +16,7 @@ class PlaceholderStrategy(Strategy):
         raise NotImplementedError(f"Strategy '{self.slug}' has not been implemented yet.")
 
 
-PLACEHOLDER_STRATEGIES: dict[str, dict[str, Any]] = {
-    "rsi_mean_reversion": {"rsi_period": 14, "oversold": 30, "overbought": 70},
-    "breakout": {"lookback": 20, "volume_confirmation": True, "min_volume_multiple": 1.5},
-    "volatility_filter": {"atr_period": 14, "min_atr_pct": 0.2, "max_atr_pct": 5.0},
-    "trend_regime_filter": {"adx_period": 14, "adx_trend_threshold": 25, "ma_slope_period": 50},
-    "ensemble_scorer": {"min_strategies_agreeing": 1, "conflict_resolution": "net_strength"},
-}
+PLACEHOLDER_STRATEGIES: dict[str, dict[str, Any]] = {}
 
 
 def register_placeholder_strategies(registry: StrategyRegistry = strategy_registry) -> StrategyRegistry:

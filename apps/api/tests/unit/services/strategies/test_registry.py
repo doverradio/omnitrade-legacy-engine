@@ -2,16 +2,13 @@ from __future__ import annotations
 
 import pytest
 
-from app.services.strategies.placeholders import register_placeholder_strategies
+from app.services.strategies.builtins import register_builtin_strategies
 from app.services.strategies.registry import StrategyLookupError, StrategyRegistry
 
 
 def test_registry_registration_and_lookup() -> None:
     registry = StrategyRegistry()
-    register_placeholder_strategies(registry)
-    from app.services.strategies.ma_crossover import register_ma_crossover_strategy
-
-    register_ma_crossover_strategy(registry)
+    register_builtin_strategies(registry)
 
     strategy = registry.get("ma_crossover")
 
@@ -28,10 +25,7 @@ def test_registry_invalid_lookup_raises_clear_error() -> None:
 
 def test_registry_registers_all_documented_placeholder_strategies() -> None:
     registry = StrategyRegistry()
-    register_placeholder_strategies(registry)
-    from app.services.strategies.ma_crossover import register_ma_crossover_strategy
-
-    register_ma_crossover_strategy(registry)
+    register_builtin_strategies(registry)
 
     assert registry.registered_slugs() == (
         "breakout",
