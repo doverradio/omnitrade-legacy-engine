@@ -9,12 +9,12 @@ class Settings(BaseSettings):
 
     database_url: str = "postgresql+asyncpg://postgres:postgres@localhost:5432/omnitrade"
     supabase_url: str = "http://localhost:54321"
-    supabase_service_role_key: SecretStr
-    supabase_jwt_secret: SecretStr
+    supabase_service_role_key: SecretStr | None = None
+    supabase_jwt_secret: SecretStr | None = None
 
     binance_us_api_base: str = "https://api.binance.us"
-    alpaca_api_key_id: SecretStr
-    alpaca_api_secret_key: SecretStr
+    alpaca_api_key_id: SecretStr | None = None
+    alpaca_api_secret_key: SecretStr | None = None
     alpaca_base_url: str = "https://paper-api.alpaca.markets"
 
     environment: str = "local"

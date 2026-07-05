@@ -90,18 +90,20 @@ Use this only if Auth/RLS aren't needed yet (early Phase 0/1 development); switc
 ```
 DATABASE_URL=postgresql+asyncpg://postgres:postgres@localhost:5432/omnitrade
 SUPABASE_URL=http://localhost:54321
-SUPABASE_SERVICE_ROLE_KEY=<from supabase start output>
-SUPABASE_JWT_SECRET=<from supabase start output>
+SUPABASE_SERVICE_ROLE_KEY=<optional for Phase 1; set when Supabase admin operations are enabled>
+SUPABASE_JWT_SECRET=<optional legacy HS256 JWT secret; newer Supabase projects may use JWKS and omit this>
 
 BINANCE_US_API_BASE=https://api.binance.us
-ALPACA_API_KEY_ID=<your Alpaca paper trading key id>
-ALPACA_API_SECRET_KEY=<your Alpaca paper trading secret>
+ALPACA_API_KEY_ID=<optional until Alpaca stock data or paper trading integration is enabled>
+ALPACA_API_SECRET_KEY=<optional until Alpaca stock data or paper trading integration is enabled>
 ALPACA_BASE_URL=https://paper-api.alpaca.markets
 
 ENVIRONMENT=local
 LOG_LEVEL=INFO
 GLOBAL_KILL_SWITCH_DEFAULT=false
 ```
+
+For Phase 1 validation (data ingestion), `SUPABASE_JWT_SECRET`, `ALPACA_API_KEY_ID`, and `ALPACA_API_SECRET_KEY` are intentionally optional. `SUPABASE_JWT_SECRET` is only needed for legacy HS256 JWT verification and may be absent on JWKS-based Supabase projects.
 
 **`apps/web/.env.local`:**
 ```
