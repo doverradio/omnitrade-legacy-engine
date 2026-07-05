@@ -60,7 +60,7 @@ describe("markets remaining Prompt 1.10 criteria", () => {
 
     render(React.createElement(MarketsPage));
 
-    await screen.findByText("BTCUSDT");
+    await screen.findByRole("heading", { name: "BTCUSDT", level: 2 });
     expect(await screen.findByText("No candle data available for this range yet")).toBeInTheDocument();
     expect(screen.queryByText(/Failed to load candles:/)).not.toBeInTheDocument();
   });

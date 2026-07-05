@@ -43,6 +43,12 @@ export default function MarketsPage() {
   const [candlesLoading, setCandlesLoading] = useState(false);
   const [candlesError, setCandlesError] = useState<string | null>(null);
   const [assetListError, setAssetListError] = useState<string | null>(null);
+  const handleSelectAsset = useCallback((asset: MarketAsset) => {
+    setSelectedAsset(asset);
+  }, []);
+  const handleAssetListError = useCallback((message: string | null) => {
+    setAssetListError(message);
+  }, []);
 
   const fetchCandles = useCallback(async () => {
     if (!selectedAsset) {
@@ -93,8 +99,8 @@ export default function MarketsPage() {
       <div className="grid flex-1 grid-cols-1 gap-4 lg:grid-cols-[280px_minmax(0,1fr)]">
         <AssetList
           selectedAssetId={selectedAsset?.id ?? null}
-          onSelectAsset={(asset) => setSelectedAsset(asset)}
-          onErrorChange={setAssetListError}
+          onSelectAsset={handleSelectAsset}
+          onErrorChange={handleAssetListError}
         />
 
         <section className="rounded-xl border border-border bg-muted/30 p-4">
