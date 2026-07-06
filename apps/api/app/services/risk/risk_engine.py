@@ -41,6 +41,12 @@ class RiskEvaluationRequest:
     no_trade_close_minutes: Decimal | None = None
     data_is_stale: bool | None = None
     data_has_gaps: bool | None = None
+    global_kill_switch_engaged_state: bool | None = None
+    global_kill_switch_rearm_required: bool | None = None
+    global_kill_switch_rearmed_by_human: bool | None = None
+    account_kill_switch_engaged_state: bool | None = None
+    account_kill_switch_rearm_required: bool | None = None
+    account_kill_switch_rearmed_by_human: bool | None = None
     actor: str = "system"
     ai_confidence: Decimal | None = None
 
@@ -101,6 +107,21 @@ class CooldownValidationResult:
 @dataclass(frozen=True, slots=True)
 class NoTradeZoneValidationResult:
     in_zone: bool
+    reason_code: str | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class KillSwitchValidationResult:
+    block_trading: bool
+    reason_code: str | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class KillSwitchRearmResult:
+    engaged: bool
+    rearm_required: bool
+    rearmed_by_human: bool
+    state_changed: bool
     reason_code: str | None = None
 
 
@@ -354,6 +375,81 @@ def validate_no_trade_zone(
     return NoTradeZoneValidationResult(in_zone=False, reason_code=None)
 
 
+def validate_kill_switch_state(
+    *,
+    scope: str,
+    engaged_state: bool | None,
+    rearm_required: bool | None,
+    rearmed_by_human: bool | None,
+) -> KillSwitchValidationResult:
+    scope_prefix = "global" if scope == "global" else "account"
+
+    if engaged_state is None:
+        return KillSwitchValidationResult(
+            block_trading=True,
+            reason_code=f"{scope_prefix}_kill_switch_state_unknown",
+        )
+
+    if rearm_required is None:
+        return KillSwitchValidationResult(
+            block_trading=True,
+            reason_code=f"{scope_prefix}_kill_switch_rearm_state_unknown",
+        )
+
+    if engaged_state:
+        return KillSwitchValidationResult(
+            block_trading=True,
+            reason_code=f"{scope_prefix}_kill_switch_engaged",
+        )
+
+    if rearm_required and rearmed_by_human is None:
+        return KillSwitchValidationResult(
+            block_trading=True,
+            reason_code=f"{scope_prefix}_kill_switch_rearm_state_unknown",
+        )
+
+    if rearm_required and not rearmed_by_human:
+        return KillSwitchValidationResult(
+            block_trading=True,
+            reason_code=f"{scope_prefix}_kill_switch_requires_manual_rearm",
+        )
+
+    return KillSwitchValidationResult(block_trading=False, reason_code=None)
+
+
+def apply_manual_kill_switch_rearm(
+    *,
+    engaged: bool,
+    rearm_required: bool,
+    actor_is_human: bool,
+) -> KillSwitchRearmResult:
+    if not actor_is_human:
+        return KillSwitchRearmResult(
+            engaged=engaged,
+            rearm_required=rearm_required,
+            rearmed_by_human=False,
+            state_changed=False,
+            reason_code="manual_rearm_requires_human_actor",
+        )
+
+    if not rearm_required:
+        return KillSwitchRearmResult(
+            engaged=engaged,
+            rearm_required=False,
+            rearmed_by_human=True,
+            state_changed=False,
+            reason_code="kill_switch_rearm_not_required",
+        )
+
+    return KillSwitchRearmResult(
+        engaged=False,
+        rearm_required=False,
+        rearmed_by_human=True,
+        state_changed=True,
+        reason_code="kill_switch_manual_rearm_completed",
+    )
+
+
 def evaluate_signal_risk(
     *,
     request: RiskEvaluationRequest,
@@ -370,20 +466,52 @@ def evaluate_signal_risk(
     approved_quantity = request.quantity
     steps: list[RiskEvaluationStep] = []
 
-    steps.append(RiskEvaluationStep(step="global_kill_switch", status="reject" if resolved_context.global_kill_switch_engaged else "pass", reason_code="global_kill_switch_engaged" if resolved_context.global_kill_switch_engaged else None))
-    if resolved_context.global_kill_switch_engaged:
+    global_kill_switch_blocked = resolved_context.global_kill_switch_engaged
+    global_kill_switch_reason = "global_kill_switch_engaged" if resolved_context.global_kill_switch_engaged else None
+    if (
+        request.global_kill_switch_engaged_state is not None
+        or request.global_kill_switch_rearm_required is not None
+        or request.global_kill_switch_rearmed_by_human is not None
+    ):
+        global_kill_switch_result = validate_kill_switch_state(
+            scope="global",
+            engaged_state=request.global_kill_switch_engaged_state,
+            rearm_required=request.global_kill_switch_rearm_required,
+            rearmed_by_human=request.global_kill_switch_rearmed_by_human,
+        )
+        global_kill_switch_blocked = global_kill_switch_result.block_trading
+        global_kill_switch_reason = global_kill_switch_result.reason_code
+
+    steps.append(RiskEvaluationStep(step="global_kill_switch", status="reject" if global_kill_switch_blocked else "pass", reason_code=global_kill_switch_reason))
+    if global_kill_switch_blocked:
         return RiskEvaluationResult(
             action=RiskDecisionAction.REJECT,
-            reason_code="global_kill_switch_engaged",
+            reason_code=global_kill_switch_reason,
             approved_quantity=Decimal("0"),
             steps=steps,
         )
 
-    steps.append(RiskEvaluationStep(step="account_pause", status="reject" if resolved_context.account_trading_paused else "pass", reason_code="account_trading_paused" if resolved_context.account_trading_paused else None))
-    if resolved_context.account_trading_paused:
+    account_kill_switch_blocked = resolved_context.account_trading_paused
+    account_kill_switch_reason = "account_trading_paused" if resolved_context.account_trading_paused else None
+    if (
+        request.account_kill_switch_engaged_state is not None
+        or request.account_kill_switch_rearm_required is not None
+        or request.account_kill_switch_rearmed_by_human is not None
+    ):
+        account_kill_switch_result = validate_kill_switch_state(
+            scope="account",
+            engaged_state=request.account_kill_switch_engaged_state,
+            rearm_required=request.account_kill_switch_rearm_required,
+            rearmed_by_human=request.account_kill_switch_rearmed_by_human,
+        )
+        account_kill_switch_blocked = account_kill_switch_result.block_trading
+        account_kill_switch_reason = account_kill_switch_result.reason_code
+
+    steps.append(RiskEvaluationStep(step="account_pause", status="reject" if account_kill_switch_blocked else "pass", reason_code=account_kill_switch_reason))
+    if account_kill_switch_blocked:
         return RiskEvaluationResult(
             action=RiskDecisionAction.REJECT,
-            reason_code="account_trading_paused",
+            reason_code=account_kill_switch_reason,
             approved_quantity=Decimal("0"),
             steps=steps,
         )

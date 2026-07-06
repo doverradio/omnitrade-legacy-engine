@@ -8,10 +8,12 @@ from app.services.risk import (
     RiskDecisionAction,
     RiskEvaluationContext,
     RiskEvaluationRequest,
+    apply_manual_kill_switch_rearm,
     compute_position_sizing,
     evaluate_signal_risk,
     validate_no_trade_zone,
     validate_daily_loss_limit,
+    validate_kill_switch_state,
     validate_max_drawdown,
     validate_strategy_asset_cooldown,
     validate_minimum_viable_order,
@@ -456,3 +458,129 @@ def test_evaluate_signal_risk_rejects_invalid_cooldown_configuration() -> None:
 
     assert result.action == RiskDecisionAction.REJECT
     assert result.reason_code == "invalid_cooldown_after_losses"
+
+
+def test_validate_kill_switch_state_fails_closed_on_unknown_state() -> None:
+    result = validate_kill_switch_state(
+        scope="global",
+        engaged_state=None,
+        rearm_required=False,
+        rearmed_by_human=False,
+    )
+
+    assert result.block_trading is True
+    assert result.reason_code == "global_kill_switch_state_unknown"
+
+
+def test_validate_kill_switch_state_requires_manual_rearm() -> None:
+    result = validate_kill_switch_state(
+        scope="account",
+        engaged_state=False,
+        rearm_required=True,
+        rearmed_by_human=False,
+    )
+
+    assert result.block_trading is True
+    assert result.reason_code == "account_kill_switch_requires_manual_rearm"
+
+
+def test_validate_kill_switch_state_passes_after_human_rearm() -> None:
+    result = validate_kill_switch_state(
+        scope="global",
+        engaged_state=False,
+        rearm_required=True,
+        rearmed_by_human=True,
+    )
+
+    assert result.block_trading is False
+    assert result.reason_code is None
+
+
+def test_apply_manual_kill_switch_rearm_requires_human_actor() -> None:
+    result = apply_manual_kill_switch_rearm(
+        engaged=True,
+        rearm_required=True,
+        actor_is_human=False,
+    )
+
+    assert result.state_changed is False
+    assert result.engaged is True
+    assert result.rearm_required is True
+    assert result.reason_code == "manual_rearm_requires_human_actor"
+
+
+def test_apply_manual_kill_switch_rearm_clears_state_for_human_actor() -> None:
+    result = apply_manual_kill_switch_rearm(
+        engaged=True,
+        rearm_required=True,
+        actor_is_human=True,
+    )
+
+    assert result.state_changed is True
+    assert result.engaged is False
+    assert result.rearm_required is False
+    assert result.rearmed_by_human is True
+    assert result.reason_code == "kill_switch_manual_rearm_completed"
+
+
+def test_evaluate_signal_risk_rejects_when_global_kill_switch_requires_manual_rearm() -> None:
+    request = _request()
+    request = RiskEvaluationRequest(
+        signal_id=request.signal_id,
+        paper_account_id=request.paper_account_id,
+        asset_id=request.asset_id,
+        side=request.side,
+        quantity=request.quantity,
+        account_equity=request.account_equity,
+        max_position_size_pct=request.max_position_size_pct,
+        min_order_notional=request.min_order_notional,
+        qty_step_size=request.qty_step_size,
+        supports_fractional=request.supports_fractional,
+        start_of_day_equity=request.start_of_day_equity,
+        current_equity=request.current_equity,
+        max_daily_loss_pct=request.max_daily_loss_pct,
+        high_water_mark_equity=request.high_water_mark_equity,
+        max_drawdown_pct=request.max_drawdown_pct,
+        global_kill_switch_engaged_state=False,
+        global_kill_switch_rearm_required=True,
+        global_kill_switch_rearmed_by_human=False,
+    )
+
+    result = evaluate_signal_risk(request=request, reference_price=Decimal("10"))
+
+    assert result.action == RiskDecisionAction.REJECT
+    assert result.reason_code == "global_kill_switch_requires_manual_rearm"
+    assert len(result.steps) == 1
+    assert result.steps[0].step == "global_kill_switch"
+
+
+def test_evaluate_signal_risk_rejects_when_account_kill_switch_engaged() -> None:
+    request = _request()
+    request = RiskEvaluationRequest(
+        signal_id=request.signal_id,
+        paper_account_id=request.paper_account_id,
+        asset_id=request.asset_id,
+        side=request.side,
+        quantity=request.quantity,
+        account_equity=request.account_equity,
+        max_position_size_pct=request.max_position_size_pct,
+        min_order_notional=request.min_order_notional,
+        qty_step_size=request.qty_step_size,
+        supports_fractional=request.supports_fractional,
+        start_of_day_equity=request.start_of_day_equity,
+        current_equity=request.current_equity,
+        max_daily_loss_pct=request.max_daily_loss_pct,
+        high_water_mark_equity=request.high_water_mark_equity,
+        max_drawdown_pct=request.max_drawdown_pct,
+        global_kill_switch_engaged_state=False,
+        global_kill_switch_rearm_required=False,
+        global_kill_switch_rearmed_by_human=False,
+        account_kill_switch_engaged_state=True,
+        account_kill_switch_rearm_required=True,
+        account_kill_switch_rearmed_by_human=False,
+    )
+
+    result = evaluate_signal_risk(request=request, reference_price=Decimal("10"))
+
+    assert result.action == RiskDecisionAction.REJECT
+    assert result.reason_code == "account_kill_switch_engaged"
