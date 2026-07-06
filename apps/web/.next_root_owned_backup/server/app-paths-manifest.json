@@ -1,0 +1,5 @@
+{
+  "/markets/page": "app/markets/page.js",
+  "/backtests/page": "app/backtests/page.js",
+  "/dashboard/page": "app/dashboard/page.js"
+}

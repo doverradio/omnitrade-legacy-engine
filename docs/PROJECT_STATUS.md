@@ -10,13 +10,13 @@ Project Stage:
 Pre-MVP
 
 Current Phase:
-Phase 6 — Risk Engine (Ready to Start)
+Phase 6 — Risk Engine (Complete)
 
 Current Prompt:
-Architecture review complete; awaiting Phase 6 prompt execution
+Phase 6 final validation complete; awaiting explicit approval before any Phase 7 work
 
 Overall Completion:
-Approximately 55%
+Approximately 67%
 
 ---
 
@@ -61,7 +61,7 @@ Capital Allocation Engine is a Portfolio Intelligence subsystem and is never tre
 
 # Current Goal
 
-Begin Phase 6 Risk Engine implementation with strict architecture-boundary verification and validation-gated progression.
+Finalize Phase 6 closure artifacts and maintain architecture-boundary discipline before any next-phase kickoff.
 
 Phase progression remains gated by validation, documentation updates, and regression-free handoff before advancing.
 
@@ -131,7 +131,16 @@ Completed highlights:
 ## ⬜ Phase 6 — Risk Engine
 
 Status:
-Not Started
+COMPLETE
+
+Completed highlights:
+
+- Deterministic risk evaluation ordering across kill switches, no-trade zones, cooldown, loss/drawdown, sizing, and minimum viable order checks
+- Risk decision persistence to `risk_events` with audit-integrated state-change handling
+- Orchestration integration with duplicate/idempotent pre-risk guard preserved and risk gate enforced on non-duplicate attempts
+- Risk Monitor API endpoints for status, kill-switch controls, and rules read/update with fail-visible unknown-state behavior
+- Risk Monitor UI with responsive status dashboard, kill-switch/rules confirmations, and accessibility-focused loading/error states
+- Full Phase 6 validation passing across backend tests, frontend tests, and frontend lint
 
 ## ⬜ Phase 7 — Decision Intelligence Foundation
 
