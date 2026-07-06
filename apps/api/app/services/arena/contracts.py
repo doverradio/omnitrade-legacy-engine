@@ -150,6 +150,68 @@ class ArenaCompetitionAllocationResult:
     provenance: dict[str, Any]
 
 
+@dataclass(frozen=True)
+class ArenaRiskContextContract:
+    account_equity: Decimal
+    start_of_day_equity: Decimal
+    current_equity: Decimal
+    max_position_size_pct: Decimal
+    max_daily_loss_pct: Decimal
+    high_water_mark_equity: Decimal
+    max_drawdown_pct: Decimal
+    consecutive_losses_on_pair: int
+    cooldown_after_losses: int
+    last_loss_at: datetime | None
+    cooldown_duration_minutes: Decimal
+    evaluation_time: datetime
+    data_is_stale: bool
+    data_has_gaps: bool
+    global_kill_switch_engaged_state: bool | None
+    global_kill_switch_rearm_required: bool | None
+    account_kill_switch_engaged_state: bool | None
+    account_kill_switch_rearm_required: bool | None
+    global_kill_switch_state_observed: bool
+    account_kill_switch_state_observed: bool
+
+
+@dataclass(frozen=True)
+class ArenaRiskEvaluationRequest:
+    cycle_id: uuid.UUID
+    proposal_id: uuid.UUID
+    competition_id: uuid.UUID
+    tournament_id: uuid.UUID
+    agent_id: uuid.UUID
+    action: str
+    symbol: str
+    requested_quantity: Decimal
+    reference_price: Decimal
+    min_order_notional: Decimal
+    qty_step_size: Decimal
+    supports_fractional: bool
+    stop_loss_computable: bool
+    provenance: dict[str, Any]
+    actor: str
+    risk_context: ArenaRiskContextContract
+
+
+@dataclass(frozen=True)
+class ArenaRiskEvaluationResult:
+    risk_gate_decision_id: uuid.UUID
+    cycle_id: uuid.UUID
+    proposal_id: uuid.UUID
+    competition_id: uuid.UUID
+    tournament_id: uuid.UUID
+    agent_id: uuid.UUID
+    action: str
+    approved_quantity: Decimal
+    reason_code: str | None
+    persisted_risk_event_type: str
+    persisted_risk_event_action: str
+    persisted_risk_event_reason_code: str | None
+    provenance: dict[str, Any]
+    decision_steps: list[dict[str, Any]]
+
+
 class ArenaLifecycleServiceContract(Protocol):
     async def ensure_competition(
         self,
@@ -200,3 +262,10 @@ class ArenaPaperAllocationServiceContract(Protocol):
         self,
         request: ArenaCompetitionAllocationRequest,
     ) -> ArenaCompetitionAllocationResult: ...
+
+
+class ArenaRiskGateServiceContract(Protocol):
+    async def evaluate_candidate_action(
+        self,
+        request: ArenaRiskEvaluationRequest,
+    ) -> ArenaRiskEvaluationResult: ...

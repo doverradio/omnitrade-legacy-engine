@@ -1,5 +1,8 @@
 from app.services.arena.contracts import (
     ArenaAgentProposalContract,
+    ArenaRiskContextContract,
+    ArenaRiskEvaluationRequest,
+    ArenaRiskEvaluationResult,
     ArenaAgentRegistrationRequest,
     ArenaAgentRegistrationResult,
     ArenaAgentVersionIdentityContract,
@@ -18,6 +21,7 @@ from app.services.arena.contracts import (
     ArenaAgentBudgetAssignmentContract,
     ArenaCompetitionAllocationRequest,
     ArenaCompetitionAllocationResult,
+    ArenaRiskGateServiceContract,
 )
 from app.services.arena.identity import (
     build_arena_competition_idempotency_key,
@@ -37,9 +41,13 @@ from app.services.arena.orchestration import (
     orchestrate_arena_cycle,
 )
 from app.services.arena.paper_allocation import allocate_competition_paper_budget
+from app.services.arena.risk_gate import evaluate_arena_candidate_action
 
 __all__ = [
     "ArenaAgentProposalContract",
+    "ArenaRiskContextContract",
+    "ArenaRiskEvaluationRequest",
+    "ArenaRiskEvaluationResult",
     "ArenaAgentRegistrationRequest",
     "ArenaAgentRegistrationResult",
     "ArenaAgentVersionIdentityContract",
@@ -58,6 +66,7 @@ __all__ = [
     "ArenaAgentBudgetAssignmentContract",
     "ArenaCompetitionAllocationRequest",
     "ArenaCompetitionAllocationResult",
+    "ArenaRiskGateServiceContract",
     "build_arena_competition_idempotency_key",
     "build_arena_cycle_idempotency_key",
     "build_arena_lifecycle_identity",
@@ -70,4 +79,5 @@ __all__ = [
     "register_arena_agent",
     "validate_arena_eligibility",
     "allocate_competition_paper_budget",
+    "evaluate_arena_candidate_action",
 ]

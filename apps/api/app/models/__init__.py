@@ -5,6 +5,7 @@ from app.models.arena_cycle_proposal import ArenaCycleProposal
 from app.models.arena_participating_agent import ArenaParticipatingAgent
 from app.models.arena_agent_registration import ArenaAgentRegistration
 from app.models.arena_agent_budget_assignment import ArenaAgentBudgetAssignment
+from app.models.arena_risk_gate_decision import ArenaRiskGateDecision
 from app.models.arena_tournament import ArenaTournament
 from app.models.arena_competition_budget_allocation import ArenaCompetitionBudgetAllocation
 from app.models.audit_log import AuditLog
@@ -35,6 +36,7 @@ __all__ = [
 	"ArenaCycleProposal",
 	"ArenaAgentRegistration",
 	"ArenaAgentBudgetAssignment",
+	"ArenaRiskGateDecision",
 	"ArenaParticipatingAgent",
 	"ArenaCompetitionBudgetAllocation",
 	"ArenaTournament",
