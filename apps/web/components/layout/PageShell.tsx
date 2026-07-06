@@ -7,7 +7,7 @@ const navItems = [
   { href: "/strategy-lab", label: "Strategy Lab" },
   { href: "/backtests", label: "Backtests" },
   { href: "/signals", label: "Signals" },
-  { href: "/paper-trading", label: "Paper Trading" },
+  { href: "/paper-trading", label: "Portfolio Intelligence" },
   { href: "/risk-monitor", label: "Risk Monitor" },
   { href: "/settings", label: "Settings" },
 ];
@@ -24,6 +24,9 @@ export default function PageShell({ children }: PageShellProps) {
           <p className="mb-4 text-sm font-semibold uppercase tracking-wide text-foreground/80">
             OmniTrade
           </p>
+          <p className="mb-3 text-xs uppercase tracking-wide text-foreground/60">
+            Phase 5 foundation
+          </p>
           <nav className="flex flex-col gap-2 text-sm">
             {navItems.map((item) => (
               <Link
@@ -38,8 +41,10 @@ export default function PageShell({ children }: PageShellProps) {
         </aside>
         <div className="flex min-h-screen flex-1 flex-col">
           <header className="flex h-14 items-center justify-between border-b border-border px-6">
-            <p className="text-sm">Top bar placeholder</p>
-            <p className="text-xs uppercase tracking-wide text-foreground/70">Paper trading</p>
+            <p className="text-sm">Portfolio Intelligence + Paper Execution Foundation</p>
+            <p className="text-xs uppercase tracking-wide text-foreground/70">
+              Paper mode only - $25 default proving ground
+            </p>
           </header>
           <main className="flex-1 p-6">{children}</main>
         </div>
