@@ -120,6 +120,11 @@ function installFetchMock(scenario: FetchScenario) {
         trade_count: 42,
         average_trade_usd: "0.11",
         fee_drag_pct: "0.30",
+        equity_curve: [
+          { time: "2026-01-01T00:00:00Z", equity: "25" },
+          { time: "2026-01-15T00:00:00Z", equity: "27.4" },
+          { time: "2026-01-31T00:00:00Z", equity: "29.12" },
+        ],
       },
     },
     {
@@ -143,6 +148,11 @@ function installFetchMock(scenario: FetchScenario) {
         trade_count: 30,
         average_trade_usd: "0.09",
         fee_drag_pct: "0.18",
+        equity_curve: [
+          { time: "2026-02-01T00:00:00Z", equity: "25" },
+          { time: "2026-02-15T00:00:00Z", equity: "26.5" },
+          { time: "2026-02-28T00:00:00Z", equity: "27.4" },
+        ],
       },
     },
     {
@@ -489,6 +499,97 @@ describe("StrategyLabPage Prompt 4.2", () => {
     expect(screen.getByRole("heading", { name: "7) Research Results Workspace" })).toBeInTheDocument();
     expect(screen.getByLabelText("Select comparison run bt-1")).toBeInTheDocument();
     expect(screen.getByLabelText("Select comparison run bt-2")).toBeInTheDocument();
+  });
+
+  it("renders equity curve comparison and missing curve state", async () => {
+    installFetchMock("success");
+    render(<StrategyLabPage />);
+    const user = userEvent.setup();
+
+    await waitFor(() => {
+      expect(screen.getByLabelText("Select comparison run bt-1")).toBeInTheDocument();
+    });
+
+    await user.click(screen.getByLabelText("Select comparison run bt-1"));
+    await user.click(screen.getByLabelText("Select comparison run bt-3"));
+
+    expect(screen.getByTestId("equity-curve-bt-1")).toBeInTheDocument();
+    expect(screen.getByTestId("equity-curve-missing-bt-3")).toHaveTextContent("Not available");
+  });
+
+  it("renders deterministic observations from existing metrics", async () => {
+    installFetchMock("success");
+    render(<StrategyLabPage />);
+    const user = userEvent.setup();
+
+    await waitFor(() => {
+      expect(screen.getByLabelText("Select comparison run bt-1")).toBeInTheDocument();
+    });
+
+    await user.click(screen.getByLabelText("Select comparison run bt-1"));
+    await user.click(screen.getByLabelText("Select comparison run bt-2"));
+    await user.click(screen.getByLabelText("Select comparison run bt-3"));
+
+    const observationsPanel = screen.getByTestId("observations-panel");
+    expect(observationsPanel).toHaveTextContent("Run A produced the highest return");
+    expect(observationsPanel).toHaveTextContent("Run B experienced the smallest drawdown");
+    expect(observationsPanel).toHaveTextContent("Run A traded most frequently");
+  });
+
+  it("renders What Improved facts for two selected runs", async () => {
+    installFetchMock("success");
+    render(<StrategyLabPage />);
+    const user = userEvent.setup();
+
+    await waitFor(() => {
+      expect(screen.getByLabelText("Select comparison run bt-1")).toBeInTheDocument();
+    });
+
+    await user.click(screen.getByLabelText("Select comparison run bt-1"));
+    await user.click(screen.getByLabelText("Select comparison run bt-2"));
+
+    const whatImproved = screen.getByTestId("what-improved-panel");
+    expect(whatImproved).toHaveTextContent("Parameter changes:");
+    expect(whatImproved).toHaveTextContent("Trade count change:");
+    expect(whatImproved).toHaveTextContent("Drawdown change:");
+    expect(whatImproved).toHaveTextContent("Fee drag change:");
+    expect(whatImproved).toHaveTextContent("Return change:");
+  });
+
+  it("shows beginner observation explanations and hides them when beginner mode is off", async () => {
+    installFetchMock("success");
+    render(<StrategyLabPage />);
+    const user = userEvent.setup();
+
+    await waitFor(() => {
+      expect(screen.getByLabelText("Select comparison run bt-1")).toBeInTheDocument();
+    });
+
+    await user.click(screen.getByLabelText("Select comparison run bt-1"));
+    await user.click(screen.getByLabelText("Select comparison run bt-2"));
+
+    expect(screen.getByText("Higher total return means that run grew the starting capital more over the test period.")).toBeInTheDocument();
+
+    await user.click(screen.getByRole("switch", { name: "Beginner Mode" }));
+
+    expect(screen.queryByText("Higher total return means that run grew the starting capital more over the test period.")).not.toBeInTheDocument();
+  });
+
+  it("keeps accessibility basics for insights workspace", async () => {
+    installFetchMock("success");
+    render(<StrategyLabPage />);
+    const user = userEvent.setup();
+
+    await waitFor(() => {
+      expect(screen.getByTestId("strategy-lab-section-insights-workspace")).toBeInTheDocument();
+    });
+
+    await user.click(screen.getByLabelText("Select comparison run bt-1"));
+
+    expect(screen.getByRole("heading", { name: "8) Insights Workspace" })).toBeInTheDocument();
+    expect(screen.getByTestId("metric-trend-visuals")).toBeInTheDocument();
+    expect(screen.getByTestId("observations-panel")).toBeInTheDocument();
+    expect(screen.getByTestId("what-improved-panel")).toBeInTheDocument();
   });
 
   it("renders saved preset snapshot cards with required fields", async () => {

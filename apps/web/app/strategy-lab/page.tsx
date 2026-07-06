@@ -3,6 +3,7 @@
 import { useEffect, useMemo, useState } from "react";
 import { useRouter } from "next/navigation";
 
+import EquityCurveChart from "@/components/charts/EquityCurveChart";
 import { ApiRequestError, getBacktests, runBacktest, type BacktestListItem } from "@/lib/api/backtests";
 import { getParameterSets, saveParameterSet, type ParameterSetItem } from "@/lib/api/parameterSets";
 import { getStrategies, type StrategyItem } from "@/lib/api/strategies";
@@ -73,6 +74,11 @@ type HighlightedComparisonWinners = {
   highestWinRateRunId: string | null;
   lowestDrawdownRunId: string | null;
   lowestFeeDragRunId: string | null;
+};
+
+type InsightObservation = {
+  text: string;
+  beginnerText: string;
 };
 
 const DEFAULT_BACKTEST_INTERVAL: "1h" = "1h";
@@ -410,6 +416,43 @@ function pickWinner(
 
   ranked.sort((a, b) => (mode === "max" ? b.value - a.value : a.value - b.value));
   return ranked[0]?.id ?? null;
+}
+
+function formatSignedNumber(value: number): string {
+  const sign = value > 0 ? "+" : "";
+  return `${sign}${value.toFixed(2)}`;
+}
+
+function formatPercentPointDelta(value: number): string {
+  const sign = value > 0 ? "+" : "";
+  return `${sign}${(value * 100).toFixed(2)} percentage points`;
+}
+
+function formatTrendPercentValue(value: number | null): string {
+  if (value === null || !Number.isFinite(value)) {
+    return "Not available";
+  }
+  return `${(value * 100).toFixed(2)}%`;
+}
+
+function normalizeWidths(values: Array<number | null>): number[] {
+  const finite = values.filter((value) => value !== null) as number[];
+  if (finite.length === 0) {
+    return values.map(() => 0);
+  }
+
+  const max = Math.max(...finite.map((value) => Math.abs(value)));
+  if (!Number.isFinite(max) || max === 0) {
+    return values.map(() => 0);
+  }
+
+  return values.map((value) => {
+    if (value === null || !Number.isFinite(value)) {
+      return 0;
+    }
+
+    return Math.max(8, Math.round((Math.abs(value) / max) * 100));
+  });
 }
 
 function coerceParameterValue(definition: ParameterDefinition, rawValue: unknown): string | number | boolean {
@@ -1033,6 +1076,120 @@ export default function StrategyLabPage() {
     }
 
     return statements;
+  }, [selectedComparisonRuns]);
+
+  const insightsObservations = useMemo(() => {
+    if (selectedComparisonRuns.length === 0) {
+      return [] as InsightObservation[];
+    }
+
+    const observations: InsightObservation[] = [];
+
+    const runWithHighestReturn = selectedComparisonRuns
+      .map((run, index) => ({ runCode: toRunCode(index), value: parseFiniteNumber(run.metrics?.total_return_pct) }))
+      .filter((entry) => entry.value !== null)
+      .sort((a, b) => (b.value as number) - (a.value as number))[0];
+
+    if (runWithHighestReturn && runWithHighestReturn.value !== null) {
+      observations.push({
+        text: `${runWithHighestReturn.runCode} produced the highest return (${formatTrendPercentValue(runWithHighestReturn.value)}).`,
+        beginnerText: "Higher total return means that run grew the starting capital more over the test period.",
+      });
+    }
+
+    const runWithLowestDrawdown = selectedComparisonRuns
+      .map((run, index) => ({ runCode: toRunCode(index), value: parseFiniteNumber(run.metrics?.max_drawdown) }))
+      .filter((entry) => entry.value !== null)
+      .sort((a, b) => (a.value as number) - (b.value as number))[0];
+
+    if (runWithLowestDrawdown && runWithLowestDrawdown.value !== null) {
+      observations.push({
+        text: `${runWithLowestDrawdown.runCode} experienced the smallest drawdown (${formatTrendPercentValue(runWithLowestDrawdown.value)}).`,
+        beginnerText: "Smaller drawdown means the run had a shallower drop from its peak equity.",
+      });
+    }
+
+    const runWithMostTrades = selectedComparisonRuns
+      .map((run, index) => ({ runCode: toRunCode(index), value: run.metrics?.trade_count }))
+      .filter((entry) => typeof entry.value === "number")
+      .sort((a, b) => (b.value as number) - (a.value as number))[0];
+
+    if (runWithMostTrades && typeof runWithMostTrades.value === "number") {
+      observations.push({
+        text: `${runWithMostTrades.runCode} traded most frequently (${runWithMostTrades.value} trades).`,
+        beginnerText: "More trades means this run entered and exited positions more often in the same period.",
+      });
+    }
+
+    return observations;
+  }, [selectedComparisonRuns]);
+
+  const whatImprovedFacts = useMemo(() => {
+    if (selectedComparisonRuns.length < 2) {
+      return [] as string[];
+    }
+
+    const baseline = selectedComparisonRuns[0];
+    const candidate = selectedComparisonRuns[1];
+
+    const baselineParams = parameterSets.find((item) => item.id === baseline.parameter_set_id)?.parameters ?? {};
+    const candidateParams = parameterSets.find((item) => item.id === candidate.parameter_set_id)?.parameters ?? {};
+
+    const paramKeys = Array.from(new Set([...Object.keys(baselineParams), ...Object.keys(candidateParams)])).sort();
+    const changedParameterLines = paramKeys
+      .filter((key) => baselineParams[key] !== candidateParams[key])
+      .map((key) => `${key}: ${String(baselineParams[key] ?? "Not available")} -> ${String(candidateParams[key] ?? "Not available")}`);
+
+    const lines: string[] = [];
+    lines.push(`Parameter changes: ${changedParameterLines.length > 0 ? changedParameterLines.join("; ") : "None"}.`);
+
+    const baselineTrades = baseline.metrics?.trade_count;
+    const candidateTrades = candidate.metrics?.trade_count;
+    if (typeof baselineTrades === "number" && typeof candidateTrades === "number") {
+      lines.push(`Trade count change: ${baselineTrades} -> ${candidateTrades} (${formatSignedNumber(candidateTrades - baselineTrades)}).`);
+    } else {
+      lines.push("Trade count change: Not available.");
+    }
+
+    const baselineDrawdown = parseFiniteNumber(baseline.metrics?.max_drawdown);
+    const candidateDrawdown = parseFiniteNumber(candidate.metrics?.max_drawdown);
+    if (baselineDrawdown !== null && candidateDrawdown !== null) {
+      lines.push(`Drawdown change: ${formatTrendPercentValue(baselineDrawdown)} -> ${formatTrendPercentValue(candidateDrawdown)} (${formatPercentPointDelta(candidateDrawdown - baselineDrawdown)}).`);
+    } else {
+      lines.push("Drawdown change: Not available.");
+    }
+
+    const baselineFeeDrag = parseFiniteNumber(baseline.metrics?.fee_drag_pct);
+    const candidateFeeDrag = parseFiniteNumber(candidate.metrics?.fee_drag_pct);
+    if (baselineFeeDrag !== null && candidateFeeDrag !== null) {
+      lines.push(`Fee drag change: ${formatTrendPercentValue(baselineFeeDrag)} -> ${formatTrendPercentValue(candidateFeeDrag)} (${formatPercentPointDelta(candidateFeeDrag - baselineFeeDrag)}).`);
+    } else {
+      lines.push("Fee drag change: Not available.");
+    }
+
+    const baselineReturn = parseFiniteNumber(baseline.metrics?.total_return_pct);
+    const candidateReturn = parseFiniteNumber(candidate.metrics?.total_return_pct);
+    if (baselineReturn !== null && candidateReturn !== null) {
+      lines.push(`Return change: ${formatTrendPercentValue(baselineReturn)} -> ${formatTrendPercentValue(candidateReturn)} (${formatPercentPointDelta(candidateReturn - baselineReturn)}).`);
+    } else {
+      lines.push("Return change: Not available.");
+    }
+
+    return lines;
+  }, [parameterSets, selectedComparisonRuns]);
+
+  const metricTrendVisuals = useMemo(() => {
+    const totalReturnValues = selectedComparisonRuns.map((run) => parseFiniteNumber(run.metrics?.total_return_pct));
+    const winRateValues = selectedComparisonRuns.map((run) => parseFiniteNumber(run.metrics?.win_rate));
+    const drawdownValues = selectedComparisonRuns.map((run) => parseFiniteNumber(run.metrics?.max_drawdown));
+    const feeDragValues = selectedComparisonRuns.map((run) => parseFiniteNumber(run.metrics?.fee_drag_pct));
+
+    return {
+      totalReturn: { values: totalReturnValues, widths: normalizeWidths(totalReturnValues) },
+      winRate: { values: winRateValues, widths: normalizeWidths(winRateValues) },
+      maxDrawdown: { values: drawdownValues, widths: normalizeWidths(drawdownValues) },
+      feeDrag: { values: feeDragValues, widths: normalizeWidths(feeDragValues) },
+    };
   }, [selectedComparisonRuns]);
 
   const toggleComparisonSelection = (runId: string) => {
@@ -2020,6 +2177,119 @@ export default function StrategyLabPage() {
                 ) : (
                   <ul className="mt-2 space-y-1 text-sm text-foreground/85">
                     {keyDifferences.map((line) => (
+                      <li key={line}>- {line}</li>
+                    ))}
+                  </ul>
+                )}
+              </section>
+            </>
+          )}
+        </section>
+
+        <section
+          aria-labelledby="insights-workspace"
+          className="rounded-xl border border-border bg-muted/30 p-4 lg:col-span-2"
+          data-testid="strategy-lab-section-insights-workspace"
+        >
+          <h2 id="insights-workspace" className="text-base font-semibold sm:text-lg">
+            8) Insights Workspace
+          </h2>
+          <p className="mt-1 text-sm text-foreground/75">
+            Visualize evidence from selected backtests without predictions or recommendations.
+          </p>
+
+          {selectedComparisonRuns.length === 0 ? (
+            <p className="mt-3 rounded-md border border-dashed border-border bg-background/20 px-3 py-2 text-sm text-foreground/70" data-testid="insights-workspace-empty">
+              Select runs in the Research Results Workspace to view insights.
+            </p>
+          ) : (
+            <>
+              <section className="mt-3 rounded-lg border border-border bg-background/30 p-3" data-testid="equity-curve-comparison">
+                <h3 className="text-sm font-semibold">Equity Curve Comparison</h3>
+                <div className="mt-2 grid gap-3 lg:grid-cols-3">
+                  {selectedComparisonRuns.map((run, index) => {
+                    const runCode = toRunCode(index);
+                    const equityCurve = run.metrics?.equity_curve ?? [];
+                    const curveData = equityCurve
+                      .map((point) => ({ time: point.time, equity: typeof point.equity === "number" ? point.equity : Number(point.equity) }))
+                      .filter((point) => Number.isFinite(point.equity));
+
+                    return (
+                      <div key={run.id} className="rounded-md border border-border bg-muted/20 p-3" tabIndex={0}>
+                        <p className="text-sm font-medium">{runCode} Equity Curve</p>
+                        {curveData.length > 0 ? (
+                          <div className="mt-2" data-testid={`equity-curve-${run.id}`}>
+                            <EquityCurveChart data={curveData} />
+                          </div>
+                        ) : (
+                          <p className="mt-2 text-sm text-foreground/70" data-testid={`equity-curve-missing-${run.id}`}>Not available</p>
+                        )}
+                      </div>
+                    );
+                  })}
+                </div>
+              </section>
+
+              <section className="mt-3 rounded-lg border border-border bg-background/30 p-3" data-testid="metric-trend-visuals">
+                <h3 className="text-sm font-semibold">Metric Trend Visuals</h3>
+                <div className="mt-2 grid gap-3 md:grid-cols-2">
+                  {([
+                    { key: "totalReturn", label: "Total Return", data: metricTrendVisuals.totalReturn },
+                    { key: "winRate", label: "Win Rate", data: metricTrendVisuals.winRate },
+                    { key: "maxDrawdown", label: "Max Drawdown", data: metricTrendVisuals.maxDrawdown },
+                    { key: "feeDrag", label: "Fee Drag", data: metricTrendVisuals.feeDrag },
+                  ] as const).map((metric) => (
+                    <div key={metric.key} className="rounded-md border border-border bg-muted/20 p-3" data-testid={`metric-trend-${metric.key}`}>
+                      <p className="text-sm font-medium">{metric.label}</p>
+                      <div className="mt-2 space-y-2">
+                        {selectedComparisonRuns.map((run, index) => {
+                          const width = metric.data.widths[index] ?? 0;
+                          const value = metric.data.values[index] ?? null;
+                          return (
+                            <div key={`${metric.key}-${run.id}`} className="space-y-1">
+                              <div className="flex items-center justify-between text-xs text-foreground/75">
+                                <span>{toRunCode(index)}</span>
+                                <span>{formatTrendPercentValue(value)}</span>
+                              </div>
+                              <div className="h-2 rounded bg-background/60">
+                                <div
+                                  className="h-2 rounded bg-accent"
+                                  style={{ width: `${width}%` }}
+                                  aria-label={`${metric.label} trend ${toRunCode(index)}`}
+                                />
+                              </div>
+                            </div>
+                          );
+                        })}
+                      </div>
+                    </div>
+                  ))}
+                </div>
+              </section>
+
+              <section className="mt-3 rounded-lg border border-border bg-background/30 p-3" data-testid="observations-panel">
+                <h3 className="text-sm font-semibold">Observations</h3>
+                {insightsObservations.length === 0 ? (
+                  <p className="mt-2 text-sm text-foreground/70">Not enough metrics are available to generate observations.</p>
+                ) : (
+                  <ul className="mt-2 space-y-2 text-sm text-foreground/85">
+                    {insightsObservations.map((observation) => (
+                      <li key={observation.text}>
+                        <p>- {observation.text}</p>
+                        {isBeginnerMode ? <p className="text-xs text-foreground/70">{observation.beginnerText}</p> : null}
+                      </li>
+                    ))}
+                  </ul>
+                )}
+              </section>
+
+              <section className="mt-3 rounded-lg border border-border bg-background/30 p-3" data-testid="what-improved-panel">
+                <h3 className="text-sm font-semibold">What Improved?</h3>
+                {selectedComparisonRuns.length < 2 ? (
+                  <p className="mt-2 text-sm text-foreground/70">Select at least two runs to compare factual changes.</p>
+                ) : (
+                  <ul className="mt-2 space-y-1 text-sm text-foreground/85">
+                    {whatImprovedFacts.map((line) => (
                       <li key={line}>- {line}</li>
                     ))}
                   </ul>
