@@ -21,6 +21,11 @@ from app.services.risk.risk_engine import (
 	validate_strategy_asset_cooldown,
 	validate_minimum_viable_order,
 )
+from app.services.risk.risk_persistence import (
+	RiskDecisionPersistenceRequest,
+	RiskDecisionPersistenceResult,
+	persist_risk_decision,
+)
 
 __all__ = [
 	"CooldownValidationResult",
@@ -44,4 +49,7 @@ __all__ = [
 	"validate_max_drawdown",
 	"validate_strategy_asset_cooldown",
 	"validate_minimum_viable_order",
+	"RiskDecisionPersistenceRequest",
+	"RiskDecisionPersistenceResult",
+	"persist_risk_decision",
 ]

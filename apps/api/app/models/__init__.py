@@ -5,6 +5,7 @@ from app.models.backtest_trade import BacktestTrade
 from app.models.candle import Candle
 from app.models.parameter_set import ParameterSet
 from app.models.paper_account import PaperAccount
+from app.models.risk_event import RiskEvent
 from app.models.strategy import Strategy
 from app.models.trade import Trade
 
@@ -16,6 +17,7 @@ __all__ = [
 	"Candle",
 	"PaperAccount",
 	"ParameterSet",
+	"RiskEvent",
 	"Strategy",
 	"Trade",
 ]
