@@ -62,6 +62,11 @@ class DecisionRecord(Base):
         back_populates="decision_record",
         cascade="all, delete-orphan",
     )
+    explainability_records = relationship(
+        "DecisionExplainabilityRecord",
+        back_populates="decision_record",
+        cascade="all, delete-orphan",
+    )
 
 
 @event.listens_for(DecisionRecord, "before_update", propagate=True)

@@ -20,6 +20,13 @@ from app.services.decisions.timeline import (
     TimelineStateField,
     read_decision_timeline,
 )
+from app.services.decisions.explainability import (
+    DecisionExplainabilityReadModel,
+    ExplainabilityEvidenceDraft,
+    build_explainability_evidence_drafts,
+    persist_explainability_evidence_for_decision,
+    read_decision_explainability,
+)
 
 __all__ = [
     "DecisionProvenanceContract",
@@ -30,10 +37,15 @@ __all__ = [
     "DECISION_SNAPSHOT_PROVENANCE_MAPPING",
     "DecisionIngestionResult",
     "DecisionTimelineEntry",
+    "DecisionExplainabilityReadModel",
+    "ExplainabilityEvidenceDraft",
     "TimelineReadFilters",
     "TimelineStateField",
+    "build_explainability_evidence_drafts",
     "build_signal_idempotency_key",
     "ingest_decision_records",
+    "persist_explainability_evidence_for_decision",
     "read_decision_timeline",
+    "read_decision_explainability",
     "validate_provenance_mappings",
 ]
