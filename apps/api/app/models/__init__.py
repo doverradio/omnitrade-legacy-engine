@@ -1,4 +1,8 @@
 from app.models.asset import Asset
+from app.models.arena_competition import ArenaCompetition
+from app.models.arena_cycle import ArenaCycle
+from app.models.arena_participating_agent import ArenaParticipatingAgent
+from app.models.arena_tournament import ArenaTournament
 from app.models.audit_log import AuditLog
 from app.models.backtest import Backtest
 from app.models.backtest_trade import BacktestTrade
@@ -22,6 +26,10 @@ from app.models.trade import Trade
 
 __all__ = [
 	"Asset",
+	"ArenaCompetition",
+	"ArenaCycle",
+	"ArenaParticipatingAgent",
+	"ArenaTournament",
 	"AuditLog",
 	"Backtest",
 	"BacktestTrade",
