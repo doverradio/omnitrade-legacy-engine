@@ -10,13 +10,13 @@ Project Stage:
 Pre-MVP
 
 Current Phase:
-Phase 4 — Research Workspace
+Phase 6 — Risk Engine (Ready to Start)
 
 Current Prompt:
-Pending next Phase 4 prompt cycle
+Architecture review complete; awaiting Phase 6 prompt execution
 
 Overall Completion:
-Approximately 30%
+Approximately 55%
 
 ---
 
@@ -61,7 +61,7 @@ Capital Allocation Engine is a Portfolio Intelligence subsystem and is never tre
 
 # Current Goal
 
-Complete Phase 4 (Research Workspace) with strict architecture discipline, then proceed through the roadmap in order.
+Begin Phase 6 Risk Engine implementation with strict architecture-boundary verification and validation-gated progression.
 
 Phase progression remains gated by validation, documentation updates, and regression-free handoff before advancing.
 
@@ -101,10 +101,10 @@ Completed highlights:
 - Strategy module integration for MVP scope
 - Persistence, metrics, and validation workflows
 
-## 🔄 Phase 4 — Research Workspace
+## ✅ Phase 4 — Research Workspace
 
 Status:
-IN PROGRESS
+COMPLETE
 
 Focus:
 
@@ -112,26 +112,33 @@ Focus:
 - Explainable comparison and validation workflows
 - Documentation-first phase discipline
 
-## ⬜ Phase 5 — Portfolio Intelligence + Paper Execution Foundation
+## ✅ Phase 5 — Portfolio Intelligence + Paper Execution Foundation
 
 Status:
-Not Started
+COMPLETE
 
 Purpose:
 
 Establish the Portfolio Intelligence + Paper Execution Foundation for safely proving strategies before any real capital exposure.
+
+Completed highlights:
+
+- Paper account lifecycle and accounting rollups
+- Paper execution foundation (internal crypto simulator + Alpaca paper adapter)
+- Signal execution orchestration (paper-only) with duplicate prevention and audit coverage
+- Trade history, portfolio timeline, performance analytics, and small-account hardening on web surfaces
 
 ## ⬜ Phase 6 — Risk Engine
 
 Status:
 Not Started
 
-## ⬜ Phase 7 — Decision Arena
+## ⬜ Phase 7 — Decision Intelligence Foundation
 
 Status:
 Not Started
 
-## ⬜ Phase 8 — Decision Intelligence Engine
+## ⬜ Phase 8 — Decision Arena
 
 Status:
 Not Started
@@ -168,10 +175,10 @@ Phase 6
 Risk Engine
 
 Phase 7
-Decision Arena
+Decision Intelligence Foundation
 
 Phase 8
-Decision Intelligence Engine
+Decision Arena
 
 Future
 Live Trading
@@ -182,7 +189,7 @@ This ordering matches docs/MASTER_PRODUCT_ROADMAP.md and reflects implementation
 
 # Future Scope Notes
 
-Decision Intelligence implementation occurs after Decision Arena in the roadmap.
+Decision Intelligence foundation work now begins before Decision Arena in the roadmap.
 
 Future Live Trading remains downstream of earlier phases and human approval gates, and is not treated as an additional engine.
 

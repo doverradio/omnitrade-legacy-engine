@@ -26,11 +26,12 @@ No phase begins until the previous phase's exit criteria are met. Every phase pr
 
 > **Note on "(Prompt N)" references below (Phases 2–8):** These point to `COPILOT_PROMPT_PACK.md`, the original prompt pack written before `REPO_STRUCTURE.md` and the per-phase `COPILOT_PHASE_0_PROMPTS.md`/`COPILOT_PHASE_1_PROMPTS.md` pattern were introduced. Phases 0 and 1 now have dedicated, up-to-date prompt files and no longer rely on `COPILOT_PROMPT_PACK.md`. Phases 2–8 have not been implemented yet and still only have `COPILOT_PROMPT_PACK.md`'s original prompts to work from — before starting each of those phases, a dedicated `COPILOT_PHASE_N_PROMPTS.md` should be authored following the Phase 0/1 pattern, using `apps/web`/`apps/api` (per `REPO_STRUCTURE.md`) rather than `COPILOT_PROMPT_PACK.md`'s original `/frontend`/`/backend`/`/workers` folder references, which are superseded. This document is not the place to generate those prompts (see `HANDOFF_TO_COPILOT.md`); the note exists so the "(Prompt N)" citations below aren't mistaken for current, ready-to-use instructions.
 
-### Phase 2 — Chart UI
-**Goal:** Users can see real market data in the browser.
-- Markets page implemented per `UI_SPEC.md` §2.2 (Prompt 4).
-- Candlestick rendering, interval switching, and at least one indicator overlay (MA) working against real ingested data.
-- **Exit criteria:** A non-technical family member can open the app, pick BTCUSDT or AAPL, and view a correct, readable candlestick chart with switchable intervals.
+### Phase 2 — Strategy Framework
+**Goal:** Establish strategy architecture and activation discipline before execution phases.
+- Strategy interfaces, registry, and module boundaries implemented per `STRATEGY_ENGINE.md`.
+- Strategy metadata and activation lifecycle wiring established with audit-compatible transitions.
+- Initial strategy readiness checks are in place so only validated strategies proceed into backtesting.
+- **Exit criteria:** MVP strategies are registered and callable through the framework with deterministic, test-covered signal generation contracts.
 
 ### Phase 3 — Backtesting
 **Goal:** Strategies can be objectively evaluated against history.
@@ -43,11 +44,12 @@ No phase begins until the previous phase's exit criteria are met. Every phase pr
   - Sharpe-like ratio and win rate are reviewed and explicitly accepted by a human (no fully automatic promotion).
 - **Exit criteria:** Each of the 6 strategies has at least one completed backtest with stored metrics, viewable and comparable in the UI.
 
-### Phase 4 — Strategy Parameters
-**Goal:** Parameters are adjustable and auditable from the UI, not just code.
+### Phase 4 — Research Workspace
+**Goal:** Deliver research-oriented UI/UX for strategy tuning and comparison.
 - Strategy Lab page implemented per `UI_SPEC.md` §2.3 (Prompt 6).
 - Parameter set creation, backtest-from-parameter-set flow, and audited "promote to active" flow all functional.
-- **Exit criteria:** A user can change `fast_period`/`slow_period` on `ma_crossover` in the UI, save it as a new parameter set, run a backtest against it, and see the result — all without touching code, and all logged to `audit_log`.
+- Markets/backtest research workflows are coherent for non-destructive experimentation.
+- **Exit criteria:** A user can modify strategy parameters, run and compare backtests, and review results end-to-end without touching code, with all state changes audited.
 
 ### Phase 5 — Paper Trading
 **Goal:** Strategies trade automatically against paper accounts using live/recent data.
@@ -56,33 +58,41 @@ No phase begins until the previous phase's exit criteria are met. Every phase pr
 - Paper Trading and Signals pages implemented per `UI_SPEC.md` §2.5–2.6.
 - **Exit criteria:** At least one strategy runs unattended for 5+ consecutive trading days against a paper account, producing trades with correct P&L accounting and no missed/duplicated executions.
 
-### Phase 6 — AI Signal Review
-**Goal:** Every signal and trade carries a grounded explanation; regime/confidence/allocation are live.
-- Regime classifier, signal scorer, allocator, explainer, and post-trade review engine implemented per `AI_LAYER.md` (Prompt 8).
-- AI Review page implemented per `UI_SPEC.md` §2.8, including the mandatory human approve/dismiss step for any AI recommendation.
-- **Exit criteria:** Every non-`hold` signal generated during Phase 5's paper-trading run (retroactively backfilled if needed) has a stored regime tag, confidence score, and human-readable explanation; a sample of explanations is manually reviewed for accuracy against the underlying data.
-
-### Phase 7 — Risk Engine
+### Phase 6 — Risk Engine
 **Goal:** No trade can occur without passing a fully enforced, tested risk gate.
 - Full risk engine implemented per `RISK_ENGINE.md` (Prompt 9), integrated into the signal generation loop ahead of execution.
 - Risk Monitor page implemented per `UI_SPEC.md` §2.7.
 - Kill switches (account + global) tested end-to-end, including re-arm flow.
 - **Exit criteria:** A deliberate test scenario (e.g., simulated large loss) correctly trips the daily loss limit and blocks further trades; a deliberate data-gap test correctly triggers a no-trade zone; a manual kill-switch trip correctly halts all trading and requires explicit human re-arm to resume.
 
-### Phase 8 — Deployment
-**Goal:** The system runs reliably outside of a local machine.
-- Frontend deployed to Vercel; backend + workers deployed to the chosen provider (Railway/Fly.io/Render) per `COPILOT_PROMPT_PACK.md` Prompt 10.
-- Supabase production project provisioned with migrations applied.
-- Scheduled workers (ingestion, signal generation, post-trade review) running on the deployed environment on their intended cadence.
-- Health-check and basic uptime monitoring in place.
-- **Exit criteria:** The full pipeline (ingestion → chart UI → backtesting → paper trading → AI review → risk gating) runs unattended in a deployed "production" (still paper-only) environment for at least one full week without manual intervention, with all audit logs intact and reviewable.
+### Phase 7 — Decision Intelligence Foundation
+**Goal:** Stand up the first implementation slice of the Decision Intelligence Engine as an observational subsystem.
+- Implement Decision Record + Decision Snapshot foundations per `DECISION_INTELLIGENCE_ENGINE.md` and ADR-0002/ADR-0004.
+- Implement foundational retrieval/review endpoints and basic Decision Explorer workflows without influencing real-time decision routing.
+- Keep all Decision Intelligence outputs advisory and reviewable; no automatic strategy/risk mutation.
+- **Exit criteria:** Decision records are written for evaluated signals (including rejected/hold outcomes where applicable), snapshots are immutable and reproducible, and review/query workflows are validated end-to-end.
 
-### Future Phase — Decision Intelligence Engine (Not Scheduled)
-**Goal:** Not yet scheduled into a numbered MVP phase. The Decision Intelligence Engine (`DECISION_INTELLIGENCE_ENGINE.md`) is a permanent foundational subsystem, but its dedicated implementation work — Decision Record schema, recording/query services, and the Decision Explorer/Timeline/Detail UI pages — begins only after Phase 8's MVP is validated and a dedicated phase is explicitly planned.
+### Phase 8 — Decision Arena
+**Goal:** Introduce comparative evaluation workflows on top of established Strategy, Portfolio, Risk, and Decision Intelligence evidence.
+- Implement Decision Arena surfaces and services for structured comparison across strategies/versions in paper context.
+- Ensure evaluation dimensions include risk discipline, explainability, and decision quality, not profit alone.
+- Maintain strict boundary: Decision Arena consumes evidence; it does not bypass risk gates or execute trades directly.
+- **Exit criteria:** Decision Arena comparisons are reproducible, auditable, and grounded in existing paper/risk/decision evidence pipelines.
+
+### Future Phase — Live Trading (Not Scheduled)
+**Goal:** Remains explicitly future scope. Live trading is a deployment mode, not a foundational engine.
+- Live enablement requires explicit human approvals, separate live account types, and independent operational readiness review.
+- No live-routing implementation is allowed in MVP phase work.
+
+### Future Capability Note — AI Signal Review and Deployment Hardening
+AI review depth and production deployment hardening remain required capabilities, but they are treated as cross-phase readiness tracks rather than standalone numbered phases in this sequence. They should be scheduled within the active phase plan without violating architectural boundaries.
+
+### Future Capability Note — Counterfactual Outcome Ledger (COL) and Decision Quality Engine (DQE)
+The COL (`DECISION_INTELLIGENCE_ENGINE.md` §8) and DQE (§8a) remain part of Decision Intelligence evolution and may begin in a constrained form within or after Phase 7 as explicitly planned.
 - In the meantime, Phases 5–7 should continue populating `signals`, `model_outputs`, and `risk_events` completely and consistently (per `DATABASE_SCHEMA.md` §3a), since these are the most likely source data the DIE's Decision Records will be built from once implemented.
 - The DIE's Counterfactual Outcome Ledger (COL, `DECISION_INTELLIGENCE_ENGINE.md` §8) is included in this same future, unscheduled phase — it is a core subsystem of the DIE, not a separate feature with its own timeline. When this future phase is eventually planned, COL's version 1 should be scoped narrowly and lightly: BTC only, evaluated once per minute, three horizons (15 minutes, 1 hour, 24 hours), a small feature snapshot, and no heavy compute — expansion to more assets, more horizons, higher frequency, and richer features is explicitly deferred to later versions (`DECISION_INTELLIGENCE_ENGINE.md` §8.7–§8.8).
 - The DIE's Decision Quality Engine (DQE, `DECISION_INTELLIGENCE_ENGINE.md` §8a) is likewise included in this same future, unscheduled phase, and depends on the COL being implemented first — a Decision Quality Score cannot be computed until counterfactual outcomes exist for a decision. When planned, DQE work should implement the scoring dimensions and dashboard metrics in `DECISION_INTELLIGENCE_ENGINE.md` §8a.3/§8a.5 without shortcutting into a real-time confidence scorer (that role belongs to `AI_LAYER.md`'s existing Signal Confidence Scorer) or an automatic strategy/risk adjustment mechanism (DQE output is a human-reviewed diagnostic only, per §8a.6).
-- No Copilot prompts, schema migrations, or endpoints for the DIE, the COL, or the DQE should be generated until this future phase is formally scheduled. Per `docs/adr/README.md`, scheduling this phase is itself likely to surface additional architectural decisions (e.g., DQE scoring methodology) that should be checked against the ADR system before implementation begins.
+- No schema migrations or runtime endpoints for the COL or DQE should be generated until they are explicitly scheduled and ADR-checked. Per `docs/adr/README.md`, material scope expansion (e.g., DQE scoring methodology changes) should trigger an ADR check before implementation.
 
 ---
 

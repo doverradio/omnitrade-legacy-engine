@@ -166,9 +166,9 @@ The implementation sequence is:
 4. Phase 4 Research Workspace
 5. Phase 5 Portfolio Intelligence + Paper Execution Foundation
 6. Phase 6 Risk Engine
-7. Phase 7 Decision Arena
-8. Phase 8 Decision Intelligence Engine
-9. Phase 9 Live Trading
+7. Phase 7 Decision Intelligence Foundation
+8. Phase 8 Decision Arena
+9. Future Live Trading
 
 This sequence describes implementation order only. It does not imply architectural importance beyond the permanent four-core-engine model.
 
