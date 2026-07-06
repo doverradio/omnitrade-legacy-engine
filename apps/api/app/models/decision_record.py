@@ -72,6 +72,11 @@ class DecisionRecord(Base):
         back_populates="decision_record",
         cascade="all, delete-orphan",
     )
+    quality_scores = relationship(
+        "DecisionQualityScore",
+        back_populates="decision_record",
+        cascade="all, delete-orphan",
+    )
 
 
 @event.listens_for(DecisionRecord, "before_update", propagate=True)
