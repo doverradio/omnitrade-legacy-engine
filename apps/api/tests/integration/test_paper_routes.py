@@ -30,6 +30,9 @@ class _ExecuteResult:
     def scalars(self) -> _ScalarResult:
         return _ScalarResult(self._items)
 
+    def all(self) -> list[Any]:
+        return self._items
+
 
 class _FakeSession:
     def __init__(self, *, accounts: list[PaperAccount], trades: list[Trade], assets: list[Asset], candles: list[Candle]) -> None:
@@ -70,6 +73,16 @@ class _FakeSession:
         sql = str(statement)
         params = statement.compile().params
         values = list(params.values())
+
+        if "FROM trades LEFT OUTER JOIN assets" in sql and "SELECT" in sql:
+            account_id = next((value for value in values if isinstance(value, uuid.UUID)), None)
+            rows = [trade for trade in self.trades if trade.paper_account_id == account_id and trade.is_paper]
+            rows.sort(key=lambda item: item.executed_at, reverse=True)
+            results = []
+            for trade in rows:
+                asset = next((item for item in self.assets if item.id == trade.asset_id), None)
+                results.append((trade, asset.symbol if asset else None))
+            return _ExecuteResult(results)
 
         if "FROM trades" in sql and "SELECT" in sql:
             account_id = next((value for value in values if isinstance(value, uuid.UUID)), None)
@@ -219,3 +232,87 @@ def test_reset_paper_account_clears_positions() -> None:
     assert payload["current_cash_balance"] == "25"
     assert payload["positions"] == []
     assert session.trades == []
+
+
+def test_get_paper_trades_returns_paper_only_trade_history() -> None:
+    account_id = uuid.uuid4()
+    now = datetime(2026, 7, 6, tzinfo=timezone.utc)
+    asset_id = uuid.uuid4()
+
+    account = PaperAccount(
+        id=account_id,
+        owner_user_id=uuid.uuid4(),
+        name="Family Paper",
+        asset_class="crypto",
+        starting_balance=Decimal("25"),
+        current_cash_balance=Decimal("25"),
+        is_active=True,
+        created_at=now,
+    )
+    paper_trade = Trade(
+        id=uuid.uuid4(),
+        paper_account_id=account_id,
+        asset_id=asset_id,
+        side="buy",
+        quantity=Decimal("0.02"),
+        price=Decimal("65010.00"),
+        fee=Decimal("0.65"),
+        is_paper=True,
+        execution_venue="internal_sim",
+        executed_at=now,
+    )
+    non_paper_trade = Trade(
+        id=uuid.uuid4(),
+        paper_account_id=account_id,
+        asset_id=asset_id,
+        side="sell",
+        quantity=Decimal("0.01"),
+        price=Decimal("65100.00"),
+        fee=Decimal("0.60"),
+        is_paper=False,
+        execution_venue="internal_sim",
+        executed_at=now,
+    )
+    asset = Asset(
+        id=asset_id,
+        symbol="BTCUSDT",
+        asset_class="crypto",
+        exchange="binance_us",
+        is_active=True,
+        supports_fractional=True,
+    )
+
+    with create_test_client(
+        _FakeSession(accounts=[account], trades=[paper_trade, non_paper_trade], assets=[asset], candles=[])
+    ) as client:
+        response = client.get(f"/paper/trades?account_id={account_id}")
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["next_cursor"] is None
+    assert len(payload["items"]) == 1
+    assert payload["items"][0]["id"] == str(paper_trade.id)
+    assert payload["items"][0]["fee"] == "0.65"
+    assert payload["items"][0]["symbol"] == "BTCUSDT"
+
+
+def test_get_paper_trades_rejects_invalid_time_range() -> None:
+    account_id = uuid.uuid4()
+    now = datetime(2026, 7, 6, tzinfo=timezone.utc)
+    account = PaperAccount(
+        id=account_id,
+        owner_user_id=uuid.uuid4(),
+        name="Family Paper",
+        asset_class="crypto",
+        starting_balance=Decimal("25"),
+        current_cash_balance=Decimal("25"),
+        is_active=True,
+        created_at=now,
+    )
+
+    with create_test_client(_FakeSession(accounts=[account], trades=[], assets=[], candles=[])) as client:
+        response = client.get(
+            f"/paper/trades?account_id={account_id}&start_time=2026-07-07T00:00:00%2B00:00&end_time=2026-07-06T00:00:00%2B00:00"
+        )
+
+    assert response.status_code == 400

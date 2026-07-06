@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import uuid
+from datetime import datetime
 from decimal import Decimal
 
 from pydantic import BaseModel, ConfigDict, field_serializer
@@ -105,3 +106,25 @@ class ExecuteSignalResponse(BaseModel):
     broker_order_id: str | None = None
     venue_status: str | None = None
     message: str
+
+
+class PaperTradeResponse(BaseModel):
+    id: uuid.UUID
+    asset_id: uuid.UUID
+    side: str
+    quantity: Decimal
+    price: Decimal
+    fee: Decimal
+    executed_at: datetime
+    signal_id: uuid.UUID | None = None
+    strategy_id: uuid.UUID | None = None
+    symbol: str | None = None
+
+    @field_serializer("quantity", "price", "fee", when_used="json")
+    def serialize_numeric_fields(self, value: Decimal) -> str:
+        return format(value, "f")
+
+
+class PaperTradeListResponse(BaseModel):
+    items: list[PaperTradeResponse]
+    next_cursor: str | None

@@ -2,10 +2,11 @@ from __future__ import annotations
 
 import logging
 import uuid
+from datetime import datetime
 from decimal import Decimal
 
 from fastapi import APIRouter, Depends, Query
-from sqlalchemy import delete, select
+from sqlalchemy import and_, delete, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import get_settings
@@ -20,6 +21,8 @@ from app.schemas.paper import (
     CreatePaperAccountResponse,
     ExecuteSignalRequest,
     ExecuteSignalResponse,
+    PaperTradeListResponse,
+    PaperTradeResponse,
     PaperAccountResponse,
     PositionResponse,
     ResetPaperAccountRequest,
@@ -35,6 +38,8 @@ router = APIRouter(prefix="/paper", tags=["paper"])
 logger = logging.getLogger(__name__)
 
 _DEFAULT_OWNER_USER_ID = uuid.UUID("00000000-0000-0000-0000-000000000001")
+_DEFAULT_PAGE_LIMIT = 50
+_MAX_PAGE_LIMIT = 200
 
 
 @router.get("/account", response_model=PaperAccountResponse)
@@ -97,8 +102,27 @@ async def create_paper_account(
     )
 
     db.add(account)
+    if hasattr(db, "flush"):
+        await db.flush()
+
+    audit = AuditLog(
+        actor="system",
+        action="paper_account_created",
+        entity_type="paper_account",
+        entity_id=account.id,
+        before_state=None,
+        after_state={
+            "name": account.name,
+            "asset_class": account.asset_class,
+            "starting_balance": format(account.starting_balance, "f"),
+            "current_cash_balance": format(account.current_cash_balance, "f"),
+            "is_active": account.is_active,
+        },
+    )
+    db.add(audit)
     await db.commit()
-    await db.refresh(account)
+    if hasattr(db, "refresh"):
+        await db.refresh(account)
 
     return CreatePaperAccountResponse(
         id=account.id,
@@ -120,8 +144,29 @@ async def reset_paper_account(
 
     account = await _load_account(db=db, account_id=payload.account_id)
 
+    existing_trade_ids = (
+        await db.execute(select(Trade.id).where(Trade.paper_account_id == account.id).where(Trade.is_paper.is_(True)))
+    ).scalars().all()
+    prior_cash_balance = account.current_cash_balance
+
     await db.execute(delete(Trade).where(Trade.paper_account_id == account.id))
     account.current_cash_balance = account.starting_balance
+
+    audit = AuditLog(
+        actor="system",
+        action="paper_account_reset",
+        entity_type="paper_account",
+        entity_id=account.id,
+        before_state={
+            "current_cash_balance": format(prior_cash_balance, "f"),
+            "trade_count": len(existing_trade_ids),
+        },
+        after_state={
+            "current_cash_balance": format(account.current_cash_balance, "f"),
+            "trade_count": 0,
+        },
+    )
+    db.add(audit)
     await db.commit()
 
     return ResetPaperAccountResponse(
@@ -163,6 +208,84 @@ async def execute_signal_paper_only(
     )
 
 
+@router.get("/trades", response_model=PaperTradeListResponse)
+async def get_paper_trades(
+    account_id: uuid.UUID = Query(...),
+    strategy_id: uuid.UUID | None = Query(default=None),
+    asset_id: uuid.UUID | None = Query(default=None),
+    start_time: datetime | None = Query(default=None),
+    end_time: datetime | None = Query(default=None),
+    limit: int = Query(default=_DEFAULT_PAGE_LIMIT, ge=1, le=_MAX_PAGE_LIMIT),
+    cursor: str | None = Query(default=None),
+    db: AsyncSession = Depends(get_db),
+) -> PaperTradeListResponse:
+    if start_time and end_time and start_time >= end_time:
+        raise InvalidRequestError(
+            message="Invalid trade history time range",
+            details={"start_time": start_time.isoformat(), "end_time": end_time.isoformat()},
+        )
+
+    await _load_account(db=db, account_id=account_id)
+
+    query = (
+        select(Trade, Asset.symbol)
+        .outerjoin(Asset, Asset.id == Trade.asset_id)
+        .where(Trade.paper_account_id == account_id)
+        .where(Trade.is_paper.is_(True))
+    )
+
+    if asset_id is not None:
+        query = query.where(Trade.asset_id == asset_id)
+
+    if start_time is not None:
+        query = query.where(Trade.executed_at >= start_time)
+
+    if end_time is not None:
+        query = query.where(Trade.executed_at <= end_time)
+
+    if strategy_id is not None:
+        logger.warning("strategy_id trade filter is currently ignored: no signal model is available")
+
+    if cursor:
+        cursor_time, cursor_trade_id = _parse_trade_cursor(cursor)
+        query = query.where(
+            or_(
+                Trade.executed_at < cursor_time,
+                and_(Trade.executed_at == cursor_time, Trade.id < cursor_trade_id),
+            )
+        )
+
+    query = query.order_by(Trade.executed_at.desc(), Trade.id.desc()).limit(limit + 1)
+
+    rows = (await db.execute(query)).all()
+    has_next = len(rows) > limit
+    visible_rows = rows[:limit]
+
+    items: list[PaperTradeResponse] = []
+    for trade, symbol in visible_rows:
+        items.append(
+            PaperTradeResponse(
+                id=trade.id,
+                asset_id=trade.asset_id,
+                side=trade.side,
+                quantity=trade.quantity,
+                price=trade.price,
+                fee=trade.fee,
+                executed_at=trade.executed_at,
+                signal_id=trade.signal_id,
+                strategy_id=None,
+                symbol=symbol,
+            )
+        )
+
+    next_cursor = None
+    if has_next and items:
+        last = items[-1]
+        next_cursor = f"{last.executed_at.isoformat()}|{last.id}"
+
+    return PaperTradeListResponse(items=items, next_cursor=next_cursor)
+
+
 async def _load_account(*, db: AsyncSession, account_id: uuid.UUID | None) -> PaperAccount:
     if account_id is not None:
         account = await db.scalar(select(PaperAccount).where(PaperAccount.id == account_id))
@@ -180,3 +303,11 @@ async def _load_account(*, db: AsyncSession, account_id: uuid.UUID | None) -> Pa
         raise NotFoundError(message="Paper account not found", details={})
 
     return account
+
+
+def _parse_trade_cursor(raw_cursor: str) -> tuple[datetime, uuid.UUID]:
+    try:
+        timestamp_raw, trade_id_raw = raw_cursor.rsplit("|", 1)
+        return datetime.fromisoformat(timestamp_raw), uuid.UUID(trade_id_raw)
+    except (ValueError, TypeError) as exc:
+        raise InvalidRequestError(message="Invalid trade cursor", details={"cursor": raw_cursor}) from exc
