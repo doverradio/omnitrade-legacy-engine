@@ -1,4 +1,5 @@
 from app.models.asset import Asset
+from app.models.audit_log import AuditLog
 from app.models.backtest import Backtest
 from app.models.backtest_trade import BacktestTrade
 from app.models.candle import Candle
@@ -9,6 +10,7 @@ from app.models.trade import Trade
 
 __all__ = [
 	"Asset",
+	"AuditLog",
 	"Backtest",
 	"BacktestTrade",
 	"Candle",
