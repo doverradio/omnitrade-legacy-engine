@@ -1,4 +1,6 @@
 from app.services.risk.risk_engine import (
+	DailyLossValidationResult,
+	DrawdownValidationResult,
 	PositionSizingResult,
 	RiskDecisionAction,
 	RiskEvaluationContext,
@@ -7,10 +9,14 @@ from app.services.risk.risk_engine import (
 	RiskEvaluationStep,
 	compute_position_sizing,
 	evaluate_signal_risk,
+	validate_daily_loss_limit,
+	validate_max_drawdown,
 	validate_minimum_viable_order,
 )
 
 __all__ = [
+	"DailyLossValidationResult",
+	"DrawdownValidationResult",
 	"PositionSizingResult",
 	"RiskDecisionAction",
 	"RiskEvaluationContext",
@@ -19,5 +25,7 @@ __all__ = [
 	"RiskEvaluationStep",
 	"compute_position_sizing",
 	"evaluate_signal_risk",
+	"validate_daily_loss_limit",
+	"validate_max_drawdown",
 	"validate_minimum_viable_order",
 ]

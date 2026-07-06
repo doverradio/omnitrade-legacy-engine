@@ -24,6 +24,11 @@ class RiskEvaluationRequest:
     min_order_notional: Decimal | None = None
     qty_step_size: Decimal | None = None
     supports_fractional: bool | None = None
+    start_of_day_equity: Decimal | None = None
+    current_equity: Decimal | None = None
+    max_daily_loss_pct: Decimal | None = None
+    high_water_mark_equity: Decimal | None = None
+    max_drawdown_pct: Decimal | None = None
     actor: str = "system"
     ai_confidence: Decimal | None = None
 
@@ -55,6 +60,22 @@ class PositionSizingResult:
     was_resized: bool
     max_position_notional: Decimal | None
     approved_notional: Decimal
+    reason_code: str | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class DailyLossValidationResult:
+    breached: bool
+    loss_pct: Decimal | None
+    threshold_pct: Decimal | None
+    reason_code: str | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class DrawdownValidationResult:
+    breached: bool
+    drawdown_pct: Decimal | None
+    threshold_pct: Decimal | None
     reason_code: str | None = None
 
 
@@ -164,6 +185,72 @@ def validate_minimum_viable_order(
     return True
 
 
+def validate_daily_loss_limit(
+    *,
+    start_of_day_equity: Decimal,
+    current_equity: Decimal,
+    max_daily_loss_pct: Decimal,
+) -> DailyLossValidationResult:
+    if start_of_day_equity <= 0:
+        return DailyLossValidationResult(
+            breached=False,
+            loss_pct=None,
+            threshold_pct=max_daily_loss_pct,
+            reason_code="invalid_start_of_day_equity",
+        )
+
+    if max_daily_loss_pct <= 0:
+        return DailyLossValidationResult(
+            breached=False,
+            loss_pct=None,
+            threshold_pct=max_daily_loss_pct,
+            reason_code="invalid_max_daily_loss_pct",
+        )
+
+    loss_pct = (start_of_day_equity - current_equity) / start_of_day_equity
+    loss_pct = loss_pct if loss_pct > 0 else Decimal("0")
+
+    return DailyLossValidationResult(
+        breached=loss_pct >= max_daily_loss_pct,
+        loss_pct=loss_pct,
+        threshold_pct=max_daily_loss_pct,
+        reason_code="max_daily_loss_breached" if loss_pct >= max_daily_loss_pct else None,
+    )
+
+
+def validate_max_drawdown(
+    *,
+    high_water_mark_equity: Decimal,
+    current_equity: Decimal,
+    max_drawdown_pct: Decimal,
+) -> DrawdownValidationResult:
+    if high_water_mark_equity <= 0:
+        return DrawdownValidationResult(
+            breached=False,
+            drawdown_pct=None,
+            threshold_pct=max_drawdown_pct,
+            reason_code="invalid_high_water_mark_equity",
+        )
+
+    if max_drawdown_pct <= 0:
+        return DrawdownValidationResult(
+            breached=False,
+            drawdown_pct=None,
+            threshold_pct=max_drawdown_pct,
+            reason_code="invalid_max_drawdown_pct",
+        )
+
+    drawdown_pct = (high_water_mark_equity - current_equity) / high_water_mark_equity
+    drawdown_pct = drawdown_pct if drawdown_pct > 0 else Decimal("0")
+
+    return DrawdownValidationResult(
+        breached=drawdown_pct >= max_drawdown_pct,
+        drawdown_pct=drawdown_pct,
+        threshold_pct=max_drawdown_pct,
+        reason_code="max_drawdown_breached" if drawdown_pct >= max_drawdown_pct else None,
+    )
+
+
 def evaluate_signal_risk(
     *,
     request: RiskEvaluationRequest,
@@ -216,8 +303,28 @@ def evaluate_signal_risk(
             steps=steps,
         )
 
-    steps.append(RiskEvaluationStep(step="daily_loss", status="reject" if resolved_context.would_breach_daily_loss else "pass", reason_code="max_daily_loss_breached" if resolved_context.would_breach_daily_loss else None))
-    if resolved_context.would_breach_daily_loss:
+    would_breach_daily_loss = resolved_context.would_breach_daily_loss
+    if (
+        request.start_of_day_equity is not None
+        and request.current_equity is not None
+        and request.max_daily_loss_pct is not None
+    ):
+        daily_loss_result = validate_daily_loss_limit(
+            start_of_day_equity=request.start_of_day_equity,
+            current_equity=request.current_equity,
+            max_daily_loss_pct=request.max_daily_loss_pct,
+        )
+        if daily_loss_result.reason_code in {"invalid_start_of_day_equity", "invalid_max_daily_loss_pct"}:
+            return RiskEvaluationResult(
+                action=RiskDecisionAction.REJECT,
+                reason_code=daily_loss_result.reason_code,
+                approved_quantity=Decimal("0"),
+                steps=steps,
+            )
+        would_breach_daily_loss = daily_loss_result.breached
+
+    steps.append(RiskEvaluationStep(step="daily_loss", status="reject" if would_breach_daily_loss else "pass", reason_code="max_daily_loss_breached" if would_breach_daily_loss else None))
+    if would_breach_daily_loss:
         return RiskEvaluationResult(
             action=RiskDecisionAction.REJECT,
             reason_code="max_daily_loss_breached",
@@ -225,8 +332,28 @@ def evaluate_signal_risk(
             steps=steps,
         )
 
-    steps.append(RiskEvaluationStep(step="drawdown", status="reject" if resolved_context.would_breach_drawdown else "pass", reason_code="max_drawdown_breached" if resolved_context.would_breach_drawdown else None))
-    if resolved_context.would_breach_drawdown:
+    would_breach_drawdown = resolved_context.would_breach_drawdown
+    if (
+        request.high_water_mark_equity is not None
+        and request.current_equity is not None
+        and request.max_drawdown_pct is not None
+    ):
+        drawdown_result = validate_max_drawdown(
+            high_water_mark_equity=request.high_water_mark_equity,
+            current_equity=request.current_equity,
+            max_drawdown_pct=request.max_drawdown_pct,
+        )
+        if drawdown_result.reason_code in {"invalid_high_water_mark_equity", "invalid_max_drawdown_pct"}:
+            return RiskEvaluationResult(
+                action=RiskDecisionAction.REJECT,
+                reason_code=drawdown_result.reason_code,
+                approved_quantity=Decimal("0"),
+                steps=steps,
+            )
+        would_breach_drawdown = drawdown_result.breached
+
+    steps.append(RiskEvaluationStep(step="drawdown", status="reject" if would_breach_drawdown else "pass", reason_code="max_drawdown_breached" if would_breach_drawdown else None))
+    if would_breach_drawdown:
         return RiskEvaluationResult(
             action=RiskDecisionAction.REJECT,
             reason_code="max_drawdown_breached",

@@ -9,6 +9,8 @@ from app.services.risk import (
     RiskEvaluationRequest,
     compute_position_sizing,
     evaluate_signal_risk,
+    validate_daily_loss_limit,
+    validate_max_drawdown,
     validate_minimum_viable_order,
 )
 
@@ -25,6 +27,11 @@ def _request(quantity: str = "0.5") -> RiskEvaluationRequest:
         min_order_notional=Decimal("1"),
         qty_step_size=Decimal("0.01"),
         supports_fractional=True,
+        start_of_day_equity=Decimal("100"),
+        current_equity=Decimal("100"),
+        max_daily_loss_pct=Decimal("0.03"),
+        high_water_mark_equity=Decimal("110"),
+        max_drawdown_pct=Decimal("0.15"),
     )
 
 
@@ -160,3 +167,101 @@ def test_validate_minimum_viable_order_checks_notional_and_step_size() -> None:
         min_order_notional=Decimal("0.0005"),
         qty_step_size=Decimal("0.001"),
     )
+
+
+def test_validate_daily_loss_limit_breaches_when_threshold_crossed() -> None:
+    result = validate_daily_loss_limit(
+        start_of_day_equity=Decimal("100"),
+        current_equity=Decimal("96"),
+        max_daily_loss_pct=Decimal("0.03"),
+    )
+
+    assert result.breached is True
+    assert result.loss_pct == Decimal("0.04")
+    assert result.reason_code == "max_daily_loss_breached"
+
+
+def test_validate_daily_loss_limit_rejects_invalid_inputs() -> None:
+    result = validate_daily_loss_limit(
+        start_of_day_equity=Decimal("0"),
+        current_equity=Decimal("96"),
+        max_daily_loss_pct=Decimal("0.03"),
+    )
+
+    assert result.breached is False
+    assert result.loss_pct is None
+    assert result.reason_code == "invalid_start_of_day_equity"
+
+
+def test_validate_max_drawdown_breaches_when_threshold_crossed() -> None:
+    result = validate_max_drawdown(
+        high_water_mark_equity=Decimal("120"),
+        current_equity=Decimal("96"),
+        max_drawdown_pct=Decimal("0.15"),
+    )
+
+    assert result.breached is True
+    assert result.drawdown_pct == Decimal("0.2")
+    assert result.reason_code == "max_drawdown_breached"
+
+
+def test_validate_max_drawdown_rejects_invalid_inputs() -> None:
+    result = validate_max_drawdown(
+        high_water_mark_equity=Decimal("0"),
+        current_equity=Decimal("96"),
+        max_drawdown_pct=Decimal("0.15"),
+    )
+
+    assert result.breached is False
+    assert result.drawdown_pct is None
+    assert result.reason_code == "invalid_high_water_mark_equity"
+
+
+def test_evaluate_signal_risk_rejects_when_daily_loss_breached() -> None:
+    request = RiskEvaluationRequest(
+        signal_id=uuid.uuid4(),
+        paper_account_id=uuid.uuid4(),
+        asset_id=uuid.uuid4(),
+        side="buy",
+        quantity=Decimal("0.5"),
+        account_equity=Decimal("100"),
+        max_position_size_pct=Decimal("0.05"),
+        min_order_notional=Decimal("1"),
+        qty_step_size=Decimal("0.01"),
+        supports_fractional=True,
+        start_of_day_equity=Decimal("100"),
+        current_equity=Decimal("95"),
+        max_daily_loss_pct=Decimal("0.03"),
+        high_water_mark_equity=Decimal("110"),
+        max_drawdown_pct=Decimal("0.15"),
+    )
+
+    result = evaluate_signal_risk(request=request, reference_price=Decimal("10"))
+
+    assert result.action == RiskDecisionAction.REJECT
+    assert result.reason_code == "max_daily_loss_breached"
+
+
+def test_evaluate_signal_risk_rejects_when_drawdown_breached() -> None:
+    request = RiskEvaluationRequest(
+        signal_id=uuid.uuid4(),
+        paper_account_id=uuid.uuid4(),
+        asset_id=uuid.uuid4(),
+        side="buy",
+        quantity=Decimal("0.5"),
+        account_equity=Decimal("100"),
+        max_position_size_pct=Decimal("0.05"),
+        min_order_notional=Decimal("1"),
+        qty_step_size=Decimal("0.01"),
+        supports_fractional=True,
+        start_of_day_equity=Decimal("100"),
+        current_equity=Decimal("100"),
+        max_daily_loss_pct=Decimal("0.03"),
+        high_water_mark_equity=Decimal("120"),
+        max_drawdown_pct=Decimal("0.15"),
+    )
+
+    result = evaluate_signal_risk(request=request, reference_price=Decimal("10"))
+
+    assert result.action == RiskDecisionAction.REJECT
+    assert result.reason_code == "max_drawdown_breached"
