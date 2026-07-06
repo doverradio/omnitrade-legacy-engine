@@ -3,6 +3,7 @@ import type { ReactNode } from "react";
 
 const navItems = [
   { href: "/dashboard", label: "Dashboard" },
+  { href: "/decision-intelligence", label: "Decision Intelligence" },
   { href: "/markets", label: "Markets" },
   { href: "/strategy-lab", label: "Strategy Lab" },
   { href: "/backtests", label: "Backtests" },
@@ -19,13 +20,13 @@ type PageShellProps = {
 export default function PageShell({ children }: PageShellProps) {
   return (
     <div className="min-h-screen bg-background text-foreground">
-      <div className="flex min-h-screen">
-        <aside className="w-64 border-r border-border bg-muted p-4">
+      <div className="flex min-h-screen flex-col md:flex-row">
+        <aside className="hidden w-64 border-r border-border bg-muted p-4 md:block" aria-label="Primary">
           <p className="mb-4 text-sm font-semibold uppercase tracking-wide text-foreground/80">
             OmniTrade
           </p>
           <p className="mb-3 text-xs uppercase tracking-wide text-foreground/60">
-            Phase 5 foundation
+            Phase 7 decision intelligence
           </p>
           <nav className="flex flex-col gap-2 text-sm">
             {navItems.map((item) => (
@@ -39,14 +40,29 @@ export default function PageShell({ children }: PageShellProps) {
             ))}
           </nav>
         </aside>
+
         <div className="flex min-h-screen flex-1 flex-col">
-          <header className="flex h-14 items-center justify-between border-b border-border px-6">
-            <p className="text-sm">Portfolio Intelligence + Paper Execution Foundation</p>
-            <p className="text-xs uppercase tracking-wide text-foreground/70">
-              Paper mode only - $25 default proving ground
-            </p>
+          <header className="border-b border-border px-4 py-3 sm:px-6">
+            <div className="flex flex-wrap items-center justify-between gap-2">
+              <p className="text-sm">Decision Intelligence Foundation (read-only)</p>
+              <p className="text-xs uppercase tracking-wide text-foreground/70">
+                Paper mode only - observational surfaces
+              </p>
+            </div>
+
+            <nav className="mt-3 flex gap-2 overflow-x-auto pb-1 md:hidden" aria-label="Mobile primary">
+              {navItems.map((item) => (
+                <Link
+                  key={item.href}
+                  href={item.href}
+                  className="whitespace-nowrap rounded-md border border-border bg-background/40 px-3 py-1.5 text-xs font-medium text-foreground/90"
+                >
+                  {item.label}
+                </Link>
+              ))}
+            </nav>
           </header>
-          <main className="flex-1 p-6">{children}</main>
+          <main className="flex-1 p-4 sm:p-6">{children}</main>
         </div>
       </div>
     </div>
