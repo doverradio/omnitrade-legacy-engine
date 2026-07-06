@@ -15,6 +15,9 @@ from app.services.arena.contracts import (
     ArenaProvenanceContract,
     ArenaRegistrationServiceContract,
     ArenaTournamentIdentityContract,
+    ArenaAgentBudgetAssignmentContract,
+    ArenaCompetitionAllocationRequest,
+    ArenaCompetitionAllocationResult,
 )
 from app.services.arena.identity import (
     build_arena_competition_idempotency_key,
@@ -33,6 +36,7 @@ from app.services.arena.orchestration import (
     build_deterministic_snapshot_hash,
     orchestrate_arena_cycle,
 )
+from app.services.arena.paper_allocation import allocate_competition_paper_budget
 
 __all__ = [
     "ArenaAgentProposalContract",
@@ -51,6 +55,9 @@ __all__ = [
     "ArenaProvenanceContract",
     "ArenaRegistrationServiceContract",
     "ArenaTournamentIdentityContract",
+    "ArenaAgentBudgetAssignmentContract",
+    "ArenaCompetitionAllocationRequest",
+    "ArenaCompetitionAllocationResult",
     "build_arena_competition_idempotency_key",
     "build_arena_cycle_idempotency_key",
     "build_arena_lifecycle_identity",
@@ -62,4 +69,5 @@ __all__ = [
     "orchestrate_arena_cycle",
     "register_arena_agent",
     "validate_arena_eligibility",
+    "allocate_competition_paper_budget",
 ]

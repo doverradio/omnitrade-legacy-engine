@@ -4,7 +4,9 @@ from app.models.arena_cycle import ArenaCycle
 from app.models.arena_cycle_proposal import ArenaCycleProposal
 from app.models.arena_participating_agent import ArenaParticipatingAgent
 from app.models.arena_agent_registration import ArenaAgentRegistration
+from app.models.arena_agent_budget_assignment import ArenaAgentBudgetAssignment
 from app.models.arena_tournament import ArenaTournament
+from app.models.arena_competition_budget_allocation import ArenaCompetitionBudgetAllocation
 from app.models.audit_log import AuditLog
 from app.models.backtest import Backtest
 from app.models.backtest_trade import BacktestTrade
@@ -32,7 +34,9 @@ __all__ = [
 	"ArenaCycle",
 	"ArenaCycleProposal",
 	"ArenaAgentRegistration",
+	"ArenaAgentBudgetAssignment",
 	"ArenaParticipatingAgent",
+	"ArenaCompetitionBudgetAllocation",
 	"ArenaTournament",
 	"AuditLog",
 	"Backtest",

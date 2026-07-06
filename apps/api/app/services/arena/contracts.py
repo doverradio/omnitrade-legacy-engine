@@ -3,6 +3,7 @@ from __future__ import annotations
 import uuid
 from dataclasses import dataclass
 from datetime import datetime
+from decimal import Decimal
 from typing import Any, Protocol
 
 
@@ -121,6 +122,34 @@ class ArenaCycleOrchestrationResult:
     proposals_captured: int
 
 
+@dataclass(frozen=True)
+class ArenaAgentBudgetAssignmentContract:
+    agent_id: uuid.UUID
+    assigned_budget: Decimal
+
+
+@dataclass(frozen=True)
+class ArenaCompetitionAllocationRequest:
+    competition_id: uuid.UUID
+    idempotency_key: str
+    competition_budget: Decimal
+    assignments: list[ArenaAgentBudgetAssignmentContract]
+    provenance: dict[str, Any]
+    requested_by: str
+
+
+@dataclass(frozen=True)
+class ArenaCompetitionAllocationResult:
+    competition_budget_allocation_id: uuid.UUID
+    competition_id: uuid.UUID
+    paper_portfolio_id: uuid.UUID
+    master_account_id: uuid.UUID
+    competition_budget: Decimal
+    total_assigned_budget: Decimal
+    assignment_count: int
+    provenance: dict[str, Any]
+
+
 class ArenaLifecycleServiceContract(Protocol):
     async def ensure_competition(
         self,
@@ -164,3 +193,10 @@ class ArenaOrchestrationServiceContract(Protocol):
         snapshot: ArenaCycleSnapshotContract,
         proposals: list[ArenaAgentProposalContract],
     ) -> ArenaCycleOrchestrationResult: ...
+
+
+class ArenaPaperAllocationServiceContract(Protocol):
+    async def allocate_competition_budget(
+        self,
+        request: ArenaCompetitionAllocationRequest,
+    ) -> ArenaCompetitionAllocationResult: ...
