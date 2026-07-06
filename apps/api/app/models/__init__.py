@@ -2,6 +2,7 @@ from app.models.asset import Asset
 from app.models.arena_competition import ArenaCompetition
 from app.models.arena_cycle import ArenaCycle
 from app.models.arena_participating_agent import ArenaParticipatingAgent
+from app.models.arena_agent_registration import ArenaAgentRegistration
 from app.models.arena_tournament import ArenaTournament
 from app.models.audit_log import AuditLog
 from app.models.backtest import Backtest
@@ -28,6 +29,7 @@ __all__ = [
 	"Asset",
 	"ArenaCompetition",
 	"ArenaCycle",
+	"ArenaAgentRegistration",
 	"ArenaParticipatingAgent",
 	"ArenaTournament",
 	"AuditLog",

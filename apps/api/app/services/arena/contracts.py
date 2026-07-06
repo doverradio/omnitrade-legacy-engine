@@ -53,6 +53,48 @@ class ArenaLifecycleWriteRequest:
     requested_at: datetime
 
 
+@dataclass(frozen=True)
+class ArenaAgentVersionIdentityContract:
+    agent_id: uuid.UUID
+    version_id: uuid.UUID
+    semantic_version: str
+    created_at: datetime
+    provenance_metadata: dict[str, Any]
+    registration_source: str
+    registration_hash: str
+
+
+@dataclass(frozen=True)
+class ArenaAgentRegistrationRequest:
+    competition_id: uuid.UUID
+    strategy_id: str
+    strategy_version: str
+    semantic_version: str
+    registration_source: str
+    requested_by: str
+    provenance_metadata: dict[str, Any]
+    paper_only_eligible: bool
+    live_capital_eligible: bool
+    human_governed: bool
+    autonomous_self_modifying: bool
+    idempotency_key: str | None = None
+
+
+@dataclass(frozen=True)
+class ArenaEligibilityResult:
+    eligible: bool
+    rejection_reason: str | None
+
+
+@dataclass(frozen=True)
+class ArenaAgentRegistrationResult:
+    accepted: bool
+    identity: ArenaAgentVersionIdentityContract
+    rejection_reason: str | None
+    registration_record_id: uuid.UUID
+    participating_agent_id: uuid.UUID | None
+
+
 class ArenaLifecycleServiceContract(Protocol):
     async def ensure_competition(
         self,
@@ -77,3 +119,10 @@ class ArenaLifecycleServiceContract(Protocol):
         identity: ArenaAgentIdentityContract,
         request: ArenaLifecycleWriteRequest,
     ) -> uuid.UUID: ...
+
+
+class ArenaRegistrationServiceContract(Protocol):
+    async def register_agent(
+        self,
+        request: ArenaAgentRegistrationRequest,
+    ) -> ArenaAgentRegistrationResult: ...

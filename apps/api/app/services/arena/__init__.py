@@ -1,10 +1,15 @@
 from app.services.arena.contracts import (
+    ArenaAgentRegistrationRequest,
+    ArenaAgentRegistrationResult,
+    ArenaAgentVersionIdentityContract,
     ArenaAgentIdentityContract,
     ArenaCompetitionIdentityContract,
     ArenaCycleIdentityContract,
+    ArenaEligibilityResult,
     ArenaLifecycleServiceContract,
     ArenaLifecycleWriteRequest,
     ArenaProvenanceContract,
+    ArenaRegistrationServiceContract,
     ArenaTournamentIdentityContract,
 )
 from app.services.arena.identity import (
@@ -14,18 +19,33 @@ from app.services.arena.identity import (
     build_arena_participating_agent_idempotency_key,
     build_arena_tournament_idempotency_key,
 )
+from app.services.arena.registration import (
+    build_registration_hash,
+    build_registration_idempotency_key,
+    register_arena_agent,
+    validate_arena_eligibility,
+)
 
 __all__ = [
+    "ArenaAgentRegistrationRequest",
+    "ArenaAgentRegistrationResult",
+    "ArenaAgentVersionIdentityContract",
     "ArenaAgentIdentityContract",
     "ArenaCompetitionIdentityContract",
     "ArenaCycleIdentityContract",
+    "ArenaEligibilityResult",
     "ArenaLifecycleServiceContract",
     "ArenaLifecycleWriteRequest",
     "ArenaProvenanceContract",
+    "ArenaRegistrationServiceContract",
     "ArenaTournamentIdentityContract",
     "build_arena_competition_idempotency_key",
     "build_arena_cycle_idempotency_key",
     "build_arena_lifecycle_identity",
     "build_arena_participating_agent_idempotency_key",
     "build_arena_tournament_idempotency_key",
+    "build_registration_hash",
+    "build_registration_idempotency_key",
+    "register_arena_agent",
+    "validate_arena_eligibility",
 ]
