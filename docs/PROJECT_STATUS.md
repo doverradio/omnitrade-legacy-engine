@@ -10,13 +10,13 @@ Project Stage:
 Pre-MVP
 
 Current Phase:
-Phase 6 — Risk Engine (Complete)
+Phase 7 — Decision Intelligence Foundation (Complete)
 
 Current Prompt:
-Phase 6 final validation complete; awaiting explicit approval before any Phase 7 work
+Phase 7 exit review complete; preparing Phase 8 planning
 
 Overall Completion:
-Approximately 67%
+Approximately 78%
 
 ---
 
@@ -61,7 +61,7 @@ Capital Allocation Engine is a Portfolio Intelligence subsystem and is never tre
 
 # Current Goal
 
-Finalize Phase 6 closure artifacts and maintain architecture-boundary discipline before any next-phase kickoff.
+Finalize Phase 7 closure artifacts and begin Phase 8 planning only (no Phase 8 implementation yet).
 
 Phase progression remains gated by validation, documentation updates, and regression-free handoff before advancing.
 
@@ -128,7 +128,7 @@ Completed highlights:
 - Signal execution orchestration (paper-only) with duplicate prevention and audit coverage
 - Trade history, portfolio timeline, performance analytics, and small-account hardening on web surfaces
 
-## ⬜ Phase 6 — Risk Engine
+## ✅ Phase 6 — Risk Engine
 
 Status:
 COMPLETE
@@ -142,10 +142,22 @@ Completed highlights:
 - Risk Monitor UI with responsive status dashboard, kill-switch/rules confirmations, and accessibility-focused loading/error states
 - Full Phase 6 validation passing across backend tests, frontend tests, and frontend lint
 
-## ⬜ Phase 7 — Decision Intelligence Foundation
+## ✅ Phase 7 — Decision Intelligence Foundation
 
 Status:
-Not Started
+COMPLETE
+
+Completed highlights:
+
+- Decision Record and immutable Decision Snapshot foundations implemented
+- Decision timeline and explainability read models implemented
+- Counterfactual Outcome Ledger v1 implemented with bounded horizons
+- WAIT/alternative-action decision analysis support implemented
+- Decision Quality scoring foundations implemented
+- Advisory-only experiment recommendation generation implemented
+- Read-only Decision Intelligence API surfaces implemented
+- Decision Intelligence dashboard implemented as observational/read-only UI
+- Phase 7 validation passed (backend tests, frontend tests, frontend lint)
 
 ## ⬜ Phase 8 — Decision Arena
 
@@ -198,9 +210,15 @@ This ordering matches docs/MASTER_PRODUCT_ROADMAP.md and reflects implementation
 
 # Future Scope Notes
 
-Decision Intelligence foundation work now begins before Decision Arena in the roadmap.
+Decision Intelligence Foundation is complete and remains observational only.
+
+No Decision Arena runtime has been implemented.
+
+No Capital Allocation Engine runtime has been implemented.
 
 Future Live Trading remains downstream of earlier phases and human approval gates, and is not treated as an additional engine.
+
+Phase 8 planning is next; implementation has not started.
 
 ---
 
