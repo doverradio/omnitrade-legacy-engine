@@ -24,6 +24,7 @@ from app.services.risk import (
     RiskEvaluationRequest,
     evaluate_signal_risk,
     persist_risk_decision,
+    resolve_execution_risk_context,
 )
 
 
@@ -153,6 +154,11 @@ async def orchestrate_paper_signal_execution(
         raise NotFoundError(message="Asset not found", details={"asset_id": str(request.asset_id)})
 
     reference_price = await _load_latest_reference_price(db=db, asset_id=request.asset_id)
+    execution_risk_context = await resolve_execution_risk_context(
+        db=db,
+        paper_account=account,
+        asset=asset,
+    )
     risk_result = evaluate_signal_risk(
         request=RiskEvaluationRequest(
             signal_id=request.signal_id,
@@ -160,12 +166,28 @@ async def orchestrate_paper_signal_execution(
             asset_id=request.asset_id,
             side=request.side,
             quantity=request.quantity,
-            account_equity=account.current_cash_balance,
-            max_position_size_pct=Decimal("0.05"),
+            account_equity=execution_risk_context.account_equity,
+            max_position_size_pct=execution_risk_context.max_position_size_pct,
             min_order_notional=asset.min_order_notional,
             qty_step_size=asset.qty_step_size,
             supports_fractional=asset.supports_fractional,
             actor=request.actor,
+            start_of_day_equity=execution_risk_context.start_of_day_equity,
+            current_equity=execution_risk_context.current_equity,
+            max_daily_loss_pct=execution_risk_context.max_daily_loss_pct,
+            high_water_mark_equity=execution_risk_context.high_water_mark_equity,
+            max_drawdown_pct=execution_risk_context.max_drawdown_pct,
+            consecutive_losses_on_pair=execution_risk_context.consecutive_losses_on_pair,
+            cooldown_after_losses=execution_risk_context.cooldown_after_losses,
+            last_loss_at=execution_risk_context.last_loss_at,
+            cooldown_duration_minutes=execution_risk_context.cooldown_duration_minutes,
+            evaluation_time=execution_risk_context.evaluation_time,
+            data_is_stale=execution_risk_context.data_is_stale,
+            data_has_gaps=execution_risk_context.data_has_gaps,
+            global_kill_switch_engaged_state=execution_risk_context.global_kill_switch_engaged_state,
+            global_kill_switch_rearm_required=execution_risk_context.global_kill_switch_rearm_required,
+            account_kill_switch_engaged_state=execution_risk_context.account_kill_switch_engaged_state,
+            account_kill_switch_rearm_required=execution_risk_context.account_kill_switch_rearm_required,
         ),
         reference_price=reference_price,
     )

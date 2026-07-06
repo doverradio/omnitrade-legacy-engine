@@ -60,8 +60,10 @@ async def risk_status(account_id: uuid.UUID, db: AsyncSession = Depends(get_db))
                 limit=status.drawdown.limit,
                 pct_used=status.drawdown.pct_used,
             ),
-            active_cooldowns=[],
-            active_no_trade_zones=[],
+            active_cooldowns=status.active_cooldowns,
+            active_no_trade_zones=status.active_no_trade_zones,
+            active_cooldowns_state=status.active_cooldowns_state,
+            active_no_trade_zones_state=status.active_no_trade_zones_state,
         ),
     )
 

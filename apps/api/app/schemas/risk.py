@@ -45,6 +45,8 @@ class AccountRiskStatusResponse(BaseModel):
     drawdown: RiskUsageResponse
     active_cooldowns: list[CooldownStateResponse]
     active_no_trade_zones: list[NoTradeZoneStateResponse]
+    active_cooldowns_state: str | None = None
+    active_no_trade_zones_state: str | None = None
 
 
 class RiskStatusResponse(BaseModel):

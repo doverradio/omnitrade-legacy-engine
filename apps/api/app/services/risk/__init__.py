@@ -26,6 +26,7 @@ from app.services.risk.risk_persistence import (
 	RiskDecisionPersistenceResult,
 	persist_risk_decision,
 )
+from app.services.risk.risk_context import ExecutionRiskContext, resolve_execution_risk_context
 
 __all__ = [
 	"CooldownValidationResult",
@@ -52,4 +53,6 @@ __all__ = [
 	"RiskDecisionPersistenceRequest",
 	"RiskDecisionPersistenceResult",
 	"persist_risk_decision",
+	"ExecutionRiskContext",
+	"resolve_execution_risk_context",
 ]

@@ -11,6 +11,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.core.errors import InvalidRequestError, NotFoundError, ServiceUnavailableError
 from app.models.audit_log import AuditLog
 from app.models.paper_account import PaperAccount
+from app.models.risk_event import RiskEvent
 from app.models.risk_kill_switch import RiskKillSwitch
 from app.models.risk_rule_config import RiskRuleConfig
 
@@ -43,6 +44,10 @@ class RiskStatusData:
     account_reason: str | None
     daily_loss: RiskStatusUsage
     drawdown: RiskStatusUsage
+    active_cooldowns: list[dict[str, str]]
+    active_no_trade_zones: list[dict[str, str]]
+    active_cooldowns_state: str
+    active_no_trade_zones_state: str
 
 
 @dataclass(frozen=True, slots=True)
@@ -200,6 +205,26 @@ async def get_risk_status(*, db: AsyncSession, account_id: uuid.UUID) -> RiskSta
             details={"account_id": str(account.id)},
         )
 
+    cooldown_event = await db.scalar(
+        select(RiskEvent)
+        .where(RiskEvent.paper_account_id == account.id)
+        .where(RiskEvent.event_type == "cooldown")
+        .where(RiskEvent.action_taken == "blocked")
+        .order_by(RiskEvent.created_at.desc())
+        .limit(1)
+    )
+    no_trade_event = await db.scalar(
+        select(RiskEvent)
+        .where(RiskEvent.paper_account_id == account.id)
+        .where(RiskEvent.event_type == "no_trade_zone")
+        .where(RiskEvent.action_taken == "blocked")
+        .order_by(RiskEvent.created_at.desc())
+        .limit(1)
+    )
+
+    active_cooldowns_state = "unknown_from_persisted_events" if cooldown_event is not None else "none_observed"
+    active_no_trade_zones_state = "unknown_from_persisted_events" if no_trade_event is not None else "none_observed"
+
     equity = Decimal(account.current_cash_balance)
     starting_balance = Decimal(account.starting_balance)
     if starting_balance <= Decimal("0"):
@@ -239,6 +264,10 @@ async def get_risk_status(*, db: AsyncSession, account_id: uuid.UUID) -> RiskSta
         account_reason=paused_reason,
         daily_loss=daily_usage,
         drawdown=drawdown_usage,
+        active_cooldowns=[],
+        active_no_trade_zones=[],
+        active_cooldowns_state=active_cooldowns_state,
+        active_no_trade_zones_state=active_no_trade_zones_state,
     )
 
 
