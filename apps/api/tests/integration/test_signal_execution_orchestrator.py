@@ -13,6 +13,7 @@ from app.models.audit_log import AuditLog
 from app.models.candle import Candle
 from app.models.paper_account import PaperAccount
 from app.models.risk_event import RiskEvent
+from app.models.risk_kill_switch import RiskKillSwitch
 from app.models.trade import Trade
 from app.services.paper.alpaca_paper import AlpacaPaperOrderResult
 from app.services.risk import (
@@ -66,6 +67,13 @@ class _FakeSession:
         self.candles = candles or []
         self.audit_logs: list[AuditLog] = []
         self.risk_events: list[RiskEvent] = []
+        self.kill_switches: list[RiskKillSwitch] = [
+            RiskKillSwitch(scope="global", paper_account_id=None, engaged=False, rearm_required=False),
+            *[
+                RiskKillSwitch(scope="account", paper_account_id=account.id, engaged=False, rearm_required=False)
+                for account in accounts
+            ],
+        ]
 
     def begin(self) -> _BeginContext:
         return _BeginContext()
@@ -94,6 +102,17 @@ class _FakeSession:
         if "FROM assets" in sql:
             asset_id = next((value for value in values if isinstance(value, uuid.UUID)), None)
             return next((item for item in self.assets if item.id == asset_id), None)
+
+        if "FROM risk_kill_switches" in sql:
+            scope = next((value for value in values if isinstance(value, str) and value in {"global", "account"}), None)
+            account_id = next((value for value in values if isinstance(value, uuid.UUID)), None)
+            for switch in self.kill_switches:
+                if switch.scope != scope:
+                    continue
+                if switch.paper_account_id != account_id:
+                    continue
+                return switch
+            return None
 
         if "SELECT candles.close" in sql:
             asset_id = next((value for value in values if isinstance(value, uuid.UUID)), None)

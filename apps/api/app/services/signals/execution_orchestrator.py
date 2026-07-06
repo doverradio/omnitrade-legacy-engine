@@ -188,6 +188,8 @@ async def orchestrate_paper_signal_execution(
             global_kill_switch_rearm_required=execution_risk_context.global_kill_switch_rearm_required,
             account_kill_switch_engaged_state=execution_risk_context.account_kill_switch_engaged_state,
             account_kill_switch_rearm_required=execution_risk_context.account_kill_switch_rearm_required,
+            global_kill_switch_state_observed=execution_risk_context.global_kill_switch_state_observed,
+            account_kill_switch_state_observed=execution_risk_context.account_kill_switch_state_observed,
         ),
         reference_price=reference_price,
     )
@@ -202,6 +204,24 @@ async def orchestrate_paper_signal_execution(
     )
 
     if risk_result.action == RiskDecisionAction.REJECT:
+        rejected_audit = AuditLog(
+            actor=request.actor,
+            action="signal_execution_rejected_by_risk",
+            entity_type="signal",
+            entity_id=request.signal_id,
+            before_state={
+                "paper_account_id": str(request.paper_account_id),
+                "asset_id": str(request.asset_id),
+                "requested_quantity": format(request.quantity, "f"),
+            },
+            after_state={
+                "reason_code": risk_result.reason_code,
+                "execution_venue": "risk_engine",
+                "is_paper": True,
+            },
+        )
+        db.add(rejected_audit)
+        await db.commit()
         return SignalExecutionResult(
             signal_id=request.signal_id,
             paper_account_id=request.paper_account_id,

@@ -44,9 +44,11 @@ class RiskEvaluationRequest:
     global_kill_switch_engaged_state: bool | None = None
     global_kill_switch_rearm_required: bool | None = None
     global_kill_switch_rearmed_by_human: bool | None = None
+    global_kill_switch_state_observed: bool = False
     account_kill_switch_engaged_state: bool | None = None
     account_kill_switch_rearm_required: bool | None = None
     account_kill_switch_rearmed_by_human: bool | None = None
+    account_kill_switch_state_observed: bool = False
     actor: str = "system"
     ai_confidence: Decimal | None = None
 
@@ -469,6 +471,8 @@ def evaluate_signal_risk(
     global_kill_switch_blocked = resolved_context.global_kill_switch_engaged
     global_kill_switch_reason = "global_kill_switch_engaged" if resolved_context.global_kill_switch_engaged else None
     if (
+        request.global_kill_switch_state_observed
+        or
         request.global_kill_switch_engaged_state is not None
         or request.global_kill_switch_rearm_required is not None
         or request.global_kill_switch_rearmed_by_human is not None
@@ -494,6 +498,8 @@ def evaluate_signal_risk(
     account_kill_switch_blocked = resolved_context.account_trading_paused
     account_kill_switch_reason = "account_trading_paused" if resolved_context.account_trading_paused else None
     if (
+        request.account_kill_switch_state_observed
+        or
         request.account_kill_switch_engaged_state is not None
         or request.account_kill_switch_rearm_required is not None
         or request.account_kill_switch_rearmed_by_human is not None

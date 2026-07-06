@@ -64,6 +64,9 @@ async def risk_status(account_id: uuid.UUID, db: AsyncSession = Depends(get_db))
             active_no_trade_zones=status.active_no_trade_zones,
             active_cooldowns_state=status.active_cooldowns_state,
             active_no_trade_zones_state=status.active_no_trade_zones_state,
+            policy_source=status.policy_source,
+            daily_loss_input_source=status.daily_loss_input_source,
+            drawdown_input_source=status.drawdown_input_source,
         ),
     )
 

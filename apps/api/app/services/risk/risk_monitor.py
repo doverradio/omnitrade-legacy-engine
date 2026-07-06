@@ -14,15 +14,16 @@ from app.models.paper_account import PaperAccount
 from app.models.risk_event import RiskEvent
 from app.models.risk_kill_switch import RiskKillSwitch
 from app.models.risk_rule_config import RiskRuleConfig
+from app.services.risk.risk_context import RISK_POLICY_DEFAULTS, resolve_effective_risk_policy
 
 
 DEFAULT_RULES = {
-    "max_position_size_pct": Decimal("0.10"),
-    "max_daily_loss_pct": Decimal("0.03"),
-    "max_drawdown_pct": Decimal("0.10"),
-    "default_stop_loss_pct": Decimal("0.03"),
-    "cooldown_after_losses": 3,
-    "cooldown_duration_hours": 24,
+    "max_position_size_pct": Decimal(RISK_POLICY_DEFAULTS["max_position_size_pct"]),
+    "max_daily_loss_pct": Decimal(RISK_POLICY_DEFAULTS["max_daily_loss_pct"]),
+    "max_drawdown_pct": Decimal(RISK_POLICY_DEFAULTS["max_drawdown_pct"]),
+    "default_stop_loss_pct": Decimal(RISK_POLICY_DEFAULTS["default_stop_loss_pct"]),
+    "cooldown_after_losses": int(RISK_POLICY_DEFAULTS["cooldown_after_losses"]),
+    "cooldown_duration_hours": int(RISK_POLICY_DEFAULTS["cooldown_duration_hours"]),
 }
 
 
@@ -48,6 +49,9 @@ class RiskStatusData:
     active_no_trade_zones: list[dict[str, str]]
     active_cooldowns_state: str
     active_no_trade_zones_state: str
+    policy_source: str
+    daily_loss_input_source: str
+    drawdown_input_source: str
 
 
 @dataclass(frozen=True, slots=True)
@@ -187,6 +191,7 @@ def _is_loosening(
 
 async def get_risk_status(*, db: AsyncSession, account_id: uuid.UUID) -> RiskStatusData:
     account = await _get_account_or_404(db, account_id)
+    effective_policy = await resolve_effective_risk_policy(db=db, paper_account_id=account.id)
 
     global_stmt = select(RiskKillSwitch).where(
         RiskKillSwitch.scope == "global",
@@ -222,8 +227,12 @@ async def get_risk_status(*, db: AsyncSession, account_id: uuid.UUID) -> RiskSta
         .limit(1)
     )
 
-    active_cooldowns_state = "unknown_from_persisted_events" if cooldown_event is not None else "none_observed"
-    active_no_trade_zones_state = "unknown_from_persisted_events" if no_trade_event is not None else "none_observed"
+    active_cooldowns_state = (
+        "active_state_unavailable_from_risk_events" if cooldown_event is not None else "unavailable_not_persisted"
+    )
+    active_no_trade_zones_state = (
+        "active_state_unavailable_from_risk_events" if no_trade_event is not None else "unavailable_not_persisted"
+    )
 
     equity = Decimal(account.current_cash_balance)
     starting_balance = Decimal(account.starting_balance)
@@ -231,8 +240,8 @@ async def get_risk_status(*, db: AsyncSession, account_id: uuid.UUID) -> RiskSta
         daily_limit = Decimal("0")
         drawdown_limit = Decimal("0")
     else:
-        daily_limit = starting_balance * DEFAULT_RULES["max_daily_loss_pct"]
-        drawdown_limit = starting_balance * DEFAULT_RULES["max_drawdown_pct"]
+        daily_limit = starting_balance * effective_policy.max_daily_loss_pct
+        drawdown_limit = starting_balance * effective_policy.max_drawdown_pct
 
     loss = max(Decimal("0"), starting_balance - equity)
 
@@ -268,6 +277,9 @@ async def get_risk_status(*, db: AsyncSession, account_id: uuid.UUID) -> RiskSta
         active_no_trade_zones=[],
         active_cooldowns_state=active_cooldowns_state,
         active_no_trade_zones_state=active_no_trade_zones_state,
+        policy_source=effective_policy.source,
+        daily_loss_input_source="fallback_starting_balance",
+        drawdown_input_source="fallback_starting_balance",
     )
 
 

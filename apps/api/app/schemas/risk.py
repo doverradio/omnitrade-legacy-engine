@@ -47,6 +47,9 @@ class AccountRiskStatusResponse(BaseModel):
     active_no_trade_zones: list[NoTradeZoneStateResponse]
     active_cooldowns_state: str | None = None
     active_no_trade_zones_state: str | None = None
+    policy_source: str | None = None
+    daily_loss_input_source: str | None = None
+    drawdown_input_source: str | None = None
 
 
 class RiskStatusResponse(BaseModel):
