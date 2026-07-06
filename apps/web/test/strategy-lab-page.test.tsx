@@ -1,4 +1,4 @@
-import { render, screen, waitFor } from "@testing-library/react";
+import { render, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
@@ -101,6 +101,135 @@ afterEach(() => {
 });
 
 describe("StrategyLabPage Prompt 4.2", () => {
+  it("renders Configuration Coach ready state by default", async () => {
+    installFetchMock("success");
+    render(<StrategyLabPage />);
+
+    await waitFor(() => {
+      expect(screen.getByTestId("strategy-lab-section-configuration-coach")).toBeInTheDocument();
+    });
+
+    expect(screen.getByTestId("configuration-health-badge")).toHaveTextContent("Ready");
+    expect(screen.getByTestId("readiness-score")).toHaveTextContent("100 / 100");
+    expect(screen.getByText("Ready for Backtesting")).toBeInTheDocument();
+  });
+
+  it("renders Configuration Coach warning state for out-of-range recommendations", async () => {
+    installFetchMock("success");
+    render(<StrategyLabPage />);
+    const user = userEvent.setup();
+
+    await waitFor(() => {
+      expect(screen.getByLabelText("Slow Period value")).toBeInTheDocument();
+    });
+
+    const slowPeriodInput = screen.getByLabelText("Slow Period value");
+    await user.clear(slowPeriodInput);
+    await user.type(slowPeriodInput, "300");
+
+    expect(screen.getByTestId("configuration-health-badge")).toHaveTextContent("Needs Attention");
+    expect(screen.getByTestId("readiness-score")).toHaveTextContent("90 / 100");
+    expect(within(screen.getByTestId("coach-card-readiness")).getByText("Needs Attention")).toBeInTheDocument();
+  });
+
+  it("renders Configuration Coach invalid state for validation errors", async () => {
+    installFetchMock("success");
+    render(<StrategyLabPage />);
+    const user = userEvent.setup();
+
+    await waitFor(() => {
+      expect(screen.getByLabelText("Slow Period value")).toBeInTheDocument();
+    });
+
+    const slowPeriodInput = screen.getByLabelText("Slow Period value");
+    await user.clear(slowPeriodInput);
+    await user.type(slowPeriodInput, "2");
+
+    expect(screen.getByTestId("configuration-health-badge")).toHaveTextContent("Invalid");
+    expect(screen.getByTestId("readiness-score")).toHaveTextContent("55 / 100");
+    expect(within(screen.getByTestId("coach-card-readiness")).getByText("Invalid")).toBeInTheDocument();
+  });
+
+  it("updates What Changed section after parameter edits", async () => {
+    installFetchMock("success");
+    render(<StrategyLabPage />);
+    const user = userEvent.setup();
+
+    await waitFor(() => {
+      expect(screen.getByLabelText("Fast Period value")).toBeInTheDocument();
+    });
+
+    const fastPeriodInput = screen.getByLabelText("Fast Period value");
+    await user.clear(fastPeriodInput);
+    await user.type(fastPeriodInput, "20");
+
+    const changedCard = screen.getByTestId("what-changed-fast_period");
+    expect(changedCard).toBeInTheDocument();
+    expect(changedCard).toHaveTextContent("10");
+    expect(changedCard).toHaveTextContent("20");
+    expect(changedCard).toHaveTextContent("Fewer trading signals");
+    expect(changedCard).toHaveTextContent("No issues detected.");
+  });
+
+  it("renders Estimated Behavior summary", async () => {
+    installFetchMock("success");
+    render(<StrategyLabPage />);
+
+    await waitFor(() => {
+      expect(screen.getByTestId("coach-card-estimated-behavior")).toBeInTheDocument();
+    });
+
+    expect(screen.getByTestId("behavior-trade-frequency")).toBeInTheDocument();
+    expect(screen.getByTestId("behavior-responsiveness")).toBeInTheDocument();
+    expect(screen.getByTestId("behavior-noise-filtering")).toBeInTheDocument();
+    expect(screen.getByTestId("behavior-trend-sensitivity")).toBeInTheDocument();
+  });
+
+  it("renders Beginner Mode Things to Know observations", async () => {
+    installFetchMock("success");
+    render(<StrategyLabPage />);
+
+    await waitFor(() => {
+      expect(screen.getByTestId("coach-card-things-to-know")).toBeInTheDocument();
+    });
+
+    expect(screen.getByText(/Your configuration is valid./)).toBeInTheDocument();
+    expect(screen.getByText(/Configuration readiness is 100 out of 100./)).toBeInTheDocument();
+  });
+
+  it("supports Advanced Details collapse and expand", async () => {
+    installFetchMock("success");
+    render(<StrategyLabPage />);
+    const user = userEvent.setup();
+
+    await waitFor(() => {
+      expect(screen.getByTestId("advanced-details-collapsed")).toBeInTheDocument();
+    });
+
+    expect(screen.queryByTestId("advanced-raw-metadata")).not.toBeVisible();
+    await user.click(screen.getByText("Show validation warnings, ranges, and metadata"));
+    expect(screen.getByTestId("advanced-raw-metadata")).toBeVisible();
+  });
+
+  it("keeps Configuration Coach mobile layout and accessibility basics", async () => {
+    installFetchMock("success");
+    render(<StrategyLabPage />);
+
+    await waitFor(() => {
+      expect(screen.getByTestId("configuration-coach-cards")).toBeInTheDocument();
+    });
+
+    expect(screen.getByTestId("strategy-lab-mobile-wrapper")).toBeInTheDocument();
+    expect(screen.getByTestId("coach-card-health")).toBeInTheDocument();
+    expect(screen.getByTestId("coach-card-readiness")).toBeInTheDocument();
+    expect(screen.getByTestId("coach-card-what-changed")).toBeInTheDocument();
+    expect(screen.getByTestId("coach-card-estimated-behavior")).toBeInTheDocument();
+    expect(screen.getByTestId("coach-card-why-this-matters")).toBeInTheDocument();
+    expect(screen.getByTestId("coach-card-things-to-know")).toBeInTheDocument();
+    expect(screen.getByTestId("coach-card-advanced-details")).toBeInTheDocument();
+    expect(screen.getByText("Show validation warnings, ranges, and metadata")).toBeInTheDocument();
+  });
+
   it("renders generated parameter editor for selected strategy", async () => {
     installFetchMock("success");
     render(<StrategyLabPage />);
@@ -199,7 +328,7 @@ describe("StrategyLabPage Prompt 4.2", () => {
     await user.clear(slowPeriodInput);
     await user.type(slowPeriodInput, "2");
 
-    expect(await screen.findByText("Slow Period must be at least 5.")).toBeInTheDocument();
+    expect((await screen.findAllByText("Slow Period must be at least 5.")).length).toBeGreaterThan(0);
     expect(screen.getByTestId("parameter-form-validation")).toHaveTextContent("validation issue");
   });
 

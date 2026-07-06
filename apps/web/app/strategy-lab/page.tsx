@@ -4,6 +4,7 @@ import { useEffect, useMemo, useState } from "react";
 
 import { ApiRequestError } from "@/lib/api/backtests";
 import { getStrategies, type StrategyItem } from "@/lib/api/strategies";
+import { ConfigurationCoach } from "@/components/domain/ConfigurationCoach";
 import {
   getParameterDefinitions,
   validateParameterValue,
@@ -905,12 +906,23 @@ export default function StrategyLabPage() {
           ) : null}
         </section>
 
-        <PlaceholderSection
-          id="configuration-intelligence"
-          title="3) Configuration Intelligence"
-          description="Review a plain-language readiness summary before running a backtest."
-          placeholder="Configuration Intelligence Panel placeholder reserved."
-        />
+        {selectedStrategy && parameterDefinitions.length > 0 ? (
+          <ConfigurationCoach
+            strategySlug={selectedStrategy.slug}
+            isBeginnerMode={isBeginnerMode}
+            definitions={parameterDefinitions}
+            values={parameterValues}
+            fieldValidation={perFieldValidation}
+            formValidation={formValidation}
+          />
+        ) : (
+          <PlaceholderSection
+            id="configuration-intelligence"
+            title="3) Configuration Intelligence"
+            description="Review a plain-language readiness summary before running a backtest."
+            placeholder="Select a strategy and load parameter metadata to view the Configuration Coach."
+          />
+        )}
 
         <PlaceholderSection
           id="run-backtest"
