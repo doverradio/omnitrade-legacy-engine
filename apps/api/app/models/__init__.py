@@ -5,6 +5,7 @@ from app.models.backtest_trade import BacktestTrade
 from app.models.candle import Candle
 from app.models.decision_alternative_action import DecisionAlternativeAction
 from app.models.decision_counterfactual_result import DecisionCounterfactualResult
+from app.models.decision_experiment_recommendation import DecisionExperimentRecommendation
 from app.models.decision_explainability_record import DecisionExplainabilityRecord
 from app.models.decision_quality_score import DecisionQualityScore
 from app.models.decision_record import DecisionRecord
@@ -27,6 +28,7 @@ __all__ = [
 	"Candle",
 	"DecisionAlternativeAction",
 	"DecisionCounterfactualResult",
+	"DecisionExperimentRecommendation",
 	"DecisionExplainabilityRecord",
 	"DecisionQualityScore",
 	"DecisionRecord",
