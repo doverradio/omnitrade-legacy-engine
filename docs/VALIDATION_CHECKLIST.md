@@ -92,6 +92,88 @@ cd apps/api && pytest tests/unit/services/backtesting -v
 **Expected results:**
 - [ ] Each of the 6 strategies has at least one completed backtest with sane, non-null metrics.
 
+---
+
+### Phase 5 — Portfolio Intelligence + Paper Execution Foundation
+
+**Commands to run:**
+```bash
+cd apps/api
+pytest tests/api -v
+pytest tests/unit -v
+pytest tests/integration -v
+pytest tests/services -v
+
+cd ../web
+pnpm test
+pnpm lint
+```
+
+**Backend validation:**
+- [ ] Paper account creation works with the documented $25 minimum floor and returns expected account state.
+- [ ] Portfolio accounting updates correctly after paper execution events (cash, equity, positions).
+- [ ] Position tracking remains consistent across account queries and trade history queries.
+- [ ] Trade recording writes complete and queryable trade records for each executed paper fill.
+- [ ] Fractional crypto quantities are persisted and returned without precision loss.
+- [ ] Fractional stock support behavior is respected for supported symbols and handled safely for unsupported paths.
+- [ ] Signal execution path runs end-to-end for paper mode without introducing live-trading paths.
+- [ ] Duplicate execution prevention is verified (same signal is not executed twice).
+- [ ] Restart recovery is verified (in-flight/pending states recover without duplicate fills or orphaned accounting state).
+- [ ] Audit logging is verified for all state-changing actions in this phase.
+
+**Frontend validation:**
+- [ ] `/paper-trading` renders complete Paper Trading workflows with correct paper labels and no live-capital ambiguity.
+- [ ] Portfolio dashboard surfaces account equity and performance consistently with backend state.
+- [ ] Trade history view renders executed paper trades correctly and remains filterable.
+- [ ] Portfolio timeline view renders chronological account/trade progression without missing states.
+- [ ] Performance charts render with correct loading/empty/error behavior and no precision-format regressions.
+- [ ] Signals display remains consistent with execution outcomes (`generated`, `risk_rejected`, `executed`, `expired` as applicable).
+- [ ] Small Account labeling is explicit wherever balances or returns are shown.
+
+**Accounting validation:**
+- [ ] Cash balance reconciliation passes against trade history and current open positions.
+- [ ] Position reconciliation passes between holdings view and executed trade ledger.
+- [ ] Realized P&L is computed and displayed correctly.
+- [ ] Unrealized P&L is computed and displayed correctly.
+- [ ] Equity calculation matches cash + mark-to-market position value.
+- [ ] Fee accounting is consistently included in execution and portfolio-level reporting.
+- [ ] Dollar + percentage reporting appears together wherever required by Small Account Mode.
+
+**Small Account Mode validation ($25 proving ground):**
+- [ ] End-to-end operation is validated at a $25 starting balance.
+- [ ] Fractional crypto execution and accounting are validated at small-account scale.
+- [ ] Supported fractional stock behavior is validated at small-account scale.
+- [ ] Fee drag visibility is present and understandable in results/performance surfaces.
+- [ ] Percentage sizing assumptions are respected in portfolio and execution flows.
+- [ ] Minimum order handling is validated (including safe rejection paths where minimums are not met).
+- [ ] Paper labeling is consistently visible across all phase-relevant pages and outputs.
+
+**Failure scenarios:**
+- [ ] Duplicate execution attempt is safely rejected or deduplicated with no double fill.
+- [ ] Service restart during execution recovers cleanly with no accounting drift.
+- [ ] Missing market data path is handled safely with clear state and no unsafe execution.
+- [ ] Rejected trade path is handled and recorded correctly.
+- [ ] Invalid order size path is handled and recorded correctly.
+- [ ] Internal simulator failure path is handled safely and visibly.
+- [ ] Disconnected paper broker path is handled safely and visibly.
+- [ ] Stale signal handling is validated.
+- [ ] Expired signal handling is validated.
+
+**Expected results (Phase 5 exit criteria):**
+- [ ] At least one strategy runs unattended for 5+ consecutive trading days against a paper account.
+- [ ] Zero duplicate executions are observed.
+- [ ] Zero accounting mismatches are observed.
+- [ ] Restart recovery is verified as successful.
+- [ ] Realized P&L is verified.
+- [ ] Unrealized P&L is verified.
+- [ ] Portfolio reconciliation from trade history is verified.
+- [ ] Trade records show no missed executions for approved paper signals during the validation window.
+- [ ] Trade records show no duplicated executions during the validation window.
+- [ ] Correct P&L accounting is verified for the validation run.
+- [ ] $25 Small Account Mode is validated end-to-end.
+- [ ] Audit logs are written for every state-changing action.
+- [ ] No live-trading code path exists in the implemented Phase 5 scope.
+
 > Checklists for Phases 4–8 should be appended to this file as those phases are reached, following the same format (commands / tests / pages / endpoints / expected results), referencing the exit criteria already defined per-phase in `MVP_BUILD_PLAN.md`.
 
 ---

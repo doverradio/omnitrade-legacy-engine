@@ -1,6 +1,6 @@
-# OmniTrade Legacy Engine — Project Status
+# OmniTrade Decision Intelligence Platform — Project Status
 
-Last Updated: 2026-07-05
+Last Updated: 2026-07-06
 
 ---
 
@@ -10,314 +10,204 @@ Project Stage:
 Pre-MVP
 
 Current Phase:
-Phase 4 — Strategy Lab
+Phase 4 — Research Workspace
 
 Current Prompt:
-Pending Phase 4 prompt creation
+Pending next Phase 4 prompt cycle
 
 Overall Completion:
 Approximately 30%
 
 ---
 
+# Project Vision
+
+OmniTrade is now positioned as the **OmniTrade Decision Intelligence Platform**.
+
+Trading is the first application domain.
+
+It is not the final product.
+
+The platform's long-term objective is to improve decision quality through explainability, experimentation, and disciplined validation, consistent with the architecture in docs/MASTER_PRODUCT_ROADMAP.md.
+
+---
+
+# Current Direction
+
+The platform is built around four permanent foundational engines:
+
+- Market Intelligence
+- Strategy Evolution
+- Portfolio Intelligence
+- Decision Intelligence
+
+No fifth foundational engine is introduced.
+
+Portfolio Intelligence currently contains the following subsystem scope:
+
+- Paper Trading
+- Portfolio Accounting
+- Performance Analytics
+- Capital Allocation Engine
+- Small Account Challenge
+
+Live Trading is not a core engine.
+
+Live Trading remains a future deployment mode.
+
+Capital Allocation Engine is a Portfolio Intelligence subsystem and is never treated as an independent foundational engine.
+
+---
+
 # Current Goal
 
-Prepare Phase 4 (Strategy Lab) prompt and implementation plan after Phase 3 completion.
+Complete Phase 4 (Research Workspace) with strict architecture discipline, then proceed through the roadmap in order.
 
-Do not begin Phase 4 (Strategy Lab) until:
-
-- Phase 3 implementation is complete. (Complete)
-- Phase 3 validation passes. (Complete)
-- Documentation is updated.
-- PROJECT_STATUS.md is updated.
-- Code is committed.
-- No known regressions remain.
-
-Project philosophy:
-
-Build one layer.
-
-Validate it.
-
-Commit it.
-
-Only then move to the next layer.
-
-Never skip phases.
+Phase progression remains gated by validation, documentation updates, and regression-free handoff before advancing.
 
 ---
 
 # Phase Progress
 
-## ✅ Phase 0 — Repository Scaffold
+## ✅ Phase 1 — Infrastructure
 
 Status:
 COMPLETE
 
-Completed:
+Completed highlights:
 
-- Monorepo scaffold
-- FastAPI backend
-- Next.js frontend
-- Shared package
-- Docker
-- Alembic
-- Health endpoint
-- CI
-- Initial validation
+- Repository scaffold and environment baseline
+- Backend and frontend service foundation
+- Health checks and initial validation workflow
 
-Validated against:
-
-- VALIDATION_CHECKLIST.md
-
----
-
-## ✅ Phase 1 — Data Ingestion
+## ✅ Phase 2 — Strategy Framework
 
 Status:
 COMPLETE
 
-Completed:
+Completed highlights:
 
-- Assets and Candles schema
-- Binance ingestion
-- Historical backfill
-- Markets API
-- Scheduled ingestion worker
-- Markets UI
-- Candlestick chart rendering with real market data
-- Phase 1 validation completed
-
-Validated against:
-
-- VALIDATION_CHECKLIST.md
-
----
-
-## ✅ Phase 2 — Chart UI
-
-Status:
-COMPLETE
-
-Completed:
-
-- Markets page completed
-- Asset selector
-- Interval selector
-- TradingView Lightweight Charts integration
-- Responsive candlestick chart
-- Crosshair
-- Zoom and pan
-- SMA overlay
-- In-memory candle caching
-- Loading state
-- Empty state
-- Error state
-- Responsive resizing
-- Frontend validation completed
-
-Validated against:
-
-- VALIDATION_CHECKLIST.md
-
----
+- Strategy framework foundations
+- Market-facing framework integration and validation support
 
 ## ✅ Phase 3 — Backtesting
 
 Status:
 COMPLETE
 
-Completed:
+Completed highlights:
 
-- Backtesting database models and migrations
-- Strategy interface and registry
-- MA Crossover strategy and remaining MVP strategy/filter modules
-- Event-driven backtesting engine
-- Fill simulation and metrics engine (including fee drag and small-account warning support)
-- Backtest persistence service
-- Backtest API endpoints (`/backtests/run`, `/backtests`, `/backtests/{id}`, `/backtests/{id}/trades`)
-- Backtests page UI with running/completed/failed/empty states
-- Metadata support endpoint for backtests UI (`GET /parameter-sets`) while preserving documented `GET /strategies` contract
-- Documented `GET /strategies` endpoint implemented for end-to-end manual validation
-- Phase 3 validation completed (backend tests, frontend tests, manual backtest/API/UI validation)
+- Event-driven backtesting flow
+- Strategy module integration for MVP scope
+- Persistence, metrics, and validation workflows
 
----
+## 🔄 Phase 4 — Research Workspace
 
-## ⬜ Phase 4 — Strategy Lab
+Status:
+IN PROGRESS
+
+Focus:
+
+- Strategy Lab and research ergonomics
+- Explainable comparison and validation workflows
+- Documentation-first phase discipline
+
+## ⬜ Phase 5 — Portfolio Intelligence + Paper Execution Foundation
 
 Status:
 Not Started
 
----
+Purpose:
 
-## ⬜ Phase 5 — Paper Trading
+Establish the Portfolio Intelligence + Paper Execution Foundation for safely proving strategies before any real capital exposure.
 
-Status:
-Not Started
-
----
-
-## ⬜ Phase 6 — AI Layer
+## ⬜ Phase 6 — Risk Engine
 
 Status:
 Not Started
 
----
-
-## ⬜ Phase 7 — Risk Engine
+## ⬜ Phase 7 — Decision Arena
 
 Status:
 Not Started
 
----
-
-## ⬜ Phase 8 — Deployment
+## ⬜ Phase 8 — Decision Intelligence Engine
 
 Status:
 Not Started
 
----
+## ⬜ Future — Live Trading
 
-## ⬜ Future Phase
+Status:
+Not Started
 
-Decision Intelligence Engine
-
-Includes:
-
-- Decision Records
-- Decision Snapshot
-- Counterfactual Outcome Ledger
-- Decision Quality Engine
-- Decision Explorer
-- Decision Timeline
-- Decision Compare
-- Confidence Analytics
+Live Trading is planned only as a future deployment mode after prior phases and explicit approval gates are satisfied.
 
 ---
 
-# Important Architectural Decisions
+# Implementation Roadmap
 
-The following have already been decided.
-
-Do not revisit them without creating an ADR.
-
-- FastAPI backend
-- Next.js frontend
-- Supabase/Postgres
-- Four Core Engine architecture
-- Small Account Mode
-- Decision Intelligence Engine
-- Counterfactual Outcome Ledger
-- Decision Snapshot
-- Decision Quality Engine
-- Paper trading only
-- Explainability first
-- Decision quality over profit
-
----
-
-# Current Priority
-
-Begin Phase 4 prompt creation while maintaining architectural discipline.
-
-Do not implement any Phase 5 or later systems until Phase 4 has been completed, validated, documented, and committed.
-
----
-
-# Phase Validation Summary
-
-Phase 0
-
-- Complete
-- Validated
+The active implementation roadmap is:
 
 Phase 1
-
-- Complete
-- Backend tests passing
-- Frontend tests passing
-- Production build verified
+Infrastructure
 
 Phase 2
-
-- Complete
-- Markets UI manually verified
-- Candlestick rendering verified
-- Interval switching verified
-- SMA overlay verified
-- Frontend tests passing
-- Production build verified
+Strategy Framework
 
 Phase 3
+Backtesting
 
-- Complete
-- Backend tests passing (`pytest`)
-- Frontend tests passing (`pnpm test`)
-- Manual MA Crossover backtest run completed against real BTCUSDT candles
-- Backtest persistence verified (`backtests`, `backtest_trades`, populated metrics)
-- API verification completed (`GET /backtests`, `GET /backtests/{id}`, `GET /backtests/{id}/trades`, `GET /strategies`)
-- Backtests UI states manually verified (running/completed/failed/empty)
+Phase 4
+Research Workspace
 
-Known developer environment issue:
+Phase 5
+Portfolio Intelligence + Paper Execution Foundation
 
-Docker may leave root-owned .next artifacts causing local EACCES errors during lint/build.
-This is a local development environment issue and is NOT considered a Phase 3 functional blocker.
+Phase 6
+Risk Engine
+
+Phase 7
+Decision Arena
+
+Phase 8
+Decision Intelligence Engine
+
+Future
+Live Trading
+
+This ordering matches docs/MASTER_PRODUCT_ROADMAP.md and reflects implementation sequence, not foundational-architecture importance.
 
 ---
 
-# Upcoming Roadmap
+# Future Scope Notes
 
-After Phase 3:
+Decision Intelligence implementation occurs after Decision Arena in the roadmap.
 
-## Phase 4
-
-Strategy Lab
-
-## Phase 5
-
-Paper Trading
-
-## Phase 6
-
-AI Layer
-
-## Phase 7
-
-Risk Engine
-
-## Phase 8
-
-Deployment
-
-## Future
-
-Decision Intelligence Engine
+Future Live Trading remains downstream of earlier phases and human approval gates, and is not treated as an additional engine.
 
 ---
 
 # Definition of Done
 
-A phase is considered complete only when:
+A phase is complete only when:
 
-- All Copilot prompts for the phase are complete.
-- Validation checklist passes.
-- Code is committed.
+- Scope goals are implemented for that phase.
+- Validation is complete.
 - Documentation is updated.
-- PROJECT_STATUS.md is updated.
+- PROJECT_STATUS.md is synchronized.
 - No known regressions remain.
 
-Only then may work begin on the next phase.
+Only then may the next phase begin.
 
 ---
 
 # Guiding Principles
-
-Slow is smooth.
-
-Smooth is fast.
 
 Architecture first.
 
 Quality over speed.
 
 Decision quality over profit.
+
+Explainability and auditability over convenience.
