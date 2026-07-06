@@ -88,6 +88,57 @@ describe("paper trading page", () => {
     cleanup();
   });
 
+  function setPaperAccountFixture(overrides?: Partial<{
+    id: string;
+    name: string;
+    asset_class: string;
+    starting_balance: string;
+    current_cash_balance: string;
+    equity: string;
+    equity_return_usd: string;
+    equity_return_pct: string;
+    positions: Array<{
+      asset_id: string;
+      symbol: string;
+      quantity: string;
+      avg_entry_price: string;
+      unrealized_pnl_usd: string;
+      unrealized_pnl_pct: string;
+    }>;
+    is_active: boolean;
+  }>) {
+    getPaperAccountMock.mockResolvedValue({
+      id: "paper-account-1",
+      name: "Family Paper Account",
+      asset_class: "crypto",
+      starting_balance: "25.00",
+      current_cash_balance: "25.00",
+      equity: "25.00",
+      equity_return_usd: "0.00",
+      equity_return_pct: "0.00",
+      positions: [],
+      is_active: true,
+      ...overrides,
+    });
+  }
+
+  function setTradeFixture(items: Array<{
+    id: string;
+    asset_id: string;
+    symbol?: string;
+    side: string;
+    quantity: string;
+    price: string;
+    fee: string;
+    executed_at: string;
+    signal_id?: string;
+  }>) {
+    getPaperTradesMock.mockResolvedValue({
+      items,
+      next_cursor: null,
+    });
+  }
+
   it("loads, switches, creates, and resets paper accounts using the documented contracts", async () => {
     const user = userEvent.setup();
 
@@ -110,6 +161,10 @@ describe("paper trading page", () => {
     expect(screen.getAllByText("PAPER").length).toBeGreaterThan(0);
     expect(screen.getByRole("heading", { name: "Trade history (PAPER)" })).toBeInTheDocument();
     expect(screen.getByRole("heading", { name: "Portfolio timeline (PAPER)" })).toBeInTheDocument();
+    expect(screen.getByRole("heading", { name: "Performance Analytics (PAPER)" })).toBeInTheDocument();
+    expect(screen.getByText("Consistency score")).toBeInTheDocument();
+    expect(screen.getByText("Show advanced analytics details")).toBeInTheDocument();
+    expect(screen.getByText(/Small-account warning: Fees consumed 100.00% of gross paper gains/i)).toBeInTheDocument();
     expect(screen.getByText("$0.25 (1.00%)")).toBeInTheDocument();
 
     await user.clear(screen.getByLabelText("Paper account ID"));
@@ -163,5 +218,100 @@ describe("paper trading page", () => {
     });
 
     expect(screen.getByText("Open Position Value")).toBeInTheDocument();
+  });
+
+  it("renders zero-trade empty states while preserving small-account and paper labeling", async () => {
+    setPaperAccountFixture();
+    setTradeFixture([]);
+
+    render(React.createElement(PaperTradingPage));
+
+    await screen.findByText("Selected account ID: paper-account-1");
+    expect(screen.getByText("$25 minimum")).toBeInTheDocument();
+    expect(screen.getByDisplayValue("25")).toBeInTheDocument();
+    expect(screen.getByText(/No trades yet for this PAPER account and filter range/i)).toBeInTheDocument();
+    expect(screen.getByText(/No PAPER trades yet\. Return uses current account equity/i)).toBeInTheDocument();
+    expect(screen.getAllByText("+$0.00 (+0.00%)").length).toBeGreaterThan(0);
+    expect(screen.getAllByText("PAPER").length).toBeGreaterThan(0);
+  });
+
+  it("handles mixed buy and sell sequences with fractional quantities and dollar+percentage reporting", async () => {
+    setPaperAccountFixture({
+      asset_class: "stock",
+      equity: "27.00",
+      equity_return_usd: "2.00",
+      equity_return_pct: "0.08",
+      positions: [
+        {
+          asset_id: "asset-aapl",
+          symbol: "AAPL",
+          quantity: "0.5",
+          avg_entry_price: "200.00",
+          unrealized_pnl_usd: "1.25",
+          unrealized_pnl_pct: "0.0125",
+        },
+      ],
+    });
+    setTradeFixture([
+      {
+        id: "trade-buy",
+        asset_id: "asset-aapl",
+        symbol: "AAPL",
+        side: "buy",
+        quantity: "0.0500",
+        price: "200.00",
+        fee: "0.10",
+        executed_at: "2026-07-06T10:00:00Z",
+      },
+      {
+        id: "trade-sell",
+        asset_id: "asset-aapl",
+        symbol: "AAPL",
+        side: "sell",
+        quantity: "0.0500",
+        price: "300.00",
+        fee: "0.15",
+        executed_at: "2026-07-06T11:00:00Z",
+      },
+      {
+        id: "trade-crypto",
+        asset_id: "asset-btc",
+        symbol: "BTCUSDT",
+        side: "buy",
+        quantity: "0.00038",
+        price: "65000.00",
+        fee: "0.05",
+        executed_at: "2026-07-06T12:00:00Z",
+      },
+    ]);
+
+    render(React.createElement(PaperTradingPage));
+
+    await screen.findByText("Selected account ID: paper-account-1");
+    await screen.findByText("0.00038");
+    expect(screen.getAllByText("0.0500").length).toBeGreaterThan(0);
+    expect(screen.getByText("+$14.85 (+59.40%)")).toBeInTheDocument();
+    expect(screen.getAllByText("$-10.10 (-40.40%)").length).toBeGreaterThan(0);
+    expect(screen.getByText("$0.30 (13.04%)")).toBeInTheDocument();
+    expect(screen.getByText("Paper return")).toBeInTheDocument();
+    expect(screen.getAllByText("+$2.00 (+8.00%)").length).toBeGreaterThan(0);
+  });
+
+  it("shows explicit trade-history error states and partial analytics fallback", async () => {
+    setPaperAccountFixture({
+      equity: "26.00",
+      equity_return_usd: "1.00",
+      equity_return_pct: "0.04",
+    });
+    getPaperTradesMock.mockRejectedValue(new Error("trade feed unavailable"));
+
+    render(React.createElement(PaperTradingPage));
+
+    await screen.findByText("Selected account ID: paper-account-1");
+    await screen.findByText(/Could not load paper trade history\. Failed to load paper trades\./i);
+    expect(screen.getByText("Unable to render portfolio timeline because trade history could not be loaded.")).toBeInTheDocument();
+    expect(screen.getByText("Trade-derived analytics are partially unavailable because trade history failed to load.")).toBeInTheDocument();
+    expect(screen.getByText("Retry trade history load")).toBeInTheDocument();
+    expect(screen.getAllByText("+$1.00 (+4.00%)").length).toBeGreaterThan(0);
   });
 });

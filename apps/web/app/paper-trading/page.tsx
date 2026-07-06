@@ -38,6 +38,20 @@ type TimelinePoint = {
   fee: number;
 };
 
+type DrawdownAnalytics = {
+  maxDrawdownUsd: number;
+  maxDrawdownPct: number;
+  peakEquity: number;
+  troughEquity: number;
+};
+
+type ConsistencyAnalytics = {
+  stableStepRate: number;
+  positiveStepRate: number;
+  averageStepMovePct: number;
+  largestStepDropPct: number;
+};
+
 const DEFAULT_FORM_STATE: AccountFormState = {
   name: "Family Paper Account",
   assetClass: "crypto",
@@ -176,6 +190,88 @@ function buildTimelinePoints(account: PaperAccount | null, trades: PaperTrade[])
   });
 
   return points;
+}
+
+function computeDrawdownAnalytics(points: TimelinePoint[]): DrawdownAnalytics {
+  if (points.length === 0) {
+    return {
+      maxDrawdownUsd: 0,
+      maxDrawdownPct: 0,
+      peakEquity: 0,
+      troughEquity: 0,
+    };
+  }
+
+  let rollingPeak = points[0].equity;
+  let peakAtWorst = rollingPeak;
+  let troughAtWorst = rollingPeak;
+  let maxDrawdownUsd = 0;
+
+  for (const point of points) {
+    if (point.equity > rollingPeak) {
+      rollingPeak = point.equity;
+    }
+
+    const drawdownUsd = rollingPeak - point.equity;
+    if (drawdownUsd > maxDrawdownUsd) {
+      maxDrawdownUsd = drawdownUsd;
+      peakAtWorst = rollingPeak;
+      troughAtWorst = point.equity;
+    }
+  }
+
+  const maxDrawdownPct = peakAtWorst > 0 ? maxDrawdownUsd / peakAtWorst : 0;
+  return {
+    maxDrawdownUsd,
+    maxDrawdownPct,
+    peakEquity: peakAtWorst,
+    troughEquity: troughAtWorst,
+  };
+}
+
+function computeConsistencyAnalytics(points: TimelinePoint[]): ConsistencyAnalytics {
+  if (points.length < 2) {
+    return {
+      stableStepRate: 1,
+      positiveStepRate: 0,
+      averageStepMovePct: 0,
+      largestStepDropPct: 0,
+    };
+  }
+
+  let stableSteps = 0;
+  let positiveSteps = 0;
+  let totalAbsStepMovePct = 0;
+  let largestStepDropPct = 0;
+  let totalSteps = 0;
+
+  for (let index = 1; index < points.length; index += 1) {
+    const previous = points[index - 1];
+    const current = points[index];
+    const stepDeltaUsd = current.equity - previous.equity;
+    const baseline = previous.equity > 0 ? previous.equity : 1;
+    const stepMovePct = stepDeltaUsd / baseline;
+
+    totalSteps += 1;
+    if (stepDeltaUsd >= 0) {
+      positiveSteps += 1;
+    }
+    if (Math.abs(stepMovePct) <= 0.03) {
+      stableSteps += 1;
+    }
+
+    totalAbsStepMovePct += Math.abs(stepMovePct);
+    if (stepMovePct < largestStepDropPct) {
+      largestStepDropPct = stepMovePct;
+    }
+  }
+
+  return {
+    stableStepRate: totalSteps > 0 ? stableSteps / totalSteps : 1,
+    positiveStepRate: totalSteps > 0 ? positiveSteps / totalSteps : 0,
+    averageStepMovePct: totalSteps > 0 ? totalAbsStepMovePct / totalSteps : 0,
+    largestStepDropPct: Math.abs(largestStepDropPct),
+  };
 }
 
 export default function PaperTradingPage() {
@@ -374,6 +470,40 @@ export default function PaperTradingPage() {
   const timelinePoints = useMemo(() => {
     return buildTimelinePoints(activeAccount, tradeHistory);
   }, [activeAccount, tradeHistory]);
+
+  const netReturnUsd = useMemo(() => {
+    if (!activeAccount) {
+      return 0;
+    }
+
+    return parseDecimal(activeAccount.equity) - parseDecimal(activeAccount.starting_balance);
+  }, [activeAccount]);
+
+  const netReturnPct = useMemo(() => {
+    if (!activeAccount) {
+      return 0;
+    }
+
+    const startingBalance = parseDecimal(activeAccount.starting_balance);
+    if (startingBalance <= 0) {
+      return 0;
+    }
+
+    return netReturnUsd / startingBalance;
+  }, [activeAccount, netReturnUsd]);
+
+  const grossReturnBeforeFeesUsd = netReturnUsd + totalFees;
+  const feeDragPctOfGrossReturn = grossReturnBeforeFeesUsd > 0 ? totalFees / grossReturnBeforeFeesUsd : 0;
+  const feeDragPctOfStartingBalance = startingBalanceNumber > 0 ? totalFees / startingBalanceNumber : 0;
+  const showSmallAccountWarning = orderedTrades.length > 0 && grossReturnBeforeFeesUsd > 0 && feeDragPctOfGrossReturn > 0.2;
+
+  const drawdownAnalytics = useMemo(() => {
+    return computeDrawdownAnalytics(timelinePoints);
+  }, [timelinePoints]);
+
+  const consistencyAnalytics = useMemo(() => {
+    return computeConsistencyAnalytics(timelinePoints);
+  }, [timelinePoints]);
 
   return (
     <div className="space-y-6">
@@ -799,6 +929,132 @@ export default function PaperTradingPage() {
                   </tbody>
                 </table>
               </div>
+            )}
+          </div>
+
+          <div className="mt-6 rounded-lg border border-border bg-muted/30 p-4">
+            <div className="flex flex-wrap items-start justify-between gap-3">
+              <div>
+                <h3 className="text-sm font-semibold uppercase tracking-wide text-foreground/80">
+                  Performance Analytics (PAPER)
+                </h3>
+                <p className="mt-1 text-xs text-foreground/70">
+                  Beginner summary first, with expandable advanced details for deeper paper-validation analysis.
+                </p>
+              </div>
+              <span className="rounded-full border border-border bg-background px-2 py-1 text-xs uppercase tracking-wide text-foreground/70">
+                PORTFOLIO INTELLIGENCE
+              </span>
+            </div>
+
+            {loading || isTradesLoading ? (
+              <div className="mt-4 space-y-2">
+                <div className="h-12 animate-pulse rounded bg-foreground/10" />
+                <div className="h-12 animate-pulse rounded bg-foreground/10" />
+                <div className="h-12 animate-pulse rounded bg-foreground/10" />
+              </div>
+            ) : !activeAccount ? (
+              <p className="mt-4 text-sm text-foreground/70">
+                Load a PAPER account to view portfolio performance analytics.
+              </p>
+            ) : (
+              <>
+                {tradesError ? (
+                  <p className="mt-4 rounded-md border border-red-500/30 bg-red-500/10 px-3 py-2 text-sm text-red-100">
+                    Trade-derived analytics are partially unavailable because trade history failed to load.
+                  </p>
+                ) : null}
+
+                <div className="mt-4 grid gap-3 md:grid-cols-2 xl:grid-cols-4">
+                  <article className="rounded-md border border-border bg-background/60 p-3">
+                    <p className="text-xs uppercase tracking-wide text-foreground/65">Paper return</p>
+                    <p className="mt-1 text-sm font-semibold">
+                      <DollarAndPercent usd={netReturnUsd} pct={netReturnPct} />
+                    </p>
+                    <p className="mt-1 text-xs text-foreground/70">Current paper equity vs starting balance.</p>
+                  </article>
+
+                  <article className="rounded-md border border-border bg-background/60 p-3">
+                    <p className="text-xs uppercase tracking-wide text-foreground/65">Max drawdown</p>
+                    <p className="mt-1 text-sm font-semibold">
+                      <DollarAndPercent usd={-drawdownAnalytics.maxDrawdownUsd} pct={-drawdownAnalytics.maxDrawdownPct} />
+                    </p>
+                    <p className="mt-1 text-xs text-foreground/70">Largest drop from a prior paper-equity peak.</p>
+                  </article>
+
+                  <article className="rounded-md border border-border bg-background/60 p-3">
+                    <p className="text-xs uppercase tracking-wide text-foreground/65">Fee drag</p>
+                    <p className="mt-1 text-sm font-semibold">
+                      {`${formatCurrency(totalFees)} (${(feeDragPctOfGrossReturn * 100).toFixed(2)}%)`}
+                    </p>
+                    <p className="mt-1 text-xs text-foreground/70">Total fees and share of gross pre-fee return.</p>
+                  </article>
+
+                  <article className="rounded-md border border-border bg-background/60 p-3">
+                    <p className="text-xs uppercase tracking-wide text-foreground/65">Consistency score</p>
+                    <p className="mt-1 text-sm font-semibold">{`${(consistencyAnalytics.stableStepRate * 100).toFixed(2)}% stable steps`}</p>
+                    <p className="mt-1 text-xs text-foreground/70">Share of timeline steps within a 3% move band.</p>
+                  </article>
+                </div>
+
+                {showSmallAccountWarning ? (
+                  <p className="mt-4 rounded-md border border-amber-400/40 bg-amber-400/10 px-3 py-2 text-sm text-amber-100">
+                    Small-account warning: Fees consumed {(feeDragPctOfGrossReturn * 100).toFixed(2)}% of gross paper gains at this balance.
+                    Consider lower-fee or lower-frequency paper strategies before promotion.
+                  </p>
+                ) : null}
+
+                {orderedTrades.length === 0 ? (
+                  <p className="mt-4 text-sm text-foreground/70">
+                    No PAPER trades yet. Return uses current account equity; drawdown, fee drag, and consistency deepen as trade history grows.
+                  </p>
+                ) : null}
+
+                <details className="mt-4 rounded-md border border-border bg-background/40 p-3">
+                  <summary className="cursor-pointer text-sm font-medium text-foreground/90">
+                    Show advanced analytics details
+                  </summary>
+
+                  <div className="mt-3 grid gap-3 md:grid-cols-2">
+                    <article className="rounded-md border border-border bg-background/60 p-3 text-sm">
+                      <p className="text-xs uppercase tracking-wide text-foreground/65">Drawdown context</p>
+                      <p className="mt-1 text-foreground/90">
+                        Peak equity: {formatCurrency(drawdownAnalytics.peakEquity)}
+                      </p>
+                      <p className="text-foreground/90">Trough equity: {formatCurrency(drawdownAnalytics.troughEquity)}</p>
+                      <p className="text-foreground/90">
+                        Drawdown depth: {formatCurrency(drawdownAnalytics.maxDrawdownUsd)} ({(drawdownAnalytics.maxDrawdownPct * 100).toFixed(2)}%)
+                      </p>
+                    </article>
+
+                    <article className="rounded-md border border-border bg-background/60 p-3 text-sm">
+                      <p className="text-xs uppercase tracking-wide text-foreground/65">Fee drag breakdown</p>
+                      <p className="mt-1 text-foreground/90">
+                        Gross return before fees: {formatCurrency(grossReturnBeforeFeesUsd)}
+                      </p>
+                      <p className="text-foreground/90">
+                        Total fees vs paper balance: {(feeDragPctOfStartingBalance * 100).toFixed(2)}%
+                      </p>
+                      <p className="text-foreground/90">
+                        Fee drag vs gross return: {(feeDragPctOfGrossReturn * 100).toFixed(2)}%
+                      </p>
+                    </article>
+
+                    <article className="rounded-md border border-border bg-background/60 p-3 text-sm md:col-span-2">
+                      <p className="text-xs uppercase tracking-wide text-foreground/65">Consistency diagnostics</p>
+                      <p className="mt-1 text-foreground/90">
+                        Positive steps: {(consistencyAnalytics.positiveStepRate * 100).toFixed(2)}%
+                      </p>
+                      <p className="text-foreground/90">
+                        Average step move magnitude: {(consistencyAnalytics.averageStepMovePct * 100).toFixed(2)}%
+                      </p>
+                      <p className="text-foreground/90">
+                        Largest single-step drop: {(consistencyAnalytics.largestStepDropPct * 100).toFixed(2)}%
+                      </p>
+                    </article>
+                  </div>
+                </details>
+              </>
             )}
           </div>
 
