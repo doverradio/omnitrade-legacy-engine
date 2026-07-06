@@ -4,6 +4,14 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 
 import StrategyLabPage from "@/app/strategy-lab/page";
 
+const pushMock = vi.fn();
+
+vi.mock("next/navigation", () => ({
+  useRouter: () => ({
+    push: pushMock,
+  }),
+}));
+
 type FetchScenario = "success" | "empty" | "error" | "loading";
 
 function jsonResponse(status: number, body: unknown): Response {
@@ -133,6 +141,13 @@ function installFetchMock(scenario: FetchScenario) {
       return jsonResponse(201, saved);
     }
 
+    if (url.pathname === "/backtests/run" && method === "POST") {
+      return jsonResponse(202, {
+        backtest_id: "bt-1",
+        status: "running",
+      });
+    }
+
     if (url.pathname !== "/strategies") {
       return jsonResponse(404, {
         error: {
@@ -166,9 +181,87 @@ function installFetchMock(scenario: FetchScenario) {
 
 afterEach(() => {
   vi.unstubAllGlobals();
+  pushMock.mockReset();
 });
 
 describe("StrategyLabPage Prompt 4.2", () => {
+  it("renders Prompt 4.7 review section fields", async () => {
+    installFetchMock("success");
+    render(<StrategyLabPage />);
+
+    await waitFor(() => {
+      expect(screen.getByTestId("strategy-lab-section-review-configuration")).toBeInTheDocument();
+    });
+
+    const reviewSection = screen.getByTestId("review-configuration-summary");
+    expect(within(reviewSection).getByText("Strategy")).toBeInTheDocument();
+    expect(within(reviewSection).getByText("Parameter Summary")).toBeInTheDocument();
+    expect(within(reviewSection).getByText("Selected Snapshot")).toBeInTheDocument();
+    expect(within(reviewSection).getByText("Starting Capital")).toBeInTheDocument();
+    expect(within(reviewSection).getByText("Fee Settings")).toBeInTheDocument();
+    expect(within(reviewSection).getByText("Slippage Settings")).toBeInTheDocument();
+    expect(within(reviewSection).getByText("Configuration Readiness")).toBeInTheDocument();
+    expect(within(reviewSection).getByText("Estimated Behavior")).toBeInTheDocument();
+    expect(screen.getByTestId("review-beginner-summary")).toBeInTheDocument();
+  });
+
+  it("shows beginner launch safety message in review section", async () => {
+    installFetchMock("success");
+    render(<StrategyLabPage />);
+
+    await waitFor(() => {
+      expect(screen.getByTestId("beginner-launch-message")).toBeInTheDocument();
+    });
+
+    expect(screen.getByTestId("beginner-launch-message")).toHaveTextContent(
+      "You're about to test this strategy using historical market data. No real money will be used.",
+    );
+  });
+
+  it("disables launch when required checklist items are incomplete", async () => {
+    installFetchMock("success");
+    render(<StrategyLabPage />);
+    const user = userEvent.setup();
+
+    await waitFor(() => {
+      expect(screen.getByLabelText("Slow Period value")).toBeInTheDocument();
+    });
+
+    const slowPeriodInput = screen.getByLabelText("Slow Period value");
+    await user.clear(slowPeriodInput);
+    await user.type(slowPeriodInput, "2");
+
+    await waitFor(() => {
+      expect(screen.getByTestId("launch-gating-message")).toBeInTheDocument();
+    });
+
+    expect(screen.getByRole("button", { name: "Launch backtest" })).toBeDisabled();
+  });
+
+  it("launches backtest and navigates to backtests page when checklist is complete", async () => {
+    const fetchMock = installFetchMock("success");
+    render(<StrategyLabPage />);
+    const user = userEvent.setup();
+
+    await waitFor(() => {
+      expect(screen.getByRole("button", { name: "Launch backtest" })).toBeEnabled();
+    });
+
+    await user.click(screen.getByRole("button", { name: "Launch backtest" }));
+
+    await waitFor(() => {
+      expect(pushMock).toHaveBeenCalledWith("/backtests");
+    });
+
+    const runCall = fetchMock.mock.calls.find((call) => {
+      const rawUrl = typeof call[0] === "string" ? call[0] : call[0] instanceof URL ? call[0].toString() : call[0].url;
+      const method = call[0] instanceof Request ? call[0].method : (call[1]?.method ?? "GET");
+      return new URL(rawUrl).pathname === "/backtests/run" && method === "POST";
+    });
+
+    expect(runCall).toBeTruthy();
+  });
+
   it("renders saved preset snapshot cards with required fields", async () => {
     installFetchMock("success");
     render(<StrategyLabPage />);
@@ -199,8 +292,8 @@ describe("StrategyLabPage Prompt 4.2", () => {
     await user.type(screen.getByLabelText("Snapshot Notes"), "Designed for smoother trend capture.");
     await user.click(screen.getByRole("button", { name: "Save snapshot" }));
 
-    expect(await screen.findByText("balanced-v2")).toBeInTheDocument();
     const savedCard = screen.getByTestId("snapshot-card-ps-2");
+    expect(savedCard).toHaveTextContent("balanced-v2");
     expect(savedCard).toHaveTextContent("Designed for smoother trend capture.");
   });
 

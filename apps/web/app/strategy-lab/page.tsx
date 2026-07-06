@@ -1,8 +1,9 @@
 "use client";
 
 import { useEffect, useMemo, useState } from "react";
+import { useRouter } from "next/navigation";
 
-import { ApiRequestError } from "@/lib/api/backtests";
+import { ApiRequestError, runBacktest } from "@/lib/api/backtests";
 import { getParameterSets, saveParameterSet, type ParameterSetItem } from "@/lib/api/parameterSets";
 import { getStrategies, type StrategyItem } from "@/lib/api/strategies";
 import { ConfigurationCoach } from "@/components/domain/ConfigurationCoach";
@@ -57,6 +58,19 @@ type SnapshotMeta = {
   notes?: string;
   createdAt?: string;
 };
+
+type ReviewChecklistItem = {
+  key: string;
+  label: string;
+  complete: boolean;
+  optional?: boolean;
+};
+
+const DEFAULT_BACKTEST_INTERVAL: "1h" = "1h";
+const DEFAULT_BACKTEST_INITIAL_CAPITAL = "25";
+const DEFAULT_BACKTEST_FEE_BPS = "10";
+const DEFAULT_BACKTEST_SLIPPAGE_BPS = "5";
+const DEFAULT_BACKTEST_ASSET_ID = process.env.NEXT_PUBLIC_DEFAULT_BACKTEST_ASSET_ID ?? "00000000-0000-0000-0000-000000000000";
 
 const PARAMETER_EFFECT_NOTES: Record<string, ExpectedEffectNotes> = {
   fast_period: {
@@ -564,6 +578,7 @@ function ResearchJourney() {
 }
 
 export default function StrategyLabPage() {
+  const router = useRouter();
   const [isBeginnerMode, setIsBeginnerMode] = useState(true);
   const [strategies, setStrategies] = useState<StrategyItem[]>([]);
   const [selectedStrategyId, setSelectedStrategyId] = useState<string | null>(null);
@@ -579,6 +594,11 @@ export default function StrategyLabPage() {
   const [isSavingSnapshot, setIsSavingSnapshot] = useState(false);
   const [snapshotMetaById, setSnapshotMetaById] = useState<Record<string, SnapshotMeta>>({});
   const [selectedSnapshotId, setSelectedSnapshotId] = useState<string | null>(null);
+  const [startingCapital, setStartingCapital] = useState(DEFAULT_BACKTEST_INITIAL_CAPITAL);
+  const [feeBps, setFeeBps] = useState(DEFAULT_BACKTEST_FEE_BPS);
+  const [slippageBps, setSlippageBps] = useState(DEFAULT_BACKTEST_SLIPPAGE_BPS);
+  const [launchError, setLaunchError] = useState<string | null>(null);
+  const [isLaunchingBacktest, setIsLaunchingBacktest] = useState(false);
 
   useEffect(() => {
     let cancelled = false;
@@ -709,6 +729,91 @@ export default function StrategyLabPage() {
 
     return strategyParameterSets.some((item) => item.name.trim().toLowerCase() === normalizedSnapshotName);
   }, [normalizedSnapshotName, strategyParameterSets]);
+
+  const selectedSnapshot = useMemo(() => {
+    if (!selectedSnapshotId) {
+      return null;
+    }
+
+    return strategyParameterSets.find((item) => item.id === selectedSnapshotId) ?? null;
+  }, [selectedSnapshotId, strategyParameterSets]);
+
+  const launchParameterSetId = selectedSnapshot?.id ?? strategyParameterSets[0]?.id ?? null;
+  const strategyHealth = getHealthState(formValidation);
+  const readinessScore = getReadinessScore(parameterDefinitions, parameterValues, formValidation);
+  const readinessLabel = getReadinessLabel(strategyHealth);
+  const estimatedBehavior = selectedStrategy ? getBehaviorSummary(selectedStrategy.slug, parameterValues) : null;
+  const beginnerChecklistSummary = getBeginnerTopObservations(strategyHealth, readinessScore, [], estimatedBehavior);
+
+  const numericStartingCapital = Number(startingCapital);
+  const hasValidStartingCapital = Number.isFinite(numericStartingCapital) && numericStartingCapital >= 25;
+  const hasRequiredLaunchFields = Boolean(selectedStrategy && launchParameterSetId && hasValidStartingCapital);
+  const hasValidConfigurationForLaunch = formValidation.errors.length === 0;
+
+  const reviewChecklist: ReviewChecklistItem[] = [
+    {
+      key: "strategy",
+      label: "Strategy selected",
+      complete: Boolean(selectedStrategy),
+    },
+    {
+      key: "parameters",
+      label: "Parameters valid",
+      complete: formValidation.errors.length === 0,
+    },
+    {
+      key: "readiness",
+      label: "Configuration ready",
+      complete: hasValidConfigurationForLaunch,
+    },
+    {
+      key: "capital",
+      label: "Starting capital specified",
+      complete: hasValidStartingCapital,
+    },
+    {
+      key: "snapshot",
+      label: "Snapshot applied",
+      complete: Boolean(selectedSnapshot),
+      optional: true,
+    },
+  ];
+
+  const missingRequiredChecklistItems = reviewChecklist.filter((item) => !item.optional && !item.complete);
+
+  const handleLaunchBacktest = async () => {
+    if (!selectedStrategy || !launchParameterSetId || !hasValidStartingCapital) {
+      setLaunchError("Complete all required checklist items before launch.");
+      return;
+    }
+
+    const endDate = new Date();
+    const startDate = new Date(endDate);
+    startDate.setDate(startDate.getDate() - 180);
+
+    setLaunchError(null);
+    setIsLaunchingBacktest(true);
+
+    try {
+      await runBacktest({
+        strategy_id: selectedStrategy.id,
+        parameter_set_id: launchParameterSetId,
+        asset_id: DEFAULT_BACKTEST_ASSET_ID,
+        interval: DEFAULT_BACKTEST_INTERVAL,
+        start_time: startDate.toISOString(),
+        end_time: endDate.toISOString(),
+        initial_capital: startingCapital,
+        fee_bps: feeBps,
+        slippage_bps: slippageBps,
+      });
+
+      router.push("/backtests");
+    } catch (error) {
+      setLaunchError(getErrorMessage(error));
+    } finally {
+      setIsLaunchingBacktest(false);
+    }
+  };
 
   const applySnapshot = (snapshot: ParameterSetItem) => {
     if (!selectedStrategy) {
@@ -1304,19 +1409,165 @@ export default function StrategyLabPage() {
           )}
         </section>
 
-        <PlaceholderSection
-          id="compare-results"
-          title="5) Compare Results"
-          description="Compare runs side by side to understand trade-offs before choosing a preset."
-          placeholder="Comparison Workspace placeholder reserved."
-        />
+        <section
+          aria-labelledby="review-configuration"
+          className="rounded-xl border border-border bg-muted/30 p-4"
+          data-testid="strategy-lab-section-review-configuration"
+        >
+          <h2 id="review-configuration" className="text-base font-semibold sm:text-lg">
+            5) Review Configuration
+          </h2>
+          <p className="mt-1 text-sm text-foreground/75">
+            Confirm your setup details before launching a backtest run.
+          </p>
 
-        <PlaceholderSection
-          id="learn-why"
-          title="6) Learn Why"
-          description="Read clear explanations of what happened and what each metric means."
-          placeholder="Explainability Panel placeholder reserved."
-        />
+          {isBeginnerMode ? (
+            <div className="mt-3 rounded-md border border-emerald-500/40 bg-emerald-500/10 px-3 py-2 text-sm text-emerald-100" data-testid="beginner-launch-message">
+              You&apos;re about to test this strategy using historical market data. No real money will be used.
+            </div>
+          ) : null}
+
+          <dl className="mt-3 grid gap-2 text-sm sm:grid-cols-2" data-testid="review-configuration-summary">
+            <div>
+              <dt className="text-foreground/60">Strategy</dt>
+              <dd className="font-medium text-foreground/90">{selectedStrategy?.name ?? "Not selected"}</dd>
+            </div>
+            <div>
+              <dt className="text-foreground/60">Selected Snapshot</dt>
+              <dd className="font-medium text-foreground/90">{selectedSnapshot?.name ?? "None selected"}</dd>
+            </div>
+            <div className="sm:col-span-2">
+              <dt className="text-foreground/60">Parameter Summary</dt>
+              <dd className="font-medium text-foreground/90">
+                {parameterDefinitions.length > 0 ? parameterSummary(parameterDefinitions, parameterValues) : "No parameter metadata available."}
+              </dd>
+            </div>
+            <div>
+              <dt className="text-foreground/60">Starting Capital</dt>
+              <dd className="font-medium text-foreground/90">${startingCapital}</dd>
+            </div>
+            <div>
+              <dt className="text-foreground/60">Fee Settings</dt>
+              <dd className="font-medium text-foreground/90">{feeBps} bps</dd>
+            </div>
+            <div>
+              <dt className="text-foreground/60">Slippage Settings</dt>
+              <dd className="font-medium text-foreground/90">{slippageBps} bps</dd>
+            </div>
+            <div>
+              <dt className="text-foreground/60">Configuration Readiness</dt>
+              <dd className="font-medium text-foreground/90">{readinessScore} / 100 • {readinessLabel}</dd>
+            </div>
+            <div className="sm:col-span-2">
+              <dt className="text-foreground/60">Estimated Behavior</dt>
+              <dd className="font-medium text-foreground/90">
+                {estimatedBehavior
+                  ? `Trade Frequency ${estimatedBehavior.tradeFrequency}, Responsiveness ${estimatedBehavior.responsiveness}, Noise Filtering ${estimatedBehavior.noiseFiltering}, Trend Sensitivity ${estimatedBehavior.trendSensitivity}`
+                  : "Behavior estimates are not yet available for this strategy."}
+              </dd>
+            </div>
+            {isBeginnerMode ? (
+              <div className="sm:col-span-2" data-testid="review-beginner-summary">
+                <dt className="text-foreground/60">Beginner Summary</dt>
+                <dd className="font-medium text-foreground/90">{beginnerChecklistSummary[0] ?? "Not yet available."}</dd>
+              </div>
+            ) : null}
+          </dl>
+        </section>
+
+        <section
+          aria-labelledby="launch-backtest"
+          className="rounded-xl border border-border bg-muted/30 p-4"
+          data-testid="strategy-lab-section-launch-backtest"
+        >
+          <h2 id="launch-backtest" className="text-base font-semibold sm:text-lg">
+            6) Launch Backtest
+          </h2>
+          <p className="mt-1 text-sm text-foreground/75">
+            Complete the checklist, then launch with the existing backtest workflow.
+          </p>
+
+          <div className="mt-3 grid gap-2 sm:grid-cols-3" data-testid="launch-settings-form">
+            <label className="space-y-1 text-sm">
+              <span className="text-foreground/80">Starting Capital</span>
+              <input
+                aria-label="Launch starting capital"
+                type="number"
+                min={25}
+                step={1}
+                value={startingCapital}
+                onChange={(event) => setStartingCapital(event.target.value)}
+                className="w-full rounded-md border border-border bg-background px-3 py-2 text-sm"
+              />
+            </label>
+            <label className="space-y-1 text-sm">
+              <span className="text-foreground/80">Fee (bps)</span>
+              <input
+                aria-label="Launch fee bps"
+                type="number"
+                min={0}
+                step={1}
+                value={feeBps}
+                onChange={(event) => setFeeBps(event.target.value)}
+                className="w-full rounded-md border border-border bg-background px-3 py-2 text-sm"
+              />
+            </label>
+            <label className="space-y-1 text-sm">
+              <span className="text-foreground/80">Slippage (bps)</span>
+              <input
+                aria-label="Launch slippage bps"
+                type="number"
+                min={0}
+                step={1}
+                value={slippageBps}
+                onChange={(event) => setSlippageBps(event.target.value)}
+                className="w-full rounded-md border border-border bg-background px-3 py-2 text-sm"
+              />
+            </label>
+          </div>
+
+          <div className="mt-3 rounded-lg border border-border bg-background/30 p-3" data-testid="review-checklist">
+            <h3 className="text-sm font-semibold">Review Checklist</h3>
+            <ul className="mt-2 space-y-2 text-sm">
+              {reviewChecklist.map((item) => (
+                <li key={item.key} className="flex items-center justify-between rounded-md border border-border bg-muted/20 px-3 py-2">
+                  <span>{item.label}{item.optional ? " (Optional)" : ""}</span>
+                  <span className={item.complete ? "text-emerald-200" : "text-amber-100"}>
+                    {item.complete ? "Complete" : "Incomplete"}
+                  </span>
+                </li>
+              ))}
+            </ul>
+          </div>
+
+          {missingRequiredChecklistItems.length > 0 ? (
+            <p className="mt-3 rounded-md border border-amber-500/40 bg-amber-500/10 px-3 py-2 text-sm text-amber-100" data-testid="launch-gating-message">
+              Complete all required checklist items before launching.
+            </p>
+          ) : null}
+
+          {!hasRequiredLaunchFields ? (
+            <p className="mt-3 rounded-md border border-amber-500/40 bg-amber-500/10 px-3 py-2 text-sm text-amber-100" data-testid="launch-required-fields-message">
+              Strategy, parameter set, and starting capital of at least $25 are required.
+            </p>
+          ) : null}
+
+          {launchError ? (
+            <p className="mt-3 rounded-md border border-red-500/40 bg-red-500/10 px-3 py-2 text-sm text-red-100" data-testid="launch-backtest-error">
+              {launchError}
+            </p>
+          ) : null}
+
+          <button
+            type="button"
+            aria-label="Launch backtest"
+            onClick={() => void handleLaunchBacktest()}
+            disabled={isLaunchingBacktest || !hasRequiredLaunchFields || missingRequiredChecklistItems.length > 0}
+            className="mt-3 inline-flex min-h-11 items-center justify-center rounded-md border border-border bg-muted px-4 py-2 text-sm font-medium transition hover:bg-foreground/10 focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-accent disabled:cursor-not-allowed disabled:opacity-60"
+          >
+            {isLaunchingBacktest ? "Launching..." : "Launch Backtest"}
+          </button>
+        </section>
       </div>
     </div>
   );
