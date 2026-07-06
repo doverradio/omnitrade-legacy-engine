@@ -85,6 +85,112 @@ function installFetchMock(scenario: FetchScenario) {
       },
       created_at: "2026-07-01T12:00:00Z",
     },
+    {
+      id: "ps-ma-2",
+      strategy_id: "strategy-1",
+      name: "balanced-v3",
+      parameters: {
+        fast_period: 15,
+        slow_period: 55,
+        ma_type: "ema",
+      },
+      created_at: "2026-07-02T12:00:00Z",
+    },
+  ];
+
+  const completedBacktests = [
+    {
+      id: "bt-1",
+      status: "completed",
+      strategy_id: "strategy-1",
+      parameter_set_id: "ps-ma-1",
+      asset_id: "asset-btc",
+      interval: "1h",
+      start_time: "2026-01-01T00:00:00Z",
+      end_time: "2026-01-31T00:00:00Z",
+      initial_capital: "25",
+      fee_bps: "10",
+      slippage_bps: "5",
+      metrics: {
+        total_return_usd: "4.12",
+        total_return_pct: "0.165",
+        win_rate: "0.57",
+        max_drawdown: "0.09",
+        sharpe_like: "1.2",
+        trade_count: 42,
+        average_trade_usd: "0.11",
+        fee_drag_pct: "0.30",
+      },
+    },
+    {
+      id: "bt-2",
+      status: "completed",
+      strategy_id: "strategy-1",
+      parameter_set_id: "ps-ma-2",
+      asset_id: "asset-btc",
+      interval: "15m",
+      start_time: "2026-02-01T00:00:00Z",
+      end_time: "2026-02-28T00:00:00Z",
+      initial_capital: "25",
+      fee_bps: "8",
+      slippage_bps: "4",
+      metrics: {
+        total_return_usd: "2.40",
+        total_return_pct: "0.096",
+        win_rate: "0.64",
+        max_drawdown: "0.05",
+        sharpe_like: "1.1",
+        trade_count: 30,
+        average_trade_usd: "0.09",
+        fee_drag_pct: "0.18",
+      },
+    },
+    {
+      id: "bt-3",
+      status: "completed",
+      strategy_id: "strategy-1",
+      parameter_set_id: "ps-ma-1",
+      asset_id: "asset-eth",
+      interval: "1d",
+      start_time: "2026-03-01T00:00:00Z",
+      end_time: "2026-03-31T00:00:00Z",
+      initial_capital: "25",
+      fee_bps: "12",
+      slippage_bps: "6",
+      metrics: {
+        total_return_usd: "-1.25",
+        total_return_pct: "-0.05",
+        win_rate: "0.40",
+        max_drawdown: "0.22",
+        sharpe_like: "0.4",
+        trade_count: 18,
+        average_trade_usd: "0.07",
+        fee_drag_pct: "0.42",
+      },
+    },
+    {
+      id: "bt-4",
+      status: "completed",
+      strategy_id: "strategy-1",
+      parameter_set_id: "ps-ma-2",
+      asset_id: "asset-sol",
+      interval: "5m",
+      start_time: "2026-04-01T00:00:00Z",
+      end_time: "2026-04-30T00:00:00Z",
+      initial_capital: "25",
+      fee_bps: "15",
+      slippage_bps: "8",
+      metrics: {
+        total_return_usd: "0.50",
+        total_return_pct: "0.02",
+        win_rate: "0.51",
+        max_drawdown: "0.11",
+        sharpe_like: "0.7",
+        trade_count: 25,
+        average_trade_usd: "0.08",
+        fee_drag_pct: "0.28",
+      },
+    },
   ];
 
   const fetchMock = vi.fn(async (input: string | URL | Request, init?: RequestInit) => {
@@ -99,6 +205,12 @@ function installFetchMock(scenario: FetchScenario) {
     if (url.pathname === "/parameter-sets" && method === "GET") {
       return jsonResponse(200, {
         items: parameterSetsStore,
+      });
+    }
+
+    if (url.pathname === "/backtests" && method === "GET") {
+      return jsonResponse(200, {
+        items: completedBacktests,
       });
     }
 
@@ -262,6 +374,123 @@ describe("StrategyLabPage Prompt 4.2", () => {
     expect(runCall).toBeTruthy();
   });
 
+  it("supports selecting up to three completed runs in comparison selection", async () => {
+    installFetchMock("success");
+    render(<StrategyLabPage />);
+    const user = userEvent.setup();
+
+    await waitFor(() => {
+      expect(screen.getByTestId("comparison-selection-list")).toBeInTheDocument();
+    });
+
+    const checkbox1 = screen.getByLabelText("Select comparison run bt-1");
+    const checkbox2 = screen.getByLabelText("Select comparison run bt-2");
+    const checkbox3 = screen.getByLabelText("Select comparison run bt-3");
+    const checkbox4 = screen.getByLabelText("Select comparison run bt-4");
+
+    await user.click(checkbox1);
+    await user.click(checkbox2);
+    await user.click(checkbox3);
+
+    expect(checkbox1).toBeChecked();
+    expect(checkbox2).toBeChecked();
+    expect(checkbox3).toBeChecked();
+    expect(checkbox4).toBeDisabled();
+
+    expect(screen.getByTestId("comparison-workspace-cards")).toBeInTheDocument();
+    expect(screen.getByTestId("comparison-card-bt-1")).toBeInTheDocument();
+    expect(screen.getByTestId("comparison-card-bt-2")).toBeInTheDocument();
+    expect(screen.getByTestId("comparison-card-bt-3")).toBeInTheDocument();
+  });
+
+  it("renders required comparison metrics and semantic highlights", async () => {
+    installFetchMock("success");
+    render(<StrategyLabPage />);
+    const user = userEvent.setup();
+
+    await waitFor(() => {
+      expect(screen.getByLabelText("Select comparison run bt-1")).toBeInTheDocument();
+    });
+
+    await user.click(screen.getByLabelText("Select comparison run bt-1"));
+    await user.click(screen.getByLabelText("Select comparison run bt-2"));
+
+    const runACard = screen.getByTestId("comparison-card-bt-1");
+    const runBCard = screen.getByTestId("comparison-card-bt-2");
+
+    expect(runACard).toHaveTextContent("Strategy");
+    expect(runACard).toHaveTextContent("Snapshot Name");
+    expect(runACard).toHaveTextContent("Asset");
+    expect(runACard).toHaveTextContent("Timeframe");
+    expect(runACard).toHaveTextContent("Date Range");
+    expect(runACard).toHaveTextContent("Starting Capital");
+    expect(runACard).toHaveTextContent("Ending Equity");
+    expect(runACard).toHaveTextContent("Net Profit / Loss");
+    expect(runACard).toHaveTextContent("Total Return");
+    expect(runACard).toHaveTextContent("Win Rate");
+    expect(runACard).toHaveTextContent("Max Drawdown");
+    expect(runACard).toHaveTextContent("Fee Drag");
+    expect(runACard).toHaveTextContent("Configuration Readiness");
+    expect(runACard).toHaveTextContent("Not available");
+
+    expect(runACard).toHaveTextContent("Best Total Return");
+    expect(runBCard).toHaveTextContent("Highest Win Rate");
+    expect(runBCard).toHaveTextContent("Lowest Drawdown");
+    expect(runBCard).toHaveTextContent("Lowest Fee Drag");
+  });
+
+  it("renders deterministic key differences from selected run metrics", async () => {
+    installFetchMock("success");
+    render(<StrategyLabPage />);
+    const user = userEvent.setup();
+
+    await waitFor(() => {
+      expect(screen.getByLabelText("Select comparison run bt-1")).toBeInTheDocument();
+    });
+
+    await user.click(screen.getByLabelText("Select comparison run bt-1"));
+    await user.click(screen.getByLabelText("Select comparison run bt-2"));
+    await user.click(screen.getByLabelText("Select comparison run bt-3"));
+
+    const keyDifferences = screen.getByTestId("key-differences-panel");
+    expect(keyDifferences).toHaveTextContent("Run A produced more trades.");
+    expect(keyDifferences).toHaveTextContent("Run B experienced lower drawdown.");
+    expect(keyDifferences).toHaveTextContent("Run C paid higher fees.");
+  });
+
+  it("shows beginner metric explanations and hides them in advanced mode", async () => {
+    installFetchMock("success");
+    render(<StrategyLabPage />);
+    const user = userEvent.setup();
+
+    await waitFor(() => {
+      expect(screen.getByLabelText("Select comparison run bt-1")).toBeInTheDocument();
+    });
+
+    await user.click(screen.getByLabelText("Select comparison run bt-1"));
+
+    expect(screen.getByText("Total return shows overall performance as dollars and percentage from the starting capital.")).toBeInTheDocument();
+    expect(screen.getByText("Win rate is the share of completed trades that were profitable.")).toBeInTheDocument();
+
+    await user.click(screen.getByRole("switch", { name: "Beginner Mode" }));
+
+    expect(screen.queryByText("Total return shows overall performance as dollars and percentage from the starting capital.")).not.toBeInTheDocument();
+    expect(screen.queryByText("Win rate is the share of completed trades that were profitable.")).not.toBeInTheDocument();
+  });
+
+  it("keeps accessibility basics for comparison workspace controls", async () => {
+    installFetchMock("success");
+    render(<StrategyLabPage />);
+
+    await waitFor(() => {
+      expect(screen.getByTestId("strategy-lab-section-research-results-workspace")).toBeInTheDocument();
+    });
+
+    expect(screen.getByRole("heading", { name: "7) Research Results Workspace" })).toBeInTheDocument();
+    expect(screen.getByLabelText("Select comparison run bt-1")).toBeInTheDocument();
+    expect(screen.getByLabelText("Select comparison run bt-2")).toBeInTheDocument();
+  });
+
   it("renders saved preset snapshot cards with required fields", async () => {
     installFetchMock("success");
     render(<StrategyLabPage />);
@@ -292,7 +521,7 @@ describe("StrategyLabPage Prompt 4.2", () => {
     await user.type(screen.getByLabelText("Snapshot Notes"), "Designed for smoother trend capture.");
     await user.click(screen.getByRole("button", { name: "Save snapshot" }));
 
-    const savedCard = screen.getByTestId("snapshot-card-ps-2");
+    const savedCard = screen.getByTestId("snapshot-card-ps-3");
     expect(savedCard).toHaveTextContent("balanced-v2");
     expect(savedCard).toHaveTextContent("Designed for smoother trend capture.");
   });
@@ -340,7 +569,7 @@ describe("StrategyLabPage Prompt 4.2", () => {
       expect(screen.getByTestId("snapshot-beginner-summary-ps-ma-1")).toBeInTheDocument();
     });
 
-    expect(screen.getByText("What was this configuration designed for?")).toBeInTheDocument();
+    expect(screen.getAllByText("What was this configuration designed for?").length).toBeGreaterThan(0);
   });
 
   it("supports snapshot view and select actions with accessibility labels", async () => {

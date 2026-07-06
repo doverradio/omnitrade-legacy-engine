@@ -3,7 +3,7 @@
 import { useEffect, useMemo, useState } from "react";
 import { useRouter } from "next/navigation";
 
-import { ApiRequestError, runBacktest } from "@/lib/api/backtests";
+import { ApiRequestError, getBacktests, runBacktest, type BacktestListItem } from "@/lib/api/backtests";
 import { getParameterSets, saveParameterSet, type ParameterSetItem } from "@/lib/api/parameterSets";
 import { getStrategies, type StrategyItem } from "@/lib/api/strategies";
 import { ConfigurationCoach } from "@/components/domain/ConfigurationCoach";
@@ -66,11 +66,27 @@ type ReviewChecklistItem = {
   optional?: boolean;
 };
 
+type ComparisonMetricKey = "totalReturn" | "winRate" | "maxDrawdown" | "feeDrag";
+
+type HighlightedComparisonWinners = {
+  bestTotalReturnRunId: string | null;
+  highestWinRateRunId: string | null;
+  lowestDrawdownRunId: string | null;
+  lowestFeeDragRunId: string | null;
+};
+
 const DEFAULT_BACKTEST_INTERVAL: "1h" = "1h";
 const DEFAULT_BACKTEST_INITIAL_CAPITAL = "25";
 const DEFAULT_BACKTEST_FEE_BPS = "10";
 const DEFAULT_BACKTEST_SLIPPAGE_BPS = "5";
 const DEFAULT_BACKTEST_ASSET_ID = process.env.NEXT_PUBLIC_DEFAULT_BACKTEST_ASSET_ID ?? "00000000-0000-0000-0000-000000000000";
+
+const BEGINNER_METRIC_EXPLANATIONS: Record<ComparisonMetricKey, string> = {
+  totalReturn: "Total return shows overall performance as dollars and percentage from the starting capital.",
+  winRate: "Win rate is the share of completed trades that were profitable.",
+  maxDrawdown: "Max drawdown is the largest drop from a peak equity value during the run.",
+  feeDrag: "Fee drag shows how much performance was reduced by fees and execution costs.",
+};
 
 const PARAMETER_EFFECT_NOTES: Record<string, ExpectedEffectNotes> = {
   fast_period: {
@@ -239,12 +255,12 @@ function formatDefaultParamsSummary(defaultParams: StrategyItem["default_params"
     .join(", ");
 }
 
-function getErrorMessage(error: unknown): string {
+function getErrorMessage(error: unknown, fallback = "Could not load strategies right now."): string {
   if (error instanceof ApiRequestError) {
     return error.message;
   }
 
-  return "Could not load strategies right now.";
+  return fallback;
 }
 
 function formatCurrentValue(value: string | number | boolean, definition: ParameterDefinition): string {
@@ -270,6 +286,130 @@ function formatDateLabel(value?: string): string {
   }
 
   return new Date(timestamp).toLocaleDateString();
+}
+
+function formatSignedCurrency(value: number | null): string {
+  if (value === null || !Number.isFinite(value)) {
+    return "Not available";
+  }
+
+  const sign = value > 0 ? "+" : "";
+  return `${sign}$${value.toFixed(2)}`;
+}
+
+function formatCurrency(value: number | null): string {
+  if (value === null || !Number.isFinite(value)) {
+    return "Not available";
+  }
+
+  return `$${value.toFixed(2)}`;
+}
+
+function formatPercentFromRatio(value: number | null): string {
+  if (value === null || !Number.isFinite(value)) {
+    return "Not available";
+  }
+
+  const percent = value * 100;
+  const sign = percent > 0 ? "+" : "";
+  return `${sign}${percent.toFixed(2)}%`;
+}
+
+function formatBpsLabel(value: string): string {
+  const numeric = Number(value);
+  if (!Number.isFinite(numeric)) {
+    return "Not available";
+  }
+
+  return `${numeric.toFixed(0)} bps`;
+}
+
+function parseFiniteNumber(value: string | number | null | undefined): number | null {
+  if (typeof value === "number") {
+    return Number.isFinite(value) ? value : null;
+  }
+
+  if (typeof value === "string") {
+    const parsed = Number(value);
+    return Number.isFinite(parsed) ? parsed : null;
+  }
+
+  return null;
+}
+
+function toRunCode(index: number): string {
+  const codes = ["A", "B", "C"];
+  return `Run ${codes[index] ?? String(index + 1)}`;
+}
+
+function getConfigurationReadinessValue(item: BacktestListItem): string {
+  const withReadiness = item as BacktestListItem & {
+    configuration_readiness?: unknown;
+    run_metadata?: { configuration_readiness?: unknown };
+  };
+
+  const direct = withReadiness.configuration_readiness;
+  if (typeof direct === "number" && Number.isFinite(direct)) {
+    return `${direct} / 100`;
+  }
+  if (typeof direct === "string" && direct.trim().length > 0) {
+    return direct;
+  }
+
+  const nested = withReadiness.run_metadata?.configuration_readiness;
+  if (typeof nested === "number" && Number.isFinite(nested)) {
+    return `${nested} / 100`;
+  }
+  if (typeof nested === "string" && nested.trim().length > 0) {
+    return nested;
+  }
+
+  return "Not available";
+}
+
+function getMetricToneClass(metric: ComparisonMetricKey, value: number | null): string {
+  if (value === null || !Number.isFinite(value)) {
+    return "text-foreground/80";
+  }
+
+  if (metric === "totalReturn" || metric === "winRate") {
+    if (value > 0) {
+      return "text-emerald-200";
+    }
+    if (value < 0) {
+      return "text-red-200";
+    }
+    return "text-foreground/80";
+  }
+
+  if (metric === "maxDrawdown" || metric === "feeDrag") {
+    if (value < 0.1) {
+      return "text-emerald-200";
+    }
+    if (value >= 0.25) {
+      return "text-red-200";
+    }
+    return "text-foreground/80";
+  }
+
+  return "text-foreground/80";
+}
+
+function pickWinner(
+  runs: BacktestListItem[],
+  extractor: (item: BacktestListItem) => number | null,
+  mode: "max" | "min",
+): string | null {
+  const ranked = runs
+    .map((item) => ({ id: item.id, value: extractor(item) }))
+    .filter((entry) => entry.value !== null) as Array<{ id: string; value: number }>;
+
+  if (ranked.length === 0) {
+    return null;
+  }
+
+  ranked.sort((a, b) => (mode === "max" ? b.value - a.value : a.value - b.value));
+  return ranked[0]?.id ?? null;
 }
 
 function coerceParameterValue(definition: ParameterDefinition, rawValue: unknown): string | number | boolean {
@@ -588,6 +728,10 @@ export default function StrategyLabPage() {
   const [parameterSets, setParameterSets] = useState<ParameterSetItem[]>([]);
   const [isLoadingParameterSets, setIsLoadingParameterSets] = useState(true);
   const [parameterSetsError, setParameterSetsError] = useState<string | null>(null);
+  const [completedBacktests, setCompletedBacktests] = useState<BacktestListItem[]>([]);
+  const [isLoadingBacktests, setIsLoadingBacktests] = useState(true);
+  const [backtestsError, setBacktestsError] = useState<string | null>(null);
+  const [selectedComparisonIds, setSelectedComparisonIds] = useState<string[]>([]);
   const [snapshotName, setSnapshotName] = useState("");
   const [snapshotNotes, setSnapshotNotes] = useState("");
   const [saveSnapshotError, setSaveSnapshotError] = useState<string | null>(null);
@@ -627,6 +771,39 @@ export default function StrategyLabPage() {
     };
 
     void loadStrategies();
+
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
+  useEffect(() => {
+    let cancelled = false;
+
+    const loadCompletedBacktests = async () => {
+      setIsLoadingBacktests(true);
+      setBacktestsError(null);
+
+      try {
+        const items = await getBacktests();
+        if (cancelled) {
+          return;
+        }
+
+        setCompletedBacktests(items.filter((item) => item.status === "completed"));
+      } catch (error) {
+        if (cancelled) {
+          return;
+        }
+        setBacktestsError(getErrorMessage(error, "Could not load completed backtests right now."));
+      } finally {
+        if (!cancelled) {
+          setIsLoadingBacktests(false);
+        }
+      }
+    };
+
+    void loadCompletedBacktests();
 
     return () => {
       cancelled = true;
@@ -780,6 +957,97 @@ export default function StrategyLabPage() {
   ];
 
   const missingRequiredChecklistItems = reviewChecklist.filter((item) => !item.optional && !item.complete);
+
+  const strategyNameById = useMemo(() => {
+    const mapping = new Map<string, string>();
+    for (const strategy of strategies) {
+      mapping.set(strategy.id, strategy.name || strategy.slug);
+    }
+    return mapping;
+  }, [strategies]);
+
+  const snapshotNameById = useMemo(() => {
+    const mapping = new Map<string, string>();
+    for (const parameterSet of parameterSets) {
+      mapping.set(parameterSet.id, parameterSet.name);
+    }
+    return mapping;
+  }, [parameterSets]);
+
+  const selectedComparisonRuns = useMemo(() => {
+    return completedBacktests.filter((item) => selectedComparisonIds.includes(item.id));
+  }, [completedBacktests, selectedComparisonIds]);
+
+  const highlightedWinners = useMemo<HighlightedComparisonWinners>(() => {
+    const getReturn = (item: BacktestListItem) => parseFiniteNumber(item.metrics?.total_return_pct);
+    const getWinRate = (item: BacktestListItem) => parseFiniteNumber(item.metrics?.win_rate);
+    const getDrawdown = (item: BacktestListItem) => parseFiniteNumber(item.metrics?.max_drawdown);
+    const getFeeDrag = (item: BacktestListItem) => parseFiniteNumber(item.metrics?.fee_drag_pct);
+
+    return {
+      bestTotalReturnRunId: pickWinner(selectedComparisonRuns, getReturn, "max"),
+      highestWinRateRunId: pickWinner(selectedComparisonRuns, getWinRate, "max"),
+      lowestDrawdownRunId: pickWinner(selectedComparisonRuns, getDrawdown, "min"),
+      lowestFeeDragRunId: pickWinner(selectedComparisonRuns, getFeeDrag, "min"),
+    };
+  }, [selectedComparisonRuns]);
+
+  const keyDifferences = useMemo(() => {
+    if (selectedComparisonRuns.length < 2) {
+      return [] as string[];
+    }
+
+    const statements: string[] = [];
+
+    const runsWithTrades = selectedComparisonRuns
+      .map((run, index) => ({ code: toRunCode(index), trades: run.metrics?.trade_count }))
+      .filter((entry) => typeof entry.trades === "number") as Array<{ code: string; trades: number }>;
+
+    if (runsWithTrades.length >= 2) {
+      const sorted = [...runsWithTrades].sort((a, b) => b.trades - a.trades);
+      if (sorted[0].trades > sorted[sorted.length - 1].trades) {
+        statements.push(`${sorted[0].code} produced more trades.`);
+      }
+    }
+
+    const runsWithDrawdown = selectedComparisonRuns
+      .map((run, index) => ({ code: toRunCode(index), drawdown: parseFiniteNumber(run.metrics?.max_drawdown) }))
+      .filter((entry) => entry.drawdown !== null) as Array<{ code: string; drawdown: number }>;
+
+    if (runsWithDrawdown.length >= 2) {
+      const sorted = [...runsWithDrawdown].sort((a, b) => a.drawdown - b.drawdown);
+      if (sorted[0].drawdown < sorted[sorted.length - 1].drawdown) {
+        statements.push(`${sorted[0].code} experienced lower drawdown.`);
+      }
+    }
+
+    const runsWithFeeDrag = selectedComparisonRuns
+      .map((run, index) => ({ code: toRunCode(index), feeDrag: parseFiniteNumber(run.metrics?.fee_drag_pct) }))
+      .filter((entry) => entry.feeDrag !== null) as Array<{ code: string; feeDrag: number }>;
+
+    if (runsWithFeeDrag.length >= 2) {
+      const sorted = [...runsWithFeeDrag].sort((a, b) => b.feeDrag - a.feeDrag);
+      if (sorted[0].feeDrag > sorted[sorted.length - 1].feeDrag) {
+        statements.push(`${sorted[0].code} paid higher fees.`);
+      }
+    }
+
+    return statements;
+  }, [selectedComparisonRuns]);
+
+  const toggleComparisonSelection = (runId: string) => {
+    setSelectedComparisonIds((previous) => {
+      if (previous.includes(runId)) {
+        return previous.filter((id) => id !== runId);
+      }
+
+      if (previous.length >= 3) {
+        return previous;
+      }
+
+      return [...previous, runId];
+    });
+  };
 
   const handleLaunchBacktest = async () => {
     if (!selectedStrategy || !launchParameterSetId || !hasValidStartingCapital) {
@@ -1567,6 +1835,198 @@ export default function StrategyLabPage() {
           >
             {isLaunchingBacktest ? "Launching..." : "Launch Backtest"}
           </button>
+        </section>
+
+        <section
+          aria-labelledby="research-results-workspace"
+          className="rounded-xl border border-border bg-muted/30 p-4 lg:col-span-2"
+          data-testid="strategy-lab-section-research-results-workspace"
+        >
+          <h2 id="research-results-workspace" className="text-base font-semibold sm:text-lg">
+            7) Research Results Workspace
+          </h2>
+          <p className="mt-1 text-sm text-foreground/75">
+            Compare up to three completed backtests to understand why outcomes differ.
+          </p>
+
+          <div className="mt-3 rounded-lg border border-border bg-background/30 p-3" data-testid="comparison-selection-list">
+            <h3 className="text-sm font-semibold">Comparison Selection</h3>
+            <p className="mt-1 text-xs text-foreground/70">Select up to three completed runs.</p>
+
+            {isLoadingBacktests ? (
+              <div className="mt-2 space-y-2" role="status" aria-label="Comparison runs loading">
+                <div className="h-10 animate-pulse rounded bg-foreground/15" />
+                <div className="h-10 animate-pulse rounded bg-foreground/15" />
+              </div>
+            ) : null}
+
+            {!isLoadingBacktests && backtestsError ? (
+              <p className="mt-2 rounded-md border border-red-500/40 bg-red-500/10 px-2 py-1 text-sm text-red-100" data-testid="comparison-selection-error">
+                {backtestsError}
+              </p>
+            ) : null}
+
+            {!isLoadingBacktests && !backtestsError && completedBacktests.length === 0 ? (
+              <p className="mt-2 rounded-md border border-dashed border-border bg-background/20 px-3 py-2 text-sm text-foreground/70" data-testid="comparison-selection-empty">
+                No completed backtests are available yet.
+              </p>
+            ) : null}
+
+            {!isLoadingBacktests && !backtestsError && completedBacktests.length > 0 ? (
+              <ul className="mt-2 space-y-2">
+                {completedBacktests.map((run) => {
+                  const isSelected = selectedComparisonIds.includes(run.id);
+                  const disableCheckbox = !isSelected && selectedComparisonIds.length >= 3;
+
+                  return (
+                    <li key={run.id} className="rounded-md border border-border bg-muted/20 px-3 py-2">
+                      <label className="flex cursor-pointer items-start gap-2 text-sm">
+                        <input
+                          type="checkbox"
+                          aria-label={`Select comparison run ${run.id}`}
+                          checked={isSelected}
+                          disabled={disableCheckbox}
+                          onChange={() => toggleComparisonSelection(run.id)}
+                          className="mt-1"
+                        />
+                        <span>
+                          {strategyNameById.get(run.strategy_id) ?? `Strategy ID: ${run.strategy_id}`} · {run.interval} · {formatDateLabel(run.start_time)} to {formatDateLabel(run.end_time)}
+                        </span>
+                      </label>
+                    </li>
+                  );
+                })}
+              </ul>
+            ) : null}
+          </div>
+
+          {selectedComparisonRuns.length === 0 ? (
+            <p className="mt-3 rounded-md border border-dashed border-border bg-background/20 px-3 py-2 text-sm text-foreground/70" data-testid="comparison-workspace-empty">
+              Select one or more completed runs to open the comparison workspace.
+            </p>
+          ) : (
+            <>
+              <div className="mt-3 grid gap-3 lg:grid-cols-3" data-testid="comparison-workspace-cards">
+                {selectedComparisonRuns.map((run, index) => {
+                  const runCode = toRunCode(index);
+                  const totalReturnRatio = parseFiniteNumber(run.metrics?.total_return_pct);
+                  const winRateRatio = parseFiniteNumber(run.metrics?.win_rate);
+                  const maxDrawdownRatio = parseFiniteNumber(run.metrics?.max_drawdown);
+                  const feeDragRatio = parseFiniteNumber(run.metrics?.fee_drag_pct);
+                  const netProfitValue = parseFiniteNumber(run.metrics?.total_return_usd);
+                  const initialCapitalValue = parseFiniteNumber(run.initial_capital);
+                  const endingEquityValue =
+                    netProfitValue !== null && initialCapitalValue !== null ? initialCapitalValue + netProfitValue : null;
+
+                  const bestTotalReturn = highlightedWinners.bestTotalReturnRunId === run.id;
+                  const highestWinRate = highlightedWinners.highestWinRateRunId === run.id;
+                  const lowestDrawdown = highlightedWinners.lowestDrawdownRunId === run.id;
+                  const lowestFeeDrag = highlightedWinners.lowestFeeDragRunId === run.id;
+
+                  return (
+                    <article key={run.id} className="rounded-lg border border-border bg-background/25 p-3" data-testid={`comparison-card-${run.id}`}>
+                      <h4 className="text-base font-semibold">{runCode}</h4>
+                      <dl className="mt-2 space-y-1 text-sm">
+                        <div>
+                          <dt className="text-foreground/60">Strategy</dt>
+                          <dd>{strategyNameById.get(run.strategy_id) ?? `Strategy ID: ${run.strategy_id}`}</dd>
+                        </div>
+                        <div>
+                          <dt className="text-foreground/60">Snapshot Name</dt>
+                          <dd>{snapshotNameById.get(run.parameter_set_id) ?? "Not available"}</dd>
+                        </div>
+                        <div>
+                          <dt className="text-foreground/60">Asset</dt>
+                          <dd>{run.asset_id}</dd>
+                        </div>
+                        <div>
+                          <dt className="text-foreground/60">Timeframe</dt>
+                          <dd>{run.interval}</dd>
+                        </div>
+                        <div>
+                          <dt className="text-foreground/60">Date Range</dt>
+                          <dd>{formatDateLabel(run.start_time)} to {formatDateLabel(run.end_time)}</dd>
+                        </div>
+                        <div>
+                          <dt className="text-foreground/60">Starting Capital</dt>
+                          <dd>{formatCurrency(initialCapitalValue)}</dd>
+                        </div>
+                        <div>
+                          <dt className="text-foreground/60">Ending Equity</dt>
+                          <dd>{formatCurrency(endingEquityValue)}</dd>
+                        </div>
+                        <div>
+                          <dt className="text-foreground/60">Net Profit / Loss</dt>
+                          <dd className={getMetricToneClass("totalReturn", totalReturnRatio)}>{formatSignedCurrency(netProfitValue)}</dd>
+                        </div>
+                        <div>
+                          <dt className="text-foreground/60">Total Return</dt>
+                          <dd className={getMetricToneClass("totalReturn", totalReturnRatio)}>
+                            {netProfitValue !== null && totalReturnRatio !== null
+                              ? `${formatSignedCurrency(netProfitValue)} (${formatPercentFromRatio(totalReturnRatio)})`
+                              : "Not available"}
+                          </dd>
+                          {bestTotalReturn ? <p className="text-xs text-emerald-200">Best Total Return</p> : null}
+                          {isBeginnerMode ? <p className="text-xs text-foreground/70">{BEGINNER_METRIC_EXPLANATIONS.totalReturn}</p> : null}
+                        </div>
+                        <div>
+                          <dt className="text-foreground/60">Win Rate</dt>
+                          <dd className={getMetricToneClass("winRate", winRateRatio)}>
+                            {winRateRatio !== null ? formatPercentFromRatio(winRateRatio) : "Not available"}
+                          </dd>
+                          {highestWinRate ? <p className="text-xs text-emerald-200">Highest Win Rate</p> : null}
+                          {isBeginnerMode ? <p className="text-xs text-foreground/70">{BEGINNER_METRIC_EXPLANATIONS.winRate}</p> : null}
+                        </div>
+                        <div>
+                          <dt className="text-foreground/60">Max Drawdown</dt>
+                          <dd className={getMetricToneClass("maxDrawdown", maxDrawdownRatio)}>
+                            {maxDrawdownRatio !== null ? formatPercentFromRatio(maxDrawdownRatio) : "Not available"}
+                          </dd>
+                          {lowestDrawdown ? <p className="text-xs text-emerald-200">Lowest Drawdown</p> : null}
+                          {isBeginnerMode ? <p className="text-xs text-foreground/70">{BEGINNER_METRIC_EXPLANATIONS.maxDrawdown}</p> : null}
+                        </div>
+                        <div>
+                          <dt className="text-foreground/60">Fee Drag</dt>
+                          <dd className={getMetricToneClass("feeDrag", feeDragRatio)}>
+                            {feeDragRatio !== null ? formatPercentFromRatio(feeDragRatio) : "Not available"}
+                          </dd>
+                          {lowestFeeDrag ? <p className="text-xs text-emerald-200">Lowest Fee Drag</p> : null}
+                          {isBeginnerMode ? <p className="text-xs text-foreground/70">{BEGINNER_METRIC_EXPLANATIONS.feeDrag}</p> : null}
+                        </div>
+                        <div>
+                          <dt className="text-foreground/60">Configuration Readiness</dt>
+                          <dd>{getConfigurationReadinessValue(run)}</dd>
+                        </div>
+                        <div>
+                          <dt className="text-foreground/60">Fee Setting</dt>
+                          <dd>{formatBpsLabel(run.fee_bps)}</dd>
+                        </div>
+                        <div>
+                          <dt className="text-foreground/60">Slippage Setting</dt>
+                          <dd>{formatBpsLabel(run.slippage_bps)}</dd>
+                        </div>
+                      </dl>
+                    </article>
+                  );
+                })}
+              </div>
+
+              <section className="mt-3 rounded-lg border border-border bg-background/30 p-3" data-testid="key-differences-panel">
+                <h3 className="text-sm font-semibold">Key Differences</h3>
+                {keyDifferences.length === 0 ? (
+                  <p className="mt-2 text-sm text-foreground/70">
+                    Not enough completed metric differences are available yet.
+                  </p>
+                ) : (
+                  <ul className="mt-2 space-y-1 text-sm text-foreground/85">
+                    {keyDifferences.map((line) => (
+                      <li key={line}>- {line}</li>
+                    ))}
+                  </ul>
+                )}
+              </section>
+            </>
+          )}
         </section>
       </div>
     </div>
