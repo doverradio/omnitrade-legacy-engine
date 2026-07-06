@@ -327,6 +327,23 @@ describe("StrategyLabPage Prompt 4.2", () => {
     expect(screen.getByTestId("review-beginner-summary")).toBeInTheDocument();
   });
 
+  it("renders contextual help toggles across major sections", async () => {
+    installFetchMock("success");
+    render(<StrategyLabPage />);
+
+    await waitFor(() => {
+      expect(screen.getByTestId("strategy-lab-section-choose-strategy")).toBeInTheDocument();
+    });
+
+    expect(screen.getByTestId("contextual-help-choose-strategy")).toBeInTheDocument();
+    expect(screen.getByTestId("contextual-help-configure-parameters")).toBeInTheDocument();
+    expect(screen.getByTestId("contextual-help-configuration-snapshots")).toBeInTheDocument();
+    expect(screen.getByTestId("contextual-help-review-configuration")).toBeInTheDocument();
+    expect(screen.getByTestId("contextual-help-launch-backtest")).toBeInTheDocument();
+    expect(screen.getByTestId("contextual-help-research-results-workspace")).toBeInTheDocument();
+    expect(screen.getByTestId("contextual-help-insights-workspace")).toBeInTheDocument();
+  });
+
   it("shows beginner launch safety message in review section", async () => {
     installFetchMock("success");
     render(<StrategyLabPage />);
@@ -440,6 +457,7 @@ describe("StrategyLabPage Prompt 4.2", () => {
     expect(runACard).toHaveTextContent("Win Rate");
     expect(runACard).toHaveTextContent("Max Drawdown");
     expect(runACard).toHaveTextContent("Fee Drag");
+    expect(runACard).toHaveTextContent("Sharpe-like");
     expect(runACard).toHaveTextContent("Configuration Readiness");
     expect(runACard).toHaveTextContent("Not available");
 
@@ -447,6 +465,11 @@ describe("StrategyLabPage Prompt 4.2", () => {
     expect(runBCard).toHaveTextContent("Highest Win Rate");
     expect(runBCard).toHaveTextContent("Lowest Drawdown");
     expect(runBCard).toHaveTextContent("Lowest Fee Drag");
+
+    expect(within(runACard).getByRole("button", { name: "Win Rate definition" })).toBeInTheDocument();
+    expect(within(runACard).getByRole("button", { name: "Max Drawdown definition" })).toBeInTheDocument();
+    expect(within(runACard).getByRole("button", { name: "Fee Drag definition" })).toBeInTheDocument();
+    expect(within(runACard).getByRole("button", { name: "Sharpe-like definition" })).toBeInTheDocument();
   });
 
   it("renders deterministic key differences from selected run metrics", async () => {
@@ -479,13 +502,21 @@ describe("StrategyLabPage Prompt 4.2", () => {
 
     await user.click(screen.getByLabelText("Select comparison run bt-1"));
 
-    expect(screen.getByText("Total return shows overall performance as dollars and percentage from the starting capital.")).toBeInTheDocument();
-    expect(screen.getByText("Win rate is the share of completed trades that were profitable.")).toBeInTheDocument();
+    expect(
+      screen.getByText("Total return shows overall performance as dollars and percentage from the starting capital.", {
+        selector: "p",
+      }),
+    ).toBeInTheDocument();
+    expect(screen.getByText("Win rate is the share of completed trades that were profitable.", { selector: "p" })).toBeInTheDocument();
 
     await user.click(screen.getByRole("switch", { name: "Beginner Mode" }));
 
-    expect(screen.queryByText("Total return shows overall performance as dollars and percentage from the starting capital.")).not.toBeInTheDocument();
-    expect(screen.queryByText("Win rate is the share of completed trades that were profitable.")).not.toBeInTheDocument();
+    expect(
+      screen.queryByText("Total return shows overall performance as dollars and percentage from the starting capital.", {
+        selector: "p",
+      }),
+    ).not.toBeInTheDocument();
+    expect(screen.queryByText("Win rate is the share of completed trades that were profitable.", { selector: "p" })).not.toBeInTheDocument();
   });
 
   it("keeps accessibility basics for comparison workspace controls", async () => {

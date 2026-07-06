@@ -3,7 +3,9 @@
 import { useEffect, useMemo, useState } from "react";
 import { useRouter } from "next/navigation";
 
+import { ContextualHelp } from "@/components/domain/ContextualHelp";
 import EquityCurveChart from "@/components/charts/EquityCurveChart";
+import { GlossaryTermTooltip } from "@/components/domain/GlossaryTermTooltip";
 import { ApiRequestError, getBacktests, runBacktest, type BacktestListItem } from "@/lib/api/backtests";
 import { getParameterSets, saveParameterSet, type ParameterSetItem } from "@/lib/api/parameterSets";
 import { getStrategies, type StrategyItem } from "@/lib/api/strategies";
@@ -98,6 +100,23 @@ const DEFAULT_BACKTEST_INITIAL_CAPITAL = "25";
 const DEFAULT_BACKTEST_FEE_BPS = "10";
 const DEFAULT_BACKTEST_SLIPPAGE_BPS = "5";
 const DEFAULT_BACKTEST_ASSET_ID = process.env.NEXT_PUBLIC_DEFAULT_BACKTEST_ASSET_ID ?? "00000000-0000-0000-0000-000000000000";
+
+const GLOSSARY_DEFINITIONS = {
+  winRate: "Win rate is the share of completed trades that were profitable.",
+  feeDrag: "Fee drag is performance reduction caused by fees and execution costs.",
+  maxDrawdown: "Max drawdown is the largest drop from a peak equity value during a run.",
+  sharpeLike: "Sharpe-like is a simplified risk-adjusted return metric where higher is generally better.",
+  slippage: "Slippage is the difference between expected price and actual fill price in the model.",
+  startingCapital: "Starting capital is the amount of money a backtest starts with.",
+  endingEquity: "Ending equity is the total account value at the end of a run.",
+  configurationReadiness: "Configuration readiness summarizes how prepared your current setup is for backtesting.",
+};
+
+const IMPROVED_EMPTY_STATE_COPY = {
+  noSnapshots: "No snapshots yet. Save your current configuration to create your first reusable preset.",
+  noComparisons: "No comparisons selected. Choose completed runs above to compare evidence side-by-side.",
+  noExperimentLogs: "No experiment log entries yet. Create one from your current comparison to preserve your research context.",
+};
 
 const BEGINNER_METRIC_EXPLANATIONS: Record<ComparisonMetricKey, string> = {
   totalReturn: "Total return shows overall performance as dollars and percentage from the starting capital.",
@@ -1423,6 +1442,10 @@ export default function StrategyLabPage() {
             1) Choose Strategy
           </h2>
           <p className="mt-1 text-sm text-foreground/75">Pick a strategy card to start this research workflow.</p>
+          <ContextualHelp
+            title="choose-strategy"
+            body="This section helps you pick a strategy before changing parameters or running backtests. Start here, then move through the workflow from top to bottom."
+          />
 
           {isLoadingStrategies ? (
             <div className="mt-3 space-y-3" role="status" aria-live="polite" aria-label="Strategies loading">
@@ -1549,6 +1572,10 @@ export default function StrategyLabPage() {
             2) Configure Parameters
           </h2>
           <p className="mt-1 text-sm text-foreground/75">Adjust strategy settings with generated controls and live validation.</p>
+          <ContextualHelp
+            title="configure-parameters"
+            body="Parameters control how a strategy behaves. Update values here and watch validation and coaching update in real time."
+          />
 
           {!selectedStrategy ? (
             <p className="mt-3 rounded-md border border-dashed border-border bg-background/30 px-3 py-2 text-sm text-foreground/70">
@@ -1712,6 +1739,10 @@ export default function StrategyLabPage() {
           <p className="mt-1 text-sm text-foreground/75">
             Save the current configuration as a reusable snapshot, then view, select, or apply saved presets.
           </p>
+          <ContextualHelp
+            title="configuration-snapshots"
+            body="Snapshots let you save and reuse parameter sets so you can compare experiments consistently without re-entering values."
+          />
 
           {!selectedStrategy ? (
             <p className="mt-3 rounded-md border border-dashed border-border bg-background/30 px-3 py-2 text-sm text-foreground/70">
@@ -1790,7 +1821,7 @@ export default function StrategyLabPage() {
 
                 {!isLoadingParameterSets && !parameterSetsError && strategyParameterSets.length === 0 ? (
                   <p className="mt-2 rounded-md border border-dashed border-border bg-background/30 px-3 py-2 text-sm text-foreground/70" data-testid="snapshot-library-empty">
-                    No saved presets yet. Save your current configuration to start the library.
+                    {IMPROVED_EMPTY_STATE_COPY.noSnapshots}
                   </p>
                 ) : null}
 
@@ -1901,6 +1932,10 @@ export default function StrategyLabPage() {
           <p className="mt-1 text-sm text-foreground/75">
             Confirm your setup details before launching a backtest run.
           </p>
+          <ContextualHelp
+            title="review-configuration"
+            body="Review confirms exactly what will be tested so you can catch mistakes before launch."
+          />
 
           {isBeginnerMode ? (
             <div className="mt-3 rounded-md border border-emerald-500/40 bg-emerald-500/10 px-3 py-2 text-sm text-emerald-100" data-testid="beginner-launch-message">
@@ -1924,7 +1959,9 @@ export default function StrategyLabPage() {
               </dd>
             </div>
             <div>
-              <dt className="text-foreground/60">Starting Capital</dt>
+              <dt className="text-foreground/60">
+                <GlossaryTermTooltip term="Starting Capital" definition={GLOSSARY_DEFINITIONS.startingCapital} />
+              </dt>
               <dd className="font-medium text-foreground/90">${startingCapital}</dd>
             </div>
             <div>
@@ -1932,11 +1969,15 @@ export default function StrategyLabPage() {
               <dd className="font-medium text-foreground/90">{feeBps} bps</dd>
             </div>
             <div>
-              <dt className="text-foreground/60">Slippage Settings</dt>
+              <dt className="text-foreground/60">
+                <GlossaryTermTooltip term="Slippage Settings" definition={GLOSSARY_DEFINITIONS.slippage} />
+              </dt>
               <dd className="font-medium text-foreground/90">{slippageBps} bps</dd>
             </div>
             <div>
-              <dt className="text-foreground/60">Configuration Readiness</dt>
+              <dt className="text-foreground/60">
+                <GlossaryTermTooltip term="Configuration Readiness" definition={GLOSSARY_DEFINITIONS.configurationReadiness} />
+              </dt>
               <dd className="font-medium text-foreground/90">{readinessScore} / 100 • {readinessLabel}</dd>
             </div>
             <div className="sm:col-span-2">
@@ -1967,10 +2008,16 @@ export default function StrategyLabPage() {
           <p className="mt-1 text-sm text-foreground/75">
             Complete the checklist, then launch with the existing backtest workflow.
           </p>
+          <ContextualHelp
+            title="launch-backtest"
+            body="Launch starts a historical simulation only. This does not place live or paper trading orders."
+          />
 
           <div className="mt-3 grid gap-2 sm:grid-cols-3" data-testid="launch-settings-form">
             <label className="space-y-1 text-sm">
-              <span className="text-foreground/80">Starting Capital</span>
+              <span className="text-foreground/80">
+                <GlossaryTermTooltip term="Starting Capital" definition={GLOSSARY_DEFINITIONS.startingCapital} />
+              </span>
               <input
                 aria-label="Launch starting capital"
                 type="number"
@@ -1994,7 +2041,9 @@ export default function StrategyLabPage() {
               />
             </label>
             <label className="space-y-1 text-sm">
-              <span className="text-foreground/80">Slippage (bps)</span>
+              <span className="text-foreground/80">
+                <GlossaryTermTooltip term="Slippage (bps)" definition={GLOSSARY_DEFINITIONS.slippage} />
+              </span>
               <input
                 aria-label="Launch slippage bps"
                 type="number"
@@ -2061,13 +2110,17 @@ export default function StrategyLabPage() {
           <p className="mt-1 text-sm text-foreground/75">
             Compare up to three completed backtests to understand why outcomes differ.
           </p>
+          <ContextualHelp
+            title="research-results-workspace"
+            body="Use this workspace to compare completed runs side-by-side and inspect differences in outcomes and configuration quality."
+          />
 
           <div className="mt-3 rounded-lg border border-border bg-background/30 p-3" data-testid="comparison-selection-list">
             <h3 className="text-sm font-semibold">Comparison Selection</h3>
             <p className="mt-1 text-xs text-foreground/70">Select up to three completed runs.</p>
 
             {isLoadingBacktests ? (
-              <div className="mt-2 space-y-2" role="status" aria-label="Comparison runs loading">
+              <div className="mt-2 space-y-2" role="status" aria-live="polite" aria-label="Comparison runs loading">
                 <div className="h-10 animate-pulse rounded bg-foreground/15" />
                 <div className="h-10 animate-pulse rounded bg-foreground/15" />
               </div>
@@ -2115,7 +2168,7 @@ export default function StrategyLabPage() {
 
           {selectedComparisonRuns.length === 0 ? (
             <p className="mt-3 rounded-md border border-dashed border-border bg-background/20 px-3 py-2 text-sm text-foreground/70" data-testid="comparison-workspace-empty">
-              Select one or more completed runs to open the comparison workspace.
+              {IMPROVED_EMPTY_STATE_COPY.noComparisons}
             </p>
           ) : (
             <>
@@ -2126,6 +2179,7 @@ export default function StrategyLabPage() {
                   const winRateRatio = parseFiniteNumber(run.metrics?.win_rate);
                   const maxDrawdownRatio = parseFiniteNumber(run.metrics?.max_drawdown);
                   const feeDragRatio = parseFiniteNumber(run.metrics?.fee_drag_pct);
+                  const sharpeLikeValue = parseFiniteNumber(run.metrics?.sharpe_like);
                   const netProfitValue = parseFiniteNumber(run.metrics?.total_return_usd);
                   const initialCapitalValue = parseFiniteNumber(run.initial_capital);
                   const endingEquityValue =
@@ -2137,7 +2191,7 @@ export default function StrategyLabPage() {
                   const lowestFeeDrag = highlightedWinners.lowestFeeDragRunId === run.id;
 
                   return (
-                    <article key={run.id} className="rounded-lg border border-border bg-background/25 p-3" data-testid={`comparison-card-${run.id}`}>
+                    <article key={run.id} className="overflow-x-auto rounded-lg border border-border bg-background/25 p-3" data-testid={`comparison-card-${run.id}`}>
                       <h4 className="text-base font-semibold">{runCode}</h4>
                       <dl className="mt-2 space-y-1 text-sm">
                         <div>
@@ -2161,11 +2215,15 @@ export default function StrategyLabPage() {
                           <dd>{formatDateLabel(run.start_time)} to {formatDateLabel(run.end_time)}</dd>
                         </div>
                         <div>
-                          <dt className="text-foreground/60">Starting Capital</dt>
+                          <dt className="text-foreground/60">
+                            <GlossaryTermTooltip term="Starting Capital" definition={GLOSSARY_DEFINITIONS.startingCapital} />
+                          </dt>
                           <dd>{formatCurrency(initialCapitalValue)}</dd>
                         </div>
                         <div>
-                          <dt className="text-foreground/60">Ending Equity</dt>
+                          <dt className="text-foreground/60">
+                            <GlossaryTermTooltip term="Ending Equity" definition={GLOSSARY_DEFINITIONS.endingEquity} />
+                          </dt>
                           <dd>{formatCurrency(endingEquityValue)}</dd>
                         </div>
                         <div>
@@ -2183,7 +2241,9 @@ export default function StrategyLabPage() {
                           {isBeginnerMode ? <p className="text-xs text-foreground/70">{BEGINNER_METRIC_EXPLANATIONS.totalReturn}</p> : null}
                         </div>
                         <div>
-                          <dt className="text-foreground/60">Win Rate</dt>
+                          <dt className="text-foreground/60">
+                            <GlossaryTermTooltip term="Win Rate" definition={GLOSSARY_DEFINITIONS.winRate} />
+                          </dt>
                           <dd className={getMetricToneClass("winRate", winRateRatio)}>
                             {winRateRatio !== null ? formatPercentFromRatio(winRateRatio) : "Not available"}
                           </dd>
@@ -2191,7 +2251,9 @@ export default function StrategyLabPage() {
                           {isBeginnerMode ? <p className="text-xs text-foreground/70">{BEGINNER_METRIC_EXPLANATIONS.winRate}</p> : null}
                         </div>
                         <div>
-                          <dt className="text-foreground/60">Max Drawdown</dt>
+                          <dt className="text-foreground/60">
+                            <GlossaryTermTooltip term="Max Drawdown" definition={GLOSSARY_DEFINITIONS.maxDrawdown} />
+                          </dt>
                           <dd className={getMetricToneClass("maxDrawdown", maxDrawdownRatio)}>
                             {maxDrawdownRatio !== null ? formatPercentFromRatio(maxDrawdownRatio) : "Not available"}
                           </dd>
@@ -2199,7 +2261,9 @@ export default function StrategyLabPage() {
                           {isBeginnerMode ? <p className="text-xs text-foreground/70">{BEGINNER_METRIC_EXPLANATIONS.maxDrawdown}</p> : null}
                         </div>
                         <div>
-                          <dt className="text-foreground/60">Fee Drag</dt>
+                          <dt className="text-foreground/60">
+                            <GlossaryTermTooltip term="Fee Drag" definition={GLOSSARY_DEFINITIONS.feeDrag} />
+                          </dt>
                           <dd className={getMetricToneClass("feeDrag", feeDragRatio)}>
                             {feeDragRatio !== null ? formatPercentFromRatio(feeDragRatio) : "Not available"}
                           </dd>
@@ -2207,7 +2271,9 @@ export default function StrategyLabPage() {
                           {isBeginnerMode ? <p className="text-xs text-foreground/70">{BEGINNER_METRIC_EXPLANATIONS.feeDrag}</p> : null}
                         </div>
                         <div>
-                          <dt className="text-foreground/60">Configuration Readiness</dt>
+                          <dt className="text-foreground/60">
+                            <GlossaryTermTooltip term="Configuration Readiness" definition={GLOSSARY_DEFINITIONS.configurationReadiness} />
+                          </dt>
                           <dd>{getConfigurationReadinessValue(run)}</dd>
                         </div>
                         <div>
@@ -2215,8 +2281,16 @@ export default function StrategyLabPage() {
                           <dd>{formatBpsLabel(run.fee_bps)}</dd>
                         </div>
                         <div>
-                          <dt className="text-foreground/60">Slippage Setting</dt>
+                          <dt className="text-foreground/60">
+                            <GlossaryTermTooltip term="Slippage Setting" definition={GLOSSARY_DEFINITIONS.slippage} />
+                          </dt>
                           <dd>{formatBpsLabel(run.slippage_bps)}</dd>
+                        </div>
+                        <div>
+                          <dt className="text-foreground/60">
+                            <GlossaryTermTooltip term="Sharpe-like" definition={GLOSSARY_DEFINITIONS.sharpeLike} />
+                          </dt>
+                          <dd>{sharpeLikeValue !== null ? formatSignedNumber(sharpeLikeValue) : "Not available"}</dd>
                         </div>
                       </dl>
                     </article>
@@ -2253,6 +2327,10 @@ export default function StrategyLabPage() {
           <p className="mt-1 text-sm text-foreground/75">
             Visualize evidence from selected backtests without predictions or recommendations.
           </p>
+          <ContextualHelp
+            title="insights-workspace"
+            body="Insights summarizes what changed across runs using existing metrics only. It does not predict future performance."
+          />
 
           {selectedComparisonRuns.length === 0 ? (
             <p className="mt-3 rounded-md border border-dashed border-border bg-background/20 px-3 py-2 text-sm text-foreground/70" data-testid="insights-workspace-empty">
@@ -2286,7 +2364,7 @@ export default function StrategyLabPage() {
                 </div>
               </section>
 
-              <section className="mt-3 rounded-lg border border-border bg-background/30 p-3" data-testid="metric-trend-visuals">
+              <section className="mt-3 overflow-x-auto rounded-lg border border-border bg-background/30 p-3" data-testid="metric-trend-visuals">
                 <h3 className="text-sm font-semibold">Metric Trend Visuals</h3>
                 <div className="mt-2 grid gap-3 md:grid-cols-2">
                   {([
@@ -2384,7 +2462,7 @@ export default function StrategyLabPage() {
 
                 {experimentLogEntries.length === 0 ? (
                   <p className="mt-3 text-sm text-foreground/70" data-testid="experiment-log-empty">
-                    No experiment entries yet.
+                    {IMPROVED_EMPTY_STATE_COPY.noExperimentLogs}
                   </p>
                 ) : (
                   <div className="mt-3 space-y-3" data-testid="experiment-log-list">
