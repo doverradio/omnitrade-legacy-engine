@@ -76,6 +76,18 @@ function installFetchMock(scenario: FetchScenario) {
             overbought: 70,
           },
         },
+        {
+          id: "strategy-3",
+          name: "Breakout",
+          slug: "breakout",
+          is_active: false,
+          module_version: "1.0.0",
+          default_params: {
+            lookback: 20,
+            volume_confirmation: true,
+            min_volume_multiple: 1.5,
+          },
+        },
       ],
     });
   });
@@ -89,6 +101,129 @@ afterEach(() => {
 });
 
 describe("StrategyLabPage Prompt 4.2", () => {
+  it("renders generated parameter editor for selected strategy", async () => {
+    installFetchMock("success");
+    render(<StrategyLabPage />);
+
+    await waitFor(() => {
+      expect(screen.getByTestId("generated-parameter-editor")).toBeInTheDocument();
+    });
+
+    expect(screen.getByTestId("strategy-lab-section-configure-parameters")).toBeInTheDocument();
+    expect(screen.getByTestId("parameter-card-fast_period")).toBeInTheDocument();
+    expect(screen.getByTestId("parameter-card-slow_period")).toBeInTheDocument();
+    expect(screen.getByTestId("parameter-card-ma_type")).toBeInTheDocument();
+    expect(screen.getAllByText("What it Controls").length).toBeGreaterThan(0);
+    expect(screen.getAllByText("Expected Effect").length).toBeGreaterThan(0);
+    expect(screen.getAllByText("Recommended Range").length).toBeGreaterThan(0);
+  });
+
+  it("renders integer controls (slider + numeric input)", async () => {
+    installFetchMock("success");
+    render(<StrategyLabPage />);
+
+    await waitFor(() => {
+      expect(screen.getByLabelText("Fast Period slider")).toBeInTheDocument();
+    });
+
+    expect(screen.getByLabelText("Fast Period value")).toBeInTheDocument();
+  });
+
+  it("renders enum dropdown control", async () => {
+    installFetchMock("success");
+    render(<StrategyLabPage />);
+
+    await waitFor(() => {
+      expect(screen.getByLabelText("Moving Average Type select")).toBeInTheDocument();
+    });
+  });
+
+  it("renders percentage slider control when selecting RSI strategy", async () => {
+    installFetchMock("success");
+    render(<StrategyLabPage />);
+    const user = userEvent.setup();
+
+    await waitFor(() => {
+      expect(screen.getByLabelText("Select strategy RSI Mean Reversion")).toBeInTheDocument();
+    });
+
+    await user.click(screen.getByLabelText("Select strategy RSI Mean Reversion"));
+
+    expect(screen.getByLabelText("Oversold Threshold slider")).toBeInTheDocument();
+    expect(screen.getByLabelText("Overbought Threshold slider")).toBeInTheDocument();
+  });
+
+  it("renders decimal and boolean controls when selecting Breakout strategy", async () => {
+    installFetchMock("success");
+    render(<StrategyLabPage />);
+    const user = userEvent.setup();
+
+    await waitFor(() => {
+      expect(screen.getByLabelText("Select strategy Breakout")).toBeInTheDocument();
+    });
+
+    await user.click(screen.getByLabelText("Select strategy Breakout"));
+
+    expect(screen.getByLabelText("Minimum Volume Multiple value")).toBeInTheDocument();
+    expect(screen.getByRole("switch", { name: "Volume Confirmation switch" })).toBeInTheDocument();
+  });
+
+  it("renders beginner explanation blocks and collapses them in advanced mode", async () => {
+    installFetchMock("success");
+    render(<StrategyLabPage />);
+    const user = userEvent.setup();
+
+    await waitFor(() => {
+      expect(screen.getByTestId("beginner-why-change-fast_period")).toBeInTheDocument();
+    });
+
+    expect(screen.getAllByText("Why would I change this?").length).toBeGreaterThan(0);
+
+    await user.click(screen.getByRole("switch", { name: "Beginner Mode" }));
+
+    expect(screen.queryByTestId("beginner-why-change-fast_period")).not.toBeInTheDocument();
+    expect(screen.getByTestId("advanced-beginner-collapsed-fast_period")).toBeInTheDocument();
+    expect(screen.getByTestId("advanced-effect-collapsed-fast_period")).toBeInTheDocument();
+  });
+
+  it("shows live validation errors when numeric values go out of range", async () => {
+    installFetchMock("success");
+    render(<StrategyLabPage />);
+    const user = userEvent.setup();
+
+    await waitFor(() => {
+      expect(screen.getByLabelText("Slow Period value")).toBeInTheDocument();
+    });
+
+    const slowPeriodInput = screen.getByLabelText("Slow Period value");
+    await user.clear(slowPeriodInput);
+    await user.type(slowPeriodInput, "2");
+
+    expect(await screen.findByText("Slow Period must be at least 5.")).toBeInTheDocument();
+    expect(screen.getByTestId("parameter-form-validation")).toHaveTextContent("validation issue");
+  });
+
+  it("keeps mobile-first wrappers and accessibility basics", async () => {
+    installFetchMock("success");
+    render(<StrategyLabPage />);
+
+    expect(screen.getByTestId("strategy-lab-mobile-wrapper")).toBeInTheDocument();
+    expect(screen.getByTestId("strategy-lab-sections-grid")).toBeInTheDocument();
+
+    await waitFor(() => {
+      expect(screen.getByTestId("generated-parameter-editor")).toBeInTheDocument();
+    });
+
+    await waitFor(() => {
+      expect(screen.getByLabelText("Fast Period slider")).toBeInTheDocument();
+    });
+
+    expect(screen.getByRole("switch", { name: "Beginner Mode" })).toBeInTheDocument();
+    expect(screen.getByRole("navigation", { name: "Research Journey" })).toBeInTheDocument();
+    expect(screen.getByLabelText("Fast Period value")).toBeInTheDocument();
+    expect(screen.getByLabelText("Moving Average Type select")).toBeInTheDocument();
+  });
+
   it("renders the Research Journey component", async () => {
     installFetchMock("success");
     render(<StrategyLabPage />);
@@ -175,7 +310,6 @@ describe("StrategyLabPage Prompt 4.2", () => {
     expect(screen.getByText("Strategy Detail")).toBeInTheDocument();
     expect(screen.getByText(/Beginner explanation:/)).toBeInTheDocument();
     expect(screen.getByText(/Default parameters:/)).toBeInTheDocument();
-    expect(screen.getByText("Parameter editor will appear in the next step.")).toBeInTheDocument();
   });
 
   it("renders empty state when no strategies are available", async () => {
@@ -200,7 +334,14 @@ describe("StrategyLabPage Prompt 4.2", () => {
     expect(screen.getByText("Failed to load strategies for test")).toBeInTheDocument();
   });
 
-  it("includes mobile layout wrappers and accessibility basics", async () => {
+  it("includes loading state", async () => {
+    installFetchMock("loading");
+    render(<StrategyLabPage />);
+
+    expect(screen.getByLabelText("Strategies loading")).toBeInTheDocument();
+  });
+
+  it("includes mobile layout wrappers and strategy accessibility basics", async () => {
     installFetchMock("success");
     render(<StrategyLabPage />);
 

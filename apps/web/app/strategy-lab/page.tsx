@@ -4,6 +4,12 @@ import { useEffect, useMemo, useState } from "react";
 
 import { ApiRequestError } from "@/lib/api/backtests";
 import { getStrategies, type StrategyItem } from "@/lib/api/strategies";
+import {
+  getParameterDefinitions,
+  validateParameterValue,
+  validateParameterValues,
+  type ParameterDefinition,
+} from "@/lib/parameterDefinitions";
 
 type PlaceholderSectionProps = {
   id: string;
@@ -21,6 +27,107 @@ type StrategyMetadata = {
   worksPoorlyIn: string;
   tradeFrequency: string;
   beginnerExplanation: string;
+};
+
+type ExpectedEffectNotes = {
+  increasing?: string[];
+  decreasing?: string[];
+  enabled?: string[];
+  disabled?: string[];
+  options?: Record<string, string[]>;
+};
+
+type BeginnerWhyChangeNotes = {
+  title: string;
+  lines: string[];
+};
+
+type ParameterValues = Record<string, string | number | boolean>;
+
+const PARAMETER_EFFECT_NOTES: Record<string, ExpectedEffectNotes> = {
+  fast_period: {
+    increasing: ["Produces fewer signals", "Reacts more slowly to price changes", "Smooths market noise"],
+    decreasing: ["Produces more signals", "Reacts faster", "May increase false signals"],
+  },
+  slow_period: {
+    increasing: ["Uses a longer trend baseline", "Generates fewer crossover events", "Reduces short-term noise"],
+    decreasing: ["Uses a shorter trend baseline", "Can react sooner to trend changes", "Can increase whipsaw risk"],
+  },
+  rsi_period: {
+    increasing: ["Makes RSI smoother", "Reduces short-term RSI swings"],
+    decreasing: ["Makes RSI react faster", "Can produce more threshold crossings"],
+  },
+  oversold: {
+    increasing: ["Makes buy entries more conservative", "Can reduce total trade count"],
+    decreasing: ["Allows earlier oversold entries", "Can increase trade frequency"],
+  },
+  overbought: {
+    increasing: ["Delays overbought exits", "Can hold positions longer"],
+    decreasing: ["Triggers overbought exits earlier", "Can increase exit frequency"],
+  },
+  lookback: {
+    increasing: ["Requires larger range breaks", "May reduce false breakout entries"],
+    decreasing: ["Allows faster breakout triggers", "Can increase noisy breakout signals"],
+  },
+  min_volume_multiple: {
+    increasing: ["Requires stronger volume confirmation", "Filters out weaker breakouts"],
+    decreasing: ["Allows more breakout entries", "Can increase false-breakout exposure"],
+  },
+  volume_confirmation: {
+    enabled: ["Requires volume evidence before triggering breakouts", "May reduce low-conviction entries"],
+    disabled: ["Allows breakout entries without volume confirmation", "Can increase trigger frequency"],
+  },
+  conflict_resolution: {
+    options: {
+      net_strength: ["Resolves conflicts using signed strength balance", "Can react quickly to strong minority signals"],
+      majority_vote: ["Resolves conflicts by vote count", "Prefers consensus and ignores small strength differences"],
+    },
+  },
+};
+
+const PARAMETER_BEGINNER_WHY_CHANGE: Record<string, BeginnerWhyChangeNotes> = {
+  fast_period: {
+    title: "Fast Moving Average",
+    lines: [
+      "A smaller value reacts faster to recent price changes.",
+      "A larger value reacts more slowly but ignores more short-term market noise.",
+    ],
+  },
+  slow_period: {
+    title: "Slow Moving Average",
+    lines: [
+      "A larger value tracks the broader market trend.",
+      "A smaller value reacts sooner but can switch direction more often.",
+    ],
+  },
+  rsi_period: {
+    title: "RSI Period",
+    lines: [
+      "A smaller value makes RSI react faster to price changes.",
+      "A larger value smooths RSI and reduces short-term noise.",
+    ],
+  },
+  oversold: {
+    title: "Oversold Threshold",
+    lines: [
+      "Lower values wait for deeper pullbacks before signaling potential entries.",
+      "Higher values allow earlier entries but may trigger more often.",
+    ],
+  },
+  overbought: {
+    title: "Overbought Threshold",
+    lines: [
+      "Lower values can lock in exits sooner.",
+      "Higher values hold longer before signaling overbought conditions.",
+    ],
+  },
+  lookback: {
+    title: "Breakout Lookback",
+    lines: [
+      "A shorter value reacts to newer ranges quickly.",
+      "A longer value waits for larger, more established breakouts.",
+    ],
+  },
 };
 
 const STRATEGY_METADATA: Record<string, Partial<StrategyMetadata>> = {
@@ -112,6 +219,220 @@ function getErrorMessage(error: unknown): string {
   return "Could not load strategies right now.";
 }
 
+function formatCurrentValue(value: string | number | boolean, definition: ParameterDefinition): string {
+  if (typeof value === "boolean") {
+    return value ? "Enabled" : "Disabled";
+  }
+
+  if (definition.type === "percentage") {
+    return `${value}${definition.units ?? "%"}`;
+  }
+
+  return String(value);
+}
+
+function renderExpectedEffects(
+  definition: ParameterDefinition,
+  currentValue: string | number | boolean,
+): React.JSX.Element {
+  const notes = PARAMETER_EFFECT_NOTES[definition.key];
+
+  if (!notes) {
+    return (
+      <p className="text-sm text-foreground/75">Expected effects for this parameter are not yet documented.</p>
+    );
+  }
+
+  if (definition.type === "boolean") {
+    const selected = currentValue === true ? notes.enabled : notes.disabled;
+    if (!selected || selected.length === 0) {
+      return (
+        <p className="text-sm text-foreground/75">Expected effects for this parameter are not yet documented.</p>
+      );
+    }
+
+    return (
+      <ul className="mt-2 space-y-1 text-sm text-foreground/80">
+        {selected.map((line) => (
+          <li key={line}>- {line}</li>
+        ))}
+      </ul>
+    );
+  }
+
+  if (definition.type === "enum") {
+    const selected = typeof currentValue === "string" ? notes.options?.[currentValue] : undefined;
+    if (!selected || selected.length === 0) {
+      return (
+        <p className="text-sm text-foreground/75">Expected effects for this parameter are not yet documented.</p>
+      );
+    }
+
+    return (
+      <ul className="mt-2 space-y-1 text-sm text-foreground/80">
+        {selected.map((line) => (
+          <li key={line}>- {line}</li>
+        ))}
+      </ul>
+    );
+  }
+
+  const increasing = notes.increasing ?? [];
+  const decreasing = notes.decreasing ?? [];
+
+  if (increasing.length === 0 && decreasing.length === 0) {
+    return <p className="text-sm text-foreground/75">Expected effects for this parameter are not yet documented.</p>;
+  }
+
+  return (
+    <div className="grid gap-3 sm:grid-cols-2">
+      <div>
+        <p className="text-sm font-medium text-foreground/90">Increasing {definition.label}</p>
+        <ul className="mt-2 space-y-1 text-sm text-foreground/80">
+          {increasing.map((line) => (
+            <li key={line}>- {line}</li>
+          ))}
+        </ul>
+      </div>
+      <div>
+        <p className="text-sm font-medium text-foreground/90">Decreasing {definition.label}</p>
+        <ul className="mt-2 space-y-1 text-sm text-foreground/80">
+          {decreasing.map((line) => (
+            <li key={line}>- {line}</li>
+          ))}
+        </ul>
+      </div>
+    </div>
+  );
+}
+
+function renderControl(
+  definition: ParameterDefinition,
+  value: string | number | boolean,
+  onChange: (nextValue: string | number | boolean) => void,
+): React.JSX.Element {
+  if (definition.type === "integer") {
+    return (
+      <div className="space-y-2">
+        <label htmlFor={`range-${definition.key}`} className="text-sm font-medium text-foreground/90">
+          {definition.label} slider
+        </label>
+        <input
+          id={`range-${definition.key}`}
+          aria-label={`${definition.label} slider`}
+          type="range"
+          min={definition.minimum}
+          max={definition.maximum}
+          step={definition.step ?? 1}
+          value={Number(value)}
+          onChange={(event) => onChange(Number(event.target.value))}
+          className="w-full"
+        />
+        <label htmlFor={`input-${definition.key}`} className="text-sm font-medium text-foreground/90">
+          {definition.label} value
+        </label>
+        <input
+          id={`input-${definition.key}`}
+          aria-label={`${definition.label} value`}
+          type="number"
+          inputMode="numeric"
+          min={definition.minimum}
+          max={definition.maximum}
+          step={definition.step ?? 1}
+          value={Number(value)}
+          onChange={(event) => onChange(Number(event.target.value))}
+          className="w-full rounded-md border border-border bg-background px-3 py-2 text-sm"
+        />
+      </div>
+    );
+  }
+
+  if (definition.type === "decimal") {
+    return (
+      <div className="space-y-2">
+        <label htmlFor={`input-${definition.key}`} className="text-sm font-medium text-foreground/90">
+          {definition.label}
+        </label>
+        <input
+          id={`input-${definition.key}`}
+          aria-label={`${definition.label} value`}
+          type="number"
+          inputMode="decimal"
+          min={definition.minimum}
+          max={definition.maximum}
+          step={definition.step ?? 0.01}
+          value={Number(value)}
+          onChange={(event) => onChange(Number(event.target.value))}
+          className="w-full rounded-md border border-border bg-background px-3 py-2 text-sm"
+        />
+      </div>
+    );
+  }
+
+  if (definition.type === "percentage") {
+    return (
+      <div className="space-y-2">
+        <label htmlFor={`range-${definition.key}`} className="text-sm font-medium text-foreground/90">
+          {definition.label}
+        </label>
+        <input
+          id={`range-${definition.key}`}
+          aria-label={`${definition.label} slider`}
+          type="range"
+          min={definition.minimum}
+          max={definition.maximum}
+          step={definition.step ?? 0.1}
+          value={Number(value)}
+          onChange={(event) => onChange(Number(event.target.value))}
+          className="w-full"
+        />
+        <p className="text-sm text-foreground/80" aria-live="polite">
+          {Number(value)}{definition.units ?? "%"}
+        </p>
+      </div>
+    );
+  }
+
+  if (definition.type === "boolean") {
+    return (
+      <div className="space-y-2">
+        <span className="text-sm font-medium text-foreground/90">{definition.label}</span>
+        <button
+          type="button"
+          role="switch"
+          aria-label={`${definition.label} switch`}
+          aria-checked={Boolean(value)}
+          onClick={() => onChange(!Boolean(value))}
+          className="inline-flex min-h-11 min-w-28 items-center justify-center rounded-md border border-border bg-muted px-4 py-2 text-sm font-medium transition hover:bg-foreground/10 focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-accent"
+        >
+          {Boolean(value) ? "Enabled" : "Disabled"}
+        </button>
+      </div>
+    );
+  }
+
+  return (
+    <div className="space-y-2">
+      <label htmlFor={`select-${definition.key}`} className="text-sm font-medium text-foreground/90">
+        {definition.label}
+      </label>
+      <select
+        id={`select-${definition.key}`}
+        aria-label={`${definition.label} select`}
+        value={String(value)}
+        onChange={(event) => onChange(event.target.value)}
+        className="w-full rounded-md border border-border bg-background px-3 py-2 text-sm"
+      >
+        {definition.allowedValues?.map((allowedValue) => (
+          <option key={allowedValue} value={allowedValue}>
+            {allowedValue}
+          </option>
+        ))}
+      </select>
+    </div>
+  );
+}
+
 function PlaceholderSection({ id, title, description, placeholder, tone = "empty" }: PlaceholderSectionProps) {
   return (
     <section
@@ -178,6 +499,7 @@ export default function StrategyLabPage() {
   const [selectedStrategyId, setSelectedStrategyId] = useState<string | null>(null);
   const [isLoadingStrategies, setIsLoadingStrategies] = useState(true);
   const [strategiesError, setStrategiesError] = useState<string | null>(null);
+  const [parameterValues, setParameterValues] = useState<ParameterValues>({});
 
   useEffect(() => {
     let cancelled = false;
@@ -220,6 +542,50 @@ export default function StrategyLabPage() {
   }, [selectedStrategyId, strategies]);
 
   const selectedMetadata = selectedStrategy ? normalizeStrategyMetadata(selectedStrategy) : null;
+  const parameterDefinitions = useMemo(() => {
+    if (!selectedStrategy) {
+      return [];
+    }
+
+    return getParameterDefinitions(selectedStrategy.slug);
+  }, [selectedStrategy]);
+
+  useEffect(() => {
+    if (!selectedStrategy) {
+      setParameterValues({});
+      return;
+    }
+
+    const definitions = getParameterDefinitions(selectedStrategy.slug);
+    const defaults: ParameterValues = {};
+    for (const definition of definitions) {
+      defaults[definition.key] = definition.defaultValue;
+    }
+    setParameterValues(defaults);
+  }, [selectedStrategy]);
+
+  const perFieldValidation = useMemo(() => {
+    const map: Record<string, ReturnType<typeof validateParameterValue>> = {};
+    for (const definition of parameterDefinitions) {
+      map[definition.key] = validateParameterValue(definition, parameterValues[definition.key]);
+    }
+    return map;
+  }, [parameterDefinitions, parameterValues]);
+
+  const formValidation = useMemo(() => {
+    if (!selectedStrategy) {
+      return { valid: true, warnings: [], errors: [] };
+    }
+
+    return validateParameterValues(selectedStrategy.slug, parameterValues);
+  }, [parameterValues, selectedStrategy]);
+
+  const handleValueChange = (key: string, nextValue: string | number | boolean) => {
+    setParameterValues((previous) => ({
+      ...previous,
+      [key]: nextValue,
+    }));
+  };
 
   return (
     <div className="mx-auto w-full max-w-7xl space-y-4 sm:space-y-6" data-testid="strategy-lab-mobile-wrapper">
@@ -390,21 +756,154 @@ export default function StrategyLabPage() {
                   <p className="mt-2 text-sm text-foreground/80">
                     <span className="font-medium">Default parameters:</span> {formatDefaultParamsSummary(selectedStrategy.default_params)}
                   </p>
-                  <p className="mt-3 rounded-md border border-dashed border-border bg-muted/20 px-3 py-2 text-sm text-foreground/70">
-                    Parameter editor will appear in the next step.
-                  </p>
                 </section>
               ) : null}
             </div>
           ) : null}
         </section>
 
-        <PlaceholderSection
-          id="configure-parameters"
-          title="2) Configure Parameters"
-          description="Adjust strategy settings once you understand what each setting does."
-          placeholder="Parameter Editor placeholder reserved."
-        />
+        <section
+          aria-labelledby="configure-parameters"
+          className="rounded-xl border border-border bg-muted/30 p-4"
+          data-testid="strategy-lab-section-configure-parameters"
+        >
+          <h2 id="configure-parameters" className="text-base font-semibold sm:text-lg">
+            2) Configure Parameters
+          </h2>
+          <p className="mt-1 text-sm text-foreground/75">Adjust strategy settings with generated controls and live validation.</p>
+
+          {!selectedStrategy ? (
+            <p className="mt-3 rounded-md border border-dashed border-border bg-background/30 px-3 py-2 text-sm text-foreground/70">
+              Select a strategy to view its parameter editor.
+            </p>
+          ) : null}
+
+          {selectedStrategy && parameterDefinitions.length === 0 ? (
+            <p className="mt-3 rounded-md border border-dashed border-border bg-background/30 px-3 py-2 text-sm text-foreground/70">
+              No parameter metadata available for this strategy.
+            </p>
+          ) : null}
+
+          {selectedStrategy && parameterDefinitions.length > 0 ? (
+            <div className="mt-3 space-y-3" data-testid="generated-parameter-editor">
+              <div
+                className={[
+                  "rounded-md border px-3 py-2 text-sm",
+                  formValidation.valid ? "border-emerald-500/40 bg-emerald-500/10 text-emerald-100" : "border-amber-500/40 bg-amber-500/10 text-amber-100",
+                ].join(" ")}
+                role="status"
+                aria-live="polite"
+                data-testid="parameter-form-validation"
+              >
+                {formValidation.valid
+                  ? "All current parameter values are valid."
+                  : `${formValidation.errors.length} validation issue(s) require attention.`}
+              </div>
+
+              {parameterDefinitions.map((definition) => {
+                const currentValue = parameterValues[definition.key] ?? definition.defaultValue;
+                const validation = perFieldValidation[definition.key] ?? { valid: true, warnings: [], errors: [] };
+                const beginnerWhyChange = PARAMETER_BEGINNER_WHY_CHANGE[definition.key];
+
+                return (
+                  <article
+                    key={definition.key}
+                    className="rounded-lg border border-border bg-background/30 p-4"
+                    data-testid={`parameter-card-${definition.key}`}
+                  >
+                    <div className="flex flex-col gap-2 sm:flex-row sm:items-start sm:justify-between">
+                      <div>
+                        <h3 className="text-base font-semibold" id={`parameter-label-${definition.key}`}>
+                          {definition.label}
+                        </h3>
+                        <p className="text-sm text-foreground/80">
+                          Current Value: <span className="font-medium">{formatCurrentValue(currentValue, definition)}</span>
+                        </p>
+                      </div>
+                      <span className="rounded-full border border-border bg-muted/40 px-2 py-1 text-xs uppercase tracking-wide text-foreground/75">
+                        {definition.type}
+                      </span>
+                    </div>
+
+                    <div className="mt-3">{renderControl(definition, currentValue, (nextValue) => handleValueChange(definition.key, nextValue))}</div>
+
+                    <section className="mt-4 rounded-md border border-border/80 bg-muted/20 p-3" aria-label={`What it controls ${definition.label}`}>
+                      <h4 className="text-sm font-semibold">What it Controls</h4>
+                      <p className="mt-1 text-sm text-foreground/80">{definition.description}</p>
+                    </section>
+
+                    {isBeginnerMode ? (
+                      <section className="mt-3 rounded-md border border-border/80 bg-muted/20 p-3" data-testid={`beginner-why-change-${definition.key}`}>
+                        <h4 className="text-sm font-semibold">Why would I change this?</h4>
+                        {beginnerWhyChange ? (
+                          <>
+                            <p className="mt-1 text-sm font-medium text-foreground/90">{beginnerWhyChange.title}</p>
+                            <p className="mt-1 text-sm text-foreground/80">{beginnerWhyChange.lines[0]}</p>
+                            <p className="mt-1 text-sm text-foreground/80">{beginnerWhyChange.lines[1]}</p>
+                          </>
+                        ) : (
+                          <p className="mt-1 text-sm text-foreground/80">{definition.beginnerDescription}</p>
+                        )}
+                      </section>
+                    ) : (
+                      <details className="mt-3 rounded-md border border-border/80 bg-muted/20 p-3" data-testid={`advanced-beginner-collapsed-${definition.key}`}>
+                        <summary className="cursor-pointer text-sm font-semibold">Why would I change this?</summary>
+                        {beginnerWhyChange ? (
+                          <>
+                            <p className="mt-2 text-sm font-medium text-foreground/90">{beginnerWhyChange.title}</p>
+                            <p className="mt-1 text-sm text-foreground/80">{beginnerWhyChange.lines[0]}</p>
+                            <p className="mt-1 text-sm text-foreground/80">{beginnerWhyChange.lines[1]}</p>
+                          </>
+                        ) : (
+                          <p className="mt-2 text-sm text-foreground/80">{definition.beginnerDescription}</p>
+                        )}
+                      </details>
+                    )}
+
+                    {isBeginnerMode ? (
+                      <section className="mt-3 rounded-md border border-border/80 bg-muted/20 p-3" data-testid={`expected-effect-${definition.key}`}>
+                        <h4 className="text-sm font-semibold">Expected Effect</h4>
+                        <div className="mt-1">{renderExpectedEffects(definition, currentValue)}</div>
+                      </section>
+                    ) : (
+                      <details className="mt-3 rounded-md border border-border/80 bg-muted/20 p-3" data-testid={`advanced-effect-collapsed-${definition.key}`}>
+                        <summary className="cursor-pointer text-sm font-semibold">Expected Effect</summary>
+                        <div className="mt-2">{renderExpectedEffects(definition, currentValue)}</div>
+                      </details>
+                    )}
+
+                    <section className="mt-3 rounded-md border border-border/80 bg-muted/20 p-3" data-testid={`recommended-range-${definition.key}`}>
+                      <h4 className="text-sm font-semibold">Recommended Range</h4>
+                      <p className="mt-1 text-sm text-foreground/80">
+                        {definition.recommendedRange
+                          ? `Recommended: ${definition.recommendedRange.minimum}-${definition.recommendedRange.maximum}`
+                          : "No recommended range available."}
+                      </p>
+                    </section>
+
+                    <section className="mt-3" aria-live="polite" data-testid={`validation-${definition.key}`}>
+                      {validation.errors.map((error) => (
+                        <p key={error} className="mt-1 rounded-md border border-red-500/40 bg-red-500/10 px-2 py-1 text-sm text-red-100">
+                          {error}
+                        </p>
+                      ))}
+                      {validation.warnings.map((warning) => (
+                        <p key={warning} className="mt-1 rounded-md border border-amber-500/40 bg-amber-500/10 px-2 py-1 text-sm text-amber-100">
+                          {warning}
+                        </p>
+                      ))}
+                      {validation.valid && validation.warnings.length === 0 ? (
+                        <p className="mt-1 rounded-md border border-emerald-500/40 bg-emerald-500/10 px-2 py-1 text-sm text-emerald-100">
+                          Value looks valid.
+                        </p>
+                      ) : null}
+                    </section>
+                  </article>
+                );
+              })}
+            </div>
+          ) : null}
+        </section>
 
         <PlaceholderSection
           id="configuration-intelligence"
