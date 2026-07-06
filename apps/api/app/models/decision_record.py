@@ -5,7 +5,7 @@ from datetime import datetime
 from decimal import Decimal
 from typing import Any
 
-from sqlalchemy import Boolean, DateTime, Numeric, Text, event, text
+from sqlalchemy import Boolean, DateTime, Numeric, Text, UniqueConstraint, event, text
 from sqlalchemy.dialects.postgresql import JSONB, UUID
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
@@ -14,12 +14,18 @@ from app.db.base import Base
 
 class DecisionRecord(Base):
     __tablename__ = "decision_records"
+    __table_args__ = (
+        UniqueConstraint("idempotency_key", name="uq_decision_records_idempotency_key"),
+    )
 
     decision_id: Mapped[uuid.UUID] = mapped_column(
         UUID(as_uuid=True),
         primary_key=True,
         server_default=text("gen_random_uuid()"),
     )
+    idempotency_key: Mapped[str] = mapped_column(Text, nullable=False)
+    source_lineage: Mapped[dict[str, list[str]]] = mapped_column(JSONB, nullable=False)
+    field_provenance: Mapped[dict[str, list[dict[str, object]]]] = mapped_column(JSONB, nullable=False)
     version: Mapped[str] = mapped_column(Text, nullable=False)
     timestamp: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
     asset: Mapped[dict[str, Any]] = mapped_column(JSONB, nullable=False)
