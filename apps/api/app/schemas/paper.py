@@ -82,3 +82,35 @@ class ResetPaperAccountResponse(BaseModel):
     @field_serializer("current_cash_balance", when_used="json")
     def serialize_numeric_field(self, value: Decimal) -> str:
         return format(value, "f")
+
+
+class SubmitAlpacaPaperOrderRequest(BaseModel):
+    account_id: uuid.UUID
+    asset_id: uuid.UUID
+    side: str
+    quantity: Decimal
+    client_order_id: str | None = None
+
+
+class AlpacaPaperOrderResponse(BaseModel):
+    broker_order_id: str
+    account_id: uuid.UUID
+    asset_id: uuid.UUID
+    status: str
+    symbol: str
+    side: str
+    type: str
+    time_in_force: str
+    quantity: Decimal
+    filled_quantity: Decimal
+    filled_avg_price: Decimal | None = None
+    submitted_at: str | None = None
+    filled_at: str | None = None
+    execution_venue: str
+    is_paper: bool
+
+    @field_serializer("quantity", "filled_quantity", "filled_avg_price", when_used="json")
+    def serialize_decimal_fields(self, value: Decimal | None) -> str | None:
+        if value is None:
+            return None
+        return format(value, "f")
