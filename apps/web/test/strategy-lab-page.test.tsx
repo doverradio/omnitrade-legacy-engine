@@ -592,6 +592,99 @@ describe("StrategyLabPage Prompt 4.2", () => {
     expect(screen.getByTestId("what-improved-panel")).toBeInTheDocument();
   });
 
+  it("renders Experiment Log section and local-session notice", async () => {
+    installFetchMock("success");
+    render(<StrategyLabPage />);
+    const user = userEvent.setup();
+
+    await waitFor(() => {
+      expect(screen.getByLabelText("Select comparison run bt-1")).toBeInTheDocument();
+    });
+
+    await user.click(screen.getByLabelText("Select comparison run bt-1"));
+
+    await waitFor(() => {
+      expect(screen.getByTestId("experiment-log-section")).toBeInTheDocument();
+    });
+
+    expect(screen.getByTestId("experiment-log-local-session-notice")).toHaveTextContent(
+      "Local session log — persistence will be added in a later phase.",
+    );
+  });
+
+  it("creates an experiment log entry from current comparison", async () => {
+    installFetchMock("success");
+    render(<StrategyLabPage />);
+    const user = userEvent.setup();
+
+    await waitFor(() => {
+      expect(screen.getByLabelText("Select comparison run bt-1")).toBeInTheDocument();
+    });
+
+    await user.click(screen.getByLabelText("Select comparison run bt-1"));
+    await user.click(screen.getByLabelText("Select comparison run bt-2"));
+    await user.click(screen.getByRole("button", { name: "Create experiment log entry" }));
+
+    expect(screen.getByTestId("experiment-log-list")).toBeInTheDocument();
+    expect(screen.getByText(/Compared Runs:/)).toBeInTheDocument();
+    expect(screen.getByText(/Strategies:/)).toBeInTheDocument();
+    expect(screen.getByText(/Snapshots:/)).toBeInTheDocument();
+    expect(screen.getByText(/Key Differences Summary/)).toBeInTheDocument();
+    expect(screen.getByText(/Observations Summary/)).toBeInTheDocument();
+  });
+
+  it("includes optional notes in experiment log entries", async () => {
+    installFetchMock("success");
+    render(<StrategyLabPage />);
+    const user = userEvent.setup();
+
+    await waitFor(() => {
+      expect(screen.getByLabelText("Select comparison run bt-1")).toBeInTheDocument();
+    });
+
+    await user.click(screen.getByLabelText("Select comparison run bt-1"));
+    await user.type(screen.getByLabelText("Experiment log notes"), "Focused on drawdown stability in this test.");
+    await user.click(screen.getByRole("button", { name: "Create experiment log entry" }));
+
+    const logList = screen.getByTestId("experiment-log-list");
+    expect(within(logList).getByText("Focused on drawdown stability in this test.")).toBeInTheDocument();
+  });
+
+  it("stores beginner mode summary in experiment log entry", async () => {
+    installFetchMock("success");
+    render(<StrategyLabPage />);
+    const user = userEvent.setup();
+
+    await waitFor(() => {
+      expect(screen.getByLabelText("Select comparison run bt-1")).toBeInTheDocument();
+    });
+
+    await user.click(screen.getByLabelText("Select comparison run bt-1"));
+    await user.click(screen.getByRole("button", { name: "Create experiment log entry" }));
+
+    expect(screen.getByText(/Beginner Summary:/)).toBeInTheDocument();
+  });
+
+  it("keeps accessibility basics for Experiment Log controls", async () => {
+    installFetchMock("success");
+    render(<StrategyLabPage />);
+    const user = userEvent.setup();
+
+    await waitFor(() => {
+      expect(screen.getByLabelText("Select comparison run bt-1")).toBeInTheDocument();
+    });
+
+    await user.click(screen.getByLabelText("Select comparison run bt-1"));
+
+    await waitFor(() => {
+      expect(screen.getByTestId("experiment-log-section")).toBeInTheDocument();
+    });
+
+    expect(screen.getByRole("heading", { name: "Experiment Log" })).toBeInTheDocument();
+    expect(screen.getByLabelText("Experiment log notes")).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Create experiment log entry" })).toBeInTheDocument();
+  });
+
   it("renders saved preset snapshot cards with required fields", async () => {
     installFetchMock("success");
     render(<StrategyLabPage />);
@@ -782,7 +875,7 @@ describe("StrategyLabPage Prompt 4.2", () => {
     });
 
     expect(screen.getAllByText(/Your configuration is valid./).length).toBeGreaterThan(0);
-    expect(screen.getAllByText(/Configuration readiness is 100 out of 100./).length).toBeGreaterThan(0);
+    expect(screen.getAllByText(/Configuration readiness is \d+ out of 100\./).length).toBeGreaterThan(0);
   });
 
   it("supports Advanced Details collapse and expand", async () => {

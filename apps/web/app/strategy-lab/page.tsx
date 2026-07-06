@@ -81,6 +81,18 @@ type InsightObservation = {
   beginnerText: string;
 };
 
+type ExperimentLogEntry = {
+  id: string;
+  createdAt: string;
+  comparedRuns: string[];
+  strategies: string[];
+  snapshots: string[];
+  keyDifferences: string[];
+  observations: string[];
+  notes?: string;
+  beginnerSummary?: string;
+};
+
 const DEFAULT_BACKTEST_INTERVAL: "1h" = "1h";
 const DEFAULT_BACKTEST_INITIAL_CAPITAL = "25";
 const DEFAULT_BACKTEST_FEE_BPS = "10";
@@ -455,6 +467,15 @@ function normalizeWidths(values: Array<number | null>): number[] {
   });
 }
 
+function formatDateTimeLabel(value: string): string {
+  const parsed = new Date(value);
+  if (Number.isNaN(parsed.getTime())) {
+    return "Not available";
+  }
+
+  return parsed.toLocaleString();
+}
+
 function coerceParameterValue(definition: ParameterDefinition, rawValue: unknown): string | number | boolean {
   if (rawValue === undefined || rawValue === null) {
     return definition.defaultValue;
@@ -775,6 +796,8 @@ export default function StrategyLabPage() {
   const [isLoadingBacktests, setIsLoadingBacktests] = useState(true);
   const [backtestsError, setBacktestsError] = useState<string | null>(null);
   const [selectedComparisonIds, setSelectedComparisonIds] = useState<string[]>([]);
+  const [experimentLogEntries, setExperimentLogEntries] = useState<ExperimentLogEntry[]>([]);
+  const [experimentNotes, setExperimentNotes] = useState("");
   const [snapshotName, setSnapshotName] = useState("");
   const [snapshotNotes, setSnapshotNotes] = useState("");
   const [saveSnapshotError, setSaveSnapshotError] = useState<string | null>(null);
@@ -1204,6 +1227,39 @@ export default function StrategyLabPage() {
 
       return [...previous, runId];
     });
+  };
+
+  const createExperimentLogEntry = () => {
+    if (selectedComparisonRuns.length === 0) {
+      return;
+    }
+
+    const comparedRuns = selectedComparisonRuns.map((run, index) => `${toRunCode(index)} (${run.id})`);
+    const strategies = Array.from(
+      new Set(
+        selectedComparisonRuns.map((run) => strategyNameById.get(run.strategy_id) ?? `Strategy ID: ${run.strategy_id}`),
+      ),
+    );
+    const snapshots = Array.from(
+      new Set(
+        selectedComparisonRuns.map((run) => snapshotNameById.get(run.parameter_set_id) ?? "Not available"),
+      ),
+    );
+
+    const nextEntry: ExperimentLogEntry = {
+      id: `experiment-log-${Date.now()}`,
+      createdAt: new Date().toISOString(),
+      comparedRuns,
+      strategies,
+      snapshots,
+      keyDifferences: keyDifferences.length > 0 ? keyDifferences : ["Not enough completed metric differences are available yet."],
+      observations: insightsObservations.length > 0 ? insightsObservations.map((item) => item.text) : ["Not enough metrics are available to generate observations."],
+      notes: experimentNotes.trim() || undefined,
+      beginnerSummary: isBeginnerMode ? insightsObservations.map((item) => item.beginnerText).join(" ") || "Not enough metrics are available for beginner summary." : undefined,
+    };
+
+    setExperimentLogEntries((previous) => [nextEntry, ...previous]);
+    setExperimentNotes("");
   };
 
   const handleLaunchBacktest = async () => {
@@ -2293,6 +2349,79 @@ export default function StrategyLabPage() {
                       <li key={line}>- {line}</li>
                     ))}
                   </ul>
+                )}
+              </section>
+
+              <section className="mt-3 rounded-lg border border-border bg-background/30 p-3" data-testid="experiment-log-section">
+                <h3 className="text-sm font-semibold">Experiment Log</h3>
+                <p className="mt-1 text-xs text-foreground/70" data-testid="experiment-log-local-session-notice">
+                  Local session log — persistence will be added in a later phase.
+                </p>
+
+                <div className="mt-2 space-y-2">
+                  <label htmlFor="experiment-notes" className="text-sm font-medium text-foreground/90">
+                    Optional notes
+                  </label>
+                  <textarea
+                    id="experiment-notes"
+                    aria-label="Experiment log notes"
+                    value={experimentNotes}
+                    onChange={(event) => setExperimentNotes(event.target.value)}
+                    className="w-full rounded-md border border-border bg-background px-3 py-2 text-sm"
+                    rows={3}
+                    placeholder="Capture context for why you compared these runs."
+                  />
+                  <button
+                    type="button"
+                    aria-label="Create experiment log entry"
+                    onClick={createExperimentLogEntry}
+                    disabled={selectedComparisonRuns.length === 0}
+                    className="inline-flex min-h-11 items-center justify-center rounded-md border border-border bg-muted px-4 py-2 text-sm font-medium transition hover:bg-foreground/10 focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-accent disabled:cursor-not-allowed disabled:opacity-60"
+                  >
+                    Create Log Entry
+                  </button>
+                </div>
+
+                {experimentLogEntries.length === 0 ? (
+                  <p className="mt-3 text-sm text-foreground/70" data-testid="experiment-log-empty">
+                    No experiment entries yet.
+                  </p>
+                ) : (
+                  <div className="mt-3 space-y-3" data-testid="experiment-log-list">
+                    {experimentLogEntries.map((entry) => (
+                      <article key={entry.id} className="rounded-md border border-border bg-muted/20 p-3" data-testid={`experiment-log-entry-${entry.id}`}>
+                        <p className="text-xs text-foreground/70">Created: {formatDateTimeLabel(entry.createdAt)}</p>
+                        <p className="mt-1 text-sm"><span className="font-medium">Compared Runs:</span> {entry.comparedRuns.join(", ")}</p>
+                        <p className="mt-1 text-sm"><span className="font-medium">Strategies:</span> {entry.strategies.join(", ")}</p>
+                        <p className="mt-1 text-sm"><span className="font-medium">Snapshots:</span> {entry.snapshots.join(", ")}</p>
+
+                        <div className="mt-2 text-sm">
+                          <p className="font-medium">Key Differences Summary</p>
+                          <ul className="mt-1 space-y-1 text-foreground/85">
+                            {entry.keyDifferences.map((line) => (
+                              <li key={`${entry.id}-difference-${line}`}>- {line}</li>
+                            ))}
+                          </ul>
+                        </div>
+
+                        <div className="mt-2 text-sm">
+                          <p className="font-medium">Observations Summary</p>
+                          <ul className="mt-1 space-y-1 text-foreground/85">
+                            {entry.observations.map((line) => (
+                              <li key={`${entry.id}-observation-${line}`}>- {line}</li>
+                            ))}
+                          </ul>
+                        </div>
+
+                        <p className="mt-2 text-sm"><span className="font-medium">Notes:</span> {entry.notes ?? "None"}</p>
+                        {entry.beginnerSummary ? (
+                          <p className="mt-2 text-xs text-foreground/70" data-testid={`experiment-log-beginner-summary-${entry.id}`}>
+                            Beginner Summary: {entry.beginnerSummary}
+                          </p>
+                        ) : null}
+                      </article>
+                    ))}
+                  </div>
                 )}
               </section>
             </>
