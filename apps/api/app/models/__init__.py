@@ -1,6 +1,7 @@
 from app.models.asset import Asset
 from app.models.arena_competition import ArenaCompetition
 from app.models.arena_cycle import ArenaCycle
+from app.models.arena_cycle_proposal import ArenaCycleProposal
 from app.models.arena_participating_agent import ArenaParticipatingAgent
 from app.models.arena_agent_registration import ArenaAgentRegistration
 from app.models.arena_tournament import ArenaTournament
@@ -29,6 +30,7 @@ __all__ = [
 	"Asset",
 	"ArenaCompetition",
 	"ArenaCycle",
+	"ArenaCycleProposal",
 	"ArenaAgentRegistration",
 	"ArenaParticipatingAgent",
 	"ArenaTournament",

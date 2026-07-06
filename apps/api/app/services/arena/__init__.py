@@ -1,13 +1,17 @@
 from app.services.arena.contracts import (
+    ArenaAgentProposalContract,
     ArenaAgentRegistrationRequest,
     ArenaAgentRegistrationResult,
     ArenaAgentVersionIdentityContract,
     ArenaAgentIdentityContract,
+    ArenaCycleOrchestrationResult,
     ArenaCompetitionIdentityContract,
     ArenaCycleIdentityContract,
+    ArenaCycleSnapshotContract,
     ArenaEligibilityResult,
     ArenaLifecycleServiceContract,
     ArenaLifecycleWriteRequest,
+    ArenaOrchestrationServiceContract,
     ArenaProvenanceContract,
     ArenaRegistrationServiceContract,
     ArenaTournamentIdentityContract,
@@ -25,17 +29,25 @@ from app.services.arena.registration import (
     register_arena_agent,
     validate_arena_eligibility,
 )
+from app.services.arena.orchestration import (
+    build_deterministic_snapshot_hash,
+    orchestrate_arena_cycle,
+)
 
 __all__ = [
+    "ArenaAgentProposalContract",
     "ArenaAgentRegistrationRequest",
     "ArenaAgentRegistrationResult",
     "ArenaAgentVersionIdentityContract",
     "ArenaAgentIdentityContract",
+    "ArenaCycleOrchestrationResult",
     "ArenaCompetitionIdentityContract",
     "ArenaCycleIdentityContract",
+    "ArenaCycleSnapshotContract",
     "ArenaEligibilityResult",
     "ArenaLifecycleServiceContract",
     "ArenaLifecycleWriteRequest",
+    "ArenaOrchestrationServiceContract",
     "ArenaProvenanceContract",
     "ArenaRegistrationServiceContract",
     "ArenaTournamentIdentityContract",
@@ -46,6 +58,8 @@ __all__ = [
     "build_arena_tournament_idempotency_key",
     "build_registration_hash",
     "build_registration_idempotency_key",
+    "build_deterministic_snapshot_hash",
+    "orchestrate_arena_cycle",
     "register_arena_agent",
     "validate_arena_eligibility",
 ]

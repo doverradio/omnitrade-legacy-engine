@@ -95,6 +95,32 @@ class ArenaAgentRegistrationResult:
     participating_agent_id: uuid.UUID | None
 
 
+@dataclass(frozen=True)
+class ArenaCycleSnapshotContract:
+    market_data: dict[str, Any]
+    portfolio_state: dict[str, Any]
+    risk_constraints: dict[str, Any]
+    cycle_timestamp: datetime
+
+
+@dataclass(frozen=True)
+class ArenaAgentProposalContract:
+    agent_id: uuid.UUID
+    action: str
+    payload: dict[str, Any]
+
+
+@dataclass(frozen=True)
+class ArenaCycleOrchestrationResult:
+    cycle_id: uuid.UUID
+    competition_id: uuid.UUID
+    tournament_id: uuid.UUID
+    deterministic_snapshot_hash: str
+    participating_agent_ids: list[uuid.UUID]
+    provenance_metadata: dict[str, Any]
+    proposals_captured: int
+
+
 class ArenaLifecycleServiceContract(Protocol):
     async def ensure_competition(
         self,
@@ -126,3 +152,15 @@ class ArenaRegistrationServiceContract(Protocol):
         self,
         request: ArenaAgentRegistrationRequest,
     ) -> ArenaAgentRegistrationResult: ...
+
+
+class ArenaOrchestrationServiceContract(Protocol):
+    async def orchestrate_cycle(
+        self,
+        *,
+        competition_id: uuid.UUID,
+        tournament_id: uuid.UUID,
+        cycle_number: int,
+        snapshot: ArenaCycleSnapshotContract,
+        proposals: list[ArenaAgentProposalContract],
+    ) -> ArenaCycleOrchestrationResult: ...
