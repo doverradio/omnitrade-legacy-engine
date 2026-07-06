@@ -119,3 +119,29 @@ Example: If a position is too large for account equity or a kill switch is activ
 Strategy Lab is the UI area where users select strategies, edit parameters, save parameter sets, run backtests, and compare outcomes.
 
 Example: Change MA periods, save a new preset, run a backtest, and compare results to a prior preset.
+
+## Trend Following
+Trend following means trying to trade in the same direction as the current market trend.
+
+Example: If price is steadily rising, a trend-following strategy prefers buy signals over sell signals.
+
+## Mean Reversion
+Mean reversion means expecting price to move back toward its typical average after moving too far away.
+
+Example: If price drops quickly and appears oversold, a mean-reversion strategy may look for a bounce.
+
+## Breakout
+A breakout is when price moves beyond a recent high or low range, which can signal a new move beginning.
+
+Example: If price closes above the highest level of the last 20 candles, that may be treated as an upside breakout.
+
+## Volatility (Strategy Context)
+Volatility is how much and how quickly price moves.
+Higher volatility means bigger swings; lower volatility means calmer movement.
+
+Example: A volatility-focused filter may block trades when the market is too noisy or too quiet.
+
+## Typical Trade Frequency
+Typical trade frequency describes how often a strategy usually opens and closes trades.
+
+Example: A high-frequency setup might trigger many trades per week, while a slower trend setup might trigger only a few.
