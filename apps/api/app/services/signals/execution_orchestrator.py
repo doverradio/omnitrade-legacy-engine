@@ -12,11 +12,19 @@ from app.config import get_settings
 from app.core.errors import AppError, InvalidRequestError, NotFoundError
 from app.models.asset import Asset
 from app.models.audit_log import AuditLog
+from app.models.candle import Candle
 from app.models.paper_account import PaperAccount
 from app.models.trade import Trade
 from app.services.data.http_client import AsyncHTTPClient
 from app.services.paper.alpaca_paper import submit_alpaca_paper_order
 from app.services.paper.internal_sim import execute_internal_crypto_fill
+from app.services.risk import (
+    RiskDecisionAction,
+    RiskDecisionPersistenceRequest,
+    RiskEvaluationRequest,
+    evaluate_signal_risk,
+    persist_risk_decision,
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -144,6 +152,49 @@ async def orchestrate_paper_signal_execution(
         )
         raise NotFoundError(message="Asset not found", details={"asset_id": str(request.asset_id)})
 
+    reference_price = await _load_latest_reference_price(db=db, asset_id=request.asset_id)
+    risk_result = evaluate_signal_risk(
+        request=RiskEvaluationRequest(
+            signal_id=request.signal_id,
+            paper_account_id=request.paper_account_id,
+            asset_id=request.asset_id,
+            side=request.side,
+            quantity=request.quantity,
+            account_equity=account.current_cash_balance,
+            max_position_size_pct=Decimal("0.05"),
+            min_order_notional=asset.min_order_notional,
+            qty_step_size=asset.qty_step_size,
+            supports_fractional=asset.supports_fractional,
+            actor=request.actor,
+        ),
+        reference_price=reference_price,
+    )
+    await persist_risk_decision(
+        db=db,
+        request=RiskDecisionPersistenceRequest(
+            paper_account_id=request.paper_account_id,
+            signal_id=request.signal_id,
+            actor=request.actor,
+            evaluation_result=risk_result,
+        ),
+    )
+
+    if risk_result.action == RiskDecisionAction.REJECT:
+        return SignalExecutionResult(
+            signal_id=request.signal_id,
+            paper_account_id=request.paper_account_id,
+            asset_id=request.asset_id,
+            execution_status="rejected",
+            execution_venue="risk_engine",
+            is_paper=True,
+            trade_id=None,
+            broker_order_id=None,
+            venue_status="rejected",
+            message=f"Signal rejected by risk engine: {risk_result.reason_code or 'risk_rejected'}",
+        )
+
+    approved_quantity = risk_result.approved_quantity
+
     if asset.asset_class == "crypto":
         if account.asset_class != "crypto":
             details = {"paper_account_id": str(account.id), "asset_class": account.asset_class}
@@ -165,7 +216,7 @@ async def orchestrate_paper_signal_execution(
                 paper_account_id=request.paper_account_id,
                 asset_id=request.asset_id,
                 side=request.side,
-                quantity=request.quantity,
+                quantity=approved_quantity,
                 actor=request.actor,
                 signal_id=request.signal_id,
             )
@@ -221,8 +272,8 @@ async def orchestrate_paper_signal_execution(
                 details=details,
             )
 
-        if not asset.supports_fractional and request.quantity != request.quantity.to_integral_value():
-            details = {"asset_id": str(asset.id), "quantity": format(request.quantity, "f")}
+        if not asset.supports_fractional and approved_quantity != approved_quantity.to_integral_value():
+            details = {"asset_id": str(asset.id), "quantity": format(approved_quantity, "f")}
             await _audit_signal_execution_failure(
                 db=db,
                 request=request,
@@ -243,7 +294,7 @@ async def orchestrate_paper_signal_execution(
                     client=client,
                     symbol=asset.symbol,
                     side=request.side,
-                    quantity=request.quantity,
+                    quantity=approved_quantity,
                     client_order_id=request.client_order_id,
                 )
         except AppError as exc:
@@ -291,7 +342,8 @@ async def orchestrate_paper_signal_execution(
                 "asset_class": asset.asset_class,
                 "paper_account_id": str(request.paper_account_id),
                 "asset_id": str(request.asset_id),
-                "quantity": format(request.quantity, "f"),
+                "requested_quantity": format(request.quantity, "f"),
+                "approved_quantity": format(approved_quantity, "f"),
             },
             after_state={
                 "execution_venue": "alpaca_paper",
@@ -325,6 +377,19 @@ async def orchestrate_paper_signal_execution(
         message="Unsupported asset class for paper execution orchestration",
         details={"asset_class": asset.asset_class},
     )
+
+
+async def _load_latest_reference_price(*, db: AsyncSession, asset_id: uuid.UUID) -> Decimal | None:
+    latest_close = await db.scalar(
+        select(Candle.close)
+        .where(Candle.asset_id == asset_id)
+        .order_by(Candle.open_time.desc())
+        .limit(1)
+    )
+    if latest_close is None:
+        return None
+
+    return Decimal(str(latest_close))
 
 
 async def _audit_signal_execution_failure(

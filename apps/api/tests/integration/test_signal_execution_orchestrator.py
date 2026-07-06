@@ -10,9 +10,17 @@ import pytest
 from app.core.errors import InvalidRequestError
 from app.models.asset import Asset
 from app.models.audit_log import AuditLog
+from app.models.candle import Candle
 from app.models.paper_account import PaperAccount
+from app.models.risk_event import RiskEvent
 from app.models.trade import Trade
 from app.services.paper.alpaca_paper import AlpacaPaperOrderResult
+from app.services.risk import (
+    RiskDecisionAction,
+    RiskDecisionPersistenceResult,
+    RiskEvaluationResult,
+    RiskEvaluationStep,
+)
 from app.services.signals.execution_orchestrator import (
     SignalExecutionRequest,
     orchestrate_paper_signal_execution,
@@ -35,12 +43,32 @@ class _ExecuteResult:
         return _ScalarResult(self._items)
 
 
+class _BeginContext:
+    async def __aenter__(self) -> "_BeginContext":
+        return self
+
+    async def __aexit__(self, exc_type: Any, exc: Any, tb: Any) -> None:
+        return None
+
+
 class _FakeSession:
-    def __init__(self, *, accounts: list[PaperAccount], assets: list[Asset], trades: list[Trade]) -> None:
+    def __init__(
+        self,
+        *,
+        accounts: list[PaperAccount],
+        assets: list[Asset],
+        trades: list[Trade],
+        candles: list[Candle] | None = None,
+    ) -> None:
         self.accounts = accounts
         self.assets = assets
         self.trades = trades
+        self.candles = candles or []
         self.audit_logs: list[AuditLog] = []
+        self.risk_events: list[RiskEvent] = []
+
+    def begin(self) -> _BeginContext:
+        return _BeginContext()
 
     async def scalar(self, statement: Any) -> Any:
         sql = str(statement)
@@ -66,6 +94,12 @@ class _FakeSession:
         if "FROM assets" in sql:
             asset_id = next((value for value in values if isinstance(value, uuid.UUID)), None)
             return next((item for item in self.assets if item.id == asset_id), None)
+
+        if "SELECT candles.close" in sql:
+            asset_id = next((value for value in values if isinstance(value, uuid.UUID)), None)
+            rows = [candle for candle in self.candles if candle.asset_id == asset_id]
+            rows.sort(key=lambda item: item.open_time, reverse=True)
+            return rows[0].close if rows else None
 
         return None
 
@@ -96,6 +130,10 @@ class _FakeSession:
 
         if isinstance(obj, AuditLog):
             self.audit_logs.append(obj)
+            return
+
+        if isinstance(obj, RiskEvent):
+            self.risk_events.append(obj)
 
     async def commit(self) -> None:
         return None
@@ -307,3 +345,153 @@ async def test_orchestrator_audits_failure_for_invalid_side() -> None:
         )
 
     assert any(audit.action == "signal_execution_failed" for audit in session.audit_logs)
+
+
+@pytest.mark.asyncio
+async def test_orchestrator_rejects_before_adapter_when_risk_rejects(monkeypatch: pytest.MonkeyPatch) -> None:
+    now = datetime(2026, 7, 6, tzinfo=timezone.utc)
+    account = PaperAccount(
+        id=uuid.uuid4(),
+        owner_user_id=uuid.uuid4(),
+        name="Family Crypto",
+        asset_class="crypto",
+        starting_balance=Decimal("25"),
+        current_cash_balance=Decimal("25"),
+        is_active=True,
+        created_at=now,
+    )
+    asset = Asset(
+        id=uuid.uuid4(),
+        symbol="BTCUSDT",
+        asset_class="crypto",
+        exchange="binance_us",
+        supports_fractional=True,
+        qty_step_size=Decimal("0.00001"),
+        min_order_notional=Decimal("1"),
+        is_active=True,
+    )
+    session = _FakeSession(accounts=[account], assets=[asset], trades=[])
+
+    import app.services.signals.execution_orchestrator as orchestrator_module
+
+    evaluate_calls = {"count": 0}
+    persist_calls = {"count": 0}
+
+    def fake_evaluate_signal_risk(*args, **kwargs):
+        evaluate_calls["count"] += 1
+        return RiskEvaluationResult(
+            action=RiskDecisionAction.REJECT,
+            reason_code="max_daily_loss_breached",
+            approved_quantity=Decimal("0"),
+            steps=[RiskEvaluationStep(step="daily_loss", status="reject", reason_code="max_daily_loss_breached")],
+        )
+
+    async def fake_persist_risk_decision(*args, **kwargs):
+        persist_calls["count"] += 1
+        return RiskDecisionPersistenceResult(
+            risk_event_action="blocked",
+            risk_event_type="daily_loss_limit",
+            risk_event_reason_code="max_daily_loss_breached",
+            audit_written=False,
+        )
+
+    async def should_not_execute_adapter(*args, **kwargs):
+        raise AssertionError("Execution adapter should not be called on risk rejection")
+
+    monkeypatch.setattr(orchestrator_module, "evaluate_signal_risk", fake_evaluate_signal_risk)
+    monkeypatch.setattr(orchestrator_module, "persist_risk_decision", fake_persist_risk_decision)
+    monkeypatch.setattr(orchestrator_module, "execute_internal_crypto_fill", should_not_execute_adapter)
+
+    result = await orchestrate_paper_signal_execution(
+        db=session,
+        request=SignalExecutionRequest(
+            signal_id=uuid.uuid4(),
+            paper_account_id=account.id,
+            asset_id=asset.id,
+            side="buy",
+            quantity=Decimal("0.02"),
+        ),
+    )
+
+    assert result.execution_status == "rejected"
+    assert result.execution_venue == "risk_engine"
+    assert evaluate_calls["count"] == 1
+    assert persist_calls["count"] == 1
+
+
+@pytest.mark.asyncio
+async def test_orchestrator_passes_resized_quantity_to_crypto_adapter(monkeypatch: pytest.MonkeyPatch) -> None:
+    now = datetime(2026, 7, 6, tzinfo=timezone.utc)
+    account = PaperAccount(
+        id=uuid.uuid4(),
+        owner_user_id=uuid.uuid4(),
+        name="Family Crypto",
+        asset_class="crypto",
+        starting_balance=Decimal("25"),
+        current_cash_balance=Decimal("25"),
+        is_active=True,
+        created_at=now,
+    )
+    asset = Asset(
+        id=uuid.uuid4(),
+        symbol="BTCUSDT",
+        asset_class="crypto",
+        exchange="binance_us",
+        supports_fractional=True,
+        qty_step_size=Decimal("0.00001"),
+        min_order_notional=Decimal("1"),
+        is_active=True,
+    )
+    session = _FakeSession(accounts=[account], assets=[asset], trades=[])
+
+    import app.services.signals.execution_orchestrator as orchestrator_module
+
+    evaluate_calls = {"count": 0}
+    persist_calls = {"count": 0}
+    adapter_quantity = {"value": None}
+
+    def fake_evaluate_signal_risk(*args, **kwargs):
+        evaluate_calls["count"] += 1
+        return RiskEvaluationResult(
+            action=RiskDecisionAction.RESIZE,
+            reason_code="position_resized_by_risk_engine",
+            approved_quantity=Decimal("0.015"),
+            steps=[RiskEvaluationStep(step="position_size", status="resize", reason_code="position_resized_by_risk_engine")],
+        )
+
+    async def fake_persist_risk_decision(*args, **kwargs):
+        persist_calls["count"] += 1
+        return RiskDecisionPersistenceResult(
+            risk_event_action="resized",
+            risk_event_type="position_limit",
+            risk_event_reason_code="position_resized_by_risk_engine",
+            audit_written=False,
+        )
+
+    class _FillResult:
+        def __init__(self, trade_id: uuid.UUID) -> None:
+            self.trade_id = trade_id
+
+    async def fake_execute_internal_crypto_fill(*args, **kwargs):
+        adapter_quantity["value"] = kwargs["quantity"]
+        return _FillResult(trade_id=uuid.uuid4())
+
+    monkeypatch.setattr(orchestrator_module, "evaluate_signal_risk", fake_evaluate_signal_risk)
+    monkeypatch.setattr(orchestrator_module, "persist_risk_decision", fake_persist_risk_decision)
+    monkeypatch.setattr(orchestrator_module, "execute_internal_crypto_fill", fake_execute_internal_crypto_fill)
+
+    result = await orchestrate_paper_signal_execution(
+        db=session,
+        request=SignalExecutionRequest(
+            signal_id=uuid.uuid4(),
+            paper_account_id=account.id,
+            asset_id=asset.id,
+            side="buy",
+            quantity=Decimal("0.02"),
+        ),
+    )
+
+    assert result.execution_status == "executed"
+    assert evaluate_calls["count"] == 1
+    assert persist_calls["count"] == 1
+    assert adapter_quantity["value"] == Decimal("0.015")
