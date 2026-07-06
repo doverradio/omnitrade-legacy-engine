@@ -8,8 +8,10 @@ import {
   ApiRequestError,
   createPaperAccount,
   getPaperAccount,
+  getPaperTrades,
   resetPaperAccount,
   type PaperAccount,
+  type PaperTrade,
 } from "@/lib/api/paperAccounts";
 
 type AccountFormState = {
@@ -18,15 +20,36 @@ type AccountFormState = {
   startingBalance: string;
 };
 
+type TradeFilters = {
+  strategyId: string;
+  assetId: string;
+  startTime: string;
+  endTime: string;
+};
+
+type TimelinePoint = {
+  id: string;
+  label: string;
+  timestamp: string;
+  equity: number;
+  changeUsd: number;
+  changePct: number;
+  notional: number;
+  fee: number;
+};
+
 const DEFAULT_FORM_STATE: AccountFormState = {
   name: "Family Paper Account",
   assetClass: "crypto",
   startingBalance: "25",
 };
 
-function formatAccountBalance(value: string): string {
-  return `$${value}`;
-}
+const DEFAULT_TRADE_FILTERS: TradeFilters = {
+  strategyId: "",
+  assetId: "",
+  startTime: "",
+  endTime: "",
+};
 
 function parseDecimal(value: string | null | undefined): number {
   if (!value) {
@@ -35,6 +58,124 @@ function parseDecimal(value: string | null | undefined): number {
 
   const parsed = Number(value);
   return Number.isFinite(parsed) ? parsed : 0;
+}
+
+function formatCurrency(value: number): string {
+  const sign = value >= 0 ? "" : "-";
+  return `${sign}$${Math.abs(value).toFixed(2)}`;
+}
+
+function formatAccountBalance(value: string): string {
+  return formatCurrency(parseDecimal(value));
+}
+
+function formatDateTime(value: string): string {
+  const date = new Date(value);
+  if (Number.isNaN(date.getTime())) {
+    return "Unknown execution time";
+  }
+
+  return date.toLocaleString();
+}
+
+function toIsoOrUndefined(localDateTime: string): string | undefined {
+  if (!localDateTime.trim()) {
+    return undefined;
+  }
+
+  const parsed = new Date(localDateTime);
+  if (Number.isNaN(parsed.getTime())) {
+    return undefined;
+  }
+
+  return parsed.toISOString();
+}
+
+function normalizeTradeSide(side: string): "buy" | "sell" | "other" {
+  const lower = side.trim().toLowerCase();
+  if (lower === "buy") {
+    return "buy";
+  }
+  if (lower === "sell") {
+    return "sell";
+  }
+  return "other";
+}
+
+function sortTradesByExecutedAtDescending(trades: PaperTrade[]): PaperTrade[] {
+  return [...trades].sort((a, b) => {
+    return new Date(b.executed_at).getTime() - new Date(a.executed_at).getTime();
+  });
+}
+
+function buildTimelinePoints(account: PaperAccount | null, trades: PaperTrade[]): TimelinePoint[] {
+  if (!account) {
+    return [];
+  }
+
+  const startingBalance = parseDecimal(account.starting_balance);
+  const sortedAscending = [...trades].sort((a, b) => {
+    return new Date(a.executed_at).getTime() - new Date(b.executed_at).getTime();
+  });
+
+  const points: TimelinePoint[] = [
+    {
+      id: "timeline-start",
+      label: "Paper account start",
+      timestamp: "Starting balance",
+      equity: startingBalance,
+      changeUsd: 0,
+      changePct: 0,
+      notional: 0,
+      fee: 0,
+    },
+  ];
+
+  let runningEquity = startingBalance;
+
+  for (const trade of sortedAscending) {
+    const quantity = parseDecimal(trade.quantity);
+    const price = parseDecimal(trade.price);
+    const fee = parseDecimal(trade.fee);
+    const notional = quantity * price;
+    const side = normalizeTradeSide(trade.side);
+
+    if (side === "buy") {
+      runningEquity -= notional + fee;
+    } else if (side === "sell") {
+      runningEquity += notional - fee;
+    } else {
+      runningEquity -= fee;
+    }
+
+    const changeUsd = runningEquity - startingBalance;
+    points.push({
+      id: trade.id,
+      label: `${side.toUpperCase()} ${trade.symbol ?? trade.asset_id.slice(0, 8)}`,
+      timestamp: trade.executed_at,
+      equity: runningEquity,
+      changeUsd,
+      changePct: startingBalance > 0 ? changeUsd / startingBalance : 0,
+      notional,
+      fee,
+    });
+  }
+
+  const currentEquity = parseDecimal(account.equity);
+  const currentChangeUsd = currentEquity - startingBalance;
+
+  points.push({
+    id: "timeline-current",
+    label: "Current paper equity snapshot",
+    timestamp: "Now",
+    equity: currentEquity,
+    changeUsd: currentChangeUsd,
+    changePct: startingBalance > 0 ? currentChangeUsd / startingBalance : 0,
+    notional: 0,
+    fee: 0,
+  });
+
+  return points;
 }
 
 export default function PaperTradingPage() {
@@ -50,6 +191,11 @@ export default function PaperTradingPage() {
   const [isCreating, setIsCreating] = useState(false);
   const [isResetting, setIsResetting] = useState(false);
   const [isResetConfirmOpen, setIsResetConfirmOpen] = useState(false);
+
+  const [tradeHistory, setTradeHistory] = useState<PaperTrade[]>([]);
+  const [tradeFilters, setTradeFilters] = useState<TradeFilters>(DEFAULT_TRADE_FILTERS);
+  const [isTradesLoading, setIsTradesLoading] = useState(false);
+  const [tradesError, setTradesError] = useState<string | null>(null);
 
   const accountLabel = useMemo(() => {
     if (!activeAccount) {
@@ -75,15 +221,47 @@ export default function PaperTradingPage() {
       const message = error instanceof ApiRequestError ? error.message : "Failed to load paper account.";
       setPageError(message);
       setActiveAccount(null);
+      setTradeHistory([]);
       return null;
     } finally {
       setLoading(false);
     }
   }, []);
 
+  const loadTradeHistory = useCallback(async (accountId: string, filters: TradeFilters) => {
+    setIsTradesLoading(true);
+    setTradesError(null);
+
+    try {
+      const response = await getPaperTrades({
+        account_id: accountId,
+        strategy_id: filters.strategyId.trim() || undefined,
+        asset_id: filters.assetId.trim() || undefined,
+        start_time: toIsoOrUndefined(filters.startTime),
+        end_time: toIsoOrUndefined(filters.endTime),
+        limit: 100,
+      });
+      setTradeHistory(response.items);
+    } catch (error) {
+      const message = error instanceof ApiRequestError ? error.message : "Failed to load paper trades.";
+      setTradesError(message);
+      setTradeHistory([]);
+    } finally {
+      setIsTradesLoading(false);
+    }
+  }, []);
+
   useEffect(() => {
     void loadAccount();
   }, [loadAccount]);
+
+  useEffect(() => {
+    if (!activeAccount?.id) {
+      return;
+    }
+
+    void loadTradeHistory(activeAccount.id, DEFAULT_TRADE_FILTERS);
+  }, [activeAccount?.id, loadTradeHistory]);
 
   const handleCreateAccount = useCallback(async () => {
     const trimmedName = formState.name.trim();
@@ -158,11 +336,44 @@ export default function PaperTradingPage() {
     }
   }, [activeAccount]);
 
+  const handleApplyTradeFilters = useCallback(async () => {
+    if (!activeAccount?.id) {
+      return;
+    }
+
+    await loadTradeHistory(activeAccount.id, tradeFilters);
+  }, [activeAccount?.id, loadTradeHistory, tradeFilters]);
+
+  const handleClearTradeFilters = useCallback(async () => {
+    setTradeFilters(DEFAULT_TRADE_FILTERS);
+    if (!activeAccount?.id) {
+      return;
+    }
+
+    await loadTradeHistory(activeAccount.id, DEFAULT_TRADE_FILTERS);
+  }, [activeAccount?.id, loadTradeHistory]);
+
   const displayAssetClass = activeAccount?.asset_class ?? formState.assetClass;
   const equityValue = parseDecimal(activeAccount?.equity);
   const cashValue = parseDecimal(activeAccount?.current_cash_balance);
   const positionValueRollup = Math.max(0, equityValue - cashValue);
   const positions = activeAccount?.positions ?? [];
+
+  const startingBalanceNumber = parseDecimal(activeAccount?.starting_balance);
+
+  const orderedTrades = useMemo(() => {
+    return sortTradesByExecutedAtDescending(tradeHistory);
+  }, [tradeHistory]);
+
+  const totalFees = useMemo(() => {
+    return tradeHistory.reduce((accumulator, trade) => {
+      return accumulator + parseDecimal(trade.fee);
+    }, 0);
+  }, [tradeHistory]);
+
+  const timelinePoints = useMemo(() => {
+    return buildTimelinePoints(activeAccount, tradeHistory);
+  }, [activeAccount, tradeHistory]);
 
   return (
     <div className="space-y-6">
@@ -170,8 +381,8 @@ export default function PaperTradingPage() {
         <p className="text-xs font-semibold uppercase tracking-wide text-foreground/70">Phase 5 shell</p>
         <h1 className="mt-2 text-2xl font-semibold">Portfolio Intelligence + Paper Execution Foundation</h1>
         <p className="mt-2 max-w-3xl text-sm text-foreground/75">
-          Paper account lifecycle controls only. This page creates, loads, displays, and resets paper accounts
-          using documented endpoints, with explicit PAPER labeling and a $25 minimum proving-ground balance.
+          Paper account lifecycle, trade history, and portfolio timeline views using documented paper endpoints only,
+          with explicit PAPER labeling, fee visibility, and dollar + percentage reporting where applicable.
         </p>
       </section>
 
@@ -240,15 +451,13 @@ export default function PaperTradingPage() {
             <article className="rounded-lg border border-border bg-muted/40 p-4">
               <p className="text-xs uppercase tracking-wide text-foreground/70">Position Value Rollup (PAPER)</p>
               <p className="mt-2 text-lg font-semibold">Open Position Value</p>
-              <p className="mt-1 text-sm text-foreground/80">{`$${positionValueRollup.toFixed(2)}`}</p>
+              <p className="mt-1 text-sm text-foreground/80">{formatCurrency(positionValueRollup)}</p>
             </article>
           </div>
 
           <div className="mt-6 rounded-lg border border-border bg-muted/30 p-4">
             <div className="flex items-center justify-between gap-3">
-              <h3 className="text-sm font-semibold uppercase tracking-wide text-foreground/80">
-                Paper account metadata
-              </h3>
+              <h3 className="text-sm font-semibold uppercase tracking-wide text-foreground/80">Paper account metadata</h3>
               <span className="rounded-full border border-border bg-background px-2 py-1 text-xs uppercase tracking-wide text-foreground/70">
                 PAPER
               </span>
@@ -293,10 +502,7 @@ export default function PaperTradingPage() {
                 <div>
                   <dt className="text-xs uppercase tracking-wide text-foreground/65">Equity return (dollar + percentage)</dt>
                   <dd className="mt-1 text-sm text-foreground/90">
-                    <DollarAndPercent
-                      usd={activeAccount.equity_return_usd}
-                      pct={activeAccount.equity_return_pct}
-                    />
+                    <DollarAndPercent usd={activeAccount.equity_return_usd} pct={activeAccount.equity_return_pct} />
                   </dd>
                 </div>
                 <div>
@@ -314,9 +520,7 @@ export default function PaperTradingPage() {
           </div>
 
           <div className="mt-6 rounded-lg border border-border bg-muted/30 p-4">
-            <h3 className="text-sm font-semibold uppercase tracking-wide text-foreground/80">
-              Position rollups (PAPER)
-            </h3>
+            <h3 className="text-sm font-semibold uppercase tracking-wide text-foreground/80">Position rollups (PAPER)</h3>
 
             {loading ? (
               <p className="mt-3 text-sm text-foreground/70">Loading position rollups...</p>
@@ -340,10 +544,256 @@ export default function PaperTradingPage() {
                       <tr key={position.asset_id} className="border-t border-border/60">
                         <td className="py-2 pr-4 font-medium">{position.symbol}</td>
                         <td className="py-2 pr-4">{position.quantity}</td>
-                        <td className="py-2 pr-4">{`$${position.avg_entry_price}`}</td>
+                        <td className="py-2 pr-4">{formatAccountBalance(position.avg_entry_price)}</td>
                         <td className="py-2 pr-4">
                           <DollarAndPercent usd={position.unrealized_pnl_usd} pct={position.unrealized_pnl_pct} />
                         </td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
+            )}
+          </div>
+
+          <div className="mt-6 rounded-lg border border-border bg-muted/30 p-4">
+            <div className="flex flex-wrap items-center justify-between gap-3">
+              <div>
+                <h3 className="text-sm font-semibold uppercase tracking-wide text-foreground/80">Trade history (PAPER)</h3>
+                <p className="mt-1 text-xs text-foreground/70">
+                  Fee visibility and notional impact are shown per trade using the documented /paper/trades contract.
+                </p>
+              </div>
+              <span className="rounded-full border border-border bg-background px-2 py-1 text-xs uppercase tracking-wide text-foreground/70">
+                PAPER ONLY
+              </span>
+            </div>
+
+            <div className="mt-4 grid gap-3 lg:grid-cols-2">
+              <label className="flex flex-col gap-1 text-sm text-foreground/90">
+                <span>Strategy ID filter (optional)</span>
+                <input
+                  value={tradeFilters.strategyId}
+                  onChange={(event) =>
+                    setTradeFilters((previous) => ({
+                      ...previous,
+                      strategyId: event.target.value,
+                    }))
+                  }
+                  className="rounded-md border border-border bg-muted/40 px-3 py-2 text-sm outline-none transition focus:border-accent"
+                />
+              </label>
+
+              <label className="flex flex-col gap-1 text-sm text-foreground/90">
+                <span>Asset ID filter (optional)</span>
+                <input
+                  value={tradeFilters.assetId}
+                  onChange={(event) =>
+                    setTradeFilters((previous) => ({
+                      ...previous,
+                      assetId: event.target.value,
+                    }))
+                  }
+                  className="rounded-md border border-border bg-muted/40 px-3 py-2 text-sm outline-none transition focus:border-accent"
+                />
+              </label>
+
+              <label className="flex flex-col gap-1 text-sm text-foreground/90">
+                <span>Start time (optional)</span>
+                <input
+                  type="datetime-local"
+                  value={tradeFilters.startTime}
+                  onChange={(event) =>
+                    setTradeFilters((previous) => ({
+                      ...previous,
+                      startTime: event.target.value,
+                    }))
+                  }
+                  className="rounded-md border border-border bg-muted/40 px-3 py-2 text-sm outline-none transition focus:border-accent"
+                />
+              </label>
+
+              <label className="flex flex-col gap-1 text-sm text-foreground/90">
+                <span>End time (optional)</span>
+                <input
+                  type="datetime-local"
+                  value={tradeFilters.endTime}
+                  onChange={(event) =>
+                    setTradeFilters((previous) => ({
+                      ...previous,
+                      endTime: event.target.value,
+                    }))
+                  }
+                  className="rounded-md border border-border bg-muted/40 px-3 py-2 text-sm outline-none transition focus:border-accent"
+                />
+              </label>
+            </div>
+
+            <div className="mt-3 flex flex-wrap gap-2">
+              <button
+                type="button"
+                disabled={!activeAccount || isTradesLoading}
+                onClick={() => void handleApplyTradeFilters()}
+                className="rounded-md border border-accent bg-accent/20 px-3 py-2 text-sm font-medium transition hover:bg-accent/30 disabled:cursor-not-allowed disabled:opacity-60"
+              >
+                {isTradesLoading ? "Loading trades..." : "Apply trade filters"}
+              </button>
+              <button
+                type="button"
+                disabled={!activeAccount || isTradesLoading}
+                onClick={() => void handleClearTradeFilters()}
+                className="rounded-md border border-border bg-muted px-3 py-2 text-sm transition hover:bg-foreground/10 disabled:cursor-not-allowed disabled:opacity-60"
+              >
+                Clear filters
+              </button>
+            </div>
+
+            <div className="mt-4 grid gap-3 sm:grid-cols-2">
+              <article className="rounded-md border border-border bg-background/60 p-3">
+                <p className="text-xs uppercase tracking-wide text-foreground/65">Trades loaded</p>
+                <p className="mt-1 text-lg font-semibold">{orderedTrades.length}</p>
+              </article>
+              <article className="rounded-md border border-border bg-background/60 p-3">
+                <p className="text-xs uppercase tracking-wide text-foreground/65">Total fees (PAPER)</p>
+                <p className="mt-1 text-lg font-semibold">{formatCurrency(totalFees)}</p>
+              </article>
+            </div>
+
+            {tradesError ? (
+              <div className="mt-4 rounded-md border border-red-500/30 bg-red-500/10 px-3 py-2 text-sm text-red-100">
+                <p>Could not load paper trade history. {tradesError}</p>
+                <button
+                  type="button"
+                  onClick={() => {
+                    if (!activeAccount?.id) {
+                      return;
+                    }
+                    void loadTradeHistory(activeAccount.id, tradeFilters);
+                  }}
+                  className="mt-2 rounded-md border border-red-300/40 bg-red-500/10 px-3 py-1 text-xs transition hover:bg-red-500/20"
+                >
+                  Retry trade history load
+                </button>
+              </div>
+            ) : null}
+
+            {isTradesLoading ? (
+              <div className="mt-4 space-y-2">
+                <div className="h-10 animate-pulse rounded bg-foreground/10" />
+                <div className="h-10 animate-pulse rounded bg-foreground/10" />
+                <div className="h-10 animate-pulse rounded bg-foreground/10" />
+              </div>
+            ) : orderedTrades.length === 0 ? (
+              <p className="mt-4 text-sm text-foreground/70">
+                No trades yet for this PAPER account and filter range. Trade history will populate once paper signals execute.
+              </p>
+            ) : (
+              <div className="mt-4 overflow-x-auto">
+                <table className="min-w-full text-sm">
+                  <thead>
+                    <tr className="text-left text-xs uppercase tracking-wide text-foreground/65">
+                      <th className="pb-2 pr-4">Executed at</th>
+                      <th className="pb-2 pr-4">Side</th>
+                      <th className="pb-2 pr-4">Asset</th>
+                      <th className="pb-2 pr-4">Quantity</th>
+                      <th className="pb-2 pr-4">Price</th>
+                      <th className="pb-2 pr-4">Notional</th>
+                      <th className="pb-2 pr-4">Fee impact</th>
+                      <th className="pb-2 pr-4">Net cash impact</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {orderedTrades.map((trade) => {
+                      const quantity = parseDecimal(trade.quantity);
+                      const price = parseDecimal(trade.price);
+                      const notional = quantity * price;
+                      const fee = parseDecimal(trade.fee);
+                      const side = normalizeTradeSide(trade.side);
+                      const netCashImpact = side === "sell" ? notional - fee : -(notional + fee);
+                      const notionalPctOfStart = startingBalanceNumber > 0 ? notional / startingBalanceNumber : 0;
+                      const feePctOfNotional = notional > 0 ? fee / notional : 0;
+                      const netImpactPctOfStart = startingBalanceNumber > 0 ? netCashImpact / startingBalanceNumber : 0;
+
+                      return (
+                        <tr key={trade.id} className="border-t border-border/60 align-top">
+                          <td className="py-2 pr-4">{formatDateTime(trade.executed_at)}</td>
+                          <td className="py-2 pr-4">
+                            <span className="rounded border border-border bg-background/50 px-2 py-1 text-xs uppercase">
+                              {trade.side}
+                            </span>
+                          </td>
+                          <td className="py-2 pr-4">{trade.symbol ?? trade.asset_id.slice(0, 8)}</td>
+                          <td className="py-2 pr-4">{trade.quantity}</td>
+                          <td className="py-2 pr-4">{formatCurrency(price)}</td>
+                          <td className="py-2 pr-4">{`${formatCurrency(notional)} (${(notionalPctOfStart * 100).toFixed(2)}%)`}</td>
+                          <td className="py-2 pr-4">{`${formatCurrency(fee)} (${(feePctOfNotional * 100).toFixed(2)}%)`}</td>
+                          <td className="py-2 pr-4">
+                            <DollarAndPercent usd={netCashImpact} pct={netImpactPctOfStart} />
+                          </td>
+                        </tr>
+                      );
+                    })}
+                  </tbody>
+                </table>
+              </div>
+            )}
+          </div>
+
+          <div className="mt-6 rounded-lg border border-border bg-muted/30 p-4">
+            <div className="flex flex-wrap items-center justify-between gap-3">
+              <div>
+                <h3 className="text-sm font-semibold uppercase tracking-wide text-foreground/80">Portfolio timeline (PAPER)</h3>
+                <p className="mt-1 text-xs text-foreground/70">
+                  Timeline points are derived from documented paper account and paper trade data without adding new execution paths.
+                </p>
+              </div>
+              <span className="rounded-full border border-border bg-background px-2 py-1 text-xs uppercase tracking-wide text-foreground/70">
+                PAPER EQUITY TIMELINE
+              </span>
+            </div>
+
+            {isTradesLoading ? (
+              <div className="mt-4 space-y-2">
+                <div className="h-10 animate-pulse rounded bg-foreground/10" />
+                <div className="h-10 animate-pulse rounded bg-foreground/10" />
+                <div className="h-10 animate-pulse rounded bg-foreground/10" />
+              </div>
+            ) : tradesError ? (
+              <p className="mt-4 rounded-md border border-red-500/30 bg-red-500/10 px-3 py-2 text-sm text-red-100">
+                Unable to render portfolio timeline because trade history could not be loaded.
+              </p>
+            ) : timelinePoints.length === 0 ? (
+              <p className="mt-4 text-sm text-foreground/70">
+                Load a PAPER account to render portfolio timeline points.
+              </p>
+            ) : (
+              <div className="mt-4 overflow-x-auto">
+                <table className="min-w-full text-sm">
+                  <thead>
+                    <tr className="text-left text-xs uppercase tracking-wide text-foreground/65">
+                      <th className="pb-2 pr-4">Timeline point</th>
+                      <th className="pb-2 pr-4">Time</th>
+                      <th className="pb-2 pr-4">Paper equity</th>
+                      <th className="pb-2 pr-4">Change vs start</th>
+                      <th className="pb-2 pr-4">Trade notional</th>
+                      <th className="pb-2 pr-4">Fee</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {[...timelinePoints].reverse().map((point) => (
+                      <tr key={point.id} className="border-t border-border/60 align-top">
+                        <td className="py-2 pr-4 font-medium">{point.label}</td>
+                        <td className="py-2 pr-4">
+                          {point.timestamp === "Starting balance" || point.timestamp === "Now"
+                            ? point.timestamp
+                            : formatDateTime(point.timestamp)}
+                        </td>
+                        <td className="py-2 pr-4">{formatCurrency(point.equity)}</td>
+                        <td className="py-2 pr-4">
+                          <DollarAndPercent usd={point.changeUsd} pct={point.changePct} />
+                        </td>
+                        <td className="py-2 pr-4">{formatCurrency(point.notional)}</td>
+                        <td className="py-2 pr-4">{formatCurrency(point.fee)}</td>
                       </tr>
                     ))}
                   </tbody>

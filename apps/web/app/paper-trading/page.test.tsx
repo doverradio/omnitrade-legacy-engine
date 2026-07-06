@@ -5,10 +5,11 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import PaperTradingPage from "./page";
 
-const { createPaperAccountMock, getPaperAccountMock, resetPaperAccountMock } = vi.hoisted(() => {
+const { createPaperAccountMock, getPaperAccountMock, getPaperTradesMock, resetPaperAccountMock } = vi.hoisted(() => {
   return {
     createPaperAccountMock: vi.fn(),
     getPaperAccountMock: vi.fn(),
+    getPaperTradesMock: vi.fn(),
     resetPaperAccountMock: vi.fn(),
   };
 });
@@ -28,6 +29,7 @@ vi.mock("@/lib/api/paperAccounts", () => {
     ApiRequestError,
     createPaperAccount: createPaperAccountMock,
     getPaperAccount: getPaperAccountMock,
+    getPaperTrades: getPaperTradesMock,
     resetPaperAccount: resetPaperAccountMock,
   };
 });
@@ -64,6 +66,22 @@ describe("paper trading page", () => {
       current_cash_balance: "25.00",
       positions: [],
     });
+    getPaperTradesMock.mockResolvedValue({
+      items: [
+        {
+          id: "trade-1",
+          asset_id: "asset-1",
+          symbol: "BTCUSDT",
+          side: "buy",
+          quantity: "0.1",
+          price: "250",
+          fee: "0.25",
+          executed_at: "2026-07-06T12:00:00Z",
+          signal_id: "signal-1",
+        },
+      ],
+      next_cursor: null,
+    });
   });
 
   afterEach(() => {
@@ -77,9 +95,22 @@ describe("paper trading page", () => {
 
     expect(await screen.findByRole("heading", { name: "Portfolio Intelligence + Paper Execution Foundation" })).toBeInTheDocument();
     await screen.findByText("Selected account ID: paper-account-1");
+    await waitFor(() => {
+      expect(getPaperTradesMock).toHaveBeenCalledWith({
+        account_id: "paper-account-1",
+        strategy_id: undefined,
+        asset_id: undefined,
+        start_time: undefined,
+        end_time: undefined,
+        limit: 100,
+      });
+    });
     expect(screen.getAllByText("Paper Balance: $25.00").length).toBeGreaterThan(0);
-    expect(screen.getByText("+$0.00 (+0.00%)")).toBeInTheDocument();
+    expect(screen.getAllByText("+$0.00 (+0.00%)").length).toBeGreaterThan(0);
     expect(screen.getAllByText("PAPER").length).toBeGreaterThan(0);
+    expect(screen.getByRole("heading", { name: "Trade history (PAPER)" })).toBeInTheDocument();
+    expect(screen.getByRole("heading", { name: "Portfolio timeline (PAPER)" })).toBeInTheDocument();
+    expect(screen.getByText("$0.25 (1.00%)")).toBeInTheDocument();
 
     await user.clear(screen.getByLabelText("Paper account ID"));
     await user.type(screen.getByLabelText("Paper account ID"), "paper-account-2");
@@ -104,6 +135,20 @@ describe("paper trading page", () => {
     });
     expect(screen.getByText("Selected account ID: paper-account-2")).toBeInTheDocument();
     expect(screen.getAllByText("Paper Balance: $50.00").length).toBeGreaterThan(0);
+
+    await user.type(screen.getByLabelText("Strategy ID filter (optional)"), "strat-1");
+    await user.click(screen.getByRole("button", { name: "Apply trade filters" }));
+
+    await waitFor(() => {
+      expect(getPaperTradesMock).toHaveBeenLastCalledWith({
+        account_id: "paper-account-2",
+        strategy_id: "strat-1",
+        asset_id: undefined,
+        start_time: undefined,
+        end_time: undefined,
+        limit: 100,
+      });
+    });
 
     await user.click(screen.getByRole("button", { name: "Reset paper account" }));
     expect(screen.getByRole("heading", { name: "Reset the active paper account?" })).toBeInTheDocument();

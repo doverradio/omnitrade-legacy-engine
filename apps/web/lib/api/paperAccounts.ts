@@ -47,6 +47,34 @@ export type ResetPaperAccountResponse = {
   positions: PaperAccountPosition[];
 };
 
+export type PaperTrade = {
+  id: string;
+  asset_id: string;
+  side: string;
+  quantity: string;
+  price: string;
+  fee: string;
+  executed_at: string;
+  signal_id?: string | null;
+  strategy_id?: string | null;
+  symbol?: string | null;
+};
+
+export type PaperTradeListResponse = {
+  items: PaperTrade[];
+  next_cursor: string | null;
+};
+
+export type GetPaperTradesParams = {
+  account_id: string;
+  strategy_id?: string;
+  asset_id?: string;
+  start_time?: string;
+  end_time?: string;
+  limit?: number;
+  cursor?: string;
+};
+
 type PaperAccountResponse = PaperAccount;
 
 const API_BASE_URL = process.env.NEXT_PUBLIC_API_BASE_URL ?? "http://localhost:8000";
@@ -106,4 +134,30 @@ export async function resetPaperAccount(payload: ResetPaperAccountRequest): Prom
     method: "POST",
     body: JSON.stringify(payload),
   });
+}
+
+export async function getPaperTrades(params: GetPaperTradesParams): Promise<PaperTradeListResponse> {
+  const search = new URLSearchParams();
+  search.set("account_id", params.account_id);
+
+  if (params.strategy_id) {
+    search.set("strategy_id", params.strategy_id);
+  }
+  if (params.asset_id) {
+    search.set("asset_id", params.asset_id);
+  }
+  if (params.start_time) {
+    search.set("start_time", params.start_time);
+  }
+  if (params.end_time) {
+    search.set("end_time", params.end_time);
+  }
+  if (typeof params.limit === "number") {
+    search.set("limit", String(params.limit));
+  }
+  if (params.cursor) {
+    search.set("cursor", params.cursor);
+  }
+
+  return requestJson<PaperTradeListResponse>(`/paper/trades?${search.toString()}`);
 }
