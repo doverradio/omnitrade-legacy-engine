@@ -70,5 +70,6 @@ ADRs are numbered sequentially (`ADR-0001`, `ADR-0002`, ...) in the order they w
 | [ADR-0005](./ADR-0005-small-account-mode.md) | Small Account Mode | Accepted |
 | [ADR-0006](./ADR-0006-fastapi-backend.md) | FastAPI Backend | Accepted |
 | [ADR-0007](./ADR-0007-decision-quality-engine.md) | Decision Quality Engine | Accepted |
+| [ADR-0008](./ADR-0008-capital-allocation-engine.md) | Capital Allocation Engine | Accepted |
 
 This index must be updated whenever a new ADR is added or an existing one's status changes.
