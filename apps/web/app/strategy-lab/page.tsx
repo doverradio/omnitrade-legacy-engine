@@ -3,8 +3,16 @@
 import { useEffect, useMemo, useState } from "react";
 
 import { ApiRequestError } from "@/lib/api/backtests";
+import { getParameterSets, saveParameterSet, type ParameterSetItem } from "@/lib/api/parameterSets";
 import { getStrategies, type StrategyItem } from "@/lib/api/strategies";
 import { ConfigurationCoach } from "@/components/domain/ConfigurationCoach";
+import {
+  getBehaviorSummary,
+  getBeginnerTopObservations,
+  getHealthState,
+  getReadinessLabel,
+  getReadinessScore,
+} from "@/lib/configurationCoach";
 import {
   getParameterDefinitions,
   validateParameterValue,
@@ -44,6 +52,11 @@ type BeginnerWhyChangeNotes = {
 };
 
 type ParameterValues = Record<string, string | number | boolean>;
+
+type SnapshotMeta = {
+  notes?: string;
+  createdAt?: string;
+};
 
 const PARAMETER_EFFECT_NOTES: Record<string, ExpectedEffectNotes> = {
   fast_period: {
@@ -230,6 +243,62 @@ function formatCurrentValue(value: string | number | boolean, definition: Parame
   }
 
   return String(value);
+}
+
+function formatDateLabel(value?: string): string {
+  if (!value) {
+    return "Not yet available";
+  }
+
+  const timestamp = Date.parse(value);
+  if (Number.isNaN(timestamp)) {
+    return "Not yet available";
+  }
+
+  return new Date(timestamp).toLocaleDateString();
+}
+
+function coerceParameterValue(definition: ParameterDefinition, rawValue: unknown): string | number | boolean {
+  if (rawValue === undefined || rawValue === null) {
+    return definition.defaultValue;
+  }
+
+  if (definition.type === "boolean") {
+    if (typeof rawValue === "boolean") {
+      return rawValue;
+    }
+
+    if (typeof rawValue === "string") {
+      return rawValue.toLowerCase() === "true";
+    }
+
+    return Boolean(rawValue);
+  }
+
+  if (definition.type === "enum") {
+    return String(rawValue);
+  }
+
+  const numeric = typeof rawValue === "number" ? rawValue : Number(rawValue);
+  if (!Number.isFinite(numeric)) {
+    return definition.defaultValue;
+  }
+
+  if (definition.type === "integer") {
+    return Math.round(numeric);
+  }
+
+  return numeric;
+}
+
+function parameterSummary(definitions: ParameterDefinition[], values: Record<string, string | number | boolean>): string {
+  if (definitions.length === 0) {
+    return "No parameter metadata available.";
+  }
+
+  return definitions
+    .map((definition) => `${definition.label}: ${String(values[definition.key] ?? definition.defaultValue)}`)
+    .join(" • ");
 }
 
 function renderExpectedEffects(
@@ -501,6 +570,15 @@ export default function StrategyLabPage() {
   const [isLoadingStrategies, setIsLoadingStrategies] = useState(true);
   const [strategiesError, setStrategiesError] = useState<string | null>(null);
   const [parameterValues, setParameterValues] = useState<ParameterValues>({});
+  const [parameterSets, setParameterSets] = useState<ParameterSetItem[]>([]);
+  const [isLoadingParameterSets, setIsLoadingParameterSets] = useState(true);
+  const [parameterSetsError, setParameterSetsError] = useState<string | null>(null);
+  const [snapshotName, setSnapshotName] = useState("");
+  const [snapshotNotes, setSnapshotNotes] = useState("");
+  const [saveSnapshotError, setSaveSnapshotError] = useState<string | null>(null);
+  const [isSavingSnapshot, setIsSavingSnapshot] = useState(false);
+  const [snapshotMetaById, setSnapshotMetaById] = useState<Record<string, SnapshotMeta>>({});
+  const [selectedSnapshotId, setSelectedSnapshotId] = useState<string | null>(null);
 
   useEffect(() => {
     let cancelled = false;
@@ -535,6 +613,38 @@ export default function StrategyLabPage() {
     };
   }, []);
 
+  useEffect(() => {
+    let cancelled = false;
+
+    const loadParameterSets = async () => {
+      setIsLoadingParameterSets(true);
+      setParameterSetsError(null);
+
+      try {
+        const items = await getParameterSets();
+        if (cancelled) {
+          return;
+        }
+        setParameterSets(items);
+      } catch (error) {
+        if (cancelled) {
+          return;
+        }
+        setParameterSetsError(getErrorMessage(error));
+      } finally {
+        if (!cancelled) {
+          setIsLoadingParameterSets(false);
+        }
+      }
+    };
+
+    void loadParameterSets();
+
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
   const selectedStrategy = useMemo(() => {
     if (!selectedStrategyId) {
       return null;
@@ -554,6 +664,7 @@ export default function StrategyLabPage() {
   useEffect(() => {
     if (!selectedStrategy) {
       setParameterValues({});
+      setSelectedSnapshotId(null);
       return;
     }
 
@@ -563,6 +674,7 @@ export default function StrategyLabPage() {
       defaults[definition.key] = definition.defaultValue;
     }
     setParameterValues(defaults);
+    setSelectedSnapshotId(null);
   }, [selectedStrategy]);
 
   const perFieldValidation = useMemo(() => {
@@ -580,6 +692,85 @@ export default function StrategyLabPage() {
 
     return validateParameterValues(selectedStrategy.slug, parameterValues);
   }, [parameterValues, selectedStrategy]);
+
+  const strategyParameterSets = useMemo(() => {
+    if (!selectedStrategy) {
+      return [];
+    }
+
+    return parameterSets.filter((item) => item.strategy_id === selectedStrategy.id);
+  }, [parameterSets, selectedStrategy]);
+
+  const normalizedSnapshotName = snapshotName.trim().toLowerCase();
+  const hasDuplicateSnapshotName = useMemo(() => {
+    if (!normalizedSnapshotName) {
+      return false;
+    }
+
+    return strategyParameterSets.some((item) => item.name.trim().toLowerCase() === normalizedSnapshotName);
+  }, [normalizedSnapshotName, strategyParameterSets]);
+
+  const applySnapshot = (snapshot: ParameterSetItem) => {
+    if (!selectedStrategy) {
+      return;
+    }
+
+    const nextValues: ParameterValues = {};
+    for (const definition of parameterDefinitions) {
+      nextValues[definition.key] = coerceParameterValue(definition, snapshot.parameters[definition.key]);
+    }
+
+    setParameterValues(nextValues);
+    setSelectedSnapshotId(snapshot.id);
+    setSaveSnapshotError(null);
+  };
+
+  const handleSaveSnapshot = async () => {
+    if (!selectedStrategy) {
+      return;
+    }
+
+    const trimmedName = snapshotName.trim();
+    if (!trimmedName) {
+      setSaveSnapshotError("Snapshot name is required.");
+      return;
+    }
+
+    if (hasDuplicateSnapshotName) {
+      setSaveSnapshotError("A snapshot with this name already exists for the selected strategy.");
+      return;
+    }
+
+    setIsSavingSnapshot(true);
+    setSaveSnapshotError(null);
+
+    try {
+      const saved = await saveParameterSet(selectedStrategy.id, {
+        name: trimmedName,
+        parameters: parameterValues,
+      });
+
+      setParameterSets((previous) => [...previous, saved]);
+      setSnapshotMetaById((previous) => ({
+        ...previous,
+        [saved.id]: {
+          notes: snapshotNotes.trim() || undefined,
+          createdAt: saved.created_at ?? new Date().toISOString(),
+        },
+      }));
+      setSnapshotName("");
+      setSnapshotNotes("");
+      setSelectedSnapshotId(saved.id);
+    } catch (error) {
+      if (error instanceof ApiRequestError && error.status === 409) {
+        setSaveSnapshotError("A snapshot with this name already exists. Choose a different name.");
+      } else {
+        setSaveSnapshotError(getErrorMessage(error));
+      }
+    } finally {
+      setIsSavingSnapshot(false);
+    }
+  };
 
   const handleValueChange = (key: string, nextValue: string | number | boolean) => {
     setParameterValues((previous) => ({
@@ -924,13 +1115,194 @@ export default function StrategyLabPage() {
           />
         )}
 
-        <PlaceholderSection
-          id="run-backtest"
-          title="4) Run Backtest"
-          description="Launch a historical simulation to test this setup without risking money."
-          placeholder="Backtest launch placeholder reserved."
-          tone="loading"
-        />
+        <section
+          aria-labelledby="configuration-snapshots"
+          className="rounded-xl border border-border bg-muted/30 p-4"
+          data-testid="strategy-lab-section-configuration-snapshots"
+        >
+          <h2 id="configuration-snapshots" className="text-base font-semibold sm:text-lg">
+            4) Configuration Snapshots & Saved Presets
+          </h2>
+          <p className="mt-1 text-sm text-foreground/75">
+            Save the current configuration as a reusable snapshot, then view, select, or apply saved presets.
+          </p>
+
+          {!selectedStrategy ? (
+            <p className="mt-3 rounded-md border border-dashed border-border bg-background/30 px-3 py-2 text-sm text-foreground/70">
+              Select a strategy to save and apply snapshots.
+            </p>
+          ) : (
+            <>
+              <div className="mt-3 rounded-lg border border-border bg-background/30 p-3" data-testid="snapshot-save-form">
+                <h3 className="text-sm font-semibold">Save Snapshot</h3>
+                <div className="mt-2 grid gap-2">
+                  <label htmlFor="snapshot-name" className="text-sm font-medium text-foreground/90">
+                    Snapshot Name
+                  </label>
+                  <input
+                    id="snapshot-name"
+                    aria-label="Snapshot Name"
+                    type="text"
+                    value={snapshotName}
+                    onChange={(event) => setSnapshotName(event.target.value)}
+                    className="w-full rounded-md border border-border bg-background px-3 py-2 text-sm"
+                    placeholder="e.g. conservative-v2"
+                  />
+
+                  <label htmlFor="snapshot-notes" className="text-sm font-medium text-foreground/90">
+                    Notes (optional)
+                  </label>
+                  <textarea
+                    id="snapshot-notes"
+                    aria-label="Snapshot Notes"
+                    value={snapshotNotes}
+                    onChange={(event) => setSnapshotNotes(event.target.value)}
+                    className="w-full rounded-md border border-border bg-background px-3 py-2 text-sm"
+                    rows={3}
+                    placeholder="Add context for what this setup is designed for."
+                  />
+                </div>
+
+                {hasDuplicateSnapshotName ? (
+                  <p className="mt-2 rounded-md border border-amber-500/40 bg-amber-500/10 px-2 py-1 text-sm text-amber-100" data-testid="snapshot-duplicate-warning">
+                    A snapshot with this name already exists for this strategy.
+                  </p>
+                ) : null}
+
+                {saveSnapshotError ? (
+                  <p className="mt-2 rounded-md border border-red-500/40 bg-red-500/10 px-2 py-1 text-sm text-red-100" data-testid="snapshot-save-error">
+                    {saveSnapshotError}
+                  </p>
+                ) : null}
+
+                <button
+                  type="button"
+                  aria-label="Save snapshot"
+                  onClick={() => void handleSaveSnapshot()}
+                  disabled={isSavingSnapshot || hasDuplicateSnapshotName}
+                  className="mt-3 inline-flex min-h-11 items-center justify-center rounded-md border border-border bg-muted px-4 py-2 text-sm font-medium transition hover:bg-foreground/10 focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-accent disabled:cursor-not-allowed disabled:opacity-60"
+                >
+                  {isSavingSnapshot ? "Saving..." : "Save Snapshot"}
+                </button>
+              </div>
+
+              <div className="mt-3" data-testid="snapshot-library">
+                <h3 className="text-sm font-semibold">Preset Library</h3>
+
+                {isLoadingParameterSets ? (
+                  <div className="mt-2 space-y-2" role="status" aria-live="polite" aria-label="Preset library loading">
+                    <div className="h-20 animate-pulse rounded-lg bg-foreground/15" />
+                    <div className="h-20 animate-pulse rounded-lg bg-foreground/15" />
+                  </div>
+                ) : null}
+
+                {!isLoadingParameterSets && parameterSetsError ? (
+                  <p className="mt-2 rounded-md border border-red-500/40 bg-red-500/10 px-2 py-1 text-sm text-red-100" data-testid="snapshot-library-error">
+                    {parameterSetsError}
+                  </p>
+                ) : null}
+
+                {!isLoadingParameterSets && !parameterSetsError && strategyParameterSets.length === 0 ? (
+                  <p className="mt-2 rounded-md border border-dashed border-border bg-background/30 px-3 py-2 text-sm text-foreground/70" data-testid="snapshot-library-empty">
+                    No saved presets yet. Save your current configuration to start the library.
+                  </p>
+                ) : null}
+
+                {!isLoadingParameterSets && !parameterSetsError && strategyParameterSets.length > 0 ? (
+                  <div className="mt-2 space-y-3" data-testid="snapshot-cards">
+                    {strategyParameterSets.map((snapshot) => {
+                      const isSelectedSnapshot = selectedSnapshotId === snapshot.id;
+                      const snapshotValues: ParameterValues = {};
+                      for (const definition of parameterDefinitions) {
+                        snapshotValues[definition.key] = coerceParameterValue(definition, snapshot.parameters[definition.key]);
+                      }
+
+                      const snapshotValidation = validateParameterValues(selectedStrategy.slug, snapshotValues);
+                      const snapshotHealth = getHealthState(snapshotValidation);
+                      const snapshotReadiness = getReadinessScore(parameterDefinitions, snapshotValues, snapshotValidation);
+                      const snapshotReadinessLabel = getReadinessLabel(snapshotHealth);
+                      const snapshotBehavior = getBehaviorSummary(selectedStrategy.slug, snapshotValues);
+                      const snapshotCreatedAt = snapshotMetaById[snapshot.id]?.createdAt ?? snapshot.created_at;
+                      const snapshotNotesValue = snapshotMetaById[snapshot.id]?.notes;
+                      const snapshotSummary = parameterSummary(parameterDefinitions, snapshotValues);
+
+                      const beginnerSummary = getBeginnerTopObservations(
+                        snapshotHealth,
+                        snapshotReadiness,
+                        [],
+                        snapshotBehavior,
+                      );
+
+                      return (
+                        <article
+                          key={snapshot.id}
+                          className={[
+                            "rounded-lg border bg-background/30 p-3",
+                            isSelectedSnapshot ? "border-accent ring-1 ring-accent/60" : "border-border",
+                          ].join(" ")}
+                          data-testid={`snapshot-card-${snapshot.id}`}
+                        >
+                          <div className="flex flex-col gap-2 sm:flex-row sm:items-start sm:justify-between">
+                            <div>
+                              <h4 className="text-base font-semibold">{snapshot.name}</h4>
+                              <p className="text-sm text-foreground/80">Strategy: {selectedStrategy.name}</p>
+                            </div>
+                            <span className="rounded-full border border-border bg-muted/30 px-2 py-0.5 text-xs font-medium text-foreground/80">
+                              {snapshotReadiness} / 100 • {snapshotReadinessLabel}
+                            </span>
+                          </div>
+
+                          <p className="mt-2 text-sm text-foreground/80">Parameter Summary: {snapshotSummary}</p>
+                          <p className="mt-1 text-sm text-foreground/80">
+                            Estimated Behavior: {snapshotBehavior
+                              ? `Trade Frequency ${snapshotBehavior.tradeFrequency}, Responsiveness ${snapshotBehavior.responsiveness}, Noise Filtering ${snapshotBehavior.noiseFiltering}, Trend Sensitivity ${snapshotBehavior.trendSensitivity}`
+                              : "Behavior estimates are not yet available for this strategy."}
+                          </p>
+                          <p className="mt-1 text-sm text-foreground/75">Created Date: {formatDateLabel(snapshotCreatedAt)}</p>
+                          <p className="mt-1 text-sm text-foreground/75">Notes: {snapshotNotesValue || "No notes provided."}</p>
+
+                          {isBeginnerMode ? (
+                            <div className="mt-2 rounded-md border border-border bg-muted/20 px-3 py-2 text-sm text-foreground/80" data-testid={`snapshot-beginner-summary-${snapshot.id}`}>
+                              <p className="font-medium">What was this configuration designed for?</p>
+                              <p className="mt-1">{beginnerSummary[0]}</p>
+                            </div>
+                          ) : null}
+
+                          <div className="mt-3 flex flex-wrap gap-2">
+                            <button
+                              type="button"
+                              aria-label={`View snapshot ${snapshot.name}`}
+                              onClick={() => setSelectedSnapshotId(snapshot.id)}
+                              className="inline-flex min-h-11 items-center justify-center rounded-md border border-border bg-muted px-3 py-2 text-sm font-medium transition hover:bg-foreground/10 focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-accent"
+                            >
+                              View
+                            </button>
+                            <button
+                              type="button"
+                              aria-label={`Select snapshot ${snapshot.name}`}
+                              onClick={() => setSelectedSnapshotId(snapshot.id)}
+                              className="inline-flex min-h-11 items-center justify-center rounded-md border border-border bg-muted px-3 py-2 text-sm font-medium transition hover:bg-foreground/10 focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-accent"
+                            >
+                              Select
+                            </button>
+                            <button
+                              type="button"
+                              aria-label={`Apply snapshot ${snapshot.name}`}
+                              onClick={() => applySnapshot(snapshot)}
+                              className="inline-flex min-h-11 items-center justify-center rounded-md border border-border bg-muted px-3 py-2 text-sm font-medium transition hover:bg-foreground/10 focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-accent"
+                            >
+                              Apply
+                            </button>
+                          </div>
+                        </article>
+                      );
+                    })}
+                  </div>
+                ) : null}
+              </div>
+            </>
+          )}
+        </section>
 
         <PlaceholderSection
           id="compare-results"

@@ -20,9 +20,118 @@ function installFetchMock(scenario: FetchScenario) {
     // Intentionally unresolved for loading-state assertions.
   });
 
-  const fetchMock = vi.fn(async (input: string | URL | Request) => {
+  const strategyItems = [
+    {
+      id: "strategy-1",
+      name: "MA Crossover",
+      slug: "ma_crossover",
+      is_active: false,
+      module_version: "1.0.0",
+      default_params: {
+        fast_period: 10,
+        slow_period: 50,
+        ma_type: "sma",
+      },
+    },
+    {
+      id: "strategy-2",
+      name: "RSI Mean Reversion",
+      slug: "rsi_mean_reversion",
+      is_active: true,
+      module_version: "1.0.0",
+      default_params: {
+        rsi_period: 14,
+        oversold: 30,
+        overbought: 70,
+      },
+    },
+    {
+      id: "strategy-3",
+      name: "Breakout",
+      slug: "breakout",
+      is_active: false,
+      module_version: "1.0.0",
+      default_params: {
+        lookback: 20,
+        volume_confirmation: true,
+        min_volume_multiple: 1.5,
+      },
+    },
+  ];
+
+  const parameterSetsStore: Array<{
+    id: string;
+    strategy_id: string;
+    name: string;
+    parameters: Record<string, unknown>;
+    created_at?: string;
+  }> = [
+    {
+      id: "ps-ma-1",
+      strategy_id: "strategy-1",
+      name: "conservative-v1",
+      parameters: {
+        fast_period: 12,
+        slow_period: 60,
+        ma_type: "sma",
+      },
+      created_at: "2026-07-01T12:00:00Z",
+    },
+  ];
+
+  const fetchMock = vi.fn(async (input: string | URL | Request, init?: RequestInit) => {
     const rawUrl = typeof input === "string" ? input : input instanceof URL ? input.toString() : input.url;
+    const method = input instanceof Request ? input.method : init?.method ?? "GET";
     const url = new URL(rawUrl);
+
+    if (scenario === "loading") {
+      return pending;
+    }
+
+    if (url.pathname === "/parameter-sets" && method === "GET") {
+      return jsonResponse(200, {
+        items: parameterSetsStore,
+      });
+    }
+
+    if (url.pathname.startsWith("/strategies/") && url.pathname.endsWith("/parameter-sets") && method === "POST") {
+      const strategyId = url.pathname.split("/")[2];
+      const request = input instanceof Request ? input : new Request(rawUrl, { method: "POST", body: init?.body });
+      const body = (await request.json()) as {
+        name?: string;
+        parameters?: Record<string, unknown>;
+      };
+
+      const name = (body.name ?? "").trim();
+      if (!name) {
+        return jsonResponse(422, {
+          error: {
+            message: "Snapshot name is required",
+          },
+        });
+      }
+
+      const duplicate = parameterSetsStore.some(
+        (item) => item.strategy_id === strategyId && item.name.toLowerCase() === name.toLowerCase(),
+      );
+      if (duplicate) {
+        return jsonResponse(409, {
+          error: {
+            message: "Duplicate parameter set name",
+          },
+        });
+      }
+
+      const saved = {
+        id: `ps-${parameterSetsStore.length + 1}`,
+        strategy_id: strategyId,
+        name,
+        parameters: body.parameters ?? {},
+        created_at: "2026-07-05T10:00:00Z",
+      };
+      parameterSetsStore.push(saved);
+      return jsonResponse(201, saved);
+    }
 
     if (url.pathname !== "/strategies") {
       return jsonResponse(404, {
@@ -30,10 +139,6 @@ function installFetchMock(scenario: FetchScenario) {
           message: `Unhandled route: ${url.pathname}`,
         },
       });
-    }
-
-    if (scenario === "loading") {
-      return pending;
     }
 
     if (scenario === "error") {
@@ -51,44 +156,7 @@ function installFetchMock(scenario: FetchScenario) {
     }
 
     return jsonResponse(200, {
-      items: [
-        {
-          id: "strategy-1",
-          name: "MA Crossover",
-          slug: "ma_crossover",
-          is_active: false,
-          module_version: "1.0.0",
-          default_params: {
-            fast_period: 10,
-            slow_period: 50,
-            ma_type: "sma",
-          },
-        },
-        {
-          id: "strategy-2",
-          name: "RSI Mean Reversion",
-          slug: "rsi_mean_reversion",
-          is_active: true,
-          module_version: "1.0.0",
-          default_params: {
-            rsi_period: 14,
-            oversold: 30,
-            overbought: 70,
-          },
-        },
-        {
-          id: "strategy-3",
-          name: "Breakout",
-          slug: "breakout",
-          is_active: false,
-          module_version: "1.0.0",
-          default_params: {
-            lookback: 20,
-            volume_confirmation: true,
-            min_volume_multiple: 1.5,
-          },
-        },
-      ],
+      items: strategyItems,
     });
   });
 
@@ -101,6 +169,103 @@ afterEach(() => {
 });
 
 describe("StrategyLabPage Prompt 4.2", () => {
+  it("renders saved preset snapshot cards with required fields", async () => {
+    installFetchMock("success");
+    render(<StrategyLabPage />);
+
+    await waitFor(() => {
+      expect(screen.getByTestId("snapshot-cards")).toBeInTheDocument();
+    });
+
+    const card = screen.getByTestId("snapshot-card-ps-ma-1");
+    expect(card).toHaveTextContent("conservative-v1");
+    expect(card).toHaveTextContent("Strategy: MA Crossover");
+    expect(card).toHaveTextContent("Parameter Summary:");
+    expect(card).toHaveTextContent("Estimated Behavior:");
+    expect(card).toHaveTextContent("Created Date:");
+    expect(card).toHaveTextContent("Notes:");
+  });
+
+  it("supports save flow for a new snapshot", async () => {
+    installFetchMock("success");
+    render(<StrategyLabPage />);
+    const user = userEvent.setup();
+
+    await waitFor(() => {
+      expect(screen.getByLabelText("Snapshot Name")).toBeInTheDocument();
+    });
+
+    await user.type(screen.getByLabelText("Snapshot Name"), "balanced-v2");
+    await user.type(screen.getByLabelText("Snapshot Notes"), "Designed for smoother trend capture.");
+    await user.click(screen.getByRole("button", { name: "Save snapshot" }));
+
+    expect(await screen.findByText("balanced-v2")).toBeInTheDocument();
+    const savedCard = screen.getByTestId("snapshot-card-ps-2");
+    expect(savedCard).toHaveTextContent("Designed for smoother trend capture.");
+  });
+
+  it("handles duplicate snapshot names gracefully", async () => {
+    installFetchMock("success");
+    render(<StrategyLabPage />);
+    const user = userEvent.setup();
+
+    await waitFor(() => {
+      expect(screen.getByLabelText("Snapshot Name")).toBeInTheDocument();
+    });
+
+    await user.type(screen.getByLabelText("Snapshot Name"), "conservative-v1");
+    expect(screen.getByTestId("snapshot-duplicate-warning")).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Save snapshot" })).toBeDisabled();
+  });
+
+  it("applies a snapshot and refreshes parameter editor and validation", async () => {
+    installFetchMock("success");
+    render(<StrategyLabPage />);
+    const user = userEvent.setup();
+
+    await waitFor(() => {
+      expect(screen.getByLabelText("Slow Period value")).toBeInTheDocument();
+    });
+
+    const slowInput = screen.getByLabelText("Slow Period value");
+    await user.clear(slowInput);
+    await user.type(slowInput, "2");
+    expect((await screen.findAllByText("Slow Period must be at least 5.")).length).toBeGreaterThan(0);
+
+    await user.click(screen.getByRole("button", { name: "Apply snapshot conservative-v1" }));
+
+    expect(screen.queryAllByText("Slow Period must be at least 5.")).toHaveLength(0);
+    expect(screen.getByTestId("parameter-form-validation")).toHaveTextContent("All current parameter values are valid.");
+    expect(screen.getByLabelText("Slow Period value")).toHaveValue(60);
+  });
+
+  it("renders beginner snapshot summary text", async () => {
+    installFetchMock("success");
+    render(<StrategyLabPage />);
+
+    await waitFor(() => {
+      expect(screen.getByTestId("snapshot-beginner-summary-ps-ma-1")).toBeInTheDocument();
+    });
+
+    expect(screen.getByText("What was this configuration designed for?")).toBeInTheDocument();
+  });
+
+  it("supports snapshot view and select actions with accessibility labels", async () => {
+    installFetchMock("success");
+    render(<StrategyLabPage />);
+    const user = userEvent.setup();
+
+    await waitFor(() => {
+      expect(screen.getByRole("button", { name: "View snapshot conservative-v1" })).toBeInTheDocument();
+    });
+
+    await user.click(screen.getByRole("button", { name: "View snapshot conservative-v1" }));
+    await user.click(screen.getByRole("button", { name: "Select snapshot conservative-v1" }));
+
+    expect(screen.getByTestId("snapshot-card-ps-ma-1")).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Apply snapshot conservative-v1" })).toBeInTheDocument();
+  });
+
   it("renders Configuration Coach ready state by default", async () => {
     installFetchMock("success");
     render(<StrategyLabPage />);
@@ -193,8 +358,8 @@ describe("StrategyLabPage Prompt 4.2", () => {
       expect(screen.getByTestId("coach-card-things-to-know")).toBeInTheDocument();
     });
 
-    expect(screen.getByText(/Your configuration is valid./)).toBeInTheDocument();
-    expect(screen.getByText(/Configuration readiness is 100 out of 100./)).toBeInTheDocument();
+    expect(screen.getAllByText(/Your configuration is valid./).length).toBeGreaterThan(0);
+    expect(screen.getAllByText(/Configuration readiness is 100 out of 100./).length).toBeGreaterThan(0);
   });
 
   it("supports Advanced Details collapse and expand", async () => {
