@@ -67,6 +67,11 @@ class DecisionRecord(Base):
         back_populates="decision_record",
         cascade="all, delete-orphan",
     )
+    counterfactual_results = relationship(
+        "DecisionCounterfactualResult",
+        back_populates="decision_record",
+        cascade="all, delete-orphan",
+    )
 
 
 @event.listens_for(DecisionRecord, "before_update", propagate=True)

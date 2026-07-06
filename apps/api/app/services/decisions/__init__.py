@@ -27,6 +27,14 @@ from app.services.decisions.explainability import (
     persist_explainability_evidence_for_decision,
     read_decision_explainability,
 )
+from app.services.decisions.counterfactuals import (
+    CounterfactualEvaluationRunResult,
+    CounterfactualResultDraft,
+    V1_COUNTERFACTUAL_HORIZONS,
+    build_counterfactual_result_draft,
+    build_counterfactual_result_idempotency_key,
+    evaluate_counterfactual_outcome_ledger_v1,
+)
 
 __all__ = [
     "DecisionProvenanceContract",
@@ -38,11 +46,17 @@ __all__ = [
     "DecisionIngestionResult",
     "DecisionTimelineEntry",
     "DecisionExplainabilityReadModel",
+    "CounterfactualEvaluationRunResult",
+    "CounterfactualResultDraft",
     "ExplainabilityEvidenceDraft",
     "TimelineReadFilters",
     "TimelineStateField",
+    "V1_COUNTERFACTUAL_HORIZONS",
+    "build_counterfactual_result_draft",
+    "build_counterfactual_result_idempotency_key",
     "build_explainability_evidence_drafts",
     "build_signal_idempotency_key",
+    "evaluate_counterfactual_outcome_ledger_v1",
     "ingest_decision_records",
     "persist_explainability_evidence_for_decision",
     "read_decision_timeline",
