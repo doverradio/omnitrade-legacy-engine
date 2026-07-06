@@ -3,6 +3,7 @@ from app.models.audit_log import AuditLog
 from app.models.backtest import Backtest
 from app.models.backtest_trade import BacktestTrade
 from app.models.candle import Candle
+from app.models.decision_alternative_action import DecisionAlternativeAction
 from app.models.decision_counterfactual_result import DecisionCounterfactualResult
 from app.models.decision_explainability_record import DecisionExplainabilityRecord
 from app.models.decision_quality_score import DecisionQualityScore
@@ -24,6 +25,7 @@ __all__ = [
 	"Backtest",
 	"BacktestTrade",
 	"Candle",
+	"DecisionAlternativeAction",
 	"DecisionCounterfactualResult",
 	"DecisionExplainabilityRecord",
 	"DecisionQualityScore",

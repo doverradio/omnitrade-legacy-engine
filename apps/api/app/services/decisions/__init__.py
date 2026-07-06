@@ -46,6 +46,14 @@ from app.services.decisions.quality import (
     persist_decision_quality_score,
     read_latest_decision_quality_score,
 )
+from app.services.decisions.alternatives import (
+    AlternativeActionDraft,
+    DecisionAlternativeActionReadModel,
+    build_alternative_action_drafts,
+    build_alternative_action_idempotency_key,
+    persist_alternative_actions_for_decision,
+    read_decision_alternative_actions,
+)
 
 __all__ = [
     "DecisionProvenanceContract",
@@ -62,6 +70,8 @@ __all__ = [
     "DecisionQualityComponentScore",
     "DecisionQualityReadModel",
     "DecisionQualityScoreDraft",
+    "AlternativeActionDraft",
+    "DecisionAlternativeActionReadModel",
     "DEFAULT_COMPONENT_WEIGHTS",
     "DEFAULT_SCORING_MODEL_VERSION",
     "ExplainabilityEvidenceDraft",
@@ -72,12 +82,16 @@ __all__ = [
     "build_counterfactual_result_idempotency_key",
     "build_decision_quality_idempotency_key",
     "build_decision_quality_score_draft",
+    "build_alternative_action_drafts",
+    "build_alternative_action_idempotency_key",
     "build_explainability_evidence_drafts",
     "build_signal_idempotency_key",
     "evaluate_counterfactual_outcome_ledger_v1",
     "ingest_decision_records",
     "persist_decision_quality_score",
+    "persist_alternative_actions_for_decision",
     "persist_explainability_evidence_for_decision",
+    "read_decision_alternative_actions",
     "read_latest_decision_quality_score",
     "read_decision_timeline",
     "read_decision_explainability",

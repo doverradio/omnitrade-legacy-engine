@@ -77,6 +77,11 @@ class DecisionRecord(Base):
         back_populates="decision_record",
         cascade="all, delete-orphan",
     )
+    alternative_actions = relationship(
+        "DecisionAlternativeAction",
+        back_populates="decision_record",
+        cascade="all, delete-orphan",
+    )
 
 
 @event.listens_for(DecisionRecord, "before_update", propagate=True)
