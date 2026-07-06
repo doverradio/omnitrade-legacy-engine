@@ -20,6 +20,8 @@ from app.schemas.paper import (
     AlpacaPaperOrderResponse,
     CreatePaperAccountRequest,
     CreatePaperAccountResponse,
+    ExecuteSignalRequest,
+    ExecuteSignalResponse,
     PaperAccountResponse,
     PositionResponse,
     ResetPaperAccountRequest,
@@ -29,6 +31,10 @@ from app.schemas.paper import (
 from app.services.data.http_client import AsyncHTTPClient
 from app.services.paper.accounting import build_account_snapshot
 from app.services.paper.alpaca_paper import get_alpaca_paper_order, submit_alpaca_paper_order
+from app.services.signals.execution_orchestrator import (
+    SignalExecutionRequest,
+    orchestrate_paper_signal_execution,
+)
 
 router = APIRouter(prefix="/paper", tags=["paper"])
 logger = logging.getLogger(__name__)
@@ -276,6 +282,38 @@ async def get_stock_paper_order_status(
         filled_at=result.filled_at,
         execution_venue=result.execution_venue,
         is_paper=result.is_paper,
+    )
+
+
+@router.post("/signals/execute", response_model=ExecuteSignalResponse)
+async def execute_signal_paper_only(
+    payload: ExecuteSignalRequest,
+    db: AsyncSession = Depends(get_db),
+) -> ExecuteSignalResponse:
+    result = await orchestrate_paper_signal_execution(
+        db=db,
+        request=SignalExecutionRequest(
+            signal_id=payload.signal_id,
+            paper_account_id=payload.account_id,
+            asset_id=payload.asset_id,
+            side=payload.side,
+            quantity=payload.quantity,
+            actor=payload.actor,
+            client_order_id=payload.client_order_id,
+        ),
+    )
+
+    return ExecuteSignalResponse(
+        signal_id=result.signal_id,
+        account_id=result.paper_account_id,
+        asset_id=result.asset_id,
+        execution_status=result.execution_status,
+        execution_venue=result.execution_venue,
+        is_paper=result.is_paper,
+        trade_id=result.trade_id,
+        broker_order_id=result.broker_order_id,
+        venue_status=result.venue_status,
+        message=result.message,
     )
 
 

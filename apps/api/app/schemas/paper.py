@@ -114,3 +114,26 @@ class AlpacaPaperOrderResponse(BaseModel):
         if value is None:
             return None
         return format(value, "f")
+
+
+class ExecuteSignalRequest(BaseModel):
+    signal_id: uuid.UUID
+    account_id: uuid.UUID
+    asset_id: uuid.UUID
+    side: str
+    quantity: Decimal
+    actor: str = "system"
+    client_order_id: str | None = None
+
+
+class ExecuteSignalResponse(BaseModel):
+    signal_id: uuid.UUID
+    account_id: uuid.UUID
+    asset_id: uuid.UUID
+    execution_status: str
+    execution_venue: str
+    is_paper: bool
+    trade_id: uuid.UUID | None = None
+    broker_order_id: str | None = None
+    venue_status: str | None = None
+    message: str

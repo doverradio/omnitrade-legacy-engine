@@ -59,6 +59,7 @@ async def execute_internal_crypto_fill(
     asset_id: uuid.UUID,
     side: str,
     quantity: Decimal,
+    signal_id: uuid.UUID | None = None,
     fee_bps: Decimal = Decimal("10"),
     slippage_bps: Decimal = Decimal("5"),
     actor: str = "system",
@@ -150,6 +151,7 @@ async def execute_internal_crypto_fill(
 
     trade = Trade(
         paper_account_id=paper_account_id,
+        signal_id=signal_id,
         asset_id=asset_id,
         side=side,
         quantity=rounded_quantity,
@@ -170,6 +172,7 @@ async def execute_internal_crypto_fill(
         entity_id=None,
         before_state={
             "paper_account_id": str(paper_account_id),
+            "signal_id": str(signal_id) if signal_id is not None else None,
             "cash_balance": format(cash_before, "f"),
             "reference_price": format(reference_price, "f"),
         },
