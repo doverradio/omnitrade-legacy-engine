@@ -2,6 +2,7 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
 from app.api.routes.backtests import router as backtests_router
+from app.api.routes.decisions import router as decisions_router
 from app.api.routes.health import router as health_router
 from app.api.routes.markets import router as markets_router
 from app.api.routes.parameter_sets import router as parameter_sets_router
@@ -33,6 +34,7 @@ def create_app() -> FastAPI:
     app.include_router(backtests_router)
     app.include_router(paper_router)
     app.include_router(risk_router)
+    app.include_router(decisions_router)
 
     return app
 
