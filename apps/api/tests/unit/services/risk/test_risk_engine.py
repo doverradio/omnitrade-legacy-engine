@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import uuid
+from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 
 from app.services.risk import (
@@ -9,8 +10,10 @@ from app.services.risk import (
     RiskEvaluationRequest,
     compute_position_sizing,
     evaluate_signal_risk,
+    validate_no_trade_zone,
     validate_daily_loss_limit,
     validate_max_drawdown,
+    validate_strategy_asset_cooldown,
     validate_minimum_viable_order,
 )
 
@@ -265,3 +268,191 @@ def test_evaluate_signal_risk_rejects_when_drawdown_breached() -> None:
 
     assert result.action == RiskDecisionAction.REJECT
     assert result.reason_code == "max_drawdown_breached"
+
+
+def test_validate_strategy_asset_cooldown_activates_within_cooldown_window() -> None:
+    now = datetime(2026, 7, 6, 15, 0, tzinfo=timezone.utc)
+    result = validate_strategy_asset_cooldown(
+        consecutive_losses_on_pair=3,
+        cooldown_after_losses=3,
+        last_loss_at=now - timedelta(minutes=30),
+        cooldown_duration_minutes=Decimal("60"),
+        evaluation_time=now,
+    )
+
+    assert result.active is True
+    assert result.reason_code == "strategy_asset_cooldown_active"
+    assert result.remaining_minutes == Decimal("30")
+
+
+def test_validate_strategy_asset_cooldown_expires_after_duration() -> None:
+    now = datetime(2026, 7, 6, 15, 0, tzinfo=timezone.utc)
+    result = validate_strategy_asset_cooldown(
+        consecutive_losses_on_pair=3,
+        cooldown_after_losses=3,
+        last_loss_at=now - timedelta(minutes=61),
+        cooldown_duration_minutes=Decimal("60"),
+        evaluation_time=now,
+    )
+
+    assert result.active is False
+    assert result.reason_code is None
+    assert result.remaining_minutes == Decimal("0")
+
+
+def test_validate_strategy_asset_cooldown_rejects_invalid_timestamps() -> None:
+    now = datetime(2026, 7, 6, 15, 0, tzinfo=timezone.utc)
+    result = validate_strategy_asset_cooldown(
+        consecutive_losses_on_pair=3,
+        cooldown_after_losses=3,
+        last_loss_at=now + timedelta(minutes=1),
+        cooldown_duration_minutes=Decimal("60"),
+        evaluation_time=now,
+    )
+
+    assert result.active is False
+    assert result.reason_code == "invalid_cooldown_timestamps"
+
+
+def test_validate_no_trade_zone_flags_data_quality_gaps() -> None:
+    now = datetime(2026, 7, 6, 15, 0, tzinfo=timezone.utc)
+    result = validate_no_trade_zone(
+        evaluation_time=now,
+        session_open_time=None,
+        session_close_time=None,
+        no_trade_open_minutes=None,
+        no_trade_close_minutes=None,
+        data_is_stale=False,
+        data_has_gaps=True,
+    )
+
+    assert result.in_zone is True
+    assert result.reason_code == "asset_in_no_trade_zone_data_quality"
+
+
+def test_validate_no_trade_zone_flags_time_window() -> None:
+    session_open = datetime(2026, 7, 6, 13, 30, tzinfo=timezone.utc)
+    session_close = datetime(2026, 7, 6, 20, 0, tzinfo=timezone.utc)
+    evaluation_time = session_open + timedelta(minutes=10)
+    result = validate_no_trade_zone(
+        evaluation_time=evaluation_time,
+        session_open_time=session_open,
+        session_close_time=session_close,
+        no_trade_open_minutes=Decimal("15"),
+        no_trade_close_minutes=Decimal("10"),
+        data_is_stale=False,
+        data_has_gaps=False,
+    )
+
+    assert result.in_zone is True
+    assert result.reason_code == "asset_in_no_trade_zone_time_window"
+
+
+def test_validate_no_trade_zone_rejects_invalid_session_window() -> None:
+    now = datetime(2026, 7, 6, 15, 0, tzinfo=timezone.utc)
+    result = validate_no_trade_zone(
+        evaluation_time=now,
+        session_open_time=now,
+        session_close_time=now,
+        no_trade_open_minutes=Decimal("15"),
+        no_trade_close_minutes=Decimal("10"),
+        data_is_stale=False,
+        data_has_gaps=False,
+    )
+
+    assert result.in_zone is False
+    assert result.reason_code == "invalid_session_window"
+
+
+def test_evaluate_signal_risk_rejects_when_no_trade_zone_is_active() -> None:
+    session_open = datetime(2026, 7, 6, 13, 30, tzinfo=timezone.utc)
+    session_close = datetime(2026, 7, 6, 20, 0, tzinfo=timezone.utc)
+    request = RiskEvaluationRequest(
+        signal_id=uuid.uuid4(),
+        paper_account_id=uuid.uuid4(),
+        asset_id=uuid.uuid4(),
+        side="buy",
+        quantity=Decimal("0.5"),
+        account_equity=Decimal("100"),
+        max_position_size_pct=Decimal("0.05"),
+        min_order_notional=Decimal("1"),
+        qty_step_size=Decimal("0.01"),
+        supports_fractional=True,
+        start_of_day_equity=Decimal("100"),
+        current_equity=Decimal("100"),
+        max_daily_loss_pct=Decimal("0.03"),
+        high_water_mark_equity=Decimal("110"),
+        max_drawdown_pct=Decimal("0.15"),
+        evaluation_time=session_open + timedelta(minutes=5),
+        session_open_time=session_open,
+        session_close_time=session_close,
+        no_trade_open_minutes=Decimal("10"),
+        no_trade_close_minutes=Decimal("10"),
+    )
+
+    result = evaluate_signal_risk(request=request, reference_price=Decimal("10"))
+
+    assert result.action == RiskDecisionAction.REJECT
+    assert result.reason_code == "asset_in_no_trade_zone"
+
+
+def test_evaluate_signal_risk_rejects_when_cooldown_is_active() -> None:
+    now = datetime(2026, 7, 6, 15, 0, tzinfo=timezone.utc)
+    request = RiskEvaluationRequest(
+        signal_id=uuid.uuid4(),
+        paper_account_id=uuid.uuid4(),
+        asset_id=uuid.uuid4(),
+        side="buy",
+        quantity=Decimal("0.5"),
+        account_equity=Decimal("100"),
+        max_position_size_pct=Decimal("0.05"),
+        min_order_notional=Decimal("1"),
+        qty_step_size=Decimal("0.01"),
+        supports_fractional=True,
+        start_of_day_equity=Decimal("100"),
+        current_equity=Decimal("100"),
+        max_daily_loss_pct=Decimal("0.03"),
+        high_water_mark_equity=Decimal("110"),
+        max_drawdown_pct=Decimal("0.15"),
+        evaluation_time=now,
+        consecutive_losses_on_pair=3,
+        cooldown_after_losses=3,
+        last_loss_at=now - timedelta(minutes=15),
+        cooldown_duration_minutes=Decimal("60"),
+    )
+
+    result = evaluate_signal_risk(request=request, reference_price=Decimal("10"))
+
+    assert result.action == RiskDecisionAction.REJECT
+    assert result.reason_code == "strategy_asset_cooldown_active"
+
+
+def test_evaluate_signal_risk_rejects_invalid_cooldown_configuration() -> None:
+    now = datetime(2026, 7, 6, 15, 0, tzinfo=timezone.utc)
+    request = RiskEvaluationRequest(
+        signal_id=uuid.uuid4(),
+        paper_account_id=uuid.uuid4(),
+        asset_id=uuid.uuid4(),
+        side="buy",
+        quantity=Decimal("0.5"),
+        account_equity=Decimal("100"),
+        max_position_size_pct=Decimal("0.05"),
+        min_order_notional=Decimal("1"),
+        qty_step_size=Decimal("0.01"),
+        supports_fractional=True,
+        start_of_day_equity=Decimal("100"),
+        current_equity=Decimal("100"),
+        max_daily_loss_pct=Decimal("0.03"),
+        high_water_mark_equity=Decimal("110"),
+        max_drawdown_pct=Decimal("0.15"),
+        evaluation_time=now,
+        consecutive_losses_on_pair=3,
+        cooldown_after_losses=0,
+        last_loss_at=now - timedelta(minutes=15),
+        cooldown_duration_minutes=Decimal("60"),
+    )
+
+    result = evaluate_signal_risk(request=request, reference_price=Decimal("10"))
+
+    assert result.action == RiskDecisionAction.REJECT
+    assert result.reason_code == "invalid_cooldown_after_losses"

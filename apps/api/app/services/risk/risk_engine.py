@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import uuid
 from dataclasses import dataclass, field
+from datetime import datetime
 from decimal import ROUND_DOWN, Decimal
 from enum import Enum
 
@@ -29,6 +30,17 @@ class RiskEvaluationRequest:
     max_daily_loss_pct: Decimal | None = None
     high_water_mark_equity: Decimal | None = None
     max_drawdown_pct: Decimal | None = None
+    consecutive_losses_on_pair: int | None = None
+    cooldown_after_losses: int | None = None
+    last_loss_at: datetime | None = None
+    cooldown_duration_minutes: Decimal | None = None
+    evaluation_time: datetime | None = None
+    session_open_time: datetime | None = None
+    session_close_time: datetime | None = None
+    no_trade_open_minutes: Decimal | None = None
+    no_trade_close_minutes: Decimal | None = None
+    data_is_stale: bool | None = None
+    data_has_gaps: bool | None = None
     actor: str = "system"
     ai_confidence: Decimal | None = None
 
@@ -76,6 +88,19 @@ class DrawdownValidationResult:
     breached: bool
     drawdown_pct: Decimal | None
     threshold_pct: Decimal | None
+    reason_code: str | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class CooldownValidationResult:
+    active: bool
+    remaining_minutes: Decimal | None
+    reason_code: str | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class NoTradeZoneValidationResult:
+    in_zone: bool
     reason_code: str | None = None
 
 
@@ -251,6 +276,84 @@ def validate_max_drawdown(
     )
 
 
+def validate_strategy_asset_cooldown(
+    *,
+    consecutive_losses_on_pair: int,
+    cooldown_after_losses: int,
+    last_loss_at: datetime,
+    cooldown_duration_minutes: Decimal,
+    evaluation_time: datetime,
+) -> CooldownValidationResult:
+    if consecutive_losses_on_pair < 0:
+        return CooldownValidationResult(active=False, remaining_minutes=None, reason_code="invalid_consecutive_losses")
+
+    if cooldown_after_losses <= 0:
+        return CooldownValidationResult(active=False, remaining_minutes=None, reason_code="invalid_cooldown_after_losses")
+
+    if cooldown_duration_minutes <= 0:
+        return CooldownValidationResult(active=False, remaining_minutes=None, reason_code="invalid_cooldown_duration_minutes")
+
+    if consecutive_losses_on_pair < cooldown_after_losses:
+        return CooldownValidationResult(active=False, remaining_minutes=Decimal("0"), reason_code=None)
+
+    elapsed_minutes = Decimal(str((evaluation_time - last_loss_at).total_seconds())) / Decimal("60")
+    if elapsed_minutes < 0:
+        return CooldownValidationResult(active=False, remaining_minutes=None, reason_code="invalid_cooldown_timestamps")
+
+    remaining_minutes = cooldown_duration_minutes - elapsed_minutes
+    if remaining_minutes > 0:
+        return CooldownValidationResult(
+            active=True,
+            remaining_minutes=remaining_minutes,
+            reason_code="strategy_asset_cooldown_active",
+        )
+
+    return CooldownValidationResult(active=False, remaining_minutes=Decimal("0"), reason_code=None)
+
+
+def validate_no_trade_zone(
+    *,
+    evaluation_time: datetime,
+    session_open_time: datetime | None,
+    session_close_time: datetime | None,
+    no_trade_open_minutes: Decimal | None,
+    no_trade_close_minutes: Decimal | None,
+    data_is_stale: bool,
+    data_has_gaps: bool,
+) -> NoTradeZoneValidationResult:
+    if data_is_stale or data_has_gaps:
+        return NoTradeZoneValidationResult(in_zone=True, reason_code="asset_in_no_trade_zone_data_quality")
+
+    has_time_guardrails = (no_trade_open_minutes is not None and no_trade_open_minutes > 0) or (
+        no_trade_close_minutes is not None and no_trade_close_minutes > 0
+    )
+    if not has_time_guardrails:
+        return NoTradeZoneValidationResult(in_zone=False, reason_code=None)
+
+    if session_open_time is None or session_close_time is None:
+        return NoTradeZoneValidationResult(in_zone=False, reason_code="invalid_session_window")
+
+    if session_close_time <= session_open_time:
+        return NoTradeZoneValidationResult(in_zone=False, reason_code="invalid_session_window")
+
+    if no_trade_open_minutes is not None and no_trade_open_minutes < 0:
+        return NoTradeZoneValidationResult(in_zone=False, reason_code="invalid_no_trade_open_minutes")
+
+    if no_trade_close_minutes is not None and no_trade_close_minutes < 0:
+        return NoTradeZoneValidationResult(in_zone=False, reason_code="invalid_no_trade_close_minutes")
+
+    minutes_since_open = Decimal(str((evaluation_time - session_open_time).total_seconds())) / Decimal("60")
+    minutes_until_close = Decimal(str((session_close_time - evaluation_time).total_seconds())) / Decimal("60")
+
+    if no_trade_open_minutes is not None and no_trade_open_minutes > 0 and minutes_since_open >= 0 and minutes_since_open < no_trade_open_minutes:
+        return NoTradeZoneValidationResult(in_zone=True, reason_code="asset_in_no_trade_zone_time_window")
+
+    if no_trade_close_minutes is not None and no_trade_close_minutes > 0 and minutes_until_close >= 0 and minutes_until_close < no_trade_close_minutes:
+        return NoTradeZoneValidationResult(in_zone=True, reason_code="asset_in_no_trade_zone_time_window")
+
+    return NoTradeZoneValidationResult(in_zone=False, reason_code=None)
+
+
 def evaluate_signal_risk(
     *,
     request: RiskEvaluationRequest,
@@ -285,8 +388,40 @@ def evaluate_signal_risk(
             steps=steps,
         )
 
-    steps.append(RiskEvaluationStep(step="no_trade_zone", status="reject" if resolved_context.asset_in_no_trade_zone else "pass", reason_code="asset_in_no_trade_zone" if resolved_context.asset_in_no_trade_zone else None))
-    if resolved_context.asset_in_no_trade_zone:
+    asset_in_no_trade_zone = resolved_context.asset_in_no_trade_zone
+    if (
+        request.evaluation_time is not None
+        and (
+            request.data_is_stale is not None
+            or request.data_has_gaps is not None
+            or request.no_trade_open_minutes is not None
+            or request.no_trade_close_minutes is not None
+        )
+    ):
+        no_trade_result = validate_no_trade_zone(
+            evaluation_time=request.evaluation_time,
+            session_open_time=request.session_open_time,
+            session_close_time=request.session_close_time,
+            no_trade_open_minutes=request.no_trade_open_minutes,
+            no_trade_close_minutes=request.no_trade_close_minutes,
+            data_is_stale=bool(request.data_is_stale),
+            data_has_gaps=bool(request.data_has_gaps),
+        )
+        if no_trade_result.reason_code in {
+            "invalid_session_window",
+            "invalid_no_trade_open_minutes",
+            "invalid_no_trade_close_minutes",
+        }:
+            return RiskEvaluationResult(
+                action=RiskDecisionAction.REJECT,
+                reason_code=no_trade_result.reason_code,
+                approved_quantity=Decimal("0"),
+                steps=steps,
+            )
+        asset_in_no_trade_zone = no_trade_result.in_zone
+
+    steps.append(RiskEvaluationStep(step="no_trade_zone", status="reject" if asset_in_no_trade_zone else "pass", reason_code="asset_in_no_trade_zone" if asset_in_no_trade_zone else None))
+    if asset_in_no_trade_zone:
         return RiskEvaluationResult(
             action=RiskDecisionAction.REJECT,
             reason_code="asset_in_no_trade_zone",
@@ -294,8 +429,37 @@ def evaluate_signal_risk(
             steps=steps,
         )
 
-    steps.append(RiskEvaluationStep(step="cooldown", status="reject" if resolved_context.pair_in_cooldown else "pass", reason_code="strategy_asset_cooldown_active" if resolved_context.pair_in_cooldown else None))
-    if resolved_context.pair_in_cooldown:
+    pair_in_cooldown = resolved_context.pair_in_cooldown
+    if (
+        request.consecutive_losses_on_pair is not None
+        and request.cooldown_after_losses is not None
+        and request.last_loss_at is not None
+        and request.cooldown_duration_minutes is not None
+        and request.evaluation_time is not None
+    ):
+        cooldown_result = validate_strategy_asset_cooldown(
+            consecutive_losses_on_pair=request.consecutive_losses_on_pair,
+            cooldown_after_losses=request.cooldown_after_losses,
+            last_loss_at=request.last_loss_at,
+            cooldown_duration_minutes=request.cooldown_duration_minutes,
+            evaluation_time=request.evaluation_time,
+        )
+        if cooldown_result.reason_code in {
+            "invalid_consecutive_losses",
+            "invalid_cooldown_after_losses",
+            "invalid_cooldown_duration_minutes",
+            "invalid_cooldown_timestamps",
+        }:
+            return RiskEvaluationResult(
+                action=RiskDecisionAction.REJECT,
+                reason_code=cooldown_result.reason_code,
+                approved_quantity=Decimal("0"),
+                steps=steps,
+            )
+        pair_in_cooldown = cooldown_result.active
+
+    steps.append(RiskEvaluationStep(step="cooldown", status="reject" if pair_in_cooldown else "pass", reason_code="strategy_asset_cooldown_active" if pair_in_cooldown else None))
+    if pair_in_cooldown:
         return RiskEvaluationResult(
             action=RiskDecisionAction.REJECT,
             reason_code="strategy_asset_cooldown_active",
