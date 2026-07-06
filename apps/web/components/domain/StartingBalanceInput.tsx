@@ -4,6 +4,7 @@ type StartingBalanceInputProps = {
   onChange: (nextValue: string) => void;
   min?: number;
   disabled?: boolean;
+  label?: string;
 };
 
 const PRESET_VALUES = [25, 50, 100, 250, 500, 1000] as const;
@@ -14,6 +15,7 @@ export default function StartingBalanceInput({
   onChange,
   min = 25,
   disabled = false,
+  label = "Backtest Starting Capital",
 }: StartingBalanceInputProps) {
   return (
     <div className="space-y-3">
@@ -42,7 +44,7 @@ export default function StartingBalanceInput({
       </div>
 
       <label htmlFor={id} className="flex flex-col gap-1 text-sm text-foreground/90">
-        <span>Backtest Starting Capital</span>
+        <span>{label}</span>
         <input
           id={id}
           type="number"
