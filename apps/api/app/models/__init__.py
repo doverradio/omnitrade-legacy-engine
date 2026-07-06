@@ -3,6 +3,8 @@ from app.models.audit_log import AuditLog
 from app.models.backtest import Backtest
 from app.models.backtest_trade import BacktestTrade
 from app.models.candle import Candle
+from app.models.decision_record import DecisionRecord
+from app.models.decision_snapshot import DecisionSnapshot
 from app.models.parameter_set import ParameterSet
 from app.models.paper_account import PaperAccount
 from app.models.risk_event import RiskEvent
@@ -17,6 +19,8 @@ __all__ = [
 	"Backtest",
 	"BacktestTrade",
 	"Candle",
+	"DecisionRecord",
+	"DecisionSnapshot",
 	"PaperAccount",
 	"ParameterSet",
 	"RiskEvent",
