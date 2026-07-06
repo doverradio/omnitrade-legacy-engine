@@ -45,6 +45,11 @@ class ForbiddenError(AppError):
     code = "forbidden"
 
 
+class ServiceUnavailableError(AppError):
+    status_code = 503
+    code = "service_unavailable"
+
+
 def _error_response(status_code: int, code: str, message: str, details: Mapping[str, Any]) -> JSONResponse:
     return JSONResponse(
         status_code=status_code,

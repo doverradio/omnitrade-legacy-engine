@@ -6,6 +6,7 @@ from app.api.routes.health import router as health_router
 from app.api.routes.markets import router as markets_router
 from app.api.routes.parameter_sets import router as parameter_sets_router
 from app.api.routes.paper import router as paper_router
+from app.api.routes.risk import router as risk_router
 from app.api.routes.strategies import router as strategies_router
 from app.core.errors import register_error_handlers
 from app.core.logging import setup_logging
@@ -31,6 +32,7 @@ def create_app() -> FastAPI:
     app.include_router(parameter_sets_router)
     app.include_router(backtests_router)
     app.include_router(paper_router)
+    app.include_router(risk_router)
 
     return app
 
