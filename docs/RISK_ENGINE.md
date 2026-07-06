@@ -6,6 +6,8 @@
 
 The risk engine is the **mandatory final gate** for every signal before it can become a trade — rules-based strategy signals and AI-adjusted signals alike (see `SYSTEM_ARCHITECTURE.md` §3, `AI_LAYER.md` §3). It can approve, resize, delay, or reject any signal, and can trip account-level or global kill switches. No other component may bypass it.
 
+Execution idempotency note: duplicate signal-execution requests are handled by a pre-risk duplicate guard in orchestration. A duplicate request is not treated as a new execution attempt, does not invoke a second risk evaluation, does not submit a new trade, and does not create a duplicate `risk_events` record. Duplicate handling remains auditable.
+
 Every risk decision is written to `risk_events` (see `DATABASE_SCHEMA.md` §2.11) and `audit_log`.
 
 ### 2. Controls

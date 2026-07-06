@@ -126,13 +126,14 @@ See `DATABASE_SCHEMA.md`. Single source of truth for assets, candles, strategies
 1. Scheduler triggers the strategy runner for an active strategy on a schedule (e.g., every closed 15m candle).
 2. Strategy engine computes indicators and emits a raw `Signal` (buy/sell/hold + strength).
 3. AI layer scores the signal's confidence and tags the current market regime; writes an explanation.
-4. Risk engine evaluates the (strategy signal + AI score) against account state, position limits, drawdown limits, and cooldown state.
-5. The Decision Intelligence Engine records a Decision Record capturing the market context, evidence, confidence, and risk engine outcome from steps 2–4 — regardless of whether the risk engine approved, resized, or rejected the signal (see `DECISION_INTELLIGENCE_ENGINE.md` §3).
-6. If approved, the paper execution engine places a simulated/paper order and records a `trade` row; the DIE's Decision Record is linked to this trade for later outcome tracking.
-7. All of steps 2–6 write to `audit_log` and (for AI steps) `model_outputs`.
-8. Frontend polls/subscribes to updated account, trade, and signal data to update the dashboard.
-9. (Asynchronous, later) Once a position is closed, outcome data, post-trade review findings, and eventually AI reflection are appended to the same Decision Record.
-10. (Asynchronous, parallel to steps 6–9, future phase) The Counterfactual Outcome Ledger spawns shadow BUY/SELL/WAIT outcomes for the decision at step 5, independent of whether execution happened, and background jobs revisit them at fixed horizons to compute hindsight-best action and lesson tags (`DECISION_INTELLIGENCE_ENGINE.md` §8).
+4. Execution orchestration performs duplicate/idempotency detection first. If the signal was already executed for the account, orchestration short-circuits as a duplicate, writes duplicate audit evidence, and does not create a new risk decision.
+5. For non-duplicate attempts, the risk engine evaluates the (strategy signal + AI score) against account state, position limits, drawdown limits, and cooldown state.
+6. The Decision Intelligence Engine records a Decision Record capturing the market context, evidence, confidence, and risk engine outcome from steps 2–5 — regardless of whether the risk engine approved, resized, or rejected the signal (see `DECISION_INTELLIGENCE_ENGINE.md` §3).
+7. If approved, the paper execution engine places a simulated/paper order and records a `trade` row; the DIE's Decision Record is linked to this trade for later outcome tracking.
+8. All of steps 2–7 write to `audit_log` and (for AI steps) `model_outputs`.
+9. Frontend polls/subscribes to updated account, trade, and signal data to update the dashboard.
+10. (Asynchronous, later) Once a position is closed, outcome data, post-trade review findings, and eventually AI reflection are appended to the same Decision Record.
+11. (Asynchronous, parallel to steps 7–10, future phase) The Counterfactual Outcome Ledger spawns shadow BUY/SELL/WAIT outcomes for the decision at step 6, independent of whether execution happened, and background jobs revisit them at fixed horizons to compute hindsight-best action and lesson tags (`DECISION_INTELLIGENCE_ENGINE.md` §8).
 
 ### 4. Environments
 

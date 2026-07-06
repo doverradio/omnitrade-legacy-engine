@@ -146,7 +146,7 @@ class _FakeSession:
 
 
 @pytest.mark.asyncio
-async def test_orchestrator_prevents_duplicate_signal_execution() -> None:
+async def test_orchestrator_prevents_duplicate_signal_execution(monkeypatch: pytest.MonkeyPatch) -> None:
     now = datetime(2026, 7, 6, tzinfo=timezone.utc)
     signal_id = uuid.uuid4()
     account = PaperAccount(
@@ -183,6 +183,28 @@ async def test_orchestrator_prevents_duplicate_signal_execution() -> None:
     )
     session = _FakeSession(accounts=[account], assets=[asset], trades=[existing_trade])
 
+    import app.services.signals.execution_orchestrator as orchestrator_module
+
+    evaluate_calls = {"count": 0}
+    persist_calls = {"count": 0}
+    adapter_calls = {"count": 0}
+
+    def fake_evaluate_signal_risk(*args, **kwargs):
+        evaluate_calls["count"] += 1
+        raise AssertionError("Risk engine must not run for duplicate requests")
+
+    async def fake_persist_risk_decision(*args, **kwargs):
+        persist_calls["count"] += 1
+        raise AssertionError("Risk persistence must not run for duplicate requests")
+
+    async def fake_execute_internal_crypto_fill(*args, **kwargs):
+        adapter_calls["count"] += 1
+        raise AssertionError("Execution adapter must not run for duplicate requests")
+
+    monkeypatch.setattr(orchestrator_module, "evaluate_signal_risk", fake_evaluate_signal_risk)
+    monkeypatch.setattr(orchestrator_module, "persist_risk_decision", fake_persist_risk_decision)
+    monkeypatch.setattr(orchestrator_module, "execute_internal_crypto_fill", fake_execute_internal_crypto_fill)
+
     result = await orchestrate_paper_signal_execution(
         db=session,
         request=SignalExecutionRequest(
@@ -196,6 +218,10 @@ async def test_orchestrator_prevents_duplicate_signal_execution() -> None:
 
     assert result.execution_status == "duplicate"
     assert result.trade_id == existing_trade.id
+    assert evaluate_calls["count"] == 0
+    assert persist_calls["count"] == 0
+    assert adapter_calls["count"] == 0
+    assert len(session.risk_events) == 0
     assert any(audit.action == "signal_execution_duplicate_skipped" for audit in session.audit_logs)
 
 

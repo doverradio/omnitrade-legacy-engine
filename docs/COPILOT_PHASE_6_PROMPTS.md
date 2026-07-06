@@ -251,6 +251,12 @@ Exact scope:
 - Enforce short-circuit behavior on risk rejection and deterministic status transitions.
 - Ensure paper-only execution remains intact and no bypass path exists.
 
+Policy clarification (applies to this prompt and downstream verification):
+- Duplicate/idempotent execution detection is a pre-risk safety guard in orchestration.
+- A duplicate request is not a new execution attempt and does not require a second risk evaluation.
+- Duplicate requests must not submit trades and must not create duplicate risk-event records.
+- Duplicate outcomes must remain auditable.
+
 Explicit exclusions:
 - No Decision Intelligence runtime work.
 - No Risk Monitor UI in this prompt.
