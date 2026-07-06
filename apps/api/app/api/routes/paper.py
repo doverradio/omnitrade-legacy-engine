@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import logging
 import uuid
-from datetime import datetime, timezone
 from decimal import Decimal
 
 from fastapi import APIRouter, Depends, Query
@@ -17,7 +16,6 @@ from app.models.audit_log import AuditLog
 from app.models.paper_account import PaperAccount
 from app.models.trade import Trade
 from app.schemas.paper import (
-    AlpacaPaperOrderResponse,
     CreatePaperAccountRequest,
     CreatePaperAccountResponse,
     ExecuteSignalRequest,
@@ -26,11 +24,8 @@ from app.schemas.paper import (
     PositionResponse,
     ResetPaperAccountRequest,
     ResetPaperAccountResponse,
-    SubmitAlpacaPaperOrderRequest,
 )
-from app.services.data.http_client import AsyncHTTPClient
 from app.services.paper.accounting import build_account_snapshot
-from app.services.paper.alpaca_paper import get_alpaca_paper_order, submit_alpaca_paper_order
 from app.services.signals.execution_orchestrator import (
     SignalExecutionRequest,
     orchestrate_paper_signal_execution,
@@ -136,155 +131,6 @@ async def reset_paper_account(
     )
 
 
-@router.post("/orders/alpaca", response_model=AlpacaPaperOrderResponse, status_code=201)
-async def submit_stock_paper_order(
-    payload: SubmitAlpacaPaperOrderRequest,
-    db: AsyncSession = Depends(get_db),
-) -> AlpacaPaperOrderResponse:
-    account = await _load_account(db=db, account_id=payload.account_id)
-    asset = await db.scalar(select(Asset).where(Asset.id == payload.asset_id))
-    if asset is None:
-        raise NotFoundError(message="Asset not found", details={"asset_id": str(payload.asset_id)})
-
-    if account.asset_class != "stock" or asset.asset_class != "stock":
-        raise InvalidRequestError(message="Alpaca paper orders are supported for stocks only", details={})
-
-    if asset.exchange != "alpaca":
-        raise InvalidRequestError(message="Asset exchange must be alpaca for Alpaca paper orders", details={"exchange": asset.exchange})
-
-    if payload.quantity <= 0:
-        raise InvalidRequestError(
-            message="Quantity must be positive",
-            details={"quantity": format(payload.quantity, "f")},
-        )
-
-    if not asset.supports_fractional and payload.quantity != payload.quantity.to_integral_value():
-        raise InvalidRequestError(
-            message="Asset does not support fractional quantity",
-            details={"asset_id": str(asset.id), "quantity": format(payload.quantity, "f")},
-        )
-
-    settings = get_settings()
-    async with AsyncHTTPClient() as client:
-        result = await submit_alpaca_paper_order(
-            settings=settings,
-            client=client,
-            symbol=asset.symbol,
-            side=payload.side,
-            quantity=payload.quantity,
-            client_order_id=payload.client_order_id,
-        )
-
-    executed_quantity = result.filled_qty
-    if executed_quantity > 0 and result.filled_avg_price is not None:
-        trade = Trade(
-            paper_account_id=account.id,
-            asset_id=asset.id,
-            side=result.side,
-            quantity=executed_quantity,
-            price=result.filled_avg_price,
-            fee=Decimal("0"),
-            is_paper=True,
-            execution_venue="alpaca_paper",
-            executed_at=_parse_iso_timestamp(result.filled_at) or datetime.now(timezone.utc),
-        )
-        db.add(trade)
-        await db.commit()
-
-    audit_entry = AuditLog(
-        actor="system",
-        action="paper_trade_submitted",
-        entity_type="paper_account",
-        entity_id=account.id,
-        before_state={
-            "account_id": str(account.id),
-            "asset_id": str(asset.id),
-            "quantity": format(payload.quantity, "f"),
-        },
-        after_state={
-            "broker_order_id": result.broker_order_id,
-            "status": result.status,
-            "execution_venue": result.execution_venue,
-            "is_paper": result.is_paper,
-            "filled_quantity": format(result.filled_qty, "f"),
-        },
-    )
-    db.add(audit_entry)
-    await db.commit()
-
-    logger.info(
-        "Submitted Alpaca paper order: broker_order_id=%s account_id=%s asset_id=%s status=%s",
-        result.broker_order_id,
-        account.id,
-        asset.id,
-        result.status,
-    )
-
-    return AlpacaPaperOrderResponse(
-        broker_order_id=result.broker_order_id,
-        account_id=account.id,
-        asset_id=asset.id,
-        status=result.status,
-        symbol=result.symbol,
-        side=result.side,
-        type=result.type,
-        time_in_force=result.time_in_force,
-        quantity=result.qty,
-        filled_quantity=result.filled_qty,
-        filled_avg_price=result.filled_avg_price,
-        submitted_at=result.submitted_at,
-        filled_at=result.filled_at,
-        execution_venue=result.execution_venue,
-        is_paper=result.is_paper,
-    )
-
-
-@router.get("/orders/alpaca/{broker_order_id}", response_model=AlpacaPaperOrderResponse)
-async def get_stock_paper_order_status(
-    broker_order_id: str,
-    account_id: uuid.UUID,
-    asset_id: uuid.UUID,
-    db: AsyncSession = Depends(get_db),
-) -> AlpacaPaperOrderResponse:
-    account = await _load_account(db=db, account_id=account_id)
-    asset = await db.scalar(select(Asset).where(Asset.id == asset_id))
-    if asset is None:
-        raise NotFoundError(message="Asset not found", details={"asset_id": str(asset_id)})
-
-    settings = get_settings()
-    async with AsyncHTTPClient() as client:
-        result = await get_alpaca_paper_order(
-            settings=settings,
-            client=client,
-            broker_order_id=broker_order_id,
-        )
-
-    logger.info(
-        "Fetched Alpaca paper order status: broker_order_id=%s account_id=%s status=%s",
-        broker_order_id,
-        account.id,
-        result.status,
-    )
-
-    return AlpacaPaperOrderResponse(
-        broker_order_id=result.broker_order_id,
-        account_id=account.id,
-        asset_id=asset.id,
-        status=result.status,
-        symbol=result.symbol,
-        side=result.side,
-        type=result.type,
-        time_in_force=result.time_in_force,
-        quantity=result.qty,
-        filled_quantity=result.filled_qty,
-        filled_avg_price=result.filled_avg_price,
-        submitted_at=result.submitted_at,
-        filled_at=result.filled_at,
-        execution_venue=result.execution_venue,
-        is_paper=result.is_paper,
-    )
-
-
 @router.post("/signals/execute", response_model=ExecuteSignalResponse)
 async def execute_signal_paper_only(
     payload: ExecuteSignalRequest,
@@ -334,13 +180,3 @@ async def _load_account(*, db: AsyncSession, account_id: uuid.UUID | None) -> Pa
         raise NotFoundError(message="Paper account not found", details={})
 
     return account
-
-
-def _parse_iso_timestamp(raw_value: str | None) -> datetime | None:
-    if raw_value is None:
-        return None
-    value = raw_value.replace("Z", "+00:00")
-    try:
-        return datetime.fromisoformat(value)
-    except ValueError:
-        return None

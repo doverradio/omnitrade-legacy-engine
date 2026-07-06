@@ -103,6 +103,9 @@ class _FakeSession:
     async def refresh(self, obj: Any) -> None:
         return None
 
+    async def flush(self) -> None:
+        return None
+
 
 @pytest.mark.asyncio
 async def test_orchestrator_prevents_duplicate_signal_execution() -> None:
@@ -155,6 +158,7 @@ async def test_orchestrator_prevents_duplicate_signal_execution() -> None:
 
     assert result.execution_status == "duplicate"
     assert result.trade_id == existing_trade.id
+    assert any(audit.action == "signal_execution_duplicate_skipped" for audit in session.audit_logs)
 
 
 @pytest.mark.asyncio
@@ -192,6 +196,8 @@ async def test_orchestrator_rejects_stock_to_internal_sim_path() -> None:
                 quantity=Decimal("0.5"),
             ),
         )
+
+    assert any(audit.action == "signal_execution_failed" for audit in session.audit_logs)
 
 
 @pytest.mark.asyncio
@@ -260,3 +266,44 @@ async def test_orchestrator_routes_stock_to_alpaca(monkeypatch: pytest.MonkeyPat
     assert result.execution_status == "executed"
     assert result.is_paper is True
     assert result.broker_order_id == "broker-order-1"
+    assert len(session.trades) == 1
+    assert session.trades[0].signal_id is not None
+    assert any(audit.action == "signal_execution_orchestrated" for audit in session.audit_logs)
+
+
+@pytest.mark.asyncio
+async def test_orchestrator_audits_failure_for_invalid_side() -> None:
+    now = datetime(2026, 7, 6, tzinfo=timezone.utc)
+    account = PaperAccount(
+        id=uuid.uuid4(),
+        owner_user_id=uuid.uuid4(),
+        name="Family Crypto",
+        asset_class="crypto",
+        starting_balance=Decimal("25"),
+        current_cash_balance=Decimal("25"),
+        is_active=True,
+        created_at=now,
+    )
+    asset = Asset(
+        id=uuid.uuid4(),
+        symbol="BTCUSDT",
+        asset_class="crypto",
+        exchange="binance_us",
+        supports_fractional=True,
+        is_active=True,
+    )
+    session = _FakeSession(accounts=[account], assets=[asset], trades=[])
+
+    with pytest.raises(InvalidRequestError):
+        await orchestrate_paper_signal_execution(
+            db=session,
+            request=SignalExecutionRequest(
+                signal_id=uuid.uuid4(),
+                paper_account_id=account.id,
+                asset_id=asset.id,
+                side="hold",
+                quantity=Decimal("0.1"),
+            ),
+        )
+
+    assert any(audit.action == "signal_execution_failed" for audit in session.audit_logs)

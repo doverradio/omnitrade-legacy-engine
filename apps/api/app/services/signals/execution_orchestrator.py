@@ -9,7 +9,7 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import get_settings
-from app.core.errors import InvalidRequestError, NotFoundError
+from app.core.errors import AppError, InvalidRequestError, NotFoundError
 from app.models.asset import Asset
 from app.models.audit_log import AuditLog
 from app.models.paper_account import PaperAccount
@@ -74,6 +74,12 @@ async def orchestrate_paper_signal_execution(
     request: SignalExecutionRequest,
 ) -> SignalExecutionResult:
     if request.side not in {"buy", "sell"}:
+        await _audit_signal_execution_failure(
+            db=db,
+            request=request,
+            reason="Invalid side",
+            details={"side": request.side},
+        )
         raise InvalidRequestError(message="Invalid side", details={"side": request.side})
 
     existing_trade = await db.scalar(
@@ -117,6 +123,12 @@ async def orchestrate_paper_signal_execution(
 
     account = await db.scalar(select(PaperAccount).where(PaperAccount.id == request.paper_account_id))
     if account is None:
+        await _audit_signal_execution_failure(
+            db=db,
+            request=request,
+            reason="Paper account not found",
+            details={"paper_account_id": str(request.paper_account_id)},
+        )
         raise NotFoundError(
             message="Paper account not found",
             details={"paper_account_id": str(request.paper_account_id)},
@@ -124,45 +136,48 @@ async def orchestrate_paper_signal_execution(
 
     asset = await db.scalar(select(Asset).where(Asset.id == request.asset_id))
     if asset is None:
+        await _audit_signal_execution_failure(
+            db=db,
+            request=request,
+            reason="Asset not found",
+            details={"asset_id": str(request.asset_id)},
+        )
         raise NotFoundError(message="Asset not found", details={"asset_id": str(request.asset_id)})
 
     if asset.asset_class == "crypto":
         if account.asset_class != "crypto":
+            details = {"paper_account_id": str(account.id), "asset_class": account.asset_class}
+            await _audit_signal_execution_failure(
+                db=db,
+                request=request,
+                reason="Crypto signal cannot execute on non-crypto paper account",
+                details=details,
+                asset=asset,
+            )
             raise InvalidRequestError(
                 message="Crypto signal cannot execute on non-crypto paper account",
-                details={"paper_account_id": str(account.id), "asset_class": account.asset_class},
+                details=details,
             )
 
-        fill = await execute_internal_crypto_fill(
-            db=db,
-            paper_account_id=request.paper_account_id,
-            asset_id=request.asset_id,
-            side=request.side,
-            quantity=request.quantity,
-            actor=request.actor,
-            signal_id=request.signal_id,
-        )
-
-        signal_audit = AuditLog(
-            actor=request.actor,
-            action="signal_execution_orchestrated",
-            entity_type="signal",
-            entity_id=request.signal_id,
-            before_state={
-                "asset_class": asset.asset_class,
-                "paper_account_id": str(request.paper_account_id),
-                "asset_id": str(request.asset_id),
-                "quantity": format(request.quantity, "f"),
-            },
-            after_state={
-                "execution_venue": "internal_sim",
-                "execution_status": "executed",
-                "trade_id": str(fill.trade_id),
-                "is_paper": True,
-            },
-        )
-        db.add(signal_audit)
-        await db.commit()
+        try:
+            fill = await execute_internal_crypto_fill(
+                db=db,
+                paper_account_id=request.paper_account_id,
+                asset_id=request.asset_id,
+                side=request.side,
+                quantity=request.quantity,
+                actor=request.actor,
+                signal_id=request.signal_id,
+            )
+        except AppError as exc:
+            await _audit_signal_execution_failure(
+                db=db,
+                request=request,
+                reason=exc.message,
+                details=exc.details,
+                asset=asset,
+            )
+            raise
 
         return SignalExecutionResult(
             signal_id=request.signal_id,
@@ -179,35 +194,69 @@ async def orchestrate_paper_signal_execution(
 
     if asset.asset_class == "stock":
         if account.asset_class != "stock":
+            details = {"paper_account_id": str(account.id), "asset_class": account.asset_class}
+            await _audit_signal_execution_failure(
+                db=db,
+                request=request,
+                reason="Stock signal cannot execute on non-stock paper account",
+                details=details,
+                asset=asset,
+            )
             raise InvalidRequestError(
                 message="Stock signal cannot execute on non-stock paper account",
-                details={"paper_account_id": str(account.id), "asset_class": account.asset_class},
+                details=details,
             )
 
         if asset.exchange != "alpaca":
+            details = {"exchange": asset.exchange}
+            await _audit_signal_execution_failure(
+                db=db,
+                request=request,
+                reason="Stock execution requires Alpaca exchange asset",
+                details=details,
+                asset=asset,
+            )
             raise InvalidRequestError(
                 message="Stock execution requires Alpaca exchange asset",
-                details={"exchange": asset.exchange},
+                details=details,
             )
 
         if not asset.supports_fractional and request.quantity != request.quantity.to_integral_value():
+            details = {"asset_id": str(asset.id), "quantity": format(request.quantity, "f")}
+            await _audit_signal_execution_failure(
+                db=db,
+                request=request,
+                reason="Asset does not support fractional quantity",
+                details=details,
+                asset=asset,
+            )
             raise InvalidRequestError(
                 message="Asset does not support fractional quantity",
-                details={"asset_id": str(asset.id), "quantity": format(request.quantity, "f")},
+                details=details,
             )
 
-        settings = get_settings()
-        async with AsyncHTTPClient() as client:
-            venue_result = await submit_alpaca_paper_order(
-                settings=settings,
-                client=client,
-                symbol=asset.symbol,
-                side=request.side,
-                quantity=request.quantity,
-                client_order_id=request.client_order_id,
+        try:
+            settings = get_settings()
+            async with AsyncHTTPClient() as client:
+                venue_result = await submit_alpaca_paper_order(
+                    settings=settings,
+                    client=client,
+                    symbol=asset.symbol,
+                    side=request.side,
+                    quantity=request.quantity,
+                    client_order_id=request.client_order_id,
+                )
+        except AppError as exc:
+            await _audit_signal_execution_failure(
+                db=db,
+                request=request,
+                reason=exc.message,
+                details=exc.details,
+                asset=asset,
             )
+            raise
 
-        trade_id: uuid.UUID | None = None
+        trade: Trade | None = None
         if venue_result.filled_qty > 0 and venue_result.filled_avg_price is not None:
             trade = Trade(
                 paper_account_id=request.paper_account_id,
@@ -222,9 +271,10 @@ async def orchestrate_paper_signal_execution(
                 executed_at=_parse_iso_timestamp(venue_result.filled_at) or datetime.now(timezone.utc),
             )
             db.add(trade)
-            await db.commit()
-            await db.refresh(trade)
-            trade_id = trade.id
+            if hasattr(db, "flush"):
+                await db.flush()
+
+        trade_id = trade.id if trade is not None else None
 
         mapped_status = _map_common_execution_status(
             venue="alpaca_paper",
@@ -255,6 +305,9 @@ async def orchestrate_paper_signal_execution(
         db.add(signal_audit)
         await db.commit()
 
+        if trade is not None and hasattr(db, "refresh"):
+            await db.refresh(trade)
+
         return SignalExecutionResult(
             signal_id=request.signal_id,
             paper_account_id=request.paper_account_id,
@@ -272,6 +325,36 @@ async def orchestrate_paper_signal_execution(
         message="Unsupported asset class for paper execution orchestration",
         details={"asset_class": asset.asset_class},
     )
+
+
+async def _audit_signal_execution_failure(
+    *,
+    db: AsyncSession,
+    request: SignalExecutionRequest,
+    reason: str,
+    details: dict[str, str | int | float | bool | None] | None,
+    asset: Asset | None = None,
+) -> None:
+    failure_audit = AuditLog(
+        actor=request.actor,
+        action="signal_execution_failed",
+        entity_type="signal",
+        entity_id=request.signal_id,
+        before_state={
+            "paper_account_id": str(request.paper_account_id),
+            "asset_id": str(request.asset_id),
+            "asset_class": asset.asset_class if asset is not None else None,
+            "side": request.side,
+            "quantity": format(request.quantity, "f"),
+        },
+        after_state={
+            "reason": reason,
+            "details": details or {},
+            "is_paper": True,
+        },
+    )
+    db.add(failure_audit)
+    await db.commit()
 
 
 def _parse_iso_timestamp(raw_value: str | None) -> datetime | None:
