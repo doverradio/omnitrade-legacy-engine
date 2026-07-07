@@ -24,6 +24,8 @@ from app.models.decision_quality_score import DecisionQualityScore
 from app.models.decision_record import DecisionRecord
 from app.models.decision_snapshot import DecisionSnapshot
 from app.models.model_output import ModelOutput
+from app.models.live_trading_event import LiveTradingEvent
+from app.models.live_trading_profile import LiveTradingProfile
 from app.models.parameter_set import ParameterSet
 from app.models.paper_account import PaperAccount
 from app.models.risk_event import RiskEvent
@@ -60,6 +62,8 @@ __all__ = [
 	"DecisionRecord",
 	"DecisionSnapshot",
 	"ModelOutput",
+	"LiveTradingEvent",
+	"LiveTradingProfile",
 	"PaperAccount",
 	"ParameterSet",
 	"RiskEvent",
