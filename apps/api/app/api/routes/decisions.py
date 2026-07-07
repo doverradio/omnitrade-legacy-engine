@@ -15,6 +15,8 @@ from app.models.decision_counterfactual_result import DecisionCounterfactualResu
 from app.models.decision_quality_score import DecisionQualityScore
 from app.models.decision_record import DecisionRecord
 from app.services.arena.comparison import read_latest_arena_comparison_record
+from app.services.arena.contracts import ArenaLeaderboardFilterContract
+from app.services.arena.leaderboard import read_latest_arena_leaderboard_snapshot
 from app.services.decisions.explainability import read_decision_explainability
 from app.services.decisions.recommendations import read_experiment_recommendations
 from app.services.decisions.timeline import TimelineReadFilters, read_decision_timeline
@@ -95,6 +97,122 @@ async def get_latest_arena_comparison(
             }
             for key, value in read_model.portfolio_dimensions.items()
         },
+        "evidence_sources": read_model.evidence_sources,
+        "provenance": read_model.provenance,
+    }
+
+
+@router.get("/arena-leaderboard/latest")
+async def get_latest_arena_leaderboard(
+    competition_id: uuid.UUID,
+    tournament_id: uuid.UUID | None = Query(default=None),
+    cycle_id: uuid.UUID | None = Query(default=None),
+    included_agent_ids: list[uuid.UUID] | None = Query(default=None),
+    limit: int | None = Query(default=None, ge=1, le=200),
+    availability_mode: str = Query(default="all", pattern="^(all|known_only)$"),
+    db: AsyncSession = Depends(get_db),
+) -> dict[str, Any]:
+    filters = ArenaLeaderboardFilterContract(
+        included_agent_ids=included_agent_ids,
+        limit=limit,
+        availability_mode=availability_mode,
+    )
+
+    read_model = await read_latest_arena_leaderboard_snapshot(
+        db=db,
+        competition_id=competition_id,
+        tournament_id=tournament_id,
+        cycle_id=cycle_id,
+        filters=filters,
+    )
+
+    scope = "cycle" if cycle_id is not None else "tournament" if tournament_id is not None else "competition"
+    if read_model is None:
+        return {
+            "snapshot_scope": scope,
+            "competition_id": str(competition_id),
+            "tournament_id": str(tournament_id) if tournament_id else None,
+            "cycle_id": str(cycle_id) if cycle_id else None,
+            "availability_state": "unavailable",
+            "state_reason": "arena_leaderboard_unavailable",
+            "ranking_hash": None,
+            "ranking_methodology_version": None,
+            "snapshot_timestamp": None,
+            "filters": {
+                "included_agent_ids": [str(item) for item in included_agent_ids] if included_agent_ids else None,
+                "limit": limit,
+                "availability_mode": availability_mode,
+            },
+            "entries": [],
+            "evidence_sources": {},
+            "provenance": {},
+        }
+
+    return {
+        "snapshot_scope": read_model.snapshot_scope,
+        "competition_id": str(read_model.competition_id),
+        "tournament_id": str(read_model.tournament_id) if read_model.tournament_id else None,
+        "cycle_id": str(read_model.cycle_id) if read_model.cycle_id else None,
+        "availability_state": "known",
+        "state_reason": None,
+        "ranking_hash": read_model.ranking_hash,
+        "ranking_methodology_version": read_model.ranking_methodology_version,
+        "snapshot_timestamp": read_model.snapshot_timestamp.isoformat(),
+        "filters": {
+            "included_agent_ids": [str(item) for item in read_model.filters.included_agent_ids]
+            if read_model.filters.included_agent_ids
+            else None,
+            "limit": read_model.filters.limit,
+            "availability_mode": read_model.filters.availability_mode,
+        },
+        "entries": [
+            {
+                "rank": item.rank,
+                "agent_id": str(item.agent_id),
+                "composite_rank_score": {
+                    "value": _decimal_to_str(item.composite_rank_score.value),
+                    "status": item.composite_rank_score.status,
+                    "reason": item.composite_rank_score.reason,
+                },
+                "decision_quality": {
+                    "value": _decimal_to_str(item.decision_quality.value),
+                    "status": item.decision_quality.status,
+                    "reason": item.decision_quality.reason,
+                },
+                "profit": {
+                    "value": _decimal_to_str(item.profit.value),
+                    "status": item.profit.status,
+                    "reason": item.profit.reason,
+                },
+                "drawdown": {
+                    "value": _decimal_to_str(item.drawdown.value),
+                    "status": item.drawdown.status,
+                    "reason": item.drawdown.reason,
+                },
+                "fee_drag": {
+                    "value": _decimal_to_str(item.fee_drag.value),
+                    "status": item.fee_drag.status,
+                    "reason": item.fee_drag.reason,
+                },
+                "consistency": {
+                    "value": _decimal_to_str(item.consistency.value),
+                    "status": item.consistency.status,
+                    "reason": item.consistency.reason,
+                },
+                "risk_discipline": {
+                    "value": _decimal_to_str(item.risk_discipline.value),
+                    "status": item.risk_discipline.status,
+                    "reason": item.risk_discipline.reason,
+                },
+                "explainability": {
+                    "value": _decimal_to_str(item.explainability.value),
+                    "status": item.explainability.status,
+                    "reason": item.explainability.reason,
+                },
+                "evidence_provenance": item.evidence_provenance,
+            }
+            for item in read_model.entries
+        ],
         "evidence_sources": read_model.evidence_sources,
         "provenance": read_model.provenance,
     }

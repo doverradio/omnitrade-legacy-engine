@@ -309,6 +309,56 @@ class ArenaComparisonRecordResult:
     provenance: dict[str, Any]
 
 
+@dataclass(frozen=True)
+class ArenaLeaderboardFilterContract:
+    included_agent_ids: list[uuid.UUID] | None
+    limit: int | None
+    availability_mode: str
+
+
+@dataclass(frozen=True)
+class ArenaLeaderboardEntryContract:
+    rank: int
+    agent_id: uuid.UUID
+    composite_rank_score: ArenaComparisonMetricContract
+    decision_quality: ArenaComparisonMetricContract
+    profit: ArenaComparisonMetricContract
+    drawdown: ArenaComparisonMetricContract
+    fee_drag: ArenaComparisonMetricContract
+    consistency: ArenaComparisonMetricContract
+    risk_discipline: ArenaComparisonMetricContract
+    explainability: ArenaComparisonMetricContract
+    evidence_provenance: dict[str, Any]
+
+
+@dataclass(frozen=True)
+class ArenaLeaderboardSnapshotRequest:
+    competition_id: uuid.UUID
+    tournament_id: uuid.UUID | None
+    cycle_id: uuid.UUID | None
+    ranking_methodology_version: str
+    filters: ArenaLeaderboardFilterContract
+    as_of: datetime
+    actor: str
+    provenance: dict[str, Any]
+
+
+@dataclass(frozen=True)
+class ArenaLeaderboardSnapshotResult:
+    leaderboard_snapshot_id: uuid.UUID
+    ranking_hash: str
+    snapshot_scope: str
+    competition_id: uuid.UUID
+    tournament_id: uuid.UUID | None
+    cycle_id: uuid.UUID | None
+    ranking_methodology_version: str
+    snapshot_timestamp: datetime
+    filters: ArenaLeaderboardFilterContract
+    entries: list[ArenaLeaderboardEntryContract]
+    evidence_sources: dict[str, Any]
+    provenance: dict[str, Any]
+
+
 class ArenaLifecycleServiceContract(Protocol):
     async def ensure_competition(
         self,
@@ -380,3 +430,10 @@ class ArenaComparisonServiceContract(Protocol):
         self,
         request: ArenaComparisonRecordRequest,
     ) -> ArenaComparisonRecordResult: ...
+
+
+class ArenaLeaderboardServiceContract(Protocol):
+    async def build_leaderboard_snapshot(
+        self,
+        request: ArenaLeaderboardSnapshotRequest,
+    ) -> ArenaLeaderboardSnapshotResult: ...

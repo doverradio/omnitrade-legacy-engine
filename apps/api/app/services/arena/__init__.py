@@ -1,6 +1,11 @@
 from app.services.arena.contracts import (
     ArenaAgentComparisonSummaryContract,
     ArenaAgentProposalContract,
+    ArenaLeaderboardEntryContract,
+    ArenaLeaderboardFilterContract,
+    ArenaLeaderboardSnapshotRequest,
+    ArenaLeaderboardSnapshotResult,
+    ArenaLeaderboardServiceContract,
     ArenaComparisonMetricContract,
     ArenaComparisonRecordRequest,
     ArenaComparisonRecordResult,
@@ -45,6 +50,10 @@ from app.services.arena.comparison import (
     build_arena_comparison_record,
     read_latest_arena_comparison_record,
 )
+from app.services.arena.leaderboard import (
+    build_arena_leaderboard_snapshot,
+    read_latest_arena_leaderboard_snapshot,
+)
 from app.services.arena.registration import (
     build_registration_hash,
     build_registration_idempotency_key,
@@ -62,6 +71,11 @@ from app.services.arena.risk_gate import evaluate_arena_candidate_action
 __all__ = [
     "ArenaAgentComparisonSummaryContract",
     "ArenaAgentProposalContract",
+    "ArenaLeaderboardEntryContract",
+    "ArenaLeaderboardFilterContract",
+    "ArenaLeaderboardSnapshotRequest",
+    "ArenaLeaderboardSnapshotResult",
+    "ArenaLeaderboardServiceContract",
     "ArenaComparisonMetricContract",
     "ArenaComparisonRecordRequest",
     "ArenaComparisonRecordResult",
@@ -109,5 +123,7 @@ __all__ = [
     "build_arena_performance_snapshot",
     "build_arena_comparison_record",
     "read_latest_arena_comparison_record",
+    "build_arena_leaderboard_snapshot",
+    "read_latest_arena_leaderboard_snapshot",
     "evaluate_arena_candidate_action",
 ]
