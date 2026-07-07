@@ -100,6 +100,54 @@ class LiveAccountRegistrationResult:
 
 
 @dataclass(frozen=True)
+class LiveApprovalCheckpointRequest:
+    live_trading_profile_id: uuid.UUID
+    checkpoint_type: str
+    approver_id: str
+    approver_role: str
+    rationale: str
+    approval_scope: dict[str, Any]
+    expires_at: datetime | None
+    renewal_condition: str | None
+    requested_by: str
+    provenance_metadata: dict[str, Any]
+    idempotency_key: str | None = None
+
+
+@dataclass(frozen=True)
+class LiveApprovalCheckpointResult:
+    approval_event_id: uuid.UUID
+    live_trading_profile_id: uuid.UUID
+    checkpoint_type: str
+    approval_state: str
+    lifecycle_state: str
+    operating_mode: str
+    expires_at: datetime | None
+    renewal_condition: str | None
+    idempotency_key: str
+
+
+@dataclass(frozen=True)
+class LiveApprovalStateChangeRequest:
+    live_trading_profile_id: uuid.UUID
+    checkpoint_type: str
+    approver_id: str
+    approver_role: str
+    rationale: str
+    approval_scope: dict[str, Any]
+    requested_by: str
+    provenance_metadata: dict[str, Any]
+    idempotency_key: str | None = None
+
+
+@dataclass(frozen=True)
+class LiveApprovalGateResult:
+    allowed: bool
+    reason: str | None
+    matched_approval_event_id: uuid.UUID | None
+
+
+@dataclass(frozen=True)
 class LiveTradingImmutableEventContract:
     idempotency_key: str
     event_hash: str
