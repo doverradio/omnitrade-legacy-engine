@@ -148,6 +148,48 @@ class LiveApprovalGateResult:
 
 
 @dataclass(frozen=True)
+class LiveRiskVerificationResult:
+    approved: bool
+    reason: str | None
+
+
+@dataclass(frozen=True)
+class LiveExecutionOrchestrationRequest:
+    live_trading_profile_id: uuid.UUID
+    provider_name: str
+    broker_account_ref: str
+    adapter_request_id: str
+    symbol: str
+    side: str
+    order_type: str
+    quantity: str
+    limit_price: str | None
+    stop_price: str | None
+    time_in_force: str
+    risk_decision_id: uuid.UUID
+    approval_event_id: uuid.UUID
+    audit_correlation_id: str
+    requested_by: str
+    provenance_metadata: dict[str, Any]
+    idempotency_key: str | None = None
+
+
+@dataclass(frozen=True)
+class LiveExecutionOrchestrationResult:
+    accepted: bool
+    status: str
+    reason: str | None
+    provider_name: str
+    live_trading_profile_id: uuid.UUID
+    execution_event_id: uuid.UUID | None
+    approval_event_id: uuid.UUID | None
+    risk_decision_id: uuid.UUID | None
+    audit_correlation_id: str
+    adapter_request_id: str
+    idempotency_key: str
+
+
+@dataclass(frozen=True)
 class LiveTradingImmutableEventContract:
     idempotency_key: str
     event_hash: str
