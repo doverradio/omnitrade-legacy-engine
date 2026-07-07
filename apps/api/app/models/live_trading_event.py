@@ -4,7 +4,7 @@ import uuid
 from datetime import datetime
 from typing import Any
 
-from sqlalchemy import CheckConstraint, DateTime, ForeignKey, Integer, Text, UniqueConstraint, event, text
+from sqlalchemy import Boolean, CheckConstraint, DateTime, ForeignKey, Integer, Text, UniqueConstraint, event, text
 from sqlalchemy.dialects.postgresql import JSONB, UUID
 from sqlalchemy.orm import Mapped, mapped_column
 
@@ -18,15 +18,15 @@ class LiveTradingEvent(Base):
         UniqueConstraint("event_hash", name="uq_live_trading_events_event_hash"),
         UniqueConstraint("live_trading_profile_id", "sequence_number", name="uq_live_trading_events_sequence"),
         CheckConstraint(
-            "event_type IN ('mode_initialized','opt_in_recorded','approval_attested','governance_attested','mode_transition_recorded','provenance_recorded')",
+            "event_type IN ('registration_created','registration_replayed','readiness_state_changed','provenance_recorded')",
             name="ck_live_trading_events_event_type",
         ),
         CheckConstraint(
-            "from_state IS NULL OR from_state IN ('paper_default','live_pending_governance','live_governance_approved','live_enabled','live_suspended')",
+            "from_state IS NULL OR from_state IN ('draft','pending_approval','approved','enabled','suspended')",
             name="ck_live_trading_events_from_state",
         ),
         CheckConstraint(
-            "to_state IN ('paper_default','live_pending_governance','live_governance_approved','live_enabled','live_suspended')",
+            "to_state IN ('draft','pending_approval','approved','enabled','suspended')",
             name="ck_live_trading_events_to_state",
         ),
         CheckConstraint(
@@ -72,9 +72,9 @@ class LiveTradingEvent(Base):
     from_state: Mapped[str | None] = mapped_column(Text, nullable=True)
     to_state: Mapped[str] = mapped_column(Text, nullable=False)
     operating_mode: Mapped[str] = mapped_column(Text, nullable=False)
-    paper_default_mode: Mapped[bool] = mapped_column(nullable=False, server_default=text("true"))
-    live_opt_in: Mapped[bool] = mapped_column(nullable=False, server_default=text("false"))
-    governance_approved: Mapped[bool] = mapped_column(nullable=False, server_default=text("false"))
+    paper_default_mode: Mapped[bool] = mapped_column(Boolean, nullable=False, server_default=text("true"))
+    live_opt_in: Mapped[bool] = mapped_column(Boolean, nullable=False, server_default=text("false"))
+    governance_approved: Mapped[bool] = mapped_column(Boolean, nullable=False, server_default=text("false"))
     risk_authority_model: Mapped[str] = mapped_column(
         Text,
         nullable=False,

@@ -19,7 +19,7 @@ class LiveTradingProfile(Base):
             name="ck_live_trading_profiles_operating_mode",
         ),
         CheckConstraint(
-            "lifecycle_state IN ('paper_default','live_pending_governance','live_governance_approved','live_enabled','live_suspended')",
+            "lifecycle_state IN ('draft','pending_approval','approved','enabled','suspended')",
             name="ck_live_trading_profiles_lifecycle_state",
         ),
         CheckConstraint(
@@ -55,11 +55,15 @@ class LiveTradingProfile(Base):
             name="ck_live_trading_profiles_live_requires_approval",
         ),
         CheckConstraint(
+            "(operating_mode = 'paper' OR human_approval_recorded = true)",
+            name="ck_live_trading_profiles_live_requires_human_approval_recorded",
+        ),
+        CheckConstraint(
             "(operating_mode = 'paper' OR governance_approved = true)",
             name="ck_live_trading_profiles_live_requires_governance_approval",
         ),
         CheckConstraint(
-            "(operating_mode = 'paper' OR lifecycle_state IN ('live_enabled','live_suspended'))",
+            "(operating_mode = 'paper' OR lifecycle_state IN ('enabled','suspended'))",
             name="ck_live_trading_profiles_live_mode_lifecycle_boundary",
         ),
     )
@@ -71,9 +75,10 @@ class LiveTradingProfile(Base):
     )
     paper_account_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), nullable=False)
     operating_mode: Mapped[str] = mapped_column(Text, nullable=False, server_default=text("'paper'"))
-    lifecycle_state: Mapped[str] = mapped_column(Text, nullable=False, server_default=text("'paper_default'"))
+    lifecycle_state: Mapped[str] = mapped_column(Text, nullable=False, server_default=text("'draft'"))
     approval_state: Mapped[str] = mapped_column(Text, nullable=False, server_default=text("'not_requested'"))
     live_opt_in: Mapped[bool] = mapped_column(Boolean, nullable=False, server_default=text("false"))
+    human_approval_recorded: Mapped[bool] = mapped_column(Boolean, nullable=False, server_default=text("false"))
     paper_default_mode: Mapped[bool] = mapped_column(Boolean, nullable=False, server_default=text("true"))
     governance_approved: Mapped[bool] = mapped_column(Boolean, nullable=False, server_default=text("false"))
     risk_authority_model: Mapped[str] = mapped_column(

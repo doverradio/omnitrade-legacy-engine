@@ -6,11 +6,11 @@ from datetime import datetime
 from typing import Any
 
 LIVE_TRADING_LIFECYCLE_STATES = {
-    "paper_default",
-    "live_pending_governance",
-    "live_governance_approved",
-    "live_enabled",
-    "live_suspended",
+    "draft",
+    "pending_approval",
+    "approved",
+    "enabled",
+    "suspended",
 }
 
 LIVE_TRADING_OPERATING_MODES = {"paper", "live"}
@@ -25,11 +25,11 @@ LIVE_TRADING_APPROVAL_STATES = {
 
 # Prompt 9.1 boundary: paper is the default mode, live is opt-in only.
 LIVE_TRADING_ALLOWED_TRANSITIONS: dict[str, set[str]] = {
-    "paper_default": {"live_pending_governance"},
-    "live_pending_governance": {"paper_default", "live_governance_approved"},
-    "live_governance_approved": {"paper_default", "live_enabled"},
-    "live_enabled": {"paper_default", "live_suspended"},
-    "live_suspended": {"paper_default", "live_enabled"},
+    "draft": {"pending_approval"},
+    "pending_approval": {"draft", "approved"},
+    "approved": {"pending_approval", "enabled", "suspended"},
+    "enabled": {"suspended"},
+    "suspended": {"enabled"},
 }
 
 
@@ -51,6 +51,7 @@ class LiveTradingProfileContract:
     lifecycle_state: str
     approval_state: str
     live_opt_in: bool
+    human_approval_recorded: bool
     paper_default_mode: bool
     governance_approved: bool
     risk_authority_model: str
@@ -67,6 +68,35 @@ class LiveTradingStateTransitionContract:
     to_state: str
     transition_reason: str
     requested_at: datetime
+
+
+@dataclass(frozen=True)
+class LiveReadinessEligibilityResult:
+    eligible: bool
+    rejection_reason: str | None
+
+
+@dataclass(frozen=True)
+class LiveAccountRegistrationRequest:
+    paper_account_id: uuid.UUID
+    requested_by: str
+    registration_source: str
+    live_opt_in: bool
+    governance_approved: bool
+    human_approval_recorded: bool
+    provenance_metadata: dict[str, Any]
+    idempotency_key: str | None = None
+
+
+@dataclass(frozen=True)
+class LiveAccountRegistrationResult:
+    live_trading_profile_id: uuid.UUID
+    readiness_state: str
+    operating_mode: str
+    accepted: bool
+    rejection_reason: str | None
+    created_event_id: uuid.UUID
+    idempotency_key: str
 
 
 @dataclass(frozen=True)
