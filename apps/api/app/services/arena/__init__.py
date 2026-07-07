@@ -63,6 +63,7 @@ from app.services.arena.leaderboard import (
 )
 from app.services.arena.tournaments import (
     record_arena_tournament_lifecycle_event,
+    read_arena_tournament_history_events,
     read_arena_tournament_lifecycle_state,
 )
 from app.services.arena.registration import (
@@ -144,6 +145,7 @@ __all__ = [
     "build_arena_leaderboard_snapshot",
     "read_latest_arena_leaderboard_snapshot",
     "record_arena_tournament_lifecycle_event",
+    "read_arena_tournament_history_events",
     "read_arena_tournament_lifecycle_state",
     "evaluate_arena_candidate_action",
 ]

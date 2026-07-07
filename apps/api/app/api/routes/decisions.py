@@ -17,6 +17,10 @@ from app.models.decision_record import DecisionRecord
 from app.services.arena.comparison import read_latest_arena_comparison_record
 from app.services.arena.contracts import ArenaLeaderboardFilterContract
 from app.services.arena.leaderboard import read_latest_arena_leaderboard_snapshot
+from app.services.arena.tournaments import (
+    read_arena_tournament_history_events,
+    read_arena_tournament_lifecycle_state,
+)
 from app.services.decisions.explainability import read_decision_explainability
 from app.services.decisions.recommendations import read_experiment_recommendations
 from app.services.decisions.timeline import TimelineReadFilters, read_decision_timeline
@@ -215,6 +219,145 @@ async def get_latest_arena_leaderboard(
         ],
         "evidence_sources": read_model.evidence_sources,
         "provenance": read_model.provenance,
+    }
+
+
+@router.get("/arena-tournaments/history")
+async def get_arena_tournament_history(
+    competition_id: uuid.UUID,
+    tournament_id: uuid.UUID,
+    db: AsyncSession = Depends(get_db),
+) -> dict[str, Any]:
+    read_model = await read_arena_tournament_lifecycle_state(
+        db=db,
+        competition_id=competition_id,
+        tournament_id=tournament_id,
+    )
+    history_events = await read_arena_tournament_history_events(
+        db=db,
+        competition_id=competition_id,
+        tournament_id=tournament_id,
+    )
+
+    if read_model is None or not history_events:
+        return {
+            "competition_id": str(competition_id),
+            "tournament_id": str(tournament_id),
+            "availability_state": "unavailable",
+            "state_reason": "arena_tournament_history_unavailable",
+            "current_state": None,
+            "latest_event_type": None,
+            "latest_event_timestamp": None,
+            "history_count": 0,
+            "replay_metadata": {},
+            "latest_schedule_payload": {},
+            "latest_standings": [],
+            "history": [],
+        }
+
+    return {
+        "competition_id": str(competition_id),
+        "tournament_id": str(tournament_id),
+        "availability_state": "known",
+        "state_reason": None,
+        "current_state": read_model.current_state,
+        "latest_event_type": read_model.latest_event_type,
+        "latest_event_timestamp": read_model.latest_event_timestamp.isoformat(),
+        "history_count": read_model.history_count,
+        "replay_metadata": read_model.replay_metadata,
+        "latest_schedule_payload": read_model.latest_schedule_payload,
+        "latest_standings": [
+            {
+                "rank": item.rank,
+                "agent_id": str(item.agent_id),
+                "composite_score": {
+                    "value": _decimal_to_str(item.composite_score.value),
+                    "status": item.composite_score.status,
+                    "reason": item.composite_score.reason,
+                },
+                "decision_quality": {
+                    "value": _decimal_to_str(item.decision_quality.value),
+                    "status": item.decision_quality.status,
+                    "reason": item.decision_quality.reason,
+                },
+                "risk_discipline": {
+                    "value": _decimal_to_str(item.risk_discipline.value),
+                    "status": item.risk_discipline.status,
+                    "reason": item.risk_discipline.reason,
+                },
+                "drawdown": {
+                    "value": _decimal_to_str(item.drawdown.value),
+                    "status": item.drawdown.status,
+                    "reason": item.drawdown.reason,
+                },
+                "fee_drag": {
+                    "value": _decimal_to_str(item.fee_drag.value),
+                    "status": item.fee_drag.status,
+                    "reason": item.fee_drag.reason,
+                },
+                "profit": {
+                    "value": _decimal_to_str(item.profit.value),
+                    "status": item.profit.status,
+                    "reason": item.profit.reason,
+                },
+                "evidence_provenance": item.evidence_provenance,
+            }
+            for item in read_model.latest_standings
+        ],
+        "history": [
+            {
+                "history_record_id": str(item.history_record_id),
+                "event_hash": item.event_hash,
+                "sequence_number": item.sequence_number,
+                "event_type": item.event_type,
+                "lifecycle_state": item.lifecycle_state,
+                "event_timestamp": item.event_timestamp.isoformat(),
+                "schedule_payload": item.schedule_payload,
+                "replay_metadata": item.replay_metadata,
+                "tie_break_rules": item.tie_break_rules,
+                "ordering_rules": item.ordering_rules,
+                "standings": [
+                    {
+                        "rank": row.rank,
+                        "agent_id": str(row.agent_id),
+                        "composite_score": {
+                            "value": _decimal_to_str(row.composite_score.value),
+                            "status": row.composite_score.status,
+                            "reason": row.composite_score.reason,
+                        },
+                        "decision_quality": {
+                            "value": _decimal_to_str(row.decision_quality.value),
+                            "status": row.decision_quality.status,
+                            "reason": row.decision_quality.reason,
+                        },
+                        "risk_discipline": {
+                            "value": _decimal_to_str(row.risk_discipline.value),
+                            "status": row.risk_discipline.status,
+                            "reason": row.risk_discipline.reason,
+                        },
+                        "drawdown": {
+                            "value": _decimal_to_str(row.drawdown.value),
+                            "status": row.drawdown.status,
+                            "reason": row.drawdown.reason,
+                        },
+                        "fee_drag": {
+                            "value": _decimal_to_str(row.fee_drag.value),
+                            "status": row.fee_drag.status,
+                            "reason": row.fee_drag.reason,
+                        },
+                        "profit": {
+                            "value": _decimal_to_str(row.profit.value),
+                            "status": row.profit.status,
+                            "reason": row.profit.reason,
+                        },
+                        "evidence_provenance": row.evidence_provenance,
+                    }
+                    for row in item.standings
+                ],
+                "provenance": item.provenance,
+            }
+            for item in history_events
+        ],
     }
 
 

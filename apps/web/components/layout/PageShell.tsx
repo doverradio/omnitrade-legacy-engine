@@ -3,6 +3,7 @@ import type { ReactNode } from "react";
 
 const navItems = [
   { href: "/dashboard", label: "Dashboard" },
+  { href: "/decision-arena", label: "Decision Arena" },
   { href: "/decision-intelligence", label: "Decision Intelligence" },
   { href: "/markets", label: "Markets" },
   { href: "/strategy-lab", label: "Strategy Lab" },
@@ -26,7 +27,7 @@ export default function PageShell({ children }: PageShellProps) {
             OmniTrade
           </p>
           <p className="mb-3 text-xs uppercase tracking-wide text-foreground/60">
-            Phase 7 decision intelligence
+            Phase 8 decision arena
           </p>
           <nav className="flex flex-col gap-2 text-sm">
             {navItems.map((item) => (
@@ -44,7 +45,7 @@ export default function PageShell({ children }: PageShellProps) {
         <div className="flex min-h-screen flex-1 flex-col">
           <header className="border-b border-border px-4 py-3 sm:px-6">
             <div className="flex flex-wrap items-center justify-between gap-2">
-              <p className="text-sm">Decision Intelligence Foundation (read-only)</p>
+              <p className="text-sm">Decision Arena & Decision Intelligence (read-only)</p>
               <p className="text-xs uppercase tracking-wide text-foreground/70">
                 Paper mode only - observational surfaces
               </p>

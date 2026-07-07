@@ -190,15 +190,6 @@ async def record_arena_tournament_lifecycle_event(
     if tournament is None:
         raise InvalidRequestError("Tournament does not belong to competition")
 
-    history_result = await db.execute(
-        select(ArenaTournamentHistoryRecord).where(
-            ArenaTournamentHistoryRecord.tournament_id == request.tournament_id
-        )
-    )
-    history_rows = list(history_result.scalars().all())
-    history_rows.sort(key=lambda item: (item.sequence_number, item.event_timestamp))
-    next_sequence = (history_rows[-1].sequence_number + 1) if history_rows else 1
-
     standings = _rank_standings(request.standings)
     event_payload = {
         "standings": [_serialize_standing(item) for item in standings],
@@ -208,7 +199,6 @@ async def record_arena_tournament_lifecycle_event(
     hash_payload = {
         "competition_id": str(request.competition_id),
         "tournament_id": str(request.tournament_id),
-        "sequence_number": next_sequence,
         "event_type": request.event_type,
         "lifecycle_state": request.lifecycle_state,
         "schedule_payload": request.schedule_payload,
@@ -235,6 +225,15 @@ async def record_arena_tournament_lifecycle_event(
     )
     if existing is not None:
         return _deserialize_result(existing)
+
+    history_result = await db.execute(
+        select(ArenaTournamentHistoryRecord).where(
+            ArenaTournamentHistoryRecord.tournament_id == request.tournament_id
+        )
+    )
+    history_rows = list(history_result.scalars().all())
+    history_rows.sort(key=lambda item: (item.sequence_number, item.event_timestamp))
+    next_sequence = (history_rows[-1].sequence_number + 1) if history_rows else 1
 
     provenance = {
         **request.provenance,
@@ -334,3 +333,20 @@ async def read_arena_tournament_lifecycle_state(
             _deserialize_standing(item) for item in latest_payload.get("standings", [])
         ],
     )
+
+
+async def read_arena_tournament_history_events(
+    *,
+    db: AsyncSession,
+    competition_id: uuid.UUID,
+    tournament_id: uuid.UUID,
+) -> list[ArenaTournamentLifecycleEventResult]:
+    result = await db.execute(
+        select(ArenaTournamentHistoryRecord).where(
+            ArenaTournamentHistoryRecord.competition_id == competition_id,
+            ArenaTournamentHistoryRecord.tournament_id == tournament_id,
+        )
+    )
+    rows = list(result.scalars().all())
+    rows.sort(key=lambda item: (item.sequence_number, item.event_timestamp))
+    return [_deserialize_result(item) for item in rows]
