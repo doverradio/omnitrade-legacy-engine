@@ -48,8 +48,9 @@ cp ../../infra/env-templates/api.env.example .env
 alembic upgrade head
 
 # Seed reference data
-python ../../scripts/seed_assets.py
-python ../../scripts/seed_strategies.py
+python scripts/seed_assets.py
+python scripts/seed_strategies.py
+python scripts/seed_paper_accounts.py
 ```
 
 ### 4. Frontend Setup (`apps/web`)
