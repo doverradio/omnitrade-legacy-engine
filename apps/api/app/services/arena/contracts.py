@@ -266,6 +266,49 @@ class ArenaPerformanceSnapshotResult:
     provenance: dict[str, Any]
 
 
+@dataclass(frozen=True)
+class ArenaComparisonMetricContract:
+    value: Decimal | None
+    status: str
+    reason: str | None
+
+
+@dataclass(frozen=True)
+class ArenaAgentComparisonSummaryContract:
+    agent_id: uuid.UUID
+    decision_quality: ArenaComparisonMetricContract
+    explainability_support_ratio: ArenaComparisonMetricContract
+    counterfactual_correctness: ArenaComparisonMetricContract
+    evidence_provenance: dict[str, Any]
+
+
+@dataclass(frozen=True)
+class ArenaComparisonRecordRequest:
+    competition_id: uuid.UUID
+    tournament_id: uuid.UUID | None
+    cycle_id: uuid.UUID | None
+    compared_agent_ids: list[uuid.UUID] | None
+    as_of: datetime
+    actor: str
+    provenance: dict[str, Any]
+
+
+@dataclass(frozen=True)
+class ArenaComparisonRecordResult:
+    comparison_record_id: uuid.UUID
+    comparison_hash: str
+    comparison_scope: str
+    competition_id: uuid.UUID
+    tournament_id: uuid.UUID | None
+    cycle_id: uuid.UUID | None
+    compared_agent_ids: list[uuid.UUID]
+    comparison_timestamp: datetime
+    agent_summaries: list[ArenaAgentComparisonSummaryContract]
+    portfolio_dimensions: dict[str, ArenaComparisonMetricContract]
+    evidence_sources: dict[str, Any]
+    provenance: dict[str, Any]
+
+
 class ArenaLifecycleServiceContract(Protocol):
     async def ensure_competition(
         self,
@@ -330,3 +373,10 @@ class ArenaPerformanceTrackingServiceContract(Protocol):
         self,
         request: ArenaPerformanceSnapshotRequest,
     ) -> ArenaPerformanceSnapshotResult: ...
+
+
+class ArenaComparisonServiceContract(Protocol):
+    async def build_comparison_record(
+        self,
+        request: ArenaComparisonRecordRequest,
+    ) -> ArenaComparisonRecordResult: ...

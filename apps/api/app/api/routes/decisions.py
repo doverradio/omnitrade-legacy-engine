@@ -14,6 +14,7 @@ from app.db.session import get_db
 from app.models.decision_counterfactual_result import DecisionCounterfactualResult
 from app.models.decision_quality_score import DecisionQualityScore
 from app.models.decision_record import DecisionRecord
+from app.services.arena.comparison import read_latest_arena_comparison_record
 from app.services.decisions.explainability import read_decision_explainability
 from app.services.decisions.recommendations import read_experiment_recommendations
 from app.services.decisions.timeline import TimelineReadFilters, read_decision_timeline
@@ -21,6 +22,82 @@ from app.services.decisions.timeline import TimelineReadFilters, read_decision_t
 router = APIRouter(prefix="/decisions", tags=["decisions"])
 
 MAX_PAGE_SIZE = 200
+
+
+@router.get("/arena-comparisons/latest")
+async def get_latest_arena_comparison(
+    competition_id: uuid.UUID,
+    tournament_id: uuid.UUID | None = Query(default=None),
+    cycle_id: uuid.UUID | None = Query(default=None),
+    db: AsyncSession = Depends(get_db),
+) -> dict[str, Any]:
+    read_model = await read_latest_arena_comparison_record(
+        db=db,
+        competition_id=competition_id,
+        tournament_id=tournament_id,
+        cycle_id=cycle_id,
+    )
+
+    if read_model is None:
+        return {
+            "comparison_scope": "cycle" if cycle_id is not None else "tournament" if tournament_id is not None else "competition",
+            "competition_id": str(competition_id),
+            "tournament_id": str(tournament_id) if tournament_id else None,
+            "cycle_id": str(cycle_id) if cycle_id else None,
+            "availability_state": "unavailable",
+            "state_reason": "arena_comparison_unavailable",
+            "comparison_hash": None,
+            "compared_agent_ids": [],
+            "comparison_timestamp": None,
+            "agent_summaries": [],
+            "portfolio_dimensions": {},
+            "evidence_sources": {},
+            "provenance": {},
+        }
+
+    return {
+        "comparison_scope": read_model.comparison_scope,
+        "competition_id": str(read_model.competition_id),
+        "tournament_id": str(read_model.tournament_id) if read_model.tournament_id else None,
+        "cycle_id": str(read_model.cycle_id) if read_model.cycle_id else None,
+        "availability_state": "known",
+        "state_reason": None,
+        "comparison_hash": read_model.comparison_hash,
+        "compared_agent_ids": [str(item) for item in read_model.compared_agent_ids],
+        "comparison_timestamp": read_model.comparison_timestamp.isoformat(),
+        "agent_summaries": [
+            {
+                "agent_id": str(item.agent_id),
+                "decision_quality": {
+                    "value": _decimal_to_str(item.decision_quality.value),
+                    "status": item.decision_quality.status,
+                    "reason": item.decision_quality.reason,
+                },
+                "explainability_support_ratio": {
+                    "value": _decimal_to_str(item.explainability_support_ratio.value),
+                    "status": item.explainability_support_ratio.status,
+                    "reason": item.explainability_support_ratio.reason,
+                },
+                "counterfactual_correctness": {
+                    "value": _decimal_to_str(item.counterfactual_correctness.value),
+                    "status": item.counterfactual_correctness.status,
+                    "reason": item.counterfactual_correctness.reason,
+                },
+                "evidence_provenance": item.evidence_provenance,
+            }
+            for item in read_model.agent_summaries
+        ],
+        "portfolio_dimensions": {
+            key: {
+                "value": _decimal_to_str(value.value),
+                "status": value.status,
+                "reason": value.reason,
+            }
+            for key, value in read_model.portfolio_dimensions.items()
+        },
+        "evidence_sources": read_model.evidence_sources,
+        "provenance": read_model.provenance,
+    }
 
 
 @router.get("/timeline")

@@ -1,5 +1,10 @@
 from app.services.arena.contracts import (
+    ArenaAgentComparisonSummaryContract,
     ArenaAgentProposalContract,
+    ArenaComparisonMetricContract,
+    ArenaComparisonRecordRequest,
+    ArenaComparisonRecordResult,
+    ArenaComparisonServiceContract,
     ArenaRiskContextContract,
     ArenaRiskEvaluationRequest,
     ArenaRiskEvaluationResult,
@@ -36,6 +41,10 @@ from app.services.arena.identity import (
     build_arena_participating_agent_idempotency_key,
     build_arena_tournament_idempotency_key,
 )
+from app.services.arena.comparison import (
+    build_arena_comparison_record,
+    read_latest_arena_comparison_record,
+)
 from app.services.arena.registration import (
     build_registration_hash,
     build_registration_idempotency_key,
@@ -51,7 +60,12 @@ from app.services.arena.performance_tracking import build_arena_performance_snap
 from app.services.arena.risk_gate import evaluate_arena_candidate_action
 
 __all__ = [
+    "ArenaAgentComparisonSummaryContract",
     "ArenaAgentProposalContract",
+    "ArenaComparisonMetricContract",
+    "ArenaComparisonRecordRequest",
+    "ArenaComparisonRecordResult",
+    "ArenaComparisonServiceContract",
     "ArenaRiskContextContract",
     "ArenaRiskEvaluationRequest",
     "ArenaRiskEvaluationResult",
@@ -93,5 +107,7 @@ __all__ = [
     "validate_arena_eligibility",
     "allocate_competition_paper_budget",
     "build_arena_performance_snapshot",
+    "build_arena_comparison_record",
+    "read_latest_arena_comparison_record",
     "evaluate_arena_candidate_action",
 ]
