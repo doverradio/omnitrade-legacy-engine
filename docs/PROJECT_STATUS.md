@@ -10,13 +10,13 @@ Project Stage:
 Pre-MVP
 
 Current Phase:
-Phase 7 — Decision Intelligence Foundation (Complete)
+Phase 8 — Decision Arena (Complete)
 
 Current Prompt:
-Phase 7 exit review complete; preparing Phase 8 planning
+Phase 8 exit review complete; preparing Phase 9 planning
 
 Overall Completion:
-Approximately 78%
+Approximately 86%
 
 ---
 
@@ -57,11 +57,21 @@ Live Trading remains a future deployment mode.
 
 Capital Allocation Engine is a Portfolio Intelligence subsystem and is never treated as an independent foundational engine.
 
+Decision Arena Foundation is implemented as a comparative subsystem within the existing architecture.
+
+Decision Arena is paper-only and observational/comparative.
+
+Risk Engine remains the final authority for candidate action evaluation before any paper execution path.
+
+No live trading path exists in current implementation.
+
+No automatic promotion to live capital exists.
+
 ---
 
 # Current Goal
 
-Finalize Phase 7 closure artifacts and begin Phase 8 planning only (no Phase 8 implementation yet).
+Begin Phase 9 planning only.
 
 Phase progression remains gated by validation, documentation updates, and regression-free handoff before advancing.
 
@@ -159,10 +169,22 @@ Completed highlights:
 - Decision Intelligence dashboard implemented as observational/read-only UI
 - Phase 7 validation passed (backend tests, frontend tests, frontend lint)
 
-## ⬜ Phase 8 — Decision Arena
+## ✅ Phase 8 — Decision Arena
 
 Status:
-Not Started
+COMPLETE
+
+Completed highlights:
+
+- Decision Arena Foundation implemented as a subsystem (not a fifth foundational engine)
+- Multi-agent orchestration, registration/version identity, tournament history, comparison, and leaderboard workflows implemented
+- Arena behavior constrained to paper-only and observational/comparative scope
+- Risk Engine authority preserved as final evaluation gate for arena candidate actions
+- No Capital Allocation Engine runtime introduced
+- No live trading implementation introduced
+- No automatic promotion to live capital introduced
+- Decision Arena read-only dashboard and API integration implemented
+- Phase 8 validation completed successfully (`cd apps/api && pytest -v`, `cd apps/web && pnpm test`, `cd apps/web && pnpm lint`)
 
 ## ⬜ Future — Live Trading
 
@@ -212,13 +234,17 @@ This ordering matches docs/MASTER_PRODUCT_ROADMAP.md and reflects implementation
 
 Decision Intelligence Foundation is complete and remains observational only.
 
-No Decision Arena runtime has been implemented.
+Decision Arena Foundation is complete and remains a subsystem under existing four-engine architecture.
+
+Decision Arena remains paper-only and observational/comparative.
 
 No Capital Allocation Engine runtime has been implemented.
 
-Future Live Trading remains downstream of earlier phases and human approval gates, and is not treated as an additional engine.
+No live trading implementation exists in current scope.
 
-Phase 8 planning is next; implementation has not started.
+No automatic promotion to live capital exists in current scope.
+
+Phase 9 planning is the next activity.
 
 ---
 
