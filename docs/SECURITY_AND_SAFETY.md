@@ -4,6 +4,13 @@
 
 These rules apply to every phase, every environment, and every contributor (human or Copilot-assisted). They are not suggestions — a PR that violates any rule below should not be merged.
 
+## Governance Boundary: MVP Restrictions vs Future Live Trading Initiative
+
+- The constraints in this document are MVP safety guarantees and remain fully in force unless and until a future live-trading initiative is explicitly approved through governance.
+- "Future live trading" in planning documents does not authorize immediate implementation or deployment in MVP environments.
+- Any future Phase 9 implementation must start only after all prior phases are complete, explicit human approval is granted, Risk Engine final authority is preserved, and governance approval is documented.
+- Until that governance transition is explicitly approved, MVP remains paper-only and no live-routing code path is permitted.
+
 ### 1. No Live Trading
 
 - The MVP contains **no code path** capable of placing a real, capital-at-risk order.

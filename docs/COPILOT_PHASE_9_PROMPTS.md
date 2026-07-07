@@ -3,6 +3,17 @@
 ## Status
 Planned
 
+## Governance Boundary and Preconditions
+This document plans a future, approved implementation phase. It does not override MVP paper-only restrictions.
+
+Before executing any Phase 9 implementation prompt, all of the following must be true:
+- prior phases are complete and validated
+- explicit human approval is in place for live-capital deployment readiness
+- Risk Engine final-authority model remains mandatory and unchanged
+- governance approval is explicitly recorded to transition from MVP paper-only restrictions to future live-trading implementation work
+
+Until these preconditions are satisfied, MVP remains paper-only and no live-routing implementation should begin.
+
 ## Phase Name
 Live Trading Foundation
 

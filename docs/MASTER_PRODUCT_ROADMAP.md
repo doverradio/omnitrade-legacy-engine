@@ -68,6 +68,11 @@ Decision Intelligence includes:
 - **Risk Engine:** the universal safety gatekeeper for signals, sizing, and execution authority (`SYSTEM_ARCHITECTURE.md`, `PROJECT_CONSTITUTION.md` Article VIII).
 - **Live Trading:** a deployment stage and operating mode, not a foundational engine.
 
+Governance boundary note:
+- MVP environments remain paper-only under current safety policy.
+- Future Live Trading planning defines a potential approved initiative, not immediate MVP authorization.
+- Any future implementation requires explicit human approval and explicit governance approval while preserving Risk Engine final authority.
+
 ## 5. Platform Dependency Hierarchy
 
 ```mermaid

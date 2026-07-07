@@ -75,6 +75,10 @@ Begin Phase 9 planning only.
 
 Phase progression remains gated by validation, documentation updates, and regression-free handoff before advancing.
 
+Governance boundary:
+- MVP safety restrictions remain fully active and paper-only operation remains mandatory.
+- Phase 9 implementation may begin only after completion of prior phases, explicit human approval, preserved Risk Engine final authority, and explicit governance approval.
+
 ---
 
 # Phase Progress

@@ -84,6 +84,10 @@ No phase begins until the previous phase's exit criteria are met. Every phase pr
 - Live enablement requires explicit human approvals, separate live account types, and independent operational readiness review.
 - No live-routing implementation is allowed in MVP phase work.
 
+Governance transition requirement:
+- The existence of a future live-trading phase in planning docs does not relax MVP safety restrictions.
+- Phase 9 implementation work may begin only after: completion of prior phases, explicit human approval, preserved Risk Engine final authority, and explicit governance approval to transition from MVP paper-only restrictions to future live-trading implementation scope.
+
 ### Future Capability Note — AI Signal Review and Deployment Hardening
 AI review depth and production deployment hardening remain required capabilities, but they are treated as cross-phase readiness tracks rather than standalone numbered phases in this sequence. They should be scheduled within the active phase plan without violating architectural boundaries.
 
