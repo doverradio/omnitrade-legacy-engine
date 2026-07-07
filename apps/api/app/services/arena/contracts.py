@@ -359,6 +359,83 @@ class ArenaLeaderboardSnapshotResult:
     provenance: dict[str, Any]
 
 
+@dataclass(frozen=True)
+class ArenaTournamentMetricContract:
+    value: Decimal | None
+    status: str
+    reason: str | None
+
+
+@dataclass(frozen=True)
+class ArenaTournamentAgentOutcomeContract:
+    agent_id: uuid.UUID
+    composite_score: ArenaTournamentMetricContract
+    decision_quality: ArenaTournamentMetricContract
+    risk_discipline: ArenaTournamentMetricContract
+    drawdown: ArenaTournamentMetricContract
+    fee_drag: ArenaTournamentMetricContract
+    profit: ArenaTournamentMetricContract
+    evidence_provenance: dict[str, Any]
+
+
+@dataclass(frozen=True)
+class ArenaTournamentStandingContract:
+    rank: int
+    agent_id: uuid.UUID
+    composite_score: ArenaTournamentMetricContract
+    decision_quality: ArenaTournamentMetricContract
+    risk_discipline: ArenaTournamentMetricContract
+    drawdown: ArenaTournamentMetricContract
+    fee_drag: ArenaTournamentMetricContract
+    profit: ArenaTournamentMetricContract
+    evidence_provenance: dict[str, Any]
+
+
+@dataclass(frozen=True)
+class ArenaTournamentLifecycleEventRequest:
+    competition_id: uuid.UUID
+    tournament_id: uuid.UUID
+    event_type: str
+    lifecycle_state: str
+    schedule_payload: dict[str, Any]
+    replay_metadata: dict[str, Any]
+    standings: list[ArenaTournamentAgentOutcomeContract]
+    as_of: datetime
+    actor: str
+    provenance: dict[str, Any]
+
+
+@dataclass(frozen=True)
+class ArenaTournamentLifecycleEventResult:
+    history_record_id: uuid.UUID
+    event_hash: str
+    tournament_id: uuid.UUID
+    competition_id: uuid.UUID
+    sequence_number: int
+    event_type: str
+    lifecycle_state: str
+    event_timestamp: datetime
+    schedule_payload: dict[str, Any]
+    replay_metadata: dict[str, Any]
+    standings: list[ArenaTournamentStandingContract]
+    tie_break_rules: list[str]
+    ordering_rules: list[str]
+    provenance: dict[str, Any]
+
+
+@dataclass(frozen=True)
+class ArenaTournamentLifecycleReadModel:
+    tournament_id: uuid.UUID
+    competition_id: uuid.UUID
+    current_state: str
+    latest_event_type: str
+    latest_event_timestamp: datetime
+    history_count: int
+    replay_metadata: dict[str, Any]
+    latest_schedule_payload: dict[str, Any]
+    latest_standings: list[ArenaTournamentStandingContract]
+
+
 class ArenaLifecycleServiceContract(Protocol):
     async def ensure_competition(
         self,
@@ -437,3 +514,10 @@ class ArenaLeaderboardServiceContract(Protocol):
         self,
         request: ArenaLeaderboardSnapshotRequest,
     ) -> ArenaLeaderboardSnapshotResult: ...
+
+
+class ArenaTournamentLifecycleServiceContract(Protocol):
+    async def record_lifecycle_event(
+        self,
+        request: ArenaTournamentLifecycleEventRequest,
+    ) -> ArenaTournamentLifecycleEventResult: ...

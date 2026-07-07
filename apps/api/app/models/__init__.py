@@ -10,6 +10,7 @@ from app.models.arena_leaderboard_snapshot import ArenaLeaderboardSnapshot
 from app.models.arena_performance_snapshot import ArenaPerformanceSnapshot
 from app.models.arena_risk_gate_decision import ArenaRiskGateDecision
 from app.models.arena_tournament import ArenaTournament
+from app.models.arena_tournament_history_record import ArenaTournamentHistoryRecord
 from app.models.arena_competition_budget_allocation import ArenaCompetitionBudgetAllocation
 from app.models.audit_log import AuditLog
 from app.models.backtest import Backtest
@@ -46,6 +47,7 @@ __all__ = [
 	"ArenaParticipatingAgent",
 	"ArenaCompetitionBudgetAllocation",
 	"ArenaTournament",
+	"ArenaTournamentHistoryRecord",
 	"AuditLog",
 	"Backtest",
 	"BacktestTrade",

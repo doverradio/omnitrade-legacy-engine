@@ -6,6 +6,13 @@ from app.services.arena.contracts import (
     ArenaLeaderboardSnapshotRequest,
     ArenaLeaderboardSnapshotResult,
     ArenaLeaderboardServiceContract,
+    ArenaTournamentAgentOutcomeContract,
+    ArenaTournamentLifecycleEventRequest,
+    ArenaTournamentLifecycleEventResult,
+    ArenaTournamentLifecycleReadModel,
+    ArenaTournamentLifecycleServiceContract,
+    ArenaTournamentMetricContract,
+    ArenaTournamentStandingContract,
     ArenaComparisonMetricContract,
     ArenaComparisonRecordRequest,
     ArenaComparisonRecordResult,
@@ -54,6 +61,10 @@ from app.services.arena.leaderboard import (
     build_arena_leaderboard_snapshot,
     read_latest_arena_leaderboard_snapshot,
 )
+from app.services.arena.tournaments import (
+    record_arena_tournament_lifecycle_event,
+    read_arena_tournament_lifecycle_state,
+)
 from app.services.arena.registration import (
     build_registration_hash,
     build_registration_idempotency_key,
@@ -76,6 +87,13 @@ __all__ = [
     "ArenaLeaderboardSnapshotRequest",
     "ArenaLeaderboardSnapshotResult",
     "ArenaLeaderboardServiceContract",
+    "ArenaTournamentAgentOutcomeContract",
+    "ArenaTournamentLifecycleEventRequest",
+    "ArenaTournamentLifecycleEventResult",
+    "ArenaTournamentLifecycleReadModel",
+    "ArenaTournamentLifecycleServiceContract",
+    "ArenaTournamentMetricContract",
+    "ArenaTournamentStandingContract",
     "ArenaComparisonMetricContract",
     "ArenaComparisonRecordRequest",
     "ArenaComparisonRecordResult",
@@ -125,5 +143,7 @@ __all__ = [
     "read_latest_arena_comparison_record",
     "build_arena_leaderboard_snapshot",
     "read_latest_arena_leaderboard_snapshot",
+    "record_arena_tournament_lifecycle_event",
+    "read_arena_tournament_lifecycle_state",
     "evaluate_arena_candidate_action",
 ]
