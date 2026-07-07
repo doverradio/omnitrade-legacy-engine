@@ -212,6 +212,60 @@ class ArenaRiskEvaluationResult:
     decision_steps: list[dict[str, Any]]
 
 
+@dataclass(frozen=True)
+class ArenaMetricValueContract:
+    value: Decimal | None
+    status: str
+    reason: str | None
+
+
+@dataclass(frozen=True)
+class ArenaAgentPerformanceSummaryContract:
+    agent_id: uuid.UUID
+    profit: ArenaMetricValueContract
+    drawdown: ArenaMetricValueContract
+    fee_drag: ArenaMetricValueContract
+    consistency: ArenaMetricValueContract
+    risk_discipline: ArenaMetricValueContract
+    provenance: dict[str, Any]
+
+
+@dataclass(frozen=True)
+class ArenaPortfolioPerformanceContract:
+    competition_id: uuid.UUID
+    tournament_id: uuid.UUID | None
+    cycle_id: uuid.UUID | None
+    profit: ArenaMetricValueContract
+    drawdown: ArenaMetricValueContract
+    fee_drag: ArenaMetricValueContract
+    consistency: ArenaMetricValueContract
+    risk_discipline: ArenaMetricValueContract
+    provenance: dict[str, Any]
+
+
+@dataclass(frozen=True)
+class ArenaPerformanceSnapshotRequest:
+    competition_id: uuid.UUID
+    tournament_id: uuid.UUID | None
+    cycle_id: uuid.UUID | None
+    as_of: datetime
+    actor: str
+    provenance: dict[str, Any]
+
+
+@dataclass(frozen=True)
+class ArenaPerformanceSnapshotResult:
+    snapshot_id: uuid.UUID
+    competition_id: uuid.UUID
+    tournament_id: uuid.UUID | None
+    cycle_id: uuid.UUID | None
+    snapshot_scope: str
+    snapshot_input_hash: str
+    agent_summaries: list[ArenaAgentPerformanceSummaryContract]
+    portfolio: ArenaPortfolioPerformanceContract
+    provenance: dict[str, Any]
+
+
 class ArenaLifecycleServiceContract(Protocol):
     async def ensure_competition(
         self,
@@ -269,3 +323,10 @@ class ArenaRiskGateServiceContract(Protocol):
         self,
         request: ArenaRiskEvaluationRequest,
     ) -> ArenaRiskEvaluationResult: ...
+
+
+class ArenaPerformanceTrackingServiceContract(Protocol):
+    async def build_performance_snapshot(
+        self,
+        request: ArenaPerformanceSnapshotRequest,
+    ) -> ArenaPerformanceSnapshotResult: ...

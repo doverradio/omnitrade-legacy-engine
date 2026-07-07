@@ -3,6 +3,11 @@ from app.services.arena.contracts import (
     ArenaRiskContextContract,
     ArenaRiskEvaluationRequest,
     ArenaRiskEvaluationResult,
+    ArenaMetricValueContract,
+    ArenaAgentPerformanceSummaryContract,
+    ArenaPortfolioPerformanceContract,
+    ArenaPerformanceSnapshotRequest,
+    ArenaPerformanceSnapshotResult,
     ArenaAgentRegistrationRequest,
     ArenaAgentRegistrationResult,
     ArenaAgentVersionIdentityContract,
@@ -22,6 +27,7 @@ from app.services.arena.contracts import (
     ArenaCompetitionAllocationRequest,
     ArenaCompetitionAllocationResult,
     ArenaRiskGateServiceContract,
+    ArenaPerformanceTrackingServiceContract,
 )
 from app.services.arena.identity import (
     build_arena_competition_idempotency_key,
@@ -41,6 +47,7 @@ from app.services.arena.orchestration import (
     orchestrate_arena_cycle,
 )
 from app.services.arena.paper_allocation import allocate_competition_paper_budget
+from app.services.arena.performance_tracking import build_arena_performance_snapshot
 from app.services.arena.risk_gate import evaluate_arena_candidate_action
 
 __all__ = [
@@ -48,6 +55,11 @@ __all__ = [
     "ArenaRiskContextContract",
     "ArenaRiskEvaluationRequest",
     "ArenaRiskEvaluationResult",
+    "ArenaMetricValueContract",
+    "ArenaAgentPerformanceSummaryContract",
+    "ArenaPortfolioPerformanceContract",
+    "ArenaPerformanceSnapshotRequest",
+    "ArenaPerformanceSnapshotResult",
     "ArenaAgentRegistrationRequest",
     "ArenaAgentRegistrationResult",
     "ArenaAgentVersionIdentityContract",
@@ -67,6 +79,7 @@ __all__ = [
     "ArenaCompetitionAllocationRequest",
     "ArenaCompetitionAllocationResult",
     "ArenaRiskGateServiceContract",
+    "ArenaPerformanceTrackingServiceContract",
     "build_arena_competition_idempotency_key",
     "build_arena_cycle_idempotency_key",
     "build_arena_lifecycle_identity",
@@ -79,5 +92,6 @@ __all__ = [
     "register_arena_agent",
     "validate_arena_eligibility",
     "allocate_competition_paper_budget",
+    "build_arena_performance_snapshot",
     "evaluate_arena_candidate_action",
 ]
