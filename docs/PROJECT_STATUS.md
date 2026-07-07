@@ -10,13 +10,13 @@ Project Stage:
 Pre-MVP
 
 Current Phase:
-Phase 8 — Decision Arena (Complete)
+Phase 9 — Live Trading Foundation (Complete)
 
 Current Prompt:
-Phase 8 exit review complete; preparing Phase 9 planning
+Phase 9 exit review complete; preparing future roadmap planning
 
 Overall Completion:
-Approximately 86%
+Approximately 92%
 
 ---
 
@@ -53,7 +53,7 @@ Portfolio Intelligence currently contains the following subsystem scope:
 
 Live Trading is not a core engine.
 
-Live Trading remains a future deployment mode.
+Live Trading remains an optional operating mode and deployment mode.
 
 Capital Allocation Engine is a Portfolio Intelligence subsystem and is never treated as an independent foundational engine.
 
@@ -63,7 +63,21 @@ Decision Arena is paper-only and observational/comparative.
 
 Risk Engine remains the final authority for candidate action evaluation before any paper execution path.
 
-No live trading path exists in current implementation.
+Live Trading Foundation operational surfaces now exist under controlled, governance-gated boundaries.
+
+Paper Trading remains the default operating mode.
+
+Human approval remains mandatory for live-mode activation paths.
+
+Risk Engine remains the mandatory final authority.
+
+No autonomous live enablement exists.
+
+No autonomous capital allocation exists.
+
+No autonomous strategy evolution exists.
+
+Broker adapters remain contracts/interfaces unless future explicit connectivity work is approved.
 
 No automatic promotion to live capital exists.
 
@@ -71,13 +85,13 @@ No automatic promotion to live capital exists.
 
 # Current Goal
 
-Begin Phase 9 planning only.
+Begin future roadmap planning only.
 
 Phase progression remains gated by validation, documentation updates, and regression-free handoff before advancing.
 
 Governance boundary:
-- MVP safety restrictions remain fully active and paper-only operation remains mandatory.
-- Phase 9 implementation may begin only after completion of prior phases, explicit human approval, preserved Risk Engine final authority, and explicit governance approval.
+- MVP safety restrictions remain fully active and controlled live operation remains optional and approval-gated.
+- Future phase implementation may begin only after completion of prior phases, explicit human approval, preserved Risk Engine final authority, and explicit governance approval.
 
 ---
 
@@ -190,12 +204,27 @@ Completed highlights:
 - Decision Arena read-only dashboard and API integration implemented
 - Phase 8 validation completed successfully (`cd apps/api && pytest -v`, `cd apps/web && pnpm test`, `cd apps/web && pnpm lint`)
 
-## ⬜ Future — Live Trading
+## ✅ Phase 9 — Live Trading Foundation
+
+Status:
+COMPLETE
+
+Completed highlights:
+
+- Controlled live operational API surfaces implemented for registration, approvals, reconciliation, execution quality, and compliance evidence/export.
+- Live Trading operational UI implemented as an operator-facing control plane with fail-visible unknown/unavailable states.
+- Live Trading remains optional; paper remains default.
+- Human approval remains mandatory; Risk Engine remains mandatory final authority.
+- No autonomous live enablement, autonomous capital allocation, or autonomous strategy evolution implemented.
+- Broker adapters remain contracts/interfaces only; no direct broker connectivity implementation was added in this phase.
+- Phase 9 validation completed successfully (`cd apps/api && pytest -v`, `cd apps/web && pnpm test`, `cd apps/web && pnpm lint`).
+
+## ⬜ Future — Post-Phase 9 Roadmap Planning
 
 Status:
 Not Started
 
-Live Trading is planned only as a future deployment mode after prior phases and explicit approval gates are satisfied.
+Future roadmap planning proceeds from the completed Phase 9 foundation and remains subject to explicit approval gates.
 
 ---
 
@@ -227,8 +256,11 @@ Decision Intelligence Foundation
 Phase 8
 Decision Arena
 
+Phase 9
+Live Trading Foundation
+
 Future
-Live Trading
+Post-Phase 9 roadmap planning
 
 This ordering matches docs/MASTER_PRODUCT_ROADMAP.md and reflects implementation sequence, not foundational-architecture importance.
 
@@ -244,11 +276,11 @@ Decision Arena remains paper-only and observational/comparative.
 
 No Capital Allocation Engine runtime has been implemented.
 
-No live trading implementation exists in current scope.
+Live Trading Foundation implementation exists in current scope under controlled, operator-facing boundaries.
 
 No automatic promotion to live capital exists in current scope.
 
-Phase 9 planning is the next activity.
+Future roadmap planning is the next activity.
 
 ---
 
