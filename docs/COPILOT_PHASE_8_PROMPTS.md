@@ -105,8 +105,8 @@ Do not implement in Phase 8:
 5. 8.5 Risk Engine integration and authority boundary enforcement
 6. 8.6 Performance tracking and portfolio-level competition metrics
 7. 8.7 Decision Intelligence comparison bridge (DQE, explainability, counterfactuals)
-8. 8.8 Tournament lifecycle and history
-9. 8.9 Leaderboard computation and read models
+8. 8.8 Arena leaderboard and ranking snapshots
+9. 8.9 Tournament lifecycle and history
 10. 8.10 Decision Arena API/UI surfaces and Phase 8 exit gate
 
 ## Dependencies
@@ -361,7 +361,37 @@ Stop and report results and ADR status.
 
 ---
 
-## Prompt 8.8 - Tournament Lifecycle and History
+## Prompt 8.8 - Arena Leaderboard and Ranking Snapshots
+
+ADR check:
+Before coding, confirm whether this work changes architecture or established boundaries. If yes, stop and request ADR guidance.
+
+Docs to read:
+- docs/MASTER_PRODUCT_ROADMAP.md
+- docs/DECISION_INTELLIGENCE_ENGINE.md
+- docs/PROJECT_CONSTITUTION.md
+
+Exact scope:
+- Implement arena leaderboard ranking snapshots using multi-dimensional scoring.
+- Persist append-only leaderboard snapshots with deterministic rank hashes and methodology versioning.
+- Preserve transparent scoring breakdown, ranking provenance, and explicit unknown/unavailable states.
+- Support read-model filtering by competition scope, tournament/cycle context, and constrained query inputs.
+
+Explicit exclusions:
+- No automatic deployment, capital routing, or allocation actions from ranking outcomes.
+- No live trading.
+- No autonomous agent self-modification.
+
+Validation commands:
+- cd apps/api
+- pytest tests/unit tests/integration -v
+
+Stop-for-review:
+Stop and report results and ADR status.
+
+---
+
+## Prompt 8.9 - Tournament Lifecycle and History
 
 ADR check:
 Before coding, confirm whether this work changes architecture or established boundaries. If yes, stop and request ADR guidance.
@@ -374,43 +404,16 @@ Docs to read:
 Exact scope:
 - Implement tournament lifecycle state model and scheduling.
 - Persist append-only tournament history and replay metadata.
-- Add deterministic tie-break and ordering rules.
+- Add deterministic tie-break and ordering rules for tournament outcomes.
 
 Explicit exclusions:
 - No autonomous agent mutation.
 - No non-audited tournament state transitions.
+- No live trading.
 
 Validation commands:
 - cd apps/api
 - pytest tests/unit tests/integration -v
-
-Stop-for-review:
-Stop and report results and ADR status.
-
----
-
-## Prompt 8.9 - Leaderboard and Comparison Read Models
-
-ADR check:
-Before coding, confirm whether this work changes architecture or established boundaries. If yes, stop and request ADR guidance.
-
-Docs to read:
-- docs/MASTER_PRODUCT_ROADMAP.md
-- docs/DECISION_INTELLIGENCE_ENGINE.md
-- docs/PROJECT_CONSTITUTION.md
-
-Exact scope:
-- Implement leaderboard read models using multi-dimensional scoring.
-- Expose transparent scoring breakdown and ranking provenance.
-- Support filtering by portfolio, tournament, horizon, and time window.
-
-Explicit exclusions:
-- No automatic deployment or allocation actions from rank outcomes.
-- No live-capital routing.
-
-Validation commands:
-- cd apps/api
-- pytest tests/api -v
 
 Stop-for-review:
 Stop and report results and ADR status.
@@ -432,12 +435,15 @@ Docs to read:
 Exact scope:
 - Implement Decision Arena API surfaces and dashboard/explorer pages.
 - Ensure comparisons are observational, auditable, and fail-visible.
+- Do not re-implement existing read-only leaderboard API behavior from Prompt 8.8; only extend remaining non-duplicative arena API/UI coverage.
 - Run full Phase 8 validation gate and produce exit report artifacts.
 
 Explicit exclusions:
 - No Capital Allocation Engine runtime implementation.
 - No live trading.
 - No automatic promotion to live capital.
+- No execution bypass of Risk Engine authority.
+- No autonomous agent self-modification.
 
 Validation commands:
 - cd apps/api && pytest -v
