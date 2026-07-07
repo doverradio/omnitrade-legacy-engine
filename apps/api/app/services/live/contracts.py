@@ -236,6 +236,55 @@ class LiveReconciliationResult:
 
 
 @dataclass(frozen=True)
+class LiveExecutionQualityCaptureRequest:
+    live_trading_profile_id: uuid.UUID
+    source_execution_event_id: uuid.UUID
+    market_context: dict[str, Any]
+    requested_by: str
+    provenance_metadata: dict[str, Any]
+    idempotency_key: str | None = None
+
+
+@dataclass(frozen=True)
+class LiveExecutionQualityCaptureResult:
+    accepted: bool
+    status: str
+    reason: str | None
+    live_trading_profile_id: uuid.UUID
+    source_execution_event_id: uuid.UUID
+    quality_metric_id: uuid.UUID | None
+    idempotency_key: str
+
+
+@dataclass(frozen=True)
+class LiveExecutionQualityReadModelItem:
+    quality_metric_id: uuid.UUID
+    provider_name: str
+    symbol: str
+    side: str
+    expected_price: str | None
+    expected_price_state: str
+    actual_fill_price: str | None
+    actual_price_state: str
+    slippage_abs: str | None
+    slippage_bps: str | None
+    slippage_state: str
+    market_context: dict[str, Any]
+    telemetry_context: dict[str, Any]
+    recorded_at: datetime
+
+
+@dataclass(frozen=True)
+class LiveExecutionQualityReadModel:
+    live_trading_profile_id: uuid.UUID
+    total_records: int
+    available_slippage_records: int
+    unknown_or_unavailable_records: int
+    average_slippage_bps: str | None
+    items: tuple[LiveExecutionQualityReadModelItem, ...]
+
+
+@dataclass(frozen=True)
 class LiveTradingImmutableEventContract:
     idempotency_key: str
     event_hash: str

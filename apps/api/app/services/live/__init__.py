@@ -6,6 +6,10 @@ from app.services.live.contracts import (
     LiveApprovalGateResult,
     LiveApprovalStateChangeRequest,
     LiveFillReconciliationRequest,
+    LiveExecutionQualityCaptureRequest,
+    LiveExecutionQualityCaptureResult,
+    LiveExecutionQualityReadModel,
+    LiveExecutionQualityReadModelItem,
     LiveExecutionOrchestrationRequest,
     LiveExecutionOrchestrationResult,
     LiveOrderReconciliationRequest,
@@ -21,6 +25,11 @@ from app.services.live.contracts import (
     LiveReadinessEligibilityResult,
     LiveTradingStateTransitionContract,
     is_valid_live_trading_transition,
+)
+from app.services.live.execution_quality import (
+    build_live_execution_quality_idempotency_key,
+    capture_live_execution_quality,
+    read_live_execution_quality,
 )
 from app.services.live.accounting_reconciliation import (
     build_live_reconciliation_event_hash,
@@ -92,6 +101,10 @@ __all__ = [
     "LiveApprovalStateChangeRequest",
     "LiveFillReconciliationRequest",
     "LiveExecutionOrchestrationRequest",
+    "LiveExecutionQualityCaptureRequest",
+    "LiveExecutionQualityCaptureResult",
+    "LiveExecutionQualityReadModel",
+    "LiveExecutionQualityReadModelItem",
     "LiveExecutionOrchestrationResult",
     "LiveOrderReconciliationRequest",
     "LiveReconciliationResult",
@@ -109,6 +122,9 @@ __all__ = [
     "build_live_execution_idempotency_key",
     "build_live_reconciliation_event_hash",
     "build_live_reconciliation_idempotency_key",
+    "build_live_execution_quality_idempotency_key",
+    "capture_live_execution_quality",
+    "read_live_execution_quality",
     "evaluate_live_approval_gate",
     "build_live_registration_event_hash",
     "build_live_registration_idempotency_key",
