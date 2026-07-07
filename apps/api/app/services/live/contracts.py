@@ -190,6 +190,52 @@ class LiveExecutionOrchestrationResult:
 
 
 @dataclass(frozen=True)
+class LiveOrderReconciliationRequest:
+    live_trading_profile_id: uuid.UUID
+    source_execution_event_id: uuid.UUID
+    provider_name: str
+    provider_order_id: str
+    client_order_id: str
+    reconciliation_status: str
+    requested_by: str
+    provenance_metadata: dict[str, Any]
+    idempotency_key: str | None = None
+
+
+@dataclass(frozen=True)
+class LiveFillReconciliationRequest:
+    live_trading_profile_id: uuid.UUID
+    source_execution_event_id: uuid.UUID
+    provider_name: str
+    provider_order_id: str
+    provider_fill_id: str
+    client_order_id: str
+    symbol: str
+    side: str
+    fill_quantity: str
+    cumulative_filled_quantity: str
+    order_quantity: str
+    fill_price: str
+    fee_amount: str
+    fee_currency: str
+    requested_by: str
+    provenance_metadata: dict[str, Any]
+    idempotency_key: str | None = None
+
+
+@dataclass(frozen=True)
+class LiveReconciliationResult:
+    accepted: bool
+    status: str
+    reason: str | None
+    live_trading_profile_id: uuid.UUID
+    source_execution_event_id: uuid.UUID
+    reconciliation_event_id: uuid.UUID | None
+    accounting_record_ids: tuple[uuid.UUID, ...]
+    idempotency_key: str
+
+
+@dataclass(frozen=True)
 class LiveTradingImmutableEventContract:
     idempotency_key: str
     event_hash: str

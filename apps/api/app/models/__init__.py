@@ -24,8 +24,10 @@ from app.models.decision_quality_score import DecisionQualityScore
 from app.models.decision_record import DecisionRecord
 from app.models.decision_snapshot import DecisionSnapshot
 from app.models.model_output import ModelOutput
+from app.models.live_accounting_record import LiveAccountingRecord
 from app.models.live_approval_event import LiveApprovalEvent
 from app.models.live_execution_event import LiveExecutionEvent
+from app.models.live_reconciliation_event import LiveReconciliationEvent
 from app.models.live_trading_event import LiveTradingEvent
 from app.models.live_trading_profile import LiveTradingProfile
 from app.models.parameter_set import ParameterSet
@@ -64,8 +66,10 @@ __all__ = [
 	"DecisionRecord",
 	"DecisionSnapshot",
 	"ModelOutput",
+	"LiveAccountingRecord",
 	"LiveApprovalEvent",
 	"LiveExecutionEvent",
+	"LiveReconciliationEvent",
 	"LiveTradingEvent",
 	"LiveTradingProfile",
 	"PaperAccount",
