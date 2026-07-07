@@ -24,6 +24,7 @@ from app.models.decision_quality_score import DecisionQualityScore
 from app.models.decision_record import DecisionRecord
 from app.models.decision_snapshot import DecisionSnapshot
 from app.models.model_output import ModelOutput
+from app.models.live_audit_evidence_record import LiveAuditEvidenceRecord
 from app.models.live_accounting_record import LiveAccountingRecord
 from app.models.live_approval_event import LiveApprovalEvent
 from app.models.live_execution_event import LiveExecutionEvent
@@ -68,6 +69,7 @@ __all__ = [
 	"DecisionRecord",
 	"DecisionSnapshot",
 	"ModelOutput",
+	"LiveAuditEvidenceRecord",
 	"LiveAccountingRecord",
 	"LiveApprovalEvent",
 	"LiveExecutionEvent",

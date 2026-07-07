@@ -337,6 +337,74 @@ class LiveSubmissionGuardResult:
 
 
 @dataclass(frozen=True)
+class LiveAuditEvidenceRequest:
+    live_trading_profile_id: uuid.UUID
+    event_type: str
+    attributable_actor_id: str
+    attributable_actor_role: str
+    action_name: str
+    action_source: str
+    action_summary: str
+    evidence_payload: dict[str, Any]
+    provenance_metadata: dict[str, Any]
+    live_execution_event_id: uuid.UUID | None = None
+    live_approval_event_id: uuid.UUID | None = None
+    live_resilience_event_id: uuid.UUID | None = None
+    live_reconciliation_event_id: uuid.UUID | None = None
+    live_accounting_record_id: uuid.UUID | None = None
+    live_execution_quality_metric_id: uuid.UUID | None = None
+    idempotency_key: str | None = None
+
+
+@dataclass(frozen=True)
+class LiveAuditEvidenceResult:
+    evidence_record_id: uuid.UUID
+    live_trading_profile_id: uuid.UUID
+    event_type: str
+    provenance_hash: str
+    idempotency_key: str
+
+
+@dataclass(frozen=True)
+class LiveComplianceEvidenceItem:
+    evidence_record_id: uuid.UUID
+    event_type: str
+    attributable_actor_id: str
+    attributable_actor_role: str
+    action_name: str
+    action_source: str
+    action_summary: str
+    provenance_hash: str
+    linked_records: dict[str, str]
+    evidence_payload: dict[str, Any]
+    provenance: dict[str, Any]
+    recorded_at: datetime
+
+
+@dataclass(frozen=True)
+class LiveComplianceEvidenceReadModel:
+    live_trading_profile_id: uuid.UUID
+    total_records: int
+    items: tuple[LiveComplianceEvidenceItem, ...]
+
+
+@dataclass(frozen=True)
+class LiveComplianceExportRequest:
+    live_trading_profile_id: uuid.UUID
+    exported_by: str
+    event_type: str | None = None
+
+
+@dataclass(frozen=True)
+class LiveComplianceExportBundle:
+    live_trading_profile_id: uuid.UUID
+    exported_by: str
+    exported_at: datetime
+    total_records: int
+    records: tuple[LiveComplianceEvidenceItem, ...]
+
+
+@dataclass(frozen=True)
 class LiveTradingImmutableEventContract:
     idempotency_key: str
     event_hash: str
