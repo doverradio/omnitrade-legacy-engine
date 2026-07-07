@@ -178,6 +178,40 @@ pnpm lint
 
 ---
 
+### Phase 9 — Live Trading Foundation Exit Gate
+
+**Commands to run:**
+```bash
+cd apps/api && pytest -v
+cd apps/web && pnpm test
+cd apps/web && pnpm lint
+```
+
+**API surfaces to verify:**
+- [ ] `/live/registration/status` provides explicit `available|unknown|unavailable` state and operator warnings.
+- [ ] `/live/approvals/status`, `/live/approvals/checkpoints`, `/live/approvals/revoke`, `/live/approvals/suspend` preserve attributable approval provenance.
+- [ ] `/live/reconciliation/status` exposes unresolved/open/partial/filled/canceled/rejected counts with fail-visible state.
+- [ ] `/live/execution-quality` exposes unknown/unavailable telemetry explicitly and does not mutate execution records.
+- [ ] `/live/compliance/evidence` and `/live/compliance/export` are read-safe and include operator-facing warnings.
+
+**UI surfaces to verify:**
+- [ ] `/live-trading` renders operator-only operational controls (no direct order submission).
+- [ ] UI shows explicit unknown/unavailable states for registration, approvals, reconciliation, quality, and compliance surfaces.
+- [ ] UI shows explicit operator warnings about paper default mode, risk authority, and controlled live boundaries.
+
+**Boundary and safety checks:**
+- [ ] Paper trading remains default mode unless explicit human approval exists.
+- [ ] Risk Engine final-authority boundary is preserved and visible in registration/status surfaces.
+- [ ] No autonomous live enablement, autonomous capital allocation, or autonomous strategy evolution path exists.
+- [ ] No hidden mutation path exists outside audited APIs.
+
+**Expected results (Phase 9 complete):**
+- [ ] Prompt 9.1–9.10 scope is implemented with append-only, attributable lineage for live operations.
+- [ ] Validation commands pass with no regression in existing paper/arena/decision workflows.
+- [ ] Phase 9 completion report is published with go/no-go recommendation.
+
+---
+
 ### General Validation Principles (Apply to Every Phase)
 
 1. **No phase is "done" based on code existing — it's done when its checklist passes against a real, running local environment.**

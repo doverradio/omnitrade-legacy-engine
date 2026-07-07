@@ -31,3 +31,28 @@ cd apps/web && pnpm lint && pnpm build
 - During verification, two scaffold defects were corrected:
   - `apps/web/tsconfig.json` `ignoreDeprecations` was changed from `6.0` to `5.0` so `next build` can run.
   - Compose/web cache state required cleanup of `.next` ownership when switching between container dev server and host build.
+
+## Phase 9 Validation (2026-07-06)
+
+### Commands Run
+
+```bash
+cd apps/api && pytest -v
+cd apps/web && pnpm test
+cd apps/web && pnpm lint
+```
+
+### Checklist Results
+
+- PASS: `apps/api` full suite passed (`327 passed, 1 warning`), including live registration/approval/reconciliation/quality/compliance route and service coverage.
+- PASS: `apps/web` tests passed (`9 files, 78 tests`).
+- PASS: `apps/web` lint passed with no warnings or errors.
+- PASS: `/live-trading` operational UI surface implemented as operator control plane only (no direct order submission).
+- PASS: Live API/UI surfaces emit explicit `available|unknown|unavailable` state and operator warnings.
+- PASS: Approval workflow state-changing endpoints remain attributable and provenance-capturing through append-only live approval events.
+- PASS: Compliance evidence/export surfaces are read-safe and non-mutating.
+- PASS: Paper default and Risk Engine final-authority boundaries remain explicit and fail-visible.
+
+### Notes
+
+- One transient test assertion issue in `apps/web/test/live-trading-page.test.tsx` was corrected to handle multiple fail-visible labels; rerun passed.
