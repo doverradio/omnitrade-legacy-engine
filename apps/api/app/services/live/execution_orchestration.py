@@ -13,6 +13,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.models.live_execution_event import LiveExecutionEvent
 from app.models.live_trading_profile import LiveTradingProfile
 from app.services.live.approval import evaluate_live_approval_gate
+from app.services.live.resilience import evaluate_live_submission_guard
 from app.services.live.broker_adapters import (
     BrokerAdapterContract,
     BrokerIdempotencyContract,
@@ -164,6 +165,19 @@ async def orchestrate_live_execution(
             request=request,
             idempotency_key=idempotency_key,
             reason="risk_engine_final_authority_required",
+        )
+
+    submission_guard = await evaluate_live_submission_guard(
+        db=db,
+        live_trading_profile_id=request.live_trading_profile_id,
+    )
+    if not submission_guard.allowed:
+        return await _record_blocked_execution(
+            db=db,
+            profile=profile,
+            request=request,
+            idempotency_key=idempotency_key,
+            reason=submission_guard.reason or "live_submission_blocked",
         )
 
     approval_gate = await evaluate_live_approval_gate(

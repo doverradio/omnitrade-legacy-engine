@@ -29,6 +29,7 @@ from app.models.live_approval_event import LiveApprovalEvent
 from app.models.live_execution_event import LiveExecutionEvent
 from app.models.live_execution_quality_metric import LiveExecutionQualityMetric
 from app.models.live_reconciliation_event import LiveReconciliationEvent
+from app.models.live_resilience_event import LiveResilienceEvent
 from app.models.live_trading_event import LiveTradingEvent
 from app.models.live_trading_profile import LiveTradingProfile
 from app.models.parameter_set import ParameterSet
@@ -72,6 +73,7 @@ __all__ = [
 	"LiveExecutionEvent",
 	"LiveExecutionQualityMetric",
 	"LiveReconciliationEvent",
+	"LiveResilienceEvent",
 	"LiveTradingEvent",
 	"LiveTradingProfile",
 	"PaperAccount",

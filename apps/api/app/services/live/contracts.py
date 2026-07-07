@@ -285,6 +285,58 @@ class LiveExecutionQualityReadModel:
 
 
 @dataclass(frozen=True)
+class LiveKillSwitchRequest:
+    live_trading_profile_id: uuid.UUID
+    requested_by: str
+    reason_code: str
+    provenance_metadata: dict[str, Any]
+    idempotency_key: str | None = None
+
+
+@dataclass(frozen=True)
+class LiveOutageDetectionRequest:
+    live_trading_profile_id: uuid.UUID
+    provider_name: str
+    requested_by: str
+    reason_code: str
+    ambiguity_detected: bool
+    provenance_metadata: dict[str, Any]
+    idempotency_key: str | None = None
+
+
+@dataclass(frozen=True)
+class LiveRecoveryRequest:
+    live_trading_profile_id: uuid.UUID
+    requested_by: str
+    rationale: str
+    approval_event_id: uuid.UUID | None
+    provenance_metadata: dict[str, Any]
+    idempotency_key: str | None = None
+
+
+@dataclass(frozen=True)
+class LiveResilienceEventResult:
+    event_id: uuid.UUID
+    live_trading_profile_id: uuid.UUID
+    event_type: str
+    submission_blocked: bool
+    reapproval_required: bool
+    reason_code: str
+    idempotency_key: str
+
+
+@dataclass(frozen=True)
+class LiveSubmissionGuardResult:
+    allowed: bool
+    reason: str | None
+    submission_blocked: bool
+    kill_switch_engaged: bool
+    outage_detected: bool
+    ambiguity_detected: bool
+    reapproval_required: bool
+
+
+@dataclass(frozen=True)
 class LiveTradingImmutableEventContract:
     idempotency_key: str
     event_hash: str
