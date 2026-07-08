@@ -181,6 +181,7 @@ scripts/
 ├── setup.sh                      # one-shot local environment bootstrap
 ├── seed_assets.py                # seeds assets table (BTC/ETH/SOL, AAPL, etc.)
 ├── seed_strategies.py            # seeds strategies table (6 MVP strategies, inactive)
+├── activate_strategy.py          # promotes the seeded MA Crossover strategy to paper-active
 ├── backfill_historical.py        # CLI historical candle backfill
 ├── reset_paper_account.py        # dev utility mirroring POST /paper/reset
 └── check_env.py                  # validates required env vars are present before running

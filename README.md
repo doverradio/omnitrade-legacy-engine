@@ -38,6 +38,7 @@ alembic upgrade head
 python scripts/seed_assets.py
 python scripts/seed_strategies.py
 python scripts/seed_paper_accounts.py
+python scripts/activate_strategy.py
 ```
 
 ### 2) Frontend Setup (`apps/web`)

@@ -1,13 +1,18 @@
 from __future__ import annotations
 
+import uuid
+
 from fastapi import APIRouter, Depends, Query
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.core.errors import UnauthorizedError
+from app.core.security import get_current_user
 from app.db.session import get_db
 from app.models.parameter_set import ParameterSet
 from app.models.strategy import Strategy
-from app.schemas.strategy import StrategyListResponse, StrategyResponse
+from app.schemas.strategy import StrategyActivationResponse, StrategyListResponse, StrategyResponse
+from app.services.strategies.promotion import activate_strategy
 
 router = APIRouter(prefix="/strategies", tags=["strategies"])
 
@@ -50,4 +55,26 @@ async def list_strategies(
             )
             for strategy in strategies
         ]
+    )
+
+
+@router.post("/{strategy_id}/activate", response_model=StrategyActivationResponse)
+async def activate_strategy_route(
+    strategy_id: uuid.UUID,
+    db: AsyncSession = Depends(get_db),
+    current_user: dict[str, str] | None = Depends(get_current_user),
+) -> StrategyActivationResponse:
+    if current_user is None:
+        raise UnauthorizedError(message="Authentication required", details={})
+
+    result = await activate_strategy(
+        db,
+        strategy_id=strategy_id,
+        activated_by=current_user["id"],
+    )
+    return StrategyActivationResponse(
+        status="activated",
+        strategy_id=result.strategy_id,
+        name=result.name,
+        active=result.active,
     )

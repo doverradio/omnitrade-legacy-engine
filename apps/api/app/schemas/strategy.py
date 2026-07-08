@@ -19,3 +19,10 @@ class StrategyResponse(BaseModel):
 
 class StrategyListResponse(BaseModel):
     items: list[StrategyResponse]
+
+
+class StrategyActivationResponse(BaseModel):
+    status: str
+    strategy_id: uuid.UUID
+    name: str
+    active: bool
