@@ -14,6 +14,7 @@ from app.db.session import get_db
 from app.models.decision_counterfactual_result import DecisionCounterfactualResult
 from app.models.decision_quality_score import DecisionQualityScore
 from app.models.decision_record import DecisionRecord
+from app.models.signal import Signal
 from app.services.arena.comparison import read_latest_arena_comparison_record
 from app.services.arena.contracts import ArenaLeaderboardFilterContract
 from app.services.arena.leaderboard import read_latest_arena_leaderboard_snapshot
@@ -21,6 +22,7 @@ from app.services.arena.tournaments import (
     read_arena_tournament_history_events,
     read_arena_tournament_lifecycle_state,
 )
+from app.services.decisions.coach import generate_ai_coach_batch_reviews
 from app.services.decisions.explainability import read_decision_explainability
 from app.services.decisions.recommendations import read_experiment_recommendations
 from app.services.decisions.timeline import TimelineReadFilters, read_decision_timeline
@@ -406,6 +408,208 @@ async def get_decision_timeline(
     return _paginate(items=items, page=page, page_size=page_size)
 
 
+@router.get("/records")
+async def list_decision_records(
+    asset_id: uuid.UUID | None = Query(default=None),
+    strategy_id: uuid.UUID | None = Query(default=None),
+    action: str | None = Query(default=None),
+    trade_accepted: bool | None = Query(default=None),
+    review_status: str | None = Query(default=None),
+    start_time: datetime | None = Query(default=None),
+    end_time: datetime | None = Query(default=None),
+    page: int = Query(default=1, ge=1),
+    page_size: int = Query(default=50, ge=1, le=MAX_PAGE_SIZE),
+    db: AsyncSession = Depends(get_db),
+) -> dict[str, Any]:
+    _validate_time_range(start_time=start_time, end_time=end_time)
+
+    statement = select(DecisionRecord).order_by(DecisionRecord.timestamp.desc(), DecisionRecord.decision_id.desc())
+    if trade_accepted is not None:
+        statement = statement.where(DecisionRecord.trade_accepted.is_(trade_accepted))
+    if review_status is not None:
+        statement = statement.where(DecisionRecord.review_status == review_status)
+    if start_time is not None:
+        statement = statement.where(DecisionRecord.timestamp >= start_time)
+    if end_time is not None:
+        statement = statement.where(DecisionRecord.timestamp <= end_time)
+
+    decision_rows = list((await db.execute(statement)).scalars().all())
+
+    signal_ids: list[uuid.UUID] = []
+    for row in decision_rows:
+        signal_id = _extract_primary_signal_id(row)
+        if signal_id is not None:
+            signal_ids.append(signal_id)
+
+    signal_map: dict[uuid.UUID, Signal] = {}
+    if signal_ids:
+        signal_rows = list(
+            (
+                await db.execute(
+                    select(Signal).where(Signal.id.in_(sorted(set(signal_ids))))
+                )
+            ).scalars().all()
+        )
+        signal_map = {item.id: item for item in signal_rows}
+
+    filtered_rows: list[DecisionRecord] = []
+    for row in decision_rows:
+        linked_signal = _linked_signal(row=row, signal_map=signal_map)
+        record_asset_id = _coerce_uuid_from_asset(row.asset.get("asset_id") if isinstance(row.asset, dict) else None)
+        resolved_asset_id = linked_signal.asset_id if linked_signal is not None else record_asset_id
+
+        if asset_id is not None and resolved_asset_id != asset_id:
+            continue
+        if strategy_id is not None:
+            if linked_signal is None or linked_signal.strategy_id != strategy_id:
+                continue
+        if action is not None:
+            resolved_action = linked_signal.action if linked_signal is not None else _record_action(row)
+            if resolved_action != action:
+                continue
+
+        filtered_rows.append(row)
+
+    filtered_decision_ids = [row.decision_id for row in filtered_rows]
+    filtered_decision_id_set = set(filtered_decision_ids)
+
+    latest_quality_by_decision: dict[uuid.UUID, DecisionQualityScore] = {}
+    counterfactuals_by_decision: dict[uuid.UUID, list[DecisionCounterfactualResult]] = {}
+    recommendation_history_by_decision: dict[uuid.UUID, dict[str, Any]] = {}
+
+    if filtered_decision_ids:
+        quality_rows = list(
+            (
+                await db.execute(
+                    select(DecisionQualityScore)
+                    .where(DecisionQualityScore.decision_id.in_(filtered_decision_ids))
+                    .order_by(
+                        DecisionQualityScore.decision_id.asc(),
+                        DecisionQualityScore.created_at.desc(),
+                        DecisionQualityScore.id.desc(),
+                    )
+                )
+            ).scalars().all()
+        )
+        for quality_row in quality_rows:
+            if quality_row.decision_id not in latest_quality_by_decision:
+                latest_quality_by_decision[quality_row.decision_id] = quality_row
+
+        counterfactual_rows = list(
+            (
+                await db.execute(
+                    select(DecisionCounterfactualResult)
+                    .where(DecisionCounterfactualResult.decision_id.in_(filtered_decision_ids))
+                    .order_by(
+                        DecisionCounterfactualResult.decision_id.asc(),
+                        DecisionCounterfactualResult.evaluated_at.desc(),
+                        DecisionCounterfactualResult.horizon_minutes.asc(),
+                        DecisionCounterfactualResult.id.asc(),
+                    )
+                )
+            ).scalars().all()
+        )
+        for counterfactual in counterfactual_rows:
+            counterfactuals_by_decision.setdefault(counterfactual.decision_id, []).append(counterfactual)
+
+        recommendation_rows = await read_experiment_recommendations(db=db)
+        for recommendation_row in recommendation_rows:
+            recommendation_created_at = _coerce_datetime(recommendation_row.created_at)
+
+            for decision_id_value in recommendation_row.originating_decision_ids:
+                decision_id = _coerce_uuid_string(decision_id_value)
+                if decision_id is None or decision_id not in filtered_decision_id_set:
+                    continue
+
+                summary = recommendation_history_by_decision.get(decision_id)
+                if summary is None:
+                    summary = {
+                        "count": 0,
+                        "latest_recommendation_at": recommendation_created_at.isoformat(),
+                        "latest_recommendation_type": recommendation_row.recommendation_type,
+                        "latest_recommendation_state": recommendation_row.evidence_state,
+                        "recommendation_ids": [],
+                    }
+                    recommendation_history_by_decision[decision_id] = summary
+
+                summary["count"] += 1
+                summary["recommendation_ids"].append(str(recommendation_row.recommendation_id))
+                latest_at = summary.get("latest_recommendation_at")
+                if not isinstance(latest_at, str) or recommendation_created_at.isoformat() > latest_at:
+                    summary["latest_recommendation_at"] = recommendation_created_at.isoformat()
+                    summary["latest_recommendation_type"] = recommendation_row.recommendation_type
+                    summary["latest_recommendation_state"] = recommendation_row.evidence_state
+
+    items: list[dict[str, Any]] = []
+    for row in filtered_rows:
+        linked_signal = _linked_signal(row=row, signal_map=signal_map)
+        items.append(
+            {
+                "decision_id": str(row.decision_id),
+                "timestamp": row.timestamp.isoformat(),
+                "asset_id": row.asset.get("asset_id") if isinstance(row.asset, dict) else None,
+                "trade_accepted": row.trade_accepted,
+                "review_status": row.review_status,
+                "outcome": row.outcome,
+                "action": _record_action(row),
+                "decision_explanation": {
+                    "trade_rejected_reason": row.trade_rejected_reason,
+                    "ai_reflection": row.ai_reflection,
+                    "post_trade_notes": row.post_trade_notes,
+                    "human_notes": row.human_notes,
+                    "lessons_learned": row.lessons_learned,
+                },
+                "linked_signal": {
+                    "signal_id": str(linked_signal.id) if linked_signal is not None else _record_signal_id_string(row),
+                    "strategy_id": str(linked_signal.strategy_id) if linked_signal is not None else None,
+                    "asset_id": str(linked_signal.asset_id) if linked_signal is not None else None,
+                    "action": linked_signal.action if linked_signal is not None else _record_action(row),
+                    "status": linked_signal.status if linked_signal is not None else _record_signal_status(row),
+                    "signal_time": linked_signal.signal_time.isoformat() if linked_signal is not None else None,
+                },
+                "quality_score": _quality_score_summary(latest_quality_by_decision.get(row.decision_id)),
+                "future_outcome_tracking": _future_outcome_summary(counterfactuals_by_decision.get(row.decision_id, [])),
+                "recommendation_history": recommendation_history_by_decision.get(
+                    row.decision_id,
+                    {
+                        "count": 0,
+                        "latest_recommendation_at": None,
+                        "latest_recommendation_type": None,
+                        "latest_recommendation_state": "unavailable",
+                        "recommendation_ids": [],
+                    },
+                ),
+            }
+        )
+
+    return _paginate(items=items, page=page, page_size=page_size)
+
+
+@router.post("/coach/reviews/generate")
+async def generate_ai_coach_reviews(
+    lookback_hours: int = Query(default=24, ge=1, le=720),
+    limit: int = Query(default=250, ge=1, le=1000),
+    db: AsyncSession = Depends(get_db),
+) -> dict[str, Any]:
+    result = await generate_ai_coach_batch_reviews(
+        db=db,
+        lookback_hours=lookback_hours,
+        limit=limit,
+    )
+    await db.commit()
+
+    return {
+        "status": "ok",
+        "advisory_only": True,
+        "paper_mode_only": True,
+        "no_automatic_strategy_changes": True,
+        "scanned_records": result.scanned_records,
+        "inserted_recommendations": result.inserted_recommendations,
+        "skipped_existing": result.skipped_existing,
+        "recommendation_ids": [str(item) for item in result.recommendation_ids],
+    }
+
+
 @router.get("/{decision_id}/explainability")
 async def get_decision_explainability(
     decision_id: uuid.UUID,
@@ -743,3 +947,121 @@ def _coerce_datetime(value: Any) -> datetime:
     if isinstance(value, str):
         return datetime.fromisoformat(value)
     raise InvalidRequestError(message="Invalid timestamp value", details={"value": str(value)})
+
+
+def _extract_primary_signal_id(record: DecisionRecord) -> uuid.UUID | None:
+    lineage = record.source_lineage if isinstance(record.source_lineage, dict) else {}
+    signal_refs = lineage.get("signals")
+    if not isinstance(signal_refs, list) or not signal_refs:
+        return None
+
+    first = signal_refs[0]
+    if not isinstance(first, str):
+        return None
+    try:
+        return uuid.UUID(first)
+    except ValueError:
+        return None
+
+
+def _linked_signal(*, row: DecisionRecord, signal_map: dict[uuid.UUID, Signal]) -> Signal | None:
+    signal_id = _extract_primary_signal_id(row)
+    if signal_id is None:
+        return None
+    return signal_map.get(signal_id)
+
+
+def _record_action(row: DecisionRecord) -> str | None:
+    if row.generated_signals and isinstance(row.generated_signals[0], dict):
+        value = row.generated_signals[0].get("action")
+        if isinstance(value, str):
+            return value
+    return None
+
+
+def _record_signal_status(row: DecisionRecord) -> str | None:
+    if row.generated_signals and isinstance(row.generated_signals[0], dict):
+        value = row.generated_signals[0].get("status")
+        if isinstance(value, str):
+            return value
+    return None
+
+
+def _record_signal_id_string(row: DecisionRecord) -> str | None:
+    signal_id = _extract_primary_signal_id(row)
+    if signal_id is None:
+        return None
+    return str(signal_id)
+
+
+def _coerce_uuid_from_asset(value: Any) -> uuid.UUID | None:
+    if not isinstance(value, str):
+        return None
+    try:
+        return uuid.UUID(value)
+    except ValueError:
+        return None
+
+
+def _coerce_uuid_string(value: Any) -> uuid.UUID | None:
+    if not isinstance(value, str):
+        return None
+    try:
+        return uuid.UUID(value)
+    except ValueError:
+        return None
+
+
+def _quality_score_summary(score: DecisionQualityScore | None) -> dict[str, Any]:
+    if score is None:
+        return {
+            "availability_state": "unavailable",
+            "state_reason": "quality_score_unavailable",
+            "scoring_model_version": None,
+            "composite_score": None,
+            "created_at": None,
+        }
+
+    return {
+        "availability_state": "known",
+        "state_reason": None,
+        "scoring_model_version": score.scoring_model_version,
+        "composite_score": _decimal_to_str(score.composite_score),
+        "created_at": score.created_at.isoformat(),
+    }
+
+
+def _future_outcome_summary(counterfactual_rows: list[DecisionCounterfactualResult]) -> dict[str, Any]:
+    if not counterfactual_rows:
+        return {
+            "availability_state": "unavailable",
+            "state_reason": "counterfactual_outcomes_unavailable",
+            "horizons_evaluated": [],
+            "resolved_horizons": 0,
+            "total_horizons": 0,
+            "latest_evaluated_at": None,
+            "latest_horizon_label": None,
+            "latest_evaluation_state": None,
+            "latest_best_action": None,
+            "latest_actual_action_correct": None,
+        }
+
+    latest = max(
+        counterfactual_rows,
+        key=lambda item: (item.evaluated_at, item.horizon_minutes, str(item.id)),
+    )
+    resolved_horizons = sum(1 for item in counterfactual_rows if item.evaluation_state == "resolved")
+    horizon_set = sorted({item.horizon_label for item in counterfactual_rows})
+
+    return {
+        "availability_state": "known",
+        "state_reason": None,
+        "horizons_evaluated": horizon_set,
+        "resolved_horizons": resolved_horizons,
+        "total_horizons": len(counterfactual_rows),
+        "latest_evaluated_at": latest.evaluated_at.isoformat(),
+        "latest_horizon_label": latest.horizon_label,
+        "latest_evaluation_state": latest.evaluation_state,
+        "latest_best_action": latest.best_action,
+        "latest_actual_action_correct": latest.actual_action_correct,
+    }

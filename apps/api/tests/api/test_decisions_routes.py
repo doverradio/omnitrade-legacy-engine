@@ -89,6 +89,14 @@ class _FakeSession:
         sql = str(statement)
         params = statement.compile().params
 
+        if "FROM decision_records" in sql and "LEFT OUTER JOIN decision_snapshots" not in sql:
+            rows = [item for item, _ in self.decision_rows]
+            rows.sort(key=lambda item: (item.timestamp, str(item.decision_id)), reverse=True)
+            return _ExecuteResult(rows, scalar_items=rows)
+
+        if "FROM signals" in sql:
+            return _ExecuteResult([], scalar_items=[])
+
         if "FROM decision_records LEFT OUTER JOIN decision_snapshots" in sql:
             return _ExecuteResult(self.decision_rows)
 
@@ -105,8 +113,12 @@ class _FakeSession:
 
         if "FROM decision_counterfactual_results" in sql:
             if "decision_id_1" in params:
-                decision_id = params.get("decision_id_1")
-                rows = [item for item in self.counterfactual_results if item.decision_id == decision_id]
+                decision_param = params.get("decision_id_1")
+                if isinstance(decision_param, (list, tuple, set)):
+                    requested = {item for item in decision_param if isinstance(item, uuid.UUID)}
+                    rows = [item for item in self.counterfactual_results if item.decision_id in requested]
+                else:
+                    rows = [item for item in self.counterfactual_results if item.decision_id == decision_param]
             else:
                 rows = list(self.counterfactual_results)
             rows.sort(key=lambda item: (item.decision_timestamp, item.horizon_minutes, str(item.id)), reverse=True)
@@ -429,3 +441,26 @@ def test_recommendations_endpoint_is_read_only_and_supports_filters() -> None:
     assert post_attempt.status_code == 405
     assert fake.add_calls == 0
     assert fake.begin_calls == 0
+
+
+def test_decision_records_endpoint_includes_learn_layer_enrichments() -> None:
+    fake = _seed_data()
+
+    with _create_test_client(fake) as client:
+        response = client.get("/decisions/records", params={"page": 1, "page_size": 20})
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["total"] == 2
+
+    first_item = payload["items"][0]
+    assert first_item["quality_score"]["availability_state"] == "known"
+    assert first_item["future_outcome_tracking"]["availability_state"] == "known"
+    assert first_item["future_outcome_tracking"]["total_horizons"] == 1
+    assert first_item["recommendation_history"]["count"] == 1
+    assert first_item["recommendation_history"]["latest_recommendation_state"] == "known"
+
+    second_item = payload["items"][1]
+    assert second_item["quality_score"]["availability_state"] == "unavailable"
+    assert second_item["future_outcome_tracking"]["availability_state"] == "unavailable"
+    assert second_item["recommendation_history"]["count"] == 0

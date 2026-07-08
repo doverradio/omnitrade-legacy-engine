@@ -3,6 +3,7 @@ import type { ReactNode } from "react";
 
 const navItems = [
   { href: "/dashboard", label: "Dashboard" },
+  { href: "/dashboard/decisions", label: "Decision Records" },
   { href: "/decision-arena", label: "Decision Arena" },
   { href: "/decision-intelligence", label: "Decision Intelligence" },
   { href: "/markets", label: "Markets" },

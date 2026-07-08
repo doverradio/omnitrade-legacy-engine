@@ -124,6 +124,80 @@ export type DecisionRecommendationItem = {
   created_at: string;
 };
 
+export type DecisionRecordItem = {
+  decision_id: string;
+  timestamp: string;
+  asset_id: string | null;
+  trade_accepted: boolean;
+  review_status: string | null;
+  outcome: string | null;
+  action: string | null;
+  decision_explanation: {
+    trade_rejected_reason: string | null;
+    ai_reflection: Record<string, unknown> | null;
+    post_trade_notes: Record<string, unknown> | null;
+    human_notes: string | null;
+    lessons_learned: Array<Record<string, unknown>> | null;
+  };
+  linked_signal: {
+    signal_id: string | null;
+    strategy_id: string | null;
+    asset_id: string | null;
+    action: string | null;
+    status: string | null;
+    signal_time: string | null;
+  };
+  quality_score: {
+    availability_state: KnownState;
+    state_reason: string | null;
+    scoring_model_version: string | null;
+    composite_score: string | null;
+    created_at: string | null;
+  };
+  future_outcome_tracking: {
+    availability_state: KnownState;
+    state_reason: string | null;
+    horizons_evaluated: string[];
+    resolved_horizons: number;
+    total_horizons: number;
+    latest_evaluated_at: string | null;
+    latest_horizon_label: string | null;
+    latest_evaluation_state: string | null;
+    latest_best_action: string | null;
+    latest_actual_action_correct: boolean | null;
+  };
+  recommendation_history: {
+    count: number;
+    latest_recommendation_at: string | null;
+    latest_recommendation_type: string | null;
+    latest_recommendation_state: KnownState;
+    recommendation_ids: string[];
+  };
+};
+
+export type DecisionRecordFilters = {
+  asset_id?: string;
+  strategy_id?: string;
+  action?: string;
+  trade_accepted?: boolean;
+  review_status?: string;
+  start_time?: string;
+  end_time?: string;
+  page?: number;
+  page_size?: number;
+};
+
+export type CoachReviewGenerationResponse = {
+  status: string;
+  advisory_only: boolean;
+  paper_mode_only: boolean;
+  no_automatic_strategy_changes: boolean;
+  scanned_records: number;
+  inserted_recommendations: number;
+  skipped_existing: number;
+  recommendation_ids: string[];
+};
+
 export type PaginatedResponse<T> = {
   items: T[];
   page: number;
@@ -230,4 +304,45 @@ export async function getDecisionQuality(filters: DecisionReadFilters): Promise<
 export async function getDecisionRecommendations(filters: DecisionReadFilters): Promise<PaginatedResponse<DecisionRecommendationItem>> {
   const query = buildQuery(filters);
   return requestJson<PaginatedResponse<DecisionRecommendationItem>>(`/decisions/recommendations?${query}`);
+}
+
+export async function getDecisionRecords(filters: DecisionRecordFilters): Promise<PaginatedResponse<DecisionRecordItem>> {
+  const query = new URLSearchParams();
+  if (filters.asset_id) {
+    query.set("asset_id", filters.asset_id);
+  }
+  if (filters.strategy_id) {
+    query.set("strategy_id", filters.strategy_id);
+  }
+  if (filters.action) {
+    query.set("action", filters.action);
+  }
+  if (typeof filters.trade_accepted === "boolean") {
+    query.set("trade_accepted", String(filters.trade_accepted));
+  }
+  if (filters.review_status) {
+    query.set("review_status", filters.review_status);
+  }
+  if (filters.start_time) {
+    query.set("start_time", filters.start_time);
+  }
+  if (filters.end_time) {
+    query.set("end_time", filters.end_time);
+  }
+  query.set("page", String(filters.page ?? 1));
+  query.set("page_size", String(filters.page_size ?? 50));
+
+  return requestJson<PaginatedResponse<DecisionRecordItem>>(`/decisions/records?${query.toString()}`);
+}
+
+export async function generateCoachReviews(params?: {
+  lookback_hours?: number;
+  limit?: number;
+}): Promise<CoachReviewGenerationResponse> {
+  const query = new URLSearchParams();
+  query.set("lookback_hours", String(params?.lookback_hours ?? 24));
+  query.set("limit", String(params?.limit ?? 250));
+  return requestJson<CoachReviewGenerationResponse>(`/decisions/coach/reviews/generate?${query.toString()}`, {
+    method: "POST",
+  });
 }
