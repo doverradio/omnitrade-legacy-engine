@@ -132,6 +132,7 @@ export default function ValidationRunsPage() {
     order: "newest",
     window: "entire_run",
     category: "all",
+    severity: "all",
     search: "",
   });
   const [selectedRunId, setSelectedRunId] = useState<string | null>(null);
@@ -170,6 +171,7 @@ export default function ValidationRunsPage() {
         order: timelineQuery.order,
         window: timelineQuery.window,
         category: timelineQuery.category,
+        severity: timelineQuery.severity,
         search: timelineQuery.search,
       });
 
@@ -214,6 +216,7 @@ export default function ValidationRunsPage() {
           order: timelineQuery.order,
           window: timelineQuery.window,
           category: timelineQuery.category,
+          severity: timelineQuery.severity,
           search: timelineQuery.search,
         }),
       ]);

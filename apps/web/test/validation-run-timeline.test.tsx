@@ -1,5 +1,5 @@
 import { fireEvent, render, screen } from "@testing-library/react";
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 
 import ValidationRunTimeline, { type TimelineQuery } from "@/components/domain/ValidationRunTimeline";
 import type { ValidationRunEvent } from "@/lib/api/arena";
@@ -8,6 +8,7 @@ const DEFAULT_QUERY: TimelineQuery = {
   order: "newest",
   window: "entire_run",
   category: "all",
+  severity: "all",
   search: "",
 };
 
@@ -78,5 +79,15 @@ describe("ValidationRunTimeline", () => {
 
     Object.defineProperty(scroller, "scrollHeight", { value: 520, configurable: true });
     expect(scroller.scrollTop).toBeGreaterThan(80);
+  });
+
+  it("supports filtering controls", () => {
+    const onQueryChange = vi.fn();
+    render(<ValidationRunTimeline events={[buildEvent({ id: 1 })]} query={DEFAULT_QUERY} onQueryChange={onQueryChange} />);
+
+    fireEvent.change(screen.getByLabelText("Filter"), { target: { value: "strategy" } });
+    fireEvent.change(screen.getByLabelText("Severity"), { target: { value: "yellow" } });
+
+    expect(onQueryChange).toHaveBeenCalled();
   });
 });

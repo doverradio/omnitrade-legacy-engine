@@ -4,6 +4,7 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 import uuid
+from typing import Any
 
 from sqlalchemy import func, select, text
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -31,32 +32,79 @@ _ALLOWED_STATUSES = {"DRAFT", "RUNNING", "COMPLETED", "FAILED", "CANCELLED"}
 _ALLOWED_RESULT_STATUSES = {"PASS", "CONDITIONAL_PASS", "FAIL", "INCOMPLETE"}
 _EVENT_ORDER = {"newest", "oldest"}
 _EVENT_WINDOWS = {"last_hour", "last_24_hours", "entire_run"}
-_EVENT_CATEGORIES = {"all", "trading", "research", "evolution", "ai", "warnings", "failures", "manual_notes"}
+_EVENT_CATEGORIES = {"all", "system", "market", "strategy", "risk", "execution", "research", "database", "warnings", "failures", "manual_notes"}
+_EVENT_SEVERITIES = {"all", "green", "blue", "purple", "yellow", "red", "gray"}
+_EVENT_TYPE_CATEGORY = {
+    "VALIDATION_RUN_STARTED": "system",
+    "VALIDATION_RUN_COMPLETED": "system",
+    "VALIDATION_RUN_CANCELLED": "system",
+    "VALIDATION_HEARTBEAT": "system",
+    "CANDLE_BATCH_INGESTED": "market",
+    "ASSET_SYNCHRONIZATION_COMPLETED": "market",
+    "SIGNAL_GENERATED": "strategy",
+    "BUY_CANDIDATE_CREATED": "strategy",
+    "SELL_CANDIDATE_CREATED": "strategy",
+    "HOLD_DECISION_RECORDED": "strategy",
+    "RISK_EVALUATION_STARTED": "risk",
+    "RISK_APPROVED": "risk",
+    "RISK_REJECTED": "risk",
+    "PAPER_TRADE_SUBMITTED": "execution",
+    "PAPER_TRADE_FILLED": "execution",
+    "PAPER_TRADE_REJECTED": "execution",
+    "POSITION_OPENED": "execution",
+    "POSITION_CLOSED": "execution",
+    "RESEARCH_CAMPAIGN_STARTED": "research",
+    "RESEARCH_CAMPAIGN_COMPLETED": "research",
+    "EVOLUTION_CYCLE_STARTED": "research",
+    "EVOLUTION_CYCLE_COMPLETED": "research",
+    "CHAMPION_STRATEGY_CHANGED": "research",
+    "MIGRATION_DETECTED": "database",
+    "DATABASE_HEALTH_WARNING": "database",
+    "DATABASE_RECOVERED": "database",
+    "WARNING": "warnings",
+    "FAILURE": "failures",
+    "MANUAL_NOTE": "manual_notes",
+}
 _CATEGORY_EVENT_TYPES = {
-    "trading": {
+    "market": {
+        "CANDLE_BATCH_INGESTED",
+        "ASSET_SYNCHRONIZATION_COMPLETED",
+    },
+    "strategy": {
         "SIGNAL_GENERATED",
-        "BUY_CANDIDATE",
-        "SELL_CANDIDATE",
-        "PAPER_TRADE_EXECUTED",
-        "CAPITAL_ALLOCATION_UPDATED",
-        "MARKET_DATA",
-        "CANDLES_INGESTED",
+        "BUY_CANDIDATE_CREATED",
+        "SELL_CANDIDATE_CREATED",
+        "HOLD_DECISION_RECORDED",
+    },
+    "risk": {
+        "RISK_EVALUATION_STARTED",
+        "RISK_APPROVED",
+        "RISK_REJECTED",
+    },
+    "execution": {
+        "PAPER_TRADE_SUBMITTED",
+        "PAPER_TRADE_FILLED",
+        "PAPER_TRADE_REJECTED",
+        "POSITION_OPENED",
+        "POSITION_CLOSED",
     },
     "research": {
         "RESEARCH_CAMPAIGN_STARTED",
         "RESEARCH_CAMPAIGN_COMPLETED",
-        "RESEARCH_CANDIDATE_GENERATED",
-        "RESEARCH_MEMORY_SAVED",
+        "EVOLUTION_CYCLE_STARTED",
+        "EVOLUTION_CYCLE_COMPLETED",
+        "CHAMPION_STRATEGY_CHANGED",
     },
-    "evolution": {
-        "EVOLUTION_CREATED_DESCENDANT",
-        "TOURNAMENT_UPDATED",
-        "CHAMPION_CHANGED",
+    "database": {
+        "MIGRATION_DETECTED",
+        "DATABASE_HEALTH_WARNING",
+        "DATABASE_RECOVERED",
     },
-    "ai": {
-        "RESEARCH_CANDIDATE_GENERATED",
-        "RESEARCH_MEMORY_SAVED",
-        "CHAMPION_CHANGED",
+    "system": {
+        "VALIDATION_RUN_STARTED",
+        "VALIDATION_RUN_COMPLETED",
+        "VALIDATION_RUN_CANCELLED",
+        "VALIDATION_HEARTBEAT",
     },
     "warnings": {"WARNING", "RISK_EVENT"},
     "failures": {"FAILURE", "ALERT"},
@@ -78,6 +126,28 @@ class _MetricSnapshot:
     research_memory_growth: int
     alerts_count: int
     current_champion: str | None
+
+
+@dataclass(frozen=True, slots=True)
+class _EventStreamSnapshot:
+    candles: int
+    assets: int
+    signals_total: int
+    signals_buy: int
+    signals_sell: int
+    signals_hold: int
+    risk_total: int
+    risk_approved: int
+    risk_rejected: int
+    trades: int
+    trade_buy: int
+    trade_sell: int
+    campaign_started: int
+    campaign_completed: int
+    evolution_cycles: int
+    champion: str | None
+    db_state: str
+    db_version: str | None
 
 
 async def list_validation_runs(*, db: AsyncSession) -> list[ValidationRunResponse]:
@@ -129,11 +199,11 @@ async def create_validation_run(*, db: AsyncSession, request: ValidationRunCreat
     db.add(
         ValidationRunEvent(
             validation_run_id=run.validation_run_id,
-            event_type="VALIDATION_STARTED",
+            event_type="MANUAL_NOTE",
             message="Validation run created",
             payload={
-                "severity": "blue",
-                "title": "Validation Started",
+                "severity": "gray",
+                "title": "Manual Note",
                 "description": "Validation run created in draft mode.",
                 "metadata": {
                     "status": "DRAFT",
@@ -186,11 +256,11 @@ async def start_validation_run(*, db: AsyncSession, validation_run_id: uuid.UUID
     db.add(
         ValidationRunEvent(
             validation_run_id=run.validation_run_id,
-            event_type="VALIDATION_STARTED",
+            event_type="VALIDATION_RUN_STARTED",
             message="Validation run started",
             payload={
                 "severity": "green",
-                "title": "Validation Started",
+                "title": "Validation Run Started",
                 "description": "Validation run is now active and collecting baseline metrics.",
                 "metadata": {
                     "started_at": now.isoformat(),
@@ -240,11 +310,11 @@ async def cancel_validation_run(*, db: AsyncSession, validation_run_id: uuid.UUI
     db.add(
         ValidationRunEvent(
             validation_run_id=run.validation_run_id,
-            event_type="WARNING",
+            event_type="VALIDATION_RUN_CANCELLED",
             message="Validation run cancelled",
             payload={
                 "severity": "yellow",
-                "title": "Warning",
+                "title": "Validation Run Cancelled",
                 "description": "Validation run cancelled before completion.",
                 "metadata": {"completed_at": now.isoformat()},
             },
@@ -273,12 +343,14 @@ async def list_validation_run_events(
     order: str = "newest",
     window: str = "entire_run",
     category: str = "all",
+    severity: str = "all",
     search: str | None = None,
 ) -> ValidationRunEventListResponse:
-    await _load_run(db=db, validation_run_id=validation_run_id)
+    run = await _load_run(db=db, validation_run_id=validation_run_id)
     normalized_order = order.strip().lower()
     normalized_window = window.strip().lower()
     normalized_category = category.strip().lower()
+    normalized_severity = severity.strip().lower()
     normalized_search = (search or "").strip().lower() or None
 
     if normalized_order not in _EVENT_ORDER:
@@ -287,8 +359,12 @@ async def list_validation_run_events(
         raise InvalidRequestError(message="Invalid event window", details={"window": window})
     if normalized_category not in _EVENT_CATEGORIES:
         raise InvalidRequestError(message="Invalid event category", details={"category": category})
+    if normalized_severity not in _EVENT_SEVERITIES:
+        raise InvalidRequestError(message="Invalid event severity", details={"severity": severity})
     if page <= 0 or page_size <= 0:
         raise InvalidRequestError(message="page and page_size must be > 0", details={"page": page, "page_size": page_size})
+
+    await _stream_validation_events(db=db, run=run)
 
     statement = select(ValidationRunEvent).where(ValidationRunEvent.validation_run_id == validation_run_id)
     if normalized_order == "oldest":
@@ -305,6 +381,13 @@ async def list_validation_run_events(
     category_event_types = _CATEGORY_EVENT_TYPES.get(normalized_category)
     if category_event_types:
         filtered_rows = [item for item in filtered_rows if item.event_type in category_event_types]
+
+    if normalized_severity != "all":
+        filtered_rows = [
+            item
+            for item in filtered_rows
+            if _safe_text(dict(item.payload or {}).get("severity")) == normalized_severity
+        ]
 
     if normalized_search is not None:
         filtered_rows = [
@@ -329,6 +412,7 @@ async def list_validation_run_events(
         order=normalized_order,
         window=normalized_window,
         category=normalized_category,
+        severity=normalized_severity,
         search=normalized_search,
     )
 
@@ -345,6 +429,7 @@ async def get_validation_run_metrics(*, db: AsyncSession, validation_run_id: uui
     )
 
     current = await _capture_snapshot(db=db)
+    await _stream_validation_events(db=db, run=run)
 
     base_candles = 0 if baseline is None else baseline.candles
     base_signals = 0 if baseline is None else baseline.signals
@@ -543,28 +628,327 @@ def _safe_text(value: object) -> str | None:
 
 
 def _event_category(event_type: str) -> str:
-    for category_name, event_types in _CATEGORY_EVENT_TYPES.items():
-        if event_type in event_types:
-            return category_name
+    category = _EVENT_TYPE_CATEGORY.get(event_type)
+    if category:
+        return category
     return "all"
 
 
 def _severity_from_event_type(event_type: str) -> str:
-    if event_type in {"FAILURE", "ALERT"}:
+    if event_type in {"FAILURE", "ALERT", "DATABASE_HEALTH_WARNING"}:
         return "red"
-    if event_type in {"WARNING", "RISK_EVENT"}:
+    if event_type in {"WARNING", "RISK_EVENT", "RISK_EVALUATION_STARTED", "RISK_REJECTED", "PAPER_TRADE_REJECTED", "VALIDATION_RUN_CANCELLED"}:
         return "yellow"
-    if event_type in {"RESEARCH_CAMPAIGN_STARTED", "RESEARCH_CAMPAIGN_COMPLETED", "RESEARCH_CANDIDATE_GENERATED", "RESEARCH_MEMORY_SAVED"}:
+    if event_type in {"RESEARCH_CAMPAIGN_STARTED", "RESEARCH_CAMPAIGN_COMPLETED", "EVOLUTION_CYCLE_STARTED", "EVOLUTION_CYCLE_COMPLETED", "CHAMPION_STRATEGY_CHANGED"}:
         return "purple"
-    if event_type in {"VALIDATION_STARTED", "VALIDATION_COMPLETED", "RECOVERY", "HEARTBEAT"}:
+    if event_type in {"VALIDATION_RUN_STARTED", "VALIDATION_RUN_COMPLETED", "VALIDATION_HEARTBEAT", "DATABASE_RECOVERED", "RISK_APPROVED", "PAPER_TRADE_FILLED", "POSITION_OPENED"}:
         return "green"
-    if event_type in {"SIGNAL_GENERATED", "BUY_CANDIDATE", "SELL_CANDIDATE", "PAPER_TRADE_EXECUTED", "MARKET_DATA", "CANDLES_INGESTED", "CAPITAL_ALLOCATION_UPDATED"}:
+    if event_type in {"SIGNAL_GENERATED", "BUY_CANDIDATE_CREATED", "SELL_CANDIDATE_CREATED", "HOLD_DECISION_RECORDED", "CANDLE_BATCH_INGESTED", "ASSET_SYNCHRONIZATION_COMPLETED", "PAPER_TRADE_SUBMITTED", "POSITION_CLOSED"}:
         return "blue"
     return "gray"
 
 
 def _title_from_event_type(event_type: str) -> str:
     return event_type.replace("_", " ").title()
+
+
+async def _stream_validation_events(*, db: AsyncSession, run: ValidationRun) -> None:
+    try:
+        current_events = await _events_for_run(db=db, validation_run_id=run.validation_run_id)
+        latest_heartbeat = next((item for item in current_events if item.event_type == "VALIDATION_HEARTBEAT"), None)
+        previous_snapshot = _snapshot_from_event(latest_heartbeat)
+
+        operations = await build_operations_status(db=db)
+        snapshot = await _capture_stream_snapshot(db=db, operations=operations)
+        now = datetime.now(timezone.utc)
+
+        if run.status == "CANCELLED" and not _has_event_type(current_events, "VALIDATION_RUN_CANCELLED"):
+            _append_event(
+                db=db,
+                validation_run_id=run.validation_run_id,
+                event_type="VALIDATION_RUN_CANCELLED",
+                severity="yellow",
+                title="Validation Run Cancelled",
+                description="Validation run was cancelled.",
+                metadata={"completed_at": run.completed_at.isoformat() if run.completed_at else None},
+            )
+
+        completed = run.status in {"COMPLETED", "FAILED"} or (
+            run.status == "RUNNING" and run.expected_end_at is not None and now >= run.expected_end_at
+        )
+        if completed and not _has_event_type(current_events, "VALIDATION_RUN_COMPLETED"):
+            _append_event(
+                db=db,
+                validation_run_id=run.validation_run_id,
+                event_type="VALIDATION_RUN_COMPLETED",
+                severity="green" if run.status != "FAILED" else "red",
+                title="Validation Run Completed",
+                description="Validation run reached completion window.",
+                metadata={
+                    "status": run.status,
+                    "completed_at": run.completed_at.isoformat() if run.completed_at else now.isoformat(),
+                },
+            )
+
+        if previous_snapshot is None:
+            _append_event(
+                db=db,
+                validation_run_id=run.validation_run_id,
+                event_type="VALIDATION_HEARTBEAT",
+                severity="green",
+                title="Validation Heartbeat",
+                description="Validation timeline heartbeat initialized.",
+                metadata={"snapshot": _snapshot_to_metadata(snapshot)},
+            )
+            await db.flush()
+            return
+
+        _stream_delta_events(
+            db=db,
+            validation_run_id=run.validation_run_id,
+            previous=previous_snapshot,
+            current=snapshot,
+        )
+
+        heartbeat_due = latest_heartbeat is None or (now - latest_heartbeat.created_at) >= timedelta(seconds=30)
+        if heartbeat_due:
+            _append_event(
+                db=db,
+                validation_run_id=run.validation_run_id,
+                event_type="VALIDATION_HEARTBEAT",
+                severity="green",
+                title="Validation Heartbeat",
+                description="Validation heartbeat captured current paper/research state.",
+                metadata={"snapshot": _snapshot_to_metadata(snapshot)},
+            )
+        await db.flush()
+    except Exception:
+        # Streaming is observational only; failures here must not impact core run behavior.
+        return
+
+
+def _stream_delta_events(
+    *,
+    db: AsyncSession,
+    validation_run_id: uuid.UUID,
+    previous: _EventStreamSnapshot,
+    current: _EventStreamSnapshot,
+) -> None:
+    candle_delta = max(current.candles - previous.candles, 0)
+    if candle_delta > 0:
+        _append_event(db=db, validation_run_id=validation_run_id, event_type="CANDLE_BATCH_INGESTED", severity="blue", title="Candle Batch Ingested", description=f"{candle_delta} new candles ingested.", metadata={"count": candle_delta})
+
+    asset_delta = max(current.assets - previous.assets, 0)
+    if asset_delta > 0:
+        _append_event(db=db, validation_run_id=validation_run_id, event_type="ASSET_SYNCHRONIZATION_COMPLETED", severity="blue", title="Asset Synchronization Completed", description=f"{asset_delta} new active assets synchronized.", metadata={"count": asset_delta})
+
+    signal_delta = max(current.signals_total - previous.signals_total, 0)
+    if signal_delta > 0:
+        _append_event(db=db, validation_run_id=validation_run_id, event_type="SIGNAL_GENERATED", severity="blue", title="Signal Generated", description=f"{signal_delta} new strategy signals generated.", metadata={"count": signal_delta})
+
+    buy_delta = max(current.signals_buy - previous.signals_buy, 0)
+    if buy_delta > 0:
+        _append_event(db=db, validation_run_id=validation_run_id, event_type="BUY_CANDIDATE_CREATED", severity="blue", title="BUY Candidate Created", description=f"{buy_delta} BUY candidates created.", metadata={"count": buy_delta})
+
+    sell_delta = max(current.signals_sell - previous.signals_sell, 0)
+    if sell_delta > 0:
+        _append_event(db=db, validation_run_id=validation_run_id, event_type="SELL_CANDIDATE_CREATED", severity="blue", title="SELL Candidate Created", description=f"{sell_delta} SELL candidates created.", metadata={"count": sell_delta})
+
+    hold_delta = max(current.signals_hold - previous.signals_hold, 0)
+    if hold_delta > 0:
+        _append_event(db=db, validation_run_id=validation_run_id, event_type="HOLD_DECISION_RECORDED", severity="blue", title="HOLD Decision Recorded", description=f"{hold_delta} HOLD decisions recorded.", metadata={"count": hold_delta})
+
+    risk_delta = max(current.risk_total - previous.risk_total, 0)
+    if risk_delta > 0:
+        _append_event(db=db, validation_run_id=validation_run_id, event_type="RISK_EVALUATION_STARTED", severity="yellow", title="Risk Evaluation Started", description=f"{risk_delta} risk evaluations observed.", metadata={"count": risk_delta})
+
+    risk_approved_delta = max(current.risk_approved - previous.risk_approved, 0)
+    if risk_approved_delta > 0:
+        _append_event(db=db, validation_run_id=validation_run_id, event_type="RISK_APPROVED", severity="green", title="Risk Approved", description=f"{risk_approved_delta} risk approvals observed.", metadata={"count": risk_approved_delta})
+        _append_event(db=db, validation_run_id=validation_run_id, event_type="PAPER_TRADE_SUBMITTED", severity="blue", title="Paper Trade Submitted", description=f"{risk_approved_delta} paper trades submitted to execution.", metadata={"count": risk_approved_delta})
+
+    risk_rejected_delta = max(current.risk_rejected - previous.risk_rejected, 0)
+    if risk_rejected_delta > 0:
+        _append_event(db=db, validation_run_id=validation_run_id, event_type="RISK_REJECTED", severity="yellow", title="Risk Rejected", description=f"{risk_rejected_delta} risk rejections observed.", metadata={"count": risk_rejected_delta})
+        _append_event(db=db, validation_run_id=validation_run_id, event_type="PAPER_TRADE_REJECTED", severity="yellow", title="Paper Trade Rejected", description=f"{risk_rejected_delta} paper trades rejected by risk.", metadata={"count": risk_rejected_delta})
+
+    trade_delta = max(current.trades - previous.trades, 0)
+    if trade_delta > 0:
+        _append_event(db=db, validation_run_id=validation_run_id, event_type="PAPER_TRADE_FILLED", severity="green", title="Paper Trade Filled", description=f"{trade_delta} paper trades filled.", metadata={"count": trade_delta})
+
+    opened_delta = max(current.trade_buy - previous.trade_buy, 0)
+    if opened_delta > 0:
+        _append_event(db=db, validation_run_id=validation_run_id, event_type="POSITION_OPENED", severity="green", title="Position Opened", description=f"{opened_delta} positions opened from BUY fills.", metadata={"count": opened_delta})
+
+    closed_delta = max(current.trade_sell - previous.trade_sell, 0)
+    if closed_delta > 0:
+        _append_event(db=db, validation_run_id=validation_run_id, event_type="POSITION_CLOSED", severity="blue", title="Position Closed", description=f"{closed_delta} positions closed from SELL fills.", metadata={"count": closed_delta})
+
+    campaign_started_delta = max(current.campaign_started - previous.campaign_started, 0)
+    if campaign_started_delta > 0:
+        _append_event(db=db, validation_run_id=validation_run_id, event_type="RESEARCH_CAMPAIGN_STARTED", severity="purple", title="Research Campaign Started", description=f"{campaign_started_delta} research campaigns entered started state.", metadata={"count": campaign_started_delta})
+
+    campaign_completed_delta = max(current.campaign_completed - previous.campaign_completed, 0)
+    if campaign_completed_delta > 0:
+        _append_event(db=db, validation_run_id=validation_run_id, event_type="RESEARCH_CAMPAIGN_COMPLETED", severity="purple", title="Research Campaign Completed", description=f"{campaign_completed_delta} research campaigns completed.", metadata={"count": campaign_completed_delta})
+
+    evolution_delta = max(current.evolution_cycles - previous.evolution_cycles, 0)
+    if evolution_delta > 0:
+        _append_event(db=db, validation_run_id=validation_run_id, event_type="EVOLUTION_CYCLE_STARTED", severity="purple", title="Evolution Cycle Started", description=f"{evolution_delta} evolution cycles started.", metadata={"count": evolution_delta})
+        _append_event(db=db, validation_run_id=validation_run_id, event_type="EVOLUTION_CYCLE_COMPLETED", severity="purple", title="Evolution Cycle Completed", description=f"{evolution_delta} evolution cycles completed.", metadata={"count": evolution_delta})
+
+    if current.champion and previous.champion != current.champion:
+        _append_event(db=db, validation_run_id=validation_run_id, event_type="CHAMPION_STRATEGY_CHANGED", severity="purple", title="Champion Strategy Changed", description=f"Champion strategy changed to {current.champion}.", metadata={"previous": previous.champion, "current": current.champion})
+
+    if previous.db_version and current.db_version and previous.db_version != current.db_version:
+        _append_event(db=db, validation_run_id=validation_run_id, event_type="MIGRATION_DETECTED", severity="gray", title="Migration Detected", description="Database migration version changed during validation run.", metadata={"previous_version": previous.db_version, "current_version": current.db_version})
+
+    if current.db_state in {"yellow", "red"} and previous.db_state != current.db_state:
+        _append_event(db=db, validation_run_id=validation_run_id, event_type="DATABASE_HEALTH_WARNING", severity="yellow" if current.db_state == "yellow" else "red", title="Database Health Warning", description=f"Database health is {current.db_state}.", metadata={"previous_state": previous.db_state, "current_state": current.db_state})
+
+    if previous.db_state in {"yellow", "red"} and current.db_state == "green":
+        _append_event(db=db, validation_run_id=validation_run_id, event_type="DATABASE_RECOVERED", severity="green", title="Database Recovered", description="Database health recovered to green.", metadata={"previous_state": previous.db_state, "current_state": current.db_state})
+
+
+async def _capture_stream_snapshot(*, db: AsyncSession, operations: OperationalStatusResponse) -> _EventStreamSnapshot:
+    db_state = operations.system_health["database"].state
+    return _EventStreamSnapshot(
+        candles=await _count_safe(db=db, sql="SELECT COUNT(*) FROM candles"),
+        assets=await _count_safe(db=db, sql="SELECT COUNT(*) FROM assets WHERE is_active = true"),
+        signals_total=await _count_safe(db=db, sql="SELECT COUNT(*) FROM signals"),
+        signals_buy=await _count_safe(db=db, sql="SELECT COUNT(*) FROM signals WHERE action = 'buy'"),
+        signals_sell=await _count_safe(db=db, sql="SELECT COUNT(*) FROM signals WHERE action = 'sell'"),
+        signals_hold=await _count_safe(db=db, sql="SELECT COUNT(*) FROM signals WHERE action = 'hold'"),
+        risk_total=await _count_safe(db=db, sql="SELECT COUNT(*) FROM risk_events"),
+        risk_approved=await _count_safe(db=db, sql="SELECT COUNT(*) FROM risk_events WHERE lower(action_taken) LIKE '%approved%'"),
+        risk_rejected=await _count_safe(db=db, sql="SELECT COUNT(*) FROM risk_events WHERE lower(action_taken) LIKE '%rejected%'"),
+        trades=await _count_safe(db=db, sql="SELECT COUNT(*) FROM trades WHERE is_paper = true"),
+        trade_buy=await _count_safe(db=db, sql="SELECT COUNT(*) FROM trades WHERE is_paper = true AND side = 'buy'"),
+        trade_sell=await _count_safe(db=db, sql="SELECT COUNT(*) FROM trades WHERE is_paper = true AND side = 'sell'"),
+        campaign_started=await _count_safe(db=db, sql="SELECT COUNT(*) FROM research_campaigns WHERE started_at IS NOT NULL"),
+        campaign_completed=await _count_safe(db=db, sql="SELECT COUNT(*) FROM research_campaigns WHERE completed_at IS NOT NULL"),
+        evolution_cycles=await _count_safe(db=db, sql="SELECT COUNT(*) FROM research_candidate_lineage"),
+        champion=await _read_current_champion(db=db),
+        db_state=db_state,
+        db_version=await _db_version(db=db),
+    )
+
+
+def _append_event(
+    *,
+    db: AsyncSession,
+    validation_run_id: uuid.UUID,
+    event_type: str,
+    severity: str,
+    title: str,
+    description: str,
+    metadata: dict[str, Any],
+) -> None:
+    db.add(
+        ValidationRunEvent(
+            validation_run_id=validation_run_id,
+            event_type=event_type,
+            message=description,
+            payload={
+                "severity": severity,
+                "title": title,
+                "description": description,
+                "metadata": metadata,
+            },
+        )
+    )
+
+
+async def _events_for_run(*, db: AsyncSession, validation_run_id: uuid.UUID) -> list[ValidationRunEvent]:
+    return (
+        await db.execute(
+            select(ValidationRunEvent)
+            .where(ValidationRunEvent.validation_run_id == validation_run_id)
+            .order_by(ValidationRunEvent.created_at.desc(), ValidationRunEvent.id.desc())
+        )
+    ).scalars().all()
+
+
+def _snapshot_from_event(event: ValidationRunEvent | None) -> _EventStreamSnapshot | None:
+    if event is None:
+        return None
+    payload = dict(event.payload or {})
+    metadata = payload.get("metadata")
+    if not isinstance(metadata, dict):
+        return None
+    snapshot = metadata.get("snapshot")
+    if not isinstance(snapshot, dict):
+        return None
+    return _EventStreamSnapshot(
+        candles=int(snapshot.get("candles", 0)),
+        assets=int(snapshot.get("assets", 0)),
+        signals_total=int(snapshot.get("signals_total", 0)),
+        signals_buy=int(snapshot.get("signals_buy", 0)),
+        signals_sell=int(snapshot.get("signals_sell", 0)),
+        signals_hold=int(snapshot.get("signals_hold", 0)),
+        risk_total=int(snapshot.get("risk_total", 0)),
+        risk_approved=int(snapshot.get("risk_approved", 0)),
+        risk_rejected=int(snapshot.get("risk_rejected", 0)),
+        trades=int(snapshot.get("trades", 0)),
+        trade_buy=int(snapshot.get("trade_buy", 0)),
+        trade_sell=int(snapshot.get("trade_sell", 0)),
+        campaign_started=int(snapshot.get("campaign_started", 0)),
+        campaign_completed=int(snapshot.get("campaign_completed", 0)),
+        evolution_cycles=int(snapshot.get("evolution_cycles", 0)),
+        champion=snapshot.get("champion") if isinstance(snapshot.get("champion"), str) else None,
+        db_state=str(snapshot.get("db_state", "green")),
+        db_version=snapshot.get("db_version") if isinstance(snapshot.get("db_version"), str) else None,
+    )
+
+
+def _snapshot_to_metadata(snapshot: _EventStreamSnapshot) -> dict[str, Any]:
+    return {
+        "candles": snapshot.candles,
+        "assets": snapshot.assets,
+        "signals_total": snapshot.signals_total,
+        "signals_buy": snapshot.signals_buy,
+        "signals_sell": snapshot.signals_sell,
+        "signals_hold": snapshot.signals_hold,
+        "risk_total": snapshot.risk_total,
+        "risk_approved": snapshot.risk_approved,
+        "risk_rejected": snapshot.risk_rejected,
+        "trades": snapshot.trades,
+        "trade_buy": snapshot.trade_buy,
+        "trade_sell": snapshot.trade_sell,
+        "campaign_started": snapshot.campaign_started,
+        "campaign_completed": snapshot.campaign_completed,
+        "evolution_cycles": snapshot.evolution_cycles,
+        "champion": snapshot.champion,
+        "db_state": snapshot.db_state,
+        "db_version": snapshot.db_version,
+    }
+
+
+def _has_event_type(events: list[ValidationRunEvent], event_type: str) -> bool:
+    return any(item.event_type == event_type for item in events)
+
+
+async def _count_safe(*, db: AsyncSession, sql: str) -> int:
+    try:
+        result = await db.execute(text(sql))
+        if hasattr(result, "scalar_one_or_none"):
+            value = result.scalar_one_or_none()
+            return int(value or 0)
+    except Exception:
+        return 0
+    return 0
+
+
+async def _db_version(*, db: AsyncSession) -> str | None:
+    try:
+        result = await db.execute(text("SELECT version_num FROM alembic_version LIMIT 1"))
+        if hasattr(result, "scalar_one_or_none"):
+            value = result.scalar_one_or_none()
+            if isinstance(value, str):
+                return value
+    except Exception:
+        return None
+    return None
 
 
 def _build_scorecards(

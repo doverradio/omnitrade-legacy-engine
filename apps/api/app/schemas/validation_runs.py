@@ -71,6 +71,7 @@ class ValidationRunEventListResponse(BaseModel):
     order: str
     window: str
     category: str
+    severity: str
     search: str | None
 
 

@@ -247,8 +247,8 @@ async def test_create_start_cancel_list_and_history_survive_restart(fake_session
 
     events_response = await service.list_validation_run_events(db=fake_session, validation_run_id=created.validation_run_id)
     event_types = {item.event_type for item in events_response.items}
-    assert "VALIDATION_STARTED" in event_types
-    assert "WARNING" in event_types
+    assert "VALIDATION_RUN_STARTED" in event_types
+    assert "VALIDATION_RUN_CANCELLED" in event_types
 
     # Simulate restart by calling list again from the same durable session-backed state.
     listed_after_restart = await service.list_validation_runs(db=fake_session)
@@ -372,6 +372,15 @@ async def test_event_ordering_filtering_and_pagination(fake_session: _FakeSessio
     )
     assert all(item.severity == "red" for item in failures_last_hour.items)
 
+    yellow_only = await service.list_validation_run_events(
+        db=fake_session,
+        validation_run_id=created.validation_run_id,
+        severity="yellow",
+        page=1,
+        page_size=50,
+    )
+    assert all(item.severity == "yellow" for item in yellow_only.items)
+
     search_trade = await service.list_validation_run_events(
         db=fake_session,
         validation_run_id=created.validation_run_id,
@@ -380,3 +389,25 @@ async def test_event_ordering_filtering_and_pagination(fake_session: _FakeSessio
         page_size=50,
     )
     assert any("trade" in item.description.lower() for item in search_trade.items)
+
+
+@pytest.mark.asyncio
+async def test_event_streaming_creates_heartbeat_event(fake_session: _FakeSession) -> None:
+    created = await service.create_validation_run(
+        db=fake_session,
+        request=ValidationRunCreateRequest(
+            name="Streamed Validation",
+            objective="Heartbeat stream",
+            duration_hours=24,
+            paper_capital=Decimal("25"),
+            enabled_strategies=["MA Crossover"],
+            enabled_research_agents=["Baseline"],
+            enabled_research_features=["Laboratory"],
+        ),
+    )
+    await service.start_validation_run(db=fake_session, validation_run_id=created.validation_run_id)
+
+    await service.get_validation_run_metrics(db=fake_session, validation_run_id=created.validation_run_id)
+    events = await service.list_validation_run_events(db=fake_session, validation_run_id=created.validation_run_id)
+    event_types = {item.event_type for item in events.items}
+    assert "VALIDATION_HEARTBEAT" in event_types

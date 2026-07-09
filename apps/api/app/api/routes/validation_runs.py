@@ -96,6 +96,7 @@ async def get_validation_run_event_history(
     order: str = Query(default="newest"),
     window: str = Query(default="entire_run"),
     category: str = Query(default="all"),
+    severity: str = Query(default="all"),
     q: str | None = Query(default=None),
     db: AsyncSession = Depends(get_db),
 ) -> ValidationRunEventListResponse:
@@ -114,6 +115,7 @@ async def get_validation_run_event_history(
         order=order,
         window=window,
         category=category,
+        severity=severity,
         search=q,
     )
 

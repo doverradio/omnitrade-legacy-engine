@@ -7,7 +7,8 @@ import type { ValidationRunEvent } from "@/lib/api/arena";
 export type TimelineQuery = {
   order: "newest" | "oldest";
   window: "last_hour" | "last_24_hours" | "entire_run";
-  category: "all" | "trading" | "research" | "evolution" | "ai" | "warnings" | "failures" | "manual_notes";
+  category: "all" | "system" | "market" | "strategy" | "risk" | "execution" | "research" | "database" | "warnings" | "failures" | "manual_notes";
+  severity: "all" | "green" | "blue" | "purple" | "yellow" | "red" | "gray";
   search: string;
 };
 
@@ -48,7 +49,7 @@ function relativeTimestamp(value: string): string {
   const diffMs = parsed.getTime() - Date.now();
   const absSeconds = Math.floor(Math.abs(diffMs) / 1000);
   if (absSeconds < 60) {
-    return diffMs >= 0 ? "in seconds" : "seconds ago";
+    return diffMs >= 0 ? `in ${absSeconds}s` : `${absSeconds}s ago`;
   }
 
   const absMinutes = Math.floor(absSeconds / 60);
@@ -103,7 +104,22 @@ function iconBadgeClass(severity: ValidationRunEvent["severity"]): string {
   return "border-slate-300/40 bg-slate-400/20 text-slate-100";
 }
 
-function eventGlyph(eventType: string): string {
+function eventGlyph(category: ValidationRunEvent["category"], eventType: string): string {
+  if (category === "market" || category === "strategy" || category === "execution") {
+    return "$";
+  }
+  if (category === "research") {
+    return "R";
+  }
+  if (category === "database") {
+    return "D";
+  }
+  if (category === "risk") {
+    return "E";
+  }
+  if (category === "warnings" || category === "failures") {
+    return "!";
+  }
   if (eventType.includes("STARTED") || eventType.includes("RECOVERY")) {
     return "!";
   }
@@ -200,7 +216,7 @@ export default function ValidationRunTimeline({
       </div>
 
       {showControls ? (
-        <div className="mt-3 grid gap-2 sm:grid-cols-2 lg:grid-cols-4">
+        <div className="mt-3 grid gap-2 sm:grid-cols-2 lg:grid-cols-5">
           <label className="text-xs text-foreground/70">
             Order
             <select
@@ -234,13 +250,33 @@ export default function ValidationRunTimeline({
               onChange={(event) => onQueryChange?.({ ...query, category: event.target.value as TimelineQuery["category"] })}
             >
               <option value="all">All</option>
-              <option value="trading">Trading</option>
+              <option value="system">System</option>
+              <option value="market">Market</option>
+              <option value="strategy">Strategy</option>
+              <option value="risk">Risk</option>
+              <option value="execution">Execution</option>
               <option value="research">Research</option>
-              <option value="evolution">Evolution</option>
-              <option value="ai">AI</option>
+              <option value="database">Database</option>
               <option value="warnings">Warnings</option>
               <option value="failures">Failures</option>
               <option value="manual_notes">Manual Notes</option>
+            </select>
+          </label>
+
+          <label className="text-xs text-foreground/70">
+            Severity
+            <select
+              className="mt-1 w-full rounded-md border border-border bg-background/60 px-2 py-1 text-sm"
+              value={query.severity}
+              onChange={(event) => onQueryChange?.({ ...query, severity: event.target.value as TimelineQuery["severity"] })}
+            >
+              <option value="all">All</option>
+              <option value="green">Healthy</option>
+              <option value="blue">Information</option>
+              <option value="purple">Research / AI</option>
+              <option value="yellow">Warning</option>
+              <option value="red">Failure</option>
+              <option value="gray">System</option>
             </select>
           </label>
 
@@ -293,7 +329,7 @@ export default function ValidationRunTimeline({
                       className={`absolute left-0 top-1.5 inline-flex h-8 w-8 items-center justify-center rounded-full border text-xs font-semibold transition-transform duration-300 group-hover:scale-105 ${iconBadgeClass(item.severity)}`}
                       aria-hidden="true"
                     >
-                      {eventGlyph(item.event_type)}
+                      {eventGlyph(item.category, item.event_type)}
                     </span>
 
                     <article className="rounded-lg border border-border bg-slate-900/60 p-3 shadow-sm transition-all duration-300 group-hover:border-foreground/35 group-hover:shadow-md">

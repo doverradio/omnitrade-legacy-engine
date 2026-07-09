@@ -251,7 +251,7 @@ export default function MissionControlPage() {
           <ValidationRunTimeline
             title="Latest 5 Validation Timeline Events"
             events={latestTimelineEvents}
-            query={{ order: "newest", window: "entire_run", category: "all", search: "" }}
+            query={{ order: "newest", window: "entire_run", category: "all", severity: "all", search: "" }}
             loading={timelineLoading}
             showControls={false}
             maxHeightClass="max-h-[26rem]"

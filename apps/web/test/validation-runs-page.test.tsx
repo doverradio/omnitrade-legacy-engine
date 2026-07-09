@@ -458,4 +458,15 @@ describe("ValidationRunsPage", () => {
       expect(screen.getByText("Validation run started successfully.")).toBeInTheDocument();
     });
   });
+
+  it("auto refreshes while active runs exist", async () => {
+    installFetchMock("active");
+    const intervalSpy = vi.spyOn(window, "setInterval");
+
+    render(<ValidationRunsPage />);
+
+    expect(await screen.findByRole("heading", { name: "Validation Runs" })).toBeInTheDocument();
+    expect(intervalSpy).toHaveBeenCalledWith(expect.any(Function), 5000);
+    intervalSpy.mockRestore();
+  });
 });

@@ -589,7 +589,7 @@ export type ValidationRunEvent = {
   validation_run_id: string;
   timestamp: string;
   event_type: string;
-  category: "all" | "trading" | "research" | "evolution" | "ai" | "warnings" | "failures" | "manual_notes";
+  category: "all" | "system" | "market" | "strategy" | "risk" | "execution" | "research" | "database" | "warnings" | "failures" | "manual_notes";
   severity: "green" | "blue" | "purple" | "yellow" | "red" | "gray";
   title: string;
   description: string;
@@ -604,7 +604,8 @@ export type ValidationRunEventListResponse = {
   has_more: boolean;
   order: "newest" | "oldest";
   window: "last_hour" | "last_24_hours" | "entire_run";
-  category: "all" | "trading" | "research" | "evolution" | "ai" | "warnings" | "failures" | "manual_notes";
+  category: "all" | "system" | "market" | "strategy" | "risk" | "execution" | "research" | "database" | "warnings" | "failures" | "manual_notes";
+  severity: "all" | "green" | "blue" | "purple" | "yellow" | "red" | "gray";
   search: string | null;
 };
 
@@ -879,7 +880,8 @@ export async function getValidationRunEvents(
     pageSize?: number;
     order?: "newest" | "oldest";
     window?: "last_hour" | "last_24_hours" | "entire_run";
-    category?: "all" | "trading" | "research" | "evolution" | "ai" | "warnings" | "failures" | "manual_notes";
+    category?: "all" | "system" | "market" | "strategy" | "risk" | "execution" | "research" | "database" | "warnings" | "failures" | "manual_notes";
+    severity?: "all" | "green" | "blue" | "purple" | "yellow" | "red" | "gray";
     search?: string;
   },
 ): Promise<ValidationRunEventListResponse> {
@@ -889,6 +891,7 @@ export async function getValidationRunEvents(
     order: input?.order ?? "newest",
     window: input?.window ?? "entire_run",
     category: input?.category ?? "all",
+    severity: input?.severity ?? "all",
     q: input?.search ?? null,
   });
   return requestJson<ValidationRunEventListResponse>(`/validation-runs/${validationRunId}/events?${query}`);
