@@ -7,9 +7,11 @@ import {
   ApiRequestError,
   coachReviewDecisionQuality,
   evaluateReplayResult,
+  getDecisionIntelligenceRecommendation,
   getStrategyArenaScoreboard,
   replayDecisionPackage,
   type AICoachObservation,
+  type DecisionIntelligenceRecommendation,
   type DecisionQualityResult,
   type ReplayResult,
   type StrategyArenaScoreboardResponse,
@@ -77,6 +79,7 @@ export default function DecisionArenaPage() {
   const [replayResult, setReplayResult] = useState<ReplayResult | null>(null);
   const [qualityResult, setQualityResult] = useState<DecisionQualityResult | null>(null);
   const [coachObservation, setCoachObservation] = useState<AICoachObservation | null>(null);
+  const [decisionIntelligence, setDecisionIntelligence] = useState<DecisionIntelligenceRecommendation | null>(null);
   const [replayError, setReplayError] = useState<string | null>(null);
 
   useEffect(() => {
@@ -87,8 +90,10 @@ export default function DecisionArenaPage() {
       setError(null);
       try {
         const payload = await getStrategyArenaScoreboard();
+        const recommendation = await getDecisionIntelligenceRecommendation();
         if (active) {
           setScoreboard(payload);
+          setDecisionIntelligence(recommendation);
         }
       } catch (fetchError) {
         if (active) {
@@ -250,6 +255,34 @@ export default function DecisionArenaPage() {
         ) : (
           <div className="mt-3 rounded-md border border-dashed border-border/70 bg-background/40 px-3 py-3 text-sm text-foreground/55">
             No coach observation yet. Run Replay to generate a deterministic AI Coach review.
+          </div>
+        )}
+      </section>
+
+      <section className="rounded-md border border-border bg-background/60 px-3 py-3 text-sm text-foreground/85">
+        <div className="flex items-center justify-between gap-3">
+          <div>
+            <p className="text-xs font-semibold uppercase tracking-wide text-foreground/60">Rule-Based Decision Intelligence</p>
+            <p className="text-xs text-foreground/45">No AI model is used.</p>
+          </div>
+        </div>
+
+        {decisionIntelligence ? (
+          <div className="mt-3 grid gap-3 sm:grid-cols-2 lg:grid-cols-3">
+            <Metric
+              label="Compared Strategies"
+              value={decisionIntelligence.compared_strategies.length > 0 ? decisionIntelligence.compared_strategies.join(", ") : "None"}
+            />
+            <Metric label="Best Current Strategy" value={decisionIntelligence.highest_quality_strategy ?? "None"} />
+            <Metric label="Evidence Summary" value={decisionIntelligence.evidence_summary} />
+            <Metric label="Confidence Summary" value={decisionIntelligence.confidence_summary} />
+            <Metric label="Recommendation Summary" value={decisionIntelligence.recommendation_summary} />
+            <Metric label="Human Review Required" value={decisionIntelligence.human_review_required ? "Yes" : "No"} />
+            <Metric label="Promotion Recommended" value={decisionIntelligence.promotion_recommended ? "Yes" : "No"} />
+          </div>
+        ) : (
+          <div className="mt-3 rounded-md border border-dashed border-border/70 bg-background/40 px-3 py-3 text-sm text-foreground/55">
+            No deterministic recommendation available yet.
           </div>
         )}
       </section>

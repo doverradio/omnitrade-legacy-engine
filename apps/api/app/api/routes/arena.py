@@ -16,10 +16,12 @@ from app.models.signal import Signal
 from app.models.strategy import Strategy
 from app.models.trade import Trade
 from app.schemas.ai_coach import AICoachObservationResponse, AICoachReviewRequest
+from app.schemas.decision_intelligence import DecisionIntelligenceRecommendationResponse
 from app.schemas.decision_quality import DecisionQualityEvaluationRequest, DecisionQualityResultResponse
 from app.schemas.arena import StrategyArenaScoreboardItem, StrategyArenaScoreboardResponse
 from app.schemas.replay_agent import ReplayRequest, ReplayResultResponse, ReplayAgentCapabilityResponse, ReplayAgentRegistrationResponse
 from app.services.ai_coach.deterministic import evaluate_decision_quality_v0
+from app.services.decision_intelligence.deterministic import StrategyEvidence, build_decision_intelligence_recommendation_v1
 from app.services.decision_quality.deterministic import evaluate_replay_result_v0
 from app.services.decisions.package import DecisionPackageBuilder
 from app.services.replay.default_agent import ReplayPackageNotFoundError, replay_decision_package_v0
@@ -189,6 +191,63 @@ async def coach_review(request: AICoachReviewRequest) -> AICoachObservationRespo
         confidence_note=observation.confidence_note,
         reproducibility_note=observation.reproducibility_note,
         suggested_follow_up=observation.suggested_follow_up,
+    )
+
+
+@router.get("/decision-intelligence", response_model=DecisionIntelligenceRecommendationResponse)
+async def decision_intelligence(db: AsyncSession = Depends(get_db)) -> DecisionIntelligenceRecommendationResponse:
+    active_strategies = (
+        await db.execute(
+            select(Strategy)
+            .where(Strategy.is_active.is_(True))
+            .order_by(Strategy.name.asc(), Strategy.created_at.asc())
+        )
+    ).scalars().all()
+
+    strategy_evidence: list[StrategyEvidence] = []
+    decision_package_builder = DecisionPackageBuilder()
+
+    for strategy in active_strategies:
+        decision_records = (
+            await db.execute(select(DecisionRecord).order_by(DecisionRecord.timestamp.desc(), DecisionRecord.decision_id.desc()))
+        ).scalars().all()
+        strategy_records = [
+            record
+            for record in decision_records
+            if _decision_record_matches_strategy(record, strategy, set())
+        ]
+
+        latest_package_id = await _resolve_latest_decision_package_id(
+            decision_package_builder=decision_package_builder,
+            db=db,
+            decision_records=strategy_records,
+        )
+        if latest_package_id is None:
+            continue
+
+        try:
+            replay_result = await replay_decision_package_v0(db=db, decision_package_id=latest_package_id)
+        except ReplayPackageNotFoundError:
+            continue
+
+        strategy_evidence.append(
+            StrategyEvidence(
+                strategy_name=strategy.name,
+                replay_result=replay_result,
+            )
+        )
+
+    recommendation = build_decision_intelligence_recommendation_v1(strategy_evidence=strategy_evidence)
+    return DecisionIntelligenceRecommendationResponse(
+        recommendation_id=recommendation.recommendation_id,
+        generated_at=recommendation.generated_at,
+        compared_strategies=list(recommendation.compared_strategies),
+        highest_quality_strategy=recommendation.highest_quality_strategy,
+        evidence_summary=recommendation.evidence_summary,
+        confidence_summary=recommendation.confidence_summary,
+        recommendation_summary=recommendation.recommendation_summary,
+        human_review_required=recommendation.human_review_required,
+        promotion_recommended=recommendation.promotion_recommended,
     )
 
 

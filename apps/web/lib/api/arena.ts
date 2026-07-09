@@ -204,6 +204,18 @@ export type AICoachObservation = {
   suggested_follow_up: string;
 };
 
+export type DecisionIntelligenceRecommendation = {
+  recommendation_id: string;
+  generated_at: string;
+  compared_strategies: string[];
+  highest_quality_strategy: string | null;
+  evidence_summary: string;
+  confidence_summary: string;
+  recommendation_summary: string;
+  human_review_required: boolean;
+  promotion_recommended: boolean;
+};
+
 async function requestJson<T>(path: string, init?: RequestInit): Promise<T> {
   const headers = new Headers(init?.headers);
   headers.set("Content-Type", "application/json");
@@ -307,4 +319,8 @@ export async function coachReviewDecisionQuality(request: DecisionQualityResult)
     method: "POST",
     body: JSON.stringify(request),
   });
+}
+
+export async function getDecisionIntelligenceRecommendation(): Promise<DecisionIntelligenceRecommendation> {
+  return requestJson<DecisionIntelligenceRecommendation>("/arena/decision-intelligence");
 }

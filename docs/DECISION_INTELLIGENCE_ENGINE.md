@@ -1,3 +1,48 @@
+# Decision Intelligence Engine v1
+
+## Purpose
+Decision Intelligence Engine v1 is a deterministic research synthesizer.
+
+It aggregates replay evidence, decision quality scores, and AI Coach observations across active strategies and produces a read-only recommendation summary for human review.
+
+This engine does not use AI models or optimization logic.
+
+## Inputs
+Decision Intelligence v1 consumes multiple records for active strategies:
+- Replay Results
+- Decision Quality Results
+- AI Coach Observations
+
+## Outputs
+Decision Intelligence v1 returns a single Decision Intelligence Recommendation:
+- recommendation_id
+- generated_at
+- compared_strategies
+- highest_quality_strategy
+- evidence_summary
+- confidence_summary
+- recommendation_summary
+- human_review_required
+- promotion_recommended
+
+## Repository Boundaries
+Allowed:
+- Read active strategies and related evidence
+- Synthesize deterministic recommendation summaries
+- Expose read-only recommendations in the Strategy Arena
+
+Not allowed:
+- LLM or model inference
+- Automatic promotion
+- Execution changes
+- Production writes
+- Scheduling or worker changes
+- Strategy optimization
+
+## Future Evolution
+Future versions may introduce richer deterministic tie-break rules, broader evidence windows, and versioned recommendation policies.
+
+Any future change must preserve read-only behavior and explicit human review requirements.
 # DECISION_INTELLIGENCE_ENGINE.md
 
 ## OmniTrade Legacy Engine — Decision Intelligence Engine (DIE)
