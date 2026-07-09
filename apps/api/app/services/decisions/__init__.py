@@ -74,6 +74,11 @@ from app.services.decisions.recommendations import (
     generate_experiment_recommendations_v1,
     read_experiment_recommendations,
 )
+from app.services.decisions.replay_candidates import (
+    ReplayCandidateReadModel,
+    certify_decision_package_readiness_v0,
+    list_replay_candidates_v0,
+)
 
 __all__ = [
     "DecisionProvenanceContract",
@@ -129,6 +134,9 @@ __all__ = [
     "read_decision_alternative_actions",
     "read_latest_decision_quality_score",
     "read_experiment_recommendations",
+    "ReplayCandidateReadModel",
+    "certify_decision_package_readiness_v0",
+    "list_replay_candidates_v0",
     "read_decision_timeline",
     "read_decision_explainability",
     "validate_provenance_mappings",

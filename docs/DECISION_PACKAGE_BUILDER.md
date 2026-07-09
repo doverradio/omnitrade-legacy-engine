@@ -98,3 +98,24 @@ The Decision Replay Engine consumes Decision Packages.
 The Decision Package Builder produces them.
 
 That boundary keeps replay reproducible and prevents accidental coupling to live production tables.
+
+---
+
+## Readiness Certification Layer (v0)
+
+Replay candidate exposure is gated by a read-only readiness certification pass.
+
+The certification verifies that a package is:
+
+- buildable
+- deterministic
+- hashable
+- version-pinned
+- explicit about missing artifacts
+- safe for replay input consumption
+
+This layer only certifies package readiness metadata.
+
+It does not execute replay.
+
+It does not write to production state.

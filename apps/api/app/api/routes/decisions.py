@@ -25,6 +25,7 @@ from app.services.arena.tournaments import (
 from app.services.decisions.coach import generate_ai_coach_batch_reviews
 from app.services.decisions.explainability import read_decision_explainability
 from app.services.decisions.recommendations import read_experiment_recommendations
+from app.services.decisions.replay_candidates import list_replay_candidates_v0
 from app.services.decisions.timeline import TimelineReadFilters, read_decision_timeline
 
 router = APIRouter(prefix="/decisions", tags=["decisions"])
@@ -863,6 +864,31 @@ async def list_decision_recommendations(
             "state_reason": item.state_reason,
             "advisory_only": item.advisory_only,
             "created_at": _coerce_datetime(item.created_at).isoformat(),
+        }
+        for item in rows
+    ]
+    return _paginate(items=items, page=page, page_size=page_size)
+
+
+@router.get("/replay/candidates")
+async def list_decision_replay_candidates(
+    page: int = Query(default=1, ge=1),
+    page_size: int = Query(default=50, ge=1, le=MAX_PAGE_SIZE),
+    db: AsyncSession = Depends(get_db),
+) -> dict[str, Any]:
+    rows = await list_replay_candidates_v0(db=db)
+
+    items = [
+        {
+            "decision_package_id": item.decision_package_id,
+            "decision_id": str(item.decision_id),
+            "package_hash": item.package_hash,
+            "package_version": item.package_version,
+            "replay_ready": item.replay_ready,
+            "missing_artifacts": item.missing_artifacts,
+            "unavailable_artifacts": item.unavailable_artifacts,
+            "candidate_reason": item.candidate_reason,
+            "created_at": item.created_at.isoformat(),
         }
         for item in rows
     ]
