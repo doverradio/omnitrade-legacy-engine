@@ -4,6 +4,16 @@ from app.services.decisions.contracts import (
     DecisionSnapshotContract,
     DecisionWriteServiceContract,
 )
+from app.services.decisions.package import (
+    DECISION_PACKAGE_SCHEMA_VERSION,
+    DecisionAlternativeActionContract,
+    DecisionCounterfactualResultContract,
+    DecisionExplainabilityEvidenceContract,
+    DecisionPackageAvailabilityContract,
+    DecisionPackageBuilder,
+    DecisionPackageContract,
+    DecisionQualityScoreContract,
+)
 from app.services.decisions.provenance import (
     DECISION_RECORD_PROVENANCE_MAPPING,
     DECISION_SNAPSHOT_PROVENANCE_MAPPING,
@@ -70,6 +80,14 @@ __all__ = [
     "DecisionRecordContract",
     "DecisionSnapshotContract",
     "DecisionWriteServiceContract",
+    "DECISION_PACKAGE_SCHEMA_VERSION",
+    "DecisionAlternativeActionContract",
+    "DecisionCounterfactualResultContract",
+    "DecisionExplainabilityEvidenceContract",
+    "DecisionPackageAvailabilityContract",
+    "DecisionPackageBuilder",
+    "DecisionPackageContract",
+    "DecisionQualityScoreContract",
     "DECISION_RECORD_PROVENANCE_MAPPING",
     "DECISION_SNAPSHOT_PROVENANCE_MAPPING",
     "DecisionIngestionResult",
