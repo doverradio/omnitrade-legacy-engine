@@ -20,6 +20,7 @@ from app.schemas.decision_intelligence import DecisionIntelligenceRecommendation
 from app.schemas.decision_quality import DecisionQualityEvaluationRequest, DecisionQualityResultResponse
 from app.schemas.arena import StrategyArenaScoreboardItem, StrategyArenaScoreboardResponse
 from app.schemas.replay_agent import ReplayRequest, ReplayResultResponse, ReplayAgentCapabilityResponse, ReplayAgentRegistrationResponse
+from app.schemas.tournament import TournamentRankingEntryResponse, TournamentResponse
 from app.services.ai_coach.deterministic import evaluate_decision_quality_v0
 from app.services.decision_intelligence.deterministic import StrategyEvidence, build_decision_intelligence_recommendation_v1
 from app.services.decision_quality.deterministic import evaluate_replay_result_v0
@@ -27,6 +28,8 @@ from app.services.decisions.package import DecisionPackageBuilder
 from app.services.replay.default_agent import ReplayPackageNotFoundError, replay_decision_package_v0
 from app.services.replay.identifiers import build_decision_package_id
 from app.services.replay.registry import list_registered_replay_agents
+from app.services.tournament.deterministic import build_tournament_snapshot_v1, replay_variance_from_confidence
+from app.services.tournament.interface import TournamentStrategyEvidence
 
 router = APIRouter(prefix="/arena", tags=["arena"])
 
@@ -251,6 +254,131 @@ async def decision_intelligence(db: AsyncSession = Depends(get_db)) -> DecisionI
     )
 
 
+@router.get("/tournament", response_model=TournamentResponse)
+async def get_tournament(db: AsyncSession = Depends(get_db)) -> TournamentResponse:
+    active_strategies = (
+        await db.execute(
+            select(Strategy)
+            .where(Strategy.is_active.is_(True))
+            .order_by(Strategy.name.asc(), Strategy.created_at.asc())
+        )
+    ).scalars().all()
+
+    if not active_strategies:
+        empty_snapshot = build_tournament_snapshot_v1(strategies=[])
+        return TournamentResponse(
+            tournament_id=empty_snapshot.tournament_id,
+            generated_at=empty_snapshot.generated_at,
+            compared_strategies=list(empty_snapshot.compared_strategies),
+            ranking=[],
+        )
+
+    strategy_ids = [strategy.id for strategy in active_strategies]
+    signals = (
+        await db.execute(
+            select(Signal)
+            .where(Signal.strategy_id.in_(strategy_ids))
+            .order_by(Signal.strategy_id.asc(), Signal.signal_time.asc(), Signal.id.asc())
+        )
+    ).scalars().all()
+    trades = (
+        await db.execute(
+            select(Trade)
+            .where(Trade.is_paper.is_(True))
+            .where(Trade.signal_id.is_not(None))
+            .order_by(Trade.executed_at.asc(), Trade.id.asc())
+        )
+    ).scalars().all()
+    decision_records = (await db.execute(select(DecisionRecord).order_by(DecisionRecord.timestamp.asc()))).scalars().all()
+
+    signals_by_strategy: dict[uuid.UUID, list[Signal]] = defaultdict(list)
+    for signal in signals:
+        signals_by_strategy[signal.strategy_id].append(signal)
+
+    signal_ids_by_strategy: dict[uuid.UUID, set[uuid.UUID]] = {
+        strategy_id: {signal.id for signal in strategy_signals}
+        for strategy_id, strategy_signals in signals_by_strategy.items()
+    }
+
+    latest_prices_by_asset_id = await _load_latest_prices_by_asset_id(
+        db=db,
+        asset_ids=sorted({trade.asset_id for trade in trades}, key=str),
+    )
+
+    decision_package_builder = DecisionPackageBuilder()
+    tournament_strategies: list[TournamentStrategyEvidence] = []
+
+    for strategy in active_strategies:
+        strategy_signal_ids = signal_ids_by_strategy.get(strategy.id, set())
+        strategy_trades = [trade for trade in trades if trade.signal_id in strategy_signal_ids]
+        strategy_decision_records = [
+            record
+            for record in decision_records
+            if _decision_record_matches_strategy(record, strategy, strategy_signal_ids)
+        ]
+
+        latest_decision_package_id = await _resolve_latest_decision_package_id(
+            decision_package_builder=decision_package_builder,
+            db=db,
+            decision_records=strategy_decision_records,
+        )
+
+        quality_score = 0
+        replay_variance = Decimal("999")
+        replay_count = 0
+        if latest_decision_package_id is not None:
+            try:
+                replay_result = await replay_decision_package_v0(db=db, decision_package_id=latest_decision_package_id)
+                replay_count = 1
+                quality = evaluate_replay_result_v0(replay_result=replay_result)
+                quality_score = quality.quality_score
+                replay_variance = replay_variance_from_confidence(
+                    original_confidence=replay_result.metadata.get("original_confidence"),
+                    reconstructed_confidence=replay_result.confidence,
+                )
+            except ReplayPackageNotFoundError:
+                pass
+
+        trade_snapshot = _compute_strategy_trade_snapshot(
+            strategy_trades=strategy_trades,
+            latest_prices_by_asset_id=latest_prices_by_asset_id,
+        )
+
+        tournament_strategies.append(
+            TournamentStrategyEvidence(
+                strategy_name=strategy.name,
+                quality_score=quality_score,
+                replay_variance=replay_variance,
+                replay_count=replay_count,
+                paper_trades=len(strategy_trades),
+                realized_pnl=trade_snapshot["realized_pnl"],
+                unrealized_pnl=trade_snapshot["unrealized_pnl"],
+                win_rate=_compute_strategy_win_rate(strategy_trades=strategy_trades),
+            )
+        )
+
+    snapshot = build_tournament_snapshot_v1(strategies=tournament_strategies)
+    return TournamentResponse(
+        tournament_id=snapshot.tournament_id,
+        generated_at=snapshot.generated_at,
+        compared_strategies=list(snapshot.compared_strategies),
+        ranking=[
+            TournamentRankingEntryResponse(
+                strategy_name=item.strategy_name,
+                quality_score=item.quality_score,
+                replay_variance=str(item.replay_variance),
+                replay_count=item.replay_count,
+                paper_trades=item.paper_trades,
+                realized_pnl=str(item.realized_pnl),
+                unrealized_pnl=str(item.unrealized_pnl),
+                win_rate=None if item.win_rate is None else str(item.win_rate),
+                overall_rank=item.overall_rank,
+            )
+            for item in snapshot.ranking
+        ],
+    )
+
+
 async def _load_latest_prices_by_asset_id(*, db: AsyncSession, asset_ids: list[uuid.UUID]) -> dict[uuid.UUID, Decimal]:
     latest_prices_by_asset_id: dict[uuid.UUID, Decimal] = {}
 
@@ -319,6 +447,40 @@ def _compute_strategy_trade_snapshot(
         "unrealized_pnl": unrealized_pnl,
         "total_return_pct": total_return_pct,
     }
+
+
+def _compute_strategy_win_rate(*, strategy_trades: list[Trade]) -> Decimal | None:
+    positions: dict[uuid.UUID, tuple[Decimal, Decimal]] = {}
+    closed_count = 0
+    wins = 0
+
+    for trade in sorted(strategy_trades, key=lambda item: (item.executed_at, item.id)):
+        quantity = Decimal(str(trade.quantity))
+        price = Decimal(str(trade.price))
+        fee = Decimal(str(trade.fee))
+        current_qty, current_avg = positions.get(trade.asset_id, (Decimal("0"), Decimal("0")))
+
+        if trade.side == "buy":
+            total_cost = (current_qty * current_avg) + (quantity * price) + fee
+            next_qty = current_qty + quantity
+            next_avg = total_cost / next_qty if next_qty > 0 else Decimal("0")
+            positions[trade.asset_id] = (next_qty, next_avg)
+            continue
+
+        if trade.side == "sell" and current_qty > 0:
+            sell_qty = min(current_qty, quantity)
+            pnl = (sell_qty * price) - (sell_qty * current_avg) - fee
+            closed_count += 1
+            if pnl > 0:
+                wins += 1
+
+            remaining_qty = current_qty - sell_qty
+            positions[trade.asset_id] = (remaining_qty if remaining_qty > 0 else Decimal("0"), current_avg)
+
+    if closed_count == 0:
+        return None
+
+    return Decimal(wins) / Decimal(closed_count)
 
 
 def _decision_record_matches_strategy(

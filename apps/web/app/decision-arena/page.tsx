@@ -6,15 +6,15 @@ import ReplayAgentsPanel from "@/components/domain/ReplayAgentsPanel";
 import {
   ApiRequestError,
   coachReviewDecisionQuality,
+  getDecisionArenaTournament,
   evaluateReplayResult,
   getDecisionIntelligenceRecommendation,
-  getStrategyArenaScoreboard,
   replayDecisionPackage,
   type AICoachObservation,
   type DecisionIntelligenceRecommendation,
   type DecisionQualityResult,
   type ReplayResult,
-  type StrategyArenaScoreboardResponse,
+  type TournamentResponse,
 } from "@/lib/api/arena";
 
 function errorMessage(error: unknown, fallback: string): string {
@@ -30,6 +30,14 @@ function formatPercent(value: string): string {
     return "0.00%";
   }
   return `${(numeric * 100).toFixed(2)}%`;
+}
+
+function formatNumber(value: string): string {
+  const numeric = Number(value);
+  if (Number.isNaN(numeric)) {
+    return value;
+  }
+  return numeric.toFixed(2);
 }
 
 function formatWhen(value: string | null): string {
@@ -74,7 +82,7 @@ function formatMetric(value: string | null): string {
 export default function DecisionArenaPage() {
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
-  const [scoreboard, setScoreboard] = useState<StrategyArenaScoreboardResponse | null>(null);
+  const [tournament, setTournament] = useState<TournamentResponse | null>(null);
   const [replayLoadingPackageId, setReplayLoadingPackageId] = useState<string | null>(null);
   const [replayResult, setReplayResult] = useState<ReplayResult | null>(null);
   const [qualityResult, setQualityResult] = useState<DecisionQualityResult | null>(null);
@@ -89,15 +97,15 @@ export default function DecisionArenaPage() {
       setLoading(true);
       setError(null);
       try {
-        const payload = await getStrategyArenaScoreboard();
+        const payload = await getDecisionArenaTournament();
         const recommendation = await getDecisionIntelligenceRecommendation();
         if (active) {
-          setScoreboard(payload);
+          setTournament(payload);
           setDecisionIntelligence(recommendation);
         }
       } catch (fetchError) {
         if (active) {
-          setError(errorMessage(fetchError, "Failed to load Strategy Arena scoreboard."));
+          setError(errorMessage(fetchError, "Failed to load Decision Arena Tournament."));
         }
       } finally {
         if (active) {
@@ -113,17 +121,9 @@ export default function DecisionArenaPage() {
     };
   }, []);
 
-  const sortedItems = useMemo(() => {
-    return [...(scoreboard?.items ?? [])].sort((left, right) => {
-      if (left.enabled !== right.enabled) {
-        return left.enabled ? -1 : 1;
-      }
-      return left.strategy_name.localeCompare(right.strategy_name);
-    });
-  }, [scoreboard]);
-
-  const activeCount = sortedItems.filter((item) => item.enabled).length;
-  const disabledCount = sortedItems.length - activeCount;
+  const ranking = useMemo(() => tournament?.ranking ?? [], [tournament]);
+  const champion = ranking[0] ?? null;
+  const runnerUp = ranking[1] ?? null;
 
   async function handleReplay(decisionPackageId: string | null) {
     if (!decisionPackageId) {
@@ -287,87 +287,105 @@ export default function DecisionArenaPage() {
         )}
       </section>
 
-      <section className="rounded-xl border border-border bg-muted/20 p-4 sm:p-5" aria-labelledby="scoreboard-heading">
+      <section className="rounded-xl border border-border bg-muted/20 p-4 sm:p-5" aria-labelledby="tournament-heading">
         <div className="flex flex-wrap items-end justify-between gap-3">
           <div>
-            <h2 id="scoreboard-heading" className="text-lg font-semibold">
-              Strategy Scoreboard
+            <h2 id="tournament-heading" className="text-lg font-semibold">
+              Decision Arena Tournament
             </h2>
             <p className="mt-1 text-xs text-foreground/70">
-              Built to scale from today&apos;s single MA Crossover strategy to many future strategies without redesign.
+              Deterministic, read-only strategy competition based on replay evidence and quality.
             </p>
           </div>
-          <div className="flex gap-2 text-xs text-foreground/75">
-            <span className="rounded-full border border-emerald-500/40 bg-emerald-500/10 px-3 py-1">Active {activeCount}</span>
-            <span className="rounded-full border border-slate-500/40 bg-slate-500/10 px-3 py-1">Disabled {disabledCount}</span>
+          <div className="flex flex-wrap gap-2 text-xs text-foreground/75">
+            <span className="rounded-full border border-amber-500/40 bg-amber-500/10 px-3 py-1">🥇 First</span>
+            <span className="rounded-full border border-slate-400/40 bg-slate-400/10 px-3 py-1">🥈 Second</span>
+            <span className="rounded-full border border-orange-700/40 bg-orange-700/10 px-3 py-1">🥉 Third</span>
           </div>
         </div>
 
         <div className="mt-4 overflow-x-auto">
           {loading ? (
-            <p className="py-8 text-sm text-foreground/70">Loading strategy scoreboard...</p>
-          ) : sortedItems.length > 0 ? (
-            <table className="min-w-[1180px] w-full text-left text-sm">
+            <p className="py-8 text-sm text-foreground/70">Loading tournament rankings...</p>
+          ) : ranking.length > 0 ? (
+            <table className="min-w-[1180px] w-full text-left text-sm" aria-label="Tournament Ranking">
               <thead>
                 <tr className="border-b border-border text-foreground/70">
+                  <th className="px-3 py-2">Rank</th>
                   <th className="px-3 py-2">Strategy</th>
-                  <th className="px-3 py-2">Status</th>
-                  <th className="px-3 py-2">Signals</th>
-                  <th className="px-3 py-2">BUY</th>
-                  <th className="px-3 py-2">SELL</th>
-                  <th className="px-3 py-2">HOLD</th>
-                  <th className="px-3 py-2">Trades</th>
-                  <th className="px-3 py-2">Open Positions</th>
-                  <th className="px-3 py-2">Return %</th>
-                  <th className="px-3 py-2">Decision Records</th>
-                  <th className="px-3 py-2">Last Signal</th>
-                  <th className="px-3 py-2">Last Trade</th>
-                  <th className="px-3 py-2">Replay</th>
+                  <th className="px-3 py-2">Quality</th>
+                  <th className="px-3 py-2">Replay Variance</th>
+                  <th className="px-3 py-2">Replay Count</th>
+                  <th className="px-3 py-2">Paper Trades</th>
+                  <th className="px-3 py-2">Realized PnL</th>
+                  <th className="px-3 py-2">Unrealized PnL</th>
+                  <th className="px-3 py-2">Win Rate</th>
                 </tr>
               </thead>
               <tbody>
-                {sortedItems.map((item) => (
-                  <tr key={item.strategy_id} className="border-b border-border/60">
-                    <td className="px-3 py-3">
-                      <div className="font-semibold text-foreground/90">{item.strategy_name}</div>
-                      <div className="text-xs text-foreground/60">{item.strategy_id}</div>
+                {ranking.map((item) => (
+                  <tr key={item.strategy_name} className={`border-b border-border/60 ${item.overall_rank === 1 ? "bg-emerald-500/10" : ""}`}>
+                    <td className="px-3 py-3 font-semibold">
+                      {item.overall_rank === 1 ? "🥇" : item.overall_rank === 2 ? "🥈" : item.overall_rank === 3 ? "🥉" : "#"}
+                      {item.overall_rank}
                     </td>
                     <td className="px-3 py-3">
-                      <span className={`inline-flex rounded-full border px-2 py-1 text-xs font-medium ${statusStyles(item.enabled)}`}>
-                        {item.enabled ? "Active" : "Disabled"}
-                      </span>
+                      <div className="font-semibold text-foreground/90">
+                        {item.strategy_name}
+                        {item.overall_rank === 1 ? <span className="ml-2 rounded-full border border-emerald-500/40 bg-emerald-500/10 px-2 py-0.5 text-xs text-emerald-100">Leader</span> : null}
+                      </div>
                     </td>
-                    <td className="px-3 py-3 font-medium">{item.signals_generated}</td>
-                    <td className="px-3 py-3 text-emerald-300">{item.buy_signals}</td>
-                    <td className="px-3 py-3 text-rose-300">{item.sell_signals}</td>
-                    <td className="px-3 py-3 text-slate-300">{item.hold_signals}</td>
+                    <td className="px-3 py-3">{item.quality_score}</td>
+                    <td className="px-3 py-3">{formatNumber(item.replay_variance)}</td>
+                    <td className="px-3 py-3">{item.replay_count}</td>
                     <td className="px-3 py-3">{item.paper_trades}</td>
-                    <td className="px-3 py-3">{item.open_positions}</td>
-                    <td className={`px-3 py-3 font-semibold ${returnStyles(item.total_return_pct)}`}>
-                      {formatPercent(item.total_return_pct)}
-                    </td>
-                    <td className="px-3 py-3">{item.decision_records}</td>
-                    <td className="px-3 py-3 text-xs text-foreground/75">{formatWhen(item.last_signal_timestamp)}</td>
-                    <td className="px-3 py-3 text-xs text-foreground/75">{formatWhen(item.last_trade_timestamp)}</td>
-                    <td className="px-3 py-3">
-                      <button
-                        type="button"
-                        className="rounded-md border border-border bg-background px-3 py-1.5 text-xs font-medium text-foreground/90 disabled:cursor-not-allowed disabled:opacity-60"
-                        disabled={!item.latest_decision_package_id || replayLoadingPackageId === item.latest_decision_package_id}
-                        onClick={() => void handleReplay(item.latest_decision_package_id)}
-                      >
-                        {replayLoadingPackageId === item.latest_decision_package_id ? "Replaying..." : "Replay"}
-                      </button>
-                    </td>
+                    <td className={`px-3 py-3 font-semibold ${returnStyles(item.realized_pnl)}`}>{formatNumber(item.realized_pnl)}</td>
+                    <td className={`px-3 py-3 font-semibold ${returnStyles(item.unrealized_pnl)}`}>{formatNumber(item.unrealized_pnl)}</td>
+                    <td className="px-3 py-3">{item.win_rate ? formatPercent(item.win_rate) : "n/a"}</td>
                   </tr>
                 ))}
               </tbody>
             </table>
           ) : (
             <div className="rounded-lg border border-dashed border-border bg-background/40 p-6 text-sm text-foreground/70">
-              No strategies are registered yet. The arena is ready for MA Crossover today and many strategies tomorrow.
+              No active strategies are available for tournament comparison yet.
             </div>
           )}
+        </div>
+      </section>
+
+      <section className="rounded-xl border border-border bg-background/50 p-4 sm:p-5" aria-labelledby="tournament-summary-heading">
+        <div className="flex flex-wrap items-center justify-between gap-3">
+          <h3 id="tournament-summary-heading" className="text-base font-semibold">Tournament Summary</h3>
+          <p className="text-xs text-foreground/60">Generated {tournament ? formatWhen(tournament.generated_at) : "Not available"}</p>
+        </div>
+
+        <div className="mt-3 grid gap-3 sm:grid-cols-2 lg:grid-cols-4">
+          <Metric label="Current Champion" value={champion?.strategy_name ?? "None"} />
+          <Metric label="Runner Up" value={runnerUp?.strategy_name ?? "None"} />
+          <Metric
+            label="Evidence Summary"
+            value={
+              tournament && tournament.compared_strategies.length > 0
+                ? `Compared ${tournament.compared_strategies.length} active strategies using deterministic tournament ranking rules.`
+                : "No active strategies available for deterministic tournament evidence."
+            }
+          />
+          <Metric label="Human Review Required" value="Yes" />
+        </div>
+      </section>
+
+      <section className="rounded-xl border border-dashed border-border bg-background/40 p-4 sm:p-5" aria-labelledby="history-placeholder-heading">
+        <h3 id="history-placeholder-heading" className="text-base font-semibold">History Placeholder</h3>
+        <div className="mt-3 grid gap-3 md:grid-cols-2">
+          <article className="rounded-md border border-border/60 bg-background/40 p-3">
+            <h4 className="text-sm font-semibold">Future: Tournament History</h4>
+            <p className="mt-1 text-xs text-foreground/65">Historical tournament snapshots will appear here.</p>
+          </article>
+          <article className="rounded-md border border-border/60 bg-background/40 p-3">
+            <h4 className="text-sm font-semibold">Future: Champion History</h4>
+            <p className="mt-1 text-xs text-foreground/65">Champion progression by tournament cycle will appear here.</p>
+          </article>
         </div>
       </section>
 

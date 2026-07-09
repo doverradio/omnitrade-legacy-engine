@@ -216,6 +216,25 @@ export type DecisionIntelligenceRecommendation = {
   promotion_recommended: boolean;
 };
 
+export type TournamentRankingEntry = {
+  strategy_name: string;
+  quality_score: number;
+  replay_variance: string;
+  replay_count: number;
+  paper_trades: number;
+  realized_pnl: string;
+  unrealized_pnl: string;
+  win_rate: string | null;
+  overall_rank: number;
+};
+
+export type TournamentResponse = {
+  tournament_id: string;
+  generated_at: string;
+  compared_strategies: string[];
+  ranking: TournamentRankingEntry[];
+};
+
 async function requestJson<T>(path: string, init?: RequestInit): Promise<T> {
   const headers = new Headers(init?.headers);
   headers.set("Content-Type", "application/json");
@@ -323,4 +342,8 @@ export async function coachReviewDecisionQuality(request: DecisionQualityResult)
 
 export async function getDecisionIntelligenceRecommendation(): Promise<DecisionIntelligenceRecommendation> {
   return requestJson<DecisionIntelligenceRecommendation>("/arena/decision-intelligence");
+}
+
+export async function getDecisionArenaTournament(): Promise<TournamentResponse> {
+  return requestJson<TournamentResponse>("/arena/tournament");
 }
