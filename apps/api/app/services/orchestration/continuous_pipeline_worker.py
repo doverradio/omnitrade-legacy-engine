@@ -282,11 +282,26 @@ async def run_orchestration_cycle(
                     )
                     signal_model.status = _signal_status_from_execution_status(execution.execution_status)
                 else:
+                    logger.info(
+                        "paper_execution_skip reason=no_active_paper_account signal_id=%s action=%s status=%s account_id=%s",
+                        signal_model.id,
+                        generated.action,
+                        signal_model.status,
+                        None,
+                    )
                     logger.warning(
                         "No active paper account for asset_class=%s asset=%s; signal persisted without execution",
                         asset.asset_class,
                         asset.symbol,
                     )
+            else:
+                logger.info(
+                    "paper_execution_skip reason=non_actionable_action signal_id=%s action=%s status=%s account_id=%s",
+                    signal_model.id,
+                    generated.action,
+                    signal_model.status,
+                    None,
+                )
 
             decision_result = await ingest_decision_records(db=db, signal_ids=[signal_model.id])
             decision_inserted_total += decision_result.inserted_records

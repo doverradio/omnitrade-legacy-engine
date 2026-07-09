@@ -74,9 +74,13 @@ class _FakeSession:
                 for account in accounts
             ],
         ]
+        self._in_transaction = False
 
     def begin(self) -> _BeginContext:
         return _BeginContext()
+
+    def in_transaction(self) -> bool:
+        return self._in_transaction
 
     async def scalar(self, statement: Any) -> Any:
         sql = str(statement)
@@ -540,3 +544,56 @@ async def test_orchestrator_passes_resized_quantity_to_crypto_adapter(monkeypatc
     assert evaluate_calls["count"] == 1
     assert persist_calls["count"] == 1
     assert adapter_quantity["value"] == Decimal("0.015")
+
+
+@pytest.mark.asyncio
+async def test_orchestrator_persists_risk_inside_existing_transaction(monkeypatch: pytest.MonkeyPatch) -> None:
+    now = datetime(2026, 7, 6, tzinfo=timezone.utc)
+    account = PaperAccount(
+        id=uuid.uuid4(),
+        owner_user_id=uuid.uuid4(),
+        name="Family Crypto",
+        asset_class="crypto",
+        starting_balance=Decimal("25"),
+        current_cash_balance=Decimal("25"),
+        is_active=True,
+        created_at=now,
+    )
+    asset = Asset(
+        id=uuid.uuid4(),
+        symbol="BTCUSDT",
+        asset_class="crypto",
+        exchange="binance_us",
+        supports_fractional=True,
+        qty_step_size=Decimal("0.00001"),
+        min_order_notional=Decimal("1"),
+        is_active=True,
+    )
+    session = _FakeSession(accounts=[account], assets=[asset], trades=[])
+    session._in_transaction = True
+
+    import app.services.signals.execution_orchestrator as orchestrator_module
+
+    def fake_evaluate_signal_risk(*args, **kwargs):
+        return RiskEvaluationResult(
+            action=RiskDecisionAction.REJECT,
+            reason_code="max_daily_loss_breached",
+            approved_quantity=Decimal("0"),
+            steps=[RiskEvaluationStep(step="daily_loss", status="reject", reason_code="max_daily_loss_breached")],
+        )
+
+    monkeypatch.setattr(orchestrator_module, "evaluate_signal_risk", fake_evaluate_signal_risk)
+
+    result = await orchestrate_paper_signal_execution(
+        db=session,
+        request=SignalExecutionRequest(
+            signal_id=uuid.uuid4(),
+            paper_account_id=account.id,
+            asset_id=asset.id,
+            side="buy",
+            quantity=Decimal("0.02"),
+        ),
+    )
+
+    assert result.execution_status == "rejected"
+    assert len(session.risk_events) == 1

@@ -29,9 +29,15 @@ class _FakeSession:
     def __init__(self) -> None:
         self.risk_events: list[RiskEvent] = []
         self.audit_logs: list[AuditLog] = []
+        self.begin_calls = 0
+        self._in_transaction = False
 
     def begin(self) -> _BeginContext:
+        self.begin_calls += 1
         return _BeginContext()
+
+    def in_transaction(self) -> bool:
+        return self._in_transaction
 
     def add(self, obj: Any) -> None:
         if isinstance(obj, RiskEvent):
@@ -159,3 +165,55 @@ async def test_persist_risk_decision_writes_resize_event_payload() -> None:
     assert persisted.audit_written is False
     assert session.risk_events[0].detail["decision"] == "resize"
     assert session.risk_events[0].detail["approved_quantity"] == "0.50"
+
+
+@pytest.mark.asyncio
+async def test_persist_risk_decision_joins_existing_transaction_without_begin() -> None:
+    session = _FakeSession()
+    session._in_transaction = True
+    result = RiskEvaluationResult(
+        action=RiskDecisionAction.REJECT,
+        reason_code="max_daily_loss_breached",
+        approved_quantity=Decimal("0"),
+        steps=[RiskEvaluationStep(step="daily_loss", status="reject", reason_code="max_daily_loss_breached")],
+    )
+
+    persisted = await persist_risk_decision(
+        db=session,
+        request=RiskDecisionPersistenceRequest(
+            paper_account_id=uuid.uuid4(),
+            signal_id=uuid.uuid4(),
+            actor="system",
+            evaluation_result=result,
+        ),
+    )
+
+    assert persisted.risk_event_action == "blocked"
+    assert session.begin_calls == 0
+    assert len(session.risk_events) == 1
+
+
+@pytest.mark.asyncio
+async def test_persist_risk_decision_standalone_uses_begin_once() -> None:
+    session = _FakeSession()
+    session._in_transaction = False
+    result = RiskEvaluationResult(
+        action=RiskDecisionAction.APPROVE,
+        reason_code=None,
+        approved_quantity=Decimal("0.25"),
+        steps=[RiskEvaluationStep(step="global_kill_switch", status="pass")],
+    )
+
+    persisted = await persist_risk_decision(
+        db=session,
+        request=RiskDecisionPersistenceRequest(
+            paper_account_id=uuid.uuid4(),
+            signal_id=uuid.uuid4(),
+            actor="system",
+            evaluation_result=result,
+        ),
+    )
+
+    assert persisted.risk_event_action == "approved"
+    assert session.begin_calls == 1
+    assert len(session.risk_events) == 1

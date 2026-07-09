@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 import uuid
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -26,6 +27,9 @@ from app.services.risk import (
     persist_risk_decision,
     resolve_execution_risk_context,
 )
+
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True, slots=True)
@@ -100,6 +104,13 @@ async def orchestrate_paper_signal_execution(
         .limit(1)
     )
     if existing_trade is not None:
+        logger.info(
+            "paper_execution_skip reason=duplicate_signal signal_id=%s action=%s status=%s account_id=%s",
+            request.signal_id,
+            request.side,
+            "executed",
+            request.paper_account_id,
+        )
         duplicate_audit = AuditLog(
             actor=request.actor,
             action="signal_execution_duplicate_skipped",
@@ -204,6 +215,13 @@ async def orchestrate_paper_signal_execution(
     )
 
     if risk_result.action == RiskDecisionAction.REJECT:
+        logger.info(
+            "paper_execution_skip reason=risk_rejected signal_id=%s action=%s status=%s account_id=%s",
+            request.signal_id,
+            request.side,
+            "risk_rejected",
+            request.paper_account_id,
+        )
         rejected_audit = AuditLog(
             actor=request.actor,
             action="signal_execution_rejected_by_risk",

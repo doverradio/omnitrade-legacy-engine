@@ -97,6 +97,18 @@ async def persist_risk_decision(
     db: AsyncSession,
     request: RiskDecisionPersistenceRequest,
 ) -> RiskDecisionPersistenceResult:
+    if db.in_transaction():
+        return await _persist_risk_decision_without_begin(db=db, request=request)
+
+    async with db.begin():
+        return await _persist_risk_decision_without_begin(db=db, request=request)
+
+
+async def _persist_risk_decision_without_begin(
+    *,
+    db: AsyncSession,
+    request: RiskDecisionPersistenceRequest,
+) -> RiskDecisionPersistenceResult:
     result = request.evaluation_result
     event_type = _map_risk_event_type(result.reason_code, result.action)
     action_taken = _map_risk_action_taken(result.action)
@@ -111,20 +123,19 @@ async def persist_risk_decision(
 
     audit_written = False
 
-    async with db.begin():
-        db.add(risk_event)
+    db.add(risk_event)
 
-        if request.state_change_action is not None:
-            audit = AuditLog(
-                actor=request.actor,
-                action=request.state_change_action,
-                entity_type=request.state_change_entity_type or "risk",
-                entity_id=request.state_change_entity_id,
-                before_state=request.state_before,
-                after_state=request.state_after,
-            )
-            db.add(audit)
-            audit_written = True
+    if request.state_change_action is not None:
+        audit = AuditLog(
+            actor=request.actor,
+            action=request.state_change_action,
+            entity_type=request.state_change_entity_type or "risk",
+            entity_id=request.state_change_entity_id,
+            before_state=request.state_before,
+            after_state=request.state_after,
+        )
+        db.add(audit)
+        audit_written = True
 
     return RiskDecisionPersistenceResult(
         risk_event_action=action_taken,
