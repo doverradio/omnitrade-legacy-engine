@@ -9,6 +9,7 @@ from app.api.routes.dashboard import router as dashboard_router
 from app.api.routes.decisions import router as decisions_router
 from app.api.routes.health import router as health_router
 from app.api.routes.live import router as live_router
+from app.api.routes.mission_control import router as mission_control_router
 from app.api.routes.markets import router as markets_router
 from app.api.routes.operations import router as operations_router
 from app.api.routes.parameter_sets import router as parameter_sets_router
@@ -49,6 +50,7 @@ def create_app() -> FastAPI:
     app.include_router(parameter_sets_router)
     app.include_router(backtests_router)
     app.include_router(dashboard_router)
+    app.include_router(mission_control_router)
     app.include_router(arena_router)
     app.include_router(research_router)
     app.include_router(paper_router)
