@@ -73,7 +73,7 @@ export default function ValidationRunsPage() {
   const [objective, setObjective] = useState("Validate paper-mode reliability and research progression.");
   const [durationPreset, setDurationPreset] = useState<string>("72");
   const [customDuration, setCustomDuration] = useState("72");
-  const [paperCapital, setPaperCapital] = useState("100000");
+  const [paperCapital, setPaperCapital] = useState("25");
   const [enabledStrategies, setEnabledStrategies] = useState<string[]>(["MA Crossover", "RSI"]);
   const [enabledAgents, setEnabledAgents] = useState<string[]>(["Baseline", "OpenAI Sandbox"]);
   const [enabledFeatures, setEnabledFeatures] = useState<string[]>([
@@ -322,6 +322,7 @@ export default function ValidationRunsPage() {
               value={paperCapital}
               onChange={(event) => setPaperCapital(event.target.value)}
             />
+            <span className="mt-1 block text-xs text-foreground/65">Default proving capital is $25 in Small Account Mode.</span>
           </label>
 
           <label className="text-sm md:col-span-2">

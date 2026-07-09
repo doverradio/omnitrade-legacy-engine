@@ -270,6 +270,8 @@ describe("ValidationRunsPage", () => {
 
     expect(await screen.findByRole("heading", { name: "Validation Runs" })).toBeInTheDocument();
     expect(screen.getByRole("button", { name: "Start Validation Run" })).toBeInTheDocument();
+    expect(screen.getByDisplayValue("25")).toBeInTheDocument();
+    expect(screen.getByText("Default proving capital is $25 in Small Account Mode.")).toBeInTheDocument();
     expect(screen.getByText("No validation runs yet.")).toBeInTheDocument();
   });
 
