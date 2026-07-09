@@ -5,9 +5,11 @@ import { useEffect, useMemo, useState } from "react";
 import ReplayAgentsPanel from "@/components/domain/ReplayAgentsPanel";
 import {
   ApiRequestError,
+  coachReviewDecisionQuality,
   evaluateReplayResult,
   getStrategyArenaScoreboard,
   replayDecisionPackage,
+  type AICoachObservation,
   type DecisionQualityResult,
   type ReplayResult,
   type StrategyArenaScoreboardResponse,
@@ -74,6 +76,7 @@ export default function DecisionArenaPage() {
   const [replayLoadingPackageId, setReplayLoadingPackageId] = useState<string | null>(null);
   const [replayResult, setReplayResult] = useState<ReplayResult | null>(null);
   const [qualityResult, setQualityResult] = useState<DecisionQualityResult | null>(null);
+  const [coachObservation, setCoachObservation] = useState<AICoachObservation | null>(null);
   const [replayError, setReplayError] = useState<string | null>(null);
 
   useEffect(() => {
@@ -127,12 +130,15 @@ export default function DecisionArenaPage() {
     setReplayError(null);
     setReplayResult(null);
     setQualityResult(null);
+    setCoachObservation(null);
 
     try {
       const result = await replayDecisionPackage({ decision_package_id: decisionPackageId });
       setReplayResult(result);
       const quality = await evaluateReplayResult(result);
       setQualityResult(quality);
+      const observation = await coachReviewDecisionQuality(quality);
+      setCoachObservation(observation);
     } catch (replayRequestError) {
       if (replayRequestError instanceof ApiRequestError) {
         setReplayError(replayRequestError.message);
@@ -212,8 +218,41 @@ export default function DecisionArenaPage() {
               </div>
             </section>
           ) : null}
+
         </div>
       ) : null}
+
+      <section className="rounded-md border border-border bg-background/60 px-3 py-3 text-sm text-foreground/85">
+        <div className="flex items-center justify-between gap-3">
+          <div>
+            <p className="text-xs font-semibold uppercase tracking-wide text-foreground/60">Deterministic AI Coach (Rule-Based)</p>
+            <p className="text-xs text-foreground/45">No AI model is being used.</p>
+          </div>
+        </div>
+
+        {coachObservation ? (
+          <div className="mt-3 space-y-3">
+            <div className="rounded-md border border-emerald-500/40 bg-emerald-500/10 px-3 py-2">
+              <p className="text-sm font-medium text-emerald-100">{coachObservation.summary}</p>
+            </div>
+
+            <div className="grid gap-3 md:grid-cols-2">
+              <ObservationList title="Strengths" items={coachObservation.strengths} emptyLabel="None" />
+              <ObservationList title="Weaknesses" items={coachObservation.weaknesses} emptyLabel="None" />
+            </div>
+
+            <div className="grid gap-3 lg:grid-cols-3">
+              <Metric label="Confidence Note" value={coachObservation.confidence_note} />
+              <Metric label="Reproducibility Note" value={coachObservation.reproducibility_note} />
+              <Metric label="Suggested Follow-up" value={coachObservation.suggested_follow_up} />
+            </div>
+          </div>
+        ) : (
+          <div className="mt-3 rounded-md border border-dashed border-border/70 bg-background/40 px-3 py-3 text-sm text-foreground/55">
+            No coach observation yet. Run Replay to generate a deterministic AI Coach review.
+          </div>
+        )}
+      </section>
 
       <section className="rounded-xl border border-border bg-muted/20 p-4 sm:p-5" aria-labelledby="scoreboard-heading">
         <div className="flex flex-wrap items-end justify-between gap-3">
@@ -331,6 +370,25 @@ function Metric({ label, value, muted = false }: { label: string; value: string 
     <div className="rounded-md border border-border/70 bg-background/40 px-3 py-2">
       <p className="text-xs uppercase tracking-wide text-foreground/55">{label}</p>
       <p className={`mt-1 text-sm font-medium ${muted ? "text-foreground/45" : "text-foreground/90"}`}>{value ?? "Planned"}</p>
+    </div>
+  );
+}
+
+function ObservationList({ title, items, emptyLabel }: { title: string; items: string[]; emptyLabel: string }) {
+  return (
+    <div className="rounded-md border border-border/70 bg-background/40 px-3 py-2">
+      <p className="text-xs uppercase tracking-wide text-foreground/55">{title}</p>
+      {items.length > 0 ? (
+        <ul className="mt-2 space-y-1 text-sm text-foreground/90">
+          {items.map((item) => (
+            <li key={item} className="rounded-md border border-border/50 bg-background/40 px-2 py-1">
+              {item}
+            </li>
+          ))}
+        </ul>
+      ) : (
+        <p className="mt-1 text-sm font-medium text-foreground/45">{emptyLabel}</p>
+      )}
     </div>
   );
 }

@@ -193,6 +193,17 @@ export type DecisionQualityResult = {
   explanation_quality: string | null;
 };
 
+export type AICoachObservation = {
+  observation_id: string;
+  evaluation_timestamp: string;
+  summary: string;
+  strengths: string[];
+  weaknesses: string[];
+  confidence_note: string;
+  reproducibility_note: string;
+  suggested_follow_up: string;
+};
+
 async function requestJson<T>(path: string, init?: RequestInit): Promise<T> {
   const headers = new Headers(init?.headers);
   headers.set("Content-Type", "application/json");
@@ -286,6 +297,13 @@ export async function replayDecisionPackage(request: ReplayRequest): Promise<Rep
 
 export async function evaluateReplayResult(request: ReplayResult): Promise<DecisionQualityResult> {
   return requestJson<DecisionQualityResult>("/arena/evaluate-replay", {
+    method: "POST",
+    body: JSON.stringify(request),
+  });
+}
+
+export async function coachReviewDecisionQuality(request: DecisionQualityResult): Promise<AICoachObservation> {
+  return requestJson<AICoachObservation>("/arena/coach-review", {
     method: "POST",
     body: JSON.stringify(request),
   });

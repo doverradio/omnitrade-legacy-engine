@@ -15,9 +15,11 @@ from app.models.decision_record import DecisionRecord
 from app.models.signal import Signal
 from app.models.strategy import Strategy
 from app.models.trade import Trade
+from app.schemas.ai_coach import AICoachObservationResponse, AICoachReviewRequest
 from app.schemas.decision_quality import DecisionQualityEvaluationRequest, DecisionQualityResultResponse
 from app.schemas.arena import StrategyArenaScoreboardItem, StrategyArenaScoreboardResponse
 from app.schemas.replay_agent import ReplayRequest, ReplayResultResponse, ReplayAgentCapabilityResponse, ReplayAgentRegistrationResponse
+from app.services.ai_coach.deterministic import evaluate_decision_quality_v0
 from app.services.decision_quality.deterministic import evaluate_replay_result_v0
 from app.services.decisions.package import DecisionPackageBuilder
 from app.services.replay.default_agent import ReplayPackageNotFoundError, replay_decision_package_v0
@@ -172,6 +174,21 @@ async def evaluate_replay(request: DecisionQualityEvaluationRequest) -> Decision
         drawdown=quality_result.drawdown,
         risk_adjusted_return=quality_result.risk_adjusted_return,
         explanation_quality=quality_result.explanation_quality,
+    )
+
+
+@router.post("/coach-review", response_model=AICoachObservationResponse)
+async def coach_review(request: AICoachReviewRequest) -> AICoachObservationResponse:
+    observation = evaluate_decision_quality_v0(decision_quality_result=request.to_decision_quality_result())
+    return AICoachObservationResponse(
+        observation_id=observation.observation_id,
+        evaluation_timestamp=observation.evaluation_timestamp,
+        summary=observation.summary,
+        strengths=list(observation.strengths),
+        weaknesses=list(observation.weaknesses),
+        confidence_note=observation.confidence_note,
+        reproducibility_note=observation.reproducibility_note,
+        suggested_follow_up=observation.suggested_follow_up,
     )
 
 

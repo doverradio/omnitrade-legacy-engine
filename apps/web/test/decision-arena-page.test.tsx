@@ -97,6 +97,19 @@ function installFetchMock() {
       });
     }
 
+    if (url.pathname === "/arena/coach-review" && method === "POST") {
+      return jsonResponse(200, {
+        observation_id: "33333333-3333-3333-3333-333333333333",
+        evaluation_timestamp: "2026-07-09T12:00:01Z",
+        summary: "Replay successfully reproduced the production decision.",
+        strengths: ["Replay successfully reproduced the production decision."],
+        weaknesses: [],
+        confidence_note: "Confidence aligned with the original decision.",
+        reproducibility_note: "Replay reproduced the production decision exactly.",
+        suggested_follow_up: "Use this replay as a deterministic baseline for future comparisons.",
+      });
+    }
+
     if (method !== "GET") {
       return jsonResponse(405, {
         error: {
@@ -173,6 +186,16 @@ describe("DecisionArenaPage", () => {
       risk_adjusted_return: null,
       explanation_quality: null,
     });
+    vi.spyOn(arenaApi, "coachReviewDecisionQuality").mockResolvedValue({
+      observation_id: "33333333-3333-3333-3333-333333333333",
+      evaluation_timestamp: "2026-07-09T12:00:01Z",
+      summary: "Replay successfully reproduced the production decision.",
+      strengths: ["Replay successfully reproduced the production decision."],
+      weaknesses: [],
+      confidence_note: "Confidence aligned with the original decision.",
+      reproducibility_note: "Replay reproduced the production decision exactly.",
+      suggested_follow_up: "Use this replay as a deterministic baseline for future comparisons.",
+    });
 
     const user = userEvent.setup();
     render(<DecisionArenaPage />);
@@ -190,6 +213,16 @@ describe("DecisionArenaPage", () => {
     expect(screen.getByText(/Confidence Match/i)).toBeInTheDocument();
     expect(screen.getByText(/Replay Duration/i)).toBeInTheDocument();
     expect(screen.getAllByText("Planned")).toHaveLength(5);
+    expect(screen.getByText(/Deterministic AI Coach \(Rule-Based\)/i)).toBeInTheDocument();
+    expect(screen.getAllByText("Replay successfully reproduced the production decision.")).toHaveLength(2);
+    expect(screen.getByText(/Confidence aligned with the original decision\./i)).toBeInTheDocument();
+  });
+
+  it("renders the empty coach state before replay", async () => {
+    installFetchMock();
+    render(<DecisionArenaPage />);
+
+    expect(await screen.findByText(/No coach observation yet\. Run Replay to generate a deterministic AI Coach review\./i)).toBeInTheDocument();
   });
 
   it("renders empty state when no strategies exist", async () => {
