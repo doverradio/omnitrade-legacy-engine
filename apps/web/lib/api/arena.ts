@@ -269,6 +269,14 @@ export type ResearchAgent = {
   capabilities: string[];
 };
 
+export type LLMResearchAdapter = {
+  adapter_id: string;
+  adapter_name: string;
+  provider: string;
+  capabilities: string[];
+  status: string;
+};
+
 export type StrategyCandidate = {
   candidate_id: string;
   generated_at: string;
@@ -572,6 +580,10 @@ export async function getStrategyHealth(): Promise<StrategyHealthResponse> {
 
 export async function getResearchAgents(): Promise<ResearchAgent[]> {
   return requestJson<ResearchAgent[]>("/research/agents");
+}
+
+export async function getLLMResearchAdapters(): Promise<LLMResearchAdapter[]> {
+  return requestJson<LLMResearchAdapter[]>("/research/llm-adapters");
 }
 
 export async function getResearchCandidates(): Promise<StrategyCandidate[]> {

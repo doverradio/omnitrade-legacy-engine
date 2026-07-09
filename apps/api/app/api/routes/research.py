@@ -21,6 +21,7 @@ from app.schemas.evolution_analytics import (
     EvolutionAnalyticsRunPointResponse,
 )
 from app.schemas.research_laboratory import ResearchLaboratoryRunResponse, ResearchLaboratoryStatusResponse
+from app.schemas.llm_adapter import LLMAdapterResponse
 from app.schemas.research_memory import (
     ResearchMemoryCandidateResponse,
     ResearchMemoryLaboratoryRunResponse,
@@ -34,6 +35,7 @@ from app.services.candidate_evaluation.deterministic import (
     resolve_candidate_by_id_v1,
 )
 from app.services.research_agents.registry import list_generated_strategy_candidates, list_registered_research_agents
+from app.services.research_agents.llm_adapter.registry import list_registered_llm_research_adapters
 from app.services.research_laboratory.registry import get_research_laboratory
 from app.services.research_memory.registry import get_research_memory
 from app.services.evolution.registry import get_evolution_engine
@@ -52,6 +54,20 @@ async def get_research_agents() -> list[ResearchAgentResponse]:
             capabilities=list(item.capabilities),
         )
         for item in list_registered_research_agents()
+    ]
+
+
+@router.get("/llm-adapters", response_model=list[LLMAdapterResponse])
+async def get_llm_research_adapters() -> list[LLMAdapterResponse]:
+    return [
+        LLMAdapterResponse(
+            adapter_id=item.adapter_id,
+            adapter_name=item.adapter_name,
+            provider=item.provider,
+            capabilities=list(item.capabilities),
+            status=item.status,
+        )
+        for item in list_registered_llm_research_adapters()
     ]
 
 

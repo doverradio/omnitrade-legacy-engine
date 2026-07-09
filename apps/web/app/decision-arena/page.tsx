@@ -9,6 +9,7 @@ import {
   coachReviewDecisionQuality,
   evolveResearchCandidates,
   evaluateCandidates,
+  getLLMResearchAdapters,
   getEvolutionAnalytics,
   getCapitalAllocationRecommendation,
   getDecisionArenaTournament,
@@ -29,6 +30,7 @@ import {
   type DecisionQualityResult,
   type EvolutionAnalytics,
   type EvolutionResponse,
+  type LLMResearchAdapter,
   type ReplayResult,
   type ResearchAgent,
   type ResearchMemoryCandidate,
@@ -126,6 +128,7 @@ export default function DecisionArenaPage() {
   const [decisionIntelligence, setDecisionIntelligence] = useState<DecisionIntelligenceRecommendation | null>(null);
   const [capitalAllocation, setCapitalAllocation] = useState<CapitalAllocationRecommendation | null>(null);
   const [researchAgents, setResearchAgents] = useState<ResearchAgent[]>([]);
+  const [llmResearchAdapters, setLlmResearchAdapters] = useState<LLMResearchAdapter[]>([]);
   const [researchCandidates, setResearchCandidates] = useState<StrategyCandidate[]>([]);
   const [candidateEvaluations, setCandidateEvaluations] = useState<CandidateEvaluation[]>([]);
   const [candidateBatchSummary, setCandidateBatchSummary] = useState<CandidateBatchEvaluationResponse | null>(null);
@@ -153,11 +156,12 @@ export default function DecisionArenaPage() {
       setResearchMemoryError(null);
       setEvolutionAnalyticsError(null);
       try {
-        const [payload, recommendation, allocation, agents, candidates, laboratory, memorySummary, memoryCandidates, analytics] = await Promise.all([
+        const [payload, recommendation, allocation, agents, llmAdapters, candidates, laboratory, memorySummary, memoryCandidates, analytics] = await Promise.all([
           getDecisionArenaTournament(),
           getDecisionIntelligenceRecommendation(),
           getCapitalAllocationRecommendation(),
           getResearchAgents(),
+          getLLMResearchAdapters(),
           getResearchCandidates(),
           getResearchLaboratoryStatus(),
           getResearchMemorySummary(),
@@ -170,6 +174,7 @@ export default function DecisionArenaPage() {
           setDecisionIntelligence(recommendation);
           setCapitalAllocation(allocation);
           setResearchAgents(agents);
+          setLlmResearchAdapters(llmAdapters);
           setResearchCandidates(candidates);
           setCandidateEvaluations([]);
           setCandidateBatchSummary(null);
@@ -592,6 +597,45 @@ export default function DecisionArenaPage() {
         ) : (
           <div className="mt-4 rounded-md border border-dashed border-border/70 bg-background/40 px-3 py-3 text-sm text-foreground/60">
             No research agents or candidate strategies are available yet.
+          </div>
+        )}
+      </section>
+
+      <section className="rounded-xl border border-border bg-background/60 p-4 sm:p-5" aria-labelledby="future-research-agents-heading">
+        <div className="flex flex-wrap items-end justify-between gap-3">
+          <div>
+            <h3 id="future-research-agents-heading" className="text-base font-semibold">Future Research Agents</h3>
+            <p className="mt-1 text-xs text-foreground/70">Adapter registry for future GPT, Claude, Gemini, or local-model research integrations.</p>
+          </div>
+          <p className="text-xs font-semibold uppercase tracking-wide text-foreground/60">Framework Only</p>
+        </div>
+
+        {llmResearchAdapters.length > 0 ? (
+          <div className="mt-3 overflow-x-auto">
+            <table className="min-w-[860px] w-full text-left text-sm" aria-label="LLM Research Adapters">
+              <thead>
+                <tr className="border-b border-border text-foreground/70">
+                  <th className="px-3 py-2">Adapter</th>
+                  <th className="px-3 py-2">Provider</th>
+                  <th className="px-3 py-2">Capabilities</th>
+                  <th className="px-3 py-2">Status</th>
+                </tr>
+              </thead>
+              <tbody>
+                {llmResearchAdapters.map((adapter) => (
+                  <tr key={adapter.adapter_id} className="border-b border-border/60">
+                    <td className="px-3 py-3 font-semibold text-foreground/90">{adapter.adapter_name}</td>
+                    <td className="px-3 py-3">{adapter.provider}</td>
+                    <td className="px-3 py-3 text-xs text-foreground/75">{adapter.capabilities.join(", ")}</td>
+                    <td className="px-3 py-3">{adapter.status}</td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        ) : (
+          <div className="mt-3 rounded-md border border-dashed border-border/70 bg-background/40 px-3 py-3 text-sm text-foreground/60">
+            No LLM adapters installed.
           </div>
         )}
       </section>

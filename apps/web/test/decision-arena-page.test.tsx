@@ -158,6 +158,18 @@ function installFetchMock() {
       ]);
     }
 
+    if (url.pathname === "/research/llm-adapters") {
+      if (method !== "GET") {
+        return jsonResponse(405, {
+          error: {
+            message: `Unexpected method ${method}`,
+          },
+        });
+      }
+
+      return jsonResponse(200, []);
+    }
+
     if (url.pathname === "/research/candidates") {
       if (method !== "GET") {
         return jsonResponse(405, {
@@ -585,7 +597,7 @@ describe("DecisionArenaPage", () => {
     expect(screen.getByRole("table", { name: /Recommended Allocation/i })).toBeInTheDocument();
     expect(screen.getByText(/Total Paper Capital/i)).toBeInTheDocument();
     expect(screen.getByText(/Rule-Based Capital Allocation/i)).toBeInTheDocument();
-    expect(screen.getByRole("heading", { name: /Research Agents/i })).toBeInTheDocument();
+    expect(screen.getByRole("heading", { name: /^Research Agents$/i })).toBeInTheDocument();
     expect(screen.getByText(/RESEARCH ONLY/i)).toBeInTheDocument();
     expect(screen.getByText(/NO PRODUCTION CHANGES/i)).toBeInTheDocument();
     expect(screen.getAllByText(/HUMAN REVIEW REQUIRED/i).length).toBeGreaterThan(0);
@@ -602,6 +614,8 @@ describe("DecisionArenaPage", () => {
     expect(screen.getByText(/Total Laboratory Runs/i)).toBeInTheDocument();
     expect(screen.getByText(/Recent Candidate History/i)).toBeInTheDocument();
     expect(screen.getByText(/No research memory has been recorded yet\./i)).toBeInTheDocument();
+    expect(screen.getByRole("heading", { name: /Future Research Agents/i })).toBeInTheDocument();
+    expect(screen.getByText(/No LLM adapters installed\./i)).toBeInTheDocument();
     expect(screen.getByRole("heading", { name: /^Evolution$/i })).toBeInTheDocument();
     expect(screen.getByRole("button", { name: /Run Evolution/i })).toBeInTheDocument();
     expect(screen.getByText(/No evolved descendants generated yet\./i)).toBeInTheDocument();
@@ -726,6 +740,10 @@ describe("DecisionArenaPage", () => {
           return jsonResponse(200, []);
         }
 
+        if (url.pathname === "/research/llm-adapters") {
+          return jsonResponse(200, []);
+        }
+
         if (url.pathname === "/research/candidates") {
           return jsonResponse(200, []);
         }
@@ -830,6 +848,7 @@ describe("DecisionArenaPage", () => {
     expect((await screen.findAllByText(/^None$/i)).length).toBeGreaterThan(0);
     expect(await screen.findByText(/No capital allocation recommendation available yet\./i)).toBeInTheDocument();
     expect(await screen.findByText(/No research agents or candidate strategies are available yet\./i)).toBeInTheDocument();
+    expect(await screen.findByText(/No LLM adapters installed\./i)).toBeInTheDocument();
     expect(screen.queryByText(/No candidate evaluations available yet\./i)).not.toBeInTheDocument();
     expect(await screen.findByText(/No laboratory run has completed yet\./i)).toBeInTheDocument();
     expect(await screen.findByText(/No research memory has been recorded yet\./i)).toBeInTheDocument();
