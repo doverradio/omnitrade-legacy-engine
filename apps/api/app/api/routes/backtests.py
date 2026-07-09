@@ -203,7 +203,7 @@ def _minimum_history_required(strategy_slug: str, params: dict[str, object]) -> 
     if strategy_slug == "ma_crossover":
         return int(params.get("slow_period", 50)) + 1
     if strategy_slug == "rsi_mean_reversion":
-        return int(params.get("rsi_period", 14)) + 2
+        return int(params.get("rsi_period", 14)) + 1
     if strategy_slug == "breakout":
         return int(params.get("lookback", 20)) + 1
     if strategy_slug == "volatility_filter":

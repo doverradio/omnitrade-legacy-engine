@@ -50,6 +50,25 @@ function installFetchMock() {
             last_trade_timestamp: "2026-07-09T09:55:00Z",
             latest_decision_package_id: "dpkg:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
           },
+          {
+            strategy_id: "22222222-2222-2222-2222-222222222222",
+            strategy_name: "RSI Mean Reversion",
+            enabled: false,
+            status: "disabled",
+            signals_generated: 8,
+            buy_signals: 2,
+            sell_signals: 1,
+            hold_signals: 5,
+            paper_trades: 3,
+            open_positions: 0,
+            realized_pnl: "7.5",
+            unrealized_pnl: "0",
+            total_return_pct: "0.015",
+            decision_records: 4,
+            last_signal_timestamp: "2026-07-09T08:50:00Z",
+            last_trade_timestamp: "2026-07-09T08:55:00Z",
+            latest_decision_package_id: "dpkg:abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789",
+          },
         ],
       });
     }
@@ -144,6 +163,7 @@ describe("DecisionArenaPage", () => {
     });
 
     expect(screen.getByText("MA Crossover")).toBeInTheDocument();
+    expect(screen.getByText("RSI Mean Reversion")).toBeInTheDocument();
     expect(screen.getByText("Active")).toBeInTheDocument();
     expect(screen.getByText("Decision Records")).toBeInTheDocument();
     expect(screen.getByText("Replay Agents")).toBeInTheDocument();
@@ -200,7 +220,9 @@ describe("DecisionArenaPage", () => {
     const user = userEvent.setup();
     render(<DecisionArenaPage />);
 
-    const replayButton = await screen.findByRole("button", { name: "Replay" });
+    const replayButtons = await screen.findAllByRole("button", { name: "Replay" });
+    expect(replayButtons).toHaveLength(2);
+    const replayButton = replayButtons[0];
     await user.click(replayButton);
 
     expect(await screen.findByRole("status")).toHaveTextContent(

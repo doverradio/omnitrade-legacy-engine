@@ -10,7 +10,7 @@ from app.services.strategies.registry import StrategyRegistry, strategy_registry
 from app.services.strategies.validation import NumericParamRule, StrategyParameterValidationError, validate_strategy_params
 
 
-DEFAULT_PARAMS = {"rsi_period": 14, "oversold": 30, "overbought": 70}
+DEFAULT_PARAMS = {"rsi_period": 14, "buy_threshold": 30, "sell_threshold": 70}
 
 
 @dataclass(slots=True)
@@ -27,63 +27,71 @@ class RsiMeanReversionStrategy(Strategy):
         try:
             params = _validated_params(dict(context.strategy_parameters))
         except StrategyParameterValidationError:
-            return _build_hold("Invalid strategy parameters.", timestamp, None, None)
+            return _build_hold("Invalid strategy parameters.", timestamp, None)
 
         closes = extract_series(context.candles, "close")
         if closes is None:
-            return _build_hold("Invalid candle data.", timestamp, None, None)
-        if len(closes) < params["rsi_period"] + 2:
-            return _build_hold("Insufficient candle history.", timestamp, None, None)
+            return _build_hold("Invalid candle data.", timestamp, None)
+        if len(closes) < params["rsi_period"] + 1:
+            return _build_hold("Insufficient candle history.", timestamp, None)
 
-        previous_rsi = _compute_rsi(closes[:-1], params["rsi_period"])
         current_rsi = _compute_rsi(closes, params["rsi_period"])
-        if previous_rsi is None or current_rsi is None:
-            return _build_hold("Insufficient candle history.", timestamp, current_rsi, None)
+        if current_rsi is None:
+            return _build_hold("Insufficient candle history.", timestamp, None)
 
-        rsi_slope = current_rsi - previous_rsi
         indicators = {
             "rsi_value": str(current_rsi),
-            "rsi_slope": str(rsi_slope),
+            "buy_threshold": str(params["buy_threshold"]),
+            "sell_threshold": str(params["sell_threshold"]),
         }
 
-        if previous_rsi <= params["oversold"] and rsi_slope > 0:
+        if current_rsi <= params["buy_threshold"]:
             return Signal(
                 action="buy",
-                strength=min(Decimal("1.0"), abs(rsi_slope) / Decimal("100")),
-                reason="RSI crossed below oversold and turned back up.",
+                strength=Decimal("1.0"),
+                reason="RSI is at or below the buy threshold.",
                 indicators=indicators,
                 timestamp=timestamp,
             )
 
-        if previous_rsi >= params["overbought"] and rsi_slope < 0:
+        if current_rsi >= params["sell_threshold"]:
             return Signal(
                 action="sell",
-                strength=min(Decimal("1.0"), abs(rsi_slope) / Decimal("100")),
-                reason="RSI crossed above overbought and turned back down.",
+                strength=Decimal("1.0"),
+                reason="RSI is at or above the sell threshold.",
                 indicators=indicators,
                 timestamp=timestamp,
             )
 
-        return hold_signal(reason="No RSI reversal detected.", timestamp=timestamp, indicators=indicators)
+        return hold_signal(reason="RSI remained between thresholds.", timestamp=timestamp, indicators=indicators)
 
 
 def _validated_params(params: dict[str, Any]) -> dict[str, Decimal | int]:
-    merged = {**DEFAULT_PARAMS, **params}
+    merged = _normalize_params({**DEFAULT_PARAMS, **params})
     validate_strategy_params(
         merged,
-        required_params=("rsi_period", "oversold", "overbought"),
+        required_params=("rsi_period", "buy_threshold", "sell_threshold"),
         numeric_rules={
             "rsi_period": NumericParamRule(minimum=Decimal("2"), integer_only=True),
-            "oversold": NumericParamRule(minimum=Decimal("0"), maximum=Decimal("100")),
-            "overbought": NumericParamRule(minimum=Decimal("0"), maximum=Decimal("100")),
+            "buy_threshold": NumericParamRule(minimum=Decimal("0"), maximum=Decimal("100")),
+            "sell_threshold": NumericParamRule(minimum=Decimal("0"), maximum=Decimal("100")),
         },
     )
     rsi_period = int(Decimal(str(merged["rsi_period"])))
-    oversold = Decimal(str(merged["oversold"]))
-    overbought = Decimal(str(merged["overbought"]))
-    if oversold >= overbought:
-        raise StrategyParameterValidationError("oversold must be less than overbought.")
-    return {"rsi_period": rsi_period, "oversold": oversold, "overbought": overbought}
+    buy_threshold = Decimal(str(merged["buy_threshold"]))
+    sell_threshold = Decimal(str(merged["sell_threshold"]))
+    if buy_threshold >= sell_threshold:
+        raise StrategyParameterValidationError("buy_threshold must be less than sell_threshold.")
+    return {"rsi_period": rsi_period, "buy_threshold": buy_threshold, "sell_threshold": sell_threshold}
+
+
+def _normalize_params(params: dict[str, Any]) -> dict[str, Any]:
+    normalized = dict(params)
+    if "buy_threshold" not in normalized and "oversold" in normalized:
+        normalized["buy_threshold"] = normalized["oversold"]
+    if "sell_threshold" not in normalized and "overbought" in normalized:
+        normalized["sell_threshold"] = normalized["overbought"]
+    return normalized
 
 
 def _compute_rsi(closes: list[Decimal], period: int) -> Decimal | None:
@@ -101,10 +109,11 @@ def _compute_rsi(closes: list[Decimal], period: int) -> Decimal | None:
     return Decimal("100") - (Decimal("100") / (Decimal("1") + relative_strength))
 
 
-def _build_hold(reason: str, timestamp, rsi_value: Decimal | None, rsi_slope: Decimal | None) -> Signal:
+def _build_hold(reason: str, timestamp, rsi_value: Decimal | None) -> Signal:
     indicators = {
         "rsi_value": None if rsi_value is None else str(rsi_value),
-        "rsi_slope": None if rsi_slope is None else str(rsi_slope),
+        "buy_threshold": None,
+        "sell_threshold": None,
     }
     return hold_signal(reason=reason, timestamp=timestamp, indicators=indicators)
 

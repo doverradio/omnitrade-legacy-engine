@@ -18,45 +18,60 @@ class SeedSummary:
     parameter_set_created: bool
 
 
-DEFAULT_STRATEGY_NAME = "MA Crossover"
-DEFAULT_STRATEGY_SLUG = "ma_crossover"
-DEFAULT_STRATEGY_VERSION = "1.0.0"
-DEFAULT_PARAMETER_SET_LABEL = "default-v1"
-DEFAULT_PARAMETER_SET_PARAMS = {"fast_period": 10, "slow_period": 50}
+DEFAULT_STRATEGY_SEEDS = (
+    {
+        "name": "MA Crossover",
+        "slug": "ma_crossover",
+        "description": "Seeded default strategy for backtesting validation",
+        "module_version": "1.0.0",
+        "parameter_set_label": "default-v1",
+        "parameter_set_params": {"fast_period": 10, "slow_period": 50, "ma_type": "sma"},
+    },
+    {
+        "name": "RSI Mean Reversion",
+        "slug": "rsi_mean_reversion",
+        "description": "Seeded RSI strategy for backtesting validation",
+        "module_version": "1.0.0",
+        "parameter_set_label": "default-v1",
+        "parameter_set_params": {"rsi_period": 14, "buy_threshold": 30, "sell_threshold": 70},
+    },
+)
 
 
 async def seed_strategies(db_session: AsyncSession) -> SeedSummary:
-    strategy = await db_session.scalar(select(Strategy).where(Strategy.slug == DEFAULT_STRATEGY_SLUG))
     strategy_created = False
     parameter_set_created = False
 
-    if strategy is None:
-        strategy = Strategy(
-            name=DEFAULT_STRATEGY_NAME,
-            slug=DEFAULT_STRATEGY_SLUG,
-            description="Seeded default strategy for backtesting validation",
-            module_version=DEFAULT_STRATEGY_VERSION,
-            is_active=False,
-        )
-        db_session.add(strategy)
-        await db_session.flush()
-        strategy_created = True
+    for seed in DEFAULT_STRATEGY_SEEDS:
+        strategy = await db_session.scalar(select(Strategy).where(Strategy.slug == seed["slug"]))
 
-    existing_parameter_set = await db_session.scalar(
-        select(ParameterSet)
-        .where(ParameterSet.strategy_id == strategy.id)
-        .where(ParameterSet.label == DEFAULT_PARAMETER_SET_LABEL)
-    )
-    if existing_parameter_set is None:
-        db_session.add(
-            ParameterSet(
-                strategy_id=strategy.id,
-                label=DEFAULT_PARAMETER_SET_LABEL,
-                params=DEFAULT_PARAMETER_SET_PARAMS,
-                created_by="system",
+        if strategy is None:
+            strategy = Strategy(
+                name=seed["name"],
+                slug=seed["slug"],
+                description=seed["description"],
+                module_version=seed["module_version"],
+                is_active=False,
             )
+            db_session.add(strategy)
+            await db_session.flush()
+            strategy_created = True
+
+        existing_parameter_set = await db_session.scalar(
+            select(ParameterSet)
+            .where(ParameterSet.strategy_id == strategy.id)
+            .where(ParameterSet.label == seed["parameter_set_label"])
         )
-        parameter_set_created = True
+        if existing_parameter_set is None:
+            db_session.add(
+                ParameterSet(
+                    strategy_id=strategy.id,
+                    label=seed["parameter_set_label"],
+                    params=seed["parameter_set_params"],
+                    created_by="system",
+                )
+            )
+            parameter_set_created = True
 
     await db_session.commit()
     return SeedSummary(strategy_created=strategy_created, parameter_set_created=parameter_set_created)
