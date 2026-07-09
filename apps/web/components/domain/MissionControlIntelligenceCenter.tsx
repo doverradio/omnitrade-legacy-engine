@@ -425,7 +425,7 @@ export default function MissionControlIntelligenceCenter() {
       return null;
     }
     return payload.timeline_events.find((item) => item.event_id === selectedEventId) ?? null;
-  }, [payload, selectedEventId]);
+  }, [isMobile, payload, selectedEventId]);
 
   useEffect(() => {
     if (!payload?.timeline_events.length) {
