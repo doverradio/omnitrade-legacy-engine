@@ -280,6 +280,21 @@ export type StrategyCandidate = {
   status: string;
 };
 
+export type CandidateEvaluationRequest = {
+  candidate_id: string;
+};
+
+export type CandidateEvaluation = {
+  evaluation_id: string;
+  candidate_id: string;
+  replay_status: string;
+  decision_quality_score: number;
+  ai_coach_summary: string;
+  decision_intelligence_summary: string;
+  tournament_rank: number | null;
+  promotion_eligible: boolean;
+};
+
 async function requestJson<T>(path: string, init?: RequestInit): Promise<T> {
   const headers = new Headers(init?.headers);
   headers.set("Content-Type", "application/json");
@@ -407,4 +422,11 @@ export async function getResearchAgents(): Promise<ResearchAgent[]> {
 
 export async function getResearchCandidates(): Promise<StrategyCandidate[]> {
   return requestJson<StrategyCandidate[]>("/research/candidates");
+}
+
+export async function evaluateCandidate(request: CandidateEvaluationRequest): Promise<CandidateEvaluation> {
+  return requestJson<CandidateEvaluation>("/research/evaluate-candidate", {
+    method: "POST",
+    body: JSON.stringify(request),
+  });
 }

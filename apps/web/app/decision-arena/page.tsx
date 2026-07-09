@@ -6,6 +6,7 @@ import ReplayAgentsPanel from "@/components/domain/ReplayAgentsPanel";
 import {
   ApiRequestError,
   coachReviewDecisionQuality,
+  evaluateCandidate,
   getCapitalAllocationRecommendation,
   getDecisionArenaTournament,
   getResearchAgents,
@@ -15,6 +16,7 @@ import {
   replayDecisionPackage,
   type AICoachObservation,
   type CapitalAllocationRecommendation,
+  type CandidateEvaluation,
   type DecisionIntelligenceRecommendation,
   type DecisionQualityResult,
   type ReplayResult,
@@ -97,6 +99,7 @@ export default function DecisionArenaPage() {
   const [capitalAllocation, setCapitalAllocation] = useState<CapitalAllocationRecommendation | null>(null);
   const [researchAgents, setResearchAgents] = useState<ResearchAgent[]>([]);
   const [researchCandidates, setResearchCandidates] = useState<StrategyCandidate[]>([]);
+  const [candidateEvaluations, setCandidateEvaluations] = useState<CandidateEvaluation[]>([]);
   const [replayError, setReplayError] = useState<string | null>(null);
 
   useEffect(() => {
@@ -113,12 +116,25 @@ export default function DecisionArenaPage() {
           getResearchAgents(),
           getResearchCandidates(),
         ]);
+
+        const evaluations =
+          candidates.length > 0
+            ? await Promise.all(
+                candidates.map((candidate) =>
+                  evaluateCandidate({
+                    candidate_id: candidate.candidate_id,
+                  }),
+                ),
+              )
+            : [];
+
         if (active) {
           setTournament(payload);
           setDecisionIntelligence(recommendation);
           setCapitalAllocation(allocation);
           setResearchAgents(agents);
           setResearchCandidates(candidates);
+          setCandidateEvaluations(evaluations);
         }
       } catch (fetchError) {
         if (active) {
@@ -391,6 +407,57 @@ export default function DecisionArenaPage() {
         ) : (
           <div className="mt-4 rounded-md border border-dashed border-border/70 bg-background/40 px-3 py-3 text-sm text-foreground/60">
             No research agents or candidate strategies are available yet.
+          </div>
+        )}
+      </section>
+
+      <section className="rounded-xl border border-border bg-background/60 p-4 sm:p-5" aria-labelledby="candidate-evaluations-heading">
+        <div className="flex flex-wrap items-end justify-between gap-3">
+          <div>
+            <h3 id="candidate-evaluations-heading" className="text-base font-semibold">Candidate Evaluations</h3>
+            <p className="mt-1 text-xs text-foreground/70">Research candidate evaluation evidence routed through deterministic pipeline stages.</p>
+          </div>
+          <div className="flex flex-wrap gap-2 text-xs">
+            <span className="rounded-full border border-sky-500/40 bg-sky-500/10 px-3 py-1 font-semibold text-sky-100">Research Only</span>
+            <span className="rounded-full border border-amber-500/40 bg-amber-500/10 px-3 py-1 font-semibold text-amber-100">Promotion Disabled</span>
+          </div>
+        </div>
+
+        {candidateEvaluations.length > 0 ? (
+          <div className="mt-4 overflow-x-auto">
+            <table className="min-w-[980px] w-full text-left text-sm" aria-label="Candidate Evaluations">
+              <thead>
+                <tr className="border-b border-border text-foreground/70">
+                  <th className="px-3 py-2">Candidate</th>
+                  <th className="px-3 py-2">Replay</th>
+                  <th className="px-3 py-2">Quality</th>
+                  <th className="px-3 py-2">Coach</th>
+                  <th className="px-3 py-2">Tournament Rank</th>
+                  <th className="px-3 py-2">Promotion Eligible</th>
+                  <th className="px-3 py-2">Status</th>
+                </tr>
+              </thead>
+              <tbody>
+                {candidateEvaluations.map((evaluation) => {
+                  const candidate = researchCandidates.find((item) => item.candidate_id === evaluation.candidate_id);
+                  return (
+                    <tr key={evaluation.evaluation_id} className="border-b border-border/60">
+                      <td className="px-3 py-3 font-semibold text-foreground/90">{candidate?.strategy_name ?? evaluation.candidate_id}</td>
+                      <td className="px-3 py-3">{evaluation.replay_status}</td>
+                      <td className="px-3 py-3">{evaluation.decision_quality_score}</td>
+                      <td className="px-3 py-3 text-xs text-foreground/75">{evaluation.ai_coach_summary}</td>
+                      <td className="px-3 py-3">{evaluation.tournament_rank ?? "n/a"}</td>
+                      <td className="px-3 py-3">{evaluation.promotion_eligible ? "Yes" : "No"}</td>
+                      <td className="px-3 py-3">{candidate?.status ?? "PROPOSED"}</td>
+                    </tr>
+                  );
+                })}
+              </tbody>
+            </table>
+          </div>
+        ) : (
+          <div className="mt-4 rounded-md border border-dashed border-border/70 bg-background/40 px-3 py-3 text-sm text-foreground/60">
+            No candidate evaluations available yet.
           </div>
         )}
       </section>

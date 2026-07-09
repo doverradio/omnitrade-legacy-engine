@@ -182,6 +182,27 @@ function installFetchMock() {
       ]);
     }
 
+    if (url.pathname === "/research/evaluate-candidate") {
+      if (method !== "POST") {
+        return jsonResponse(405, {
+          error: {
+            message: `Unexpected method ${method}`,
+          },
+        });
+      }
+
+      return jsonResponse(200, {
+        evaluation_id: "88888888-8888-8888-8888-888888888888",
+        candidate_id: "77777777-7777-7777-7777-777777777777",
+        replay_status: "COMPLETED",
+        decision_quality_score: 100,
+        ai_coach_summary: "Replay successfully reproduced the production decision.",
+        decision_intelligence_summary: "Volatility Filter MA-RSI Blend ranked highest by deterministic quality scoring with configured tie-break rules.",
+        tournament_rank: 1,
+        promotion_eligible: false,
+      });
+    }
+
     if (method !== "GET") {
       return jsonResponse(405, {
         error: {
@@ -230,14 +251,23 @@ describe("DecisionArenaPage", () => {
     expect(screen.getByText(/Research agents only generate candidate strategies\./i)).toBeInTheDocument();
     expect(screen.getByText(/Baseline Research Agent/i)).toBeInTheDocument();
     expect(screen.getByRole("table", { name: /Candidate Strategies/i })).toBeInTheDocument();
-    expect(screen.getByText(/PROPOSED/i)).toBeInTheDocument();
+    expect(screen.getAllByText(/PROPOSED/i).length).toBeGreaterThan(0);
+    expect(screen.getByRole("heading", { name: /Candidate Evaluations/i })).toBeInTheDocument();
+    expect(screen.getByText(/Research Only/i)).toBeInTheDocument();
+    expect(screen.getByText(/Promotion Disabled/i)).toBeInTheDocument();
+    expect(screen.getByRole("table", { name: /Candidate Evaluations/i })).toBeInTheDocument();
+    expect(screen.getByText(/COMPLETED/i)).toBeInTheDocument();
+    expect(screen.getAllByText(/^100$/i).length).toBeGreaterThan(0);
 
     const nonGetCalls = fetchMock.mock.calls.filter((call) => {
       const init = call[1] as RequestInit | undefined;
       return (init?.method ?? "GET") !== "GET";
     });
 
-    expect(nonGetCalls).toHaveLength(0);
+    expect(nonGetCalls).toHaveLength(1);
+    const postCallUrl = new URL(nonGetCalls[0][0] as string);
+    expect(postCallUrl.pathname).toBe("/research/evaluate-candidate");
+    expect((nonGetCalls[0][1] as RequestInit | undefined)?.method).toBe("POST");
   });
 
   it("renders champion and runner up summary", async () => {
@@ -326,6 +356,19 @@ describe("DecisionArenaPage", () => {
           return jsonResponse(200, []);
         }
 
+        if (url.pathname === "/research/evaluate-candidate") {
+          return jsonResponse(200, {
+            evaluation_id: "88888888-8888-8888-8888-888888888888",
+            candidate_id: "77777777-7777-7777-7777-777777777777",
+            replay_status: "COMPLETED",
+            decision_quality_score: 100,
+            ai_coach_summary: "Replay successfully reproduced the production decision.",
+            decision_intelligence_summary: "Deterministic recommendation.",
+            tournament_rank: 1,
+            promotion_eligible: false,
+          });
+        }
+
         return jsonResponse(404, {
           error: {
             message: `Unhandled route in test: ${method} ${url.pathname}`,
@@ -342,5 +385,6 @@ describe("DecisionArenaPage", () => {
     expect((await screen.findAllByText(/^None$/i)).length).toBeGreaterThan(0);
     expect(await screen.findByText(/No capital allocation recommendation available yet\./i)).toBeInTheDocument();
     expect(await screen.findByText(/No research agents or candidate strategies are available yet\./i)).toBeInTheDocument();
+    expect(await screen.findByText(/No candidate evaluations available yet\./i)).toBeInTheDocument();
   });
 });
