@@ -160,6 +160,19 @@ describe("DecisionArenaPage", () => {
       explanation: "Replayed immutable decision package.",
       metadata: { mode: "read_only" },
     });
+    vi.spyOn(arenaApi, "evaluateReplayResult").mockResolvedValue({
+      quality_score: 100,
+      decision_reproduced: true,
+      action_matches_original: true,
+      confidence_matches_original: true,
+      replay_duration_ms: 12,
+      evaluation_timestamp: "2026-07-09T12:00:01Z",
+      calibration: null,
+      opportunity_cost: null,
+      drawdown: null,
+      risk_adjusted_return: null,
+      explanation_quality: null,
+    });
 
     const user = userEvent.setup();
     render(<DecisionArenaPage />);
@@ -171,6 +184,12 @@ describe("DecisionArenaPage", () => {
       /Replay completed\. Decision reproduced successfully\./i,
     );
     expect(screen.getByText(/Reconstructed action: BUY/i)).toBeInTheDocument();
+    expect(screen.getByText(/Quality Score 100/i)).toBeInTheDocument();
+    expect(screen.getAllByText("Decision reproduced")).toHaveLength(1);
+    expect(screen.getByText(/Action Match/i)).toBeInTheDocument();
+    expect(screen.getByText(/Confidence Match/i)).toBeInTheDocument();
+    expect(screen.getByText(/Replay Duration/i)).toBeInTheDocument();
+    expect(screen.getAllByText("Planned")).toHaveLength(5);
   });
 
   it("renders empty state when no strategies exist", async () => {

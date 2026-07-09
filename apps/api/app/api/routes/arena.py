@@ -15,8 +15,10 @@ from app.models.decision_record import DecisionRecord
 from app.models.signal import Signal
 from app.models.strategy import Strategy
 from app.models.trade import Trade
+from app.schemas.decision_quality import DecisionQualityEvaluationRequest, DecisionQualityResultResponse
 from app.schemas.arena import StrategyArenaScoreboardItem, StrategyArenaScoreboardResponse
 from app.schemas.replay_agent import ReplayRequest, ReplayResultResponse, ReplayAgentCapabilityResponse, ReplayAgentRegistrationResponse
+from app.services.decision_quality.deterministic import evaluate_replay_result_v0
 from app.services.decisions.package import DecisionPackageBuilder
 from app.services.replay.default_agent import ReplayPackageNotFoundError, replay_decision_package_v0
 from app.services.replay.identifiers import build_decision_package_id
@@ -152,6 +154,24 @@ async def replay_decision_package(request: ReplayRequest, db: AsyncSession = Dep
         supporting_evidence=[dict(item) for item in replay_result.supporting_evidence],
         explanation=replay_result.explanation,
         metadata=replay_result.metadata,
+    )
+
+
+@router.post("/evaluate-replay", response_model=DecisionQualityResultResponse)
+async def evaluate_replay(request: DecisionQualityEvaluationRequest) -> DecisionQualityResultResponse:
+    quality_result = evaluate_replay_result_v0(replay_result=request.to_replay_result())
+    return DecisionQualityResultResponse(
+        quality_score=quality_result.quality_score,
+        decision_reproduced=quality_result.decision_reproduced,
+        action_matches_original=quality_result.action_matches_original,
+        confidence_matches_original=quality_result.confidence_matches_original,
+        replay_duration_ms=quality_result.replay_duration_ms,
+        evaluation_timestamp=quality_result.evaluation_timestamp,
+        calibration=quality_result.calibration,
+        opportunity_cost=quality_result.opportunity_cost,
+        drawdown=quality_result.drawdown,
+        risk_adjusted_return=quality_result.risk_adjusted_return,
+        explanation_quality=quality_result.explanation_quality,
     )
 
 

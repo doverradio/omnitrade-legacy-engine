@@ -179,12 +179,28 @@ export type ReplayResult = {
   metadata: Record<string, unknown>;
 };
 
-async function requestJson<T>(path: string): Promise<T> {
+export type DecisionQualityResult = {
+  quality_score: number;
+  decision_reproduced: boolean;
+  action_matches_original: boolean;
+  confidence_matches_original: boolean;
+  replay_duration_ms: number | null;
+  evaluation_timestamp: string;
+  calibration: string | null;
+  opportunity_cost: string | null;
+  drawdown: string | null;
+  risk_adjusted_return: string | null;
+  explanation_quality: string | null;
+};
+
+async function requestJson<T>(path: string, init?: RequestInit): Promise<T> {
+  const headers = new Headers(init?.headers);
+  headers.set("Content-Type", "application/json");
+
   const response = await fetch(`${API_BASE_URL}${path}`, {
+    ...init,
     cache: "no-store",
-    headers: {
-      "Content-Type": "application/json",
-    },
+    headers,
   });
 
   if (!response.ok) {
@@ -263,6 +279,13 @@ export async function getReplayAgents(): Promise<ReplayAgentRegistration[]> {
 
 export async function replayDecisionPackage(request: ReplayRequest): Promise<ReplayResult> {
   return requestJson<ReplayResult>("/arena/replay", {
+    method: "POST",
+    body: JSON.stringify(request),
+  });
+}
+
+export async function evaluateReplayResult(request: ReplayResult): Promise<DecisionQualityResult> {
+  return requestJson<DecisionQualityResult>("/arena/evaluate-replay", {
     method: "POST",
     body: JSON.stringify(request),
   });

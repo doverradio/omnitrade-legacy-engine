@@ -5,8 +5,10 @@ import { useEffect, useMemo, useState } from "react";
 import ReplayAgentsPanel from "@/components/domain/ReplayAgentsPanel";
 import {
   ApiRequestError,
+  evaluateReplayResult,
   getStrategyArenaScoreboard,
   replayDecisionPackage,
+  type DecisionQualityResult,
   type ReplayResult,
   type StrategyArenaScoreboardResponse,
 } from "@/lib/api/arena";
@@ -58,12 +60,20 @@ function formatConfidence(value: string | null): string {
   return `${(numeric * 100).toFixed(2)}%`;
 }
 
+function formatMetric(value: string | null): string {
+  if (value === null) {
+    return "Planned";
+  }
+  return value;
+}
+
 export default function DecisionArenaPage() {
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const [scoreboard, setScoreboard] = useState<StrategyArenaScoreboardResponse | null>(null);
   const [replayLoadingPackageId, setReplayLoadingPackageId] = useState<string | null>(null);
   const [replayResult, setReplayResult] = useState<ReplayResult | null>(null);
+  const [qualityResult, setQualityResult] = useState<DecisionQualityResult | null>(null);
   const [replayError, setReplayError] = useState<string | null>(null);
 
   useEffect(() => {
@@ -116,10 +126,13 @@ export default function DecisionArenaPage() {
     setReplayLoadingPackageId(decisionPackageId);
     setReplayError(null);
     setReplayResult(null);
+    setQualityResult(null);
 
     try {
       const result = await replayDecisionPackage({ decision_package_id: decisionPackageId });
       setReplayResult(result);
+      const quality = await evaluateReplayResult(result);
+      setQualityResult(quality);
     } catch (replayRequestError) {
       if (replayRequestError instanceof ApiRequestError) {
         setReplayError(replayRequestError.message);
@@ -156,12 +169,50 @@ export default function DecisionArenaPage() {
       ) : null}
 
       {replayResult ? (
-        <section className="rounded-md border border-emerald-500/40 bg-emerald-500/10 px-3 py-2 text-sm text-emerald-100" role="status">
-          <p className="font-medium">Replay completed. Decision reproduced successfully.</p>
-          <p className="mt-1 text-xs text-emerald-100/80">
-            Reconstructed action: {replayResult.reconstructed_action} | Confidence: {formatConfidence(replayResult.reconstructed_confidence)}
-          </p>
-        </section>
+        <div className="space-y-3">
+          <section className="rounded-md border border-emerald-500/40 bg-emerald-500/10 px-3 py-2 text-sm text-emerald-100" role="status">
+            <p className="font-medium">Replay completed. Decision reproduced successfully.</p>
+            <p className="mt-1 text-xs text-emerald-100/80">
+              Reconstructed action: {replayResult.reconstructed_action} | Confidence: {formatConfidence(replayResult.reconstructed_confidence)}
+            </p>
+          </section>
+
+          {qualityResult ? (
+            <section className="rounded-md border border-border bg-background/60 px-3 py-3 text-sm text-foreground/85">
+              <div className="flex items-center justify-between gap-3">
+                <div>
+                  <p className="text-xs font-semibold uppercase tracking-wide text-foreground/60">Replay</p>
+                  <p className="font-medium text-foreground/75">↓</p>
+                  <p className="text-xs font-semibold uppercase tracking-wide text-foreground/60">Decision Quality</p>
+                </div>
+                <div className="rounded-full border border-emerald-500/40 bg-emerald-500/10 px-3 py-1 text-base font-semibold text-emerald-100">
+                  Quality Score {qualityResult.quality_score}
+                </div>
+              </div>
+
+              <div className="mt-3 grid gap-3 sm:grid-cols-2 lg:grid-cols-3">
+                <Metric label="Decision reproduced" value={qualityResult.decision_reproduced ? "Yes" : "No"} />
+                <Metric label="Action Match" value={qualityResult.action_matches_original ? "Yes" : "No"} />
+                <Metric label="Confidence Match" value={qualityResult.confidence_matches_original ? "Yes" : "No"} />
+                <Metric label="Replay Duration" value={qualityResult.replay_duration_ms === null ? null : `${qualityResult.replay_duration_ms} ms`} />
+              </div>
+
+              <div className="mt-4 border-t border-border/70 pt-4">
+                <div className="flex items-center justify-between gap-2">
+                  <h4 className="text-xs font-semibold uppercase tracking-wide text-foreground/60">Future metrics</h4>
+                  <span className="text-xs text-foreground/45">Planned placeholders only</span>
+                </div>
+                <div className="mt-3 grid gap-3 sm:grid-cols-2 lg:grid-cols-3">
+                  <Metric label="Calibration" value={formatMetric(qualityResult.calibration)} muted={qualityResult.calibration === null} />
+                  <Metric label="Opportunity Cost" value={formatMetric(qualityResult.opportunity_cost)} muted={qualityResult.opportunity_cost === null} />
+                  <Metric label="Drawdown" value={formatMetric(qualityResult.drawdown)} muted={qualityResult.drawdown === null} />
+                  <Metric label="Risk-Adjusted Return" value={formatMetric(qualityResult.risk_adjusted_return)} muted={qualityResult.risk_adjusted_return === null} />
+                  <Metric label="Explanation Quality" value={formatMetric(qualityResult.explanation_quality)} muted={qualityResult.explanation_quality === null} />
+                </div>
+              </div>
+            </section>
+          ) : null}
+        </div>
       ) : null}
 
       <section className="rounded-xl border border-border bg-muted/20 p-4 sm:p-5" aria-labelledby="scoreboard-heading">
@@ -271,6 +322,15 @@ export default function DecisionArenaPage() {
           </article>
         ))}
       </section>
+    </div>
+  );
+}
+
+function Metric({ label, value, muted = false }: { label: string; value: string | null; muted?: boolean }) {
+  return (
+    <div className="rounded-md border border-border/70 bg-background/40 px-3 py-2">
+      <p className="text-xs uppercase tracking-wide text-foreground/55">{label}</p>
+      <p className={`mt-1 text-sm font-medium ${muted ? "text-foreground/45" : "text-foreground/90"}`}>{value ?? "Planned"}</p>
     </div>
   );
 }

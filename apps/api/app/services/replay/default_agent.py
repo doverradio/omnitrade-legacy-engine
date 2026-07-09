@@ -4,6 +4,7 @@ import uuid
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from decimal import Decimal
+from time import perf_counter
 from typing import Any
 
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -24,6 +25,7 @@ class DefaultReplayAgent(ReplayAgent):
     status: str = "Registered"
 
     async def replay(self, *, db: AsyncSession, decision_package_id: str) -> ReplayResult:
+        started_at = perf_counter()
         candidate = await _resolve_candidate(db=db, decision_package_id=decision_package_id)
         if candidate is None:
             raise ReplayPackageNotFoundError(decision_package_id)
@@ -36,6 +38,7 @@ class DefaultReplayAgent(ReplayAgent):
             package=package,
             candidate=candidate,
             replay_agent_id=self.replay_agent_id,
+            replay_duration_ms=max(int((perf_counter() - started_at) * 1000), 0),
         )
 
 
@@ -60,6 +63,7 @@ def _build_replay_result(
     package: DecisionPackageContract,
     candidate: ReplayCandidateReadModel,
     replay_agent_id: uuid.UUID,
+    replay_duration_ms: int,
 ) -> ReplayResult:
     reconstructed_action = _reconstructed_action(package=package)
     reconstructed_confidence = package.decision_record.confidence
@@ -100,6 +104,9 @@ def _build_replay_result(
         "package_version": candidate.package_version,
         "replay_ready": candidate.replay_ready,
         "replay_agent_name": "Default Replay Agent",
+        "original_action": reconstructed_action,
+        "original_confidence": _decimal_to_str(reconstructed_confidence),
+        "replay_duration_ms": replay_duration_ms,
         "package_built_at": package.built_at.isoformat(),
     }
 
