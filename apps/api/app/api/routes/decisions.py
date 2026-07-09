@@ -23,6 +23,7 @@ from app.services.arena.tournaments import (
     read_arena_tournament_lifecycle_state,
 )
 from app.services.decisions.coach import generate_ai_coach_batch_reviews
+from app.services.decisions.coach_reader import list_ai_coach_replay_reviews_v0
 from app.services.decisions.explainability import read_decision_explainability
 from app.services.decisions.recommendations import read_experiment_recommendations
 from app.services.decisions.replay_candidates import list_replay_candidates_v0
@@ -889,6 +890,33 @@ async def list_decision_replay_candidates(
             "unavailable_artifacts": item.unavailable_artifacts,
             "candidate_reason": item.candidate_reason,
             "created_at": item.created_at.isoformat(),
+        }
+        for item in rows
+    ]
+    return _paginate(items=items, page=page, page_size=page_size)
+
+
+@router.get("/coach/replay-reviews")
+async def list_ai_coach_replay_reviews(
+    page: int = Query(default=1, ge=1),
+    page_size: int = Query(default=50, ge=1, le=MAX_PAGE_SIZE),
+    db: AsyncSession = Depends(get_db),
+) -> dict[str, Any]:
+    rows = await list_ai_coach_replay_reviews_v0(db=db)
+
+    items = [
+        {
+            "decision_id": str(item.decision_id),
+            "decision_package_id": item.decision_package_id,
+            "package_hash": item.package_hash,
+            "package_version": item.package_version,
+            "replay_ready": item.replay_ready,
+            "summary": item.summary,
+            "strengths": item.strengths,
+            "weaknesses": item.weaknesses,
+            "missing_evidence": item.missing_evidence,
+            "suggested_followups": item.suggested_followups,
+            "advisory_only": item.advisory_only,
         }
         for item in rows
     ]

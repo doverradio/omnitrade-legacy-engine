@@ -79,6 +79,10 @@ from app.services.decisions.replay_candidates import (
     certify_decision_package_readiness_v0,
     list_replay_candidates_v0,
 )
+from app.services.decisions.coach_reader import (
+    CoachReplayReviewReadModel,
+    list_ai_coach_replay_reviews_v0,
+)
 
 __all__ = [
     "DecisionProvenanceContract",
@@ -137,6 +141,8 @@ __all__ = [
     "ReplayCandidateReadModel",
     "certify_decision_package_readiness_v0",
     "list_replay_candidates_v0",
+    "CoachReplayReviewReadModel",
+    "list_ai_coach_replay_reviews_v0",
     "read_decision_timeline",
     "read_decision_explainability",
     "validate_provenance_mappings",
