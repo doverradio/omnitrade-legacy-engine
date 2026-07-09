@@ -472,6 +472,76 @@ function installFetchMock() {
       });
     }
 
+    if (url.pathname === "/research/evolution-analytics") {
+      if (method !== "GET") {
+        return jsonResponse(405, {
+          error: {
+            message: `Unexpected method ${method}`,
+          },
+        });
+      }
+
+      return jsonResponse(200, {
+        total_laboratory_runs: laboratoryRunComplete ? 1 : 0,
+        total_candidates_generated: laboratoryRunComplete ? 5 : 0,
+        total_evolved_candidates: laboratoryRunComplete ? 2 : 0,
+        average_quality_score: laboratoryRunComplete ? 75.0 : null,
+        best_quality_score: laboratoryRunComplete ? 100 : null,
+        best_candidate: laboratoryRunComplete
+          ? {
+              candidate_id: "77777777-7777-7777-7777-777777777777",
+              quality_score: 100,
+              tournament_rank: 1,
+              originating_agent: "Baseline Research Agent",
+            }
+          : null,
+        successful_mutations: laboratoryRunComplete ? 1 : 0,
+        unsuccessful_mutations: laboratoryRunComplete ? 1 : 0,
+        generation_distribution: laboratoryRunComplete
+          ? [
+              { generation: 1, count: 5 },
+              { generation: 2, count: 2 },
+            ]
+          : [],
+        lineage_depth: laboratoryRunComplete ? 2 : 0,
+        top_research_agent: laboratoryRunComplete ? "Baseline Research Agent" : null,
+        quality_score_over_time: laboratoryRunComplete
+          ? [
+              { sequence: 1, quality_score: 100 },
+              { sequence: 2, quality_score: 50 },
+            ]
+          : [],
+        candidates_generated_per_laboratory_run: laboratoryRunComplete
+          ? [
+              {
+                laboratory_run_id: "99999999-aaaa-bbbb-cccc-999999999999",
+                candidates_generated: 5,
+              },
+            ]
+          : [],
+        mutation_success_rate: {
+          successful_mutations: laboratoryRunComplete ? 1 : 0,
+          unsuccessful_mutations: laboratoryRunComplete ? 1 : 0,
+          success_rate_percent: laboratoryRunComplete ? 50.0 : 0.0,
+        },
+        research_agent_leaderboard: laboratoryRunComplete
+          ? [
+              {
+                agent_name: "Baseline Research Agent",
+                average_quality_score: 75.0,
+                best_quality_score: 100,
+                total_candidates: 7,
+              },
+            ]
+          : [],
+        largest_lineage_tree: {
+          root_candidate_id: laboratoryRunComplete ? "77777777-7777-7777-7777-777777777777" : null,
+          lineage_depth: laboratoryRunComplete ? 2 : 0,
+          descendant_count: laboratoryRunComplete ? 2 : 0,
+        },
+      });
+    }
+
     if (method !== "GET") {
       return jsonResponse(405, {
         error: {
@@ -532,9 +602,11 @@ describe("DecisionArenaPage", () => {
     expect(screen.getByText(/Total Laboratory Runs/i)).toBeInTheDocument();
     expect(screen.getByText(/Recent Candidate History/i)).toBeInTheDocument();
     expect(screen.getByText(/No research memory has been recorded yet\./i)).toBeInTheDocument();
-    expect(screen.getByRole("heading", { name: /Evolution/i })).toBeInTheDocument();
+    expect(screen.getByRole("heading", { name: /^Evolution$/i })).toBeInTheDocument();
     expect(screen.getByRole("button", { name: /Run Evolution/i })).toBeInTheDocument();
     expect(screen.getByText(/No evolved descendants generated yet\./i)).toBeInTheDocument();
+    expect(screen.getByRole("heading", { name: /Evolution Analytics/i })).toBeInTheDocument();
+    expect(screen.getByText(/No evolution analytics available yet\./i)).toBeInTheDocument();
 
     fireEvent.click(screen.getByRole("button", { name: /Run Laboratory/i }));
     expect(await screen.findByText(/Last run included 1 agent\(s\) and completed with status COMPLETED\./i)).toBeInTheDocument();
@@ -542,8 +614,14 @@ describe("DecisionArenaPage", () => {
 
     fireEvent.click(screen.getByRole("button", { name: /Run Evolution/i }));
     expect(await screen.findByRole("table", { name: /Evolution Results/i })).toBeInTheDocument();
-    expect(screen.getByText(/Lineage Tree/i)).toBeInTheDocument();
+    expect(screen.getByText(/^Lineage Tree$/i)).toBeInTheDocument();
     expect(screen.getByText(/rsi_period 14->12/i)).toBeInTheDocument();
+    expect(screen.getByText(/Quality Score over Time/i)).toBeInTheDocument();
+    expect(screen.getByText(/Candidates Generated per Laboratory Run/i)).toBeInTheDocument();
+    expect(screen.getByText(/Generation Distribution/i)).toBeInTheDocument();
+    expect(screen.getByText(/Mutation Success Rate/i)).toBeInTheDocument();
+    expect(screen.getByRole("table", { name: /Research Agent Leaderboard/i })).toBeInTheDocument();
+    expect(screen.getByText(/Largest Lineage Tree/i)).toBeInTheDocument();
 
     expect(screen.getByRole("button", { name: /Evaluate Candidates/i })).toBeInTheDocument();
     expect(screen.getByText(/No candidate evaluations available yet\./i)).toBeInTheDocument();
@@ -707,6 +785,35 @@ describe("DecisionArenaPage", () => {
           });
         }
 
+        if (url.pathname === "/research/evolution-analytics") {
+          return jsonResponse(200, {
+            total_laboratory_runs: 0,
+            total_candidates_generated: 0,
+            total_evolved_candidates: 0,
+            average_quality_score: null,
+            best_quality_score: null,
+            best_candidate: null,
+            successful_mutations: 0,
+            unsuccessful_mutations: 0,
+            generation_distribution: [],
+            lineage_depth: 0,
+            top_research_agent: null,
+            quality_score_over_time: [],
+            candidates_generated_per_laboratory_run: [],
+            mutation_success_rate: {
+              successful_mutations: 0,
+              unsuccessful_mutations: 0,
+              success_rate_percent: 0,
+            },
+            research_agent_leaderboard: [],
+            largest_lineage_tree: {
+              root_candidate_id: null,
+              lineage_depth: 0,
+              descendant_count: 0,
+            },
+          });
+        }
+
         return jsonResponse(404, {
           error: {
             message: `Unhandled route in test: ${method} ${url.pathname}`,
@@ -727,5 +834,6 @@ describe("DecisionArenaPage", () => {
     expect(await screen.findByText(/No laboratory run has completed yet\./i)).toBeInTheDocument();
     expect(await screen.findByText(/No research memory has been recorded yet\./i)).toBeInTheDocument();
     expect(await screen.findByText(/No evolved descendants generated yet\./i)).toBeInTheDocument();
+    expect(await screen.findByText(/No evolution analytics available yet\./i)).toBeInTheDocument();
   });
 });

@@ -1,6 +1,7 @@
 "use client";
 
 import { useEffect, useMemo, useState } from "react";
+import type { ReactNode } from "react";
 
 import ReplayAgentsPanel from "@/components/domain/ReplayAgentsPanel";
 import {
@@ -8,6 +9,7 @@ import {
   coachReviewDecisionQuality,
   evolveResearchCandidates,
   evaluateCandidates,
+  getEvolutionAnalytics,
   getCapitalAllocationRecommendation,
   getDecisionArenaTournament,
   getResearchMemoryCandidates,
@@ -25,6 +27,7 @@ import {
   type CandidateEvaluation,
   type DecisionIntelligenceRecommendation,
   type DecisionQualityResult,
+  type EvolutionAnalytics,
   type EvolutionResponse,
   type ReplayResult,
   type ResearchAgent,
@@ -137,6 +140,8 @@ export default function DecisionArenaPage() {
   const [evolutionResult, setEvolutionResult] = useState<EvolutionResponse | null>(null);
   const [evolutionRunning, setEvolutionRunning] = useState(false);
   const [evolutionError, setEvolutionError] = useState<string | null>(null);
+  const [evolutionAnalytics, setEvolutionAnalytics] = useState<EvolutionAnalytics | null>(null);
+  const [evolutionAnalyticsError, setEvolutionAnalyticsError] = useState<string | null>(null);
   const [replayError, setReplayError] = useState<string | null>(null);
 
   useEffect(() => {
@@ -146,8 +151,9 @@ export default function DecisionArenaPage() {
       setLoading(true);
       setError(null);
       setResearchMemoryError(null);
+      setEvolutionAnalyticsError(null);
       try {
-        const [payload, recommendation, allocation, agents, candidates, laboratory, memorySummary, memoryCandidates] = await Promise.all([
+        const [payload, recommendation, allocation, agents, candidates, laboratory, memorySummary, memoryCandidates, analytics] = await Promise.all([
           getDecisionArenaTournament(),
           getDecisionIntelligenceRecommendation(),
           getCapitalAllocationRecommendation(),
@@ -156,6 +162,7 @@ export default function DecisionArenaPage() {
           getResearchLaboratoryStatus(),
           getResearchMemorySummary(),
           getResearchMemoryCandidates(),
+          getEvolutionAnalytics(),
         ]);
 
         if (active) {
@@ -169,12 +176,14 @@ export default function DecisionArenaPage() {
           setLaboratoryStatus(laboratory);
           setResearchMemorySummary(memorySummary);
           setResearchMemoryCandidates(memoryCandidates);
+          setEvolutionAnalytics(analytics);
         }
       } catch (fetchError) {
         if (active) {
           const message = errorMessage(fetchError, "Failed to load Decision Arena Tournament.");
           setError(message);
           setResearchMemoryError(message);
+          setEvolutionAnalyticsError(message);
         }
       } finally {
         if (active) {
@@ -252,9 +261,11 @@ export default function DecisionArenaPage() {
         getResearchMemorySummary(),
         getResearchMemoryCandidates(),
       ]);
+      const analytics = await getEvolutionAnalytics();
       setLaboratoryStatus(refreshedStatus);
       setResearchMemorySummary(memorySummary);
       setResearchMemoryCandidates(memoryCandidates);
+      setEvolutionAnalytics(analytics);
     } catch (runError) {
       setLaboratoryError(errorMessage(runError, "Failed to run research laboratory."));
     } finally {
@@ -268,8 +279,12 @@ export default function DecisionArenaPage() {
     try {
       const response = await evolveResearchCandidates({});
       setEvolutionResult(response);
-      const memoryCandidates = await getResearchMemoryCandidates();
+      const [memoryCandidates, analytics] = await Promise.all([
+        getResearchMemoryCandidates(),
+        getEvolutionAnalytics(),
+      ]);
       setResearchMemoryCandidates(memoryCandidates);
+      setEvolutionAnalytics(analytics);
     } catch (evolutionRequestError) {
       setEvolutionResult(null);
       setEvolutionError(errorMessage(evolutionRequestError, "Failed to run evolution engine."));
@@ -784,6 +799,123 @@ export default function DecisionArenaPage() {
         )}
       </section>
 
+      <section className="rounded-xl border border-border bg-background/60 p-4 sm:p-5" aria-labelledby="evolution-analytics-heading">
+        <div className="flex flex-wrap items-end justify-between gap-3">
+          <div>
+            <h3 id="evolution-analytics-heading" className="text-base font-semibold">Evolution Analytics</h3>
+            <p className="mt-1 text-xs text-foreground/70">Read-only deterministic analytics of long-term research evolution progress.</p>
+          </div>
+          <p className="text-xs font-semibold uppercase tracking-wide text-foreground/60">Analytics Only</p>
+        </div>
+
+        {evolutionAnalyticsError ? (
+          <div className="mt-3 rounded-md border border-red-500/50 bg-red-500/10 px-3 py-2 text-xs text-red-100" role="alert">
+            {evolutionAnalyticsError}
+          </div>
+        ) : null}
+
+        {evolutionAnalytics && evolutionAnalytics.total_candidates_generated > 0 ? (
+          <div className="mt-4 space-y-4">
+            <div className="grid gap-3 sm:grid-cols-2 lg:grid-cols-4">
+              <Metric label="Total Laboratory Runs" value={String(evolutionAnalytics.total_laboratory_runs)} />
+              <Metric label="Total Candidates Generated" value={String(evolutionAnalytics.total_candidates_generated)} />
+              <Metric label="Total Evolved Candidates" value={String(evolutionAnalytics.total_evolved_candidates)} />
+              <Metric label="Top Research Agent" value={evolutionAnalytics.top_research_agent ?? "None"} />
+            </div>
+
+            <div className="grid gap-3 lg:grid-cols-2">
+              <AnalyticsCard title="Quality Score over Time">
+                <BarChartRows
+                  rows={evolutionAnalytics.quality_score_over_time.map((item) => ({
+                    label: `#${item.sequence}`,
+                    value: item.quality_score,
+                    max: 100,
+                  }))}
+                />
+              </AnalyticsCard>
+
+              <AnalyticsCard title="Candidates Generated per Laboratory Run">
+                <BarChartRows
+                  rows={evolutionAnalytics.candidates_generated_per_laboratory_run.map((item, index) => ({
+                    label: `Run ${index + 1}`,
+                    value: item.candidates_generated,
+                    max: Math.max(
+                      1,
+                      ...evolutionAnalytics.candidates_generated_per_laboratory_run.map((point) => point.candidates_generated),
+                    ),
+                  }))}
+                />
+              </AnalyticsCard>
+
+              <AnalyticsCard title="Generation Distribution">
+                <BarChartRows
+                  rows={evolutionAnalytics.generation_distribution.map((item) => ({
+                    label: `Generation ${item.generation}`,
+                    value: item.count,
+                    max: Math.max(1, ...evolutionAnalytics.generation_distribution.map((point) => point.count)),
+                  }))}
+                />
+              </AnalyticsCard>
+
+              <AnalyticsCard title="Mutation Success Rate">
+                <BarChartRows
+                  rows={[
+                    {
+                      label: "Successful Mutations",
+                      value: evolutionAnalytics.successful_mutations,
+                      max: Math.max(1, evolutionAnalytics.successful_mutations + evolutionAnalytics.unsuccessful_mutations),
+                    },
+                    {
+                      label: "Unsuccessful Mutations",
+                      value: evolutionAnalytics.unsuccessful_mutations,
+                      max: Math.max(1, evolutionAnalytics.successful_mutations + evolutionAnalytics.unsuccessful_mutations),
+                    },
+                  ]}
+                />
+                <p className="mt-2 text-xs text-foreground/70">Success rate: {evolutionAnalytics.mutation_success_rate.success_rate_percent.toFixed(2)}%</p>
+              </AnalyticsCard>
+
+              <AnalyticsCard title="Research Agent Leaderboard">
+                <div className="overflow-x-auto">
+                  <table className="min-w-[520px] w-full text-left text-xs" aria-label="Research Agent Leaderboard">
+                    <thead>
+                      <tr className="border-b border-border text-foreground/70">
+                        <th className="px-2 py-1">Agent</th>
+                        <th className="px-2 py-1">Avg Quality</th>
+                        <th className="px-2 py-1">Best Quality</th>
+                        <th className="px-2 py-1">Candidates</th>
+                      </tr>
+                    </thead>
+                    <tbody>
+                      {evolutionAnalytics.research_agent_leaderboard.map((item) => (
+                        <tr key={item.agent_name} className="border-b border-border/60">
+                          <td className="px-2 py-2 font-medium text-foreground/90">{item.agent_name}</td>
+                          <td className="px-2 py-2">{item.average_quality_score ?? "n/a"}</td>
+                          <td className="px-2 py-2">{item.best_quality_score ?? "n/a"}</td>
+                          <td className="px-2 py-2">{item.total_candidates}</td>
+                        </tr>
+                      ))}
+                    </tbody>
+                  </table>
+                </div>
+              </AnalyticsCard>
+
+              <AnalyticsCard title="Largest Lineage Tree">
+                <div className="space-y-2 text-xs text-foreground/80">
+                  <p>Root Candidate: {evolutionAnalytics.largest_lineage_tree.root_candidate_id ?? "None"}</p>
+                  <p>Lineage Depth: {evolutionAnalytics.largest_lineage_tree.lineage_depth}</p>
+                  <p>Descendant Count: {evolutionAnalytics.largest_lineage_tree.descendant_count}</p>
+                </div>
+              </AnalyticsCard>
+            </div>
+          </div>
+        ) : (
+          <div className="mt-3 rounded-md border border-dashed border-border/70 bg-background/40 px-3 py-3 text-sm text-foreground/60">
+            No evolution analytics available yet.
+          </div>
+        )}
+      </section>
+
       <section className="rounded-md border border-border bg-background/60 px-3 py-3 text-sm text-foreground/85">
         <div className="flex items-center justify-between gap-3">
           <div>
@@ -943,6 +1075,37 @@ function Metric({ label, value, muted = false }: { label: string; value: string 
       <p className="text-xs uppercase tracking-wide text-foreground/55">{label}</p>
       <p className={`mt-1 text-sm font-medium ${muted ? "text-foreground/45" : "text-foreground/90"}`}>{value ?? "Planned"}</p>
     </div>
+  );
+}
+
+function AnalyticsCard({ title, children }: { title: string; children: ReactNode }) {
+  return (
+    <article className="rounded-md border border-border/70 bg-background/40 p-3">
+      <h4 className="text-xs font-semibold uppercase tracking-wide text-foreground/60">{title}</h4>
+      <div className="mt-2">{children}</div>
+    </article>
+  );
+}
+
+function BarChartRows({ rows }: { rows: Array<{ label: string; value: number; max: number }> }) {
+  return (
+    <ul className="space-y-2 text-xs text-foreground/80">
+      {rows.map((row) => {
+        const denominator = row.max <= 0 ? 1 : row.max;
+        const widthPercent = Math.max(0, Math.min(100, (row.value / denominator) * 100));
+        return (
+          <li key={`${row.label}-${row.value}`}>
+            <div className="mb-1 flex items-center justify-between gap-2">
+              <span>{row.label}</span>
+              <span className="font-medium text-foreground/90">{row.value}</span>
+            </div>
+            <div className="h-2 rounded bg-background/70">
+              <div className="h-2 rounded bg-cyan-400/80" style={{ width: `${widthPercent}%` }} />
+            </div>
+          </li>
+        );
+      })}
+    </ul>
   );
 }
 

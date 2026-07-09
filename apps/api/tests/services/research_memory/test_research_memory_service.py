@@ -4,6 +4,7 @@ from datetime import datetime, timezone
 import uuid
 
 from app.services.candidate_evaluation.interface import CandidateEvaluation
+from app.services.evolution.interface import EvolvedCandidate, EvolutionMutation
 from app.services.research_agents.interface import StrategyCandidate
 from app.services.research_laboratory.interface import ResearchLaboratoryRun
 from app.services.research_memory.service import ResearchMemory
@@ -110,6 +111,49 @@ def test_research_memory_records_candidates() -> None:
     assert summary.highest_quality_candidate is not None
     assert summary.highest_quality_candidate.quality_score == 100
     assert summary.average_quality_score == 75.0
+    assert all(item.generation == 1 for item in candidates)
+    assert all(item.parent_candidate_id is None for item in candidates)
+
+
+def test_research_memory_records_evolved_candidates() -> None:
+    memory = ResearchMemory()
+    memory.record_laboratory_run(
+        run=_build_run(),
+        candidates=_build_candidates(),
+        evaluations=_build_evaluations(),
+    )
+
+    evolved = EvolvedCandidate(
+        candidate_id=uuid.UUID("90000000-0000-0000-0000-000000000013"),
+        parent_candidate_id=uuid.UUID("90000000-0000-0000-0000-000000000011"),
+        generation=2,
+        mutation_reason="rsi_period 14->12",
+        parameter_diff=(
+            EvolutionMutation(
+                parameter_name="rsi_period",
+                previous_value=14,
+                new_value=12,
+            ),
+        ),
+        parameter_set={"rsi_period": 12},
+        strategy_name="Evolved candidate",
+        originating_agent="Baseline Research Agent",
+        generated_at=datetime(2026, 7, 9, 12, 2, tzinfo=timezone.utc),
+        quality_score=100,
+        tournament_rank=1,
+        status="EVALUATED",
+    )
+
+    memory.record_evolved_candidates(descendants=[evolved])
+
+    candidates = memory.list_candidates()
+    assert len(candidates) == 3
+    assert candidates[0].candidate_id == uuid.UUID("90000000-0000-0000-0000-000000000013")
+    assert candidates[0].parent_candidate_id == uuid.UUID("90000000-0000-0000-0000-000000000011")
+    assert candidates[0].generation == 2
+    assert candidates[0].mutation_reason == "rsi_period 14->12"
+    assert len(candidates[0].parameter_diff) == 1
+    assert candidates[0].parameter_diff[0].parameter_name == "rsi_period"
 
 
 def test_research_memory_is_empty_by_default() -> None:

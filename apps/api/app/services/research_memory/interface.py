@@ -17,6 +17,13 @@ class ResearchMemoryLaboratoryRunRecord:
 
 
 @dataclass(frozen=True, slots=True)
+class ResearchMemoryParameterDiffRecord:
+    parameter_name: str
+    previous_value: int
+    new_value: int
+
+
+@dataclass(frozen=True, slots=True)
 class ResearchMemoryCandidateRecord:
     laboratory_run_id: uuid.UUID
     candidate_id: uuid.UUID
@@ -26,6 +33,10 @@ class ResearchMemoryCandidateRecord:
     quality_score: int | None
     tournament_rank: int | None
     status: str
+    parent_candidate_id: uuid.UUID | None = None
+    generation: int = 1
+    mutation_reason: str | None = None
+    parameter_diff: tuple[ResearchMemoryParameterDiffRecord, ...] = tuple()
 
 
 @dataclass(frozen=True, slots=True)

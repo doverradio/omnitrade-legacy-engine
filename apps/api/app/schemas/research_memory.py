@@ -17,6 +17,11 @@ class ResearchMemoryLaboratoryRunResponse(BaseModel):
 
 
 class ResearchMemoryCandidateResponse(BaseModel):
+    class ParameterDiffResponse(BaseModel):
+        parameter_name: str
+        previous_value: int
+        new_value: int
+
     laboratory_run_id: uuid.UUID
     candidate_id: uuid.UUID
     originating_agent: str
@@ -25,6 +30,10 @@ class ResearchMemoryCandidateResponse(BaseModel):
     quality_score: int | None
     tournament_rank: int | None
     status: str
+    parent_candidate_id: uuid.UUID | None
+    generation: int
+    mutation_reason: str | None
+    parameter_diff: list[ParameterDiffResponse]
 
 
 class ResearchMemorySummaryResponse(BaseModel):

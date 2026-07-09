@@ -333,6 +333,12 @@ export type ResearchMemoryLaboratoryRun = {
   candidates_evaluated: number;
 };
 
+export type ResearchMemoryParameterDiff = {
+  parameter_name: string;
+  previous_value: number;
+  new_value: number;
+};
+
 export type ResearchMemoryCandidate = {
   laboratory_run_id: string;
   candidate_id: string;
@@ -342,6 +348,10 @@ export type ResearchMemoryCandidate = {
   quality_score: number | null;
   tournament_rank: number | null;
   status: string;
+  parent_candidate_id: string | null;
+  generation: number;
+  mutation_reason: string | null;
+  parameter_diff: ResearchMemoryParameterDiff[];
 };
 
 export type ResearchMemorySummary = {
@@ -379,6 +389,64 @@ export type EvolutionRequest = {
 export type EvolutionResponse = {
   generated_count: number;
   descendants: EvolvedCandidate[];
+};
+
+export type EvolutionAnalyticsGenerationDistributionItem = {
+  generation: number;
+  count: number;
+};
+
+export type EvolutionAnalyticsQualityPoint = {
+  sequence: number;
+  quality_score: number;
+};
+
+export type EvolutionAnalyticsRunPoint = {
+  laboratory_run_id: string;
+  candidates_generated: number;
+};
+
+export type EvolutionAnalyticsMutationSuccessRate = {
+  successful_mutations: number;
+  unsuccessful_mutations: number;
+  success_rate_percent: number;
+};
+
+export type EvolutionAnalyticsAgentLeaderboardItem = {
+  agent_name: string;
+  average_quality_score: number | null;
+  best_quality_score: number | null;
+  total_candidates: number;
+};
+
+export type EvolutionAnalyticsLargestLineageTree = {
+  root_candidate_id: string | null;
+  lineage_depth: number;
+  descendant_count: number;
+};
+
+export type EvolutionAnalytics = {
+  total_laboratory_runs: number;
+  total_candidates_generated: number;
+  total_evolved_candidates: number;
+  average_quality_score: number | null;
+  best_quality_score: number | null;
+  best_candidate: {
+    candidate_id: string;
+    quality_score: number;
+    tournament_rank: number | null;
+    originating_agent: string;
+  } | null;
+  successful_mutations: number;
+  unsuccessful_mutations: number;
+  generation_distribution: EvolutionAnalyticsGenerationDistributionItem[];
+  lineage_depth: number;
+  top_research_agent: string | null;
+  quality_score_over_time: EvolutionAnalyticsQualityPoint[];
+  candidates_generated_per_laboratory_run: EvolutionAnalyticsRunPoint[];
+  mutation_success_rate: EvolutionAnalyticsMutationSuccessRate;
+  research_agent_leaderboard: EvolutionAnalyticsAgentLeaderboardItem[];
+  largest_lineage_tree: EvolutionAnalyticsLargestLineageTree;
 };
 
 async function requestJson<T>(path: string, init?: RequestInit): Promise<T> {
@@ -551,4 +619,8 @@ export async function evolveResearchCandidates(request: EvolutionRequest): Promi
     method: "POST",
     body: JSON.stringify(request),
   });
+}
+
+export async function getEvolutionAnalytics(): Promise<EvolutionAnalytics> {
+  return requestJson<EvolutionAnalytics>("/research/evolution-analytics");
 }

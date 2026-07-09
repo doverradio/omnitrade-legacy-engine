@@ -107,5 +107,9 @@ def test_research_memory_endpoints_return_recorded_history() -> None:
     assert candidates[0]["candidate_id"] == "91000000-0000-0000-0000-000000000011"
     assert candidates[0]["quality_score"] == 100
     assert candidates[0]["tournament_rank"] == 1
+    assert candidates[0]["parent_candidate_id"] is None
+    assert candidates[0]["generation"] == 1
+    assert candidates[0]["mutation_reason"] is None
+    assert candidates[0]["parameter_diff"] == []
 
     get_research_memory().clear()

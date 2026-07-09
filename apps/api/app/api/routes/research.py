@@ -10,6 +10,16 @@ from app.schemas.candidate_evaluation import (
     CandidateEvaluationResponse,
 )
 from app.schemas.evolution import EvolvedCandidateResponse, EvolutionMutationResponse, EvolutionRequest, EvolutionResponse
+from app.schemas.evolution_analytics import (
+    EvolutionAnalyticsAgentLeaderboardResponse,
+    EvolutionAnalyticsBestCandidateResponse,
+    EvolutionAnalyticsGenerationDistributionResponse,
+    EvolutionAnalyticsLargestLineageTreeResponse,
+    EvolutionAnalyticsMutationSuccessRateResponse,
+    EvolutionAnalyticsQualityPointResponse,
+    EvolutionAnalyticsResponse,
+    EvolutionAnalyticsRunPointResponse,
+)
 from app.schemas.research_laboratory import ResearchLaboratoryRunResponse, ResearchLaboratoryStatusResponse
 from app.schemas.research_memory import (
     ResearchMemoryCandidateResponse,
@@ -28,6 +38,7 @@ from app.services.research_laboratory.registry import get_research_laboratory
 from app.services.research_memory.registry import get_research_memory
 from app.services.evolution.registry import get_evolution_engine
 from app.services.evolution.service import ParentCandidateNotFoundError
+from app.services.evolution_analytics.registry import get_evolution_analytics_service
 
 router = APIRouter(prefix="/research", tags=["research"])
 
@@ -186,6 +197,17 @@ async def get_research_memory_summary() -> ResearchMemorySummaryResponse:
                 quality_score=summary.highest_quality_candidate.quality_score,
                 tournament_rank=summary.highest_quality_candidate.tournament_rank,
                 status=summary.highest_quality_candidate.status,
+                parent_candidate_id=summary.highest_quality_candidate.parent_candidate_id,
+                generation=summary.highest_quality_candidate.generation,
+                mutation_reason=summary.highest_quality_candidate.mutation_reason,
+                parameter_diff=[
+                    ResearchMemoryCandidateResponse.ParameterDiffResponse(
+                        parameter_name=diff.parameter_name,
+                        previous_value=diff.previous_value,
+                        new_value=diff.new_value,
+                    )
+                    for diff in summary.highest_quality_candidate.parameter_diff
+                ],
             )
         ),
         average_quality_score=summary.average_quality_score,
@@ -233,6 +255,17 @@ async def get_research_memory_candidates() -> list[ResearchMemoryCandidateRespon
             quality_score=item.quality_score,
             tournament_rank=item.tournament_rank,
             status=item.status,
+            parent_candidate_id=item.parent_candidate_id,
+            generation=item.generation,
+            mutation_reason=item.mutation_reason,
+            parameter_diff=[
+                ResearchMemoryCandidateResponse.ParameterDiffResponse(
+                    parameter_name=diff.parameter_name,
+                    previous_value=diff.previous_value,
+                    new_value=diff.new_value,
+                )
+                for diff in item.parameter_diff
+            ],
         )
         for item in memory.list_candidates()
     ]
@@ -254,6 +287,8 @@ async def evolve_research_candidates(request: EvolutionRequest) -> EvolutionResp
             message="Parent candidate not found",
             details={"parent_candidate_id": str(request.parent_candidate_id)},
         )
+
+    memory.record_evolved_candidates(descendants=list(run.descendants))
 
     return EvolutionResponse(
         generated_count=run.generated_count,
@@ -279,4 +314,72 @@ async def evolve_research_candidates(request: EvolutionRequest) -> EvolutionResp
             )
             for item in run.descendants
         ],
+    )
+
+
+@router.get("/evolution-analytics", response_model=EvolutionAnalyticsResponse)
+async def get_evolution_analytics() -> EvolutionAnalyticsResponse:
+    service = get_evolution_analytics_service()
+    summary = service.build_summary()
+
+    return EvolutionAnalyticsResponse(
+        total_laboratory_runs=summary.total_laboratory_runs,
+        total_candidates_generated=summary.total_candidates_generated,
+        total_evolved_candidates=summary.total_evolved_candidates,
+        average_quality_score=summary.average_quality_score,
+        best_quality_score=summary.best_quality_score,
+        best_candidate=(
+            None
+            if summary.best_candidate is None
+            else EvolutionAnalyticsBestCandidateResponse(
+                candidate_id=summary.best_candidate.candidate_id,
+                quality_score=summary.best_candidate.quality_score,
+                tournament_rank=summary.best_candidate.tournament_rank,
+                originating_agent=summary.best_candidate.originating_agent,
+            )
+        ),
+        successful_mutations=summary.successful_mutations,
+        unsuccessful_mutations=summary.unsuccessful_mutations,
+        generation_distribution=[
+            EvolutionAnalyticsGenerationDistributionResponse(
+                generation=item.generation,
+                count=item.count,
+            )
+            for item in summary.generation_distribution
+        ],
+        lineage_depth=summary.lineage_depth,
+        top_research_agent=summary.top_research_agent,
+        quality_score_over_time=[
+            EvolutionAnalyticsQualityPointResponse(
+                sequence=item.sequence,
+                quality_score=item.quality_score,
+            )
+            for item in summary.quality_score_over_time
+        ],
+        candidates_generated_per_laboratory_run=[
+            EvolutionAnalyticsRunPointResponse(
+                laboratory_run_id=item.laboratory_run_id,
+                candidates_generated=item.candidates_generated,
+            )
+            for item in summary.candidates_generated_per_laboratory_run
+        ],
+        mutation_success_rate=EvolutionAnalyticsMutationSuccessRateResponse(
+            successful_mutations=summary.successful_mutations,
+            unsuccessful_mutations=summary.unsuccessful_mutations,
+            success_rate_percent=summary.mutation_success_rate,
+        ),
+        research_agent_leaderboard=[
+            EvolutionAnalyticsAgentLeaderboardResponse(
+                agent_name=item.agent_name,
+                average_quality_score=item.average_quality_score,
+                best_quality_score=item.best_quality_score,
+                total_candidates=item.total_candidates,
+            )
+            for item in summary.research_agent_leaderboard
+        ],
+        largest_lineage_tree=EvolutionAnalyticsLargestLineageTreeResponse(
+            root_candidate_id=summary.largest_lineage_tree.root_candidate_id,
+            lineage_depth=summary.largest_lineage_tree.lineage_depth,
+            descendant_count=summary.largest_lineage_tree.descendant_count,
+        ),
     )

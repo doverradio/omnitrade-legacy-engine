@@ -1,12 +1,16 @@
 from __future__ import annotations
 
+import uuid
+
 from app.services.candidate_evaluation.interface import CandidateEvaluation
+from app.services.evolution.interface import EvolvedCandidate
 from app.services.research_agents.interface import StrategyCandidate
 from app.services.research_laboratory.interface import ResearchLaboratoryRun
 from app.services.research_memory.interface import (
     ResearchMemoryAgentParticipationRecord,
     ResearchMemoryCandidateRecord,
     ResearchMemoryLaboratoryRunRecord,
+    ResearchMemoryParameterDiffRecord,
     ResearchMemorySummary,
     ResearchMemoryTournamentOutcomeRecord,
 )
@@ -66,6 +70,10 @@ class ResearchMemory:
                 quality_score=None if evaluation is None else evaluation.decision_quality_score,
                 tournament_rank=None if evaluation is None else evaluation.tournament_rank,
                 status="EVALUATED" if evaluation is not None else candidate.status,
+                parent_candidate_id=None,
+                generation=1,
+                mutation_reason=None,
+                parameter_diff=tuple(),
             )
             self._candidate_history.append(candidate_record)
 
@@ -75,6 +83,57 @@ class ResearchMemory:
                         laboratory_run_id=run.laboratory_run_id,
                         candidate_id=candidate.candidate_id,
                         tournament_rank=evaluation.tournament_rank,
+                    )
+                )
+
+    def record_evolved_candidates(self, *, descendants: list[EvolvedCandidate]) -> None:
+        if not descendants:
+            return
+
+        candidate_index = {
+            item.candidate_id: item
+            for item in self._candidate_history
+        }
+        fallback_run_id = (
+            self._laboratory_runs[-1].laboratory_run_id
+            if self._laboratory_runs
+            else uuid.UUID("00000000-0000-0000-0000-000000000000")
+        )
+
+        for descendant in descendants:
+            parent = candidate_index.get(descendant.parent_candidate_id)
+            run_id = fallback_run_id if parent is None else parent.laboratory_run_id
+
+            self._candidate_history.append(
+                ResearchMemoryCandidateRecord(
+                    laboratory_run_id=run_id,
+                    candidate_id=descendant.candidate_id,
+                    originating_agent=descendant.originating_agent,
+                    parameter_set=dict(descendant.parameter_set),
+                    evaluation_summary=descendant.mutation_reason,
+                    quality_score=descendant.quality_score,
+                    tournament_rank=descendant.tournament_rank,
+                    status=descendant.status,
+                    parent_candidate_id=descendant.parent_candidate_id,
+                    generation=descendant.generation,
+                    mutation_reason=descendant.mutation_reason,
+                    parameter_diff=tuple(
+                        ResearchMemoryParameterDiffRecord(
+                            parameter_name=diff.parameter_name,
+                            previous_value=diff.previous_value,
+                            new_value=diff.new_value,
+                        )
+                        for diff in descendant.parameter_diff
+                    ),
+                )
+            )
+
+            if descendant.tournament_rank is not None:
+                self._tournament_outcomes.append(
+                    ResearchMemoryTournamentOutcomeRecord(
+                        laboratory_run_id=run_id,
+                        candidate_id=descendant.candidate_id,
+                        tournament_rank=descendant.tournament_rank,
                     )
                 )
 
