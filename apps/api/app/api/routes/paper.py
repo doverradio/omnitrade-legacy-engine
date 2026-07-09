@@ -30,6 +30,8 @@ from app.schemas.paper import (
     PaperLatestTradeSummary,
     PaperPerformanceSummaryResponse,
     PaperPipelineHealthResponse,
+    PaperTradeHistoryItem,
+    PaperTradeHistoryResponse,
     PaperStrategyPerformanceSummary,
     PipelineActivityItem,
     PaperTradeListResponse,
@@ -449,6 +451,94 @@ async def get_paper_pipeline_health(
     )
 
 
+@router.get("/trade-history", response_model=PaperTradeHistoryResponse)
+async def get_paper_trade_history(
+    account_id: uuid.UUID | None = Query(default=None),
+    limit: int = Query(default=_DEFAULT_PAGE_LIMIT, ge=1, le=_MAX_PAGE_LIMIT),
+    offset: int = Query(default=0, ge=0),
+    db: AsyncSession = Depends(get_db),
+) -> PaperTradeHistoryResponse:
+    account_filter_id = account_id
+    if account_filter_id is not None:
+        account = await _load_account(db=db, account_id=account_filter_id)
+        account_filter_id = account.id
+
+    filters = [Trade.is_paper.is_(True)]
+    if account_filter_id is not None:
+        filters.append(Trade.paper_account_id == account_filter_id)
+
+    total = await _count_rows_since(
+        db=db,
+        statement=select(func.count()).select_from(Trade).where(*filters),
+    )
+
+    page_rows = (
+        await db.execute(
+            select(Trade, Asset.symbol)
+            .outerjoin(Asset, Asset.id == Trade.asset_id)
+            .where(*filters)
+            .order_by(Trade.executed_at.desc(), Trade.id.desc())
+            .limit(limit)
+            .offset(offset)
+        )
+    ).all()
+
+    all_trades = (
+        await db.execute(
+            select(Trade)
+            .where(*filters)
+            .order_by(Trade.executed_at.asc(), Trade.id.asc())
+        )
+    ).scalars().all()
+    realized_pnl_by_trade_id = _compute_realized_pnl_by_trade(trades=all_trades)
+
+    page_signal_ids = sorted(
+        {trade.signal_id for trade, _ in page_rows if trade.signal_id is not None},
+        key=str,
+    )
+    strategy_by_signal_id: dict[uuid.UUID, uuid.UUID] = {}
+    if page_signal_ids:
+        strategy_rows = (
+            await db.execute(select(Signal.id, Signal.strategy_id).where(Signal.id.in_(page_signal_ids)))
+        ).all()
+        strategy_by_signal_id = {signal_id: strategy_id for signal_id, strategy_id in strategy_rows}
+
+    decision_record_by_signal_id = await _resolve_decision_records_for_signals(
+        db=db,
+        signal_ids=page_signal_ids,
+    )
+
+    items = [
+        PaperTradeHistoryItem(
+            trade_id=trade.id,
+            executed_at=trade.executed_at,
+            asset=symbol,
+            side=trade.side,
+            quantity=trade.quantity,
+            execution_price=trade.price,
+            notional=Decimal(str(trade.quantity)) * Decimal(str(trade.price)),
+            signal_id=trade.signal_id,
+            strategy_id=(strategy_by_signal_id.get(trade.signal_id) if trade.signal_id is not None else None),
+            decision_record_id=(
+                decision_record_by_signal_id.get(trade.signal_id)
+                if trade.signal_id is not None
+                else None
+            ),
+            realized_pnl=realized_pnl_by_trade_id.get(trade.id),
+            paper_account_id=trade.paper_account_id,
+        )
+        for trade, symbol in page_rows
+    ]
+
+    return PaperTradeHistoryResponse(
+        items=items,
+        limit=limit,
+        offset=offset,
+        total=total,
+        has_more=offset + len(items) < total,
+    )
+
+
 @router.get("/performance-summary", response_model=PaperPerformanceSummaryResponse)
 async def get_paper_performance_summary(
     account_id: uuid.UUID | None = Query(default=None),
@@ -678,3 +768,76 @@ def _compute_realized_performance(*, trades: list[Trade], strategy_by_signal_id:
             positions[trade.asset_id] = (remaining_qty, current_avg)
 
     return realized_pnl, win_count, loss_count, realized_by_asset, realized_by_strategy, wins_by_strategy, losses_by_strategy
+
+
+def _compute_realized_pnl_by_trade(*, trades: list[Trade]) -> dict[uuid.UUID, Decimal]:
+    positions: dict[tuple[uuid.UUID, uuid.UUID], tuple[Decimal, Decimal]] = {}
+    realized_by_trade_id: dict[uuid.UUID, Decimal] = {}
+
+    for trade in sorted(trades, key=lambda item: (item.executed_at, item.id)):
+        quantity = Decimal(str(trade.quantity))
+        price = Decimal(str(trade.price))
+        fee = Decimal(str(trade.fee))
+        key = (trade.paper_account_id, trade.asset_id)
+        current_qty, current_avg = positions.get(key, (Decimal("0"), Decimal("0")))
+
+        if trade.side == "buy":
+            total_cost = (current_qty * current_avg) + (quantity * price) + fee
+            next_qty = current_qty + quantity
+            next_avg = total_cost / next_qty if next_qty > 0 else Decimal("0")
+            positions[key] = (next_qty, next_avg)
+            continue
+
+        if trade.side != "sell":
+            continue
+
+        sell_qty = min(current_qty, quantity)
+        if sell_qty <= 0:
+            continue
+
+        pnl = (sell_qty * price) - (sell_qty * current_avg) - fee
+        realized_by_trade_id[trade.id] = pnl
+
+        remaining_qty = current_qty - sell_qty
+        if remaining_qty <= 0:
+            positions[key] = (Decimal("0"), Decimal("0"))
+        else:
+            positions[key] = (remaining_qty, current_avg)
+
+    return realized_by_trade_id
+
+
+async def _resolve_decision_records_for_signals(
+    *,
+    db: AsyncSession,
+    signal_ids: list[uuid.UUID],
+) -> dict[uuid.UUID, uuid.UUID]:
+    if not signal_ids:
+        return {}
+
+    decision_rows = (
+        await db.execute(
+            select(DecisionRecord.decision_id, DecisionRecord.timestamp, DecisionRecord.source_lineage)
+            .where(DecisionRecord.source_lineage.is_not(None))
+            .order_by(DecisionRecord.timestamp.desc())
+            .limit(2000)
+        )
+    ).all()
+
+    signal_texts = {str(signal_id): signal_id for signal_id in signal_ids}
+    resolved: dict[uuid.UUID, uuid.UUID] = {}
+    for decision_id, _timestamp, source_lineage in decision_rows:
+        if not isinstance(source_lineage, dict):
+            continue
+        signals = source_lineage.get("signals")
+        if not isinstance(signals, list):
+            continue
+        for signal_value in signals:
+            if not isinstance(signal_value, str):
+                continue
+            signal_id = signal_texts.get(signal_value)
+            if signal_id is None or signal_id in resolved:
+                continue
+            resolved[signal_id] = decision_id
+
+    return resolved

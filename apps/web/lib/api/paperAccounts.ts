@@ -139,6 +139,35 @@ export type PaperPerformanceSummary = {
   by_strategy: PaperPerformanceByStrategy[];
 };
 
+export type PaperTradeHistoryItem = {
+  trade_id: string;
+  executed_at: string;
+  asset?: string | null;
+  side: string;
+  quantity: string;
+  execution_price: string;
+  notional: string;
+  signal_id?: string | null;
+  strategy_id?: string | null;
+  decision_record_id?: string | null;
+  realized_pnl?: string | null;
+  paper_account_id: string;
+};
+
+export type PaperTradeHistoryResponse = {
+  items: PaperTradeHistoryItem[];
+  limit: number;
+  offset: number;
+  total: number;
+  has_more: boolean;
+};
+
+export type GetPaperTradeHistoryParams = {
+  account_id?: string;
+  limit?: number;
+  offset?: number;
+};
+
 export type GetPaperTradesParams = {
   account_id: string;
   strategy_id?: string;
@@ -248,4 +277,19 @@ export async function getPaperPerformanceSummary(accountId?: string): Promise<Pa
   }
   const suffix = query.toString() ? `?${query.toString()}` : "";
   return requestJson<PaperPerformanceSummary>(`/paper/performance-summary${suffix}`);
+}
+
+export async function getPaperTradeHistory(params: GetPaperTradeHistoryParams = {}): Promise<PaperTradeHistoryResponse> {
+  const query = new URLSearchParams();
+  if (params.account_id) {
+    query.set("account_id", params.account_id);
+  }
+  if (typeof params.limit === "number") {
+    query.set("limit", String(params.limit));
+  }
+  if (typeof params.offset === "number") {
+    query.set("offset", String(params.offset));
+  }
+  const suffix = query.toString() ? `?${query.toString()}` : "";
+  return requestJson<PaperTradeHistoryResponse>(`/paper/trade-history${suffix}`);
 }

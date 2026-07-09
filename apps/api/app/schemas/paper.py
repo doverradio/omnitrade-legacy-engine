@@ -130,6 +130,39 @@ class PaperTradeListResponse(BaseModel):
     next_cursor: str | None
 
 
+class PaperTradeHistoryItem(BaseModel):
+    trade_id: uuid.UUID
+    executed_at: datetime
+    asset: str | None = None
+    side: str
+    quantity: Decimal
+    execution_price: Decimal
+    notional: Decimal
+    signal_id: uuid.UUID | None = None
+    strategy_id: uuid.UUID | None = None
+    decision_record_id: uuid.UUID | None = None
+    realized_pnl: Decimal | None = None
+    paper_account_id: uuid.UUID
+
+    @field_serializer("quantity", "execution_price", "notional", when_used="json")
+    def serialize_numeric_fields(self, value: Decimal) -> str:
+        return format(value, "f")
+
+    @field_serializer("realized_pnl", when_used="json")
+    def serialize_optional_numeric_field(self, value: Decimal | None) -> str | None:
+        if value is None:
+            return None
+        return format(value, "f")
+
+
+class PaperTradeHistoryResponse(BaseModel):
+    items: list[PaperTradeHistoryItem]
+    limit: int
+    offset: int
+    total: int
+    has_more: bool
+
+
 class PipelineActivityItem(BaseModel):
     signal_id: uuid.UUID
     action: str
