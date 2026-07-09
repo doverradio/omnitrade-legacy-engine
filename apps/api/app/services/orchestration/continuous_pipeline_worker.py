@@ -63,7 +63,9 @@ class WorkerConfig:
 class CycleStats:
     ingestion_assets_ok: int
     signals_created: int
+    execution_candidates: int
     executions_attempted: int
+    executions_skipped: int
     decisions_inserted: int
 
 
@@ -205,18 +207,30 @@ async def run_orchestration_cycle(
     strategies = await _load_active_strategies(db)
 
     signals_created = 0
+    execution_candidates = 0
     executions_attempted = 0
+    executions_skipped = 0
     decision_inserted_total = 0
 
     for strategy_row in strategies:
         try:
             strategy_impl = strategy_registry.get(strategy_row.slug)
         except StrategyLookupError:
+            logger.info(
+                "paper_execution_skip reason=unregistered_strategy strategy_id=%s strategy_slug=%s",
+                strategy_row.id,
+                strategy_row.slug,
+            )
             logger.warning("Skipping unregistered strategy slug=%s", strategy_row.slug)
             continue
 
         parameter_set = await _load_latest_parameter_set(db, strategy_id=strategy_row.id)
         if parameter_set is None:
+            logger.info(
+                "paper_execution_skip reason=missing_parameter_set strategy_id=%s strategy_slug=%s",
+                strategy_row.id,
+                strategy_row.slug,
+            )
             logger.warning("Skipping strategy without parameter_set strategy_id=%s slug=%s", strategy_row.id, strategy_row.slug)
             continue
 
@@ -228,6 +242,13 @@ async def run_orchestration_cycle(
                 limit=config.candle_lookback_limit,
             )
             if len(candles) < 2:
+                logger.info(
+                    "paper_execution_skip reason=insufficient_candles strategy_id=%s asset_id=%s candle_count=%s minimum_required=%s",
+                    strategy_row.id,
+                    asset.id,
+                    len(candles),
+                    2,
+                )
                 continue
 
             signal_time = candles[-1].open_time
@@ -239,6 +260,13 @@ async def run_orchestration_cycle(
                 signal_time=signal_time,
             )
             if exists:
+                logger.info(
+                    "paper_execution_skip reason=duplicate_existing_signal strategy_id=%s parameter_set_id=%s asset_id=%s signal_time=%s",
+                    strategy_row.id,
+                    parameter_set.id,
+                    asset.id,
+                    signal_time.isoformat(),
+                )
                 continue
 
             context = _to_strategy_context(
@@ -266,6 +294,7 @@ async def run_orchestration_cycle(
             signals_created += 1
 
             if generated.action in {"buy", "sell"}:
+                execution_candidates += 1
                 account = await _load_primary_account_by_asset_class(db, asset_class=asset.asset_class)
                 if account is not None:
                     executions_attempted += 1
@@ -282,6 +311,7 @@ async def run_orchestration_cycle(
                     )
                     signal_model.status = _signal_status_from_execution_status(execution.execution_status)
                 else:
+                    executions_skipped += 1
                     logger.info(
                         "paper_execution_skip reason=no_active_paper_account signal_id=%s action=%s status=%s account_id=%s",
                         signal_model.id,
@@ -295,6 +325,7 @@ async def run_orchestration_cycle(
                         asset.symbol,
                     )
             else:
+                executions_skipped += 1
                 logger.info(
                     "paper_execution_skip reason=non_actionable_action signal_id=%s action=%s status=%s account_id=%s",
                     signal_model.id,
@@ -311,7 +342,9 @@ async def run_orchestration_cycle(
     return CycleStats(
         ingestion_assets_ok=ingestion_result.successful_assets,
         signals_created=signals_created,
+        execution_candidates=execution_candidates,
         executions_attempted=executions_attempted,
+        executions_skipped=executions_skipped,
         decisions_inserted=decision_inserted_total,
     )
 
@@ -337,10 +370,12 @@ async def run_forever() -> None:
                     stats = await run_orchestration_cycle(db, client=client, config=config)
 
                 logger.info(
-                    "Pipeline cycle completed ingestion_assets_ok=%s signals_created=%s executions_attempted=%s decisions_inserted=%s",
+                    "Pipeline cycle completed ingestion_assets_ok=%s signals_created=%s execution_candidates=%s executions_attempted=%s executions_skipped=%s decisions_inserted=%s",
                     stats.ingestion_assets_ok,
                     stats.signals_created,
+                    stats.execution_candidates,
                     stats.executions_attempted,
+                    stats.executions_skipped,
                     stats.decisions_inserted,
                 )
             except Exception:
