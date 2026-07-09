@@ -27,6 +27,8 @@ from app.schemas.paper import (
     ExecuteSignalRequest,
     ExecuteSignalResponse,
     PaperAssetPerformanceSummary,
+    PaperEquityCurvePoint,
+    PaperEquityCurveResponse,
     PaperLatestTradeSummary,
     PaperPerformanceSummaryResponse,
     PaperPipelineHealthResponse,
@@ -55,6 +57,9 @@ _DEFAULT_PAGE_LIMIT = 50
 _MAX_PAGE_LIMIT = 200
 _DEFAULT_PIPELINE_WINDOW_MINUTES = 120
 _MAX_PIPELINE_WINDOW_MINUTES = 1440
+_DEFAULT_EQUITY_WINDOW_MINUTES = 720
+_DEFAULT_EQUITY_INTERVAL_MINUTES = 15
+_MAX_EQUITY_INTERVAL_MINUTES = 240
 
 
 @router.get("/account", response_model=PaperAccountResponse)
@@ -668,6 +673,88 @@ async def get_paper_performance_summary(
     )
 
 
+@router.get("/equity-curve", response_model=PaperEquityCurveResponse)
+async def get_paper_equity_curve(
+    account_id: uuid.UUID | None = Query(default=None),
+    window_minutes: int = Query(default=_DEFAULT_EQUITY_WINDOW_MINUTES, ge=1, le=_MAX_PIPELINE_WINDOW_MINUTES),
+    interval: int = Query(default=_DEFAULT_EQUITY_INTERVAL_MINUTES, ge=1, le=_MAX_EQUITY_INTERVAL_MINUTES),
+    db: AsyncSession = Depends(get_db),
+) -> PaperEquityCurveResponse:
+    account = await _load_account(db=db, account_id=account_id)
+
+    now = datetime.now(timezone.utc)
+    window_start = now - timedelta(minutes=window_minutes)
+
+    trades = (
+        await db.execute(
+            select(Trade)
+            .where(Trade.paper_account_id == account.id)
+            .where(Trade.is_paper.is_(True))
+            .where(Trade.executed_at >= window_start)
+            .order_by(Trade.executed_at.asc(), Trade.id.asc())
+        )
+    ).scalars().all()
+
+    if not trades:
+        points = [
+            PaperEquityCurvePoint(
+                timestamp=window_start,
+                equity=account.starting_balance,
+                cash_balance=account.starting_balance,
+                realized_pnl=Decimal("0"),
+                unrealized_pnl=Decimal("0"),
+                trade_count_at_point=0,
+            ),
+            PaperEquityCurvePoint(
+                timestamp=now,
+                equity=account.starting_balance,
+                cash_balance=account.starting_balance,
+                realized_pnl=Decimal("0"),
+                unrealized_pnl=Decimal("0"),
+                trade_count_at_point=0,
+            ),
+        ]
+        return PaperEquityCurveResponse(
+            account_id=account.id,
+            window_minutes=window_minutes,
+            interval=interval,
+            starting_balance=account.starting_balance,
+            current_equity=account.starting_balance,
+            total_return_usd=Decimal("0"),
+            total_return_pct=Decimal("0"),
+            latest_point_timestamp=now,
+            points=points,
+        )
+
+    bucket_start = _floor_timestamp(window_start, interval_minutes=interval)
+    bucket_end = _ceil_timestamp(now, interval_minutes=interval)
+    buckets = _build_bucket_timestamps(start=bucket_start, end=bucket_end, interval_minutes=interval)
+
+    points = _build_equity_curve_points(
+        trades=trades,
+        starting_balance=account.starting_balance,
+        buckets=buckets,
+    )
+
+    latest_equity = points[-1].equity if points else account.starting_balance
+    total_return_usd = latest_equity - account.starting_balance
+    total_return_pct = Decimal("0")
+    if account.starting_balance > 0:
+        total_return_pct = total_return_usd / account.starting_balance
+
+    return PaperEquityCurveResponse(
+        account_id=account.id,
+        window_minutes=window_minutes,
+        interval=interval,
+        starting_balance=account.starting_balance,
+        current_equity=latest_equity,
+        total_return_usd=total_return_usd,
+        total_return_pct=total_return_pct,
+        latest_point_timestamp=points[-1].timestamp if points else None,
+        points=points,
+    )
+
+
 async def _load_account(*, db: AsyncSession, account_id: uuid.UUID | None) -> PaperAccount:
     if account_id is not None:
         account = await db.scalar(select(PaperAccount).where(PaperAccount.id == account_id))
@@ -841,3 +928,94 @@ async def _resolve_decision_records_for_signals(
             resolved[signal_id] = decision_id
 
     return resolved
+
+
+def _floor_timestamp(value: datetime, *, interval_minutes: int) -> datetime:
+    minute = (value.minute // interval_minutes) * interval_minutes
+    return value.replace(minute=minute, second=0, microsecond=0)
+
+
+def _ceil_timestamp(value: datetime, *, interval_minutes: int) -> datetime:
+    floored = _floor_timestamp(value, interval_minutes=interval_minutes)
+    if floored == value.replace(second=0, microsecond=0):
+        return floored
+    return floored + timedelta(minutes=interval_minutes)
+
+
+def _build_bucket_timestamps(*, start: datetime, end: datetime, interval_minutes: int) -> list[datetime]:
+    timestamps: list[datetime] = []
+    current = start
+    while current <= end:
+        timestamps.append(current)
+        current += timedelta(minutes=interval_minutes)
+    return timestamps
+
+
+def _build_equity_curve_points(
+    *,
+    trades: list[Trade],
+    starting_balance: Decimal,
+    buckets: list[datetime],
+) -> list[PaperEquityCurvePoint]:
+    cash = Decimal(starting_balance)
+    realized = Decimal("0")
+    positions: dict[uuid.UUID, tuple[Decimal, Decimal]] = {}
+    marks: dict[uuid.UUID, Decimal] = {}
+    points: list[PaperEquityCurvePoint] = []
+
+    trade_index = 0
+    trade_count = 0
+    ordered_trades = sorted(trades, key=lambda item: (item.executed_at, item.id))
+
+    for bucket in buckets:
+        while trade_index < len(ordered_trades) and ordered_trades[trade_index].executed_at <= bucket:
+            trade = ordered_trades[trade_index]
+            quantity = Decimal(str(trade.quantity))
+            price = Decimal(str(trade.price))
+            fee = Decimal(str(trade.fee))
+            current_qty, current_avg = positions.get(trade.asset_id, (Decimal("0"), Decimal("0")))
+
+            if trade.side == "buy":
+                total_cost = (current_qty * current_avg) + (quantity * price) + fee
+                next_qty = current_qty + quantity
+                next_avg = total_cost / next_qty if next_qty > 0 else Decimal("0")
+                positions[trade.asset_id] = (next_qty, next_avg)
+                cash -= (quantity * price) + fee
+                marks[trade.asset_id] = price
+            elif trade.side == "sell":
+                sell_qty = min(current_qty, quantity)
+                proceeds = (sell_qty * price) - fee
+                cash += proceeds
+                pnl = (sell_qty * price) - (sell_qty * current_avg) - fee
+                realized += pnl
+                remaining_qty = current_qty - sell_qty
+                if remaining_qty <= 0:
+                    positions[trade.asset_id] = (Decimal("0"), Decimal("0"))
+                else:
+                    positions[trade.asset_id] = (remaining_qty, current_avg)
+                marks[trade.asset_id] = price
+
+            trade_count += 1
+            trade_index += 1
+
+        unrealized = Decimal("0")
+        position_value = Decimal("0")
+        for asset_id, (qty, avg_price) in positions.items():
+            if qty <= 0:
+                continue
+            mark = marks.get(asset_id, avg_price)
+            position_value += qty * mark
+            unrealized += (mark - avg_price) * qty
+
+        points.append(
+            PaperEquityCurvePoint(
+                timestamp=bucket,
+                equity=cash + position_value,
+                cash_balance=cash,
+                realized_pnl=realized,
+                unrealized_pnl=unrealized,
+                trade_count_at_point=trade_count,
+            )
+        )
+
+    return points

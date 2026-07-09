@@ -163,6 +163,41 @@ class PaperTradeHistoryResponse(BaseModel):
     has_more: bool
 
 
+class PaperEquityCurvePoint(BaseModel):
+    timestamp: datetime
+    equity: Decimal
+    cash_balance: Decimal
+    realized_pnl: Decimal
+    unrealized_pnl: Decimal
+    trade_count_at_point: int
+
+    @field_serializer("equity", "cash_balance", "realized_pnl", "unrealized_pnl", when_used="json")
+    def serialize_numeric_fields(self, value: Decimal) -> str:
+        return format(value, "f")
+
+
+class PaperEquityCurveResponse(BaseModel):
+    account_id: uuid.UUID
+    window_minutes: int
+    interval: int
+    starting_balance: Decimal
+    current_equity: Decimal
+    total_return_usd: Decimal
+    total_return_pct: Decimal
+    latest_point_timestamp: datetime | None = None
+    points: list[PaperEquityCurvePoint]
+
+    @field_serializer(
+        "starting_balance",
+        "current_equity",
+        "total_return_usd",
+        "total_return_pct",
+        when_used="json",
+    )
+    def serialize_numeric_fields(self, value: Decimal) -> str:
+        return format(value, "f")
+
+
 class PipelineActivityItem(BaseModel):
     signal_id: uuid.UUID
     action: str

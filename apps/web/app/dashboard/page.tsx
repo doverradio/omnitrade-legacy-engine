@@ -1,4 +1,5 @@
 import EquityCurveChart from "@/components/charts/EquityCurveChart";
+import PaperEquityCurvePanel from "@/components/domain/PaperEquityCurvePanel";
 import PaperPerformancePanel from "@/components/domain/PaperPerformancePanel";
 import PaperPipelineFlow from "@/components/domain/PaperPipelineFlow";
 import PaperTradeHistoryPanel from "@/components/domain/PaperTradeHistoryPanel";
@@ -17,6 +18,8 @@ export default function DashboardPage() {
       <PaperPipelineFlow />
 
       <PaperPerformancePanel />
+
+      <PaperEquityCurvePanel />
 
       <PaperTradeHistoryPanel />
 

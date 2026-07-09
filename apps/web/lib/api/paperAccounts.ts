@@ -162,6 +162,33 @@ export type PaperTradeHistoryResponse = {
   has_more: boolean;
 };
 
+export type PaperEquityCurvePoint = {
+  timestamp: string;
+  equity: string;
+  cash_balance: string;
+  realized_pnl: string;
+  unrealized_pnl: string;
+  trade_count_at_point: number;
+};
+
+export type PaperEquityCurveResponse = {
+  account_id: string;
+  window_minutes: number;
+  interval: number;
+  starting_balance: string;
+  current_equity: string;
+  total_return_usd: string;
+  total_return_pct: string;
+  latest_point_timestamp?: string | null;
+  points: PaperEquityCurvePoint[];
+};
+
+export type GetPaperEquityCurveParams = {
+  account_id?: string;
+  window_minutes?: number;
+  interval?: number;
+};
+
 export type GetPaperTradeHistoryParams = {
   account_id?: string;
   limit?: number;
@@ -292,4 +319,19 @@ export async function getPaperTradeHistory(params: GetPaperTradeHistoryParams = 
   }
   const suffix = query.toString() ? `?${query.toString()}` : "";
   return requestJson<PaperTradeHistoryResponse>(`/paper/trade-history${suffix}`);
+}
+
+export async function getPaperEquityCurve(params: GetPaperEquityCurveParams = {}): Promise<PaperEquityCurveResponse> {
+  const query = new URLSearchParams();
+  if (params.account_id) {
+    query.set("account_id", params.account_id);
+  }
+  if (typeof params.window_minutes === "number") {
+    query.set("window_minutes", String(params.window_minutes));
+  }
+  if (typeof params.interval === "number") {
+    query.set("interval", String(params.interval));
+  }
+  const suffix = query.toString() ? `?${query.toString()}` : "";
+  return requestJson<PaperEquityCurveResponse>(`/paper/equity-curve${suffix}`);
 }
