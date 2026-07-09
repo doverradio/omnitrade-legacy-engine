@@ -6,6 +6,7 @@ import ReplayAgentsPanel from "@/components/domain/ReplayAgentsPanel";
 import {
   ApiRequestError,
   coachReviewDecisionQuality,
+  evolveResearchCandidates,
   evaluateCandidates,
   getCapitalAllocationRecommendation,
   getDecisionArenaTournament,
@@ -24,6 +25,7 @@ import {
   type CandidateEvaluation,
   type DecisionIntelligenceRecommendation,
   type DecisionQualityResult,
+  type EvolutionResponse,
   type ReplayResult,
   type ResearchAgent,
   type ResearchMemoryCandidate,
@@ -132,6 +134,9 @@ export default function DecisionArenaPage() {
   const [researchMemorySummary, setResearchMemorySummary] = useState<ResearchMemorySummary | null>(null);
   const [researchMemoryCandidates, setResearchMemoryCandidates] = useState<ResearchMemoryCandidate[]>([]);
   const [researchMemoryError, setResearchMemoryError] = useState<string | null>(null);
+  const [evolutionResult, setEvolutionResult] = useState<EvolutionResponse | null>(null);
+  const [evolutionRunning, setEvolutionRunning] = useState(false);
+  const [evolutionError, setEvolutionError] = useState<string | null>(null);
   const [replayError, setReplayError] = useState<string | null>(null);
 
   useEffect(() => {
@@ -256,6 +261,40 @@ export default function DecisionArenaPage() {
       setLaboratoryRunning(false);
     }
   }
+
+  async function handleRunEvolution() {
+    setEvolutionError(null);
+    setEvolutionRunning(true);
+    try {
+      const response = await evolveResearchCandidates({});
+      setEvolutionResult(response);
+      const memoryCandidates = await getResearchMemoryCandidates();
+      setResearchMemoryCandidates(memoryCandidates);
+    } catch (evolutionRequestError) {
+      setEvolutionResult(null);
+      setEvolutionError(errorMessage(evolutionRequestError, "Failed to run evolution engine."));
+    } finally {
+      setEvolutionRunning(false);
+    }
+  }
+
+  const parentLabelsById = useMemo(() => {
+    const labels = new Map<string, string>();
+    researchCandidates.forEach((candidate) => {
+      labels.set(candidate.candidate_id, candidate.strategy_name);
+    });
+    researchMemoryCandidates.forEach((candidate) => {
+      if (!labels.has(candidate.candidate_id)) {
+        labels.set(candidate.candidate_id, candidate.candidate_id);
+      }
+    });
+    evolutionResult?.descendants.forEach((candidate) => {
+      if (!labels.has(candidate.candidate_id)) {
+        labels.set(candidate.candidate_id, candidate.candidate_id);
+      }
+    });
+    return labels;
+  }, [evolutionResult?.descendants, researchCandidates, researchMemoryCandidates]);
 
   return (
     <div className="space-y-6">
@@ -666,6 +705,83 @@ export default function DecisionArenaPage() {
             <p className="mt-2 text-sm text-foreground/65">No research memory has been recorded yet.</p>
           )}
         </div>
+      </section>
+
+      <section className="rounded-xl border border-border bg-background/60 p-4 sm:p-5" aria-labelledby="evolution-heading">
+        <div className="flex flex-wrap items-end justify-between gap-3">
+          <div>
+            <h3 id="evolution-heading" className="text-base font-semibold">Evolution</h3>
+            <p className="mt-1 text-xs text-foreground/70">Deterministic descendant generation from prior successful research candidates.</p>
+          </div>
+          <button
+            type="button"
+            onClick={() => {
+              void handleRunEvolution();
+            }}
+            disabled={evolutionRunning || researchMemoryCandidates.length === 0}
+            className="rounded border border-cyan-500/40 bg-cyan-500/10 px-3 py-1 text-xs font-semibold text-cyan-100 disabled:cursor-not-allowed disabled:opacity-50"
+          >
+            {evolutionRunning ? "Evolving..." : "Run Evolution"}
+          </button>
+        </div>
+
+        {evolutionError ? (
+          <div className="mt-3 rounded-md border border-red-500/50 bg-red-500/10 px-3 py-2 text-xs text-red-100" role="alert">
+            {evolutionError}
+          </div>
+        ) : null}
+
+        {evolutionResult && evolutionResult.descendants.length > 0 ? (
+          <div className="mt-4 space-y-3">
+            <p className="text-xs text-foreground/70">Generated {evolutionResult.generated_count} descendant candidate(s).</p>
+            <div className="overflow-x-auto">
+              <table className="min-w-[980px] w-full text-left text-sm" aria-label="Evolution Results">
+                <thead>
+                  <tr className="border-b border-border text-foreground/70">
+                    <th className="px-3 py-2">Parent Candidate</th>
+                    <th className="px-3 py-2">Generation</th>
+                    <th className="px-3 py-2">Mutation</th>
+                    <th className="px-3 py-2">Quality</th>
+                    <th className="px-3 py-2">Tournament Rank</th>
+                    <th className="px-3 py-2">Status</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {evolutionResult.descendants.map((candidate) => (
+                    <tr key={candidate.candidate_id} className="border-b border-border/60">
+                      <td className="px-3 py-3 font-semibold text-foreground/90">{parentLabelsById.get(candidate.parent_candidate_id) ?? candidate.parent_candidate_id}</td>
+                      <td className="px-3 py-3">{candidate.generation}</td>
+                      <td className="px-3 py-3 text-xs text-foreground/75">{candidate.mutation_reason}</td>
+                      <td className="px-3 py-3">{candidate.quality_score ?? "n/a"}</td>
+                      <td className="px-3 py-3">{candidate.tournament_rank ?? "n/a"}</td>
+                      <td className="px-3 py-3">{candidate.status}</td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+
+            <div className="rounded-md border border-border/70 bg-background/40 p-3" aria-labelledby="lineage-tree-heading">
+              <h4 id="lineage-tree-heading" className="text-xs font-semibold uppercase tracking-wide text-foreground/60">Lineage Tree</h4>
+              <ul className="mt-2 space-y-1 text-xs text-foreground/80">
+                {evolutionResult.descendants.map((candidate) => (
+                  <li key={`lineage-${candidate.candidate_id}`}>
+                    {(parentLabelsById.get(candidate.parent_candidate_id) ?? candidate.parent_candidate_id)}
+                    {" -> "}
+                    {candidate.candidate_id}
+                    {" (g"}
+                    {candidate.generation}
+                    {")"}
+                  </li>
+                ))}
+              </ul>
+            </div>
+          </div>
+        ) : (
+          <div className="mt-3 rounded-md border border-dashed border-border/70 bg-background/40 px-3 py-3 text-sm text-foreground/60">
+            No evolved descendants generated yet.
+          </div>
+        )}
       </section>
 
       <section className="rounded-md border border-border bg-background/60 px-3 py-3 text-sm text-foreground/85">

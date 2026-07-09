@@ -416,6 +416,62 @@ function installFetchMock() {
       );
     }
 
+    if (url.pathname === "/research/evolve") {
+      if (method !== "POST") {
+        return jsonResponse(405, {
+          error: {
+            message: `Unexpected method ${method}`,
+          },
+        });
+      }
+
+      return jsonResponse(200, {
+        generated_count: 2,
+        descendants: [
+          {
+            candidate_id: "aaaaaaaa-7777-7777-7777-777777777701",
+            parent_candidate_id: "77777777-7777-7777-7777-777777777777",
+            generation: 2,
+            mutation_reason: "rsi_period 14->12",
+            parameter_diff: [
+              {
+                parameter_name: "rsi_period",
+                previous_value: 14,
+                new_value: 12,
+              },
+            ],
+            parameter_set: {
+              rsi_period: 12,
+            },
+            generated_at: "2026-07-09T12:00:03Z",
+            quality_score: 100,
+            tournament_rank: 1,
+            status: "EVALUATED",
+          },
+          {
+            candidate_id: "aaaaaaaa-7777-7777-7777-777777777702",
+            parent_candidate_id: "77777777-7777-7777-7777-777777777777",
+            generation: 2,
+            mutation_reason: "rsi_period 14->16",
+            parameter_diff: [
+              {
+                parameter_name: "rsi_period",
+                previous_value: 14,
+                new_value: 16,
+              },
+            ],
+            parameter_set: {
+              rsi_period: 16,
+            },
+            generated_at: "2026-07-09T12:00:03Z",
+            quality_score: 50,
+            tournament_rank: 2,
+            status: "EVALUATED",
+          },
+        ],
+      });
+    }
+
     if (method !== "GET") {
       return jsonResponse(405, {
         error: {
@@ -476,10 +532,18 @@ describe("DecisionArenaPage", () => {
     expect(screen.getByText(/Total Laboratory Runs/i)).toBeInTheDocument();
     expect(screen.getByText(/Recent Candidate History/i)).toBeInTheDocument();
     expect(screen.getByText(/No research memory has been recorded yet\./i)).toBeInTheDocument();
+    expect(screen.getByRole("heading", { name: /Evolution/i })).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: /Run Evolution/i })).toBeInTheDocument();
+    expect(screen.getByText(/No evolved descendants generated yet\./i)).toBeInTheDocument();
 
     fireEvent.click(screen.getByRole("button", { name: /Run Laboratory/i }));
     expect(await screen.findByText(/Last run included 1 agent\(s\) and completed with status COMPLETED\./i)).toBeInTheDocument();
     expect(await screen.findByRole("table", { name: /Recent Candidate History/i })).toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole("button", { name: /Run Evolution/i }));
+    expect(await screen.findByRole("table", { name: /Evolution Results/i })).toBeInTheDocument();
+    expect(screen.getByText(/Lineage Tree/i)).toBeInTheDocument();
+    expect(screen.getByText(/rsi_period 14->12/i)).toBeInTheDocument();
 
     expect(screen.getByRole("button", { name: /Evaluate Candidates/i })).toBeInTheDocument();
     expect(screen.getByText(/No candidate evaluations available yet\./i)).toBeInTheDocument();
@@ -495,10 +559,11 @@ describe("DecisionArenaPage", () => {
       return (init?.method ?? "GET") !== "GET";
     });
 
-    expect(nonGetCalls).toHaveLength(2);
+    expect(nonGetCalls).toHaveLength(3);
     const postCallUrls = nonGetCalls.map((call) => new URL(call[0] as string).pathname);
     expect(postCallUrls).toContain("/research/laboratory/run");
     expect(postCallUrls).toContain("/research/evaluate-candidates");
+    expect(postCallUrls).toContain("/research/evolve");
   });
 
   it("renders champion and runner up summary", async () => {
@@ -635,6 +700,13 @@ describe("DecisionArenaPage", () => {
           return jsonResponse(200, []);
         }
 
+        if (url.pathname === "/research/evolve") {
+          return jsonResponse(200, {
+            generated_count: 0,
+            descendants: [],
+          });
+        }
+
         return jsonResponse(404, {
           error: {
             message: `Unhandled route in test: ${method} ${url.pathname}`,
@@ -654,5 +726,6 @@ describe("DecisionArenaPage", () => {
     expect(screen.queryByText(/No candidate evaluations available yet\./i)).not.toBeInTheDocument();
     expect(await screen.findByText(/No laboratory run has completed yet\./i)).toBeInTheDocument();
     expect(await screen.findByText(/No research memory has been recorded yet\./i)).toBeInTheDocument();
+    expect(await screen.findByText(/No evolved descendants generated yet\./i)).toBeInTheDocument();
   });
 });

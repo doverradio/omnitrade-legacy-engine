@@ -9,6 +9,7 @@ from app.schemas.candidate_evaluation import (
     CandidateEvaluationRequest,
     CandidateEvaluationResponse,
 )
+from app.schemas.evolution import EvolvedCandidateResponse, EvolutionMutationResponse, EvolutionRequest, EvolutionResponse
 from app.schemas.research_laboratory import ResearchLaboratoryRunResponse, ResearchLaboratoryStatusResponse
 from app.schemas.research_memory import (
     ResearchMemoryCandidateResponse,
@@ -25,6 +26,8 @@ from app.services.candidate_evaluation.deterministic import (
 from app.services.research_agents.registry import list_generated_strategy_candidates, list_registered_research_agents
 from app.services.research_laboratory.registry import get_research_laboratory
 from app.services.research_memory.registry import get_research_memory
+from app.services.evolution.registry import get_evolution_engine
+from app.services.evolution.service import ParentCandidateNotFoundError
 
 router = APIRouter(prefix="/research", tags=["research"])
 
@@ -233,3 +236,47 @@ async def get_research_memory_candidates() -> list[ResearchMemoryCandidateRespon
         )
         for item in memory.list_candidates()
     ]
+
+
+@router.post("/evolve", response_model=EvolutionResponse)
+async def evolve_research_candidates(request: EvolutionRequest) -> EvolutionResponse:
+    memory = get_research_memory()
+    engine = get_evolution_engine()
+
+    try:
+        run = engine.evolve(
+            memory_candidates=memory.list_candidates(),
+            parent_candidate_id=request.parent_candidate_id,
+            generation_limit=request.generation_limit,
+        )
+    except ParentCandidateNotFoundError:
+        raise NotFoundError(
+            message="Parent candidate not found",
+            details={"parent_candidate_id": str(request.parent_candidate_id)},
+        )
+
+    return EvolutionResponse(
+        generated_count=run.generated_count,
+        descendants=[
+            EvolvedCandidateResponse(
+                candidate_id=item.candidate_id,
+                parent_candidate_id=item.parent_candidate_id,
+                generation=item.generation,
+                mutation_reason=item.mutation_reason,
+                parameter_diff=[
+                    EvolutionMutationResponse(
+                        parameter_name=diff.parameter_name,
+                        previous_value=diff.previous_value,
+                        new_value=diff.new_value,
+                    )
+                    for diff in item.parameter_diff
+                ],
+                parameter_set=dict(item.parameter_set),
+                generated_at=item.generated_at,
+                quality_score=item.quality_score,
+                tournament_rank=item.tournament_rank,
+                status=item.status,
+            )
+            for item in run.descendants
+        ],
+    )

@@ -5,5 +5,3 @@ from app.services.research_memory.interface import (
     ResearchMemorySummary,
     ResearchMemoryTournamentOutcomeRecord,
 )
-from app.services.research_memory.registry import get_research_memory
-from app.services.research_memory.service import ResearchMemory

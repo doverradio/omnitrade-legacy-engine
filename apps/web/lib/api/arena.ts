@@ -352,6 +352,35 @@ export type ResearchMemorySummary = {
   latest_laboratory_run: ResearchMemoryLaboratoryRun | null;
 };
 
+export type EvolutionMutation = {
+  parameter_name: string;
+  previous_value: number;
+  new_value: number;
+};
+
+export type EvolvedCandidate = {
+  candidate_id: string;
+  parent_candidate_id: string;
+  generation: number;
+  mutation_reason: string;
+  parameter_diff: EvolutionMutation[];
+  parameter_set: Record<string, unknown>;
+  generated_at: string;
+  quality_score: number | null;
+  tournament_rank: number | null;
+  status: string;
+};
+
+export type EvolutionRequest = {
+  parent_candidate_id?: string;
+  generation_limit?: number;
+};
+
+export type EvolutionResponse = {
+  generated_count: number;
+  descendants: EvolvedCandidate[];
+};
+
 async function requestJson<T>(path: string, init?: RequestInit): Promise<T> {
   const headers = new Headers(init?.headers);
   headers.set("Content-Type", "application/json");
@@ -515,4 +544,11 @@ export async function getResearchMemoryRuns(): Promise<ResearchMemoryLaboratoryR
 
 export async function getResearchMemoryCandidates(): Promise<ResearchMemoryCandidate[]> {
   return requestJson<ResearchMemoryCandidate[]>("/research/memory/candidates");
+}
+
+export async function evolveResearchCandidates(request: EvolutionRequest): Promise<EvolutionResponse> {
+  return requestJson<EvolutionResponse>("/research/evolve", {
+    method: "POST",
+    body: JSON.stringify(request),
+  });
 }
