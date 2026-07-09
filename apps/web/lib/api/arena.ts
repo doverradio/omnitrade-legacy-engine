@@ -584,13 +584,28 @@ export type ValidationRunDetail = ValidationRun & {
   scorecards: ValidationRunScorecard[];
 };
 
+export type ValidationRunEventCategory =
+  | "all"
+  | "system"
+  | "market"
+  | "strategy"
+  | "risk"
+  | "execution"
+  | "research"
+  | "database"
+  | "warnings"
+  | "failures"
+  | "manual_notes";
+
+export type ValidationRunEventSeverity = "green" | "blue" | "purple" | "yellow" | "red" | "gray";
+
 export type ValidationRunEvent = {
   id: number;
   validation_run_id: string;
   timestamp: string;
   event_type: string;
-  category: "all" | "system" | "market" | "strategy" | "risk" | "execution" | "research" | "database" | "warnings" | "failures" | "manual_notes";
-  severity: "green" | "blue" | "purple" | "yellow" | "red" | "gray";
+  category: ValidationRunEventCategory;
+  severity: ValidationRunEventSeverity;
   title: string;
   description: string;
   metadata: Record<string, unknown>;
@@ -604,8 +619,8 @@ export type ValidationRunEventListResponse = {
   has_more: boolean;
   order: "newest" | "oldest";
   window: "last_hour" | "last_24_hours" | "entire_run";
-  category: "all" | "system" | "market" | "strategy" | "risk" | "execution" | "research" | "database" | "warnings" | "failures" | "manual_notes";
-  severity: "all" | "green" | "blue" | "purple" | "yellow" | "red" | "gray";
+  category: ValidationRunEventCategory;
+  severity: "all" | ValidationRunEventSeverity;
   search: string | null;
 };
 

@@ -2,9 +2,25 @@ from __future__ import annotations
 
 from datetime import datetime
 from decimal import Decimal
+from typing import Literal, TypeAlias
 import uuid
 
 from pydantic import BaseModel, field_serializer
+
+
+ValidationRunEventCategory: TypeAlias = Literal[
+    "all",
+    "system",
+    "market",
+    "strategy",
+    "risk",
+    "execution",
+    "research",
+    "database",
+    "warnings",
+    "failures",
+    "manual_notes",
+]
 
 
 class ValidationRunCreateRequest(BaseModel):
@@ -55,7 +71,7 @@ class ValidationRunEventResponse(BaseModel):
     validation_run_id: uuid.UUID
     timestamp: datetime
     event_type: str
-    category: str
+    category: ValidationRunEventCategory
     severity: str
     title: str
     description: str
@@ -70,7 +86,7 @@ class ValidationRunEventListResponse(BaseModel):
     has_more: bool
     order: str
     window: str
-    category: str
+    category: ValidationRunEventCategory
     severity: str
     search: str | None
 

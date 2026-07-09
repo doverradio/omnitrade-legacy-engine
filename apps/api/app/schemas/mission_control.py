@@ -5,7 +5,7 @@ from datetime import datetime
 from pydantic import BaseModel
 
 from app.schemas.operations import OperationalStatusResponse
-from app.schemas.validation_runs import ValidationRunResponse
+from app.schemas.validation_runs import ValidationRunEventCategory, ValidationRunResponse
 
 
 class MissionControlIntelligenceTrendResponse(BaseModel):
@@ -39,7 +39,7 @@ class MissionControlIntelligenceTimelineEventResponse(BaseModel):
     trades: int | None
     decision_count: int | None
     severity: str
-    category: str
+    category: ValidationRunEventCategory
     event_type: str
     metadata: dict[str, object]
 

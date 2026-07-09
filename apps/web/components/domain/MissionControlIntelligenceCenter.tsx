@@ -425,7 +425,7 @@ export default function MissionControlIntelligenceCenter() {
       return null;
     }
     return payload.timeline_events.find((item) => item.event_id === selectedEventId) ?? null;
-  }, [isMobile, payload, selectedEventId]);
+  }, [payload, selectedEventId]);
 
   useEffect(() => {
     if (!payload?.timeline_events.length) {
@@ -444,7 +444,7 @@ export default function MissionControlIntelligenceCenter() {
     if (!selectedExists && selectedEventId !== null) {
       setSelectedEventId(payload.timeline_events[0]?.event_id ?? null);
     }
-  }, [payload, selectedEventId]);
+  }, [isMobile, payload, selectedEventId]);
 
   const selectedRun = useMemo(() => {
     if (!payload) {

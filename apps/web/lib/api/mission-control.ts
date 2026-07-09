@@ -4,7 +4,7 @@ type ErrorEnvelope = {
   };
 };
 
-import { ApiRequestError, type OperationalStatus, type ValidationRun, type ValidationRunEvent } from "@/lib/api/arena";
+import { ApiRequestError, type OperationalStatus, type ValidationRun, type ValidationRunEventCategory, type ValidationRunEventSeverity } from "@/lib/api/arena";
 
 export type MissionControlIntelligenceRange = "24h" | "7d" | "30d" | "90d" | "all";
 
@@ -38,8 +38,8 @@ export type MissionControlIntelligenceTimelineEvent = {
   signals: number | null;
   trades: number | null;
   decision_count: number | null;
-  severity: string;
-  category: string;
+  severity: ValidationRunEventSeverity;
+  category: ValidationRunEventCategory;
   event_type: string;
   metadata: Record<string, unknown>;
 };
