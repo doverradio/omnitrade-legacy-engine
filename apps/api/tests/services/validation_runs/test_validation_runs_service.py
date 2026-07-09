@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 import uuid
 
@@ -56,6 +56,8 @@ class _FakeSession:
             return
 
         if isinstance(obj, ValidationRunEvent):
+            if getattr(obj, "id", None) is None:
+                obj.id = len(self.events) + 1
             if getattr(obj, "created_at", None) is None:
                 obj.created_at = datetime.now(timezone.utc)
             self.events.append(obj)
@@ -122,7 +124,8 @@ class _FakeSession:
         if "FROM validation_run_events" in sql:
             run_id = params.get("validation_run_id_1")
             rows = [item for item in self.events if item.validation_run_id == run_id]
-            rows.sort(key=lambda item: (item.created_at, item.id), reverse=True)
+            descending = " DESC" in sql
+            rows.sort(key=lambda item: (item.created_at, item.id), reverse=descending)
             return _ExecuteRows(rows)
 
         if "FROM validation_run_scorecards" in sql:
@@ -242,11 +245,10 @@ async def test_create_start_cancel_list_and_history_survive_restart(fake_session
     cancelled = await service.cancel_validation_run(db=fake_session, validation_run_id=created.validation_run_id)
     assert cancelled.status == "CANCELLED"
 
-    events = await service.list_validation_run_events(db=fake_session, validation_run_id=created.validation_run_id)
-    event_types = {item.event_type for item in events}
-    assert "VALIDATION_RUN_CREATED" in event_types
-    assert "VALIDATION_RUN_STARTED" in event_types
-    assert "VALIDATION_RUN_CANCELLED" in event_types
+    events_response = await service.list_validation_run_events(db=fake_session, validation_run_id=created.validation_run_id)
+    event_types = {item.event_type for item in events_response.items}
+    assert "VALIDATION_STARTED" in event_types
+    assert "WARNING" in event_types
 
     # Simulate restart by calling list again from the same durable session-backed state.
     listed_after_restart = await service.list_validation_runs(db=fake_session)
@@ -276,3 +278,105 @@ async def test_scorecard_and_metrics_calculation(fake_session: _FakeSession) -> 
     metrics = await service.get_validation_run_metrics(db=fake_session, validation_run_id=created.validation_run_id)
     assert metrics.elapsed_percentage >= 0
     assert metrics.current_equity == "100250.00"
+
+
+@pytest.mark.asyncio
+async def test_event_ordering_filtering_and_pagination(fake_session: _FakeSession) -> None:
+    created = await service.create_validation_run(
+        db=fake_session,
+        request=ValidationRunCreateRequest(
+            name="Timeline Filtering",
+            objective="Timeline endpoint behavior",
+            duration_hours=24,
+            paper_capital=Decimal("10000"),
+            enabled_strategies=["MA Crossover"],
+            enabled_research_agents=["Baseline"],
+            enabled_research_features=["Laboratory"],
+        ),
+    )
+    await service.start_validation_run(db=fake_session, validation_run_id=created.validation_run_id)
+
+    now = datetime.now(timezone.utc)
+    fake_session.add(
+        ValidationRunEvent(
+            validation_run_id=created.validation_run_id,
+            event_type="PAPER_TRADE_EXECUTED",
+            message="Paper trade executed",
+            payload={"title": "Paper Trade Executed", "description": "BUY simulated order", "severity": "blue", "metadata": {"trade_id": "t-1"}},
+            created_at=now,
+        )
+    )
+    fake_session.add(
+        ValidationRunEvent(
+            validation_run_id=created.validation_run_id,
+            event_type="WARNING",
+            message="Latency warning",
+            payload={"title": "Warning", "description": "Data ingest lagging", "severity": "yellow", "metadata": {}},
+            created_at=now - timedelta(minutes=50),
+        )
+    )
+    fake_session.add(
+        ValidationRunEvent(
+            validation_run_id=created.validation_run_id,
+            event_type="FAILURE",
+            message="Worker restart required",
+            payload={"title": "Failure", "description": "Worker stalled", "severity": "red", "metadata": {}},
+            created_at=now - timedelta(hours=3),
+        )
+    )
+
+    newest_page_1 = await service.list_validation_run_events(
+        db=fake_session,
+        validation_run_id=created.validation_run_id,
+        order="newest",
+        page=1,
+        page_size=2,
+    )
+    newest_page_2 = await service.list_validation_run_events(
+        db=fake_session,
+        validation_run_id=created.validation_run_id,
+        order="newest",
+        page=2,
+        page_size=2,
+    )
+    assert len(newest_page_1.items) == 2
+    assert newest_page_1.has_more is True
+    assert newest_page_2.page == 2
+    assert newest_page_2.items[0].id != newest_page_1.items[0].id
+
+    oldest = await service.list_validation_run_events(
+        db=fake_session,
+        validation_run_id=created.validation_run_id,
+        order="oldest",
+        page=1,
+        page_size=50,
+    )
+    assert oldest.items[0].timestamp <= oldest.items[-1].timestamp
+
+    warning_only = await service.list_validation_run_events(
+        db=fake_session,
+        validation_run_id=created.validation_run_id,
+        category="warnings",
+        page=1,
+        page_size=50,
+    )
+    assert all(item.event_type in {"WARNING", "RISK_EVENT"} for item in warning_only.items)
+
+    failures_last_hour = await service.list_validation_run_events(
+        db=fake_session,
+        validation_run_id=created.validation_run_id,
+        category="failures",
+        window="last_hour",
+        page=1,
+        page_size=50,
+    )
+    assert all(item.severity == "red" for item in failures_last_hour.items)
+
+    search_trade = await service.list_validation_run_events(
+        db=fake_session,
+        validation_run_id=created.validation_run_id,
+        search="trade",
+        page=1,
+        page_size=50,
+    )
+    assert any("trade" in item.description.lower() for item in search_trade.items)

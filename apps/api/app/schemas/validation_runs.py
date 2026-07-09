@@ -51,10 +51,27 @@ class ValidationRunDetailResponse(ValidationRunResponse):
 
 
 class ValidationRunEventResponse(BaseModel):
+    id: int
+    validation_run_id: uuid.UUID
+    timestamp: datetime
     event_type: str
-    message: str
-    payload: dict[str, object]
-    created_at: datetime
+    category: str
+    severity: str
+    title: str
+    description: str
+    metadata: dict[str, object]
+
+
+class ValidationRunEventListResponse(BaseModel):
+    items: list[ValidationRunEventResponse]
+    page: int
+    page_size: int
+    total: int
+    has_more: bool
+    order: str
+    window: str
+    category: str
+    search: str | None
 
 
 class ValidationRunMetricsResponse(BaseModel):

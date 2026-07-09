@@ -123,14 +123,29 @@ function installFetchMock(scenario: Scenario) {
     }
 
     if (url.pathname === "/validation-runs/11111111-1111-1111-1111-111111111111/events" && method === "GET") {
-      return jsonResponse(200, [
-        {
-          event_type: "VALIDATION_RUN_STARTED",
-          message: "Validation run started",
-          payload: {},
-          created_at: "2026-07-09T00:00:00Z",
-        },
-      ]);
+      return jsonResponse(200, {
+        items: [
+          {
+            id: 1,
+            validation_run_id: "11111111-1111-1111-1111-111111111111",
+            timestamp: "2026-07-09T00:00:00Z",
+            event_type: "VALIDATION_STARTED",
+            category: "all",
+            severity: "green",
+            title: "Validation Started",
+            description: "Validation run started",
+            metadata: {},
+          },
+        ],
+        page: 1,
+        page_size: 30,
+        total: 1,
+        has_more: false,
+        order: "newest",
+        window: "entire_run",
+        category: "all",
+        search: null,
+      });
     }
 
     if (url.pathname === "/validation-runs/11111111-1111-1111-1111-111111111111" && method === "GET") {
@@ -196,7 +211,17 @@ function installFetchMock(scenario: Scenario) {
     }
 
     if (url.pathname === "/validation-runs/22222222-2222-2222-2222-222222222222/events" && method === "GET") {
-      return jsonResponse(200, []);
+      return jsonResponse(200, {
+        items: [],
+        page: 1,
+        page_size: 30,
+        total: 0,
+        has_more: false,
+        order: "newest",
+        window: "entire_run",
+        category: "all",
+        search: null,
+      });
     }
 
     if (url.pathname === "/validation-runs/22222222-2222-2222-2222-222222222222" && method === "GET") {
@@ -270,7 +295,7 @@ describe("ValidationRunsPage", () => {
     await waitFor(() => {
       expect(screen.getByText("Validation Run Detail")).toBeInTheDocument();
     });
-    expect(screen.getByText("Timeline / Events")).toBeInTheDocument();
+    expect(screen.getByText("Validation Timeline")).toBeInTheDocument();
     expect(screen.getByText("Final Result Summary")).toBeInTheDocument();
   });
 

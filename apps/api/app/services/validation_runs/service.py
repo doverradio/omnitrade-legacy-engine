@@ -19,6 +19,7 @@ from app.schemas.validation_runs import (
     ValidationRunCreateRequest,
     ValidationRunDetailResponse,
     ValidationRunEventResponse,
+    ValidationRunEventListResponse,
     ValidationRunMetricsResponse,
     ValidationRunResponse,
     ValidationRunScorecardResponse,
@@ -28,6 +29,39 @@ from app.services.paper.accounting import build_account_snapshot
 
 _ALLOWED_STATUSES = {"DRAFT", "RUNNING", "COMPLETED", "FAILED", "CANCELLED"}
 _ALLOWED_RESULT_STATUSES = {"PASS", "CONDITIONAL_PASS", "FAIL", "INCOMPLETE"}
+_EVENT_ORDER = {"newest", "oldest"}
+_EVENT_WINDOWS = {"last_hour", "last_24_hours", "entire_run"}
+_EVENT_CATEGORIES = {"all", "trading", "research", "evolution", "ai", "warnings", "failures", "manual_notes"}
+_CATEGORY_EVENT_TYPES = {
+    "trading": {
+        "SIGNAL_GENERATED",
+        "BUY_CANDIDATE",
+        "SELL_CANDIDATE",
+        "PAPER_TRADE_EXECUTED",
+        "CAPITAL_ALLOCATION_UPDATED",
+        "MARKET_DATA",
+        "CANDLES_INGESTED",
+    },
+    "research": {
+        "RESEARCH_CAMPAIGN_STARTED",
+        "RESEARCH_CAMPAIGN_COMPLETED",
+        "RESEARCH_CANDIDATE_GENERATED",
+        "RESEARCH_MEMORY_SAVED",
+    },
+    "evolution": {
+        "EVOLUTION_CREATED_DESCENDANT",
+        "TOURNAMENT_UPDATED",
+        "CHAMPION_CHANGED",
+    },
+    "ai": {
+        "RESEARCH_CANDIDATE_GENERATED",
+        "RESEARCH_MEMORY_SAVED",
+        "CHAMPION_CHANGED",
+    },
+    "warnings": {"WARNING", "RISK_EVENT"},
+    "failures": {"FAILURE", "ALERT"},
+    "manual_notes": {"MANUAL_NOTE"},
+}
 
 
 @dataclass(frozen=True, slots=True)
@@ -95,11 +129,16 @@ async def create_validation_run(*, db: AsyncSession, request: ValidationRunCreat
     db.add(
         ValidationRunEvent(
             validation_run_id=run.validation_run_id,
-            event_type="VALIDATION_RUN_CREATED",
+            event_type="VALIDATION_STARTED",
             message="Validation run created",
             payload={
-                "status": "DRAFT",
-                "duration_hours": run.duration_hours,
+                "severity": "blue",
+                "title": "Validation Started",
+                "description": "Validation run created in draft mode.",
+                "metadata": {
+                    "status": "DRAFT",
+                    "duration_hours": run.duration_hours,
+                },
             },
         )
     )
@@ -147,20 +186,25 @@ async def start_validation_run(*, db: AsyncSession, validation_run_id: uuid.UUID
     db.add(
         ValidationRunEvent(
             validation_run_id=run.validation_run_id,
-            event_type="VALIDATION_RUN_STARTED",
+            event_type="VALIDATION_STARTED",
             message="Validation run started",
             payload={
-                "started_at": now.isoformat(),
-                "expected_end_at": run.expected_end_at.isoformat() if run.expected_end_at else None,
-                "baseline": {
-                    "candles": baseline.candles,
-                    "signals": baseline.signals,
-                    "trades": baseline.trades,
-                    "decision_records": baseline.decision_records,
-                    "paper_equity": format(baseline.paper_equity, "f"),
-                    "campaign_count": baseline.campaign_count,
-                    "research_candidates": baseline.research_candidates,
-                    "evolution_count": baseline.evolution_count,
+                "severity": "green",
+                "title": "Validation Started",
+                "description": "Validation run is now active and collecting baseline metrics.",
+                "metadata": {
+                    "started_at": now.isoformat(),
+                    "expected_end_at": run.expected_end_at.isoformat() if run.expected_end_at else None,
+                    "baseline": {
+                        "candles": baseline.candles,
+                        "signals": baseline.signals,
+                        "trades": baseline.trades,
+                        "decision_records": baseline.decision_records,
+                        "paper_equity": format(baseline.paper_equity, "f"),
+                        "campaign_count": baseline.campaign_count,
+                        "research_candidates": baseline.research_candidates,
+                        "evolution_count": baseline.evolution_count,
+                    },
                 },
             },
         )
@@ -196,9 +240,14 @@ async def cancel_validation_run(*, db: AsyncSession, validation_run_id: uuid.UUI
     db.add(
         ValidationRunEvent(
             validation_run_id=run.validation_run_id,
-            event_type="VALIDATION_RUN_CANCELLED",
+            event_type="WARNING",
             message="Validation run cancelled",
-            payload={"completed_at": now.isoformat()},
+            payload={
+                "severity": "yellow",
+                "title": "Warning",
+                "description": "Validation run cancelled before completion.",
+                "metadata": {"completed_at": now.isoformat()},
+            },
         )
     )
 
@@ -215,25 +264,73 @@ async def cancel_validation_run(*, db: AsyncSession, validation_run_id: uuid.UUI
     return _to_run_response(run)
 
 
-async def list_validation_run_events(*, db: AsyncSession, validation_run_id: uuid.UUID) -> list[ValidationRunEventResponse]:
+async def list_validation_run_events(
+    *,
+    db: AsyncSession,
+    validation_run_id: uuid.UUID,
+    page: int = 1,
+    page_size: int = 50,
+    order: str = "newest",
+    window: str = "entire_run",
+    category: str = "all",
+    search: str | None = None,
+) -> ValidationRunEventListResponse:
     await _load_run(db=db, validation_run_id=validation_run_id)
-    rows = (
-        await db.execute(
-            select(ValidationRunEvent)
-            .where(ValidationRunEvent.validation_run_id == validation_run_id)
-            .order_by(ValidationRunEvent.created_at.desc(), ValidationRunEvent.id.desc())
-        )
-    ).scalars().all()
+    normalized_order = order.strip().lower()
+    normalized_window = window.strip().lower()
+    normalized_category = category.strip().lower()
+    normalized_search = (search or "").strip().lower() or None
 
-    return [
-        ValidationRunEventResponse(
-            event_type=item.event_type,
-            message=item.message,
-            payload=dict(item.payload),
-            created_at=item.created_at,
-        )
-        for item in rows
-    ]
+    if normalized_order not in _EVENT_ORDER:
+        raise InvalidRequestError(message="Invalid event order", details={"order": order})
+    if normalized_window not in _EVENT_WINDOWS:
+        raise InvalidRequestError(message="Invalid event window", details={"window": window})
+    if normalized_category not in _EVENT_CATEGORIES:
+        raise InvalidRequestError(message="Invalid event category", details={"category": category})
+    if page <= 0 or page_size <= 0:
+        raise InvalidRequestError(message="page and page_size must be > 0", details={"page": page, "page_size": page_size})
+
+    statement = select(ValidationRunEvent).where(ValidationRunEvent.validation_run_id == validation_run_id)
+    if normalized_order == "oldest":
+        statement = statement.order_by(ValidationRunEvent.created_at.asc(), ValidationRunEvent.id.asc())
+    else:
+        statement = statement.order_by(ValidationRunEvent.created_at.desc(), ValidationRunEvent.id.desc())
+
+    rows = (await db.execute(statement)).scalars().all()
+    since = _window_start(normalized_window)
+    filtered_rows = list(rows)
+    if since is not None:
+        filtered_rows = [item for item in filtered_rows if item.created_at >= since]
+
+    category_event_types = _CATEGORY_EVENT_TYPES.get(normalized_category)
+    if category_event_types:
+        filtered_rows = [item for item in filtered_rows if item.event_type in category_event_types]
+
+    if normalized_search is not None:
+        filtered_rows = [
+            item
+            for item in filtered_rows
+            if normalized_search in item.message.lower()
+            or normalized_search in item.event_type.lower()
+            or normalized_search in str(item.payload).lower()
+        ]
+
+    total = len(filtered_rows)
+    offset = (page - 1) * page_size
+    page_rows = filtered_rows[offset : offset + page_size]
+    items = [_to_event_response(item) for item in page_rows]
+
+    return ValidationRunEventListResponse(
+        items=items,
+        page=page,
+        page_size=page_size,
+        total=total,
+        has_more=(offset + len(items)) < total,
+        order=normalized_order,
+        window=normalized_window,
+        category=normalized_category,
+        search=normalized_search,
+    )
 
 
 async def get_validation_run_metrics(*, db: AsyncSession, validation_run_id: uuid.UUID) -> ValidationRunMetricsResponse:
@@ -405,6 +502,69 @@ def _compute_time_remaining(*, run: ValidationRun) -> str:
     hours = (total_seconds % 86400) // 3600
     minutes = (total_seconds % 3600) // 60
     return f"{days}d {hours:02d}h {minutes:02d}m"
+
+
+def _window_start(window: str) -> datetime | None:
+    now = datetime.now(timezone.utc)
+    if window == "last_hour":
+        return now - timedelta(hours=1)
+    if window == "last_24_hours":
+        return now - timedelta(hours=24)
+    return None
+
+
+def _to_event_response(event: ValidationRunEvent) -> ValidationRunEventResponse:
+    payload = dict(event.payload or {})
+    metadata = payload.get("metadata") if isinstance(payload.get("metadata"), dict) else {}
+    category = _event_category(event.event_type)
+    title = _safe_text(payload.get("title")) or _title_from_event_type(event.event_type)
+    description = _safe_text(payload.get("description")) or event.message
+    severity = _safe_text(payload.get("severity")) or _severity_from_event_type(event.event_type)
+
+    return ValidationRunEventResponse(
+        id=int(event.id),
+        validation_run_id=event.validation_run_id,
+        timestamp=event.created_at,
+        event_type=event.event_type,
+        category=category,
+        severity=severity,
+        title=title,
+        description=description,
+        metadata=metadata,
+    )
+
+
+def _safe_text(value: object) -> str | None:
+    if isinstance(value, str):
+        cleaned = value.strip()
+        if cleaned:
+            return cleaned
+    return None
+
+
+def _event_category(event_type: str) -> str:
+    for category_name, event_types in _CATEGORY_EVENT_TYPES.items():
+        if event_type in event_types:
+            return category_name
+    return "all"
+
+
+def _severity_from_event_type(event_type: str) -> str:
+    if event_type in {"FAILURE", "ALERT"}:
+        return "red"
+    if event_type in {"WARNING", "RISK_EVENT"}:
+        return "yellow"
+    if event_type in {"RESEARCH_CAMPAIGN_STARTED", "RESEARCH_CAMPAIGN_COMPLETED", "RESEARCH_CANDIDATE_GENERATED", "RESEARCH_MEMORY_SAVED"}:
+        return "purple"
+    if event_type in {"VALIDATION_STARTED", "VALIDATION_COMPLETED", "RECOVERY", "HEARTBEAT"}:
+        return "green"
+    if event_type in {"SIGNAL_GENERATED", "BUY_CANDIDATE", "SELL_CANDIDATE", "PAPER_TRADE_EXECUTED", "MARKET_DATA", "CANDLES_INGESTED", "CAPITAL_ALLOCATION_UPDATED"}:
+        return "blue"
+    return "gray"
+
+
+def _title_from_event_type(event_type: str) -> str:
+    return event_type.replace("_", " ").title()
 
 
 def _build_scorecards(

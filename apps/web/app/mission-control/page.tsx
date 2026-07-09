@@ -2,11 +2,15 @@
 
 import { useEffect, useMemo, useState } from "react";
 
+import ValidationRunTimeline from "@/components/domain/ValidationRunTimeline";
 import {
   ApiRequestError,
+  getValidationRunEvents,
+  getValidationRuns,
   getOperationsStatus,
   type OperationalHealthIndicator,
   type OperationalStatus,
+  type ValidationRunEvent,
 } from "@/lib/api/arena";
 
 function errorMessage(error: unknown, fallback: string): string {
@@ -68,6 +72,8 @@ function HealthChip({ label, indicator }: { label: string; indicator: Operationa
 
 export default function MissionControlPage() {
   const [data, setData] = useState<OperationalStatus | null>(null);
+  const [latestTimelineEvents, setLatestTimelineEvents] = useState<ValidationRunEvent[]>([]);
+  const [timelineLoading, setTimelineLoading] = useState(false);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
 
@@ -80,6 +86,23 @@ export default function MissionControlPage() {
 
       try {
         const payload = await getOperationsStatus();
+        setTimelineLoading(true);
+        const runs = await getValidationRuns();
+        const timelineRun = runs.items.find((item) => item.status === "RUNNING") ?? runs.items[0] ?? null;
+        if (timelineRun) {
+          const timeline = await getValidationRunEvents(timelineRun.validation_run_id, {
+            page: 1,
+            pageSize: 5,
+            order: "newest",
+            window: "entire_run",
+            category: "all",
+          });
+          if (active) {
+            setLatestTimelineEvents(timeline.items);
+          }
+        } else if (active) {
+          setLatestTimelineEvents([]);
+        }
         if (active) {
           setData(payload);
         }
@@ -88,6 +111,9 @@ export default function MissionControlPage() {
           setError(errorMessage(requestError, "Failed to load mission control status."));
         }
       } finally {
+        if (active) {
+          setTimelineLoading(false);
+        }
         if (active) {
           setLoading(false);
         }
@@ -221,6 +247,16 @@ export default function MissionControlPage() {
               </ul>
             )}
           </section>
+
+          <ValidationRunTimeline
+            title="Latest 5 Validation Timeline Events"
+            events={latestTimelineEvents}
+            query={{ order: "newest", window: "entire_run", category: "all", search: "" }}
+            loading={timelineLoading}
+            showControls={false}
+            maxHeightClass="max-h-[26rem]"
+            emptyMessage="No validation timeline events available yet."
+          />
         </>
       ) : null}
     </div>

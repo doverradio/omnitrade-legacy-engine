@@ -2,6 +2,7 @@
 
 import { useEffect, useMemo, useState } from "react";
 
+import ValidationRunTimeline, { type TimelineQuery } from "@/components/domain/ValidationRunTimeline";
 import {
   ApiRequestError,
   cancelValidationRun,
@@ -14,6 +15,7 @@ import {
   type ValidationRun,
   type ValidationRunDetail,
   type ValidationRunEvent,
+  type ValidationRunEventListResponse,
   type ValidationRunMetrics,
   type ValidationRunScorecard,
 } from "@/lib/api/arena";
@@ -84,7 +86,16 @@ export default function ValidationRunsPage() {
   const [runs, setRuns] = useState<ValidationRun[]>([]);
   const [activeMetrics, setActiveMetrics] = useState<ValidationRunMetrics | null>(null);
   const [activeDetail, setActiveDetail] = useState<ValidationRunDetail | null>(null);
-  const [activeEvents, setActiveEvents] = useState<ValidationRunEvent[]>([]);
+  const [timelineEvents, setTimelineEvents] = useState<ValidationRunEvent[]>([]);
+  const [timelinePage, setTimelinePage] = useState(1);
+  const [timelineHasMore, setTimelineHasMore] = useState(false);
+  const [timelineLoading, setTimelineLoading] = useState(false);
+  const [timelineQuery, setTimelineQuery] = useState<TimelineQuery>({
+    order: "newest",
+    window: "entire_run",
+    category: "all",
+    search: "",
+  });
   const [expandedRunId, setExpandedRunId] = useState<string | null>(null);
 
   const [loading, setLoading] = useState(true);
@@ -92,6 +103,37 @@ export default function ValidationRunsPage() {
   const [error, setError] = useState<string | null>(null);
 
   const activeRun = useMemo(() => runs.find((item) => item.status === "RUNNING") ?? null, [runs]);
+  const selectedTimelineRunId = useMemo(() => {
+    if (expandedRunId) {
+      return expandedRunId;
+    }
+    if (activeRun) {
+      return activeRun.validation_run_id;
+    }
+    return runs[0]?.validation_run_id ?? null;
+  }, [expandedRunId, activeRun, runs]);
+
+  async function loadTimeline(runId: string, reset: boolean): Promise<ValidationRunEventListResponse> {
+    setTimelineLoading(true);
+    try {
+      const page = reset ? 1 : timelinePage + 1;
+      const result = await getValidationRunEvents(runId, {
+        page,
+        pageSize: 30,
+        order: timelineQuery.order,
+        window: timelineQuery.window,
+        category: timelineQuery.category,
+        search: timelineQuery.search,
+      });
+
+      setTimelinePage(result.page);
+      setTimelineHasMore(result.has_more);
+      setTimelineEvents((previous) => (reset ? result.items : [...previous, ...result.items]));
+      return result;
+    } finally {
+      setTimelineLoading(false);
+    }
+  }
 
   async function refreshAll() {
     const list = await getValidationRuns();
@@ -102,15 +144,26 @@ export default function ValidationRunsPage() {
       const [detail, metrics, events] = await Promise.all([
         getValidationRun(running.validation_run_id),
         getValidationRunMetrics(running.validation_run_id),
-        getValidationRunEvents(running.validation_run_id),
+        getValidationRunEvents(running.validation_run_id, {
+          page: 1,
+          pageSize: 30,
+          order: timelineQuery.order,
+          window: timelineQuery.window,
+          category: timelineQuery.category,
+          search: timelineQuery.search,
+        }),
       ]);
       setActiveDetail(detail);
       setActiveMetrics(metrics);
-      setActiveEvents(events);
+      setTimelineEvents(events.items);
+      setTimelinePage(events.page);
+      setTimelineHasMore(events.has_more);
     } else {
       setActiveDetail(null);
       setActiveMetrics(null);
-      setActiveEvents([]);
+      setTimelineEvents([]);
+      setTimelinePage(1);
+      setTimelineHasMore(false);
     }
   }
 
@@ -135,15 +188,41 @@ export default function ValidationRunsPage() {
 
     void load();
 
-    const timer = window.setInterval(() => {
-      void load();
-    }, 15000);
-
     return () => {
       active = false;
-      window.clearInterval(timer);
     };
   }, []);
+
+  useEffect(() => {
+    if (!selectedTimelineRunId) {
+      return;
+    }
+
+    setError(null);
+    void loadTimeline(selectedTimelineRunId, true).catch((timelineError) => {
+      setError(errorMessage(timelineError, "Failed to load validation run timeline."));
+    });
+  }, [selectedTimelineRunId, timelineQuery]);
+
+  useEffect(() => {
+    const intervalMs = activeRun ? 5000 : 15000;
+    const timer = window.setInterval(() => {
+      setError(null);
+      void refreshAll().catch((refreshError) => {
+        setError(errorMessage(refreshError, "Failed to refresh validation runs."));
+      });
+
+      if (activeRun && selectedTimelineRunId) {
+        void loadTimeline(selectedTimelineRunId, true).catch((timelineError) => {
+          setError(errorMessage(timelineError, "Failed to refresh timeline events."));
+        });
+      }
+    }, intervalMs);
+
+    return () => {
+      window.clearInterval(timer);
+    };
+  }, [activeRun, selectedTimelineRunId, timelineQuery]);
 
   const effectiveDuration = durationPreset === "custom" ? Number(customDuration) : Number(durationPreset);
 
@@ -190,12 +269,9 @@ export default function ValidationRunsPage() {
 
     setExpandedRunId(runId);
     try {
-      const [detail, events] = await Promise.all([
-        getValidationRun(runId),
-        getValidationRunEvents(runId),
-      ]);
+      const detail = await getValidationRun(runId);
       setActiveDetail(detail);
-      setActiveEvents(events);
+      await loadTimeline(runId, true);
       if (activeRun && activeRun.validation_run_id === runId) {
         const metrics = await getValidationRunMetrics(runId);
         setActiveMetrics(metrics);
@@ -455,30 +531,34 @@ export default function ValidationRunsPage() {
         )}
       </section>
 
+      <ValidationRunTimeline
+        title="Validation Timeline"
+        events={timelineEvents}
+        query={timelineQuery}
+        loading={timelineLoading}
+        hasMore={timelineHasMore}
+        emptyMessage={selectedTimelineRunId ? "No timeline events for this run yet." : "Select a validation run to view timeline."}
+        onQueryChange={(next) => setTimelineQuery(next)}
+        onLoadMore={() => {
+          if (!selectedTimelineRunId) {
+            return;
+          }
+          void loadTimeline(selectedTimelineRunId, false).catch((timelineError) => {
+            setError(errorMessage(timelineError, "Failed to load more timeline events."));
+          });
+        }}
+      />
+
       {expandedRunId && activeDetail ? (
         <section className="rounded-lg border border-border bg-muted/30 p-4">
           <h2 className="text-sm font-semibold uppercase tracking-wide text-foreground/80">Validation Run Detail</h2>
-          <div className="mt-3 grid gap-4 lg:grid-cols-2">
-            <article className="rounded-md border border-border bg-background/40 p-3">
-              <h3 className="text-xs uppercase tracking-wide text-foreground/70">Timeline / Events</h3>
-              <ul className="mt-2 space-y-2">
-                {activeEvents.map((event) => (
-                  <li key={`${event.event_type}-${event.created_at}`} className="rounded border border-border px-2 py-2">
-                    <p className="text-xs font-medium">{event.message}</p>
-                    <p className="text-xs text-foreground/70">{event.event_type} • {formatTime(event.created_at)}</p>
-                  </li>
-                ))}
-              </ul>
-            </article>
-
-            <article className="rounded-md border border-border bg-background/40 p-3">
-              <h3 className="text-xs uppercase tracking-wide text-foreground/70">Final Result Summary</h3>
-              <p className="mt-2 text-sm">Result: {activeDetail.result_status}</p>
-              <p className="mt-1 text-sm">Overall score: {activeDetail.overall_score}</p>
-              <p className="mt-1 text-sm">Status: {activeDetail.status}</p>
-              <p className="mt-1 text-sm">Objective: {activeDetail.objective}</p>
-            </article>
-          </div>
+          <article className="mt-3 rounded-md border border-border bg-background/40 p-3">
+            <h3 className="text-xs uppercase tracking-wide text-foreground/70">Final Result Summary</h3>
+            <p className="mt-2 text-sm">Result: {activeDetail.result_status}</p>
+            <p className="mt-1 text-sm">Overall score: {activeDetail.overall_score}</p>
+            <p className="mt-1 text-sm">Status: {activeDetail.status}</p>
+            <p className="mt-1 text-sm">Objective: {activeDetail.objective}</p>
+          </article>
         </section>
       ) : null}
     </div>

@@ -19,6 +19,55 @@ function installFetchMock(scenario: Scenario) {
     const rawUrl = typeof input === "string" ? input : input instanceof URL ? input.toString() : input.url;
     const url = new URL(rawUrl);
 
+    if (url.pathname === "/validation-runs") {
+      return jsonResponse(200, {
+        items: [
+          {
+            validation_run_id: "11111111-1111-1111-1111-111111111111",
+            name: "72h Proving",
+            objective: "Validate stability",
+            duration_hours: 72,
+            status: "RUNNING",
+            started_at: "2026-07-09T00:00:00Z",
+            expected_end_at: "2026-07-12T00:00:00Z",
+            completed_at: null,
+            paper_capital: "100000",
+            enabled_strategies: ["MA Crossover"],
+            enabled_research_agents: ["Baseline"],
+            enabled_research_features: ["Laboratory"],
+            health_score: 88,
+            result_status: "INCOMPLETE",
+          },
+        ],
+      });
+    }
+
+    if (url.pathname === "/validation-runs/11111111-1111-1111-1111-111111111111/events") {
+      return jsonResponse(200, {
+        items: [
+          {
+            id: 1,
+            validation_run_id: "11111111-1111-1111-1111-111111111111",
+            timestamp: "2026-07-09T00:00:00Z",
+            event_type: "VALIDATION_STARTED",
+            category: "all",
+            severity: "green",
+            title: "Validation Started",
+            description: "Validation run started",
+            metadata: {},
+          },
+        ],
+        page: 1,
+        page_size: 5,
+        total: 1,
+        has_more: false,
+        order: "newest",
+        window: "entire_run",
+        category: "all",
+        search: null,
+      });
+    }
+
     if (url.pathname !== "/operations/status") {
       return jsonResponse(404, {
         error: {
@@ -180,6 +229,7 @@ describe("MissionControlPage", () => {
     expect(screen.getByText("Research Status")).toBeInTheDocument();
     expect(screen.getByText("Monitoring")).toBeInTheDocument();
     expect(screen.getByText("No active alerts.")).toBeInTheDocument();
+    expect(screen.getByText("Latest 5 Validation Timeline Events")).toBeInTheDocument();
   });
 
   it("renders empty-state values with no active alerts", async () => {

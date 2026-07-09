@@ -151,3 +151,6 @@ vite.config.js.timestamp-*
 vite.config.ts.timestamp-*
 .vite/
 .next-local
+
+# Local UI inspiration / reference images
+pics/

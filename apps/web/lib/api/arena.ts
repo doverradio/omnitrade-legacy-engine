@@ -585,10 +585,27 @@ export type ValidationRunDetail = ValidationRun & {
 };
 
 export type ValidationRunEvent = {
+  id: number;
+  validation_run_id: string;
+  timestamp: string;
   event_type: string;
-  message: string;
-  payload: Record<string, unknown>;
-  created_at: string;
+  category: "all" | "trading" | "research" | "evolution" | "ai" | "warnings" | "failures" | "manual_notes";
+  severity: "green" | "blue" | "purple" | "yellow" | "red" | "gray";
+  title: string;
+  description: string;
+  metadata: Record<string, unknown>;
+};
+
+export type ValidationRunEventListResponse = {
+  items: ValidationRunEvent[];
+  page: number;
+  page_size: number;
+  total: number;
+  has_more: boolean;
+  order: "newest" | "oldest";
+  window: "last_hour" | "last_24_hours" | "entire_run";
+  category: "all" | "trading" | "research" | "evolution" | "ai" | "warnings" | "failures" | "manual_notes";
+  search: string | null;
 };
 
 export type ValidationRunMetrics = {
@@ -855,8 +872,26 @@ export async function cancelValidationRun(validationRunId: string): Promise<Vali
   });
 }
 
-export async function getValidationRunEvents(validationRunId: string): Promise<ValidationRunEvent[]> {
-  return requestJson<ValidationRunEvent[]>(`/validation-runs/${validationRunId}/events`);
+export async function getValidationRunEvents(
+  validationRunId: string,
+  input?: {
+    page?: number;
+    pageSize?: number;
+    order?: "newest" | "oldest";
+    window?: "last_hour" | "last_24_hours" | "entire_run";
+    category?: "all" | "trading" | "research" | "evolution" | "ai" | "warnings" | "failures" | "manual_notes";
+    search?: string;
+  },
+): Promise<ValidationRunEventListResponse> {
+  const query = buildQuery({
+    page: String(input?.page ?? 1),
+    page_size: String(input?.pageSize ?? 50),
+    order: input?.order ?? "newest",
+    window: input?.window ?? "entire_run",
+    category: input?.category ?? "all",
+    q: input?.search ?? null,
+  });
+  return requestJson<ValidationRunEventListResponse>(`/validation-runs/${validationRunId}/events?${query}`);
 }
 
 export async function getValidationRunMetrics(validationRunId: string): Promise<ValidationRunMetrics> {
