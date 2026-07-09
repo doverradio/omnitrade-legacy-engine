@@ -1,5 +1,4 @@
 import { render, screen, waitFor } from "@testing-library/react";
-import userEvent from "@testing-library/user-event";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
 import DecisionArenaPage from "@/app/decision-arena/page";
@@ -27,95 +26,26 @@ function installFetchMock() {
       });
     }
 
-    if (url.pathname === "/decisions/arena-leaderboard/latest") {
+    if (url.pathname === "/arena/strategy-scoreboard") {
       return jsonResponse(200, {
-        snapshot_scope: "tournament",
-        competition_id: "11111111-1111-1111-1111-111111111111",
-        tournament_id: "22222222-2222-2222-2222-222222222222",
-        cycle_id: null,
-        availability_state: "known",
-        state_reason: null,
-        ranking_hash: "rank-hash",
-        ranking_methodology_version: "v1",
-        snapshot_timestamp: "2026-07-06T00:00:00Z",
-        filters: {
-          included_agent_ids: null,
-          limit: null,
-          availability_mode: "all",
-        },
-        entries: [
+        items: [
           {
-            rank: 1,
-            agent_id: "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa",
-            composite_rank_score: { value: "0.9000", status: "available", reason: null },
-            decision_quality: { value: "0.9000", status: "available", reason: null },
-            profit: { value: "10", status: "available", reason: null },
-            drawdown: { value: "0.1", status: "available", reason: null },
-            fee_drag: { value: "1", status: "available", reason: null },
-            consistency: { value: "0.9", status: "available", reason: null },
-            risk_discipline: { value: "0.9", status: "available", reason: null },
-            explainability: { value: "0.8", status: "available", reason: null },
-            evidence_provenance: {},
-          },
-        ],
-        evidence_sources: {},
-        provenance: {},
-      });
-    }
-
-    if (url.pathname === "/decisions/arena-comparisons/latest") {
-      return jsonResponse(200, {
-        comparison_scope: "tournament",
-        competition_id: "11111111-1111-1111-1111-111111111111",
-        tournament_id: "22222222-2222-2222-2222-222222222222",
-        cycle_id: null,
-        availability_state: "known",
-        state_reason: null,
-        comparison_hash: "cmp-hash",
-        compared_agent_ids: ["aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa"],
-        comparison_timestamp: "2026-07-06T00:00:00Z",
-        agent_summaries: [
-          {
-            agent_id: "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa",
-            decision_quality: { value: "0.9000", status: "available", reason: null },
-            explainability_support_ratio: { value: "0.8000", status: "available", reason: null },
-            counterfactual_correctness: { value: "0.7000", status: "available", reason: null },
-            evidence_provenance: {},
-          },
-        ],
-        portfolio_dimensions: {},
-        evidence_sources: {},
-        provenance: {},
-      });
-    }
-
-    if (url.pathname === "/decisions/arena-tournaments/history") {
-      return jsonResponse(200, {
-        competition_id: "11111111-1111-1111-1111-111111111111",
-        tournament_id: "22222222-2222-2222-2222-222222222222",
-        availability_state: "known",
-        state_reason: null,
-        current_state: "active",
-        latest_event_type: "standings_recorded",
-        latest_event_timestamp: "2026-07-06T00:10:00Z",
-        history_count: 1,
-        replay_metadata: { deterministic_replay: true },
-        latest_schedule_payload: { cycle_interval_minutes: 30 },
-        latest_standings: [],
-        history: [
-          {
-            history_record_id: "h1",
-            event_hash: "hash",
-            sequence_number: 1,
-            event_type: "standings_recorded",
-            lifecycle_state: "active",
-            event_timestamp: "2026-07-06T00:10:00Z",
-            schedule_payload: { cycle_interval_minutes: 30 },
-            replay_metadata: { deterministic_replay: true },
-            tie_break_rules: ["decision_quality_desc"],
-            ordering_rules: ["composite_score_desc"],
-            standings: [],
-            provenance: {},
+            strategy_id: "11111111-1111-1111-1111-111111111111",
+            strategy_name: "MA Crossover",
+            enabled: true,
+            status: "active",
+            signals_generated: 12,
+            buy_signals: 5,
+            sell_signals: 4,
+            hold_signals: 3,
+            paper_trades: 6,
+            open_positions: 1,
+            realized_pnl: "18.5",
+            unrealized_pnl: "2.25",
+            total_return_pct: "0.02075",
+            decision_records: 9,
+            last_signal_timestamp: "2026-07-09T09:50:00Z",
+            last_trade_timestamp: "2026-07-09T09:55:00Z",
           },
         ],
       });
@@ -136,24 +66,22 @@ afterEach(() => {
   vi.unstubAllGlobals();
 });
 
-describe("DecisionArenaPage Prompt 8.10", () => {
-  it("renders read-only arena dashboard and uses GET-only API integration", async () => {
+describe("DecisionArenaPage", () => {
+  it("renders the strategy scoreboard and uses GET-only API integration", async () => {
     const fetchMock = installFetchMock();
     render(<DecisionArenaPage />);
 
-    expect(await screen.findByRole("heading", { name: "Decision Arena Dashboard" })).toBeInTheDocument();
-    expect(screen.getByText(/Observational only/i)).toBeInTheDocument();
-
-    const user = userEvent.setup();
-    await user.type(screen.getByLabelText("Competition ID"), "11111111-1111-1111-1111-111111111111");
-    await user.type(screen.getByLabelText("Tournament ID"), "22222222-2222-2222-2222-222222222222");
-    await user.click(screen.getByRole("button", { name: "Load Arena Dashboard" }));
-
     await waitFor(() => {
-      expect(screen.getByText("Leaderboard")).toBeInTheDocument();
-      expect(screen.getByText("Comparisons")).toBeInTheDocument();
-      expect(screen.getByText("Tournament Replay Viewer")).toBeInTheDocument();
+      expect(screen.getByText("Strategy Scoreboard")).toBeInTheDocument();
     });
+
+    expect(screen.getByText("MA Crossover")).toBeInTheDocument();
+    expect(screen.getByText("Active")).toBeInTheDocument();
+    expect(screen.getByText("Decision Records")).toBeInTheDocument();
+    expect(screen.getByText("Replay Ranking")).toBeInTheDocument();
+    expect(
+      screen.getAllByText(/These panels will activate as additional replay agents and research systems are introduced/i),
+    ).toHaveLength(4);
 
     const nonGetCalls = fetchMock.mock.calls.filter((call) => {
       const init = call[1] as RequestInit | undefined;
@@ -161,5 +89,21 @@ describe("DecisionArenaPage Prompt 8.10", () => {
     });
 
     expect(nonGetCalls).toHaveLength(0);
+  });
+
+  it("renders empty state when no strategies exist", async () => {
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async () =>
+        jsonResponse(200, {
+          items: [],
+        }),
+      ),
+    );
+
+    render(<DecisionArenaPage />);
+
+    expect(await screen.findByRole("heading", { name: "Decision Arena" })).toBeInTheDocument();
+    expect(await screen.findByText(/No strategies are registered yet/i)).toBeInTheDocument();
   });
 });

@@ -122,6 +122,29 @@ export type ArenaTournamentHistoryResponse = {
   history: ArenaTournamentHistoryItem[];
 };
 
+export type StrategyArenaScoreboardItem = {
+  strategy_id: string;
+  strategy_name: string;
+  enabled: boolean;
+  status: string;
+  signals_generated: number;
+  buy_signals: number;
+  sell_signals: number;
+  hold_signals: number;
+  paper_trades: number;
+  open_positions: number;
+  realized_pnl: string;
+  unrealized_pnl: string;
+  total_return_pct: string;
+  decision_records: number;
+  last_signal_timestamp: string | null;
+  last_trade_timestamp: string | null;
+};
+
+export type StrategyArenaScoreboardResponse = {
+  items: StrategyArenaScoreboardItem[];
+};
+
 async function requestJson<T>(path: string): Promise<T> {
   const response = await fetch(`${API_BASE_URL}${path}`, {
     cache: "no-store",
@@ -194,4 +217,8 @@ export async function getArenaTournamentHistory(input: {
     tournament_id: input.tournamentId,
   });
   return requestJson<ArenaTournamentHistoryResponse>(`/decisions/arena-tournaments/history?${query}`);
+}
+
+export async function getStrategyArenaScoreboard(): Promise<StrategyArenaScoreboardResponse> {
+  return requestJson<StrategyArenaScoreboardResponse>("/arena/strategy-scoreboard");
 }
