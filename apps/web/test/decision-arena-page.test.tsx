@@ -1,4 +1,4 @@
-import { render, screen, waitFor } from "@testing-library/react";
+import { fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
 import DecisionArenaPage from "@/app/decision-arena/page";
@@ -179,10 +179,61 @@ function installFetchMock() {
           rationale: "Baseline deterministic candidate intended to improve signal quality under mixed trend and mean-reversion market states.",
           status: "PROPOSED",
         },
+        {
+          candidate_id: "77777777-7777-7777-7777-777777777778",
+          generated_at: "2026-07-09T12:00:00Z",
+          originating_agent: "Baseline Research Agent",
+          strategy_name: "MA-RSI Blend rsi10",
+          description: "Shorter RSI lookback variant to increase sensitivity in momentum transitions.",
+          parameter_set: {
+            rsi_period: 10,
+          },
+          rationale: "Tests whether shorter RSI lookback improves deterministic decision fidelity.",
+          status: "PROPOSED",
+        },
+        {
+          candidate_id: "77777777-7777-7777-7777-777777777779",
+          generated_at: "2026-07-09T12:00:00Z",
+          originating_agent: "Baseline Research Agent",
+          strategy_name: "MA-RSI Blend threshold 35/65",
+          description: "RSI threshold variant with narrower entry/exit bands.",
+          parameter_set: {
+            buy_threshold: 35,
+            sell_threshold: 65,
+          },
+          rationale: "Assesses deterministic quality under less extreme RSI trigger levels.",
+          status: "PROPOSED",
+        },
+        {
+          candidate_id: "77777777-7777-7777-7777-777777777780",
+          generated_at: "2026-07-09T12:00:00Z",
+          originating_agent: "Baseline Research Agent",
+          strategy_name: "MA Crossover 9/30",
+          description: "Faster MA crossover profile for earlier trend entries.",
+          parameter_set: {
+            fast_period: 9,
+            slow_period: 30,
+          },
+          rationale: "Evaluates deterministic replay quality impact of a more responsive MA pair.",
+          status: "PROPOSED",
+        },
+        {
+          candidate_id: "77777777-7777-7777-7777-777777777781",
+          generated_at: "2026-07-09T12:00:00Z",
+          originating_agent: "Baseline Research Agent",
+          strategy_name: "MA Crossover 20/100",
+          description: "Slower MA crossover profile to reduce signal churn.",
+          parameter_set: {
+            fast_period: 20,
+            slow_period: 100,
+          },
+          rationale: "Evaluates deterministic replay quality impact of a slower trend-following profile.",
+          status: "PROPOSED",
+        },
       ]);
     }
 
-    if (url.pathname === "/research/evaluate-candidate") {
+    if (url.pathname === "/research/evaluate-candidates") {
       if (method !== "POST") {
         return jsonResponse(405, {
           error: {
@@ -192,14 +243,29 @@ function installFetchMock() {
       }
 
       return jsonResponse(200, {
-        evaluation_id: "88888888-8888-8888-8888-888888888888",
-        candidate_id: "77777777-7777-7777-7777-777777777777",
-        replay_status: "COMPLETED",
-        decision_quality_score: 100,
-        ai_coach_summary: "Replay successfully reproduced the production decision.",
-        decision_intelligence_summary: "Volatility Filter MA-RSI Blend ranked highest by deterministic quality scoring with configured tie-break rules.",
-        tournament_rank: 1,
-        promotion_eligible: false,
+        evaluated_count: 5,
+        evaluations: [
+          {
+            evaluation_id: "88888888-8888-8888-8888-888888888888",
+            candidate_id: "77777777-7777-7777-7777-777777777777",
+            replay_status: "COMPLETED",
+            decision_quality_score: 100,
+            ai_coach_summary: "Replay successfully reproduced the production decision.",
+            decision_intelligence_summary: "Volatility Filter MA-RSI Blend ranked highest by deterministic quality scoring with configured tie-break rules.",
+            tournament_rank: 1,
+            promotion_eligible: false,
+          },
+          {
+            evaluation_id: "88888888-8888-8888-8888-888888888889",
+            candidate_id: "77777777-7777-7777-7777-777777777778",
+            replay_status: "COMPLETED",
+            decision_quality_score: 50,
+            ai_coach_summary: "Replay action differed from production.",
+            decision_intelligence_summary: "Deterministic recommendation summary.",
+            tournament_rank: 2,
+            promotion_eligible: false,
+          },
+        ],
       });
     }
 
@@ -247,16 +313,21 @@ describe("DecisionArenaPage", () => {
     expect(screen.getByText(/Total Paper Capital/i)).toBeInTheDocument();
     expect(screen.getByText(/Rule-Based Capital Allocation/i)).toBeInTheDocument();
     expect(screen.getByRole("heading", { name: /Research Agents/i })).toBeInTheDocument();
-    expect(screen.getByText(/Research agents cannot trade\./i)).toBeInTheDocument();
-    expect(screen.getByText(/Research agents only generate candidate strategies\./i)).toBeInTheDocument();
+    expect(screen.getByText(/RESEARCH ONLY/i)).toBeInTheDocument();
+    expect(screen.getByText(/NO PRODUCTION CHANGES/i)).toBeInTheDocument();
+    expect(screen.getAllByText(/HUMAN REVIEW REQUIRED/i).length).toBeGreaterThan(0);
     expect(screen.getByText(/Baseline Research Agent/i)).toBeInTheDocument();
     expect(screen.getByRole("table", { name: /Candidate Strategies/i })).toBeInTheDocument();
     expect(screen.getAllByText(/PROPOSED/i).length).toBeGreaterThan(0);
-    expect(screen.getByRole("heading", { name: /Candidate Evaluations/i })).toBeInTheDocument();
-    expect(screen.getByText(/Research Only/i)).toBeInTheDocument();
-    expect(screen.getByText(/Promotion Disabled/i)).toBeInTheDocument();
-    expect(screen.getByRole("table", { name: /Candidate Evaluations/i })).toBeInTheDocument();
-    expect(screen.getByText(/COMPLETED/i)).toBeInTheDocument();
+    expect(screen.getByText(/MA Crossover 9\/30/i)).toBeInTheDocument();
+    expect(screen.getByText(/MA Crossover 20\/100/i)).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: /Evaluate Candidates/i })).toBeInTheDocument();
+    expect(screen.getByText(/No candidate evaluations available yet\./i)).toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole("button", { name: /Evaluate Candidates/i }));
+    expect(await screen.findByRole("table", { name: /Candidate Evaluations/i })).toBeInTheDocument();
+    expect(screen.getByText(/Evaluated 5 candidates\./i)).toBeInTheDocument();
+    expect(screen.getByText(/Replay successfully reproduced the production decision\./i)).toBeInTheDocument();
     expect(screen.getAllByText(/^100$/i).length).toBeGreaterThan(0);
 
     const nonGetCalls = fetchMock.mock.calls.filter((call) => {
@@ -266,7 +337,7 @@ describe("DecisionArenaPage", () => {
 
     expect(nonGetCalls).toHaveLength(1);
     const postCallUrl = new URL(nonGetCalls[0][0] as string);
-    expect(postCallUrl.pathname).toBe("/research/evaluate-candidate");
+    expect(postCallUrl.pathname).toBe("/research/evaluate-candidates");
     expect((nonGetCalls[0][1] as RequestInit | undefined)?.method).toBe("POST");
   });
 
@@ -356,16 +427,10 @@ describe("DecisionArenaPage", () => {
           return jsonResponse(200, []);
         }
 
-        if (url.pathname === "/research/evaluate-candidate") {
+        if (url.pathname === "/research/evaluate-candidates") {
           return jsonResponse(200, {
-            evaluation_id: "88888888-8888-8888-8888-888888888888",
-            candidate_id: "77777777-7777-7777-7777-777777777777",
-            replay_status: "COMPLETED",
-            decision_quality_score: 100,
-            ai_coach_summary: "Replay successfully reproduced the production decision.",
-            decision_intelligence_summary: "Deterministic recommendation.",
-            tournament_rank: 1,
-            promotion_eligible: false,
+            evaluated_count: 0,
+            evaluations: [],
           });
         }
 
@@ -385,6 +450,6 @@ describe("DecisionArenaPage", () => {
     expect((await screen.findAllByText(/^None$/i)).length).toBeGreaterThan(0);
     expect(await screen.findByText(/No capital allocation recommendation available yet\./i)).toBeInTheDocument();
     expect(await screen.findByText(/No research agents or candidate strategies are available yet\./i)).toBeInTheDocument();
-    expect(await screen.findByText(/No candidate evaluations available yet\./i)).toBeInTheDocument();
+    expect(screen.queryByText(/No candidate evaluations available yet\./i)).not.toBeInTheDocument();
   });
 });

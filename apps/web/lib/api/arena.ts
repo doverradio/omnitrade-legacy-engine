@@ -295,6 +295,16 @@ export type CandidateEvaluation = {
   promotion_eligible: boolean;
 };
 
+export type CandidateBatchEvaluationRequest = {
+  candidate_ids?: string[];
+  limit?: number;
+};
+
+export type CandidateBatchEvaluationResponse = {
+  evaluated_count: number;
+  evaluations: CandidateEvaluation[];
+};
+
 async function requestJson<T>(path: string, init?: RequestInit): Promise<T> {
   const headers = new Headers(init?.headers);
   headers.set("Content-Type", "application/json");
@@ -426,6 +436,13 @@ export async function getResearchCandidates(): Promise<StrategyCandidate[]> {
 
 export async function evaluateCandidate(request: CandidateEvaluationRequest): Promise<CandidateEvaluation> {
   return requestJson<CandidateEvaluation>("/research/evaluate-candidate", {
+    method: "POST",
+    body: JSON.stringify(request),
+  });
+}
+
+export async function evaluateCandidates(request: CandidateBatchEvaluationRequest): Promise<CandidateBatchEvaluationResponse> {
+  return requestJson<CandidateBatchEvaluationResponse>("/research/evaluate-candidates", {
     method: "POST",
     body: JSON.stringify(request),
   });

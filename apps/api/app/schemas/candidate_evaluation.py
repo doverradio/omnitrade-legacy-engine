@@ -18,3 +18,13 @@ class CandidateEvaluationResponse(BaseModel):
     decision_intelligence_summary: str
     tournament_rank: int | None
     promotion_eligible: bool
+
+
+class CandidateBatchEvaluationRequest(BaseModel):
+    candidate_ids: list[uuid.UUID] | None = None
+    limit: int | None = None
+
+
+class CandidateBatchEvaluationResponse(BaseModel):
+    evaluated_count: int
+    evaluations: list[CandidateEvaluationResponse]

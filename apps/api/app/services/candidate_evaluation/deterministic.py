@@ -70,6 +70,32 @@ def build_candidate_evaluation_v1(
     )
 
 
+def build_candidate_evaluations_batch_v1(
+    *,
+    candidates: list[StrategyCandidate],
+    selected_candidate_ids: list[uuid.UUID] | None,
+    limit: int | None,
+) -> list[CandidateEvaluation]:
+    filtered_candidates = candidates
+    if selected_candidate_ids is not None:
+        filtered_candidates = [
+            resolve_candidate_by_id_v1(candidate_id=candidate_id, candidates=candidates)
+            for candidate_id in selected_candidate_ids
+        ]
+
+    if limit is not None:
+        capped_limit = max(limit, 0)
+        filtered_candidates = filtered_candidates[:capped_limit]
+
+    return [
+        build_candidate_evaluation_v1(
+            candidate=candidate,
+            all_candidates=candidates,
+        )
+        for candidate in filtered_candidates
+    ]
+
+
 def _build_replay_result_from_candidate(candidate: StrategyCandidate) -> ReplayResult:
     confidence = _confidence_from_candidate(candidate)
     action = _action_from_candidate(candidate)

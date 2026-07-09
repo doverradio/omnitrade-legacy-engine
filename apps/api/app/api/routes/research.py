@@ -3,10 +3,16 @@ from __future__ import annotations
 from fastapi import APIRouter
 
 from app.core.errors import NotFoundError
-from app.schemas.candidate_evaluation import CandidateEvaluationRequest, CandidateEvaluationResponse
+from app.schemas.candidate_evaluation import (
+    CandidateBatchEvaluationRequest,
+    CandidateBatchEvaluationResponse,
+    CandidateEvaluationRequest,
+    CandidateEvaluationResponse,
+)
 from app.schemas.research_agents import ResearchAgentResponse, StrategyCandidateResponse
 from app.services.candidate_evaluation.deterministic import (
     CandidateNotFoundError,
+    build_candidate_evaluations_batch_v1,
     build_candidate_evaluation_v1,
     resolve_candidate_by_id_v1,
 )
@@ -71,4 +77,38 @@ async def evaluate_candidate(request: CandidateEvaluationRequest) -> CandidateEv
         decision_intelligence_summary=evaluation.decision_intelligence_summary,
         tournament_rank=evaluation.tournament_rank,
         promotion_eligible=evaluation.promotion_eligible,
+    )
+
+
+@router.post("/evaluate-candidates", response_model=CandidateBatchEvaluationResponse)
+async def evaluate_candidates(request: CandidateBatchEvaluationRequest) -> CandidateBatchEvaluationResponse:
+    all_candidates = list(list_generated_strategy_candidates())
+
+    try:
+        evaluations = build_candidate_evaluations_batch_v1(
+            candidates=all_candidates,
+            selected_candidate_ids=request.candidate_ids,
+            limit=request.limit,
+        )
+    except CandidateNotFoundError as exc:
+        raise NotFoundError(
+            message="Strategy candidate not found",
+            details={"candidate_id": str(exc)},
+        )
+
+    return CandidateBatchEvaluationResponse(
+        evaluated_count=len(evaluations),
+        evaluations=[
+            CandidateEvaluationResponse(
+                evaluation_id=item.evaluation_id,
+                candidate_id=item.candidate_id,
+                replay_status=item.replay_status,
+                decision_quality_score=item.decision_quality_score,
+                ai_coach_summary=item.ai_coach_summary,
+                decision_intelligence_summary=item.decision_intelligence_summary,
+                tournament_rank=item.tournament_rank,
+                promotion_eligible=item.promotion_eligible,
+            )
+            for item in evaluations
+        ],
     )

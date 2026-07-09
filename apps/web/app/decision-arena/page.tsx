@@ -6,7 +6,7 @@ import ReplayAgentsPanel from "@/components/domain/ReplayAgentsPanel";
 import {
   ApiRequestError,
   coachReviewDecisionQuality,
-  evaluateCandidate,
+  evaluateCandidates,
   getCapitalAllocationRecommendation,
   getDecisionArenaTournament,
   getResearchAgents,
@@ -15,6 +15,7 @@ import {
   getDecisionIntelligenceRecommendation,
   replayDecisionPackage,
   type AICoachObservation,
+  type CandidateBatchEvaluationResponse,
   type CapitalAllocationRecommendation,
   type CandidateEvaluation,
   type DecisionIntelligenceRecommendation,
@@ -100,6 +101,9 @@ export default function DecisionArenaPage() {
   const [researchAgents, setResearchAgents] = useState<ResearchAgent[]>([]);
   const [researchCandidates, setResearchCandidates] = useState<StrategyCandidate[]>([]);
   const [candidateEvaluations, setCandidateEvaluations] = useState<CandidateEvaluation[]>([]);
+  const [candidateBatchSummary, setCandidateBatchSummary] = useState<CandidateBatchEvaluationResponse | null>(null);
+  const [evaluatingCandidates, setEvaluatingCandidates] = useState(false);
+  const [candidateEvaluationError, setCandidateEvaluationError] = useState<string | null>(null);
   const [replayError, setReplayError] = useState<string | null>(null);
 
   useEffect(() => {
@@ -117,24 +121,14 @@ export default function DecisionArenaPage() {
           getResearchCandidates(),
         ]);
 
-        const evaluations =
-          candidates.length > 0
-            ? await Promise.all(
-                candidates.map((candidate) =>
-                  evaluateCandidate({
-                    candidate_id: candidate.candidate_id,
-                  }),
-                ),
-              )
-            : [];
-
         if (active) {
           setTournament(payload);
           setDecisionIntelligence(recommendation);
           setCapitalAllocation(allocation);
           setResearchAgents(agents);
           setResearchCandidates(candidates);
-          setCandidateEvaluations(evaluations);
+          setCandidateEvaluations([]);
+          setCandidateBatchSummary(null);
         }
       } catch (fetchError) {
         if (active) {
@@ -185,6 +179,24 @@ export default function DecisionArenaPage() {
       }
     } finally {
       setReplayLoadingPackageId(null);
+    }
+  }
+
+  async function handleEvaluateCandidates() {
+    setCandidateEvaluationError(null);
+    setEvaluatingCandidates(true);
+    try {
+      const response = await evaluateCandidates({
+        candidate_ids: researchCandidates.map((candidate) => candidate.candidate_id),
+      });
+      setCandidateBatchSummary(response);
+      setCandidateEvaluations(response.evaluations);
+    } catch (batchError) {
+      setCandidateBatchSummary(null);
+      setCandidateEvaluations([]);
+      setCandidateEvaluationError(errorMessage(batchError, "Failed to evaluate candidates."));
+    } finally {
+      setEvaluatingCandidates(false);
     }
   }
 
@@ -347,9 +359,10 @@ export default function DecisionArenaPage() {
             <h3 id="research-agents-heading" className="text-base font-semibold">Research Agents</h3>
             <p className="mt-1 text-xs text-foreground/70">Framework for deterministic candidate strategy generation.</p>
           </div>
-          <div className="text-right text-xs">
-            <p className="font-semibold uppercase tracking-wide text-foreground/60">Research agents cannot trade.</p>
-            <p className="text-foreground/70">Research agents only generate candidate strategies.</p>
+          <div className="flex flex-wrap gap-2 text-xs">
+            <span className="rounded-full border border-sky-500/40 bg-sky-500/10 px-3 py-1 font-semibold text-sky-100">RESEARCH ONLY</span>
+            <span className="rounded-full border border-amber-500/40 bg-amber-500/10 px-3 py-1 font-semibold text-amber-100">NO PRODUCTION CHANGES</span>
+            <span className="rounded-full border border-emerald-500/40 bg-emerald-500/10 px-3 py-1 font-semibold text-emerald-100">HUMAN REVIEW REQUIRED</span>
           </div>
         </div>
 
@@ -373,7 +386,19 @@ export default function DecisionArenaPage() {
             </div>
 
             <div className="rounded-md border border-border/70 bg-background/40 p-3">
-              <p className="text-xs font-semibold uppercase tracking-wide text-foreground/60">Candidate Strategies</p>
+              <div className="flex flex-wrap items-center justify-between gap-3">
+                <p className="text-xs font-semibold uppercase tracking-wide text-foreground/60">Candidate Strategies</p>
+                <button
+                  type="button"
+                  onClick={() => {
+                    void handleEvaluateCandidates();
+                  }}
+                  disabled={researchCandidates.length === 0 || evaluatingCandidates}
+                  className="rounded border border-sky-500/40 bg-sky-500/10 px-3 py-1 text-xs font-semibold text-sky-100 disabled:cursor-not-allowed disabled:opacity-50"
+                >
+                  {evaluatingCandidates ? "Evaluating..." : "Evaluate Candidates"}
+                </button>
+              </div>
               {researchCandidates.length > 0 ? (
                 <div className="mt-2 overflow-x-auto">
                   <table className="min-w-[760px] w-full text-left text-sm" aria-label="Candidate Strategies">
@@ -403,61 +428,59 @@ export default function DecisionArenaPage() {
                 <p className="mt-2 text-sm text-foreground/65">No candidate strategies available.</p>
               )}
             </div>
+
+            <div className="rounded-md border border-border/70 bg-background/40 p-3" aria-labelledby="candidate-evaluations-heading">
+              <div className="flex flex-wrap items-center justify-between gap-3">
+                <h4 id="candidate-evaluations-heading" className="text-xs font-semibold uppercase tracking-wide text-foreground/60">Candidate Evaluations</h4>
+                <p className="text-xs text-foreground/65">
+                  {candidateBatchSummary ? `Evaluated ${candidateBatchSummary.evaluated_count} candidates.` : "No batch evaluated yet."}
+                </p>
+              </div>
+
+              {candidateEvaluationError ? (
+                <div className="mt-2 rounded-md border border-red-500/50 bg-red-500/10 px-3 py-2 text-xs text-red-100" role="alert">
+                  {candidateEvaluationError}
+                </div>
+              ) : null}
+
+              {candidateEvaluations.length > 0 ? (
+                <div className="mt-2 overflow-x-auto">
+                  <table className="min-w-[980px] w-full text-left text-sm" aria-label="Candidate Evaluations">
+                    <thead>
+                      <tr className="border-b border-border text-foreground/70">
+                        <th className="px-3 py-2">Candidate</th>
+                        <th className="px-3 py-2">Quality</th>
+                        <th className="px-3 py-2">Coach Summary</th>
+                        <th className="px-3 py-2">Tournament Rank</th>
+                        <th className="px-3 py-2">Promotion Eligible</th>
+                        <th className="px-3 py-2">Status</th>
+                      </tr>
+                    </thead>
+                    <tbody>
+                      {candidateEvaluations.map((evaluation) => {
+                        const candidate = researchCandidates.find((item) => item.candidate_id === evaluation.candidate_id);
+                        return (
+                          <tr key={evaluation.evaluation_id} className="border-b border-border/60">
+                            <td className="px-3 py-3 font-semibold text-foreground/90">{candidate?.strategy_name ?? evaluation.candidate_id}</td>
+                            <td className="px-3 py-3">{evaluation.decision_quality_score}</td>
+                            <td className="px-3 py-3 text-xs text-foreground/75">{evaluation.ai_coach_summary}</td>
+                            <td className="px-3 py-3">{evaluation.tournament_rank ?? "n/a"}</td>
+                            <td className="px-3 py-3">{evaluation.promotion_eligible ? "Yes" : "No"}</td>
+                            <td className="px-3 py-3">{candidate?.status ?? "PROPOSED"}</td>
+                          </tr>
+                        );
+                      })}
+                    </tbody>
+                  </table>
+                </div>
+              ) : (
+                <p className="mt-2 text-sm text-foreground/65">No candidate evaluations available yet.</p>
+              )}
+            </div>
           </div>
         ) : (
           <div className="mt-4 rounded-md border border-dashed border-border/70 bg-background/40 px-3 py-3 text-sm text-foreground/60">
             No research agents or candidate strategies are available yet.
-          </div>
-        )}
-      </section>
-
-      <section className="rounded-xl border border-border bg-background/60 p-4 sm:p-5" aria-labelledby="candidate-evaluations-heading">
-        <div className="flex flex-wrap items-end justify-between gap-3">
-          <div>
-            <h3 id="candidate-evaluations-heading" className="text-base font-semibold">Candidate Evaluations</h3>
-            <p className="mt-1 text-xs text-foreground/70">Research candidate evaluation evidence routed through deterministic pipeline stages.</p>
-          </div>
-          <div className="flex flex-wrap gap-2 text-xs">
-            <span className="rounded-full border border-sky-500/40 bg-sky-500/10 px-3 py-1 font-semibold text-sky-100">Research Only</span>
-            <span className="rounded-full border border-amber-500/40 bg-amber-500/10 px-3 py-1 font-semibold text-amber-100">Promotion Disabled</span>
-          </div>
-        </div>
-
-        {candidateEvaluations.length > 0 ? (
-          <div className="mt-4 overflow-x-auto">
-            <table className="min-w-[980px] w-full text-left text-sm" aria-label="Candidate Evaluations">
-              <thead>
-                <tr className="border-b border-border text-foreground/70">
-                  <th className="px-3 py-2">Candidate</th>
-                  <th className="px-3 py-2">Replay</th>
-                  <th className="px-3 py-2">Quality</th>
-                  <th className="px-3 py-2">Coach</th>
-                  <th className="px-3 py-2">Tournament Rank</th>
-                  <th className="px-3 py-2">Promotion Eligible</th>
-                  <th className="px-3 py-2">Status</th>
-                </tr>
-              </thead>
-              <tbody>
-                {candidateEvaluations.map((evaluation) => {
-                  const candidate = researchCandidates.find((item) => item.candidate_id === evaluation.candidate_id);
-                  return (
-                    <tr key={evaluation.evaluation_id} className="border-b border-border/60">
-                      <td className="px-3 py-3 font-semibold text-foreground/90">{candidate?.strategy_name ?? evaluation.candidate_id}</td>
-                      <td className="px-3 py-3">{evaluation.replay_status}</td>
-                      <td className="px-3 py-3">{evaluation.decision_quality_score}</td>
-                      <td className="px-3 py-3 text-xs text-foreground/75">{evaluation.ai_coach_summary}</td>
-                      <td className="px-3 py-3">{evaluation.tournament_rank ?? "n/a"}</td>
-                      <td className="px-3 py-3">{evaluation.promotion_eligible ? "Yes" : "No"}</td>
-                      <td className="px-3 py-3">{candidate?.status ?? "PROPOSED"}</td>
-                    </tr>
-                  );
-                })}
-              </tbody>
-            </table>
-          </div>
-        ) : (
-          <div className="mt-4 rounded-md border border-dashed border-border/70 bg-background/40 px-3 py-3 text-sm text-foreground/60">
-            No candidate evaluations available yet.
           </div>
         )}
       </section>

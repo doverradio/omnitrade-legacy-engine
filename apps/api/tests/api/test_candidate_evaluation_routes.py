@@ -36,3 +36,41 @@ def test_evaluate_candidate_route_returns_not_found_for_unknown_candidate() -> N
     payload = response.json()
     assert payload["error"]["code"] == "not_found"
     assert payload["error"]["message"] == "Strategy candidate not found"
+
+
+def test_evaluate_candidates_route_returns_batch_evaluations() -> None:
+    app = create_app()
+    candidates = list_generated_strategy_candidates()
+
+    with TestClient(app) as client:
+        response = client.post(
+            "/research/evaluate-candidates",
+            json={
+                "candidate_ids": [str(candidates[0].candidate_id), str(candidates[1].candidate_id)],
+                "limit": 2,
+            },
+        )
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["evaluated_count"] == 2
+    assert len(payload["evaluations"]) == 2
+    assert payload["evaluations"][0]["candidate_id"] == str(candidates[0].candidate_id)
+    assert payload["evaluations"][0]["promotion_eligible"] is False
+
+
+def test_evaluate_candidates_route_returns_not_found_for_unknown_candidate() -> None:
+    app = create_app()
+
+    with TestClient(app) as client:
+        response = client.post(
+            "/research/evaluate-candidates",
+            json={
+                "candidate_ids": ["00000000-0000-0000-0000-000000000099"],
+            },
+        )
+
+    assert response.status_code == 404
+    payload = response.json()
+    assert payload["error"]["code"] == "not_found"
+    assert payload["error"]["message"] == "Strategy candidate not found"

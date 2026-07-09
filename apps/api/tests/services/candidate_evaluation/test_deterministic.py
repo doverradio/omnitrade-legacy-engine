@@ -6,6 +6,7 @@ import pytest
 
 from app.services.candidate_evaluation.deterministic import (
     CandidateNotFoundError,
+    build_candidate_evaluations_batch_v1,
     build_candidate_evaluation_v1,
     resolve_candidate_by_id_v1,
 )
@@ -47,4 +48,28 @@ def test_candidate_resolution_raises_for_missing_candidate() -> None:
         resolve_candidate_by_id_v1(
             candidate_id=uuid.UUID("00000000-0000-0000-0000-000000000099"),
             candidates=list(candidates),
+        )
+
+
+def test_candidate_batch_evaluation_respects_limit() -> None:
+    candidates = list(list_generated_strategy_candidates())
+
+    evaluations = build_candidate_evaluations_batch_v1(
+        candidates=candidates,
+        selected_candidate_ids=None,
+        limit=3,
+    )
+
+    assert len(evaluations) == 3
+    assert all(item.promotion_eligible is False for item in evaluations)
+
+
+def test_candidate_batch_evaluation_raises_for_missing_candidate() -> None:
+    candidates = list(list_generated_strategy_candidates())
+
+    with pytest.raises(CandidateNotFoundError):
+        build_candidate_evaluations_batch_v1(
+            candidates=candidates,
+            selected_candidate_ids=[uuid.UUID("00000000-0000-0000-0000-000000000099")],
+            limit=None,
         )
