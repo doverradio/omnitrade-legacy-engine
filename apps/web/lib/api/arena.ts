@@ -305,6 +305,25 @@ export type CandidateBatchEvaluationResponse = {
   evaluations: CandidateEvaluation[];
 };
 
+export type ResearchLaboratoryRun = {
+  laboratory_run_id: string;
+  started_at: string;
+  completed_at: string | null;
+  participating_agents: string[];
+  generated_candidates: number;
+  evaluated_candidates: number;
+  status: string;
+};
+
+export type ResearchLaboratoryStatus = {
+  status: string;
+  registered_agents: string[];
+  last_run: ResearchLaboratoryRun | null;
+  candidates_generated: number;
+  candidates_evaluated: number;
+  success_rate: string;
+};
+
 async function requestJson<T>(path: string, init?: RequestInit): Promise<T> {
   const headers = new Headers(init?.headers);
   headers.set("Content-Type", "application/json");
@@ -445,5 +464,15 @@ export async function evaluateCandidates(request: CandidateBatchEvaluationReques
   return requestJson<CandidateBatchEvaluationResponse>("/research/evaluate-candidates", {
     method: "POST",
     body: JSON.stringify(request),
+  });
+}
+
+export async function getResearchLaboratoryStatus(): Promise<ResearchLaboratoryStatus> {
+  return requestJson<ResearchLaboratoryStatus>("/research/laboratory");
+}
+
+export async function runResearchLaboratory(): Promise<ResearchLaboratoryRun> {
+  return requestJson<ResearchLaboratoryRun>("/research/laboratory/run", {
+    method: "POST",
   });
 }

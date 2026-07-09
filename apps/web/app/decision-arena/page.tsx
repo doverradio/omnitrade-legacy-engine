@@ -11,9 +11,11 @@ import {
   getDecisionArenaTournament,
   getResearchAgents,
   getResearchCandidates,
+  getResearchLaboratoryStatus,
   evaluateReplayResult,
   getDecisionIntelligenceRecommendation,
   replayDecisionPackage,
+  runResearchLaboratory,
   type AICoachObservation,
   type CandidateBatchEvaluationResponse,
   type CapitalAllocationRecommendation,
@@ -23,6 +25,7 @@ import {
   type ReplayResult,
   type ResearchAgent,
   type StrategyCandidate,
+  type ResearchLaboratoryStatus,
   type TournamentResponse,
 } from "@/lib/api/arena";
 
@@ -104,6 +107,9 @@ export default function DecisionArenaPage() {
   const [candidateBatchSummary, setCandidateBatchSummary] = useState<CandidateBatchEvaluationResponse | null>(null);
   const [evaluatingCandidates, setEvaluatingCandidates] = useState(false);
   const [candidateEvaluationError, setCandidateEvaluationError] = useState<string | null>(null);
+  const [laboratoryStatus, setLaboratoryStatus] = useState<ResearchLaboratoryStatus | null>(null);
+  const [laboratoryRunning, setLaboratoryRunning] = useState(false);
+  const [laboratoryError, setLaboratoryError] = useState<string | null>(null);
   const [replayError, setReplayError] = useState<string | null>(null);
 
   useEffect(() => {
@@ -113,12 +119,13 @@ export default function DecisionArenaPage() {
       setLoading(true);
       setError(null);
       try {
-        const [payload, recommendation, allocation, agents, candidates] = await Promise.all([
+        const [payload, recommendation, allocation, agents, candidates, laboratory] = await Promise.all([
           getDecisionArenaTournament(),
           getDecisionIntelligenceRecommendation(),
           getCapitalAllocationRecommendation(),
           getResearchAgents(),
           getResearchCandidates(),
+          getResearchLaboratoryStatus(),
         ]);
 
         if (active) {
@@ -129,6 +136,7 @@ export default function DecisionArenaPage() {
           setResearchCandidates(candidates);
           setCandidateEvaluations([]);
           setCandidateBatchSummary(null);
+          setLaboratoryStatus(laboratory);
         }
       } catch (fetchError) {
         if (active) {
@@ -197,6 +205,20 @@ export default function DecisionArenaPage() {
       setCandidateEvaluationError(errorMessage(batchError, "Failed to evaluate candidates."));
     } finally {
       setEvaluatingCandidates(false);
+    }
+  }
+
+  async function handleRunLaboratory() {
+    setLaboratoryError(null);
+    setLaboratoryRunning(true);
+    try {
+      await runResearchLaboratory();
+      const refreshedStatus = await getResearchLaboratoryStatus();
+      setLaboratoryStatus(refreshedStatus);
+    } catch (runError) {
+      setLaboratoryError(errorMessage(runError, "Failed to run research laboratory."));
+    } finally {
+      setLaboratoryRunning(false);
     }
   }
 
@@ -481,6 +503,63 @@ export default function DecisionArenaPage() {
         ) : (
           <div className="mt-4 rounded-md border border-dashed border-border/70 bg-background/40 px-3 py-3 text-sm text-foreground/60">
             No research agents or candidate strategies are available yet.
+          </div>
+        )}
+      </section>
+
+      <section className="rounded-xl border border-border bg-background/60 p-4 sm:p-5" aria-labelledby="research-laboratory-heading">
+        <div className="flex flex-wrap items-end justify-between gap-3">
+          <div>
+            <h3 id="research-laboratory-heading" className="text-base font-semibold">Research Laboratory</h3>
+            <p className="mt-1 text-xs text-foreground/70">Central deterministic coordinator for multi-agent research runs.</p>
+          </div>
+          <button
+            type="button"
+            onClick={() => {
+              void handleRunLaboratory();
+            }}
+            disabled={laboratoryRunning}
+            className="rounded border border-indigo-500/40 bg-indigo-500/10 px-3 py-1 text-xs font-semibold text-indigo-100 disabled:cursor-not-allowed disabled:opacity-50"
+          >
+            {laboratoryRunning ? "Running..." : "Run Laboratory"}
+          </button>
+        </div>
+
+        {laboratoryError ? (
+          <div className="mt-3 rounded-md border border-red-500/50 bg-red-500/10 px-3 py-2 text-xs text-red-100" role="alert">
+            {laboratoryError}
+          </div>
+        ) : null}
+
+        {laboratoryStatus ? (
+          <div className="mt-4 grid gap-3 sm:grid-cols-2 lg:grid-cols-3">
+            <Metric label="Laboratory Status" value={laboratoryStatus.status} />
+            <Metric
+              label="Registered Agents"
+              value={
+                laboratoryStatus.registered_agents.length > 0
+                  ? laboratoryStatus.registered_agents.join(", ")
+                  : "None"
+              }
+            />
+            <Metric label="Last Run" value={formatWhen(laboratoryStatus.last_run?.completed_at ?? null)} />
+            <Metric label="Candidates Generated" value={String(laboratoryStatus.candidates_generated)} />
+            <Metric label="Candidates Evaluated" value={String(laboratoryStatus.candidates_evaluated)} />
+            <Metric label="Success Rate" value={laboratoryStatus.success_rate} />
+          </div>
+        ) : (
+          <div className="mt-3 rounded-md border border-dashed border-border/70 bg-background/40 px-3 py-3 text-sm text-foreground/60">
+            No laboratory status available yet.
+          </div>
+        )}
+
+        {laboratoryStatus?.last_run ? (
+          <div className="mt-3 rounded-md border border-border/70 bg-background/40 px-3 py-2 text-xs text-foreground/70">
+            Last run included {laboratoryStatus.last_run.participating_agents.length} agent(s) and completed with status {laboratoryStatus.last_run.status}.
+          </div>
+        ) : (
+          <div className="mt-3 rounded-md border border-dashed border-border/70 bg-background/40 px-3 py-2 text-xs text-foreground/65">
+            No laboratory run has completed yet.
           </div>
         )}
       </section>

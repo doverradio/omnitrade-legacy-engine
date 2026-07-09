@@ -9,6 +9,7 @@ from app.schemas.candidate_evaluation import (
     CandidateEvaluationRequest,
     CandidateEvaluationResponse,
 )
+from app.schemas.research_laboratory import ResearchLaboratoryRunResponse, ResearchLaboratoryStatusResponse
 from app.schemas.research_agents import ResearchAgentResponse, StrategyCandidateResponse
 from app.services.candidate_evaluation.deterministic import (
     CandidateNotFoundError,
@@ -17,6 +18,7 @@ from app.services.candidate_evaluation.deterministic import (
     resolve_candidate_by_id_v1,
 )
 from app.services.research_agents.registry import list_generated_strategy_candidates, list_registered_research_agents
+from app.services.research_laboratory.registry import get_research_laboratory
 
 router = APIRouter(prefix="/research", tags=["research"])
 
@@ -111,4 +113,45 @@ async def evaluate_candidates(request: CandidateBatchEvaluationRequest) -> Candi
             )
             for item in evaluations
         ],
+    )
+
+
+@router.get("/laboratory", response_model=ResearchLaboratoryStatusResponse)
+async def get_research_laboratory_status() -> ResearchLaboratoryStatusResponse:
+    laboratory = get_research_laboratory()
+    status = laboratory.get_status()
+    return ResearchLaboratoryStatusResponse(
+        status=status.status,
+        registered_agents=list(status.registered_agents),
+        last_run=(
+            None
+            if status.last_run is None
+            else ResearchLaboratoryRunResponse(
+                laboratory_run_id=status.last_run.laboratory_run_id,
+                started_at=status.last_run.started_at,
+                completed_at=status.last_run.completed_at,
+                participating_agents=list(status.last_run.participating_agents),
+                generated_candidates=status.last_run.generated_candidates,
+                evaluated_candidates=status.last_run.evaluated_candidates,
+                status=status.last_run.status,
+            )
+        ),
+        candidates_generated=status.candidates_generated,
+        candidates_evaluated=status.candidates_evaluated,
+        success_rate=status.success_rate,
+    )
+
+
+@router.post("/laboratory/run", response_model=ResearchLaboratoryRunResponse)
+async def run_research_laboratory() -> ResearchLaboratoryRunResponse:
+    laboratory = get_research_laboratory()
+    run = laboratory.run()
+    return ResearchLaboratoryRunResponse(
+        laboratory_run_id=run.laboratory_run_id,
+        started_at=run.started_at,
+        completed_at=run.completed_at,
+        participating_agents=list(run.participating_agents),
+        generated_candidates=run.generated_candidates,
+        evaluated_candidates=run.evaluated_candidates,
+        status=run.status,
     )
