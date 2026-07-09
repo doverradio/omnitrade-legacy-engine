@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useMemo, useRef, useState, type ReactNode } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from "react";
 
 import ValidationRunTimeline, { type TimelineQuery } from "@/components/domain/ValidationRunTimeline";
 import {
@@ -149,7 +149,7 @@ export default function ValidationRunsPage() {
   const [error, setError] = useState<string | null>(null);
   const [success, setSuccess] = useState<string | null>(null);
 
-  const activeRunPanelRef = useRef<HTMLElement | null>(null);
+  const activeRunPanelRef = useRef<HTMLDivElement | null>(null);
 
   const activeRuns = useMemo(() => runs.filter((item) => item.status === "RUNNING"), [runs]);
   const historyRuns = useMemo(() => runs.filter((item) => item.status !== "RUNNING"), [runs]);
@@ -160,7 +160,7 @@ export default function ValidationRunsPage() {
     return runs.find((item) => item.validation_run_id === selectedRunId) ?? null;
   }, [runs, selectedRunId]);
 
-  async function loadTimeline(runId: string, reset: boolean): Promise<ValidationRunEventListResponse> {
+  const loadTimeline = useCallback(async (runId: string, reset: boolean): Promise<ValidationRunEventListResponse> => {
     setTimelineLoading(true);
     try {
       const page = reset ? 1 : timelinePage + 1;
@@ -180,9 +180,9 @@ export default function ValidationRunsPage() {
     } finally {
       setTimelineLoading(false);
     }
-  }
+  }, [timelinePage, timelineQuery]);
 
-  async function refreshAll() {
+  const refreshAll = useCallback(async () => {
     const list = await getValidationRuns();
     setRuns(list.items);
 
@@ -227,7 +227,7 @@ export default function ValidationRunsPage() {
       setTimelinePage(1);
       setTimelineHasMore(false);
     }
-  }
+  }, [selectedRunId, timelineQuery]);
 
   useEffect(() => {
     let active = true;
@@ -253,7 +253,7 @@ export default function ValidationRunsPage() {
     return () => {
       active = false;
     };
-  }, []);
+  }, [refreshAll]);
 
   useEffect(() => {
     if (!selectedRunId) {
@@ -264,7 +264,7 @@ export default function ValidationRunsPage() {
     void loadTimeline(selectedRunId, true).catch((timelineError) => {
       setError(errorMessage(timelineError, "Failed to load validation run timeline."));
     });
-  }, [selectedRunId, timelineQuery]);
+  }, [loadTimeline, selectedRunId, timelineQuery]);
 
   useEffect(() => {
     const intervalMs = activeRuns.length > 0 ? 5000 : 15000;
@@ -284,7 +284,7 @@ export default function ValidationRunsPage() {
     return () => {
       window.clearInterval(timer);
     };
-  }, [activeRuns.length, selectedRunId, timelineQuery]);
+  }, [activeRuns.length, loadTimeline, refreshAll, selectedRunId, timelineQuery]);
 
   const effectiveDuration = durationPreset === "custom" ? Number(customDuration) : Number(durationPreset);
 
