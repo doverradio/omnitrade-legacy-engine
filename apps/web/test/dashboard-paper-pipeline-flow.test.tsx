@@ -43,6 +43,7 @@ function installFetchMock(scenario: Scenario) {
         latest_rejection_reason: null,
         latest_updated_at: null,
         recent_activity: [],
+        strategy_metrics: [],
       });
     }
 
@@ -70,6 +71,14 @@ function installFetchMock(scenario: Scenario) {
             created_at: "2026-07-08T12:00:00Z",
           },
         ],
+        strategy_metrics: [
+          {
+            strategy_name: "MA Crossover",
+            signals: 4,
+            trades: 0,
+            decision_records: 4,
+          },
+        ],
       });
     }
 
@@ -94,6 +103,20 @@ function installFetchMock(scenario: Scenario) {
           status: "executed",
           reason: null,
           created_at: "2026-07-08T12:00:00Z",
+        },
+      ],
+      strategy_metrics: [
+        {
+          strategy_name: "MA Crossover",
+          signals: 20,
+          trades: 1,
+          decision_records: 20,
+        },
+        {
+          strategy_name: "RSI Mean Reversion",
+          signals: 16,
+          trades: 0,
+          decision_records: 16,
         },
       ],
     });
@@ -126,6 +149,12 @@ describe("PaperPipelineFlow", () => {
     expect(screen.getByText("executed")).toBeInTheDocument();
     expect(screen.getByText("trade: yes")).toBeInTheDocument();
     expect(screen.getByText("Reason: -")).toBeInTheDocument();
+    expect(screen.getByText("Paper Pipeline by Strategy")).toBeInTheDocument();
+    expect(screen.getAllByText("MA Crossover").length).toBeGreaterThan(0);
+    expect(screen.getByText("RSI Mean Reversion")).toBeInTheDocument();
+    expect(screen.getAllByText("Signals").length).toBeGreaterThan(0);
+    expect(screen.getAllByText("Trades").length).toBeGreaterThan(0);
+    expect(screen.getAllByText("Decision Records").length).toBeGreaterThan(0);
   });
 
   it("renders empty-state pipeline with no recent activity", async () => {
@@ -141,6 +170,7 @@ describe("PaperPipelineFlow", () => {
     expect(screen.getByText("No recent signals in this window.")).toBeInTheDocument();
     expect(screen.getByText("Waiting for market data")).toBeInTheDocument();
     expect(screen.getByText("None")).toBeInTheDocument();
+    expect(screen.getByText("No active strategy pipeline metrics yet.")).toBeInTheDocument();
   });
 
   it("surfaces rejected state and blocking-safe summary", async () => {

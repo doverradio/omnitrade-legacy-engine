@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import uuid
 from collections import Counter, defaultdict
+from datetime import datetime, timezone
 from decimal import Decimal
 from typing import Any
 
@@ -21,6 +22,7 @@ from app.schemas.decision_intelligence import DecisionIntelligenceRecommendation
 from app.schemas.decision_quality import DecisionQualityEvaluationRequest, DecisionQualityResultResponse
 from app.schemas.arena import StrategyArenaScoreboardItem, StrategyArenaScoreboardResponse
 from app.schemas.replay_agent import ReplayRequest, ReplayResultResponse, ReplayAgentCapabilityResponse, ReplayAgentRegistrationResponse
+from app.schemas.strategy_health import StrategyHealthItemResponse, StrategyHealthResponse
 from app.schemas.tournament import TournamentRankingEntryResponse, TournamentResponse
 from app.services.ai_coach.deterministic import evaluate_decision_quality_v0
 from app.services.capital_allocation.deterministic import build_capital_allocation_recommendation_v1
@@ -509,6 +511,90 @@ async def get_capital_allocation(db: AsyncSession = Depends(get_db)) -> CapitalA
             for item in allocation.allocations
         ],
     )
+
+
+@router.get("/strategy-health", response_model=StrategyHealthResponse)
+async def get_strategy_health(db: AsyncSession = Depends(get_db)) -> StrategyHealthResponse:
+    strategies = (
+        await db.execute(select(Strategy).order_by(Strategy.is_active.desc(), Strategy.name.asc(), Strategy.created_at.asc()))
+    ).scalars().all()
+    if not strategies:
+        return StrategyHealthResponse(items=[])
+
+    strategy_ids = [strategy.id for strategy in strategies]
+    signals = (
+        await db.execute(
+            select(Signal)
+            .where(Signal.strategy_id.in_(strategy_ids))
+            .order_by(Signal.signal_time.asc(), Signal.id.asc())
+        )
+    ).scalars().all()
+    signal_ids_by_strategy: dict[uuid.UUID, set[uuid.UUID]] = defaultdict(set)
+    signals_by_strategy: dict[uuid.UUID, list[Signal]] = defaultdict(list)
+    for signal in signals:
+        signal_ids_by_strategy[signal.strategy_id].add(signal.id)
+        signals_by_strategy[signal.strategy_id].append(signal)
+
+    trades = (
+        await db.execute(
+            select(Trade)
+            .where(Trade.is_paper.is_(True))
+            .where(Trade.signal_id.is_not(None))
+            .order_by(Trade.executed_at.asc(), Trade.id.asc())
+        )
+    ).scalars().all()
+    decision_records = (await db.execute(select(DecisionRecord).order_by(DecisionRecord.timestamp.asc()))).scalars().all()
+
+    now = datetime.now(timezone.utc)
+    today_start = now.replace(hour=0, minute=0, second=0, microsecond=0)
+
+    items: list[StrategyHealthItemResponse] = []
+    for strategy in strategies:
+        strategy_signal_ids = signal_ids_by_strategy.get(strategy.id, set())
+        strategy_signals = signals_by_strategy.get(strategy.id, [])
+        strategy_trades = [trade for trade in trades if trade.signal_id in strategy_signal_ids]
+        strategy_decision_records = [
+            record
+            for record in decision_records
+            if _decision_record_matches_strategy(record, strategy, strategy_signal_ids)
+        ]
+
+        signals_today = sum(
+            1
+            for signal in strategy_signals
+            if (signal.signal_time.tzinfo is not None and signal.signal_time.astimezone(timezone.utc) >= today_start)
+            or (signal.signal_time.tzinfo is None and signal.signal_time >= today_start.replace(tzinfo=None))
+        )
+        decision_records_today = sum(
+            1
+            for record in strategy_decision_records
+            if (record.timestamp.tzinfo is not None and record.timestamp.astimezone(timezone.utc) >= today_start)
+            or (record.timestamp.tzinfo is None and record.timestamp >= today_start.replace(tzinfo=None))
+        )
+
+        if not strategy.is_active:
+            status = "disabled"
+        elif signals_today == 0 and decision_records_today == 0:
+            status = "idle"
+        else:
+            status = "active"
+
+        last_signal_time = max((signal.signal_time for signal in strategy_signals), default=None)
+        last_trade_time = max((trade.executed_at for trade in strategy_trades), default=None)
+
+        items.append(
+            StrategyHealthItemResponse(
+                strategy_name=strategy.name,
+                enabled=strategy.is_active,
+                last_signal_time=last_signal_time,
+                last_trade_time=last_trade_time,
+                signals_today=signals_today,
+                decision_records_today=decision_records_today,
+                status=status,
+            )
+        )
+
+    return StrategyHealthResponse(items=items)
 
 
 async def _load_latest_prices_by_asset_id(*, db: AsyncSession, asset_ids: list[uuid.UUID]) -> dict[uuid.UUID, Decimal]:

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import logging
 import uuid
+from collections import defaultdict
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 
@@ -20,6 +21,7 @@ from app.models.paper_account import PaperAccount
 from app.models.risk_event import RiskEvent
 from app.models.risk_kill_switch import RiskKillSwitch
 from app.models.signal import Signal
+from app.models.strategy import Strategy
 from app.models.trade import Trade
 from app.schemas.paper import (
     CreatePaperAccountRequest,
@@ -35,6 +37,7 @@ from app.schemas.paper import (
     PaperTradeHistoryItem,
     PaperTradeHistoryResponse,
     PaperStrategyPerformanceSummary,
+    StrategyPipelineMetricsItem,
     PipelineActivityItem,
     PaperTradeListResponse,
     PaperTradeResponse,
@@ -60,6 +63,14 @@ _MAX_PIPELINE_WINDOW_MINUTES = 1440
 _DEFAULT_EQUITY_WINDOW_MINUTES = 720
 _DEFAULT_EQUITY_INTERVAL_MINUTES = 15
 _MAX_EQUITY_INTERVAL_MINUTES = 240
+
+
+def _is_uuid(value: str) -> bool:
+    try:
+        uuid.UUID(value)
+    except ValueError:
+        return False
+    return True
 
 
 @router.get("/account", response_model=PaperAccountResponse)
@@ -438,6 +449,95 @@ async def get_paper_pipeline_health(
 
     latest_updated_at = await _resolve_latest_update_timestamp(db=db, window_start=window_start)
 
+    active_strategies = (
+        await db.execute(
+            select(Strategy)
+            .where(Strategy.is_active.is_(True))
+            .order_by(Strategy.name.asc(), Strategy.created_at.asc())
+        )
+    ).scalars().all()
+    strategy_ids = [strategy.id for strategy in active_strategies]
+
+    strategy_signals = (
+        await db.execute(
+            select(Signal.id, Signal.strategy_id)
+            .where(Signal.strategy_id.in_(strategy_ids))
+            .where(Signal.created_at >= window_start)
+            .order_by(Signal.created_at.desc(), Signal.id.desc())
+        )
+    ).all() if strategy_ids else []
+    signal_count_by_strategy: dict[uuid.UUID, int] = defaultdict(int)
+    signal_to_strategy: dict[uuid.UUID, uuid.UUID] = {}
+    for signal_id, strategy_id in strategy_signals:
+        signal_count_by_strategy[strategy_id] += 1
+        signal_to_strategy[signal_id] = strategy_id
+
+    strategy_trades = (
+        await db.execute(
+            select(Trade.signal_id)
+            .where(Trade.created_at >= window_start)
+            .where(Trade.is_paper.is_(True))
+            .where(Trade.signal_id.is_not(None))
+            .order_by(Trade.created_at.desc(), Trade.id.desc())
+        )
+    ).all()
+    missing_trade_signal_ids = sorted(
+        {
+            signal_id
+            for (signal_id,) in strategy_trades
+            if signal_id is not None and signal_id not in signal_to_strategy
+        },
+        key=str,
+    )
+    if missing_trade_signal_ids:
+        lookup_rows = (
+            await db.execute(
+                select(Signal.id, Signal.strategy_id)
+                .where(Signal.id.in_(missing_trade_signal_ids))
+            )
+        ).all()
+        for signal_id, strategy_id in lookup_rows:
+            signal_to_strategy[signal_id] = strategy_id
+
+    trade_count_by_strategy: dict[uuid.UUID, int] = defaultdict(int)
+    for (signal_id,) in strategy_trades:
+        if signal_id is None:
+            continue
+        strategy_id = signal_to_strategy.get(signal_id)
+        if strategy_id is None:
+            continue
+        trade_count_by_strategy[strategy_id] += 1
+
+    decision_records_window = (
+        await db.execute(
+            select(DecisionRecord)
+            .where(DecisionRecord.timestamp >= window_start)
+            .order_by(DecisionRecord.timestamp.desc(), DecisionRecord.decision_id.desc())
+        )
+    ).scalars().all()
+    decision_count_by_strategy: dict[uuid.UUID, int] = defaultdict(int)
+    for record in decision_records_window:
+        signal_ids = [item.get("signal_id") for item in (record.generated_signals or []) if isinstance(item, dict)]
+        matched_strategy_ids = {
+            signal_to_strategy[uuid.UUID(signal_id)]
+            for signal_id in signal_ids
+            if isinstance(signal_id, str)
+            and _is_uuid(signal_id)
+            and uuid.UUID(signal_id) in signal_to_strategy
+        }
+        for strategy_id in matched_strategy_ids:
+            decision_count_by_strategy[strategy_id] += 1
+
+    strategy_metrics = [
+        StrategyPipelineMetricsItem(
+            strategy_name=strategy.name,
+            signals=signal_count_by_strategy.get(strategy.id, 0),
+            trades=trade_count_by_strategy.get(strategy.id, 0),
+            decision_records=decision_count_by_strategy.get(strategy.id, 0),
+        )
+        for strategy in active_strategies
+    ]
+
     return PaperPipelineHealthResponse(
         window_minutes=window_minutes,
         candles=candles,
@@ -453,6 +553,7 @@ async def get_paper_pipeline_health(
         latest_rejection_reason=latest_rejection_reason,
         latest_updated_at=latest_updated_at,
         recent_activity=recent_activity,
+        strategy_metrics=strategy_metrics,
     )
 
 

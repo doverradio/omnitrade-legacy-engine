@@ -206,6 +206,13 @@ class PipelineActivityItem(BaseModel):
     created_at: datetime
 
 
+class StrategyPipelineMetricsItem(BaseModel):
+    strategy_name: str
+    signals: int
+    trades: int
+    decision_records: int
+
+
 class PaperPipelineHealthResponse(BaseModel):
     window_minutes: int
     candles: int
@@ -221,6 +228,7 @@ class PaperPipelineHealthResponse(BaseModel):
     latest_rejection_reason: str | None = None
     latest_updated_at: datetime | None = None
     recent_activity: list[PipelineActivityItem]
+    strategy_metrics: list[StrategyPipelineMetricsItem] = []
 
 
 class PaperLatestTradeSummary(BaseModel):

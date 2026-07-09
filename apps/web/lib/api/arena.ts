@@ -249,6 +249,20 @@ export type CapitalAllocationRecommendation = {
   allocations: CapitalAllocationEntry[];
 };
 
+export type StrategyHealthItem = {
+  strategy_name: string;
+  enabled: boolean;
+  last_signal_time: string | null;
+  last_trade_time: string | null;
+  signals_today: number;
+  decision_records_today: number;
+  status: string;
+};
+
+export type StrategyHealthResponse = {
+  items: StrategyHealthItem[];
+};
+
 async function requestJson<T>(path: string, init?: RequestInit): Promise<T> {
   const headers = new Headers(init?.headers);
   headers.set("Content-Type", "application/json");
@@ -364,4 +378,8 @@ export async function getDecisionArenaTournament(): Promise<TournamentResponse> 
 
 export async function getCapitalAllocationRecommendation(): Promise<CapitalAllocationRecommendation> {
   return requestJson<CapitalAllocationRecommendation>("/arena/capital-allocation");
+}
+
+export async function getStrategyHealth(): Promise<StrategyHealthResponse> {
+  return requestJson<StrategyHealthResponse>("/arena/strategy-health");
 }

@@ -15,14 +15,21 @@ from app.core.logging import setup_logging
 from app.db.session import AsyncSessionLocal
 from app.models.asset import Asset
 from app.models.candle import Candle
+from app.models.decision_record import DecisionRecord
 from app.models.paper_account import PaperAccount
 from app.models.parameter_set import ParameterSet
 from app.models.signal import Signal as SignalModel
 from app.models.strategy import Strategy as StrategyModel
+from app.services.ai_coach.deterministic import evaluate_decision_quality_v0
 from app.services.data.binance_client import BinanceUSClient
 from app.services.data.http_client import AsyncHTTPClient
+from app.services.decision_quality.deterministic import evaluate_replay_result_v0
+from app.services.decisions.ingestion import build_signal_idempotency_key
+from app.services.decisions.package import DecisionPackageBuilder
 from app.services.data.worker_entrypoint import run_ingestion_cycle
 from app.services.decisions.ingestion import ingest_decision_records
+from app.services.replay.default_agent import ReplayPackageNotFoundError, replay_decision_package_v0
+from app.services.replay.identifiers import build_decision_package_id
 from app.services.signals.execution_orchestrator import SignalExecutionRequest, orchestrate_paper_signal_execution
 from app.services.strategies import StrategyContext, strategy_registry
 from app.services.strategies.registry import StrategyLookupError
@@ -146,6 +153,45 @@ async def _signal_exists(
     return result.scalars().first() is not None
 
 
+async def _load_decision_record_for_signal(
+    *,
+    db: AsyncSession,
+    signal_id: uuid.UUID,
+) -> DecisionRecord | None:
+    idempotency_key = build_signal_idempotency_key(signal_id)
+    result = await db.execute(
+        select(DecisionRecord)
+        .where(DecisionRecord.idempotency_key == idempotency_key)
+        .limit(1)
+    )
+    return result.scalars().first()
+
+
+async def _produce_research_evidence(
+    *,
+    db: AsyncSession,
+    decision_package_builder: DecisionPackageBuilder,
+    decision_record: DecisionRecord,
+) -> None:
+    package = await decision_package_builder.build_decision_package(db=db, decision_id=decision_record.decision_id)
+    if package is None:
+        return
+
+    decision_package_id = build_decision_package_id(
+        decision_id=package.decision_id,
+        package_hash=package.content_hash,
+        package_version=package.schema_version,
+    )
+
+    try:
+        replay_result = await replay_decision_package_v0(db=db, decision_package_id=decision_package_id)
+    except ReplayPackageNotFoundError:
+        return
+
+    quality_result = evaluate_replay_result_v0(replay_result=replay_result)
+    _ = evaluate_decision_quality_v0(decision_quality_result=quality_result)
+
+
 def _to_strategy_context(
     *,
     candles: list[Candle],
@@ -211,8 +257,17 @@ async def run_orchestration_cycle(
     executions_attempted = 0
     executions_skipped = 0
     decision_inserted_total = 0
+    decision_package_builder = DecisionPackageBuilder()
 
     for strategy_row in strategies:
+        if not getattr(strategy_row, "is_active", True):
+            logger.info(
+                "paper_execution_skip reason=disabled_strategy strategy_id=%s strategy_slug=%s",
+                strategy_row.id,
+                strategy_row.slug,
+            )
+            continue
+
         try:
             strategy_impl = strategy_registry.get(strategy_row.slug)
         except StrategyLookupError:
@@ -281,7 +336,7 @@ async def run_orchestration_cycle(
                 strategy_id=strategy_row.id,
                 parameter_set_id=parameter_set.id,
                 asset_id=asset.id,
-                signal_time=generated.timestamp,
+                signal_time=signal_time,
                 action=generated.action,
                 raw_strength=generated.strength,
                 ai_confidence=generated.strength,
@@ -336,6 +391,14 @@ async def run_orchestration_cycle(
 
             decision_result = await ingest_decision_records(db=db, signal_ids=[signal_model.id])
             decision_inserted_total += decision_result.inserted_records
+
+            decision_record = await _load_decision_record_for_signal(db=db, signal_id=signal_model.id)
+            if decision_record is not None:
+                await _produce_research_evidence(
+                    db=db,
+                    decision_package_builder=decision_package_builder,
+                    decision_record=decision_record,
+                )
 
             await db.commit()
 

@@ -7,6 +7,7 @@ import {
   getPaperPipelineHealth,
   type PaperPipelineHealth,
   type PipelineActivity,
+  type StrategyPipelineMetric,
 } from "@/lib/api/paperAccounts";
 
 type StageTone = "green" | "yellow" | "red" | "gray";
@@ -294,6 +295,7 @@ export default function PaperPipelineFlow() {
   const stages = useMemo(() => toStages(data), [data]);
   const latestReason = data?.latest_rejection_reason ?? null;
   const activity = data?.recent_activity ?? [];
+  const strategyMetrics = data?.strategy_metrics ?? [];
   const summaryStatus = machineStatus(data);
 
   return (
@@ -383,6 +385,35 @@ export default function PaperPipelineFlow() {
           <p className="text-xs font-semibold uppercase tracking-wide text-foreground/80">Last updated</p>
           <p className="mt-2 text-sm text-foreground/90">{loading ? "Loading..." : formatWhen(lastFetchAt ?? data?.latest_updated_at)}</p>
         </div>
+      </div>
+
+      <div className="mt-4 rounded-md border border-border bg-background/40 p-3">
+        <p className="text-xs font-semibold uppercase tracking-wide text-foreground/80">Paper Pipeline by Strategy</p>
+        {strategyMetrics.length === 0 ? (
+          <p className="mt-2 text-sm text-foreground/70">No active strategy pipeline metrics yet.</p>
+        ) : (
+          <div className="mt-2 grid gap-2 md:grid-cols-2">
+            {strategyMetrics.map((item: StrategyPipelineMetric) => (
+              <article key={item.strategy_name} className="rounded border border-border/70 bg-background/60 p-2">
+                <p className="text-xs font-semibold text-foreground/90">{item.strategy_name}</p>
+                <div className="mt-1 grid grid-cols-3 gap-2 text-[11px] text-foreground/75">
+                  <div>
+                    <p className="uppercase tracking-wide text-foreground/60">Signals</p>
+                    <p className="text-sm font-medium text-foreground/90">{item.signals}</p>
+                  </div>
+                  <div>
+                    <p className="uppercase tracking-wide text-foreground/60">Trades</p>
+                    <p className="text-sm font-medium text-foreground/90">{item.trades}</p>
+                  </div>
+                  <div>
+                    <p className="uppercase tracking-wide text-foreground/60">Decision Records</p>
+                    <p className="text-sm font-medium text-foreground/90">{item.decision_records}</p>
+                  </div>
+                </div>
+              </article>
+            ))}
+          </div>
+        )}
       </div>
 
       <div className="mt-4 rounded-md border border-border bg-background/40 p-3">

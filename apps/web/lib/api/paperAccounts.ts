@@ -73,6 +73,13 @@ export type PipelineActivity = {
   created_at: string;
 };
 
+export type StrategyPipelineMetric = {
+  strategy_name: string;
+  signals: number;
+  trades: number;
+  decision_records: number;
+};
+
 export type PaperPipelineHealth = {
   window_minutes: number;
   candles: number;
@@ -88,6 +95,7 @@ export type PaperPipelineHealth = {
   latest_rejection_reason?: string | null;
   latest_updated_at?: string | null;
   recent_activity: PipelineActivity[];
+  strategy_metrics?: StrategyPipelineMetric[];
 };
 
 export type PaperPerformanceLatestTrade = {

@@ -70,7 +70,11 @@ def _asset() -> SimpleNamespace:
 
 
 def _strategy_row() -> SimpleNamespace:
-    return SimpleNamespace(id=uuid.uuid4(), slug="ma_crossover")
+    return SimpleNamespace(id=uuid.uuid4(), slug="ma_crossover", is_active=True)
+
+
+def _disabled_strategy_row() -> SimpleNamespace:
+    return SimpleNamespace(id=uuid.uuid4(), slug="rsi_mean_reversion", is_active=False)
 
 
 def _parameter_set() -> SimpleNamespace:
@@ -121,6 +125,8 @@ async def test_new_buy_signal_reaches_orchestrator(monkeypatch: pytest.MonkeyPat
 
     monkeypatch.setattr(worker_module, "run_ingestion_cycle", _fake_ingestion_cycle)
     monkeypatch.setattr(worker_module, "ingest_decision_records", _fake_decision_ingestion)
+    monkeypatch.setattr(worker_module, "_load_decision_record_for_signal", _async_return(None))
+    monkeypatch.setattr(worker_module, "_produce_research_evidence", _async_return(None))
     monkeypatch.setattr(worker_module, "_load_active_assets", _async_return([asset]))
     monkeypatch.setattr(worker_module, "_load_active_strategies", _async_return([strategy]))
     monkeypatch.setattr(worker_module, "_load_latest_parameter_set", _async_return(parameter_set))
@@ -137,6 +143,108 @@ async def test_new_buy_signal_reaches_orchestrator(monkeypatch: pytest.MonkeyPat
     assert stats.execution_candidates == 1
     assert stats.executions_attempted == 1
     assert stats.executions_skipped == 0
+
+
+@pytest.mark.asyncio
+async def test_one_enabled_strategy_generates_signal(monkeypatch: pytest.MonkeyPatch) -> None:
+    db = _FakeDB()
+    asset = _asset()
+    strategy = _strategy_row()
+    parameter_set = _parameter_set()
+
+    import app.services.orchestration.continuous_pipeline_worker as worker_module
+
+    monkeypatch.setattr(worker_module, "run_ingestion_cycle", _fake_ingestion_cycle)
+    monkeypatch.setattr(worker_module, "ingest_decision_records", _fake_decision_ingestion)
+    monkeypatch.setattr(worker_module, "_load_decision_record_for_signal", _async_return(None))
+    monkeypatch.setattr(worker_module, "_produce_research_evidence", _async_return(None))
+    monkeypatch.setattr(worker_module, "_load_decision_record_for_signal", _async_return(None))
+    monkeypatch.setattr(worker_module, "_produce_research_evidence", _async_return(None))
+    monkeypatch.setattr(worker_module, "_load_active_assets", _async_return([asset]))
+    monkeypatch.setattr(worker_module, "_load_active_strategies", _async_return([strategy]))
+    monkeypatch.setattr(worker_module, "_load_latest_parameter_set", _async_return(parameter_set))
+    monkeypatch.setattr(worker_module, "_load_latest_candles", _async_return(_candles(2)))
+    monkeypatch.setattr(worker_module, "_signal_exists", _async_return(False))
+    monkeypatch.setattr(worker_module, "_load_primary_account_by_asset_class", _async_return(None))
+    monkeypatch.setattr(worker_module.strategy_registry, "get", lambda slug: _FixedStrategy("hold"))
+
+    stats = await run_orchestration_cycle(db=db, client=object(), config=_config())
+
+    assert stats.signals_created == 1
+    generated_signals = [item for item in db.added if item.__class__.__name__ == "Signal"]
+    assert len(generated_signals) == 1
+    assert generated_signals[0].strategy_id == strategy.id
+
+
+@pytest.mark.asyncio
+async def test_two_enabled_strategies_each_generate_signal(monkeypatch: pytest.MonkeyPatch) -> None:
+    db = _FakeDB()
+    asset = _asset()
+    strategy_a = _strategy_row()
+    strategy_b = SimpleNamespace(id=uuid.uuid4(), slug="rsi_mean_reversion", is_active=True)
+    parameter_set_a = _parameter_set()
+    parameter_set_b = SimpleNamespace(id=uuid.uuid4(), params={"rsi_period": 14})
+
+    import app.services.orchestration.continuous_pipeline_worker as worker_module
+
+    monkeypatch.setattr(worker_module, "run_ingestion_cycle", _fake_ingestion_cycle)
+    monkeypatch.setattr(worker_module, "ingest_decision_records", _fake_decision_ingestion)
+    monkeypatch.setattr(worker_module, "_load_decision_record_for_signal", _async_return(None))
+    monkeypatch.setattr(worker_module, "_produce_research_evidence", _async_return(None))
+    monkeypatch.setattr(worker_module, "_load_decision_record_for_signal", _async_return(None))
+    monkeypatch.setattr(worker_module, "_produce_research_evidence", _async_return(None))
+    monkeypatch.setattr(worker_module, "_load_active_assets", _async_return([asset]))
+    monkeypatch.setattr(worker_module, "_load_active_strategies", _async_return([strategy_a, strategy_b]))
+
+    async def _load_parameter_set(*args, strategy_id, **kwargs):
+        if strategy_id == strategy_a.id:
+            return parameter_set_a
+        return parameter_set_b
+
+    monkeypatch.setattr(worker_module, "_load_latest_parameter_set", _load_parameter_set)
+    monkeypatch.setattr(worker_module, "_load_latest_candles", _async_return(_candles(2)))
+    monkeypatch.setattr(worker_module, "_signal_exists", _async_return(False))
+    monkeypatch.setattr(worker_module, "_load_primary_account_by_asset_class", _async_return(None))
+    monkeypatch.setattr(worker_module.strategy_registry, "get", lambda slug: _FixedStrategy("hold"))
+
+    stats = await run_orchestration_cycle(db=db, client=object(), config=_config())
+
+    assert stats.signals_created == 2
+    generated_signals = [item for item in db.added if item.__class__.__name__ == "Signal"]
+    strategy_ids = {item.strategy_id for item in generated_signals}
+    assert strategy_ids == {strategy_a.id, strategy_b.id}
+
+
+@pytest.mark.asyncio
+async def test_disabled_strategy_is_skipped(monkeypatch: pytest.MonkeyPatch) -> None:
+    db = _FakeDB()
+    asset = _asset()
+    enabled_strategy = _strategy_row()
+    disabled_strategy = _disabled_strategy_row()
+    parameter_set = _parameter_set()
+
+    import app.services.orchestration.continuous_pipeline_worker as worker_module
+
+    monkeypatch.setattr(worker_module, "run_ingestion_cycle", _fake_ingestion_cycle)
+    monkeypatch.setattr(worker_module, "ingest_decision_records", _fake_decision_ingestion)
+    monkeypatch.setattr(worker_module, "_load_decision_record_for_signal", _async_return(None))
+    monkeypatch.setattr(worker_module, "_produce_research_evidence", _async_return(None))
+    monkeypatch.setattr(worker_module, "_load_decision_record_for_signal", _async_return(None))
+    monkeypatch.setattr(worker_module, "_produce_research_evidence", _async_return(None))
+    monkeypatch.setattr(worker_module, "_load_active_assets", _async_return([asset]))
+    monkeypatch.setattr(worker_module, "_load_active_strategies", _async_return([enabled_strategy, disabled_strategy]))
+    monkeypatch.setattr(worker_module, "_load_latest_parameter_set", _async_return(parameter_set))
+    monkeypatch.setattr(worker_module, "_load_latest_candles", _async_return(_candles(2)))
+    monkeypatch.setattr(worker_module, "_signal_exists", _async_return(False))
+    monkeypatch.setattr(worker_module, "_load_primary_account_by_asset_class", _async_return(None))
+    monkeypatch.setattr(worker_module.strategy_registry, "get", lambda slug: _FixedStrategy("hold"))
+
+    stats = await run_orchestration_cycle(db=db, client=object(), config=_config())
+
+    assert stats.signals_created == 1
+    generated_signals = [item for item in db.added if item.__class__.__name__ == "Signal"]
+    assert len(generated_signals) == 1
+    assert generated_signals[0].strategy_id == enabled_strategy.id
 
 
 @pytest.mark.asyncio
@@ -157,6 +265,8 @@ async def test_new_buy_signal_without_account_logs_skip_reason(monkeypatch: pyte
 
     monkeypatch.setattr(worker_module, "run_ingestion_cycle", _fake_ingestion_cycle)
     monkeypatch.setattr(worker_module, "ingest_decision_records", _fake_decision_ingestion)
+    monkeypatch.setattr(worker_module, "_load_decision_record_for_signal", _async_return(None))
+    monkeypatch.setattr(worker_module, "_produce_research_evidence", _async_return(None))
     monkeypatch.setattr(worker_module, "_load_active_assets", _async_return([asset]))
     monkeypatch.setattr(worker_module, "_load_active_strategies", _async_return([strategy]))
     monkeypatch.setattr(worker_module, "_load_latest_parameter_set", _async_return(parameter_set))
@@ -189,6 +299,8 @@ async def test_new_hold_signal_logs_non_actionable_skip(monkeypatch: pytest.Monk
 
     monkeypatch.setattr(worker_module, "run_ingestion_cycle", _fake_ingestion_cycle)
     monkeypatch.setattr(worker_module, "ingest_decision_records", _fake_decision_ingestion)
+    monkeypatch.setattr(worker_module, "_load_decision_record_for_signal", _async_return(None))
+    monkeypatch.setattr(worker_module, "_produce_research_evidence", _async_return(None))
     monkeypatch.setattr(worker_module, "_load_active_assets", _async_return([asset]))
     monkeypatch.setattr(worker_module, "_load_active_strategies", _async_return([strategy]))
     monkeypatch.setattr(worker_module, "_load_latest_parameter_set", _async_return(parameter_set))
@@ -263,6 +375,8 @@ async def test_worker_logs_early_continue_reasons(
 
     monkeypatch.setattr(worker_module, "run_ingestion_cycle", _fake_ingestion_cycle)
     monkeypatch.setattr(worker_module, "ingest_decision_records", _fake_decision_ingestion)
+    monkeypatch.setattr(worker_module, "_load_decision_record_for_signal", _async_return(None))
+    monkeypatch.setattr(worker_module, "_produce_research_evidence", _async_return(None))
     monkeypatch.setattr(worker_module, "_load_active_assets", _async_return([asset]))
     monkeypatch.setattr(worker_module, "_load_active_strategies", _async_return([strategy]))
     monkeypatch.setattr(worker_module, "_load_latest_parameter_set", _async_return(parameter_set))
