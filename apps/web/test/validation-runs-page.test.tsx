@@ -287,6 +287,7 @@ describe("ValidationRunsPage", () => {
     });
 
     expect(screen.getByText("Active Validation Run")).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "View active run" })).toBeInTheDocument();
     expect(screen.getByText("45.50%")).toBeInTheDocument();
     expect(screen.getByText("Scorecard")).toBeInTheDocument();
     expect(screen.getByText("API Health")).toBeInTheDocument();
@@ -315,6 +316,10 @@ describe("ValidationRunsPage", () => {
         expect.stringContaining("/validation-runs"),
         expect.objectContaining({ method: "POST" }),
       );
+    });
+
+    await waitFor(() => {
+      expect(screen.getByText("Validation run started successfully.")).toBeInTheDocument();
     });
   });
 });

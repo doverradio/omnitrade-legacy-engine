@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 
 import ValidationRunTimeline, { type TimelineQuery } from "@/components/domain/ValidationRunTimeline";
 import {
@@ -99,8 +99,12 @@ export default function ValidationRunsPage() {
   const [expandedRunId, setExpandedRunId] = useState<string | null>(null);
 
   const [loading, setLoading] = useState(true);
-  const [submitting, setSubmitting] = useState(false);
+  const [starting, setStarting] = useState(false);
+  const [cancelling, setCancelling] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [success, setSuccess] = useState<string | null>(null);
+
+  const activeRunPanelRef = useRef<HTMLElement | null>(null);
 
   const activeRun = useMemo(() => runs.find((item) => item.status === "RUNNING") ?? null, [runs]);
   const selectedTimelineRunId = useMemo(() => {
@@ -226,9 +230,14 @@ export default function ValidationRunsPage() {
 
   const effectiveDuration = durationPreset === "custom" ? Number(customDuration) : Number(durationPreset);
 
+  function scrollToActiveRunPanel() {
+    activeRunPanelRef.current?.scrollIntoView({ behavior: "smooth", block: "start" });
+  }
+
   async function handleStartValidationRun() {
-    setSubmitting(true);
+    setStarting(true);
     setError(null);
+    setSuccess(null);
     try {
       const created = await createValidationRun({
         name: name.trim(),
@@ -241,23 +250,26 @@ export default function ValidationRunsPage() {
       });
       await startValidationRun(created.validation_run_id);
       await refreshAll();
+      setSuccess("Validation run started successfully.");
+      scrollToActiveRunPanel();
     } catch (submitError) {
       setError(errorMessage(submitError, "Failed to start validation run."));
     } finally {
-      setSubmitting(false);
+      setStarting(false);
     }
   }
 
   async function handleCancelRun(runId: string) {
-    setSubmitting(true);
+    setCancelling(true);
     setError(null);
+    setSuccess(null);
     try {
       await cancelValidationRun(runId);
       await refreshAll();
     } catch (cancelError) {
       setError(errorMessage(cancelError, "Failed to cancel validation run."));
     } finally {
-      setSubmitting(false);
+      setCancelling(false);
     }
   }
 
@@ -300,6 +312,12 @@ export default function ValidationRunsPage() {
       {error ? (
         <section className="rounded-md border border-rose-500/40 bg-rose-500/10 px-3 py-2 text-sm text-rose-100" role="alert">
           {error}
+        </section>
+      ) : null}
+
+      {success ? (
+        <section className="rounded-md border border-emerald-500/40 bg-emerald-500/10 px-3 py-2 text-sm text-emerald-100" role="status">
+          {success}
         </section>
       ) : null}
 
@@ -412,16 +430,27 @@ export default function ValidationRunsPage() {
           </div>
         </div>
 
-        <button
-          className="mt-4 rounded-md border border-emerald-500/40 bg-emerald-500/20 px-4 py-2 text-sm font-medium text-emerald-100 disabled:opacity-50"
-          onClick={() => void handleStartValidationRun()}
-          disabled={submitting || effectiveDuration <= 0 || Number.isNaN(effectiveDuration)}
-        >
-          Start Validation Run
-        </button>
+        <div className="mt-4 flex flex-wrap items-center gap-3">
+          <button
+            className="rounded-md border border-emerald-500/40 bg-emerald-500/20 px-4 py-2 text-sm font-medium text-emerald-100 disabled:opacity-50"
+            onClick={() => void handleStartValidationRun()}
+            disabled={starting || effectiveDuration <= 0 || Number.isNaN(effectiveDuration)}
+          >
+            {starting ? "Starting..." : "Start Validation Run"}
+          </button>
+          {activeRun ? (
+            <button
+              type="button"
+              className="rounded-md border border-sky-500/40 bg-sky-500/15 px-3 py-2 text-sm text-sky-100"
+              onClick={scrollToActiveRunPanel}
+            >
+              View active run
+            </button>
+          ) : null}
+        </div>
       </section>
 
-      <section className="rounded-lg border border-border bg-muted/30 p-4">
+      <section ref={activeRunPanelRef} className="rounded-lg border border-border bg-muted/30 p-4">
         <h2 className="text-sm font-semibold uppercase tracking-wide text-foreground/80">Active Validation Run</h2>
         {activeRun && activeMetrics ? (
           <div className="mt-3 space-y-3">
@@ -449,7 +478,7 @@ export default function ValidationRunsPage() {
             <button
               className="rounded-md border border-rose-500/40 bg-rose-500/15 px-4 py-2 text-sm text-rose-100 disabled:opacity-50"
               onClick={() => void handleCancelRun(activeRun.validation_run_id)}
-              disabled={submitting}
+              disabled={cancelling}
             >
               Cancel Run
             </button>
