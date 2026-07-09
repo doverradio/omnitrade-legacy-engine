@@ -2,6 +2,7 @@ import Link from "next/link";
 import type { ReactNode } from "react";
 
 const navItems = [
+  { href: "/mission-control", label: "Mission Control" },
   { href: "/dashboard", label: "Dashboard" },
   { href: "/dashboard/decisions", label: "Decision Records" },
   { href: "/decision-arena", label: "Decision Arena" },

@@ -9,6 +9,7 @@ from app.api.routes.decisions import router as decisions_router
 from app.api.routes.health import router as health_router
 from app.api.routes.live import router as live_router
 from app.api.routes.markets import router as markets_router
+from app.api.routes.operations import router as operations_router
 from app.api.routes.parameter_sets import router as parameter_sets_router
 from app.api.routes.paper import router as paper_router
 from app.api.routes.research import router as research_router
@@ -41,6 +42,7 @@ def create_app() -> FastAPI:
     register_error_handlers(app)
     app.include_router(health_router)
     app.include_router(markets_router)
+    app.include_router(operations_router)
     app.include_router(strategies_router)
     app.include_router(parameter_sets_router)
     app.include_router(backtests_router)

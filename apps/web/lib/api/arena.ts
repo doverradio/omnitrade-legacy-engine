@@ -490,6 +490,61 @@ export type EvolutionAnalytics = {
   largest_lineage_tree: EvolutionAnalyticsLargestLineageTree;
 };
 
+export type OperationalHealthIndicator = {
+  state: "green" | "yellow" | "red";
+  detail: string;
+};
+
+export type OperationalRunStatus = {
+  run_id: string;
+  started_at: string;
+  expected_end: string;
+  uptime: string;
+  current_phase: string;
+  health_status: "green" | "yellow" | "red";
+};
+
+export type OperationalMonitoring = {
+  candles_processed: number;
+  signals_generated: number;
+  paper_trades_executed: number;
+  decision_records_created: number;
+  replay_count: number;
+  candidate_count: number;
+  campaign_count: number;
+  laboratory_runs: number;
+  evolution_count: number;
+  current_champion: string | null;
+  paper_equity: string;
+  signals_today: number;
+  trades_today: number;
+  research_memory_growth: number;
+};
+
+export type OperationalAlert = {
+  code: string;
+  severity: "green" | "yellow" | "red";
+  message: string;
+};
+
+export type OperationalStatus = {
+  overall_health: "green" | "yellow" | "red";
+  run_status: OperationalRunStatus;
+  system_health: {
+    api: OperationalHealthIndicator;
+    orchestrator: OperationalHealthIndicator;
+    database: OperationalHealthIndicator;
+    research_agent: OperationalHealthIndicator;
+  };
+  research_status: {
+    current_campaign: string | null;
+    current_champion: string | null;
+    campaign_status: string;
+  };
+  monitoring: OperationalMonitoring;
+  alerts: OperationalAlert[];
+};
+
 async function requestJson<T>(path: string, init?: RequestInit): Promise<T> {
   const headers = new Headers(init?.headers);
   headers.set("Content-Type", "application/json");
@@ -695,4 +750,8 @@ export async function evolveResearchCandidates(request: EvolutionRequest): Promi
 
 export async function getEvolutionAnalytics(): Promise<EvolutionAnalytics> {
   return requestJson<EvolutionAnalytics>("/research/evolution-analytics");
+}
+
+export async function getOperationsStatus(): Promise<OperationalStatus> {
+  return requestJson<OperationalStatus>("/operations/status");
 }
