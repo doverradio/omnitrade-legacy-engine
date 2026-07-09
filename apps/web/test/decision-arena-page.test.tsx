@@ -51,6 +51,27 @@ function installFetchMock() {
       });
     }
 
+    if (url.pathname === "/arena/replay-agents") {
+      return jsonResponse(200, [
+        {
+          replay_agent_id: "11111111-1111-1111-1111-111111111111",
+          name: "Default Replay Agent",
+          status: "Registered",
+          capabilities: [
+            {
+              name: "Decision Package consumer",
+              description: "Consumes immutable Decision Packages for read-only research analysis.",
+            },
+          ],
+          decision_package_consumer: true,
+          execution_logic: false,
+          processing_enabled: false,
+          scheduling_enabled: false,
+          writes_enabled: false,
+        },
+      ]);
+    }
+
     return jsonResponse(404, {
       error: {
         message: `Unhandled route in test: ${method} ${url.pathname}`,
@@ -78,10 +99,11 @@ describe("DecisionArenaPage", () => {
     expect(screen.getByText("MA Crossover")).toBeInTheDocument();
     expect(screen.getByText("Active")).toBeInTheDocument();
     expect(screen.getByText("Decision Records")).toBeInTheDocument();
-    expect(screen.getByText("Replay Ranking")).toBeInTheDocument();
+    expect(screen.getByText("Replay Agents")).toBeInTheDocument();
     expect(
       screen.getAllByText(/These panels will activate as additional replay agents and research systems are introduced/i),
-    ).toHaveLength(4);
+    ).toHaveLength(3);
+    expect(screen.getByText(/Replay agents analyze immutable Decision Packages without affecting production/i)).toBeInTheDocument();
 
     const nonGetCalls = fetchMock.mock.calls.filter((call) => {
       const init = call[1] as RequestInit | undefined;

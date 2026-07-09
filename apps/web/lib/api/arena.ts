@@ -145,6 +145,23 @@ export type StrategyArenaScoreboardResponse = {
   items: StrategyArenaScoreboardItem[];
 };
 
+export type ReplayAgentCapability = {
+  name: string;
+  description: string;
+};
+
+export type ReplayAgentRegistration = {
+  replay_agent_id: string;
+  name: string;
+  status: string;
+  capabilities: ReplayAgentCapability[];
+  decision_package_consumer: boolean;
+  execution_logic: boolean;
+  processing_enabled: boolean;
+  scheduling_enabled: boolean;
+  writes_enabled: boolean;
+};
+
 async function requestJson<T>(path: string): Promise<T> {
   const response = await fetch(`${API_BASE_URL}${path}`, {
     cache: "no-store",
@@ -221,4 +238,8 @@ export async function getArenaTournamentHistory(input: {
 
 export async function getStrategyArenaScoreboard(): Promise<StrategyArenaScoreboardResponse> {
   return requestJson<StrategyArenaScoreboardResponse>("/arena/strategy-scoreboard");
+}
+
+export async function getReplayAgents(): Promise<ReplayAgentRegistration[]> {
+  return requestJson<ReplayAgentRegistration[]>("/arena/replay-agents");
 }

@@ -16,8 +16,31 @@ from app.models.signal import Signal
 from app.models.strategy import Strategy
 from app.models.trade import Trade
 from app.schemas.arena import StrategyArenaScoreboardItem, StrategyArenaScoreboardResponse
+from app.schemas.replay_agent import ReplayAgentCapabilityResponse, ReplayAgentRegistrationResponse
+from app.services.replay.registry import list_registered_replay_agents
 
 router = APIRouter(prefix="/arena", tags=["arena"])
+
+
+@router.get("/replay-agents", response_model=list[ReplayAgentRegistrationResponse])
+async def get_replay_agents() -> list[ReplayAgentRegistrationResponse]:
+    return [
+        ReplayAgentRegistrationResponse(
+            replay_agent_id=item.replay_agent_id,
+            name=item.name,
+            status=item.status,
+            capabilities=[
+                ReplayAgentCapabilityResponse(name=capability.name, description=capability.description)
+                for capability in item.capabilities
+            ],
+            decision_package_consumer=item.decision_package_consumer,
+            execution_logic=item.execution_logic,
+            processing_enabled=item.processing_enabled,
+            scheduling_enabled=item.scheduling_enabled,
+            writes_enabled=item.writes_enabled,
+        )
+        for item in list_registered_replay_agents()
+    ]
 
 
 @router.get("/strategy-scoreboard", response_model=StrategyArenaScoreboardResponse)

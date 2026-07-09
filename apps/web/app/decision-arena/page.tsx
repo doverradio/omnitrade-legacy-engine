@@ -2,6 +2,7 @@
 
 import { useEffect, useMemo, useState } from "react";
 
+import ReplayAgentsPanel from "@/components/domain/ReplayAgentsPanel";
 import { ApiRequestError, getStrategyArenaScoreboard, type StrategyArenaScoreboardResponse } from "@/lib/api/arena";
 
 function errorMessage(error: unknown, fallback: string): string {
@@ -178,11 +179,9 @@ export default function DecisionArenaPage() {
       </section>
 
       <section className="grid gap-4 lg:grid-cols-2" aria-label="Reserved Future Panels">
+        <ReplayAgentsPanel />
+
         {[
-          {
-            title: "Replay Ranking",
-            text: "These panels will activate as additional replay agents and research systems are introduced.",
-          },
           {
             title: "Decision Quality",
             text: "These panels will activate as additional replay agents and research systems are introduced.",
