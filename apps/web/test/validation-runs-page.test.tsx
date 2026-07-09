@@ -12,7 +12,7 @@ function jsonResponse(status: number, body: unknown): Response {
   });
 }
 
-type Scenario = "empty" | "active";
+type Scenario = "empty" | "active" | "multi-active";
 
 function installFetchMock(scenario: Scenario) {
   const fetchMock = vi.fn(async (input: string | URL | Request, init?: RequestInit) => {
@@ -23,6 +23,45 @@ function installFetchMock(scenario: Scenario) {
     if (url.pathname === "/validation-runs" && method === "GET") {
       if (scenario === "empty") {
         return jsonResponse(200, { items: [] });
+      }
+
+      if (scenario === "multi-active") {
+        return jsonResponse(200, {
+          items: [
+            {
+              validation_run_id: "11111111-1111-1111-1111-111111111111",
+              name: "72h Proving",
+              objective: "Validate stability",
+              duration_hours: 72,
+              status: "RUNNING",
+              started_at: "2026-07-09T00:00:00Z",
+              expected_end_at: "2026-07-12T00:00:00Z",
+              completed_at: null,
+              paper_capital: "100000",
+              enabled_strategies: ["MA Crossover", "RSI"],
+              enabled_research_agents: ["Baseline", "OpenAI Sandbox"],
+              enabled_research_features: ["Laboratory", "Evolution"],
+              health_score: 88,
+              result_status: "INCOMPLETE",
+            },
+            {
+              validation_run_id: "33333333-3333-3333-3333-333333333333",
+              name: "24h Experiment",
+              objective: "Second active run",
+              duration_hours: 24,
+              status: "RUNNING",
+              started_at: "2026-07-09T02:00:00Z",
+              expected_end_at: "2026-07-10T02:00:00Z",
+              completed_at: null,
+              paper_capital: "25",
+              enabled_strategies: ["RSI"],
+              enabled_research_agents: ["Baseline"],
+              enabled_research_features: ["Laboratory"],
+              health_score: 79,
+              result_status: "INCOMPLETE",
+            },
+          ],
+        });
       }
 
       return jsonResponse(200, {
@@ -122,6 +161,25 @@ function installFetchMock(scenario: Scenario) {
       });
     }
 
+    if (url.pathname === "/validation-runs/33333333-3333-3333-3333-333333333333/metrics" && method === "GET") {
+      return jsonResponse(200, {
+        elapsed_percentage: 12.25,
+        time_remaining: "0d 20h 00m",
+        candles_processed_during_run: 210,
+        signals_generated_during_run: 9,
+        trades_executed_during_run: 2,
+        decision_records_created_during_run: 9,
+        paper_pnl_during_run: "3.12",
+        current_equity: "28.12",
+        current_champion: "RSI",
+        candidates_generated: 3,
+        candidates_evaluated: 3,
+        evolution_descendants: 0,
+        research_memory_growth: 4,
+        alerts_count: 0,
+      });
+    }
+
     if (url.pathname === "/validation-runs/11111111-1111-1111-1111-111111111111/events" && method === "GET") {
       return jsonResponse(200, {
         items: [
@@ -168,6 +226,55 @@ function installFetchMock(scenario: Scenario) {
         scorecards: [
           { category: "API Health", status: "GREEN", score: 100, notes: "OK" },
           { category: "Worker Health", status: "YELLOW", score: 70, notes: "Minor delay" },
+        ],
+      });
+    }
+
+    if (url.pathname === "/validation-runs/33333333-3333-3333-3333-333333333333/events" && method === "GET") {
+      return jsonResponse(200, {
+        items: [
+          {
+            id: 2,
+            validation_run_id: "33333333-3333-3333-3333-333333333333",
+            timestamp: "2026-07-09T02:00:00Z",
+            event_type: "VALIDATION_STARTED",
+            category: "all",
+            severity: "green",
+            title: "Validation Started",
+            description: "Second run started",
+            metadata: {},
+          },
+        ],
+        page: 1,
+        page_size: 30,
+        total: 1,
+        has_more: false,
+        order: "newest",
+        window: "entire_run",
+        category: "all",
+        search: null,
+      });
+    }
+
+    if (url.pathname === "/validation-runs/33333333-3333-3333-3333-333333333333" && method === "GET") {
+      return jsonResponse(200, {
+        validation_run_id: "33333333-3333-3333-3333-333333333333",
+        name: "24h Experiment",
+        objective: "Second active run",
+        duration_hours: 24,
+        status: "RUNNING",
+        started_at: "2026-07-09T02:00:00Z",
+        expected_end_at: "2026-07-10T02:00:00Z",
+        completed_at: null,
+        paper_capital: "25",
+        enabled_strategies: ["RSI"],
+        enabled_research_agents: ["Baseline"],
+        enabled_research_features: ["Laboratory"],
+        health_score: 79,
+        result_status: "INCOMPLETE",
+        overall_score: 79,
+        scorecards: [
+          { category: "Campaign Engine", status: "GREEN", score: 100, notes: "Active" },
         ],
       });
     }
@@ -263,20 +370,35 @@ afterEach(() => {
 });
 
 describe("ValidationRunsPage", () => {
-  it("renders form and empty state", async () => {
+  it("uses accordion default state with active section open", async () => {
     installFetchMock("empty");
 
     render(<ValidationRunsPage />);
 
     expect(await screen.findByRole("heading", { name: "Validation Runs" })).toBeInTheDocument();
-    expect(screen.getByRole("button", { name: "Start Validation Run" })).toBeInTheDocument();
-    expect(screen.getByDisplayValue("25")).toBeInTheDocument();
-    expect(screen.getByText("Default proving capital is $25 in Small Account Mode.")).toBeInTheDocument();
-    expect(screen.getByText("No validation runs yet.")).toBeInTheDocument();
+    expect(screen.getByText("Active Validation Runs")).toBeInTheDocument();
+    expect(screen.getByText("No active validation runs.")).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "Start Validation Run" })).not.toBeInTheDocument();
   });
 
-  it("renders active run progress, scorecard, history and detail", async () => {
+  it("allows multiple accordions to stay open", async () => {
     installFetchMock("active");
+
+    render(<ValidationRunsPage />);
+
+    expect(await screen.findByRole("heading", { name: "Validation Runs" })).toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole("button", { name: /New Validation Run/i }));
+    fireEvent.click(screen.getByRole("button", { name: /Scorecard/i }));
+
+    expect(screen.getByRole("button", { name: "Start Validation Run" })).toBeInTheDocument();
+    expect(screen.getByText("Default proving capital is $25 in Small Account Mode.")).toBeInTheDocument();
+    expect(screen.getByText("Active Validation Runs")).toBeInTheDocument();
+    expect(screen.getByText("Scorecard")).toBeInTheDocument();
+  });
+
+  it("renders active run cards and selecting a run updates scorecard/timeline target", async () => {
+    installFetchMock("multi-active");
 
     render(<ValidationRunsPage />);
 
@@ -285,21 +407,33 @@ describe("ValidationRunsPage", () => {
     await waitFor(() => {
       expect(screen.getAllByText("72h Proving").length).toBeGreaterThan(0);
     });
+    expect(screen.getByText("24h Experiment")).toBeInTheDocument();
 
-    expect(screen.getByText("Active Validation Run")).toBeInTheDocument();
-    expect(screen.getByRole("button", { name: "View active run" })).toBeInTheDocument();
-    expect(screen.getByText("45.50%")).toBeInTheDocument();
-    expect(screen.getByText("Scorecard")).toBeInTheDocument();
-    expect(screen.getByText("API Health")).toBeInTheDocument();
-    expect(screen.getByText("Validation Run History")).toBeInTheDocument();
-
-    fireEvent.click(screen.getByRole("button", { name: "View" }));
+    fireEvent.click(screen.getByRole("button", { name: "Select run" }));
+    fireEvent.click(screen.getByRole("button", { name: /Scorecard/i }));
+    fireEvent.click(screen.getByRole("button", { name: /Validation Timeline/i }));
 
     await waitFor(() => {
-      expect(screen.getByText("Validation Run Detail")).toBeInTheDocument();
+      expect(screen.getByText("Campaign Engine")).toBeInTheDocument();
     });
-    expect(screen.getByText("Validation Timeline")).toBeInTheDocument();
-    expect(screen.getByText("Final Result Summary")).toBeInTheDocument();
+    expect(screen.getByText("Objective: Second active run")).toBeInTheDocument();
+    expect(screen.getAllByText("Validation Timeline").length).toBeGreaterThan(0);
+  });
+
+  it("shows mobile-friendly empty states for scorecard and timeline when no run selected", async () => {
+    installFetchMock("empty");
+
+    render(<ValidationRunsPage />);
+
+    expect(await screen.findByRole("heading", { name: "Validation Runs" })).toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole("button", { name: /Scorecard/i }));
+    fireEvent.click(screen.getByRole("button", { name: /Validation Timeline/i }));
+
+    await waitFor(() => {
+      expect(screen.getByText("Select a validation run to view scorecard.")).toBeInTheDocument();
+    });
+    expect(screen.getByText("Select a validation run to view timeline.")).toBeInTheDocument();
   });
 
   it("supports start run flow from form", async () => {
@@ -308,6 +442,8 @@ describe("ValidationRunsPage", () => {
     render(<ValidationRunsPage />);
 
     expect(await screen.findByRole("heading", { name: "Validation Runs" })).toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole("button", { name: /New Validation Run/i }));
 
     fireEvent.click(screen.getByRole("button", { name: "Start Validation Run" }));
 

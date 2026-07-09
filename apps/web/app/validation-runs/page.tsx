@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useEffect, useMemo, useRef, useState, type ReactNode } from "react";
 
 import ValidationRunTimeline, { type TimelineQuery } from "@/components/domain/ValidationRunTimeline";
 import {
@@ -19,6 +19,44 @@ import {
   type ValidationRunMetrics,
   type ValidationRunScorecard,
 } from "@/lib/api/arena";
+
+type AccordionKey = "new" | "active" | "scorecard" | "history" | "timeline";
+
+function AccordionSection({
+  id,
+  title,
+  count,
+  open,
+  onToggle,
+  children,
+}: {
+  id: AccordionKey;
+  title: string;
+  count?: number;
+  open: boolean;
+  onToggle: (key: AccordionKey) => void;
+  children: ReactNode;
+}) {
+  return (
+    <section className="rounded-lg border border-border bg-muted/30">
+      <button
+        type="button"
+        className="flex w-full items-center justify-between gap-3 px-4 py-3 text-left"
+        onClick={() => onToggle(id)}
+        aria-expanded={open}
+      >
+        <div className="flex items-center gap-2">
+          <h2 className="text-sm font-semibold uppercase tracking-wide text-foreground/85">{title}</h2>
+          {typeof count === "number" ? (
+            <span className="rounded-full border border-border bg-background/60 px-2 py-0.5 text-xs text-foreground/75">{count}</span>
+          ) : null}
+        </div>
+        <span className="text-xs text-foreground/65">{open ? "Hide" : "Show"}</span>
+      </button>
+      {open ? <div className="border-t border-border px-4 py-4">{children}</div> : null}
+    </section>
+  );
+}
 
 function errorMessage(error: unknown, fallback: string): string {
   if (error instanceof ApiRequestError) {
@@ -84,8 +122,8 @@ export default function ValidationRunsPage() {
   ]);
 
   const [runs, setRuns] = useState<ValidationRun[]>([]);
-  const [activeMetrics, setActiveMetrics] = useState<ValidationRunMetrics | null>(null);
   const [activeDetail, setActiveDetail] = useState<ValidationRunDetail | null>(null);
+  const [metricsByRunId, setMetricsByRunId] = useState<Record<string, ValidationRunMetrics>>({});
   const [timelineEvents, setTimelineEvents] = useState<ValidationRunEvent[]>([]);
   const [timelinePage, setTimelinePage] = useState(1);
   const [timelineHasMore, setTimelineHasMore] = useState(false);
@@ -96,7 +134,14 @@ export default function ValidationRunsPage() {
     category: "all",
     search: "",
   });
-  const [expandedRunId, setExpandedRunId] = useState<string | null>(null);
+  const [selectedRunId, setSelectedRunId] = useState<string | null>(null);
+  const [openSections, setOpenSections] = useState<Record<AccordionKey, boolean>>({
+    new: false,
+    active: true,
+    scorecard: false,
+    history: false,
+    timeline: false,
+  });
 
   const [loading, setLoading] = useState(true);
   const [starting, setStarting] = useState(false);
@@ -106,16 +151,14 @@ export default function ValidationRunsPage() {
 
   const activeRunPanelRef = useRef<HTMLElement | null>(null);
 
-  const activeRun = useMemo(() => runs.find((item) => item.status === "RUNNING") ?? null, [runs]);
-  const selectedTimelineRunId = useMemo(() => {
-    if (expandedRunId) {
-      return expandedRunId;
+  const activeRuns = useMemo(() => runs.filter((item) => item.status === "RUNNING"), [runs]);
+  const historyRuns = useMemo(() => runs.filter((item) => item.status !== "RUNNING"), [runs]);
+  const selectedRun = useMemo(() => {
+    if (!selectedRunId) {
+      return null;
     }
-    if (activeRun) {
-      return activeRun.validation_run_id;
-    }
-    return runs[0]?.validation_run_id ?? null;
-  }, [expandedRunId, activeRun, runs]);
+    return runs.find((item) => item.validation_run_id === selectedRunId) ?? null;
+  }, [runs, selectedRunId]);
 
   async function loadTimeline(runId: string, reset: boolean): Promise<ValidationRunEventListResponse> {
     setTimelineLoading(true);
@@ -143,12 +186,29 @@ export default function ValidationRunsPage() {
     const list = await getValidationRuns();
     setRuns(list.items);
 
-    const running = list.items.find((item) => item.status === "RUNNING") ?? null;
-    if (running) {
-      const [detail, metrics, events] = await Promise.all([
-        getValidationRun(running.validation_run_id),
-        getValidationRunMetrics(running.validation_run_id),
-        getValidationRunEvents(running.validation_run_id, {
+    const running = list.items.filter((item) => item.status === "RUNNING");
+    const metricsResults = await Promise.all(
+      running.map(async (item) => ({
+        id: item.validation_run_id,
+        metrics: await getValidationRunMetrics(item.validation_run_id),
+      })),
+    );
+    const nextMetricsByRunId: Record<string, ValidationRunMetrics> = {};
+    for (const row of metricsResults) {
+      nextMetricsByRunId[row.id] = row.metrics;
+    }
+    setMetricsByRunId(nextMetricsByRunId);
+
+    const preferredRunId =
+      selectedRunId && list.items.some((item) => item.validation_run_id === selectedRunId)
+        ? selectedRunId
+        : (running[0]?.validation_run_id ?? list.items[0]?.validation_run_id ?? null);
+    setSelectedRunId(preferredRunId);
+
+    if (preferredRunId) {
+      const [detail, events] = await Promise.all([
+        getValidationRun(preferredRunId),
+        getValidationRunEvents(preferredRunId, {
           page: 1,
           pageSize: 30,
           order: timelineQuery.order,
@@ -158,13 +218,11 @@ export default function ValidationRunsPage() {
         }),
       ]);
       setActiveDetail(detail);
-      setActiveMetrics(metrics);
       setTimelineEvents(events.items);
       setTimelinePage(events.page);
       setTimelineHasMore(events.has_more);
     } else {
       setActiveDetail(null);
-      setActiveMetrics(null);
       setTimelineEvents([]);
       setTimelinePage(1);
       setTimelineHasMore(false);
@@ -198,26 +256,26 @@ export default function ValidationRunsPage() {
   }, []);
 
   useEffect(() => {
-    if (!selectedTimelineRunId) {
+    if (!selectedRunId) {
       return;
     }
 
     setError(null);
-    void loadTimeline(selectedTimelineRunId, true).catch((timelineError) => {
+    void loadTimeline(selectedRunId, true).catch((timelineError) => {
       setError(errorMessage(timelineError, "Failed to load validation run timeline."));
     });
-  }, [selectedTimelineRunId, timelineQuery]);
+  }, [selectedRunId, timelineQuery]);
 
   useEffect(() => {
-    const intervalMs = activeRun ? 5000 : 15000;
+    const intervalMs = activeRuns.length > 0 ? 5000 : 15000;
     const timer = window.setInterval(() => {
       setError(null);
       void refreshAll().catch((refreshError) => {
         setError(errorMessage(refreshError, "Failed to refresh validation runs."));
       });
 
-      if (activeRun && selectedTimelineRunId) {
-        void loadTimeline(selectedTimelineRunId, true).catch((timelineError) => {
+      if (activeRuns.length > 0 && selectedRunId) {
+        void loadTimeline(selectedRunId, true).catch((timelineError) => {
           setError(errorMessage(timelineError, "Failed to refresh timeline events."));
         });
       }
@@ -226,7 +284,7 @@ export default function ValidationRunsPage() {
     return () => {
       window.clearInterval(timer);
     };
-  }, [activeRun, selectedTimelineRunId, timelineQuery]);
+  }, [activeRuns.length, selectedRunId, timelineQuery]);
 
   const effectiveDuration = durationPreset === "custom" ? Number(customDuration) : Number(durationPreset);
 
@@ -251,6 +309,7 @@ export default function ValidationRunsPage() {
       await startValidationRun(created.validation_run_id);
       await refreshAll();
       setSuccess("Validation run started successfully.");
+      setOpenSections((previous) => ({ ...previous, active: true }));
       scrollToActiveRunPanel();
     } catch (submitError) {
       setError(errorMessage(submitError, "Failed to start validation run."));
@@ -273,24 +332,26 @@ export default function ValidationRunsPage() {
     }
   }
 
-  async function handleToggleDetail(runId: string) {
-    if (expandedRunId === runId) {
-      setExpandedRunId(null);
-      return;
-    }
-
-    setExpandedRunId(runId);
+  async function handleSelectRun(runId: string) {
+    setSelectedRunId(runId);
     try {
       const detail = await getValidationRun(runId);
       setActiveDetail(detail);
       await loadTimeline(runId, true);
-      if (activeRun && activeRun.validation_run_id === runId) {
+      if (!metricsByRunId[runId]) {
         const metrics = await getValidationRunMetrics(runId);
-        setActiveMetrics(metrics);
+        setMetricsByRunId((previous) => ({ ...previous, [runId]: metrics }));
       }
     } catch (detailError) {
       setError(errorMessage(detailError, "Failed to load validation run details."));
     }
+  }
+
+  function toggleAccordion(section: AccordionKey) {
+    setOpenSections((previous) => ({
+      ...previous,
+      [section]: !previous[section],
+    }));
   }
 
   function toggleSelection(values: string[], value: string): string[] {
@@ -321,9 +382,8 @@ export default function ValidationRunsPage() {
         </section>
       ) : null}
 
-      <section className="rounded-lg border border-border bg-muted/30 p-4">
-        <h2 className="text-sm font-semibold uppercase tracking-wide text-foreground/80">New Validation Run</h2>
-        <div className="mt-3 grid gap-3 md:grid-cols-2">
+      <AccordionSection id="new" title="New Validation Run" open={openSections.new} onToggle={toggleAccordion}>
+        <div className="grid gap-3 md:grid-cols-2">
           <label className="text-sm">
             <span className="mb-1 block text-foreground/80">Name</span>
             <input
@@ -438,159 +498,152 @@ export default function ValidationRunsPage() {
           >
             {starting ? "Starting..." : "Start Validation Run"}
           </button>
-          {activeRun ? (
+          {activeRuns.length > 0 ? (
             <button
               type="button"
               className="rounded-md border border-sky-500/40 bg-sky-500/15 px-3 py-2 text-sm text-sky-100"
-              onClick={scrollToActiveRunPanel}
+              onClick={() => {
+                setOpenSections((previous) => ({ ...previous, active: true }));
+                scrollToActiveRunPanel();
+              }}
             >
               View active run
             </button>
           ) : null}
         </div>
-      </section>
+      </AccordionSection>
 
-      <section ref={activeRunPanelRef} className="rounded-lg border border-border bg-muted/30 p-4">
-        <h2 className="text-sm font-semibold uppercase tracking-wide text-foreground/80">Active Validation Run</h2>
-        {activeRun && activeMetrics ? (
-          <div className="mt-3 space-y-3">
-            <div className="flex flex-wrap items-center gap-2">
-              <p className="text-lg font-semibold">{activeRun.name}</p>
-              <span className={`rounded-full border px-2 py-1 text-xs font-medium ${statusClass(activeRun.status)}`}>
-                {activeRun.status}
-              </span>
+      <AccordionSection id="active" title="Active Validation Runs" count={activeRuns.length} open={openSections.active} onToggle={toggleAccordion}>
+        <div ref={activeRunPanelRef} className="space-y-3">
+          {activeRuns.length === 0 ? (
+            <p className="rounded-md border border-border bg-background/40 p-3 text-sm text-foreground/75">No active validation runs.</p>
+          ) : (
+            activeRuns.map((run) => {
+              const metrics = metricsByRunId[run.validation_run_id] ?? null;
+              const selected = selectedRunId === run.validation_run_id;
+              return (
+                <article
+                  key={run.validation_run_id}
+                  className={`rounded-md border p-3 ${selected ? "border-sky-400/55 bg-sky-500/10" : "border-border bg-background/45"}`}
+                >
+                  <div className="flex flex-wrap items-center justify-between gap-2">
+                    <div className="flex items-center gap-2">
+                      <p className="text-sm font-semibold">{run.name}</p>
+                      <span className={`rounded-full border px-2 py-0.5 text-xs font-medium ${statusClass(run.status)}`}>{run.status}</span>
+                    </div>
+                    <button
+                      type="button"
+                      className="rounded border border-border bg-background/60 px-2 py-1 text-xs"
+                      onClick={() => void handleSelectRun(run.validation_run_id)}
+                    >
+                      {selected ? "Selected" : "Select run"}
+                    </button>
+                  </div>
+
+                  <div className="mt-2 grid gap-2 text-xs sm:grid-cols-2 lg:grid-cols-4">
+                    <p>Duration: {run.duration_hours}h</p>
+                    <p>Progress: {metrics ? `${metrics.elapsed_percentage.toFixed(2)}%` : "--"}</p>
+                    <p>Time remaining: {metrics?.time_remaining ?? "--"}</p>
+                    <p>Health score: {run.health_score ?? activeDetail?.overall_score ?? 0}</p>
+                    <p>Paper PnL: {metrics ? formatCurrency(metrics.paper_pnl_during_run) : "--"}</p>
+                    <p>Alerts: {metrics?.alerts_count ?? 0}</p>
+                  </div>
+
+                  <div className="mt-3">
+                    <button
+                      className="rounded-md border border-rose-500/40 bg-rose-500/15 px-3 py-1.5 text-xs text-rose-100 disabled:opacity-50"
+                      onClick={() => void handleCancelRun(run.validation_run_id)}
+                      disabled={cancelling}
+                    >
+                      Cancel Run
+                    </button>
+                  </div>
+                </article>
+              );
+            })
+          )}
+        </div>
+      </AccordionSection>
+
+      <AccordionSection id="scorecard" title="Scorecard" open={openSections.scorecard} onToggle={toggleAccordion}>
+        {!selectedRunId ? (
+          <p className="rounded-md border border-border bg-background/40 p-3 text-sm text-foreground/75">Select a validation run to view scorecard.</p>
+        ) : activeDetail?.scorecards?.length ? (
+          <div className="space-y-3">
+            <div className="grid gap-3 md:grid-cols-2">
+              {activeDetail.scorecards.map((item: ValidationRunScorecard) => (
+                <article key={item.category} className="rounded-md border border-border bg-background/40 p-3">
+                  <div className="flex items-center justify-between gap-2">
+                    <p className="text-sm font-medium">{item.category}</p>
+                    <span className={`text-sm font-semibold ${scoreClass(item.score)}`}>{item.score}</span>
+                  </div>
+                  <p className="mt-1 text-xs text-foreground/70">{item.status}</p>
+                  <p className="mt-2 text-xs text-foreground/75">{item.notes}</p>
+                </article>
+              ))}
             </div>
-
-            <div className="h-3 overflow-hidden rounded-full border border-border bg-background/40">
-              <div className="h-full bg-emerald-500/60" style={{ width: `${activeMetrics.elapsed_percentage}%` }} />
-            </div>
-
-            <div className="grid gap-3 md:grid-cols-4 text-sm">
-              <div><p className="text-foreground/70">Elapsed</p><p>{activeMetrics.elapsed_percentage.toFixed(2)}%</p></div>
-              <div><p className="text-foreground/70">Time remaining</p><p>{activeMetrics.time_remaining}</p></div>
-              <div><p className="text-foreground/70">Current phase</p><p>{activeRun.status}</p></div>
-              <div><p className="text-foreground/70">Health score</p><p>{activeRun.health_score ?? activeDetail?.overall_score ?? 0}</p></div>
-              <div><p className="text-foreground/70">Current champion</p><p>{activeMetrics.current_champion ?? "None"}</p></div>
-              <div><p className="text-foreground/70">Paper PnL</p><p>{formatCurrency(activeMetrics.paper_pnl_during_run)}</p></div>
-              <div><p className="text-foreground/70">Alerts</p><p>{activeMetrics.alerts_count}</p></div>
-            </div>
-
-            <button
-              className="rounded-md border border-rose-500/40 bg-rose-500/15 px-4 py-2 text-sm text-rose-100 disabled:opacity-50"
-              onClick={() => void handleCancelRun(activeRun.validation_run_id)}
-              disabled={cancelling}
-            >
-              Cancel Run
-            </button>
+            <article className="rounded-md border border-border bg-background/40 p-3">
+              <p className="text-xs uppercase tracking-wide text-foreground/70">Selected Run Detail</p>
+              <p className="mt-2 text-sm">Result: {activeDetail.result_status}</p>
+              <p className="mt-1 text-sm">Overall score: {activeDetail.overall_score}</p>
+              <p className="mt-1 text-sm">Status: {activeDetail.status}</p>
+              <p className="mt-1 text-sm">Objective: {activeDetail.objective}</p>
+            </article>
           </div>
         ) : (
-          <p className="mt-3 rounded-md border border-border bg-background/40 p-3 text-sm text-foreground/75">
-            No active validation run.
-          </p>
+          <p className="rounded-md border border-border bg-background/40 p-3 text-sm text-foreground/75">No scorecard yet.</p>
         )}
-      </section>
+      </AccordionSection>
 
-      <section className="rounded-lg border border-border bg-muted/30 p-4">
-        <h2 className="text-sm font-semibold uppercase tracking-wide text-foreground/80">Scorecard</h2>
-        {activeDetail?.scorecards?.length ? (
-          <div className="mt-3 grid gap-3 md:grid-cols-2">
-            {activeDetail.scorecards.map((item: ValidationRunScorecard) => (
-              <article key={item.category} className="rounded-md border border-border bg-background/40 p-3">
-                <div className="flex items-center justify-between gap-2">
-                  <p className="text-sm font-medium">{item.category}</p>
-                  <span className={`text-sm font-semibold ${scoreClass(item.score)}`}>{item.score}</span>
+      <AccordionSection id="history" title="Validation Run History" count={historyRuns.length} open={openSections.history} onToggle={toggleAccordion}>
+        {loading ? (
+          <p className="text-sm text-foreground/75">Loading history...</p>
+        ) : historyRuns.length === 0 ? (
+          <p className="rounded-md border border-border bg-background/40 p-3 text-sm text-foreground/75">No validation run history yet.</p>
+        ) : (
+          <div className="space-y-2">
+            {historyRuns.map((run) => (
+              <article key={run.validation_run_id} className="rounded-md border border-border bg-background/40 p-3">
+                <div className="flex flex-wrap items-center justify-between gap-2">
+                  <div>
+                    <p className="text-sm font-semibold">{run.name}</p>
+                    <p className="text-xs text-foreground/70">{run.duration_hours}h • {run.result_status}</p>
+                  </div>
+                  <button
+                    type="button"
+                    className="rounded border border-border bg-background/60 px-2 py-1 text-xs"
+                    onClick={() => void handleSelectRun(run.validation_run_id)}
+                  >
+                    {selectedRunId === run.validation_run_id ? "Selected" : "Select run"}
+                  </button>
                 </div>
-                <p className="mt-1 text-xs text-foreground/70">{item.status}</p>
-                <p className="mt-2 text-xs text-foreground/75">{item.notes}</p>
+                <p className="mt-2 text-xs text-foreground/70">Started: {formatTime(run.started_at)}</p>
+                <p className="mt-1 text-xs text-foreground/70">Completed: {formatTime(run.completed_at)}</p>
               </article>
             ))}
           </div>
-        ) : (
-          <p className="mt-3 rounded-md border border-border bg-background/40 p-3 text-sm text-foreground/75">No scorecard yet.</p>
         )}
-      </section>
+      </AccordionSection>
 
-      <section className="rounded-lg border border-border bg-muted/30 p-4">
-        <h2 className="text-sm font-semibold uppercase tracking-wide text-foreground/80">Validation Run History</h2>
-        {loading ? (
-          <p className="mt-3 text-sm text-foreground/75">Loading history...</p>
-        ) : runs.length === 0 ? (
-          <p className="mt-3 rounded-md border border-border bg-background/40 p-3 text-sm text-foreground/75">No validation runs yet.</p>
-        ) : (
-          <div className="mt-3 overflow-x-auto">
-            <table className="min-w-full border-collapse text-sm">
-              <thead>
-                <tr className="text-left text-foreground/70">
-                  <th className="border-b border-border px-2 py-2">Run Name</th>
-                  <th className="border-b border-border px-2 py-2">Duration</th>
-                  <th className="border-b border-border px-2 py-2">Status</th>
-                  <th className="border-b border-border px-2 py-2">Result</th>
-                  <th className="border-b border-border px-2 py-2">Health</th>
-                  <th className="border-b border-border px-2 py-2">Paper PnL</th>
-                  <th className="border-b border-border px-2 py-2">Candidates Generated</th>
-                  <th className="border-b border-border px-2 py-2">Started</th>
-                  <th className="border-b border-border px-2 py-2">Completed</th>
-                  <th className="border-b border-border px-2 py-2">Detail</th>
-                </tr>
-              </thead>
-              <tbody>
-                {runs.map((run) => (
-                  <tr key={run.validation_run_id} className="align-top">
-                    <td className="border-b border-border px-2 py-2">{run.name}</td>
-                    <td className="border-b border-border px-2 py-2">{run.duration_hours}h</td>
-                    <td className="border-b border-border px-2 py-2">{run.status}</td>
-                    <td className="border-b border-border px-2 py-2">{run.result_status}</td>
-                    <td className="border-b border-border px-2 py-2">{run.health_score ?? "-"}</td>
-                    <td className="border-b border-border px-2 py-2">{activeRun?.validation_run_id === run.validation_run_id && activeMetrics ? formatCurrency(activeMetrics.paper_pnl_during_run) : "-"}</td>
-                    <td className="border-b border-border px-2 py-2">{activeRun?.validation_run_id === run.validation_run_id && activeMetrics ? activeMetrics.candidates_generated : "-"}</td>
-                    <td className="border-b border-border px-2 py-2">{formatTime(run.started_at)}</td>
-                    <td className="border-b border-border px-2 py-2">{formatTime(run.completed_at)}</td>
-                    <td className="border-b border-border px-2 py-2">
-                      <button
-                        className="rounded border border-border bg-background/60 px-2 py-1 text-xs"
-                        onClick={() => void handleToggleDetail(run.validation_run_id)}
-                      >
-                        {expandedRunId === run.validation_run_id ? "Hide" : "View"}
-                      </button>
-                    </td>
-                  </tr>
-                ))}
-              </tbody>
-            </table>
-          </div>
-        )}
-      </section>
-
-      <ValidationRunTimeline
-        title="Validation Timeline"
-        events={timelineEvents}
-        query={timelineQuery}
-        loading={timelineLoading}
-        hasMore={timelineHasMore}
-        emptyMessage={selectedTimelineRunId ? "No timeline events for this run yet." : "Select a validation run to view timeline."}
-        onQueryChange={(next) => setTimelineQuery(next)}
-        onLoadMore={() => {
-          if (!selectedTimelineRunId) {
-            return;
-          }
-          void loadTimeline(selectedTimelineRunId, false).catch((timelineError) => {
-            setError(errorMessage(timelineError, "Failed to load more timeline events."));
-          });
-        }}
-      />
-
-      {expandedRunId && activeDetail ? (
-        <section className="rounded-lg border border-border bg-muted/30 p-4">
-          <h2 className="text-sm font-semibold uppercase tracking-wide text-foreground/80">Validation Run Detail</h2>
-          <article className="mt-3 rounded-md border border-border bg-background/40 p-3">
-            <h3 className="text-xs uppercase tracking-wide text-foreground/70">Final Result Summary</h3>
-            <p className="mt-2 text-sm">Result: {activeDetail.result_status}</p>
-            <p className="mt-1 text-sm">Overall score: {activeDetail.overall_score}</p>
-            <p className="mt-1 text-sm">Status: {activeDetail.status}</p>
-            <p className="mt-1 text-sm">Objective: {activeDetail.objective}</p>
-          </article>
-        </section>
-      ) : null}
+      <AccordionSection id="timeline" title="Validation Timeline" count={timelineEvents.length} open={openSections.timeline} onToggle={toggleAccordion}>
+        <ValidationRunTimeline
+          title="Validation Timeline"
+          events={timelineEvents}
+          query={timelineQuery}
+          loading={timelineLoading}
+          hasMore={timelineHasMore}
+          emptyMessage={selectedRunId ? "No timeline events for this run yet." : "Select a validation run to view timeline."}
+          onQueryChange={(next) => setTimelineQuery(next)}
+          onLoadMore={() => {
+            if (!selectedRunId) {
+              return;
+            }
+            void loadTimeline(selectedRunId, false).catch((timelineError) => {
+              setError(errorMessage(timelineError, "Failed to load more timeline events."));
+            });
+          }}
+        />
+      </AccordionSection>
     </div>
   );
 }
