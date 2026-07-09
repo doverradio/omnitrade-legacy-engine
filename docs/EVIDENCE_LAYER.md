@@ -335,6 +335,54 @@ Its sole responsibility is preserving trustworthy production evidence so those s
 
 ---
 
+## Relationship to Other Architecture Documents
+
+These Tier-1 architecture documents are intentionally complementary rather than overlapping.
+
+### SYSTEM_ARCHITECTURE.md
+
+Defines the overall platform architecture and the relationships between major subsystems.
+
+### STRATEGY_ENGINE.md
+
+Defines how production strategies generate trading signals.
+
+### RISK_ENGINE.md
+
+Defines how candidate decisions are evaluated and either approved, rejected, or resized before execution.
+
+### EVIDENCE_LAYER.md
+
+Defines how production decisions become immutable evidence and establishes the contract between the Execution layer and the Learn layer.
+
+### DECISION_REPLAY_ENGINE.md
+
+Defines how immutable evidence is replayed, compared, and transformed into Replay Evidence.
+
+### DECISION_INTELLIGENCE_ENGINE.md
+
+Defines how Replay Evidence, Decision Quality, and AI observations are synthesized into recommendations for human review.
+
+---
+
+## Core Architectural Principle
+
+Execution produces evidence.
+
+Learning consumes evidence.
+
+Governance decides what returns to production.
+
+Execution systems create immutable production history.
+
+Learn systems analyze that history without modifying it.
+
+Governance, through human approval, is the only path by which learning influences production.
+
+This separation preserves explainability, reproducibility, auditability, safety, and architectural stability.
+
+---
+
 ### Operating Summary
 
 The Evidence Layer is OmniTrade's memory contract.
