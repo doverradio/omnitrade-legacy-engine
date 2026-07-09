@@ -545,6 +545,78 @@ export type OperationalStatus = {
   alerts: OperationalAlert[];
 };
 
+export type ValidationRunCreateRequest = {
+  name: string;
+  objective: string;
+  duration_hours: number;
+  paper_capital: string;
+  enabled_strategies: string[];
+  enabled_research_agents: string[];
+  enabled_research_features: string[];
+};
+
+export type ValidationRunScorecard = {
+  category: string;
+  status: string;
+  score: number;
+  notes: string;
+};
+
+export type ValidationRun = {
+  validation_run_id: string;
+  name: string;
+  objective: string;
+  duration_hours: number;
+  status: "DRAFT" | "RUNNING" | "COMPLETED" | "FAILED" | "CANCELLED";
+  started_at: string | null;
+  expected_end_at: string | null;
+  completed_at: string | null;
+  paper_capital: string;
+  enabled_strategies: string[];
+  enabled_research_agents: string[];
+  enabled_research_features: string[];
+  health_score: number | null;
+  result_status: "PASS" | "CONDITIONAL_PASS" | "FAIL" | "INCOMPLETE";
+};
+
+export type ValidationRunDetail = ValidationRun & {
+  overall_score: number;
+  scorecards: ValidationRunScorecard[];
+};
+
+export type ValidationRunEvent = {
+  event_type: string;
+  message: string;
+  payload: Record<string, unknown>;
+  created_at: string;
+};
+
+export type ValidationRunMetrics = {
+  elapsed_percentage: number;
+  time_remaining: string;
+  candles_processed_during_run: number;
+  signals_generated_during_run: number;
+  trades_executed_during_run: number;
+  decision_records_created_during_run: number;
+  paper_pnl_during_run: string;
+  current_equity: string;
+  current_champion: string | null;
+  candidates_generated: number;
+  candidates_evaluated: number;
+  evolution_descendants: number;
+  research_memory_growth: number;
+  alerts_count: number;
+};
+
+export type ValidationRunStartResponse = {
+  run: ValidationRun;
+  initial_metrics: ValidationRunMetrics;
+};
+
+export type ValidationRunListResponse = {
+  items: ValidationRun[];
+};
+
 async function requestJson<T>(path: string, init?: RequestInit): Promise<T> {
   const headers = new Headers(init?.headers);
   headers.set("Content-Type", "application/json");
@@ -754,4 +826,39 @@ export async function getEvolutionAnalytics(): Promise<EvolutionAnalytics> {
 
 export async function getOperationsStatus(): Promise<OperationalStatus> {
   return requestJson<OperationalStatus>("/operations/status");
+}
+
+export async function getValidationRuns(): Promise<ValidationRunListResponse> {
+  return requestJson<ValidationRunListResponse>("/validation-runs");
+}
+
+export async function getValidationRun(validationRunId: string): Promise<ValidationRunDetail> {
+  return requestJson<ValidationRunDetail>(`/validation-runs/${validationRunId}`);
+}
+
+export async function createValidationRun(request: ValidationRunCreateRequest): Promise<ValidationRun> {
+  return requestJson<ValidationRun>("/validation-runs", {
+    method: "POST",
+    body: JSON.stringify(request),
+  });
+}
+
+export async function startValidationRun(validationRunId: string): Promise<ValidationRunStartResponse> {
+  return requestJson<ValidationRunStartResponse>(`/validation-runs/${validationRunId}/start`, {
+    method: "POST",
+  });
+}
+
+export async function cancelValidationRun(validationRunId: string): Promise<ValidationRun> {
+  return requestJson<ValidationRun>(`/validation-runs/${validationRunId}/cancel`, {
+    method: "POST",
+  });
+}
+
+export async function getValidationRunEvents(validationRunId: string): Promise<ValidationRunEvent[]> {
+  return requestJson<ValidationRunEvent[]>(`/validation-runs/${validationRunId}/events`);
+}
+
+export async function getValidationRunMetrics(validationRunId: string): Promise<ValidationRunMetrics> {
+  return requestJson<ValidationRunMetrics>(`/validation-runs/${validationRunId}/metrics`);
 }

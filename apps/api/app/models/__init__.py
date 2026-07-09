@@ -49,6 +49,10 @@ from app.models.research_candidate_evaluation import ResearchCandidateEvaluation
 from app.models.research_memory_entry import ResearchMemoryEntry
 from app.models.research_agent_activity import ResearchAgentActivity
 from app.models.research_campaign_statistic import ResearchCampaignStatistic
+from app.models.validation_run import ValidationRun
+from app.models.validation_run_event import ValidationRunEvent
+from app.models.validation_run_metric import ValidationRunMetric
+from app.models.validation_run_scorecard import ValidationRunScorecard
 
 __all__ = [
 	"Asset",
@@ -102,4 +106,8 @@ __all__ = [
 	"ResearchMemoryEntry",
 	"ResearchAgentActivity",
 	"ResearchCampaignStatistic",
+	"ValidationRun",
+	"ValidationRunEvent",
+	"ValidationRunMetric",
+	"ValidationRunScorecard",
 ]

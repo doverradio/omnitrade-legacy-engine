@@ -15,6 +15,7 @@ from app.api.routes.paper import router as paper_router
 from app.api.routes.research import router as research_router
 from app.api.routes.risk import router as risk_router
 from app.api.routes.strategies import router as strategies_router
+from app.api.routes.validation_runs import router as validation_runs_router
 from app.config import get_settings
 from app.core.errors import register_error_handlers
 from app.core.logging import setup_logging
@@ -52,6 +53,7 @@ def create_app() -> FastAPI:
     app.include_router(risk_router)
     app.include_router(decisions_router)
     app.include_router(live_router)
+    app.include_router(validation_runs_router)
 
     @app.on_event("startup")
     async def _flush_legacy_research_state() -> None:
