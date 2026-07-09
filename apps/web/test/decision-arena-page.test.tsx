@@ -139,6 +139,49 @@ function installFetchMock() {
       });
     }
 
+    if (url.pathname === "/research/agents") {
+      if (method !== "GET") {
+        return jsonResponse(405, {
+          error: {
+            message: `Unexpected method ${method}`,
+          },
+        });
+      }
+
+      return jsonResponse(200, [
+        {
+          agent_id: "66666666-6666-6666-6666-666666666666",
+          agent_name: "Baseline Research Agent",
+          capabilities: ["Generate deterministic candidate strategies"],
+        },
+      ]);
+    }
+
+    if (url.pathname === "/research/candidates") {
+      if (method !== "GET") {
+        return jsonResponse(405, {
+          error: {
+            message: `Unexpected method ${method}`,
+          },
+        });
+      }
+
+      return jsonResponse(200, [
+        {
+          candidate_id: "77777777-7777-7777-7777-777777777777",
+          generated_at: "2026-07-09T12:00:00Z",
+          originating_agent: "Baseline Research Agent",
+          strategy_name: "Volatility Filter MA-RSI Blend",
+          description: "Combines moving-average trend filter with RSI threshold confirmation under deterministic volatility guardrails.",
+          parameter_set: {
+            fast_period: 12,
+          },
+          rationale: "Baseline deterministic candidate intended to improve signal quality under mixed trend and mean-reversion market states.",
+          status: "PROPOSED",
+        },
+      ]);
+    }
+
     if (method !== "GET") {
       return jsonResponse(405, {
         error: {
@@ -182,6 +225,12 @@ describe("DecisionArenaPage", () => {
     expect(screen.getByRole("table", { name: /Recommended Allocation/i })).toBeInTheDocument();
     expect(screen.getByText(/Total Paper Capital/i)).toBeInTheDocument();
     expect(screen.getByText(/Rule-Based Capital Allocation/i)).toBeInTheDocument();
+    expect(screen.getByRole("heading", { name: /Research Agents/i })).toBeInTheDocument();
+    expect(screen.getByText(/Research agents cannot trade\./i)).toBeInTheDocument();
+    expect(screen.getByText(/Research agents only generate candidate strategies\./i)).toBeInTheDocument();
+    expect(screen.getByText(/Baseline Research Agent/i)).toBeInTheDocument();
+    expect(screen.getByRole("table", { name: /Candidate Strategies/i })).toBeInTheDocument();
+    expect(screen.getByText(/PROPOSED/i)).toBeInTheDocument();
 
     const nonGetCalls = fetchMock.mock.calls.filter((call) => {
       const init = call[1] as RequestInit | undefined;
@@ -269,6 +318,14 @@ describe("DecisionArenaPage", () => {
           return jsonResponse(200, []);
         }
 
+        if (url.pathname === "/research/agents") {
+          return jsonResponse(200, []);
+        }
+
+        if (url.pathname === "/research/candidates") {
+          return jsonResponse(200, []);
+        }
+
         return jsonResponse(404, {
           error: {
             message: `Unhandled route in test: ${method} ${url.pathname}`,
@@ -284,5 +341,6 @@ describe("DecisionArenaPage", () => {
     expect(await screen.findByText(/Current Champion/i)).toBeInTheDocument();
     expect((await screen.findAllByText(/^None$/i)).length).toBeGreaterThan(0);
     expect(await screen.findByText(/No capital allocation recommendation available yet\./i)).toBeInTheDocument();
+    expect(await screen.findByText(/No research agents or candidate strategies are available yet\./i)).toBeInTheDocument();
   });
 });

@@ -9,6 +9,7 @@ from app.api.routes.live import router as live_router
 from app.api.routes.markets import router as markets_router
 from app.api.routes.parameter_sets import router as parameter_sets_router
 from app.api.routes.paper import router as paper_router
+from app.api.routes.research import router as research_router
 from app.api.routes.risk import router as risk_router
 from app.api.routes.strategies import router as strategies_router
 from app.config import get_settings
@@ -37,6 +38,7 @@ def create_app() -> FastAPI:
     app.include_router(parameter_sets_router)
     app.include_router(backtests_router)
     app.include_router(arena_router)
+    app.include_router(research_router)
     app.include_router(paper_router)
     app.include_router(risk_router)
     app.include_router(decisions_router)

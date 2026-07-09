@@ -8,6 +8,8 @@ import {
   coachReviewDecisionQuality,
   getCapitalAllocationRecommendation,
   getDecisionArenaTournament,
+  getResearchAgents,
+  getResearchCandidates,
   evaluateReplayResult,
   getDecisionIntelligenceRecommendation,
   replayDecisionPackage,
@@ -16,6 +18,8 @@ import {
   type DecisionIntelligenceRecommendation,
   type DecisionQualityResult,
   type ReplayResult,
+  type ResearchAgent,
+  type StrategyCandidate,
   type TournamentResponse,
 } from "@/lib/api/arena";
 
@@ -91,6 +95,8 @@ export default function DecisionArenaPage() {
   const [coachObservation, setCoachObservation] = useState<AICoachObservation | null>(null);
   const [decisionIntelligence, setDecisionIntelligence] = useState<DecisionIntelligenceRecommendation | null>(null);
   const [capitalAllocation, setCapitalAllocation] = useState<CapitalAllocationRecommendation | null>(null);
+  const [researchAgents, setResearchAgents] = useState<ResearchAgent[]>([]);
+  const [researchCandidates, setResearchCandidates] = useState<StrategyCandidate[]>([]);
   const [replayError, setReplayError] = useState<string | null>(null);
 
   useEffect(() => {
@@ -100,15 +106,19 @@ export default function DecisionArenaPage() {
       setLoading(true);
       setError(null);
       try {
-        const [payload, recommendation, allocation] = await Promise.all([
+        const [payload, recommendation, allocation, agents, candidates] = await Promise.all([
           getDecisionArenaTournament(),
           getDecisionIntelligenceRecommendation(),
           getCapitalAllocationRecommendation(),
+          getResearchAgents(),
+          getResearchCandidates(),
         ]);
         if (active) {
           setTournament(payload);
           setDecisionIntelligence(recommendation);
           setCapitalAllocation(allocation);
+          setResearchAgents(agents);
+          setResearchCandidates(candidates);
         }
       } catch (fetchError) {
         if (active) {
@@ -311,6 +321,76 @@ export default function DecisionArenaPage() {
         ) : (
           <div className="mt-4 rounded-md border border-dashed border-border/70 bg-background/40 px-3 py-3 text-sm text-foreground/60">
             No capital allocation recommendation available yet.
+          </div>
+        )}
+      </section>
+
+      <section className="rounded-xl border border-border bg-background/60 p-4 sm:p-5" aria-labelledby="research-agents-heading">
+        <div className="flex flex-wrap items-end justify-between gap-3">
+          <div>
+            <h3 id="research-agents-heading" className="text-base font-semibold">Research Agents</h3>
+            <p className="mt-1 text-xs text-foreground/70">Framework for deterministic candidate strategy generation.</p>
+          </div>
+          <div className="text-right text-xs">
+            <p className="font-semibold uppercase tracking-wide text-foreground/60">Research agents cannot trade.</p>
+            <p className="text-foreground/70">Research agents only generate candidate strategies.</p>
+          </div>
+        </div>
+
+        {researchAgents.length > 0 || researchCandidates.length > 0 ? (
+          <div className="mt-4 space-y-3">
+            <div className="rounded-md border border-border/70 bg-background/40 p-3">
+              <p className="text-xs font-semibold uppercase tracking-wide text-foreground/60">Registered Agents</p>
+              <div className="mt-2 space-y-2">
+                {researchAgents.map((agent) => (
+                  <article key={agent.agent_id} className="rounded border border-border/60 bg-background/60 p-2">
+                    <p className="text-sm font-semibold text-foreground/90">{agent.agent_name}</p>
+                    <p className="mt-1 text-xs text-foreground/65">Capabilities</p>
+                    <ul className="mt-1 space-y-1 text-xs text-foreground/80">
+                      {agent.capabilities.map((capability) => (
+                        <li key={`${agent.agent_id}-${capability}`}>{capability}</li>
+                      ))}
+                    </ul>
+                  </article>
+                ))}
+              </div>
+            </div>
+
+            <div className="rounded-md border border-border/70 bg-background/40 p-3">
+              <p className="text-xs font-semibold uppercase tracking-wide text-foreground/60">Candidate Strategies</p>
+              {researchCandidates.length > 0 ? (
+                <div className="mt-2 overflow-x-auto">
+                  <table className="min-w-[760px] w-full text-left text-sm" aria-label="Candidate Strategies">
+                    <thead>
+                      <tr className="border-b border-border text-foreground/70">
+                        <th className="px-3 py-2">Strategy</th>
+                        <th className="px-3 py-2">Description</th>
+                        <th className="px-3 py-2">Status</th>
+                      </tr>
+                    </thead>
+                    <tbody>
+                      {researchCandidates.map((candidate) => (
+                        <tr key={candidate.candidate_id} className="border-b border-border/60">
+                          <td className="px-3 py-3 font-semibold text-foreground/90">{candidate.strategy_name}</td>
+                          <td className="px-3 py-3 text-xs text-foreground/75">{candidate.description}</td>
+                          <td className="px-3 py-3">
+                            <span className="rounded border border-sky-500/40 bg-sky-500/10 px-2 py-1 text-xs font-medium text-sky-100">
+                              {candidate.status}
+                            </span>
+                          </td>
+                        </tr>
+                      ))}
+                    </tbody>
+                  </table>
+                </div>
+              ) : (
+                <p className="mt-2 text-sm text-foreground/65">No candidate strategies available.</p>
+              )}
+            </div>
+          </div>
+        ) : (
+          <div className="mt-4 rounded-md border border-dashed border-border/70 bg-background/40 px-3 py-3 text-sm text-foreground/60">
+            No research agents or candidate strategies are available yet.
           </div>
         )}
       </section>

@@ -263,6 +263,23 @@ export type StrategyHealthResponse = {
   items: StrategyHealthItem[];
 };
 
+export type ResearchAgent = {
+  agent_id: string;
+  agent_name: string;
+  capabilities: string[];
+};
+
+export type StrategyCandidate = {
+  candidate_id: string;
+  generated_at: string;
+  originating_agent: string;
+  strategy_name: string;
+  description: string;
+  parameter_set: Record<string, unknown>;
+  rationale: string;
+  status: string;
+};
+
 async function requestJson<T>(path: string, init?: RequestInit): Promise<T> {
   const headers = new Headers(init?.headers);
   headers.set("Content-Type", "application/json");
@@ -382,4 +399,12 @@ export async function getCapitalAllocationRecommendation(): Promise<CapitalAlloc
 
 export async function getStrategyHealth(): Promise<StrategyHealthResponse> {
   return requestJson<StrategyHealthResponse>("/arena/strategy-health");
+}
+
+export async function getResearchAgents(): Promise<ResearchAgent[]> {
+  return requestJson<ResearchAgent[]>("/research/agents");
+}
+
+export async function getResearchCandidates(): Promise<StrategyCandidate[]> {
+  return requestJson<StrategyCandidate[]>("/research/candidates");
 }
