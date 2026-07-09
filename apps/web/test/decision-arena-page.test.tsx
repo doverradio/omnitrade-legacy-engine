@@ -167,7 +167,51 @@ function installFetchMock() {
         });
       }
 
-      return jsonResponse(200, []);
+      return jsonResponse(200, [
+        {
+          adapter_id: "aaaaaaaa-1111-2222-3333-444444444444",
+          adapter_name: "OpenAI Research Agent",
+          provider: "openai",
+          capabilities: ["generate_hypotheses", "explain_candidate", "critique_candidate", "summarize_laboratory"],
+          status: "AVAILABLE",
+        },
+      ]);
+    }
+
+    if (url.pathname === "/research/llm-adapters/openai/generate-candidates") {
+      if (method !== "POST") {
+        return jsonResponse(405, {
+          error: {
+            message: `Unexpected method ${method}`,
+          },
+        });
+      }
+
+      return jsonResponse(200, {
+        status: "AVAILABLE",
+        generated_candidates: [
+          {
+            candidate_id: "bbbbbbbb-7777-7777-7777-777777777701",
+            generated_at: "2026-07-09T12:00:04Z",
+            originating_agent: "OpenAI Research Agent",
+            strategy_name: "OpenAI Sandbox Momentum Variant",
+            description: "Sandbox-generated research candidate.",
+            parameter_set: {
+              fast_period: 11,
+              slow_period: 44,
+            },
+            rationale: "Generated from research-only context.",
+            status: "PROPOSED",
+          },
+        ],
+        evaluations: [],
+        generation_timestamp: "2026-07-09T12:00:04Z",
+        prompt_version: "openai-research-agent-v1",
+        response_duration_ms: 25,
+        prompt_tokens: 100,
+        completion_tokens: 120,
+        total_tokens: 220,
+      });
     }
 
     if (url.pathname === "/research/candidates") {
@@ -615,7 +659,9 @@ describe("DecisionArenaPage", () => {
     expect(screen.getByText(/Recent Candidate History/i)).toBeInTheDocument();
     expect(screen.getByText(/No research memory has been recorded yet\./i)).toBeInTheDocument();
     expect(screen.getByRole("heading", { name: /Future Research Agents/i })).toBeInTheDocument();
-    expect(screen.getByText(/No LLM adapters installed\./i)).toBeInTheDocument();
+    expect(screen.getByRole("table", { name: /LLM Research Adapters/i })).toBeInTheDocument();
+    expect(screen.getAllByText(/OpenAI Research Agent/i).length).toBeGreaterThan(0);
+    expect(screen.getByRole("button", { name: /Generate Candidates/i })).toBeInTheDocument();
     expect(screen.getByRole("heading", { name: /^Evolution$/i })).toBeInTheDocument();
     expect(screen.getByRole("button", { name: /Run Evolution/i })).toBeInTheDocument();
     expect(screen.getByText(/No evolved descendants generated yet\./i)).toBeInTheDocument();
@@ -637,6 +683,10 @@ describe("DecisionArenaPage", () => {
     expect(screen.getByRole("table", { name: /Research Agent Leaderboard/i })).toBeInTheDocument();
     expect(screen.getByText(/Largest Lineage Tree/i)).toBeInTheDocument();
 
+    fireEvent.click(screen.getByRole("button", { name: /Generate Candidates/i }));
+    expect(await screen.findByText(/Latest Generated Candidates/i)).toBeInTheDocument();
+    expect(screen.getAllByText(/OpenAI Sandbox Momentum Variant/i).length).toBeGreaterThan(0);
+
     expect(screen.getByRole("button", { name: /Evaluate Candidates/i })).toBeInTheDocument();
     expect(screen.getByText(/No candidate evaluations available yet\./i)).toBeInTheDocument();
 
@@ -651,11 +701,12 @@ describe("DecisionArenaPage", () => {
       return (init?.method ?? "GET") !== "GET";
     });
 
-    expect(nonGetCalls).toHaveLength(3);
+    expect(nonGetCalls).toHaveLength(4);
     const postCallUrls = nonGetCalls.map((call) => new URL(call[0] as string).pathname);
     expect(postCallUrls).toContain("/research/laboratory/run");
     expect(postCallUrls).toContain("/research/evaluate-candidates");
     expect(postCallUrls).toContain("/research/evolve");
+    expect(postCallUrls).toContain("/research/llm-adapters/openai/generate-candidates");
   });
 
   it("renders champion and runner up summary", async () => {

@@ -277,6 +277,18 @@ export type LLMResearchAdapter = {
   status: string;
 };
 
+export type OpenAIResearchGenerationResponse = {
+  status: string;
+  generated_candidates: StrategyCandidate[];
+  evaluations: CandidateEvaluation[];
+  generation_timestamp: string | null;
+  prompt_version: string | null;
+  response_duration_ms: number | null;
+  prompt_tokens: number | null;
+  completion_tokens: number | null;
+  total_tokens: number | null;
+};
+
 export type StrategyCandidate = {
   candidate_id: string;
   generated_at: string;
@@ -584,6 +596,12 @@ export async function getResearchAgents(): Promise<ResearchAgent[]> {
 
 export async function getLLMResearchAdapters(): Promise<LLMResearchAdapter[]> {
   return requestJson<LLMResearchAdapter[]>("/research/llm-adapters");
+}
+
+export async function generateOpenAIResearchCandidates(): Promise<OpenAIResearchGenerationResponse> {
+  return requestJson<OpenAIResearchGenerationResponse>("/research/llm-adapters/openai/generate-candidates", {
+    method: "POST",
+  });
 }
 
 export async function getResearchCandidates(): Promise<StrategyCandidate[]> {

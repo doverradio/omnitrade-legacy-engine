@@ -22,6 +22,7 @@ from app.schemas.evolution_analytics import (
 )
 from app.schemas.research_laboratory import ResearchLaboratoryRunResponse, ResearchLaboratoryStatusResponse
 from app.schemas.llm_adapter import LLMAdapterResponse
+from app.schemas.openai_research_agent import OpenAIResearchGenerationResponse
 from app.schemas.research_memory import (
     ResearchMemoryCandidateResponse,
     ResearchMemoryLaboratoryRunResponse,
@@ -36,6 +37,8 @@ from app.services.candidate_evaluation.deterministic import (
 )
 from app.services.research_agents.registry import list_generated_strategy_candidates, list_registered_research_agents
 from app.services.research_agents.llm_adapter.registry import list_registered_llm_research_adapters
+from app.services.research_agents.llm_adapter.contracts import CandidateHistoryItem, HypothesisRequest, TournamentHistoryItem
+from app.services.research_agents.openai.registry import get_openai_research_agent, get_openai_research_agent_registration
 from app.services.research_laboratory.registry import get_research_laboratory
 from app.services.research_memory.registry import get_research_memory
 from app.services.evolution.registry import get_evolution_engine
@@ -59,6 +62,11 @@ async def get_research_agents() -> list[ResearchAgentResponse]:
 
 @router.get("/llm-adapters", response_model=list[LLMAdapterResponse])
 async def get_llm_research_adapters() -> list[LLMAdapterResponse]:
+    openai_registration = get_openai_research_agent_registration()
+    registrations = {openai_registration.adapter_id: openai_registration}
+    for item in list_registered_llm_research_adapters():
+        registrations[item.adapter_id] = item
+
     return [
         LLMAdapterResponse(
             adapter_id=item.adapter_id,
@@ -67,8 +75,129 @@ async def get_llm_research_adapters() -> list[LLMAdapterResponse]:
             capabilities=list(item.capabilities),
             status=item.status,
         )
-        for item in list_registered_llm_research_adapters()
+        for item in registrations.values()
     ]
+
+
+@router.post("/llm-adapters/openai/generate-candidates", response_model=OpenAIResearchGenerationResponse)
+async def generate_openai_research_candidates() -> OpenAIResearchGenerationResponse:
+    agent = get_openai_research_agent()
+    if not agent.is_available:
+        return OpenAIResearchGenerationResponse(
+            status="UNAVAILABLE",
+            generated_candidates=[],
+            evaluations=[],
+            generation_timestamp=None,
+            prompt_version=None,
+            response_duration_ms=None,
+            prompt_tokens=None,
+            completion_tokens=None,
+            total_tokens=None,
+        )
+
+    memory = get_research_memory()
+    analytics_summary = get_evolution_analytics_service().build_summary()
+    candidates_history = list(memory.list_candidates())
+    tournament_outcomes = list(memory.list_tournament_outcomes())
+
+    successful_candidates = [
+        item
+        for item in candidates_history
+        if item.quality_score is not None and item.quality_score >= 75
+    ][:10]
+    failed_candidates = [
+        item
+        for item in candidates_history
+        if item.quality_score is not None and item.quality_score < 50
+    ][:10]
+
+    request = HypothesisRequest(
+        research_memory={
+            "total_laboratory_runs": memory.get_summary().total_laboratory_runs,
+            "total_candidates": memory.get_summary().total_candidates,
+            "recent_successful_candidates": [str(item.candidate_id) for item in successful_candidates],
+            "recent_failed_candidates": [str(item.candidate_id) for item in failed_candidates],
+        },
+        evolution_analytics={
+            "total_laboratory_runs": analytics_summary.total_laboratory_runs,
+            "total_candidates_generated": analytics_summary.total_candidates_generated,
+            "total_evolved_candidates": analytics_summary.total_evolved_candidates,
+            "average_quality_score": analytics_summary.average_quality_score,
+            "best_quality_score": analytics_summary.best_quality_score,
+            "top_research_agent": analytics_summary.top_research_agent,
+            "lineage_depth": analytics_summary.lineage_depth,
+        },
+        candidate_history=[
+            CandidateHistoryItem(
+                candidate_id=item.candidate_id,
+                generation=item.generation,
+                quality_score=item.quality_score,
+                tournament_rank=item.tournament_rank,
+                parameter_set=dict(item.parameter_set),
+            )
+            for item in candidates_history[:20]
+        ],
+        tournament_history=[
+            TournamentHistoryItem(
+                tournament_id=None,
+                generated_at=None,
+                ranking=[
+                    {
+                        "candidate_id": str(item.candidate_id),
+                        "rank": item.tournament_rank,
+                    }
+                    for item in tournament_outcomes[:20]
+                ],
+            )
+        ],
+    )
+
+    ideas, metadata = agent.generate_hypotheses_batch(request=request)
+    generated_candidates = agent.to_strategy_candidates(
+        ideas=ideas,
+        generated_at=metadata.generation_timestamp,
+    )
+    evaluations = build_candidate_evaluations_batch_v1(
+        candidates=list(generated_candidates),
+        selected_candidate_ids=[item.candidate_id for item in generated_candidates],
+        limit=None,
+    )
+
+    return OpenAIResearchGenerationResponse(
+        status="AVAILABLE",
+        generated_candidates=[
+            StrategyCandidateResponse(
+                candidate_id=item.candidate_id,
+                generated_at=item.generated_at,
+                originating_agent=item.originating_agent,
+                strategy_name=item.strategy_name,
+                description=item.description,
+                parameter_set=dict(item.parameter_set),
+                rationale=item.rationale,
+                status=item.status,
+            )
+            for item in generated_candidates
+        ],
+        evaluations=[
+            CandidateEvaluationResponse(
+                evaluation_id=item.evaluation_id,
+                candidate_id=item.candidate_id,
+                replay_status=item.replay_status,
+                decision_quality_score=item.decision_quality_score,
+                ai_coach_summary=item.ai_coach_summary,
+                decision_intelligence_summary=item.decision_intelligence_summary,
+                tournament_rank=item.tournament_rank,
+                promotion_eligible=item.promotion_eligible,
+            )
+            for item in evaluations
+        ],
+        generation_timestamp=metadata.generation_timestamp,
+        prompt_version=metadata.prompt_version,
+        response_duration_ms=metadata.response_duration_ms,
+        prompt_tokens=metadata.prompt_tokens,
+        completion_tokens=metadata.completion_tokens,
+        total_tokens=metadata.total_tokens,
+    )
 
 
 @router.get("/candidates", response_model=list[StrategyCandidateResponse])

@@ -9,6 +9,7 @@ import {
   coachReviewDecisionQuality,
   evolveResearchCandidates,
   evaluateCandidates,
+  generateOpenAIResearchCandidates,
   getLLMResearchAdapters,
   getEvolutionAnalytics,
   getCapitalAllocationRecommendation,
@@ -31,6 +32,7 @@ import {
   type EvolutionAnalytics,
   type EvolutionResponse,
   type LLMResearchAdapter,
+  type OpenAIResearchGenerationResponse,
   type ReplayResult,
   type ResearchAgent,
   type ResearchMemoryCandidate,
@@ -129,6 +131,9 @@ export default function DecisionArenaPage() {
   const [capitalAllocation, setCapitalAllocation] = useState<CapitalAllocationRecommendation | null>(null);
   const [researchAgents, setResearchAgents] = useState<ResearchAgent[]>([]);
   const [llmResearchAdapters, setLlmResearchAdapters] = useState<LLMResearchAdapter[]>([]);
+  const [openAIGeneration, setOpenAIGeneration] = useState<OpenAIResearchGenerationResponse | null>(null);
+  const [openAIGenerating, setOpenAIGenerating] = useState(false);
+  const [openAIGenerationError, setOpenAIGenerationError] = useState<string | null>(null);
   const [researchCandidates, setResearchCandidates] = useState<StrategyCandidate[]>([]);
   const [candidateEvaluations, setCandidateEvaluations] = useState<CandidateEvaluation[]>([]);
   const [candidateBatchSummary, setCandidateBatchSummary] = useState<CandidateBatchEvaluationResponse | null>(null);
@@ -295,6 +300,23 @@ export default function DecisionArenaPage() {
       setEvolutionError(errorMessage(evolutionRequestError, "Failed to run evolution engine."));
     } finally {
       setEvolutionRunning(false);
+    }
+  }
+
+  async function handleGenerateOpenAICandidates() {
+    setOpenAIGenerationError(null);
+    setOpenAIGenerating(true);
+    try {
+      const response = await generateOpenAIResearchCandidates();
+      setOpenAIGeneration(response);
+      if (response.generated_candidates.length > 0) {
+        setResearchCandidates((existing) => [...response.generated_candidates, ...existing]);
+      }
+    } catch (openAIError) {
+      setOpenAIGeneration(null);
+      setOpenAIGenerationError(errorMessage(openAIError, "Failed to generate OpenAI research candidates."));
+    } finally {
+      setOpenAIGenerating(false);
     }
   }
 
@@ -605,10 +627,16 @@ export default function DecisionArenaPage() {
         <div className="flex flex-wrap items-end justify-between gap-3">
           <div>
             <h3 id="future-research-agents-heading" className="text-base font-semibold">Future Research Agents</h3>
-            <p className="mt-1 text-xs text-foreground/70">Adapter registry for future GPT, Claude, Gemini, or local-model research integrations.</p>
+            <p className="mt-1 text-xs text-foreground/70">Adapter registry for sandbox GPT, Claude, Gemini, or local-model research integrations.</p>
           </div>
-          <p className="text-xs font-semibold uppercase tracking-wide text-foreground/60">Framework Only</p>
+          <p className="text-xs font-semibold uppercase tracking-wide text-foreground/60">Sandbox Only</p>
         </div>
+
+        {openAIGenerationError ? (
+          <div className="mt-3 rounded-md border border-red-500/50 bg-red-500/10 px-3 py-2 text-xs text-red-100" role="alert">
+            {openAIGenerationError}
+          </div>
+        ) : null}
 
         {llmResearchAdapters.length > 0 ? (
           <div className="mt-3 overflow-x-auto">
@@ -619,19 +647,56 @@ export default function DecisionArenaPage() {
                   <th className="px-3 py-2">Provider</th>
                   <th className="px-3 py-2">Capabilities</th>
                   <th className="px-3 py-2">Status</th>
+                  <th className="px-3 py-2">Action</th>
                 </tr>
               </thead>
               <tbody>
                 {llmResearchAdapters.map((adapter) => (
                   <tr key={adapter.adapter_id} className="border-b border-border/60">
                     <td className="px-3 py-3 font-semibold text-foreground/90">{adapter.adapter_name}</td>
-                    <td className="px-3 py-3">{adapter.provider}</td>
+                    <td className="px-3 py-3">{adapter.provider === "openai" ? "OpenAI" : adapter.provider}</td>
                     <td className="px-3 py-3 text-xs text-foreground/75">{adapter.capabilities.join(", ")}</td>
                     <td className="px-3 py-3">{adapter.status}</td>
+                    <td className="px-3 py-3">
+                      {adapter.provider === "openai" ? (
+                        <button
+                          type="button"
+                          onClick={() => {
+                            void handleGenerateOpenAICandidates();
+                          }}
+                          disabled={adapter.status !== "AVAILABLE" || openAIGenerating}
+                          className="rounded border border-cyan-500/40 bg-cyan-500/10 px-3 py-1 text-xs font-semibold text-cyan-100 disabled:cursor-not-allowed disabled:opacity-50"
+                        >
+                          {openAIGenerating ? "Generating..." : "Generate Candidates"}
+                        </button>
+                      ) : (
+                        <span className="text-xs text-foreground/60">n/a</span>
+                      )}
+                    </td>
                   </tr>
                 ))}
               </tbody>
             </table>
+
+            {openAIGeneration ? (
+              <div className="mt-3 rounded-md border border-border/70 bg-background/40 p-3" aria-labelledby="openai-generated-candidates-heading">
+                <h4 id="openai-generated-candidates-heading" className="text-xs font-semibold uppercase tracking-wide text-foreground/60">Latest Generated Candidates</h4>
+                <p className="mt-1 text-xs text-foreground/70">
+                  Status: {openAIGeneration.status} | Prompt Version: {openAIGeneration.prompt_version ?? "n/a"} | Duration: {openAIGeneration.response_duration_ms ?? 0} ms
+                </p>
+                {openAIGeneration.generated_candidates.length > 0 ? (
+                  <ul className="mt-2 space-y-1 text-xs text-foreground/80">
+                    {openAIGeneration.generated_candidates.map((candidate) => (
+                      <li key={candidate.candidate_id}>
+                        {candidate.strategy_name} ({candidate.originating_agent})
+                      </li>
+                    ))}
+                  </ul>
+                ) : (
+                  <p className="mt-2 text-xs text-foreground/65">No candidates generated.</p>
+                )}
+              </div>
+            ) : null}
           </div>
         ) : (
           <div className="mt-3 rounded-md border border-dashed border-border/70 bg-background/40 px-3 py-3 text-sm text-foreground/60">
