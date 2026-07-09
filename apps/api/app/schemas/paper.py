@@ -153,3 +153,78 @@ class PaperPipelineHealthResponse(BaseModel):
     latest_rejection_reason: str | None = None
     latest_updated_at: datetime | None = None
     recent_activity: list[PipelineActivityItem]
+
+
+class PaperLatestTradeSummary(BaseModel):
+    id: uuid.UUID
+    asset_id: uuid.UUID
+    symbol: str | None = None
+    strategy_id: uuid.UUID | None = None
+    side: str
+    quantity: Decimal
+    price: Decimal
+    fee: Decimal
+    executed_at: datetime
+
+    @field_serializer("quantity", "price", "fee", when_used="json")
+    def serialize_numeric_fields(self, value: Decimal) -> str:
+        return format(value, "f")
+
+
+class PaperAssetPerformanceSummary(BaseModel):
+    asset_id: uuid.UUID
+    symbol: str | None = None
+    trade_count: int
+    realized_pnl: Decimal
+    unrealized_pnl: Decimal
+    total_pnl: Decimal
+
+    @field_serializer("realized_pnl", "unrealized_pnl", "total_pnl", when_used="json")
+    def serialize_numeric_fields(self, value: Decimal) -> str:
+        return format(value, "f")
+
+
+class PaperStrategyPerformanceSummary(BaseModel):
+    strategy_id: uuid.UUID
+    trade_count: int
+    win_count: int
+    loss_count: int
+    win_rate: Decimal
+    realized_pnl: Decimal
+
+    @field_serializer("win_rate", "realized_pnl", when_used="json")
+    def serialize_numeric_fields(self, value: Decimal) -> str:
+        return format(value, "f")
+
+
+class PaperPerformanceSummaryResponse(BaseModel):
+    account_id: uuid.UUID
+    starting_balance: Decimal
+    current_cash_balance: Decimal
+    equity: Decimal
+    realized_pnl: Decimal
+    unrealized_pnl: Decimal
+    total_return_usd: Decimal
+    total_return_pct: Decimal
+    trade_count: int
+    win_count: int
+    loss_count: int
+    win_rate: Decimal
+    latest_trade: PaperLatestTradeSummary | None = None
+    positions: list[PositionResponse]
+    by_asset: list[PaperAssetPerformanceSummary]
+    by_strategy: list[PaperStrategyPerformanceSummary]
+
+    @field_serializer(
+        "starting_balance",
+        "current_cash_balance",
+        "equity",
+        "realized_pnl",
+        "unrealized_pnl",
+        "total_return_usd",
+        "total_return_pct",
+        "win_rate",
+        when_used="json",
+    )
+    def serialize_numeric_fields(self, value: Decimal) -> str:
+        return format(value, "f")

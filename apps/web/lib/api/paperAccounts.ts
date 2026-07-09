@@ -90,6 +90,55 @@ export type PaperPipelineHealth = {
   recent_activity: PipelineActivity[];
 };
 
+export type PaperPerformanceLatestTrade = {
+  id: string;
+  asset_id: string;
+  symbol?: string | null;
+  strategy_id?: string | null;
+  side: string;
+  quantity: string;
+  price: string;
+  fee: string;
+  executed_at: string;
+};
+
+export type PaperPerformanceByAsset = {
+  asset_id: string;
+  symbol?: string | null;
+  trade_count: number;
+  realized_pnl: string;
+  unrealized_pnl: string;
+  total_pnl: string;
+};
+
+export type PaperPerformanceByStrategy = {
+  strategy_id: string;
+  trade_count: number;
+  win_count: number;
+  loss_count: number;
+  win_rate: string;
+  realized_pnl: string;
+};
+
+export type PaperPerformanceSummary = {
+  account_id: string;
+  starting_balance: string;
+  current_cash_balance: string;
+  equity: string;
+  realized_pnl: string;
+  unrealized_pnl: string;
+  total_return_usd: string;
+  total_return_pct: string;
+  trade_count: number;
+  win_count: number;
+  loss_count: number;
+  win_rate: string;
+  latest_trade?: PaperPerformanceLatestTrade | null;
+  positions: PaperAccountPosition[];
+  by_asset: PaperPerformanceByAsset[];
+  by_strategy: PaperPerformanceByStrategy[];
+};
+
 export type GetPaperTradesParams = {
   account_id: string;
   strategy_id?: string;
@@ -190,4 +239,13 @@ export async function getPaperTrades(params: GetPaperTradesParams): Promise<Pape
 export async function getPaperPipelineHealth(windowMinutes = 120): Promise<PaperPipelineHealth> {
   const query = new URLSearchParams({ window_minutes: String(windowMinutes) });
   return requestJson<PaperPipelineHealth>(`/paper/pipeline-health?${query.toString()}`);
+}
+
+export async function getPaperPerformanceSummary(accountId?: string): Promise<PaperPerformanceSummary> {
+  const query = new URLSearchParams();
+  if (accountId) {
+    query.set("account_id", accountId);
+  }
+  const suffix = query.toString() ? `?${query.toString()}` : "";
+  return requestJson<PaperPerformanceSummary>(`/paper/performance-summary${suffix}`);
 }

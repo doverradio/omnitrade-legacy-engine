@@ -26,7 +26,11 @@ from app.schemas.paper import (
     CreatePaperAccountResponse,
     ExecuteSignalRequest,
     ExecuteSignalResponse,
+    PaperAssetPerformanceSummary,
+    PaperLatestTradeSummary,
+    PaperPerformanceSummaryResponse,
     PaperPipelineHealthResponse,
+    PaperStrategyPerformanceSummary,
     PipelineActivityItem,
     PaperTradeListResponse,
     PaperTradeResponse,
@@ -445,6 +449,135 @@ async def get_paper_pipeline_health(
     )
 
 
+@router.get("/performance-summary", response_model=PaperPerformanceSummaryResponse)
+async def get_paper_performance_summary(
+    account_id: uuid.UUID | None = Query(default=None),
+    db: AsyncSession = Depends(get_db),
+) -> PaperPerformanceSummaryResponse:
+    account = await _load_account(db=db, account_id=account_id)
+
+    snapshot = await build_account_snapshot(
+        db=db,
+        paper_account_id=account.id,
+        starting_balance=account.starting_balance,
+    )
+
+    trade_rows = (
+        await db.execute(
+            select(Trade, Asset.symbol)
+            .outerjoin(Asset, Asset.id == Trade.asset_id)
+            .where(Trade.paper_account_id == account.id)
+            .where(Trade.is_paper.is_(True))
+            .order_by(Trade.executed_at.asc(), Trade.id.asc())
+        )
+    ).all()
+
+    trades = [row[0] for row in trade_rows]
+    symbol_by_trade_id = {row[0].id: row[1] for row in trade_rows}
+
+    strategy_by_signal_id: dict[uuid.UUID, uuid.UUID] = {}
+    signal_ids = sorted({trade.signal_id for trade in trades if trade.signal_id is not None}, key=str)
+    if signal_ids:
+        strategy_rows = (
+            await db.execute(select(Signal.id, Signal.strategy_id).where(Signal.id.in_(signal_ids)))
+        ).all()
+        strategy_by_signal_id = {signal_id: strategy_id for signal_id, strategy_id in strategy_rows}
+
+    realized_pnl, win_count, loss_count, realized_by_asset, realized_by_strategy, wins_by_strategy, losses_by_strategy = (
+        _compute_realized_performance(trades=trades, strategy_by_signal_id=strategy_by_signal_id)
+    )
+    unrealized_pnl = sum((position.unrealized_pnl_usd for position in snapshot.positions), Decimal("0"))
+    total_return_usd = snapshot.equity_return_usd
+    total_return_pct = snapshot.equity_return_pct
+    trade_count = len(trades)
+    win_rate = Decimal("0")
+    if trade_count > 0:
+        win_rate = Decimal(win_count) / Decimal(trade_count)
+
+    latest_trade = None
+    if trades:
+        latest = max(trades, key=lambda trade: (trade.executed_at, trade.id))
+        latest_trade = PaperLatestTradeSummary(
+            id=latest.id,
+            asset_id=latest.asset_id,
+            symbol=symbol_by_trade_id.get(latest.id),
+            strategy_id=strategy_by_signal_id.get(latest.signal_id) if latest.signal_id is not None else None,
+            side=latest.side,
+            quantity=latest.quantity,
+            price=latest.price,
+            fee=latest.fee,
+            executed_at=latest.executed_at,
+        )
+
+    unrealized_by_asset = {position.asset_id: position.unrealized_pnl_usd for position in snapshot.positions}
+    symbols_by_asset = {position.asset_id: position.symbol for position in snapshot.positions}
+    for trade in trades:
+        if trade.asset_id not in symbols_by_asset:
+            symbol = symbol_by_trade_id.get(trade.id)
+            if isinstance(symbol, str):
+                symbols_by_asset[trade.asset_id] = symbol
+
+    by_asset_ids = sorted(set(realized_by_asset.keys()) | set(unrealized_by_asset.keys()), key=str)
+    by_asset = [
+        PaperAssetPerformanceSummary(
+            asset_id=asset_id,
+            symbol=symbols_by_asset.get(asset_id),
+            trade_count=sum(1 for trade in trades if trade.asset_id == asset_id),
+            realized_pnl=realized_by_asset.get(asset_id, Decimal("0")),
+            unrealized_pnl=unrealized_by_asset.get(asset_id, Decimal("0")),
+            total_pnl=realized_by_asset.get(asset_id, Decimal("0")) + unrealized_by_asset.get(asset_id, Decimal("0")),
+        )
+        for asset_id in by_asset_ids
+    ]
+
+    by_strategy_ids = sorted(realized_by_strategy.keys(), key=str)
+    by_strategy = [
+        PaperStrategyPerformanceSummary(
+            strategy_id=strategy_id,
+            trade_count=wins_by_strategy.get(strategy_id, 0) + losses_by_strategy.get(strategy_id, 0),
+            win_count=wins_by_strategy.get(strategy_id, 0),
+            loss_count=losses_by_strategy.get(strategy_id, 0),
+            win_rate=(
+                Decimal(wins_by_strategy.get(strategy_id, 0))
+                / Decimal(wins_by_strategy.get(strategy_id, 0) + losses_by_strategy.get(strategy_id, 0))
+                if (wins_by_strategy.get(strategy_id, 0) + losses_by_strategy.get(strategy_id, 0)) > 0
+                else Decimal("0")
+            ),
+            realized_pnl=realized_by_strategy.get(strategy_id, Decimal("0")),
+        )
+        for strategy_id in by_strategy_ids
+    ]
+
+    return PaperPerformanceSummaryResponse(
+        account_id=account.id,
+        starting_balance=account.starting_balance,
+        current_cash_balance=snapshot.cash_balance,
+        equity=snapshot.equity,
+        realized_pnl=realized_pnl,
+        unrealized_pnl=unrealized_pnl,
+        total_return_usd=total_return_usd,
+        total_return_pct=total_return_pct,
+        trade_count=trade_count,
+        win_count=win_count,
+        loss_count=loss_count,
+        win_rate=win_rate,
+        latest_trade=latest_trade,
+        positions=[
+            PositionResponse(
+                asset_id=position.asset_id,
+                symbol=position.symbol,
+                quantity=position.quantity,
+                avg_entry_price=position.avg_entry_price,
+                unrealized_pnl_usd=position.unrealized_pnl_usd,
+                unrealized_pnl_pct=position.unrealized_pnl_pct,
+            )
+            for position in snapshot.positions
+        ],
+        by_asset=by_asset,
+        by_strategy=by_strategy,
+    )
+
+
 async def _load_account(*, db: AsyncSession, account_id: uuid.UUID | None) -> PaperAccount:
     if account_id is not None:
         account = await db.scalar(select(PaperAccount).where(PaperAccount.id == account_id))
@@ -489,3 +622,59 @@ async def _resolve_latest_update_timestamp(*, db: AsyncSession, window_start: da
     if not non_null:
         return None
     return max(non_null)
+
+
+def _compute_realized_performance(*, trades: list[Trade], strategy_by_signal_id: dict[uuid.UUID, uuid.UUID]):
+    positions: dict[uuid.UUID, tuple[Decimal, Decimal]] = {}
+    realized_pnl = Decimal("0")
+    win_count = 0
+    loss_count = 0
+    realized_by_asset: dict[uuid.UUID, Decimal] = {}
+    realized_by_strategy: dict[uuid.UUID, Decimal] = {}
+    wins_by_strategy: dict[uuid.UUID, int] = {}
+    losses_by_strategy: dict[uuid.UUID, int] = {}
+
+    for trade in sorted(trades, key=lambda item: (item.executed_at, item.id)):
+        quantity = Decimal(str(trade.quantity))
+        price = Decimal(str(trade.price))
+        fee = Decimal(str(trade.fee))
+        current_qty, current_avg = positions.get(trade.asset_id, (Decimal("0"), Decimal("0")))
+
+        if trade.side == "buy":
+            total_cost = (current_qty * current_avg) + (quantity * price) + fee
+            next_qty = current_qty + quantity
+            next_avg = total_cost / next_qty if next_qty > 0 else Decimal("0")
+            positions[trade.asset_id] = (next_qty, next_avg)
+            continue
+
+        if trade.side != "sell":
+            continue
+
+        sell_qty = min(current_qty, quantity)
+        if sell_qty <= 0:
+            continue
+
+        pnl = (sell_qty * price) - (sell_qty * current_avg) - fee
+        realized_pnl += pnl
+        realized_by_asset[trade.asset_id] = realized_by_asset.get(trade.asset_id, Decimal("0")) + pnl
+
+        strategy_id = strategy_by_signal_id.get(trade.signal_id) if trade.signal_id is not None else None
+        if strategy_id is not None:
+            realized_by_strategy[strategy_id] = realized_by_strategy.get(strategy_id, Decimal("0")) + pnl
+
+        if pnl > 0:
+            win_count += 1
+            if strategy_id is not None:
+                wins_by_strategy[strategy_id] = wins_by_strategy.get(strategy_id, 0) + 1
+        elif pnl < 0:
+            loss_count += 1
+            if strategy_id is not None:
+                losses_by_strategy[strategy_id] = losses_by_strategy.get(strategy_id, 0) + 1
+
+        remaining_qty = current_qty - sell_qty
+        if remaining_qty <= 0:
+            positions[trade.asset_id] = (Decimal("0"), Decimal("0"))
+        else:
+            positions[trade.asset_id] = (remaining_qty, current_avg)
+
+    return realized_pnl, win_count, loss_count, realized_by_asset, realized_by_strategy, wins_by_strategy, losses_by_strategy

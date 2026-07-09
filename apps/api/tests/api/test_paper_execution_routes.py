@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 from datetime import datetime, timezone
+from decimal import Decimal
+from types import SimpleNamespace
 import uuid
 
 from fastapi.testclient import TestClient
@@ -34,6 +36,9 @@ class _ResultRows:
 
     def all(self):
         return self._rows
+
+    def scalars(self):
+        return self
 
 
 class _PipelineHealthFakeSession:
@@ -105,6 +110,83 @@ class _PipelineHealthFakeSession:
                     )
                 ]
             )
+        return _ResultRows([])
+
+    def add(self, obj):
+        return None
+
+    async def commit(self):
+        return None
+
+    async def refresh(self, obj):
+        return None
+
+
+class _PerformanceSummaryFakeSession:
+    def __init__(self, *, empty: bool = False) -> None:
+        self.empty = empty
+        self.account_id = uuid.uuid4()
+        self.asset_id = uuid.uuid4()
+        self.signal_id = uuid.uuid4()
+        self.strategy_id = uuid.uuid4()
+        self.now = datetime(2026, 7, 9, 10, 0, tzinfo=timezone.utc)
+
+        self.account = SimpleNamespace(
+            id=self.account_id,
+            starting_balance=Decimal("1000"),
+            current_cash_balance=Decimal("1000"),
+            is_active=True,
+            created_at=self.now,
+        )
+
+        self.trade_buy = SimpleNamespace(
+            id=uuid.uuid4(),
+            paper_account_id=self.account_id,
+            signal_id=self.signal_id,
+            asset_id=self.asset_id,
+            side="buy",
+            quantity=Decimal("1"),
+            price=Decimal("100"),
+            fee=Decimal("1"),
+            is_paper=True,
+            executed_at=self.now,
+            created_at=self.now,
+        )
+        self.trade_sell = SimpleNamespace(
+            id=uuid.uuid4(),
+            paper_account_id=self.account_id,
+            signal_id=self.signal_id,
+            asset_id=self.asset_id,
+            side="sell",
+            quantity=Decimal("1"),
+            price=Decimal("110"),
+            fee=Decimal("1"),
+            is_paper=True,
+            executed_at=self.now.replace(minute=5),
+            created_at=self.now.replace(minute=5),
+        )
+
+    async def scalar(self, statement):
+        sql = str(statement)
+        if "FROM paper_accounts" in sql:
+            return self.account
+        return None
+
+    async def execute(self, statement):
+        sql = str(statement)
+        if "FROM trades LEFT OUTER JOIN assets" in sql:
+            if self.empty:
+                return _ResultRows([])
+            return _ResultRows(
+                [
+                    (self.trade_buy, "BTCUSD"),
+                    (self.trade_sell, "BTCUSD"),
+                ]
+            )
+        if "FROM signals" in sql and "strategy_id" in sql:
+            if self.empty:
+                return _ResultRows([])
+            return _ResultRows([(self.signal_id, self.strategy_id)])
         return _ResultRows([])
 
     def add(self, obj):
@@ -236,3 +318,73 @@ def test_pipeline_health_risk_rejected_state_exposes_latest_reason() -> None:
     assert payload["risk_rejected"] == 5
     assert payload["latest_rejection_reason"] == "position_below_minimum_order_size"
     assert payload["recent_activity"][0]["reason"] == "position_below_minimum_order_size"
+
+
+def test_performance_summary_empty_state(monkeypatch) -> None:
+    fake_session = _PerformanceSummaryFakeSession(empty=True)
+
+    async def fake_build_account_snapshot(*args, **kwargs):
+        return SimpleNamespace(
+            cash_balance=Decimal("1000"),
+            equity=Decimal("1000"),
+            equity_return_usd=Decimal("0"),
+            equity_return_pct=Decimal("0"),
+            positions=(),
+        )
+
+    monkeypatch.setattr(paper_route_module, "build_account_snapshot", fake_build_account_snapshot)
+
+    with create_test_client(fake_session) as client:
+        response = client.get(f"/paper/performance-summary?account_id={fake_session.account_id}")
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["trade_count"] == 0
+    assert payload["win_count"] == 0
+    assert payload["loss_count"] == 0
+    assert payload["win_rate"] == "0"
+    assert payload["latest_trade"] is None
+    assert payload["positions"] == []
+    assert payload["by_asset"] == []
+    assert payload["by_strategy"] == []
+
+
+def test_performance_summary_with_trades_and_positions(monkeypatch) -> None:
+    fake_session = _PerformanceSummaryFakeSession(empty=False)
+
+    async def fake_build_account_snapshot(*args, **kwargs):
+        return SimpleNamespace(
+            cash_balance=Decimal("1008"),
+            equity=Decimal("1013"),
+            equity_return_usd=Decimal("13"),
+            equity_return_pct=Decimal("0.013"),
+            positions=(
+                SimpleNamespace(
+                    asset_id=fake_session.asset_id,
+                    symbol="BTCUSD",
+                    quantity=Decimal("0.5"),
+                    avg_entry_price=Decimal("100"),
+                    unrealized_pnl_usd=Decimal("5"),
+                    unrealized_pnl_pct=Decimal("0.05"),
+                ),
+            ),
+        )
+
+    monkeypatch.setattr(paper_route_module, "build_account_snapshot", fake_build_account_snapshot)
+
+    with create_test_client(fake_session) as client:
+        response = client.get(f"/paper/performance-summary?account_id={fake_session.account_id}")
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["trade_count"] == 2
+    assert payload["win_count"] == 1
+    assert payload["loss_count"] == 0
+    assert payload["win_rate"] == "0.5"
+    assert payload["realized_pnl"] == "9"
+    assert payload["unrealized_pnl"] == "5"
+    assert payload["equity"] == "1013"
+    assert payload["latest_trade"]["side"] == "sell"
+    assert payload["positions"][0]["symbol"] == "BTCUSD"
+    assert payload["by_asset"][0]["symbol"] == "BTCUSD"
+    assert payload["by_strategy"][0]["strategy_id"] == str(fake_session.strategy_id)

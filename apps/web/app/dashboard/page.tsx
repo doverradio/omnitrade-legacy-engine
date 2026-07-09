@@ -1,4 +1,5 @@
 import EquityCurveChart from "@/components/charts/EquityCurveChart";
+import PaperPerformancePanel from "@/components/domain/PaperPerformancePanel";
 import PaperPipelineFlow from "@/components/domain/PaperPipelineFlow";
 import SummaryCardRow from "@/components/domain/SummaryCardRow";
 
@@ -13,6 +14,8 @@ export default function DashboardPage() {
       <SummaryCardRow />
 
       <PaperPipelineFlow />
+
+      <PaperPerformancePanel />
 
       <div className="grid gap-6 lg:grid-cols-2">
         <section className="rounded-lg border border-border bg-muted/60 p-4">
