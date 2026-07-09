@@ -1,9 +1,11 @@
 from __future__ import annotations
 
-from fastapi import APIRouter
+from fastapi import APIRouter, Depends, Query
 import uuid
+from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.errors import NotFoundError
+from app.db.session import get_db
 from app.schemas.candidate_evaluation import (
     CandidateBatchEvaluationRequest,
     CandidateBatchEvaluationResponse,
@@ -41,13 +43,14 @@ from app.services.research_agents.registry import list_generated_strategy_candid
 from app.services.research_agents.llm_adapter.registry import list_registered_llm_research_adapters
 from app.services.research_agents.llm_adapter.contracts import CandidateHistoryItem, HypothesisRequest, TournamentHistoryItem
 from app.services.research_agents.openai.registry import get_openai_research_agent, get_openai_research_agent_registration
-from app.services.research_campaign.registry import get_research_campaign_engine
-from app.services.research_campaign.service import CampaignNotFoundError
 from app.services.research_laboratory.registry import get_research_laboratory
-from app.services.research_memory.registry import get_research_memory
 from app.services.evolution.registry import get_evolution_engine
 from app.services.evolution.service import ParentCandidateNotFoundError
-from app.services.evolution_analytics.registry import get_evolution_analytics_service
+from app.services.evolution_analytics.service import EvolutionAnalyticsService
+from app.services.research_persistence import ResearchPersistenceRepository
+
+
+_RESEARCH_REPOSITORY = ResearchPersistenceRepository()
 
 router = APIRouter(prefix="/research", tags=["research"])
 
@@ -84,7 +87,7 @@ async def get_llm_research_adapters() -> list[LLMAdapterResponse]:
 
 
 @router.post("/llm-adapters/openai/generate-candidates", response_model=OpenAIResearchGenerationResponse)
-async def generate_openai_research_candidates() -> OpenAIResearchGenerationResponse:
+async def generate_openai_research_candidates(db: AsyncSession = Depends(get_db)) -> OpenAIResearchGenerationResponse:
     agent = get_openai_research_agent()
     if not agent.is_available:
         return OpenAIResearchGenerationResponse(
@@ -99,10 +102,13 @@ async def generate_openai_research_candidates() -> OpenAIResearchGenerationRespo
             total_tokens=None,
         )
 
-    memory = get_research_memory()
-    analytics_summary = get_evolution_analytics_service().build_summary()
-    candidates_history = list(memory.list_candidates())
-    tournament_outcomes = list(memory.list_tournament_outcomes())
+    summary = await _RESEARCH_REPOSITORY.get_summary(db=db)
+    candidates_history = list(await _RESEARCH_REPOSITORY.list_candidates(db=db, limit=200, offset=0))
+    tournament_outcomes = list(await _RESEARCH_REPOSITORY.list_tournament_outcomes(db=db, limit=200, offset=0))
+    analytics_summary = EvolutionAnalyticsService(
+        runs_provider=lambda: tuple(),
+        candidates_provider=lambda: tuple(candidates_history),
+    ).build_summary()
 
     successful_candidates = [
         item
@@ -117,8 +123,8 @@ async def generate_openai_research_candidates() -> OpenAIResearchGenerationRespo
 
     request = HypothesisRequest(
         research_memory={
-            "total_laboratory_runs": memory.get_summary().total_laboratory_runs,
-            "total_candidates": memory.get_summary().total_candidates,
+            "total_laboratory_runs": summary.total_laboratory_runs,
+            "total_candidates": summary.total_candidates,
             "recent_successful_candidates": [str(item.candidate_id) for item in successful_candidates],
             "recent_failed_candidates": [str(item.candidate_id) for item in failed_candidates],
         },
@@ -205,8 +211,12 @@ async def generate_openai_research_candidates() -> OpenAIResearchGenerationRespo
 
 
 @router.get("/campaigns", response_model=list[ResearchCampaignResponse])
-async def get_research_campaigns() -> list[ResearchCampaignResponse]:
-    campaigns = get_research_campaign_engine().list_campaigns()
+async def get_research_campaigns(
+    limit: int = Query(default=100, ge=1, le=500),
+    offset: int = Query(default=0, ge=0),
+    db: AsyncSession = Depends(get_db),
+) -> list[ResearchCampaignResponse]:
+    campaigns = await _RESEARCH_REPOSITORY.list_campaigns(db=db, limit=limit, offset=offset)
     return [
         ResearchCampaignResponse(
             campaign_id=item.campaign_id,
@@ -228,10 +238,17 @@ async def get_research_campaigns() -> list[ResearchCampaignResponse]:
 
 
 @router.get("/campaigns/{campaign_id}", response_model=ResearchCampaignResponse)
-async def get_research_campaign(campaign_id: str) -> ResearchCampaignResponse:
+async def get_research_campaign(campaign_id: str, db: AsyncSession = Depends(get_db)) -> ResearchCampaignResponse:
     try:
-        campaign = get_research_campaign_engine().get_campaign(campaign_id=uuid.UUID(campaign_id))
-    except (ValueError, CampaignNotFoundError):
+        parsed_campaign_id = uuid.UUID(campaign_id)
+    except ValueError:
+        raise NotFoundError(
+            message="Research campaign not found",
+            details={"campaign_id": campaign_id},
+        )
+
+    campaign = await _RESEARCH_REPOSITORY.get_campaign(db=db, campaign_id=parsed_campaign_id)
+    if campaign is None:
         raise NotFoundError(
             message="Research campaign not found",
             details={"campaign_id": campaign_id},
@@ -255,11 +272,14 @@ async def get_research_campaign(campaign_id: str) -> ResearchCampaignResponse:
 
 
 @router.post("/campaigns", response_model=ResearchCampaignResponse)
-async def create_research_campaign(request: ResearchCampaignCreateRequest) -> ResearchCampaignResponse:
-    campaign = get_research_campaign_engine().create_campaign(
+async def create_research_campaign(request: ResearchCampaignCreateRequest, db: AsyncSession = Depends(get_db)) -> ResearchCampaignResponse:
+    campaign = await _RESEARCH_REPOSITORY.create_campaign(
+        db=db,
         name=request.name,
         objective=request.objective,
+        participating_agents=get_research_laboratory().get_status().registered_agents,
     )
+    await db.commit()
     return ResearchCampaignResponse(
         campaign_id=campaign.campaign_id,
         name=campaign.name,
@@ -278,14 +298,79 @@ async def create_research_campaign(request: ResearchCampaignCreateRequest) -> Re
 
 
 @router.post("/campaigns/{campaign_id}/run", response_model=ResearchCampaignResponse)
-async def run_research_campaign(campaign_id: str) -> ResearchCampaignResponse:
+async def run_research_campaign(campaign_id: str, db: AsyncSession = Depends(get_db)) -> ResearchCampaignResponse:
     try:
-        campaign = get_research_campaign_engine().run_campaign(campaign_id=uuid.UUID(campaign_id))
-    except (ValueError, CampaignNotFoundError):
+        parsed_campaign_id = uuid.UUID(campaign_id)
+    except ValueError:
         raise NotFoundError(
             message="Research campaign not found",
             details={"campaign_id": campaign_id},
         )
+
+    existing_campaign = await _RESEARCH_REPOSITORY.get_campaign(db=db, campaign_id=parsed_campaign_id)
+    if existing_campaign is None:
+        raise NotFoundError(
+            message="Research campaign not found",
+            details={"campaign_id": campaign_id},
+        )
+
+    laboratory = get_research_laboratory()
+    run = laboratory.run()
+    baseline_candidates = list_generated_strategy_candidates()
+    baseline_evaluations = build_candidate_evaluations_batch_v1(
+        candidates=list(baseline_candidates),
+        selected_candidate_ids=[item.candidate_id for item in baseline_candidates],
+        limit=None,
+    )
+    await _RESEARCH_REPOSITORY.record_laboratory_run(
+        db=db,
+        run=run,
+        candidates=list(baseline_candidates),
+        evaluations=list(baseline_evaluations),
+        campaign_id=parsed_campaign_id,
+    )
+
+    persisted_candidates = await _RESEARCH_REPOSITORY.list_candidates(db=db, limit=5000, offset=0)
+    engine = get_evolution_engine()
+    try:
+        evolution_run = engine.evolve(
+            memory_candidates=persisted_candidates,
+            parent_candidate_id=None,
+            generation_limit=None,
+        )
+    except ParentCandidateNotFoundError:
+        evolution_run = None
+
+    if evolution_run is not None:
+        await _RESEARCH_REPOSITORY.record_evolved_candidates(
+            db=db,
+            descendants=list(evolution_run.descendants),
+            campaign_id=parsed_campaign_id,
+        )
+
+    refreshed_candidates = await _RESEARCH_REPOSITORY.list_candidates(db=db, limit=5000, offset=0)
+    analytics_summary = EvolutionAnalyticsService(
+        runs_provider=lambda: tuple(),
+        candidates_provider=lambda: tuple(refreshed_candidates),
+    ).build_summary()
+
+    best_candidate_id = analytics_summary.best_candidate.candidate_id if analytics_summary.best_candidate is not None else None
+    best_quality_score = analytics_summary.best_quality_score
+    current_champion = analytics_summary.best_candidate.originating_agent if analytics_summary.best_candidate is not None else None
+
+    campaign = await _RESEARCH_REPOSITORY.upsert_campaign_statistics(
+        db=db,
+        campaign_id=parsed_campaign_id,
+        laboratory_runs_increment=1,
+        candidates_generated_increment=run.generated_candidates + (0 if evolution_run is None else evolution_run.generated_count),
+        candidates_evaluated_increment=run.evaluated_candidates + (0 if evolution_run is None else evolution_run.generated_count),
+        best_candidate_id=best_candidate_id,
+        best_quality_score=best_quality_score,
+        current_champion=current_champion,
+        status="COMPLETED",
+        participating_agents=run.participating_agents,
+    )
+    await db.commit()
 
     return ResearchCampaignResponse(
         campaign_id=campaign.campaign_id,
@@ -305,7 +390,13 @@ async def run_research_campaign(campaign_id: str) -> ResearchCampaignResponse:
 
 
 @router.get("/candidates", response_model=list[StrategyCandidateResponse])
-async def get_research_candidates() -> list[StrategyCandidateResponse]:
+async def get_research_candidates(
+    limit: int = Query(default=200, ge=1, le=1000),
+    offset: int = Query(default=0, ge=0),
+    db: AsyncSession = Depends(get_db),
+) -> list[StrategyCandidateResponse]:
+    persisted = await _RESEARCH_REPOSITORY.list_strategy_candidates(db=db, limit=limit, offset=offset)
+    source_candidates = persisted if persisted else list_generated_strategy_candidates()
     return [
         StrategyCandidateResponse(
             candidate_id=item.candidate_id,
@@ -317,7 +408,7 @@ async def get_research_candidates() -> list[StrategyCandidateResponse]:
             rationale=item.rationale,
             status=item.status,
         )
-        for item in list_generated_strategy_candidates()
+        for item in source_candidates
     ]
 
 
@@ -386,9 +477,9 @@ async def evaluate_candidates(request: CandidateBatchEvaluationRequest) -> Candi
 
 
 @router.get("/laboratory", response_model=ResearchLaboratoryStatusResponse)
-async def get_research_laboratory_status() -> ResearchLaboratoryStatusResponse:
-    laboratory = get_research_laboratory()
-    status = laboratory.get_status()
+async def get_research_laboratory_status(db: AsyncSession = Depends(get_db)) -> ResearchLaboratoryStatusResponse:
+    registered_agents = tuple(item.agent_name for item in list_registered_research_agents())
+    status = await _RESEARCH_REPOSITORY.get_laboratory_status(db=db, registered_agents=registered_agents)
     return ResearchLaboratoryStatusResponse(
         status=status.status,
         registered_agents=list(status.registered_agents),
@@ -412,9 +503,23 @@ async def get_research_laboratory_status() -> ResearchLaboratoryStatusResponse:
 
 
 @router.post("/laboratory/run", response_model=ResearchLaboratoryRunResponse)
-async def run_research_laboratory() -> ResearchLaboratoryRunResponse:
+async def run_research_laboratory(db: AsyncSession = Depends(get_db)) -> ResearchLaboratoryRunResponse:
     laboratory = get_research_laboratory()
     run = laboratory.run()
+    candidates = list_generated_strategy_candidates()
+    evaluations = build_candidate_evaluations_batch_v1(
+        candidates=list(candidates),
+        selected_candidate_ids=[item.candidate_id for item in candidates],
+        limit=None,
+    )
+    await _RESEARCH_REPOSITORY.record_laboratory_run(
+        db=db,
+        run=run,
+        candidates=list(candidates),
+        evaluations=list(evaluations),
+        campaign_id=None,
+    )
+    await db.commit()
     return ResearchLaboratoryRunResponse(
         laboratory_run_id=run.laboratory_run_id,
         started_at=run.started_at,
@@ -427,9 +532,8 @@ async def run_research_laboratory() -> ResearchLaboratoryRunResponse:
 
 
 @router.get("/memory", response_model=ResearchMemorySummaryResponse)
-async def get_research_memory_summary() -> ResearchMemorySummaryResponse:
-    memory = get_research_memory()
-    summary = memory.get_summary()
+async def get_research_memory_summary(db: AsyncSession = Depends(get_db)) -> ResearchMemorySummaryResponse:
+    summary = await _RESEARCH_REPOSITORY.get_summary(db=db)
 
     return ResearchMemorySummaryResponse(
         total_laboratory_runs=summary.total_laboratory_runs,
@@ -476,8 +580,12 @@ async def get_research_memory_summary() -> ResearchMemorySummaryResponse:
 
 
 @router.get("/memory/runs", response_model=list[ResearchMemoryLaboratoryRunResponse])
-async def get_research_memory_runs() -> list[ResearchMemoryLaboratoryRunResponse]:
-    memory = get_research_memory()
+async def get_research_memory_runs(
+    limit: int = Query(default=200, ge=1, le=1000),
+    offset: int = Query(default=0, ge=0),
+    db: AsyncSession = Depends(get_db),
+) -> list[ResearchMemoryLaboratoryRunResponse]:
+    runs = await _RESEARCH_REPOSITORY.list_runs(db=db, limit=limit, offset=offset)
     return [
         ResearchMemoryLaboratoryRunResponse(
             laboratory_run_id=item.laboratory_run_id,
@@ -487,13 +595,17 @@ async def get_research_memory_runs() -> list[ResearchMemoryLaboratoryRunResponse
             candidates_generated=item.candidates_generated,
             candidates_evaluated=item.candidates_evaluated,
         )
-        for item in memory.list_runs()
+        for item in runs
     ]
 
 
 @router.get("/memory/candidates", response_model=list[ResearchMemoryCandidateResponse])
-async def get_research_memory_candidates() -> list[ResearchMemoryCandidateResponse]:
-    memory = get_research_memory()
+async def get_research_memory_candidates(
+    limit: int = Query(default=500, ge=1, le=5000),
+    offset: int = Query(default=0, ge=0),
+    db: AsyncSession = Depends(get_db),
+) -> list[ResearchMemoryCandidateResponse]:
+    candidates = await _RESEARCH_REPOSITORY.list_candidates(db=db, limit=limit, offset=offset)
     return [
         ResearchMemoryCandidateResponse(
             laboratory_run_id=item.laboratory_run_id,
@@ -516,18 +628,18 @@ async def get_research_memory_candidates() -> list[ResearchMemoryCandidateRespon
                 for diff in item.parameter_diff
             ],
         )
-        for item in memory.list_candidates()
+        for item in candidates
     ]
 
 
 @router.post("/evolve", response_model=EvolutionResponse)
-async def evolve_research_candidates(request: EvolutionRequest) -> EvolutionResponse:
-    memory = get_research_memory()
+async def evolve_research_candidates(request: EvolutionRequest, db: AsyncSession = Depends(get_db)) -> EvolutionResponse:
     engine = get_evolution_engine()
+    candidates = await _RESEARCH_REPOSITORY.list_candidates(db=db, limit=5000, offset=0)
 
     try:
         run = engine.evolve(
-            memory_candidates=memory.list_candidates(),
+            memory_candidates=candidates,
             parent_candidate_id=request.parent_candidate_id,
             generation_limit=request.generation_limit,
         )
@@ -537,7 +649,12 @@ async def evolve_research_candidates(request: EvolutionRequest) -> EvolutionResp
             details={"parent_candidate_id": str(request.parent_candidate_id)},
         )
 
-    memory.record_evolved_candidates(descendants=list(run.descendants))
+    await _RESEARCH_REPOSITORY.record_evolved_candidates(
+        db=db,
+        descendants=list(run.descendants),
+        campaign_id=None,
+    )
+    await db.commit()
 
     return EvolutionResponse(
         generated_count=run.generated_count,
@@ -567,8 +684,13 @@ async def evolve_research_candidates(request: EvolutionRequest) -> EvolutionResp
 
 
 @router.get("/evolution-analytics", response_model=EvolutionAnalyticsResponse)
-async def get_evolution_analytics() -> EvolutionAnalyticsResponse:
-    service = get_evolution_analytics_service()
+async def get_evolution_analytics(db: AsyncSession = Depends(get_db)) -> EvolutionAnalyticsResponse:
+    runs = await _RESEARCH_REPOSITORY.list_runs(db=db, limit=100000, offset=0)
+    candidates = await _RESEARCH_REPOSITORY.list_candidates(db=db, limit=100000, offset=0)
+    service = EvolutionAnalyticsService(
+        runs_provider=lambda: runs,
+        candidates_provider=lambda: candidates,
+    )
     summary = service.build_summary()
 
     return EvolutionAnalyticsResponse(

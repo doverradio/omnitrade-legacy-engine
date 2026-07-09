@@ -1,3 +1,5 @@
+import logging
+
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
@@ -15,6 +17,11 @@ from app.api.routes.strategies import router as strategies_router
 from app.config import get_settings
 from app.core.errors import register_error_handlers
 from app.core.logging import setup_logging
+from app.db.session import AsyncSessionLocal
+from app.services.research_persistence import ResearchPersistenceRepository, flush_legacy_research_state
+
+
+logger = logging.getLogger(__name__)
 
 
 def create_app() -> FastAPI:
@@ -43,6 +50,18 @@ def create_app() -> FastAPI:
     app.include_router(risk_router)
     app.include_router(decisions_router)
     app.include_router(live_router)
+
+    @app.on_event("startup")
+    async def _flush_legacy_research_state() -> None:
+        repository = ResearchPersistenceRepository()
+        try:
+            async with AsyncSessionLocal() as session:
+                flushed = await flush_legacy_research_state(db=session, repository=repository)
+                if flushed:
+                    await session.commit()
+        except Exception:
+            # Keep startup resilient in environments without a reachable DB.
+            logger.warning("Skipping legacy research state flush at startup", exc_info=True)
 
     return app
 

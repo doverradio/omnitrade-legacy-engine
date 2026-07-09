@@ -41,6 +41,14 @@ from app.models.risk_rule_config import RiskRuleConfig
 from app.models.signal import Signal
 from app.models.strategy import Strategy
 from app.models.trade import Trade
+from app.models.research_laboratory_run import ResearchLaboratoryRun
+from app.models.research_campaign import ResearchCampaign
+from app.models.research_candidate import ResearchCandidate
+from app.models.research_candidate_lineage import ResearchCandidateLineage
+from app.models.research_candidate_evaluation import ResearchCandidateEvaluation
+from app.models.research_memory_entry import ResearchMemoryEntry
+from app.models.research_agent_activity import ResearchAgentActivity
+from app.models.research_campaign_statistic import ResearchCampaignStatistic
 
 __all__ = [
 	"Asset",
@@ -86,4 +94,12 @@ __all__ = [
 	"Signal",
 	"Strategy",
 	"Trade",
+	"ResearchLaboratoryRun",
+	"ResearchCampaign",
+	"ResearchCandidate",
+	"ResearchCandidateLineage",
+	"ResearchCandidateEvaluation",
+	"ResearchMemoryEntry",
+	"ResearchAgentActivity",
+	"ResearchCampaignStatistic",
 ]
