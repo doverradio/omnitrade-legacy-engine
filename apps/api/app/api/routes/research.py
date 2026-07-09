@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from fastapi import APIRouter
+import uuid
 
 from app.core.errors import NotFoundError
 from app.schemas.candidate_evaluation import (
@@ -21,6 +22,7 @@ from app.schemas.evolution_analytics import (
     EvolutionAnalyticsRunPointResponse,
 )
 from app.schemas.research_laboratory import ResearchLaboratoryRunResponse, ResearchLaboratoryStatusResponse
+from app.schemas.research_campaign import ResearchCampaignCreateRequest, ResearchCampaignResponse
 from app.schemas.llm_adapter import LLMAdapterResponse
 from app.schemas.openai_research_agent import OpenAIResearchGenerationResponse
 from app.schemas.research_memory import (
@@ -39,6 +41,8 @@ from app.services.research_agents.registry import list_generated_strategy_candid
 from app.services.research_agents.llm_adapter.registry import list_registered_llm_research_adapters
 from app.services.research_agents.llm_adapter.contracts import CandidateHistoryItem, HypothesisRequest, TournamentHistoryItem
 from app.services.research_agents.openai.registry import get_openai_research_agent, get_openai_research_agent_registration
+from app.services.research_campaign.registry import get_research_campaign_engine
+from app.services.research_campaign.service import CampaignNotFoundError
 from app.services.research_laboratory.registry import get_research_laboratory
 from app.services.research_memory.registry import get_research_memory
 from app.services.evolution.registry import get_evolution_engine
@@ -197,6 +201,106 @@ async def generate_openai_research_candidates() -> OpenAIResearchGenerationRespo
         prompt_tokens=metadata.prompt_tokens,
         completion_tokens=metadata.completion_tokens,
         total_tokens=metadata.total_tokens,
+    )
+
+
+@router.get("/campaigns", response_model=list[ResearchCampaignResponse])
+async def get_research_campaigns() -> list[ResearchCampaignResponse]:
+    campaigns = get_research_campaign_engine().list_campaigns()
+    return [
+        ResearchCampaignResponse(
+            campaign_id=item.campaign_id,
+            name=item.name,
+            objective=item.objective,
+            status=item.status,
+            started_at=item.started_at,
+            completed_at=item.completed_at,
+            participating_agents=list(item.participating_agents),
+            laboratory_runs=item.laboratory_runs,
+            candidates_generated=item.candidates_generated,
+            candidates_evaluated=item.candidates_evaluated,
+            best_candidate=item.best_candidate,
+            best_quality_score=item.best_quality_score,
+            current_champion=item.current_champion,
+        )
+        for item in campaigns
+    ]
+
+
+@router.get("/campaigns/{campaign_id}", response_model=ResearchCampaignResponse)
+async def get_research_campaign(campaign_id: str) -> ResearchCampaignResponse:
+    try:
+        campaign = get_research_campaign_engine().get_campaign(campaign_id=uuid.UUID(campaign_id))
+    except (ValueError, CampaignNotFoundError):
+        raise NotFoundError(
+            message="Research campaign not found",
+            details={"campaign_id": campaign_id},
+        )
+
+    return ResearchCampaignResponse(
+        campaign_id=campaign.campaign_id,
+        name=campaign.name,
+        objective=campaign.objective,
+        status=campaign.status,
+        started_at=campaign.started_at,
+        completed_at=campaign.completed_at,
+        participating_agents=list(campaign.participating_agents),
+        laboratory_runs=campaign.laboratory_runs,
+        candidates_generated=campaign.candidates_generated,
+        candidates_evaluated=campaign.candidates_evaluated,
+        best_candidate=campaign.best_candidate,
+        best_quality_score=campaign.best_quality_score,
+        current_champion=campaign.current_champion,
+    )
+
+
+@router.post("/campaigns", response_model=ResearchCampaignResponse)
+async def create_research_campaign(request: ResearchCampaignCreateRequest) -> ResearchCampaignResponse:
+    campaign = get_research_campaign_engine().create_campaign(
+        name=request.name,
+        objective=request.objective,
+    )
+    return ResearchCampaignResponse(
+        campaign_id=campaign.campaign_id,
+        name=campaign.name,
+        objective=campaign.objective,
+        status=campaign.status,
+        started_at=campaign.started_at,
+        completed_at=campaign.completed_at,
+        participating_agents=list(campaign.participating_agents),
+        laboratory_runs=campaign.laboratory_runs,
+        candidates_generated=campaign.candidates_generated,
+        candidates_evaluated=campaign.candidates_evaluated,
+        best_candidate=campaign.best_candidate,
+        best_quality_score=campaign.best_quality_score,
+        current_champion=campaign.current_champion,
+    )
+
+
+@router.post("/campaigns/{campaign_id}/run", response_model=ResearchCampaignResponse)
+async def run_research_campaign(campaign_id: str) -> ResearchCampaignResponse:
+    try:
+        campaign = get_research_campaign_engine().run_campaign(campaign_id=uuid.UUID(campaign_id))
+    except (ValueError, CampaignNotFoundError):
+        raise NotFoundError(
+            message="Research campaign not found",
+            details={"campaign_id": campaign_id},
+        )
+
+    return ResearchCampaignResponse(
+        campaign_id=campaign.campaign_id,
+        name=campaign.name,
+        objective=campaign.objective,
+        status=campaign.status,
+        started_at=campaign.started_at,
+        completed_at=campaign.completed_at,
+        participating_agents=list(campaign.participating_agents),
+        laboratory_runs=campaign.laboratory_runs,
+        candidates_generated=campaign.candidates_generated,
+        candidates_evaluated=campaign.candidates_evaluated,
+        best_candidate=campaign.best_candidate,
+        best_quality_score=campaign.best_quality_score,
+        current_champion=campaign.current_champion,
     )
 
 

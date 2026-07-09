@@ -7,15 +7,18 @@ import ReplayAgentsPanel from "@/components/domain/ReplayAgentsPanel";
 import {
   ApiRequestError,
   coachReviewDecisionQuality,
+  createResearchCampaign,
   evolveResearchCandidates,
   evaluateCandidates,
   generateOpenAIResearchCandidates,
+  getResearchCampaigns,
   getLLMResearchAdapters,
   getEvolutionAnalytics,
   getCapitalAllocationRecommendation,
   getDecisionArenaTournament,
   getResearchMemoryCandidates,
   getResearchMemorySummary,
+  runResearchCampaign,
   getResearchAgents,
   getResearchCandidates,
   getResearchLaboratoryStatus,
@@ -34,6 +37,7 @@ import {
   type LLMResearchAdapter,
   type OpenAIResearchGenerationResponse,
   type ReplayResult,
+  type ResearchCampaign,
   type ResearchAgent,
   type ResearchMemoryCandidate,
   type ResearchMemorySummary,
@@ -145,6 +149,9 @@ export default function DecisionArenaPage() {
   const [researchMemorySummary, setResearchMemorySummary] = useState<ResearchMemorySummary | null>(null);
   const [researchMemoryCandidates, setResearchMemoryCandidates] = useState<ResearchMemoryCandidate[]>([]);
   const [researchMemoryError, setResearchMemoryError] = useState<string | null>(null);
+  const [campaigns, setCampaigns] = useState<ResearchCampaign[]>([]);
+  const [campaignError, setCampaignError] = useState<string | null>(null);
+  const [runningCampaignId, setRunningCampaignId] = useState<string | null>(null);
   const [evolutionResult, setEvolutionResult] = useState<EvolutionResponse | null>(null);
   const [evolutionRunning, setEvolutionRunning] = useState(false);
   const [evolutionError, setEvolutionError] = useState<string | null>(null);
@@ -160,8 +167,9 @@ export default function DecisionArenaPage() {
       setError(null);
       setResearchMemoryError(null);
       setEvolutionAnalyticsError(null);
+      setCampaignError(null);
       try {
-        const [payload, recommendation, allocation, agents, llmAdapters, candidates, laboratory, memorySummary, memoryCandidates, analytics] = await Promise.all([
+        const [payload, recommendation, allocation, agents, llmAdapters, candidates, laboratory, memorySummary, memoryCandidates, analytics, campaignsResponse] = await Promise.all([
           getDecisionArenaTournament(),
           getDecisionIntelligenceRecommendation(),
           getCapitalAllocationRecommendation(),
@@ -172,6 +180,7 @@ export default function DecisionArenaPage() {
           getResearchMemorySummary(),
           getResearchMemoryCandidates(),
           getEvolutionAnalytics(),
+          getResearchCampaigns(),
         ]);
 
         if (active) {
@@ -187,6 +196,7 @@ export default function DecisionArenaPage() {
           setResearchMemorySummary(memorySummary);
           setResearchMemoryCandidates(memoryCandidates);
           setEvolutionAnalytics(analytics);
+          setCampaigns(campaignsResponse);
         }
       } catch (fetchError) {
         if (active) {
@@ -194,6 +204,7 @@ export default function DecisionArenaPage() {
           setError(message);
           setResearchMemoryError(message);
           setEvolutionAnalyticsError(message);
+          setCampaignError(message);
         }
       } finally {
         if (active) {
@@ -300,6 +311,43 @@ export default function DecisionArenaPage() {
       setEvolutionError(errorMessage(evolutionRequestError, "Failed to run evolution engine."));
     } finally {
       setEvolutionRunning(false);
+    }
+  }
+
+  async function handleRunCampaign(campaignId: string) {
+    setCampaignError(null);
+    setRunningCampaignId(campaignId);
+    try {
+      const updated = await runResearchCampaign(campaignId);
+      setCampaigns((existing) => existing.map((item) => (item.campaign_id === updated.campaign_id ? updated : item)));
+      const [refreshedStatus, memorySummary, memoryCandidates, analytics] = await Promise.all([
+        getResearchLaboratoryStatus(),
+        getResearchMemorySummary(),
+        getResearchMemoryCandidates(),
+        getEvolutionAnalytics(),
+      ]);
+      setLaboratoryStatus(refreshedStatus);
+      setResearchMemorySummary(memorySummary);
+      setResearchMemoryCandidates(memoryCandidates);
+      setEvolutionAnalytics(analytics);
+    } catch (campaignRunError) {
+      setCampaignError(errorMessage(campaignRunError, "Failed to run research campaign."));
+    } finally {
+      setRunningCampaignId(null);
+    }
+  }
+
+  async function handleCreateCampaign() {
+    setCampaignError(null);
+    try {
+      const existing = campaigns.length;
+      const created = await createResearchCampaign({
+        name: `Campaign ${existing + 1}`,
+        objective: "Coordinate repeated deterministic laboratory and evolution cycles.",
+      });
+      setCampaigns((items) => [created, ...items]);
+    } catch (campaignCreateError) {
+      setCampaignError(errorMessage(campaignCreateError, "Failed to create research campaign."));
     }
   }
 
@@ -701,6 +749,85 @@ export default function DecisionArenaPage() {
         ) : (
           <div className="mt-3 rounded-md border border-dashed border-border/70 bg-background/40 px-3 py-3 text-sm text-foreground/60">
             No LLM adapters installed.
+          </div>
+        )}
+      </section>
+
+      <section className="rounded-xl border border-border bg-background/60 p-4 sm:p-5" aria-labelledby="research-campaigns-heading">
+        <div className="flex flex-wrap items-end justify-between gap-3">
+          <div>
+            <h3 id="research-campaigns-heading" className="text-base font-semibold">Research Campaigns</h3>
+            <p className="mt-1 text-xs text-foreground/70">Orchestrates repeated deterministic laboratory cycles for research-only campaigns.</p>
+          </div>
+          <button
+            type="button"
+            onClick={() => {
+              void handleCreateCampaign();
+            }}
+            className="rounded border border-cyan-500/40 bg-cyan-500/10 px-3 py-1 text-xs font-semibold text-cyan-100"
+          >
+            Create Campaign
+          </button>
+        </div>
+
+        {campaignError ? (
+          <div className="mt-3 rounded-md border border-red-500/50 bg-red-500/10 px-3 py-2 text-xs text-red-100" role="alert">
+            {campaignError}
+          </div>
+        ) : null}
+
+        {campaigns.length > 0 ? (
+          <div className="mt-3 overflow-x-auto">
+            <table className="min-w-[980px] w-full text-left text-sm" aria-label="Research Campaigns">
+              <thead>
+                <tr className="border-b border-border text-foreground/70">
+                  <th className="px-3 py-2">Campaign Name</th>
+                  <th className="px-3 py-2">Status</th>
+                  <th className="px-3 py-2">Runs</th>
+                  <th className="px-3 py-2">Candidates</th>
+                  <th className="px-3 py-2">Best Candidate</th>
+                  <th className="px-3 py-2">Best Score</th>
+                  <th className="px-3 py-2">Current Champion</th>
+                  <th className="px-3 py-2">Progress</th>
+                  <th className="px-3 py-2">Action</th>
+                </tr>
+              </thead>
+              <tbody>
+                {campaigns.map((campaign) => {
+                  const progressPercent = campaign.candidates_generated > 0
+                    ? ((campaign.candidates_evaluated / campaign.candidates_generated) * 100).toFixed(2)
+                    : "0.00";
+                  return (
+                    <tr key={campaign.campaign_id} className="border-b border-border/60">
+                      <td className="px-3 py-3 font-semibold text-foreground/90">{campaign.name}</td>
+                      <td className="px-3 py-3">{campaign.status}</td>
+                      <td className="px-3 py-3">{campaign.laboratory_runs}</td>
+                      <td className="px-3 py-3">{campaign.candidates_generated}</td>
+                      <td className="px-3 py-3 text-xs text-foreground/75">{campaign.best_candidate ?? "n/a"}</td>
+                      <td className="px-3 py-3">{campaign.best_quality_score ?? "n/a"}</td>
+                      <td className="px-3 py-3 text-xs text-foreground/75">{campaign.current_champion ?? "n/a"}</td>
+                      <td className="px-3 py-3">{progressPercent}%</td>
+                      <td className="px-3 py-3">
+                        <button
+                          type="button"
+                          onClick={() => {
+                            void handleRunCampaign(campaign.campaign_id);
+                          }}
+                          disabled={runningCampaignId === campaign.campaign_id}
+                          className="rounded border border-indigo-500/40 bg-indigo-500/10 px-3 py-1 text-xs font-semibold text-indigo-100 disabled:cursor-not-allowed disabled:opacity-50"
+                        >
+                          {runningCampaignId === campaign.campaign_id ? "Running..." : "Run Campaign"}
+                        </button>
+                      </td>
+                    </tr>
+                  );
+                })}
+              </tbody>
+            </table>
+          </div>
+        ) : (
+          <div className="mt-3 rounded-md border border-dashed border-border/70 bg-background/40 px-3 py-3 text-sm text-foreground/60">
+            No research campaigns created yet.
           </div>
         )}
       </section>

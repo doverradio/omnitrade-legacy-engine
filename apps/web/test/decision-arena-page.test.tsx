@@ -290,6 +290,73 @@ function installFetchMock() {
       ]);
     }
 
+    if (url.pathname === "/research/campaigns") {
+      if (method === "GET") {
+        return jsonResponse(200, [
+          {
+            campaign_id: "cccccccc-1111-2222-3333-444444444444",
+            name: "Campaign 1",
+            objective: "Coordinate repeated deterministic runs.",
+            status: "IDLE",
+            started_at: null,
+            completed_at: null,
+            participating_agents: ["Baseline Research Agent"],
+            laboratory_runs: 0,
+            candidates_generated: 0,
+            candidates_evaluated: 0,
+            best_candidate: null,
+            best_quality_score: null,
+            current_champion: null,
+          },
+        ]);
+      }
+
+      if (method === "POST") {
+        return jsonResponse(200, {
+          campaign_id: "cccccccc-5555-6666-7777-888888888888",
+          name: "Campaign 2",
+          objective: "Coordinate repeated deterministic laboratory and evolution cycles.",
+          status: "IDLE",
+          started_at: null,
+          completed_at: null,
+          participating_agents: ["Baseline Research Agent"],
+          laboratory_runs: 0,
+          candidates_generated: 0,
+          candidates_evaluated: 0,
+          best_candidate: null,
+          best_quality_score: null,
+          current_champion: null,
+        });
+      }
+    }
+
+    if (url.pathname === "/research/campaigns/cccccccc-1111-2222-3333-444444444444/run") {
+      if (method !== "POST") {
+        return jsonResponse(405, {
+          error: {
+            message: `Unexpected method ${method}`,
+          },
+        });
+      }
+
+      laboratoryRunComplete = true;
+      return jsonResponse(200, {
+        campaign_id: "cccccccc-1111-2222-3333-444444444444",
+        name: "Campaign 1",
+        objective: "Coordinate repeated deterministic runs.",
+        status: "COMPLETED",
+        started_at: "2026-07-09T12:00:00Z",
+        completed_at: "2026-07-09T12:00:05Z",
+        participating_agents: ["Baseline Research Agent"],
+        laboratory_runs: 1,
+        candidates_generated: 7,
+        candidates_evaluated: 7,
+        best_candidate: "Volatility Filter MA-RSI Blend",
+        best_quality_score: 100,
+        current_champion: "Volatility Filter MA-RSI Blend",
+      });
+    }
+
     if (url.pathname === "/research/evaluate-candidates") {
       if (method !== "POST") {
         return jsonResponse(405, {
@@ -662,6 +729,12 @@ describe("DecisionArenaPage", () => {
     expect(screen.getByRole("table", { name: /LLM Research Adapters/i })).toBeInTheDocument();
     expect(screen.getAllByText(/OpenAI Research Agent/i).length).toBeGreaterThan(0);
     expect(screen.getByRole("button", { name: /Generate Candidates/i })).toBeInTheDocument();
+    expect(screen.getByRole("heading", { name: /Research Campaigns/i })).toBeInTheDocument();
+    expect(screen.getByRole("table", { name: /Research Campaigns/i })).toBeInTheDocument();
+    expect(screen.getByText(/Campaign Name/i)).toBeInTheDocument();
+    expect(screen.getAllByText(/Current Champion/i).length).toBeGreaterThan(0);
+    expect(screen.getAllByText(/Progress/i).length).toBeGreaterThan(0);
+    expect(screen.getByRole("button", { name: /Run Campaign/i })).toBeInTheDocument();
     expect(screen.getByRole("heading", { name: /^Evolution$/i })).toBeInTheDocument();
     expect(screen.getByRole("button", { name: /Run Evolution/i })).toBeInTheDocument();
     expect(screen.getByText(/No evolved descendants generated yet\./i)).toBeInTheDocument();
@@ -687,6 +760,10 @@ describe("DecisionArenaPage", () => {
     expect(await screen.findByText(/Latest Generated Candidates/i)).toBeInTheDocument();
     expect(screen.getAllByText(/OpenAI Sandbox Momentum Variant/i).length).toBeGreaterThan(0);
 
+    fireEvent.click(screen.getByRole("button", { name: /Run Campaign/i }));
+    expect((await screen.findAllByText(/Volatility Filter MA-RSI Blend/i)).length).toBeGreaterThan(0);
+    expect(screen.getAllByText(/100\.00%/i).length).toBeGreaterThan(0);
+
     expect(screen.getByRole("button", { name: /Evaluate Candidates/i })).toBeInTheDocument();
     expect(screen.getByText(/No candidate evaluations available yet\./i)).toBeInTheDocument();
 
@@ -701,12 +778,13 @@ describe("DecisionArenaPage", () => {
       return (init?.method ?? "GET") !== "GET";
     });
 
-    expect(nonGetCalls).toHaveLength(4);
+    expect(nonGetCalls).toHaveLength(5);
     const postCallUrls = nonGetCalls.map((call) => new URL(call[0] as string).pathname);
     expect(postCallUrls).toContain("/research/laboratory/run");
     expect(postCallUrls).toContain("/research/evaluate-candidates");
     expect(postCallUrls).toContain("/research/evolve");
     expect(postCallUrls).toContain("/research/llm-adapters/openai/generate-candidates");
+    expect(postCallUrls).toContain("/research/campaigns/cccccccc-1111-2222-3333-444444444444/run");
   });
 
   it("renders champion and runner up summary", async () => {
@@ -797,6 +875,47 @@ describe("DecisionArenaPage", () => {
 
         if (url.pathname === "/research/candidates") {
           return jsonResponse(200, []);
+        }
+
+        if (url.pathname === "/research/campaigns") {
+          if (method === "GET") {
+            return jsonResponse(200, []);
+          }
+          if (method === "POST") {
+            return jsonResponse(200, {
+              campaign_id: "cccccccc-5555-6666-7777-888888888888",
+              name: "Campaign 1",
+              objective: "Coordinate repeated deterministic laboratory and evolution cycles.",
+              status: "IDLE",
+              started_at: null,
+              completed_at: null,
+              participating_agents: [],
+              laboratory_runs: 0,
+              candidates_generated: 0,
+              candidates_evaluated: 0,
+              best_candidate: null,
+              best_quality_score: null,
+              current_champion: null,
+            });
+          }
+        }
+
+        if (url.pathname === "/research/campaigns/cccccccc-5555-6666-7777-888888888888/run") {
+          return jsonResponse(200, {
+            campaign_id: "cccccccc-5555-6666-7777-888888888888",
+            name: "Campaign 1",
+            objective: "Coordinate repeated deterministic laboratory and evolution cycles.",
+            status: "COMPLETED",
+            started_at: "2026-07-09T12:00:00Z",
+            completed_at: "2026-07-09T12:00:05Z",
+            participating_agents: [],
+            laboratory_runs: 1,
+            candidates_generated: 0,
+            candidates_evaluated: 0,
+            best_candidate: null,
+            best_quality_score: null,
+            current_champion: null,
+          });
         }
 
         if (url.pathname === "/research/evaluate-candidates") {
@@ -900,6 +1019,7 @@ describe("DecisionArenaPage", () => {
     expect(await screen.findByText(/No capital allocation recommendation available yet\./i)).toBeInTheDocument();
     expect(await screen.findByText(/No research agents or candidate strategies are available yet\./i)).toBeInTheDocument();
     expect(await screen.findByText(/No LLM adapters installed\./i)).toBeInTheDocument();
+    expect(await screen.findByText(/No research campaigns created yet\./i)).toBeInTheDocument();
     expect(screen.queryByText(/No candidate evaluations available yet\./i)).not.toBeInTheDocument();
     expect(await screen.findByText(/No laboratory run has completed yet\./i)).toBeInTheDocument();
     expect(await screen.findByText(/No research memory has been recorded yet\./i)).toBeInTheDocument();

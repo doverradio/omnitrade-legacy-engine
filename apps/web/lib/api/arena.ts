@@ -382,6 +382,27 @@ export type ResearchMemorySummary = {
   latest_laboratory_run: ResearchMemoryLaboratoryRun | null;
 };
 
+export type ResearchCampaign = {
+  campaign_id: string;
+  name: string;
+  objective: string;
+  status: string;
+  started_at: string | null;
+  completed_at: string | null;
+  participating_agents: string[];
+  laboratory_runs: number;
+  candidates_generated: number;
+  candidates_evaluated: number;
+  best_candidate: string | null;
+  best_quality_score: number | null;
+  current_champion: string | null;
+};
+
+export type ResearchCampaignCreateRequest = {
+  name: string;
+  objective: string;
+};
+
 export type EvolutionMutation = {
   parameter_name: string;
   previous_value: number;
@@ -642,6 +663,27 @@ export async function getResearchMemoryRuns(): Promise<ResearchMemoryLaboratoryR
 
 export async function getResearchMemoryCandidates(): Promise<ResearchMemoryCandidate[]> {
   return requestJson<ResearchMemoryCandidate[]>("/research/memory/candidates");
+}
+
+export async function getResearchCampaigns(): Promise<ResearchCampaign[]> {
+  return requestJson<ResearchCampaign[]>("/research/campaigns");
+}
+
+export async function getResearchCampaign(campaignId: string): Promise<ResearchCampaign> {
+  return requestJson<ResearchCampaign>(`/research/campaigns/${campaignId}`);
+}
+
+export async function createResearchCampaign(request: ResearchCampaignCreateRequest): Promise<ResearchCampaign> {
+  return requestJson<ResearchCampaign>("/research/campaigns", {
+    method: "POST",
+    body: JSON.stringify(request),
+  });
+}
+
+export async function runResearchCampaign(campaignId: string): Promise<ResearchCampaign> {
+  return requestJson<ResearchCampaign>(`/research/campaigns/${campaignId}/run`, {
+    method: "POST",
+  });
 }
 
 export async function evolveResearchCandidates(request: EvolutionRequest): Promise<EvolutionResponse> {
