@@ -128,3 +128,28 @@ class PaperTradeResponse(BaseModel):
 class PaperTradeListResponse(BaseModel):
     items: list[PaperTradeResponse]
     next_cursor: str | None
+
+
+class PipelineActivityItem(BaseModel):
+    signal_id: uuid.UUID
+    action: str
+    status: str
+    reason: str | None = None
+    created_at: datetime
+
+
+class PaperPipelineHealthResponse(BaseModel):
+    window_minutes: int
+    candles: int
+    signals_created: int
+    hold_signals: int
+    buy_sell_signals: int
+    execution_candidates: int
+    executions_attempted: int
+    risk_events: int
+    risk_rejected: int
+    trades: int
+    decision_records: int
+    latest_rejection_reason: str | None = None
+    latest_updated_at: datetime | None = None
+    recent_activity: list[PipelineActivityItem]

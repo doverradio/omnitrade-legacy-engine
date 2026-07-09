@@ -65,6 +65,31 @@ export type PaperTradeListResponse = {
   next_cursor: string | null;
 };
 
+export type PipelineActivity = {
+  signal_id: string;
+  action: string;
+  status: string;
+  reason?: string | null;
+  created_at: string;
+};
+
+export type PaperPipelineHealth = {
+  window_minutes: number;
+  candles: number;
+  signals_created: number;
+  hold_signals: number;
+  buy_sell_signals: number;
+  execution_candidates: number;
+  executions_attempted: number;
+  risk_events: number;
+  risk_rejected: number;
+  trades: number;
+  decision_records: number;
+  latest_rejection_reason?: string | null;
+  latest_updated_at?: string | null;
+  recent_activity: PipelineActivity[];
+};
+
 export type GetPaperTradesParams = {
   account_id: string;
   strategy_id?: string;
@@ -160,4 +185,9 @@ export async function getPaperTrades(params: GetPaperTradesParams): Promise<Pape
   }
 
   return requestJson<PaperTradeListResponse>(`/paper/trades?${search.toString()}`);
+}
+
+export async function getPaperPipelineHealth(windowMinutes = 120): Promise<PaperPipelineHealth> {
+  const query = new URLSearchParams({ window_minutes: String(windowMinutes) });
+  return requestJson<PaperPipelineHealth>(`/paper/pipeline-health?${query.toString()}`);
 }
