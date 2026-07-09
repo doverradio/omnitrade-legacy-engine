@@ -207,7 +207,19 @@ export type GetPaperTradesParams = {
 
 type PaperAccountResponse = PaperAccount;
 
-const API_BASE_URL = process.env.NEXT_PUBLIC_API_BASE_URL ?? "http://localhost:8000";
+function resolveApiBaseUrl(): string {
+  if (process.env.NEXT_PUBLIC_API_BASE_URL) {
+    return process.env.NEXT_PUBLIC_API_BASE_URL;
+  }
+
+  if (typeof window !== "undefined" && window.location.hostname === "app.bigdeal.sale") {
+    return "https://api.bigdeal.sale";
+  }
+
+  return "http://localhost:8000";
+}
+
+const API_BASE_URL = resolveApiBaseUrl();
 
 export class ApiRequestError extends Error {
   status: number;

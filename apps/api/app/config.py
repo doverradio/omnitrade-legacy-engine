@@ -1,4 +1,5 @@
 from functools import lru_cache
+import json
 
 from pydantic import SecretStr
 from pydantic_settings import BaseSettings, SettingsConfigDict
@@ -20,6 +21,23 @@ class Settings(BaseSettings):
     environment: str = "local"
     log_level: str = "INFO"
     global_kill_switch_default: bool = False
+    cors_allowed_origins: str = "http://localhost:3000,https://app.bigdeal.sale"
+
+    @property
+    def parsed_cors_allowed_origins(self) -> list[str]:
+        value = (self.cors_allowed_origins or "").strip()
+        if not value:
+            return []
+
+        if value.startswith("["):
+            try:
+                loaded = json.loads(value)
+            except json.JSONDecodeError:
+                loaded = []
+            if isinstance(loaded, list):
+                return [str(item).strip() for item in loaded if str(item).strip()]
+
+        return [origin.strip() for origin in value.split(",") if origin.strip()]
 
 
 @lru_cache

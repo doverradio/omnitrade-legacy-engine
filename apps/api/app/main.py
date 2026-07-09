@@ -10,18 +10,20 @@ from app.api.routes.parameter_sets import router as parameter_sets_router
 from app.api.routes.paper import router as paper_router
 from app.api.routes.risk import router as risk_router
 from app.api.routes.strategies import router as strategies_router
+from app.config import get_settings
 from app.core.errors import register_error_handlers
 from app.core.logging import setup_logging
 
 
 def create_app() -> FastAPI:
     setup_logging()
+    settings = get_settings()
 
     app = FastAPI(title="OmniTrade Legacy Engine API", version="0.1.0")
 
     app.add_middleware(
         CORSMiddleware,
-        allow_origins=["http://localhost:3000"],
+        allow_origins=settings.parsed_cors_allowed_origins,
         allow_credentials=True,
         allow_methods=["*"],
         allow_headers=["*"],
