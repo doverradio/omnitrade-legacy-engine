@@ -10,8 +10,10 @@ from fastapi.testclient import TestClient
 from app.db.session import get_db
 from app.main import create_app
 from app.models.asset import Asset
+from app.models.audit_log import AuditLog
 from app.models.candle import Candle
 from app.models.paper_account import PaperAccount
+from app.models.risk_kill_switch import RiskKillSwitch
 from app.models.trade import Trade
 
 
@@ -40,6 +42,8 @@ class _FakeSession:
         self.trades = trades
         self.assets = assets
         self.candles = candles
+        self.kill_switches: list[RiskKillSwitch] = []
+        self.audit_logs: list[AuditLog] = []
 
     async def scalar(self, statement: Any) -> Any:
         sql = str(statement)
@@ -102,6 +106,14 @@ class _FakeSession:
             if not obj.id:
                 obj.id = uuid.uuid4()
             self.accounts.append(obj)
+            return
+
+        if isinstance(obj, RiskKillSwitch):
+            self.kill_switches.append(obj)
+            return
+
+        if isinstance(obj, AuditLog):
+            self.audit_logs.append(obj)
 
     async def refresh(self, obj: Any) -> None:
         return None
@@ -185,6 +197,36 @@ def test_get_paper_account_returns_rollups() -> None:
     assert payload["equity_return_pct"] == "0.00"
     assert payload["positions"][0]["symbol"] == "BTCUSDT"
     assert payload["positions"][0]["quantity"] == "0.10"
+
+
+def test_create_paper_account_bootstraps_account_kill_switch() -> None:
+    session = _FakeSession(accounts=[], trades=[], assets=[], candles=[])
+
+    with create_test_client(session) as client:
+        response = client.post(
+            "/paper/account",
+            json={
+                "name": "Family Paper",
+                "asset_class": "crypto",
+                "starting_balance": "25",
+            },
+        )
+
+    assert response.status_code == 201
+    payload = response.json()
+    account_id = payload["id"]
+
+    account_switches = [
+        switch
+        for switch in session.kill_switches
+        if switch.scope == "account" and str(switch.paper_account_id) == account_id
+    ]
+    assert len(account_switches) == 1
+    switch = account_switches[0]
+    assert switch.engaged is False
+    assert switch.rearm_required is False
+    assert switch.changed_by == "system_bootstrap"
+    assert switch.reason == "account_bootstrap_default"
 
 
 def test_get_paper_account_not_found() -> None:

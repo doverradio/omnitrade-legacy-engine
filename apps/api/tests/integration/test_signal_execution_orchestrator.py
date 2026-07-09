@@ -60,6 +60,7 @@ class _FakeSession:
         assets: list[Asset],
         trades: list[Trade],
         candles: list[Candle] | None = None,
+        include_account_kill_switches: bool = True,
     ) -> None:
         self.accounts = accounts
         self.assets = assets
@@ -69,11 +70,14 @@ class _FakeSession:
         self.risk_events: list[RiskEvent] = []
         self.kill_switches: list[RiskKillSwitch] = [
             RiskKillSwitch(scope="global", paper_account_id=None, engaged=False, rearm_required=False),
-            *[
-                RiskKillSwitch(scope="account", paper_account_id=account.id, engaged=False, rearm_required=False)
-                for account in accounts
-            ],
         ]
+        if include_account_kill_switches:
+            self.kill_switches.extend(
+                [
+                    RiskKillSwitch(scope="account", paper_account_id=account.id, engaged=False, rearm_required=False)
+                    for account in accounts
+                ]
+            )
         self._in_transaction = False
 
     def begin(self) -> _BeginContext:
@@ -597,3 +601,120 @@ async def test_orchestrator_persists_risk_inside_existing_transaction(monkeypatc
 
     assert result.execution_status == "rejected"
     assert len(session.risk_events) == 1
+
+
+@pytest.mark.asyncio
+async def test_orchestrator_rejects_with_unknown_account_kill_switch_when_row_missing() -> None:
+    now = datetime(2026, 7, 6, tzinfo=timezone.utc)
+    account = PaperAccount(
+        id=uuid.uuid4(),
+        owner_user_id=uuid.uuid4(),
+        name="Family Crypto",
+        asset_class="crypto",
+        starting_balance=Decimal("25"),
+        current_cash_balance=Decimal("25"),
+        is_active=True,
+        created_at=now,
+    )
+    asset = Asset(
+        id=uuid.uuid4(),
+        symbol="BTCUSDT",
+        asset_class="crypto",
+        exchange="binance_us",
+        supports_fractional=True,
+        qty_step_size=Decimal("0.00001"),
+        min_order_notional=Decimal("1"),
+        is_active=True,
+    )
+    session = _FakeSession(
+        accounts=[account],
+        assets=[asset],
+        trades=[],
+        candles=[
+            Candle(
+                asset_id=asset.id,
+                interval="1m",
+                open_time=now,
+                close_time=now,
+                open=Decimal("100"),
+                high=Decimal("100"),
+                low=Decimal("100"),
+                close=Decimal("100"),
+                volume=Decimal("1"),
+                source="binance_us",
+            )
+        ],
+        include_account_kill_switches=False,
+    )
+
+    result = await orchestrate_paper_signal_execution(
+        db=session,
+        request=SignalExecutionRequest(
+            signal_id=uuid.uuid4(),
+            paper_account_id=account.id,
+            asset_id=asset.id,
+            side="buy",
+            quantity=Decimal("0.1"),
+        ),
+    )
+
+    assert result.execution_status == "rejected"
+    assert session.risk_events[-1].detail["reason_code"] == "account_kill_switch_state_unknown"
+
+
+@pytest.mark.asyncio
+async def test_orchestrator_with_bootstrapped_account_kill_switch_progresses_past_unknown_state() -> None:
+    now = datetime(2026, 7, 6, tzinfo=timezone.utc)
+    account = PaperAccount(
+        id=uuid.uuid4(),
+        owner_user_id=uuid.uuid4(),
+        name="Family Crypto",
+        asset_class="crypto",
+        starting_balance=Decimal("25"),
+        current_cash_balance=Decimal("25"),
+        is_active=True,
+        created_at=now,
+    )
+    asset = Asset(
+        id=uuid.uuid4(),
+        symbol="BTCUSDT",
+        asset_class="crypto",
+        exchange="binance_us",
+        supports_fractional=True,
+        qty_step_size=Decimal("0.00001"),
+        min_order_notional=Decimal("1"),
+        is_active=True,
+    )
+    session = _FakeSession(
+        accounts=[account],
+        assets=[asset],
+        trades=[],
+        candles=[
+            Candle(
+                asset_id=asset.id,
+                interval="1m",
+                open_time=now,
+                close_time=now,
+                open=Decimal("100"),
+                high=Decimal("100"),
+                low=Decimal("100"),
+                close=Decimal("100"),
+                volume=Decimal("1"),
+                source="binance_us",
+            )
+        ],
+    )
+
+    result = await orchestrate_paper_signal_execution(
+        db=session,
+        request=SignalExecutionRequest(
+            signal_id=uuid.uuid4(),
+            paper_account_id=account.id,
+            asset_id=asset.id,
+            side="buy",
+            quantity=Decimal("0.1"),
+        ),
+    )
+
+    assert result.execution_status in {"executed", "pending", "rejected"}
+    assert session.risk_events[-1].detail["reason_code"] != "account_kill_switch_state_unknown"

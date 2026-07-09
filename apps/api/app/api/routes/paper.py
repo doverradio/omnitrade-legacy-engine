@@ -15,6 +15,7 @@ from app.db.session import get_db
 from app.models.asset import Asset
 from app.models.audit_log import AuditLog
 from app.models.paper_account import PaperAccount
+from app.models.risk_kill_switch import RiskKillSwitch
 from app.models.trade import Trade
 from app.schemas.paper import (
     CreatePaperAccountRequest,
@@ -104,6 +105,17 @@ async def create_paper_account(
     db.add(account)
     if hasattr(db, "flush"):
         await db.flush()
+
+    # Bootstrap account-level kill switch state so execution-time risk checks never see unknown state.
+    account_kill_switch = RiskKillSwitch(
+        scope="account",
+        paper_account_id=account.id,
+        engaged=False,
+        rearm_required=False,
+        changed_by="system_bootstrap",
+        reason="account_bootstrap_default",
+    )
+    db.add(account_kill_switch)
 
     audit = AuditLog(
         actor="system",
