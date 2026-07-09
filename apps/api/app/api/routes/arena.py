@@ -16,12 +16,15 @@ from app.models.signal import Signal
 from app.models.strategy import Strategy
 from app.models.trade import Trade
 from app.schemas.ai_coach import AICoachObservationResponse, AICoachReviewRequest
+from app.schemas.capital_allocation import CapitalAllocationEntryResponse, CapitalAllocationRecommendationResponse
 from app.schemas.decision_intelligence import DecisionIntelligenceRecommendationResponse
 from app.schemas.decision_quality import DecisionQualityEvaluationRequest, DecisionQualityResultResponse
 from app.schemas.arena import StrategyArenaScoreboardItem, StrategyArenaScoreboardResponse
 from app.schemas.replay_agent import ReplayRequest, ReplayResultResponse, ReplayAgentCapabilityResponse, ReplayAgentRegistrationResponse
 from app.schemas.tournament import TournamentRankingEntryResponse, TournamentResponse
 from app.services.ai_coach.deterministic import evaluate_decision_quality_v0
+from app.services.capital_allocation.deterministic import build_capital_allocation_recommendation_v1
+from app.services.capital_allocation.interface import CapitalAllocationInput
 from app.services.decision_intelligence.deterministic import StrategyEvidence, build_decision_intelligence_recommendation_v1
 from app.services.decision_quality.deterministic import evaluate_replay_result_v0
 from app.services.decisions.package import DecisionPackageBuilder
@@ -375,6 +378,135 @@ async def get_tournament(db: AsyncSession = Depends(get_db)) -> TournamentRespon
                 overall_rank=item.overall_rank,
             )
             for item in snapshot.ranking
+        ],
+    )
+
+
+@router.get("/capital-allocation", response_model=CapitalAllocationRecommendationResponse)
+async def get_capital_allocation(db: AsyncSession = Depends(get_db)) -> CapitalAllocationRecommendationResponse:
+    active_strategies = (
+        await db.execute(
+            select(Strategy)
+            .where(Strategy.is_active.is_(True))
+            .order_by(Strategy.name.asc(), Strategy.created_at.asc())
+        )
+    ).scalars().all()
+
+    strategy_ids = [strategy.id for strategy in active_strategies]
+    signals = (
+        await db.execute(
+            select(Signal)
+            .where(Signal.strategy_id.in_(strategy_ids))
+            .order_by(Signal.strategy_id.asc(), Signal.signal_time.asc(), Signal.id.asc())
+        )
+    ).scalars().all()
+    trades = (
+        await db.execute(
+            select(Trade)
+            .where(Trade.is_paper.is_(True))
+            .where(Trade.signal_id.is_not(None))
+            .order_by(Trade.executed_at.asc(), Trade.id.asc())
+        )
+    ).scalars().all()
+    decision_records = (await db.execute(select(DecisionRecord).order_by(DecisionRecord.timestamp.asc()))).scalars().all()
+
+    signals_by_strategy: dict[uuid.UUID, list[Signal]] = defaultdict(list)
+    for signal in signals:
+        signals_by_strategy[signal.strategy_id].append(signal)
+
+    signal_ids_by_strategy: dict[uuid.UUID, set[uuid.UUID]] = {
+        strategy_id: {signal.id for signal in strategy_signals}
+        for strategy_id, strategy_signals in signals_by_strategy.items()
+    }
+
+    latest_prices_by_asset_id = await _load_latest_prices_by_asset_id(
+        db=db,
+        asset_ids=sorted({trade.asset_id for trade in trades}, key=str),
+    )
+
+    decision_package_builder = DecisionPackageBuilder()
+    tournament_strategies: list[TournamentStrategyEvidence] = []
+    strategy_evidence: list[StrategyEvidence] = []
+    quality_scores_by_strategy: dict[str, int] = {}
+
+    for strategy in active_strategies:
+        strategy_signal_ids = signal_ids_by_strategy.get(strategy.id, set())
+        strategy_trades = [trade for trade in trades if trade.signal_id in strategy_signal_ids]
+        strategy_decision_records = [
+            record
+            for record in decision_records
+            if _decision_record_matches_strategy(record, strategy, strategy_signal_ids)
+        ]
+
+        latest_decision_package_id = await _resolve_latest_decision_package_id(
+            decision_package_builder=decision_package_builder,
+            db=db,
+            decision_records=strategy_decision_records,
+        )
+
+        quality_score = 0
+        replay_variance = Decimal("999")
+        replay_count = 0
+        if latest_decision_package_id is not None:
+            try:
+                replay_result = await replay_decision_package_v0(db=db, decision_package_id=latest_decision_package_id)
+                replay_count = 1
+                quality = evaluate_replay_result_v0(replay_result=replay_result)
+                quality_score = quality.quality_score
+                replay_variance = replay_variance_from_confidence(
+                    original_confidence=replay_result.metadata.get("original_confidence"),
+                    reconstructed_confidence=replay_result.confidence,
+                )
+                strategy_evidence.append(StrategyEvidence(strategy_name=strategy.name, replay_result=replay_result))
+            except ReplayPackageNotFoundError:
+                pass
+
+        quality_scores_by_strategy[strategy.name] = quality_score
+
+        trade_snapshot = _compute_strategy_trade_snapshot(
+            strategy_trades=strategy_trades,
+            latest_prices_by_asset_id=latest_prices_by_asset_id,
+        )
+
+        tournament_strategies.append(
+            TournamentStrategyEvidence(
+                strategy_name=strategy.name,
+                quality_score=quality_score,
+                replay_variance=replay_variance,
+                replay_count=replay_count,
+                paper_trades=len(strategy_trades),
+                realized_pnl=trade_snapshot["realized_pnl"],
+                unrealized_pnl=trade_snapshot["unrealized_pnl"],
+                win_rate=_compute_strategy_win_rate(strategy_trades=strategy_trades),
+            )
+        )
+
+    tournament_snapshot = build_tournament_snapshot_v1(strategies=tournament_strategies)
+    intelligence = build_decision_intelligence_recommendation_v1(strategy_evidence=strategy_evidence)
+    total_paper_capital = Decimal("100000")
+
+    allocation = build_capital_allocation_recommendation_v1(
+        tournament_ranking=[
+            CapitalAllocationInput(strategy_name=item.strategy_name, overall_rank=item.overall_rank)
+            for item in tournament_snapshot.ranking
+        ],
+        highest_quality_strategy=intelligence.highest_quality_strategy,
+        quality_scores_by_strategy=quality_scores_by_strategy,
+        total_paper_capital=total_paper_capital,
+    )
+
+    return CapitalAllocationRecommendationResponse(
+        recommendation_id=allocation.recommendation_id,
+        generated_at=allocation.generated_at,
+        total_paper_capital=str(allocation.total_paper_capital),
+        allocations=[
+            CapitalAllocationEntryResponse(
+                strategy_name=item.strategy_name,
+                allocation_percent=str(item.allocation_percent),
+                allocation_amount=str(item.allocation_amount),
+                rationale=item.rationale,
+            )
+            for item in allocation.allocations
         ],
     )
 

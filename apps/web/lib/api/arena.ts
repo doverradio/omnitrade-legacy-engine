@@ -235,6 +235,20 @@ export type TournamentResponse = {
   ranking: TournamentRankingEntry[];
 };
 
+export type CapitalAllocationEntry = {
+  strategy_name: string;
+  allocation_percent: string;
+  allocation_amount: string;
+  rationale: string;
+};
+
+export type CapitalAllocationRecommendation = {
+  recommendation_id: string;
+  generated_at: string;
+  total_paper_capital: string;
+  allocations: CapitalAllocationEntry[];
+};
+
 async function requestJson<T>(path: string, init?: RequestInit): Promise<T> {
   const headers = new Headers(init?.headers);
   headers.set("Content-Type", "application/json");
@@ -346,4 +360,8 @@ export async function getDecisionIntelligenceRecommendation(): Promise<DecisionI
 
 export async function getDecisionArenaTournament(): Promise<TournamentResponse> {
   return requestJson<TournamentResponse>("/arena/tournament");
+}
+
+export async function getCapitalAllocationRecommendation(): Promise<CapitalAllocationRecommendation> {
+  return requestJson<CapitalAllocationRecommendation>("/arena/capital-allocation");
 }

@@ -109,6 +109,36 @@ function installFetchMock() {
       });
     }
 
+    if (url.pathname === "/arena/capital-allocation") {
+      if (method !== "GET") {
+        return jsonResponse(405, {
+          error: {
+            message: `Unexpected method ${method}`,
+          },
+        });
+      }
+
+      return jsonResponse(200, {
+        recommendation_id: "55555555-5555-5555-5555-555555555555",
+        generated_at: "2026-07-09T12:00:00Z",
+        total_paper_capital: "100000",
+        allocations: [
+          {
+            strategy_name: "MA Crossover",
+            allocation_percent: "70",
+            allocation_amount: "70000",
+            rationale: "Ranked first in tournament with quality score 100. Receives primary deterministic allocation tier.",
+          },
+          {
+            strategy_name: "RSI Mean Reversion",
+            allocation_percent: "30",
+            allocation_amount: "30000",
+            rationale: "Ranked second in tournament with quality score 50. Receives secondary deterministic allocation tier.",
+          },
+        ],
+      });
+    }
+
     if (method !== "GET") {
       return jsonResponse(405, {
         error: {
@@ -149,6 +179,9 @@ describe("DecisionArenaPage", () => {
     expect(screen.getAllByText("RSI Mean Reversion").length).toBeGreaterThanOrEqual(1);
     expect(screen.getByText("Replay Agents")).toBeInTheDocument();
     expect(screen.getByText(/Tournament Summary/i)).toBeInTheDocument();
+    expect(screen.getByRole("table", { name: /Recommended Allocation/i })).toBeInTheDocument();
+    expect(screen.getByText(/Total Paper Capital/i)).toBeInTheDocument();
+    expect(screen.getByText(/Rule-Based Capital Allocation/i)).toBeInTheDocument();
 
     const nonGetCalls = fetchMock.mock.calls.filter((call) => {
       const init = call[1] as RequestInit | undefined;
@@ -170,6 +203,18 @@ describe("DecisionArenaPage", () => {
     expect(screen.getByText(/History Placeholder/i)).toBeInTheDocument();
     expect(screen.getByText(/Future: Tournament History/i)).toBeInTheDocument();
     expect(screen.getByText(/Future: Champion History/i)).toBeInTheDocument();
+  });
+
+  it("renders capital allocation panel", async () => {
+    installFetchMock();
+    render(<DecisionArenaPage />);
+
+    expect(await screen.findByRole("heading", { name: "Capital Allocation" })).toBeInTheDocument();
+    expect(screen.getByText(/Human Approval Required/i)).toBeInTheDocument();
+    expect(screen.getByRole("table", { name: /Recommended Allocation/i })).toBeInTheDocument();
+    expect(screen.getAllByText("MA Crossover").length).toBeGreaterThanOrEqual(1);
+    expect(screen.getByText(/70.00%/i)).toBeInTheDocument();
+    expect(screen.getByText(/\$70000\.00/i)).toBeInTheDocument();
   });
 
   it("renders empty tournament state", async () => {
@@ -211,6 +256,15 @@ describe("DecisionArenaPage", () => {
           });
         }
 
+        if (url.pathname === "/arena/capital-allocation") {
+          return jsonResponse(200, {
+            recommendation_id: "55555555-5555-5555-5555-555555555555",
+            generated_at: "2026-07-09T12:00:00Z",
+            total_paper_capital: "100000",
+            allocations: [],
+          });
+        }
+
         if (url.pathname === "/arena/replay-agents") {
           return jsonResponse(200, []);
         }
@@ -229,5 +283,6 @@ describe("DecisionArenaPage", () => {
     expect(await screen.findByText(/No active strategies are available for tournament comparison yet\./i)).toBeInTheDocument();
     expect(await screen.findByText(/Current Champion/i)).toBeInTheDocument();
     expect((await screen.findAllByText(/^None$/i)).length).toBeGreaterThan(0);
+    expect(await screen.findByText(/No capital allocation recommendation available yet\./i)).toBeInTheDocument();
   });
 });

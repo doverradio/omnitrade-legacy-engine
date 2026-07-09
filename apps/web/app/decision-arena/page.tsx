@@ -6,11 +6,13 @@ import ReplayAgentsPanel from "@/components/domain/ReplayAgentsPanel";
 import {
   ApiRequestError,
   coachReviewDecisionQuality,
+  getCapitalAllocationRecommendation,
   getDecisionArenaTournament,
   evaluateReplayResult,
   getDecisionIntelligenceRecommendation,
   replayDecisionPackage,
   type AICoachObservation,
+  type CapitalAllocationRecommendation,
   type DecisionIntelligenceRecommendation,
   type DecisionQualityResult,
   type ReplayResult,
@@ -88,6 +90,7 @@ export default function DecisionArenaPage() {
   const [qualityResult, setQualityResult] = useState<DecisionQualityResult | null>(null);
   const [coachObservation, setCoachObservation] = useState<AICoachObservation | null>(null);
   const [decisionIntelligence, setDecisionIntelligence] = useState<DecisionIntelligenceRecommendation | null>(null);
+  const [capitalAllocation, setCapitalAllocation] = useState<CapitalAllocationRecommendation | null>(null);
   const [replayError, setReplayError] = useState<string | null>(null);
 
   useEffect(() => {
@@ -97,11 +100,15 @@ export default function DecisionArenaPage() {
       setLoading(true);
       setError(null);
       try {
-        const payload = await getDecisionArenaTournament();
-        const recommendation = await getDecisionIntelligenceRecommendation();
+        const [payload, recommendation, allocation] = await Promise.all([
+          getDecisionArenaTournament(),
+          getDecisionIntelligenceRecommendation(),
+          getCapitalAllocationRecommendation(),
+        ]);
         if (active) {
           setTournament(payload);
           setDecisionIntelligence(recommendation);
+          setCapitalAllocation(allocation);
         }
       } catch (fetchError) {
         if (active) {
@@ -259,6 +266,55 @@ export default function DecisionArenaPage() {
         )}
       </section>
 
+      <section className="rounded-xl border border-border bg-background/60 p-4 sm:p-5" aria-labelledby="capital-allocation-heading">
+        <div className="flex flex-wrap items-end justify-between gap-3">
+          <div>
+            <h3 id="capital-allocation-heading" className="text-base font-semibold">Capital Allocation</h3>
+            <p className="mt-1 text-xs text-foreground/70">Deterministic recommendation-only paper capital allocation by tournament rank.</p>
+          </div>
+          <div className="text-right text-xs">
+            <p className="font-semibold uppercase tracking-wide text-foreground/60">Rule-Based Capital Allocation</p>
+            <p className="text-amber-200">Human Approval Required</p>
+          </div>
+        </div>
+
+        {capitalAllocation && capitalAllocation.allocations.length > 0 ? (
+          <div className="mt-4 space-y-3">
+            <div className="rounded-md border border-border/70 bg-background/40 px-3 py-2 text-sm">
+              <p className="text-xs uppercase tracking-wide text-foreground/55">Total Paper Capital</p>
+              <p className="mt-1 font-semibold text-foreground/90">${formatNumber(capitalAllocation.total_paper_capital)}</p>
+            </div>
+
+            <div className="overflow-x-auto">
+              <table className="min-w-[760px] w-full text-left text-sm" aria-label="Recommended Allocation">
+                <thead>
+                  <tr className="border-b border-border text-foreground/70">
+                    <th className="px-3 py-2">Strategy</th>
+                    <th className="px-3 py-2">%</th>
+                    <th className="px-3 py-2">$</th>
+                    <th className="px-3 py-2">Rationale</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {capitalAllocation.allocations.map((item) => (
+                    <tr key={item.strategy_name} className="border-b border-border/60">
+                      <td className="px-3 py-3 font-semibold text-foreground/90">{item.strategy_name}</td>
+                      <td className="px-3 py-3">{formatNumber(item.allocation_percent)}%</td>
+                      <td className="px-3 py-3">${formatNumber(item.allocation_amount)}</td>
+                      <td className="px-3 py-3 text-xs text-foreground/75">{item.rationale}</td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+          </div>
+        ) : (
+          <div className="mt-4 rounded-md border border-dashed border-border/70 bg-background/40 px-3 py-3 text-sm text-foreground/60">
+            No capital allocation recommendation available yet.
+          </div>
+        )}
+      </section>
+
       <section className="rounded-md border border-border bg-background/60 px-3 py-3 text-sm text-foreground/85">
         <div className="flex items-center justify-between gap-3">
           <div>
@@ -399,10 +455,6 @@ export default function DecisionArenaPage() {
           },
           {
             title: "AI Coach",
-            text: "These panels will activate as additional replay agents and research systems are introduced.",
-          },
-          {
-            title: "Capital Allocation",
             text: "These panels will activate as additional replay agents and research systems are introduced.",
           },
         ].map((panel) => (
