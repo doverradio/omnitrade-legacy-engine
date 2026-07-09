@@ -22,12 +22,13 @@ class ResearchLaboratory:
         registration_provider: Callable[[], tuple[ResearchAgentRegistration, ...]] = list_registered_research_agents,
         candidates_provider: Callable[[], tuple[StrategyCandidate, ...]] = list_generated_strategy_candidates,
         evaluation_builder: Callable[..., list[CandidateEvaluation]] = build_candidate_evaluations_batch_v1,
+        memory_recorder: Callable[[ResearchLaboratoryRun, list[StrategyCandidate], list[CandidateEvaluation]], None] | None = None,
     ) -> None:
         self._registration_provider = registration_provider
         self._candidates_provider = candidates_provider
         self._evaluation_builder = evaluation_builder
+        self._memory_recorder = memory_recorder
         self._last_run: ResearchLaboratoryRun | None = None
-        self._batch_metadata: dict[str, dict[str, list[str]]] = {}
 
     def get_status(self) -> ResearchLaboratoryStatus:
         registrations = self._registration_provider()
@@ -74,10 +75,8 @@ class ResearchLaboratory:
                 status="EMPTY",
             )
             self._last_run = run
-            self._batch_metadata[str(run.laboratory_run_id)] = {
-                "candidate_ids": [],
-                "evaluation_ids": [],
-            }
+            if self._memory_recorder is not None:
+                self._memory_recorder(run, [], [])
             return run
 
         candidates = list(self._candidates_provider())
@@ -99,10 +98,8 @@ class ResearchLaboratory:
         )
 
         self._last_run = run
-        self._batch_metadata[str(run.laboratory_run_id)] = {
-            "candidate_ids": [str(item.candidate_id) for item in candidates],
-            "evaluation_ids": [str(item.evaluation_id) for item in evaluations],
-        }
+        if self._memory_recorder is not None:
+            self._memory_recorder(run, candidates, evaluations)
         return run
 
 

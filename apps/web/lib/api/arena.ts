@@ -324,6 +324,34 @@ export type ResearchLaboratoryStatus = {
   success_rate: string;
 };
 
+export type ResearchMemoryLaboratoryRun = {
+  laboratory_run_id: string;
+  started_at: string;
+  completed_at: string | null;
+  participating_agents: string[];
+  candidates_generated: number;
+  candidates_evaluated: number;
+};
+
+export type ResearchMemoryCandidate = {
+  laboratory_run_id: string;
+  candidate_id: string;
+  originating_agent: string;
+  parameter_set: Record<string, unknown>;
+  evaluation_summary: string | null;
+  quality_score: number | null;
+  tournament_rank: number | null;
+  status: string;
+};
+
+export type ResearchMemorySummary = {
+  total_laboratory_runs: number;
+  total_candidates: number;
+  highest_quality_candidate: ResearchMemoryCandidate | null;
+  average_quality_score: number | null;
+  latest_laboratory_run: ResearchMemoryLaboratoryRun | null;
+};
+
 async function requestJson<T>(path: string, init?: RequestInit): Promise<T> {
   const headers = new Headers(init?.headers);
   headers.set("Content-Type", "application/json");
@@ -475,4 +503,16 @@ export async function runResearchLaboratory(): Promise<ResearchLaboratoryRun> {
   return requestJson<ResearchLaboratoryRun>("/research/laboratory/run", {
     method: "POST",
   });
+}
+
+export async function getResearchMemorySummary(): Promise<ResearchMemorySummary> {
+  return requestJson<ResearchMemorySummary>("/research/memory");
+}
+
+export async function getResearchMemoryRuns(): Promise<ResearchMemoryLaboratoryRun[]> {
+  return requestJson<ResearchMemoryLaboratoryRun[]>("/research/memory/runs");
+}
+
+export async function getResearchMemoryCandidates(): Promise<ResearchMemoryCandidate[]> {
+  return requestJson<ResearchMemoryCandidate[]>("/research/memory/candidates");
 }

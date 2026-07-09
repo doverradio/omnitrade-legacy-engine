@@ -9,6 +9,8 @@ import {
   evaluateCandidates,
   getCapitalAllocationRecommendation,
   getDecisionArenaTournament,
+  getResearchMemoryCandidates,
+  getResearchMemorySummary,
   getResearchAgents,
   getResearchCandidates,
   getResearchLaboratoryStatus,
@@ -24,6 +26,8 @@ import {
   type DecisionQualityResult,
   type ReplayResult,
   type ResearchAgent,
+  type ResearchMemoryCandidate,
+  type ResearchMemorySummary,
   type StrategyCandidate,
   type ResearchLaboratoryStatus,
   type TournamentResponse,
@@ -91,6 +95,21 @@ function formatMetric(value: string | null): string {
   return value;
 }
 
+function formatAverageQuality(value: number | null): string {
+  if (value === null) {
+    return "n/a";
+  }
+  return value.toFixed(2);
+}
+
+function toCandidateLabel(candidateId: string, candidates: StrategyCandidate[]): string {
+  const match = candidates.find((item) => item.candidate_id === candidateId);
+  if (match) {
+    return match.strategy_name;
+  }
+  return candidateId;
+}
+
 export default function DecisionArenaPage() {
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
@@ -110,6 +129,9 @@ export default function DecisionArenaPage() {
   const [laboratoryStatus, setLaboratoryStatus] = useState<ResearchLaboratoryStatus | null>(null);
   const [laboratoryRunning, setLaboratoryRunning] = useState(false);
   const [laboratoryError, setLaboratoryError] = useState<string | null>(null);
+  const [researchMemorySummary, setResearchMemorySummary] = useState<ResearchMemorySummary | null>(null);
+  const [researchMemoryCandidates, setResearchMemoryCandidates] = useState<ResearchMemoryCandidate[]>([]);
+  const [researchMemoryError, setResearchMemoryError] = useState<string | null>(null);
   const [replayError, setReplayError] = useState<string | null>(null);
 
   useEffect(() => {
@@ -118,14 +140,17 @@ export default function DecisionArenaPage() {
     async function load() {
       setLoading(true);
       setError(null);
+      setResearchMemoryError(null);
       try {
-        const [payload, recommendation, allocation, agents, candidates, laboratory] = await Promise.all([
+        const [payload, recommendation, allocation, agents, candidates, laboratory, memorySummary, memoryCandidates] = await Promise.all([
           getDecisionArenaTournament(),
           getDecisionIntelligenceRecommendation(),
           getCapitalAllocationRecommendation(),
           getResearchAgents(),
           getResearchCandidates(),
           getResearchLaboratoryStatus(),
+          getResearchMemorySummary(),
+          getResearchMemoryCandidates(),
         ]);
 
         if (active) {
@@ -137,10 +162,14 @@ export default function DecisionArenaPage() {
           setCandidateEvaluations([]);
           setCandidateBatchSummary(null);
           setLaboratoryStatus(laboratory);
+          setResearchMemorySummary(memorySummary);
+          setResearchMemoryCandidates(memoryCandidates);
         }
       } catch (fetchError) {
         if (active) {
-          setError(errorMessage(fetchError, "Failed to load Decision Arena Tournament."));
+          const message = errorMessage(fetchError, "Failed to load Decision Arena Tournament.");
+          setError(message);
+          setResearchMemoryError(message);
         }
       } finally {
         if (active) {
@@ -213,8 +242,14 @@ export default function DecisionArenaPage() {
     setLaboratoryRunning(true);
     try {
       await runResearchLaboratory();
-      const refreshedStatus = await getResearchLaboratoryStatus();
+      const [refreshedStatus, memorySummary, memoryCandidates] = await Promise.all([
+        getResearchLaboratoryStatus(),
+        getResearchMemorySummary(),
+        getResearchMemoryCandidates(),
+      ]);
       setLaboratoryStatus(refreshedStatus);
+      setResearchMemorySummary(memorySummary);
+      setResearchMemoryCandidates(memoryCandidates);
     } catch (runError) {
       setLaboratoryError(errorMessage(runError, "Failed to run research laboratory."));
     } finally {
@@ -562,6 +597,75 @@ export default function DecisionArenaPage() {
             No laboratory run has completed yet.
           </div>
         )}
+      </section>
+
+      <section className="rounded-xl border border-border bg-background/60 p-4 sm:p-5" aria-labelledby="research-memory-heading">
+        <div className="flex flex-wrap items-end justify-between gap-3">
+          <div>
+            <h3 id="research-memory-heading" className="text-base font-semibold">Research Memory</h3>
+            <p className="mt-1 text-xs text-foreground/70">Deterministic, read-only historical memory across laboratory runs.</p>
+          </div>
+          <p className="text-xs font-semibold uppercase tracking-wide text-foreground/60">Read-only Research History</p>
+        </div>
+
+        {researchMemoryError ? (
+          <div className="mt-3 rounded-md border border-red-500/50 bg-red-500/10 px-3 py-2 text-xs text-red-100" role="alert">
+            {researchMemoryError}
+          </div>
+        ) : null}
+
+        {researchMemorySummary ? (
+          <div className="mt-4 grid gap-3 sm:grid-cols-2 lg:grid-cols-3">
+            <Metric label="Total Laboratory Runs" value={String(researchMemorySummary.total_laboratory_runs)} />
+            <Metric label="Total Candidates" value={String(researchMemorySummary.total_candidates)} />
+            <Metric
+              label="Highest Quality Candidate"
+              value={
+                researchMemorySummary.highest_quality_candidate
+                  ? toCandidateLabel(researchMemorySummary.highest_quality_candidate.candidate_id, researchCandidates)
+                  : "None yet"
+              }
+            />
+            <Metric label="Average Quality" value={formatAverageQuality(researchMemorySummary.average_quality_score)} />
+            <Metric label="Latest Laboratory Run" value={formatWhen(researchMemorySummary.latest_laboratory_run?.completed_at ?? null)} />
+          </div>
+        ) : (
+          <div className="mt-3 rounded-md border border-dashed border-border/70 bg-background/40 px-3 py-3 text-sm text-foreground/60">
+            Research memory summary is not available yet.
+          </div>
+        )}
+
+        <div className="mt-4 rounded-md border border-border/70 bg-background/40 p-3" aria-labelledby="recent-memory-candidates-heading">
+          <h4 id="recent-memory-candidates-heading" className="text-xs font-semibold uppercase tracking-wide text-foreground/60">Recent Candidate History</h4>
+          {researchMemoryCandidates.length > 0 ? (
+            <div className="mt-2 overflow-x-auto">
+              <table className="min-w-[900px] w-full text-left text-sm" aria-label="Recent Candidate History">
+                <thead>
+                  <tr className="border-b border-border text-foreground/70">
+                    <th className="px-3 py-2">Candidate</th>
+                    <th className="px-3 py-2">Originating Agent</th>
+                    <th className="px-3 py-2">Quality</th>
+                    <th className="px-3 py-2">Tournament Rank</th>
+                    <th className="px-3 py-2">Status</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {researchMemoryCandidates.slice(0, 5).map((candidate) => (
+                    <tr key={`${candidate.laboratory_run_id}-${candidate.candidate_id}`} className="border-b border-border/60">
+                      <td className="px-3 py-3 font-semibold text-foreground/90">{toCandidateLabel(candidate.candidate_id, researchCandidates)}</td>
+                      <td className="px-3 py-3 text-xs text-foreground/75">{candidate.originating_agent}</td>
+                      <td className="px-3 py-3">{candidate.quality_score ?? "n/a"}</td>
+                      <td className="px-3 py-3">{candidate.tournament_rank ?? "n/a"}</td>
+                      <td className="px-3 py-3">{candidate.status}</td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+          ) : (
+            <p className="mt-2 text-sm text-foreground/65">No research memory has been recorded yet.</p>
+          )}
+        </div>
       </section>
 
       <section className="rounded-md border border-border bg-background/60 px-3 py-3 text-sm text-foreground/85">

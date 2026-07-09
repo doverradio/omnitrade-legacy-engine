@@ -10,6 +10,11 @@ from app.schemas.candidate_evaluation import (
     CandidateEvaluationResponse,
 )
 from app.schemas.research_laboratory import ResearchLaboratoryRunResponse, ResearchLaboratoryStatusResponse
+from app.schemas.research_memory import (
+    ResearchMemoryCandidateResponse,
+    ResearchMemoryLaboratoryRunResponse,
+    ResearchMemorySummaryResponse,
+)
 from app.schemas.research_agents import ResearchAgentResponse, StrategyCandidateResponse
 from app.services.candidate_evaluation.deterministic import (
     CandidateNotFoundError,
@@ -19,6 +24,7 @@ from app.services.candidate_evaluation.deterministic import (
 )
 from app.services.research_agents.registry import list_generated_strategy_candidates, list_registered_research_agents
 from app.services.research_laboratory.registry import get_research_laboratory
+from app.services.research_memory.registry import get_research_memory
 
 router = APIRouter(prefix="/research", tags=["research"])
 
@@ -155,3 +161,75 @@ async def run_research_laboratory() -> ResearchLaboratoryRunResponse:
         evaluated_candidates=run.evaluated_candidates,
         status=run.status,
     )
+
+
+@router.get("/memory", response_model=ResearchMemorySummaryResponse)
+async def get_research_memory_summary() -> ResearchMemorySummaryResponse:
+    memory = get_research_memory()
+    summary = memory.get_summary()
+
+    return ResearchMemorySummaryResponse(
+        total_laboratory_runs=summary.total_laboratory_runs,
+        total_candidates=summary.total_candidates,
+        highest_quality_candidate=(
+            None
+            if summary.highest_quality_candidate is None
+            else ResearchMemoryCandidateResponse(
+                laboratory_run_id=summary.highest_quality_candidate.laboratory_run_id,
+                candidate_id=summary.highest_quality_candidate.candidate_id,
+                originating_agent=summary.highest_quality_candidate.originating_agent,
+                parameter_set=dict(summary.highest_quality_candidate.parameter_set),
+                evaluation_summary=summary.highest_quality_candidate.evaluation_summary,
+                quality_score=summary.highest_quality_candidate.quality_score,
+                tournament_rank=summary.highest_quality_candidate.tournament_rank,
+                status=summary.highest_quality_candidate.status,
+            )
+        ),
+        average_quality_score=summary.average_quality_score,
+        latest_laboratory_run=(
+            None
+            if summary.latest_laboratory_run is None
+            else ResearchMemoryLaboratoryRunResponse(
+                laboratory_run_id=summary.latest_laboratory_run.laboratory_run_id,
+                started_at=summary.latest_laboratory_run.started_at,
+                completed_at=summary.latest_laboratory_run.completed_at,
+                participating_agents=list(summary.latest_laboratory_run.participating_agents),
+                candidates_generated=summary.latest_laboratory_run.candidates_generated,
+                candidates_evaluated=summary.latest_laboratory_run.candidates_evaluated,
+            )
+        ),
+    )
+
+
+@router.get("/memory/runs", response_model=list[ResearchMemoryLaboratoryRunResponse])
+async def get_research_memory_runs() -> list[ResearchMemoryLaboratoryRunResponse]:
+    memory = get_research_memory()
+    return [
+        ResearchMemoryLaboratoryRunResponse(
+            laboratory_run_id=item.laboratory_run_id,
+            started_at=item.started_at,
+            completed_at=item.completed_at,
+            participating_agents=list(item.participating_agents),
+            candidates_generated=item.candidates_generated,
+            candidates_evaluated=item.candidates_evaluated,
+        )
+        for item in memory.list_runs()
+    ]
+
+
+@router.get("/memory/candidates", response_model=list[ResearchMemoryCandidateResponse])
+async def get_research_memory_candidates() -> list[ResearchMemoryCandidateResponse]:
+    memory = get_research_memory()
+    return [
+        ResearchMemoryCandidateResponse(
+            laboratory_run_id=item.laboratory_run_id,
+            candidate_id=item.candidate_id,
+            originating_agent=item.originating_agent,
+            parameter_set=dict(item.parameter_set),
+            evaluation_summary=item.evaluation_summary,
+            quality_score=item.quality_score,
+            tournament_rank=item.tournament_rank,
+            status=item.status,
+        )
+        for item in memory.list_candidates()
+    ]

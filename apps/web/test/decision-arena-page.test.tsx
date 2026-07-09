@@ -320,6 +320,102 @@ function installFetchMock() {
       });
     }
 
+    if (url.pathname === "/research/memory") {
+      if (method !== "GET") {
+        return jsonResponse(405, {
+          error: {
+            message: `Unexpected method ${method}`,
+          },
+        });
+      }
+
+      return jsonResponse(200, {
+        total_laboratory_runs: laboratoryRunComplete ? 1 : 0,
+        total_candidates: laboratoryRunComplete ? 5 : 0,
+        highest_quality_candidate: laboratoryRunComplete
+          ? {
+              laboratory_run_id: "99999999-aaaa-bbbb-cccc-999999999999",
+              candidate_id: "77777777-7777-7777-7777-777777777777",
+              originating_agent: "Baseline Research Agent",
+              parameter_set: {
+                fast_period: 12,
+              },
+              evaluation_summary: "Replay successfully reproduced the production decision.",
+              quality_score: 100,
+              tournament_rank: 1,
+              status: "EVALUATED",
+            }
+          : null,
+        average_quality_score: laboratoryRunComplete ? 75.0 : null,
+        latest_laboratory_run: laboratoryRunComplete
+          ? {
+              laboratory_run_id: "99999999-aaaa-bbbb-cccc-999999999999",
+              started_at: "2026-07-09T12:00:00Z",
+              completed_at: "2026-07-09T12:00:02Z",
+              participating_agents: ["Baseline Research Agent"],
+              candidates_generated: 5,
+              candidates_evaluated: 5,
+            }
+          : null,
+      });
+    }
+
+    if (url.pathname === "/research/memory/runs") {
+      if (method !== "GET") {
+        return jsonResponse(405, {
+          error: {
+            message: `Unexpected method ${method}`,
+          },
+        });
+      }
+
+      return jsonResponse(
+        200,
+        laboratoryRunComplete
+          ? [
+              {
+                laboratory_run_id: "99999999-aaaa-bbbb-cccc-999999999999",
+                started_at: "2026-07-09T12:00:00Z",
+                completed_at: "2026-07-09T12:00:02Z",
+                participating_agents: ["Baseline Research Agent"],
+                candidates_generated: 5,
+                candidates_evaluated: 5,
+              },
+            ]
+          : [],
+      );
+    }
+
+    if (url.pathname === "/research/memory/candidates") {
+      if (method !== "GET") {
+        return jsonResponse(405, {
+          error: {
+            message: `Unexpected method ${method}`,
+          },
+        });
+      }
+
+      return jsonResponse(
+        200,
+        laboratoryRunComplete
+          ? [
+              {
+                laboratory_run_id: "99999999-aaaa-bbbb-cccc-999999999999",
+                candidate_id: "77777777-7777-7777-7777-777777777777",
+                originating_agent: "Baseline Research Agent",
+                parameter_set: {
+                  fast_period: 12,
+                },
+                evaluation_summary: "Replay successfully reproduced the production decision.",
+                quality_score: 100,
+                tournament_rank: 1,
+                status: "EVALUATED",
+              },
+            ]
+          : [],
+      );
+    }
+
     if (method !== "GET") {
       return jsonResponse(405, {
         error: {
@@ -376,9 +472,14 @@ describe("DecisionArenaPage", () => {
     expect(screen.getByRole("button", { name: /Run Laboratory/i })).toBeInTheDocument();
     expect(screen.getByText(/Laboratory Status/i)).toBeInTheDocument();
     expect(screen.getByText(/No laboratory run has completed yet\./i)).toBeInTheDocument();
+    expect(screen.getByRole("heading", { name: /Research Memory/i })).toBeInTheDocument();
+    expect(screen.getByText(/Total Laboratory Runs/i)).toBeInTheDocument();
+    expect(screen.getByText(/Recent Candidate History/i)).toBeInTheDocument();
+    expect(screen.getByText(/No research memory has been recorded yet\./i)).toBeInTheDocument();
 
     fireEvent.click(screen.getByRole("button", { name: /Run Laboratory/i }));
     expect(await screen.findByText(/Last run included 1 agent\(s\) and completed with status COMPLETED\./i)).toBeInTheDocument();
+    expect(await screen.findByRole("table", { name: /Recent Candidate History/i })).toBeInTheDocument();
 
     expect(screen.getByRole("button", { name: /Evaluate Candidates/i })).toBeInTheDocument();
     expect(screen.getByText(/No candidate evaluations available yet\./i)).toBeInTheDocument();
@@ -516,6 +617,24 @@ describe("DecisionArenaPage", () => {
           });
         }
 
+        if (url.pathname === "/research/memory") {
+          return jsonResponse(200, {
+            total_laboratory_runs: 0,
+            total_candidates: 0,
+            highest_quality_candidate: null,
+            average_quality_score: null,
+            latest_laboratory_run: null,
+          });
+        }
+
+        if (url.pathname === "/research/memory/runs") {
+          return jsonResponse(200, []);
+        }
+
+        if (url.pathname === "/research/memory/candidates") {
+          return jsonResponse(200, []);
+        }
+
         return jsonResponse(404, {
           error: {
             message: `Unhandled route in test: ${method} ${url.pathname}`,
@@ -534,5 +653,6 @@ describe("DecisionArenaPage", () => {
     expect(await screen.findByText(/No research agents or candidate strategies are available yet\./i)).toBeInTheDocument();
     expect(screen.queryByText(/No candidate evaluations available yet\./i)).not.toBeInTheDocument();
     expect(await screen.findByText(/No laboratory run has completed yet\./i)).toBeInTheDocument();
+    expect(await screen.findByText(/No research memory has been recorded yet\./i)).toBeInTheDocument();
   });
 });
