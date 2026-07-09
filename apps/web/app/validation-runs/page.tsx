@@ -151,6 +151,7 @@ export default function ValidationRunsPage() {
   const [success, setSuccess] = useState<string | null>(null);
 
   const activeRunPanelRef = useRef<HTMLDivElement | null>(null);
+  const selectedRunIdRef = useRef<string | null>(null);
 
   const activeRuns = useMemo(() => runs.filter((item) => item.status === "RUNNING"), [runs]);
   const historyRuns = useMemo(() => runs.filter((item) => item.status !== "RUNNING"), [runs]);
@@ -160,6 +161,10 @@ export default function ValidationRunsPage() {
     }
     return runs.find((item) => item.validation_run_id === selectedRunId) ?? null;
   }, [runs, selectedRunId]);
+
+  useEffect(() => {
+    selectedRunIdRef.current = selectedRunId;
+  }, [selectedRunId]);
 
   const loadTimeline = useCallback(async (runId: string, reset: boolean): Promise<ValidationRunEventListResponse> => {
     setTimelineLoading(true);
@@ -201,9 +206,16 @@ export default function ValidationRunsPage() {
     }
     setMetricsByRunId(nextMetricsByRunId);
 
+    const currentSelectedRunId = selectedRunIdRef.current;
+    const selectedRunStillExists = currentSelectedRunId
+      ? list.items.find((item) => item.validation_run_id === currentSelectedRunId) ?? null
+      : null;
+    const selectedRunIsTerminal = selectedRunStillExists
+      ? selectedRunStillExists.status === "COMPLETED" || selectedRunStillExists.status === "CANCELLED"
+      : false;
     const preferredRunId =
-      selectedRunId && list.items.some((item) => item.validation_run_id === selectedRunId)
-        ? selectedRunId
+      selectedRunStillExists && !selectedRunIsTerminal
+        ? currentSelectedRunId
         : (running[0]?.validation_run_id ?? list.items[0]?.validation_run_id ?? null);
     setSelectedRunId(preferredRunId);
 
@@ -230,7 +242,7 @@ export default function ValidationRunsPage() {
       setTimelinePage(1);
       setTimelineHasMore(false);
     }
-  }, [selectedRunId, timelineQuery]);
+  }, [timelineQuery]);
 
   useEffect(() => {
     let active = true;
@@ -277,8 +289,9 @@ export default function ValidationRunsPage() {
         setError(errorMessage(refreshError, "Failed to refresh validation runs."));
       });
 
-      if (activeRuns.length > 0 && selectedRunId) {
-        void loadTimeline(selectedRunId, true).catch((timelineError) => {
+      const currentSelectedRunId = selectedRunIdRef.current;
+      if (activeRuns.length > 0 && currentSelectedRunId) {
+        void loadTimeline(currentSelectedRunId, true).catch((timelineError) => {
           setError(errorMessage(timelineError, "Failed to refresh timeline events."));
         });
       }
@@ -287,7 +300,7 @@ export default function ValidationRunsPage() {
     return () => {
       window.clearInterval(timer);
     };
-  }, [activeRuns.length, loadTimeline, refreshAll, selectedRunId, timelineQuery]);
+  }, [activeRuns.length, loadTimeline, refreshAll, timelineQuery]);
 
   const effectiveDuration = durationPreset === "custom" ? Number(customDuration) : Number(durationPreset);
 
@@ -336,6 +349,7 @@ export default function ValidationRunsPage() {
   }
 
   async function handleSelectRun(runId: string) {
+    selectedRunIdRef.current = runId;
     setSelectedRunId(runId);
     try {
       const detail = await getValidationRun(runId);
