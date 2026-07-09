@@ -139,6 +139,7 @@ export type StrategyArenaScoreboardItem = {
   decision_records: number;
   last_signal_timestamp: string | null;
   last_trade_timestamp: string | null;
+  latest_decision_package_id: string | null;
 };
 
 export type StrategyArenaScoreboardResponse = {
@@ -160,6 +161,22 @@ export type ReplayAgentRegistration = {
   processing_enabled: boolean;
   scheduling_enabled: boolean;
   writes_enabled: boolean;
+};
+
+export type ReplayRequest = {
+  decision_package_id: string;
+};
+
+export type ReplayResult = {
+  replay_id: string;
+  replay_agent_id: string;
+  decision_package_id: string;
+  replay_timestamp: string;
+  reconstructed_action: "BUY" | "SELL" | "HOLD";
+  reconstructed_confidence: string | null;
+  supporting_evidence: Array<Record<string, unknown>>;
+  explanation: string | null;
+  metadata: Record<string, unknown>;
 };
 
 async function requestJson<T>(path: string): Promise<T> {
@@ -242,4 +259,11 @@ export async function getStrategyArenaScoreboard(): Promise<StrategyArenaScorebo
 
 export async function getReplayAgents(): Promise<ReplayAgentRegistration[]> {
   return requestJson<ReplayAgentRegistration[]>("/arena/replay-agents");
+}
+
+export async function replayDecisionPackage(request: ReplayRequest): Promise<ReplayResult> {
+  return requestJson<ReplayResult>("/arena/replay", {
+    method: "POST",
+    body: JSON.stringify(request),
+  });
 }

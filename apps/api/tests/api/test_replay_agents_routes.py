@@ -43,20 +43,16 @@ def test_replay_agent_registration_endpoint_serializes_placeholder_agent() -> No
 
 def test_replay_result_response_serializes_interface_fields() -> None:
     replay_id = uuid.uuid4()
-    decision_package_id = uuid.uuid4()
+    decision_package_id = "dpkg:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
     response = ReplayResultResponse(
         replay_id=replay_id,
         replay_agent_id=DEFAULT_REPLAY_AGENT_ID,
-        strategy_name="MA Crossover",
         decision_package_id=decision_package_id,
         replay_timestamp=datetime(2026, 7, 9, 12, tzinfo=timezone.utc),
-        decision_outcome="BUY",
-        confidence=Decimal("0.875"),
+        reconstructed_action="BUY",
+        reconstructed_confidence=Decimal("0.875"),
         supporting_evidence=[{"type": "decision_package"}],
         explanation="Read-only placeholder replay result.",
-        simulated_execution_metrics={"slippage_bps": 5},
-        risk_assessment={"risk_state": "unknown"},
-        quality_metrics={"quality_state": "placeholder"},
         metadata={"mode": "read_only"},
     )
 
@@ -64,6 +60,7 @@ def test_replay_result_response_serializes_interface_fields() -> None:
 
     assert payload["replay_id"] == str(replay_id)
     assert payload["replay_agent_id"] == str(DEFAULT_REPLAY_AGENT_ID)
-    assert payload["decision_package_id"] == str(decision_package_id)
-    assert payload["decision_outcome"] == "BUY"
-    assert payload["confidence"] == "0.875"
+    assert payload["decision_package_id"] == decision_package_id
+    assert payload["reconstructed_action"] == "BUY"
+    assert payload["reconstructed_confidence"] == "0.875"
+

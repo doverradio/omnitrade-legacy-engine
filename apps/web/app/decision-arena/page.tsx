@@ -3,7 +3,13 @@
 import { useEffect, useMemo, useState } from "react";
 
 import ReplayAgentsPanel from "@/components/domain/ReplayAgentsPanel";
-import { ApiRequestError, getStrategyArenaScoreboard, type StrategyArenaScoreboardResponse } from "@/lib/api/arena";
+import {
+  ApiRequestError,
+  getStrategyArenaScoreboard,
+  replayDecisionPackage,
+  type ReplayResult,
+  type StrategyArenaScoreboardResponse,
+} from "@/lib/api/arena";
 
 function errorMessage(error: unknown, fallback: string): string {
   if (error instanceof ApiRequestError) {
@@ -41,10 +47,24 @@ function returnStyles(value: string): string {
   return Number(value) >= 0 ? "text-emerald-300" : "text-rose-300";
 }
 
+function formatConfidence(value: string | null): string {
+  if (value === null) {
+    return "n/a";
+  }
+  const numeric = Number(value);
+  if (Number.isNaN(numeric)) {
+    return value;
+  }
+  return `${(numeric * 100).toFixed(2)}%`;
+}
+
 export default function DecisionArenaPage() {
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const [scoreboard, setScoreboard] = useState<StrategyArenaScoreboardResponse | null>(null);
+  const [replayLoadingPackageId, setReplayLoadingPackageId] = useState<string | null>(null);
+  const [replayResult, setReplayResult] = useState<ReplayResult | null>(null);
+  const [replayError, setReplayError] = useState<string | null>(null);
 
   useEffect(() => {
     let active = true;
@@ -87,6 +107,30 @@ export default function DecisionArenaPage() {
   const activeCount = sortedItems.filter((item) => item.enabled).length;
   const disabledCount = sortedItems.length - activeCount;
 
+  async function handleReplay(decisionPackageId: string | null) {
+    if (!decisionPackageId) {
+      setReplayError("No replay package is available for this strategy yet.");
+      return;
+    }
+
+    setReplayLoadingPackageId(decisionPackageId);
+    setReplayError(null);
+    setReplayResult(null);
+
+    try {
+      const result = await replayDecisionPackage({ decision_package_id: decisionPackageId });
+      setReplayResult(result);
+    } catch (replayRequestError) {
+      if (replayRequestError instanceof ApiRequestError) {
+        setReplayError(replayRequestError.message);
+      } else {
+        setReplayError("Replay failed.");
+      }
+    } finally {
+      setReplayLoadingPackageId(null);
+    }
+  }
+
   return (
     <div className="space-y-6">
       <header className="space-y-2">
@@ -102,6 +146,21 @@ export default function DecisionArenaPage() {
       {error ? (
         <section className="rounded-md border border-red-500/50 bg-red-500/10 px-3 py-2 text-sm text-red-100" role="alert">
           {error}
+        </section>
+      ) : null}
+
+      {replayError ? (
+        <section className="rounded-md border border-red-500/50 bg-red-500/10 px-3 py-2 text-sm text-red-100" role="alert">
+          {replayError}
+        </section>
+      ) : null}
+
+      {replayResult ? (
+        <section className="rounded-md border border-emerald-500/40 bg-emerald-500/10 px-3 py-2 text-sm text-emerald-100" role="status">
+          <p className="font-medium">Replay completed. Decision reproduced successfully.</p>
+          <p className="mt-1 text-xs text-emerald-100/80">
+            Reconstructed action: {replayResult.reconstructed_action} | Confidence: {formatConfidence(replayResult.reconstructed_confidence)}
+          </p>
         </section>
       ) : null}
 
@@ -140,6 +199,7 @@ export default function DecisionArenaPage() {
                   <th className="px-3 py-2">Decision Records</th>
                   <th className="px-3 py-2">Last Signal</th>
                   <th className="px-3 py-2">Last Trade</th>
+                  <th className="px-3 py-2">Replay</th>
                 </tr>
               </thead>
               <tbody>
@@ -166,6 +226,16 @@ export default function DecisionArenaPage() {
                     <td className="px-3 py-3">{item.decision_records}</td>
                     <td className="px-3 py-3 text-xs text-foreground/75">{formatWhen(item.last_signal_timestamp)}</td>
                     <td className="px-3 py-3 text-xs text-foreground/75">{formatWhen(item.last_trade_timestamp)}</td>
+                    <td className="px-3 py-3">
+                      <button
+                        type="button"
+                        className="rounded-md border border-border bg-background px-3 py-1.5 text-xs font-medium text-foreground/90 disabled:cursor-not-allowed disabled:opacity-60"
+                        disabled={!item.latest_decision_package_id || replayLoadingPackageId === item.latest_decision_package_id}
+                        onClick={() => void handleReplay(item.latest_decision_package_id)}
+                      >
+                        {replayLoadingPackageId === item.latest_decision_package_id ? "Replaying..." : "Replay"}
+                      </button>
+                    </td>
                   </tr>
                 ))}
               </tbody>

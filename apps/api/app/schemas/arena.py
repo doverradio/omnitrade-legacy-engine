@@ -24,6 +24,7 @@ class StrategyArenaScoreboardItem(BaseModel):
     decision_records: int
     last_signal_timestamp: datetime | None = None
     last_trade_timestamp: datetime | None = None
+    latest_decision_package_id: str | None = None
 
     @field_serializer("realized_pnl", "unrealized_pnl", "total_return_pct", when_used="json")
     def serialize_decimal_fields(self, value: Decimal) -> str:

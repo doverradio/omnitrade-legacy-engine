@@ -6,21 +6,19 @@ from datetime import datetime
 from decimal import Decimal
 from typing import Any, Literal, Protocol
 
+from sqlalchemy.ext.asyncio import AsyncSession
+
 
 @dataclass(frozen=True, slots=True)
 class ReplayResult:
     replay_id: uuid.UUID
     replay_agent_id: uuid.UUID
-    strategy_name: str
-    decision_package_id: uuid.UUID
+    decision_package_id: str
     replay_timestamp: datetime
-    decision_outcome: Literal["BUY", "SELL", "HOLD"]
+    reconstructed_action: Literal["BUY", "SELL", "HOLD"]
     confidence: Decimal | None
     supporting_evidence: tuple[dict[str, Any], ...]
     explanation: str | None
-    simulated_execution_metrics: dict[str, Any]
-    risk_assessment: dict[str, Any]
-    quality_metrics: dict[str, Any]
     metadata: dict[str, Any]
 
 
@@ -48,4 +46,4 @@ class ReplayAgent(Protocol):
     name: str
     status: str
 
-    async def replay(self, *, decision_package_id: uuid.UUID) -> ReplayResult: ...
+    async def replay(self, *, db: AsyncSession, decision_package_id: str) -> ReplayResult: ...

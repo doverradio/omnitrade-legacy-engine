@@ -5,7 +5,7 @@ from collections import Counter, defaultdict
 from decimal import Decimal
 from typing import Any
 
-from fastapi import APIRouter, Depends
+from fastapi import APIRouter, Depends, HTTPException, status
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -16,7 +16,10 @@ from app.models.signal import Signal
 from app.models.strategy import Strategy
 from app.models.trade import Trade
 from app.schemas.arena import StrategyArenaScoreboardItem, StrategyArenaScoreboardResponse
-from app.schemas.replay_agent import ReplayAgentCapabilityResponse, ReplayAgentRegistrationResponse
+from app.schemas.replay_agent import ReplayRequest, ReplayResultResponse, ReplayAgentCapabilityResponse, ReplayAgentRegistrationResponse
+from app.services.decisions.package import DecisionPackageBuilder
+from app.services.replay.default_agent import ReplayPackageNotFoundError, replay_decision_package_v0
+from app.services.replay.identifiers import build_decision_package_id
 from app.services.replay.registry import list_registered_replay_agents
 
 router = APIRouter(prefix="/arena", tags=["arena"])
@@ -69,6 +72,7 @@ async def get_strategy_scoreboard(db: AsyncSession = Depends(get_db)) -> Strateg
         )
     ).scalars().all()
     decision_records = (await db.execute(select(DecisionRecord).order_by(DecisionRecord.timestamp.asc()))).scalars().all()
+    decision_package_builder = DecisionPackageBuilder()
 
     signals_by_strategy: dict[uuid.UUID, list[Signal]] = defaultdict(list)
     for signal in signals:
@@ -94,6 +98,11 @@ async def get_strategy_scoreboard(db: AsyncSession = Depends(get_db)) -> Strateg
             for record in decision_records
             if _decision_record_matches_strategy(record, strategy, strategy_signal_ids)
         ]
+        latest_decision_package_id = await _resolve_latest_decision_package_id(
+            decision_package_builder=decision_package_builder,
+            db=db,
+            decision_records=strategy_decision_records,
+        )
 
         trade_snapshot = _compute_strategy_trade_snapshot(
             strategy_trades=strategy_trades,
@@ -119,10 +128,31 @@ async def get_strategy_scoreboard(db: AsyncSession = Depends(get_db)) -> Strateg
                 decision_records=len(strategy_decision_records),
                 last_signal_timestamp=max((signal.signal_time for signal in strategy_signals), default=None),
                 last_trade_timestamp=max((trade.executed_at for trade in strategy_trades), default=None),
+                latest_decision_package_id=latest_decision_package_id,
             )
         )
 
     return StrategyArenaScoreboardResponse(items=items)
+
+
+@router.post("/replay", response_model=ReplayResultResponse)
+async def replay_decision_package(request: ReplayRequest, db: AsyncSession = Depends(get_db)) -> ReplayResultResponse:
+    try:
+        replay_result = await replay_decision_package_v0(db=db, decision_package_id=request.decision_package_id)
+    except ReplayPackageNotFoundError as error:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Replay package not found") from error
+
+    return ReplayResultResponse(
+        replay_id=replay_result.replay_id,
+        replay_agent_id=replay_result.replay_agent_id,
+        decision_package_id=replay_result.decision_package_id,
+        replay_timestamp=replay_result.replay_timestamp,
+        reconstructed_action=replay_result.reconstructed_action,
+        reconstructed_confidence=replay_result.confidence,
+        supporting_evidence=[dict(item) for item in replay_result.supporting_evidence],
+        explanation=replay_result.explanation,
+        metadata=replay_result.metadata,
+    )
 
 
 async def _load_latest_prices_by_asset_id(*, db: AsyncSession, asset_ids: list[uuid.UUID]) -> dict[uuid.UUID, Decimal]:
@@ -233,3 +263,22 @@ def _dict_matches_strategy_identifiers(value: dict[str, Any], strategy_identifie
         value.get("slug"),
     ]
     return any(str(candidate).strip() in strategy_identifiers for candidate in candidate_values if candidate is not None)
+
+
+async def _resolve_latest_decision_package_id(
+    *,
+    decision_package_builder: DecisionPackageBuilder,
+    db: AsyncSession,
+    decision_records: list[DecisionRecord],
+) -> str | None:
+    for decision_record in sorted(decision_records, key=lambda item: (item.timestamp, item.decision_id), reverse=True):
+        package = await decision_package_builder.build_decision_package(db=db, decision_id=decision_record.decision_id)
+        if package is None:
+            continue
+        return build_decision_package_id(
+            decision_id=package.decision_id,
+            package_hash=package.content_hash,
+            package_version=package.schema_version,
+        )
+
+    return None

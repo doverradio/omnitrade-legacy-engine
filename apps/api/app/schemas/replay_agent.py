@@ -8,6 +8,10 @@ from typing import Literal
 from pydantic import BaseModel, field_serializer
 
 
+class ReplayRequest(BaseModel):
+    decision_package_id: str
+
+
 class ReplayAgentCapabilityResponse(BaseModel):
     name: str
     description: str
@@ -28,19 +32,15 @@ class ReplayAgentRegistrationResponse(BaseModel):
 class ReplayResultResponse(BaseModel):
     replay_id: uuid.UUID
     replay_agent_id: uuid.UUID
-    strategy_name: str
-    decision_package_id: uuid.UUID
+    decision_package_id: str
     replay_timestamp: datetime
-    decision_outcome: Literal["BUY", "SELL", "HOLD"]
-    confidence: Decimal | None = None
+    reconstructed_action: Literal["BUY", "SELL", "HOLD"]
+    reconstructed_confidence: Decimal | None = None
     supporting_evidence: list[dict[str, object]]
     explanation: str | None = None
-    simulated_execution_metrics: dict[str, object]
-    risk_assessment: dict[str, object]
-    quality_metrics: dict[str, object]
     metadata: dict[str, object]
 
-    @field_serializer("confidence", when_used="json")
+    @field_serializer("reconstructed_confidence", when_used="json")
     def serialize_decimal_fields(self, value: Decimal | None) -> str | None:
         if value is None:
             return None
