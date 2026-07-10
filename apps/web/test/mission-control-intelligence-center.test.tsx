@@ -146,6 +146,7 @@ function buildPayload(range: string, severity: "green" | "yellow" | "red" = "gre
       },
       alerts: severity === "green" ? [] : [{ code: "worker_stopped", severity, message: "Worker stopped" }],
     },
+    total_managed_capital: "125.00",
     validation_runs: [
       {
         validation_run_id: "11111111-1111-1111-1111-111111111111",

@@ -15,6 +15,7 @@ from app.models.arena_competition_budget_allocation import ArenaCompetitionBudge
 from app.models.audit_log import AuditLog
 from app.models.backtest import Backtest
 from app.models.backtest_trade import BacktestTrade
+from app.models.capital_campaign import CapitalCampaign
 from app.models.candle import Candle
 from app.models.decision_alternative_action import DecisionAlternativeAction
 from app.models.decision_counterfactual_result import DecisionCounterfactualResult
@@ -75,6 +76,7 @@ __all__ = [
 	"AuditLog",
 	"Backtest",
 	"BacktestTrade",
+	"CapitalCampaign",
 	"Candle",
 	"DecisionAlternativeAction",
 	"DecisionCounterfactualResult",

@@ -67,6 +67,22 @@ Capital Ledger v1 reads existing durable sources only:
 - `trades`
 - computed paper accounting snapshot (derived from durable trades + candles)
 - `research_campaigns` presence only (funded campaign allocations are currently unavailable)
+- `capital_campaigns` optional linkage for related pools
+
+## Campaign Linkage
+
+Where applicable, ledger pool rows may include campaign linkage metadata:
+
+- `capital_campaign_uuid`
+- `capital_campaign_name`
+- `capital_campaign_status`
+
+These fields provide campaign context and do not change v1 managed-capital semantics.
+
+Campaign linkage is optional and backward compatible:
+
+- old rows without campaign linkage remain valid
+- totals do not change solely because linkage metadata exists
 
 No second accounting database is introduced.
 

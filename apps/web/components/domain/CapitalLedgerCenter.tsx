@@ -390,6 +390,8 @@ export default function CapitalLedgerCenter() {
                     <p>Available: {formatCurrency(pool.available_capital)}</p>
                     <p>PnL: {formatCurrency(pool.unrealized_pnl)}</p>
                     <p>Children: {pool.child_allocations_count}</p>
+                    <p>Campaign: {pool.capital_campaign_name ?? "Not linked"}</p>
+                    <p>Campaign Status: {pool.capital_campaign_status ?? "Not linked"}</p>
                   </div>
 
                   <div className="mt-3 flex items-center justify-between gap-2">
@@ -433,6 +435,7 @@ export default function CapitalLedgerCenter() {
                       <th className="px-3 py-2">Available</th>
                       <th className="px-3 py-2">Realized PnL</th>
                       <th className="px-3 py-2">Unrealized PnL</th>
+                      <th className="px-3 py-2">Campaign</th>
                       <th className="px-3 py-2">Started</th>
                       <th className="px-3 py-2">Details</th>
                     </tr>
@@ -449,6 +452,7 @@ export default function CapitalLedgerCenter() {
                         <td className="px-3 py-2">{formatCurrency(pool.available_capital)}</td>
                         <td className="px-3 py-2">{formatCurrency(pool.realized_pnl)}</td>
                         <td className="px-3 py-2">{formatCurrency(pool.unrealized_pnl)}</td>
+                        <td className="px-3 py-2">{pool.capital_campaign_name ?? pool.capital_campaign_uuid ?? "Not linked"}</td>
                         <td className="px-3 py-2">{formatTimestamp(pool.started_at)}</td>
                         <td className="px-3 py-2">
                           <Link href={pool.related_page_url} className="text-cyan-300 hover:text-cyan-200">Open</Link>
@@ -474,6 +478,7 @@ export default function CapitalLedgerCenter() {
                     <p>Current equity: {formatCurrency(pool.current_equity)}</p>
                     <p>PnL: {formatCurrency(pool.unrealized_pnl)}</p>
                     <p>Result: {pool.status}</p>
+                    <p>Campaign: {pool.capital_campaign_name ?? "Not linked"}</p>
                     <p>Started: {formatTimestamp(pool.started_at)}</p>
                     <p>Completed: {formatTimestamp(pool.completed_at)}</p>
                   </div>

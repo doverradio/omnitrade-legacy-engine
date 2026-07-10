@@ -5,6 +5,7 @@ const navItems = [
   { href: "/mission-control", label: "Mission Control" },
   { href: "/crypto-order-preview", label: "Order Preview" },
   { href: "/exchange-connections", label: "Exchange Connections" },
+  { href: "/capital-campaigns", label: "Capital Campaigns" },
   { href: "/capital", label: "Capital Ledger" },
   { href: "/validation-runs", label: "Validation Runs" },
   { href: "/dashboard", label: "Dashboard" },

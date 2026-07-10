@@ -9,6 +9,7 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.models.audit_log import AuditLog
+from app.models.capital_campaign import CapitalCampaign
 from app.schemas.mission_control import (
     MissionControlIntelligenceHistoryPointResponse,
     MissionControlIntelligenceMetricResponse,
@@ -59,6 +60,7 @@ async def build_mission_control_intelligence(*, db: AsyncSession, range_value: s
 
     component_scores = _compute_component_scores(operations=operations, validation_runs=validation_runs)
     current_score = dashboard_score.score if dashboard_score is not None else _aggregate_score(component_scores)
+    total_managed_capital = await _load_total_managed_capital(db=db)
     if dashboard_score is not None:
         baseline_equity = dashboard_score.timeline[0].equity if dashboard_score.timeline else Decimal("0")
         history = [
@@ -114,6 +116,7 @@ async def build_mission_control_intelligence(*, db: AsyncSession, range_value: s
         timeline_events=timeline_events,
         metric_breakdown=metric_breakdown,
         operations=operations,
+        total_managed_capital=None if total_managed_capital is None else format(total_managed_capital, "f"),
         validation_runs=validation_runs,
         selected_validation_run_id=None if selected_validation_run is None else str(selected_validation_run.validation_run_id),
         notes=(
@@ -144,6 +147,47 @@ async def _load_run_events(*, db: AsyncSession, validation_run: ValidationRunRes
 def _pick_selected_run(validation_runs: list[ValidationRunResponse]) -> ValidationRunResponse | None:
     running = next((item for item in validation_runs if item.status == "RUNNING"), None)
     return running or (validation_runs[0] if validation_runs else None)
+
+
+async def _load_total_managed_capital(*, db: AsyncSession) -> Decimal | None:
+    if not hasattr(db, "execute"):
+        return Decimal("0")
+    campaigns = (
+        (
+            await db.execute(
+                select(CapitalCampaign).order_by(CapitalCampaign.created_at.desc(), CapitalCampaign.id.desc())
+            )
+        )
+        .scalars()
+        .all()
+    )
+    return _calculate_total_managed_capital(campaigns)
+
+
+def _calculate_total_managed_capital(campaigns: list[CapitalCampaign]) -> Decimal:
+    active_statuses = {"READY", "RUNNING", "PAUSED", "TARGET_REACHED"}
+    total = Decimal("0")
+    seen_campaign_ids: set[str] = set()
+    seen_paper_account_ids: set[str] = set()
+
+    for campaign in campaigns:
+        if campaign.status not in active_statuses:
+            continue
+
+        campaign_id = str(campaign.uuid)
+        if campaign_id in seen_campaign_ids:
+            continue
+
+        if campaign.paper_account_id is not None:
+            account_id = str(campaign.paper_account_id)
+            if account_id in seen_paper_account_ids:
+                continue
+            seen_paper_account_ids.add(account_id)
+
+        total += Decimal(str(campaign.starting_capital))
+        seen_campaign_ids.add(campaign_id)
+
+    return total
 
 
 def _compute_component_scores(*, operations: OperationalStatusResponse, validation_runs: list[ValidationRunResponse]) -> _ComponentScores:

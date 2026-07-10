@@ -62,6 +62,9 @@ class CapitalPoolResponse(BaseModel):
     related_entity_type: str
     related_entity_id: str
     related_page_url: str
+    capital_campaign_uuid: str | None = None
+    capital_campaign_name: str | None = None
+    capital_campaign_status: str | None = None
     parent_capital_pool_id: str | None = None
     child_allocations_count: int
     notes: str | None = None

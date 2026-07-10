@@ -53,6 +53,9 @@ function buildPayload(totalManaged: string, empty = false) {
             related_entity_type: "validation_run",
             related_entity_id: "run-a",
             related_page_url: "/validation-runs",
+            capital_campaign_uuid: "99999999-9999-9999-9999-999999999999",
+            capital_campaign_name: "Campaign Link",
+            capital_campaign_status: "RUNNING",
             parent_capital_pool_id: null,
             child_allocations_count: 1,
             notes: "Top-level funded validation pool.",
@@ -75,6 +78,9 @@ function buildPayload(totalManaged: string, empty = false) {
             related_entity_type: "validation_run",
             related_entity_id: "run-b",
             related_page_url: "/validation-runs",
+            capital_campaign_uuid: null,
+            capital_campaign_name: null,
+            capital_campaign_status: null,
             parent_capital_pool_id: null,
             child_allocations_count: 1,
             notes: "Top-level funded validation pool.",
@@ -97,6 +103,9 @@ function buildPayload(totalManaged: string, empty = false) {
             related_entity_type: "validation_run",
             related_entity_id: "run-c",
             related_page_url: "/validation-runs",
+            capital_campaign_uuid: null,
+            capital_campaign_name: null,
+            capital_campaign_status: null,
             parent_capital_pool_id: null,
             child_allocations_count: 0,
             notes: null,
@@ -119,6 +128,9 @@ function buildPayload(totalManaged: string, empty = false) {
             related_entity_type: "validation_run",
             related_entity_id: "run-a",
             related_page_url: "/validation-runs",
+            capital_campaign_uuid: "99999999-9999-9999-9999-999999999999",
+            capital_campaign_name: "Campaign Link",
+            capital_campaign_status: "RUNNING",
             parent_capital_pool_id: "validation-run:run-a",
             child_allocations_count: 0,
             notes: "Strategy child allocation.",
@@ -231,6 +243,9 @@ describe("CapitalPage", () => {
     expect(await screen.findByRole("heading", { name: "Capital Ledger" })).toBeInTheDocument();
     expect(await screen.findByText("Run A")).toBeInTheDocument();
     expect(await screen.findByText("Run B")).toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole("button", { name: /Capital Pools/i }));
+    expect((await screen.findAllByText("Campaign Link")).length).toBeGreaterThan(0);
 
     fireEvent.click(screen.getByRole("button", { name: /Validation Run Capital/i }));
     expect((await screen.findAllByText("View Validation Run")).length).toBeGreaterThan(0);

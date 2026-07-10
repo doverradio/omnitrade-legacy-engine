@@ -105,6 +105,7 @@ export type MissionControlIntelligenceResponse = {
   timeline_events: MissionControlIntelligenceTimelineEvent[];
   metric_breakdown: MissionControlIntelligenceMetric[];
   operations: OperationalStatus;
+  total_managed_capital: string | null;
   validation_runs: ValidationRun[];
   selected_validation_run_id: string | null;
   notes: string;

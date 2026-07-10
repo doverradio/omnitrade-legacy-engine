@@ -998,9 +998,9 @@ export default function MissionControlIntelligenceCenter() {
         href: "/capital",
       },
       {
-        label: "Managed Capital",
-        value: selectedRun ? formatCurrency(String(selectedRun.paper_capital)) : "Not available",
-        helper: "Validation paper capital",
+        label: "Total Managed Capital",
+        value: formatCurrency(payload?.total_managed_capital ?? null),
+        helper: "Active campaigns",
         href: "/capital",
       },
       {
@@ -1016,7 +1016,7 @@ export default function MissionControlIntelligenceCenter() {
         href: "/strategy-lab",
       },
     ];
-  }, [payload, profitAllPaper?.net_profit, profit24hPaper?.net_profit, profit72hPaper?.net_profit, selectedRun, profit?.ending_equity, range, profitMode]);
+  }, [payload, profitAllPaper?.net_profit, profit24hPaper?.net_profit, profit72hPaper?.net_profit, profit?.ending_equity, range, profitMode]);
 
   const selectedTimelineDetail = drawerRecord;
 

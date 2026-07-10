@@ -40,6 +40,9 @@ export type CapitalLedgerPool = {
   related_entity_type: string;
   related_entity_id: string;
   related_page_url: string;
+  capital_campaign_uuid?: string | null;
+  capital_campaign_name?: string | null;
+  capital_campaign_status?: string | null;
   parent_capital_pool_id?: string | null;
   child_allocations_count: number;
   notes?: string | null;

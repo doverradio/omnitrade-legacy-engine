@@ -8,6 +8,7 @@ import uuid
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.models.capital_campaign import CapitalCampaign
 from app.models.paper_account import PaperAccount
 from app.models.research_campaign import ResearchCampaign
 from app.models.trade import Trade
@@ -106,6 +107,12 @@ async def _load_research_campaigns(db: AsyncSession) -> list[ResearchCampaign]:
     return (await db.execute(select(ResearchCampaign).order_by(ResearchCampaign.created_at.desc()))).scalars().all()
 
 
+async def _load_capital_campaigns(db: AsyncSession) -> list[CapitalCampaign]:
+    if not hasattr(db, "execute"):
+        return []
+    return (await db.execute(select(CapitalCampaign).order_by(CapitalCampaign.created_at.desc()))).scalars().all()
+
+
 async def _load_trade_counts_by_account(db: AsyncSession) -> dict[uuid.UUID, int]:
     rows = (
         await db.execute(select(Trade.paper_account_id, Trade.id).order_by(Trade.paper_account_id.asc()))
@@ -145,6 +152,15 @@ async def build_capital_ledger(
     validation_runs = await _load_validation_runs(db)
     paper_accounts = await _load_paper_accounts(db)
     research_campaigns = await _load_research_campaigns(db)
+    capital_campaigns = await _load_capital_campaigns(db)
+
+    campaign_by_validation_run_id: dict[uuid.UUID, CapitalCampaign] = {}
+    campaign_by_paper_account_id: dict[uuid.UUID, CapitalCampaign] = {}
+    for campaign in capital_campaigns:
+        if campaign.validation_run_id is not None and campaign.validation_run_id not in campaign_by_validation_run_id:
+            campaign_by_validation_run_id[campaign.validation_run_id] = campaign
+        if campaign.paper_account_id is not None and campaign.paper_account_id not in campaign_by_paper_account_id:
+            campaign_by_paper_account_id[campaign.paper_account_id] = campaign
 
     metric_by_run = await _load_validation_run_metrics(db)
     trade_counts_by_account = await _load_trade_counts_by_account(db)
@@ -164,6 +180,7 @@ async def build_capital_ledger(
 
         start_capital = _to_decimal(run.paper_capital)
         metric = metric_by_run.get(run.validation_run_id)
+        campaign = campaign_by_validation_run_id.get(run.validation_run_id)
         current_equity = metric.current_equity if metric else None
         if current_equity is None:
             unavailable_sources.append(f"validation_run_metrics:{run.validation_run_id}")
@@ -201,6 +218,9 @@ async def build_capital_ledger(
                 related_entity_type="validation_run",
                 related_entity_id=str(run.validation_run_id),
                 related_page_url="/validation-runs",
+                capital_campaign_uuid=None if campaign is None else str(campaign.uuid),
+                capital_campaign_name=None if campaign is None else campaign.name,
+                capital_campaign_status=None if campaign is None else campaign.status,
                 parent_capital_pool_id=None,
                 child_allocations_count=len(run.enabled_strategies),
                 notes=(
@@ -231,6 +251,9 @@ async def build_capital_ledger(
                     related_entity_type="validation_run",
                     related_entity_id=str(run.validation_run_id),
                     related_page_url="/validation-runs",
+                    capital_campaign_uuid=None if campaign is None else str(campaign.uuid),
+                    capital_campaign_name=None if campaign is None else campaign.name,
+                    capital_campaign_status=None if campaign is None else campaign.status,
                     parent_capital_pool_id=pool_id,
                     child_allocations_count=0,
                     notes="Strategy child allocation is informational only. Funding split is not durably tracked yet.",
@@ -241,6 +264,7 @@ async def build_capital_ledger(
     for account in paper_accounts:
         pool_id = f"paper-account:{account.id}"
         account_status: CapitalPoolStatus = "active" if bool(account.is_active) else "inactive"
+        campaign = campaign_by_paper_account_id.get(account.id)
 
         snapshot = await build_account_snapshot(db=db, paper_account_id=account.id, starting_balance=account.starting_balance)
 
@@ -280,6 +304,9 @@ async def build_capital_ledger(
                 related_entity_type="paper_account",
                 related_entity_id=str(account.id),
                 related_page_url="/paper-trading",
+                capital_campaign_uuid=None if campaign is None else str(campaign.uuid),
+                capital_campaign_name=None if campaign is None else campaign.name,
+                capital_campaign_status=None if campaign is None else campaign.status,
                 parent_capital_pool_id=None,
                 child_allocations_count=len(snapshot.positions),
                 notes="Top-level paper account pool. Open positions are child allocations and excluded from Managed Capital.",
@@ -309,6 +336,9 @@ async def build_capital_ledger(
                     related_entity_type="paper_account",
                     related_entity_id=str(account.id),
                     related_page_url="/paper-trading",
+                    capital_campaign_uuid=None if campaign is None else str(campaign.uuid),
+                    capital_campaign_name=None if campaign is None else campaign.name,
+                    capital_campaign_status=None if campaign is None else campaign.status,
                     parent_capital_pool_id=pool_id,
                     child_allocations_count=0,
                     notes="Position valuation is derived from parent paper account and not added to Managed Capital.",

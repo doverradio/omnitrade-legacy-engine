@@ -64,6 +64,7 @@ class MissionControlIntelligenceResponse(BaseModel):
     timeline_events: list[MissionControlIntelligenceTimelineEventResponse]
     metric_breakdown: list[MissionControlIntelligenceMetricResponse]
     operations: OperationalStatusResponse
+    total_managed_capital: str | None = None
     validation_runs: list[ValidationRunResponse]
     selected_validation_run_id: str | None
     notes: str

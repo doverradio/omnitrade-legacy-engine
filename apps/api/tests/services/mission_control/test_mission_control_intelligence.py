@@ -126,6 +126,15 @@ def _events() -> ValidationRunEventListResponse:
     )
 
 
+def _campaign(*, campaign_uuid: str, status: str, starting_capital: str, paper_account_id: str | None = None):
+    return SimpleNamespace(
+        uuid=uuid.UUID(campaign_uuid),
+        status=status,
+        starting_capital=Decimal(starting_capital),
+        paper_account_id=None if paper_account_id is None else uuid.UUID(paper_account_id),
+    )
+
+
 @pytest.mark.asyncio
 async def test_build_mission_control_intelligence_calculates_score_and_orders_history(monkeypatch: pytest.MonkeyPatch) -> None:
     async def _operations_stub(*_args, **_kwargs):
@@ -197,3 +206,85 @@ async def test_build_mission_control_intelligence_handles_empty_inputs(monkeypat
     assert result.timeline_events
     assert result.history == sorted(result.history, key=lambda item: item.timestamp)
     assert result.notes.startswith("Mission Control Intelligence Center V1")
+
+
+def test_managed_capital_calculation_no_campaigns() -> None:
+    assert service._calculate_total_managed_capital([]) == Decimal("0")
+
+
+def test_managed_capital_calculation_single_active_campaign() -> None:
+    campaigns = [
+        _campaign(
+            campaign_uuid="11111111-1111-1111-1111-111111111111",
+            status="RUNNING",
+            starting_capital="25",
+            paper_account_id="aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa",
+        )
+    ]
+    assert service._calculate_total_managed_capital(campaigns) == Decimal("25")
+
+
+def test_managed_capital_calculation_two_active_campaigns() -> None:
+    campaigns = [
+        _campaign(
+            campaign_uuid="11111111-1111-1111-1111-111111111111",
+            status="READY",
+            starting_capital="25",
+            paper_account_id="aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa",
+        ),
+        _campaign(
+            campaign_uuid="22222222-2222-2222-2222-222222222222",
+            status="RUNNING",
+            starting_capital="40",
+            paper_account_id="bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb",
+        ),
+    ]
+    assert service._calculate_total_managed_capital(campaigns) == Decimal("65")
+
+
+def test_managed_capital_calculation_excludes_archived_and_completed() -> None:
+    campaigns = [
+        _campaign(
+            campaign_uuid="11111111-1111-1111-1111-111111111111",
+            status="RUNNING",
+            starting_capital="25",
+            paper_account_id="aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa",
+        ),
+        _campaign(
+            campaign_uuid="22222222-2222-2222-2222-222222222222",
+            status="ARCHIVED",
+            starting_capital="50",
+            paper_account_id="bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb",
+        ),
+        _campaign(
+            campaign_uuid="33333333-3333-3333-3333-333333333333",
+            status="COMPLETED",
+            starting_capital="75",
+            paper_account_id="cccccccc-cccc-cccc-cccc-cccccccccccc",
+        ),
+        _campaign(
+            campaign_uuid="44444444-4444-4444-4444-444444444444",
+            status="PAUSED",
+            starting_capital="15",
+            paper_account_id="dddddddd-dddd-dddd-dddd-dddddddddddd",
+        ),
+    ]
+    assert service._calculate_total_managed_capital(campaigns) == Decimal("40")
+
+
+def test_managed_capital_calculation_avoids_duplicate_paper_account_reference() -> None:
+    campaigns = [
+        _campaign(
+            campaign_uuid="11111111-1111-1111-1111-111111111111",
+            status="RUNNING",
+            starting_capital="25",
+            paper_account_id="aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa",
+        ),
+        _campaign(
+            campaign_uuid="22222222-2222-2222-2222-222222222222",
+            status="TARGET_REACHED",
+            starting_capital="25",
+            paper_account_id="aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa",
+        ),
+    ]
+    assert service._calculate_total_managed_capital(campaigns) == Decimal("25")

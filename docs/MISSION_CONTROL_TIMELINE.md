@@ -4,6 +4,20 @@
 
 Mission Control presents an operator-facing intelligence and profit cockpit.
 
+Primary capital metric:
+- Total Managed Capital (campaign-derived)
+
+Managed-capital included statuses:
+- READY
+- RUNNING
+- PAUSED
+- TARGET_REACHED
+
+Managed-capital excluded statuses:
+- DRAFT
+- COMPLETED
+- ARCHIVED
+
 ## Current Timeline Sources
 
 Current timeline evidence comes from:
@@ -33,6 +47,7 @@ These annotations are informational evidence only and do not authorize live subm
 Mission Control now treats profit as a first-class metric.
 
 Visible operator metrics include:
+- total managed capital
 - net profit
 - realized PnL
 - unrealized PnL
