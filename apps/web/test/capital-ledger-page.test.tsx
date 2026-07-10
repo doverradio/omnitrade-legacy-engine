@@ -143,6 +143,58 @@ function installFetchMock(scenario: "empty" | "with-data" = "with-data") {
       return jsonResponse(200, buildPayload("50", false));
     }
 
+    if (url.pathname === "/crypto-order-previews") {
+      return jsonResponse(200, {
+        items: [
+          {
+            crypto_order_preview_id: "preview-1",
+            preview_version: 1,
+            status: "PREVIEW_READY",
+            provider: "coinbase_advanced",
+            environment: "production",
+            product_id: "BTC-USD",
+            side: "BUY",
+            order_type: "MARKET",
+            quote_size: "5.00",
+            base_size: null,
+            requested_amount: "5.00",
+            requested_amount_currency: "USD",
+            readiness_verdict: "READY_FOR_PREVIEW",
+            risk_verdict: "approved_for_preview",
+            risk_explanation: "Risk engine approved the proposed preview.",
+            strategy_id: null,
+            strategy_name: null,
+            decision_record_id: null,
+            validation_run_id: null,
+            preview_id: "preview-123",
+            estimated_average_price: "10000.00",
+            estimated_total_value: "5.10",
+            estimated_base_size: "0.0005",
+            estimated_quote_size: "5.00",
+            estimated_fee: "0.10",
+            estimated_fee_currency: "USD",
+            estimated_slippage: "0.01",
+            estimated_commission_total: "0.10",
+            best_bid: "9995.00",
+            best_ask: "10005.00",
+            available_balance_before: "100.00",
+            estimated_balance_after: "94.90",
+            failure_reason: null,
+            warning_messages: [],
+            exchange_response_summary: {},
+            expires_at: "2026-07-09T10:05:00Z",
+            generated_by: "operator",
+            audit_correlation_id: null,
+            order_submitted: false,
+            execution_available: false,
+            created_at: "2026-07-09T10:00:00Z",
+            updated_at: "2026-07-09T10:00:00Z",
+            refreshed_from_preview_id: null,
+          },
+        ],
+      });
+    }
+
     return jsonResponse(404, {
       error: {
         message: `Unhandled route in test: GET ${url.pathname}`,
@@ -168,6 +220,7 @@ describe("CapitalPage", () => {
     expect(screen.getByText("Total Managed Capital")).toBeInTheDocument();
     expect(screen.getAllByText("$50.00").length).toBeGreaterThan(0);
     expect(screen.getByText("Data Completeness: 83.33%")).toBeInTheDocument();
+    expect(screen.getByText("Preview Activity")).toBeInTheDocument();
   });
 
   it("renders active pools and validation run capital rows", async () => {
@@ -176,8 +229,8 @@ describe("CapitalPage", () => {
     render(<CapitalPage />);
 
     expect(await screen.findByRole("heading", { name: "Capital Ledger" })).toBeInTheDocument();
-    expect(screen.getByText("Run A")).toBeInTheDocument();
-    expect(screen.getByText("Run B")).toBeInTheDocument();
+    expect(await screen.findByText("Run A")).toBeInTheDocument();
+    expect(await screen.findByText("Run B")).toBeInTheDocument();
 
     fireEvent.click(screen.getByRole("button", { name: /Validation Run Capital/i }));
     expect((await screen.findAllByText("View Validation Run")).length).toBeGreaterThan(0);

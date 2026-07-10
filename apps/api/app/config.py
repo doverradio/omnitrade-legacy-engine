@@ -1,5 +1,6 @@
 from functools import lru_cache
 import json
+from decimal import Decimal
 
 from pydantic import SecretStr
 from pydantic_settings import BaseSettings, SettingsConfigDict
@@ -18,6 +19,12 @@ class Settings(BaseSettings):
     alpaca_api_secret_key: SecretStr | None = None
     alpaca_base_url: str = "https://paper-api.alpaca.markets"
     exchange_credentials_encryption_key: SecretStr | None = None
+    crypto_preview_max_quote_size_usd: Decimal = Decimal("25")
+    crypto_preview_default_quote_size_usd: Decimal = Decimal("5")
+    crypto_preview_allowed_products: str = "BTC-USD"
+    crypto_preview_market_data_max_age_minutes: int = 15
+    crypto_preview_expiration_minutes: int = 5
+    crypto_preview_idempotency_window_minutes: int = 5
 
     environment: str = "local"
     log_level: str = "INFO"
@@ -39,6 +46,10 @@ class Settings(BaseSettings):
                 return [str(item).strip() for item in loaded if str(item).strip()]
 
         return [origin.strip() for origin in value.split(",") if origin.strip()]
+
+    @property
+    def parsed_crypto_preview_allowed_products(self) -> list[str]:
+        return [item.strip().upper() for item in self.crypto_preview_allowed_products.split(",") if item.strip()]
 
 
 @lru_cache

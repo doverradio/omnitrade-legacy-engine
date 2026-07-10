@@ -1,9 +1,11 @@
 from __future__ import annotations
 
+import json
 from datetime import datetime, timezone
 from decimal import Decimal
 import email.utils
 import secrets
+from typing import Any
 
 import httpx
 import jwt
@@ -15,6 +17,7 @@ from app.services.exchange_connections.providers.base import (
     ExchangeAuthResult,
     ExchangeBalanceItem,
     ExchangeBalanceSnapshot,
+    ExchangePreviewResult,
     ExchangePermissionSnapshot,
 )
 
@@ -106,6 +109,63 @@ def _permission_flags(permissions: list[str]) -> tuple[bool, bool]:
     withdrawal = any("withdraw" in item or "transfer" in item for item in lowered)
     trade = any("trade" in item or "order" in item for item in lowered)
     return withdrawal, trade
+
+
+def _decimal_field(payload: dict[str, Any], *names: str) -> Decimal | None:
+    for name in names:
+        value = payload.get(name)
+        if value is None or value == "":
+            continue
+        try:
+            return Decimal(str(value))
+        except Exception:
+            continue
+    return None
+
+
+def normalize_coinbase_preview_response(payload: dict[str, Any]) -> dict[str, Any]:
+    normalized: dict[str, Any] = {}
+    for key in (
+        "preview_id",
+        "product_id",
+        "side",
+        "order_type",
+        "success",
+    ):
+        if key in payload:
+            normalized[key] = payload[key]
+
+    numeric_fields = {
+        "estimated_average_price": ("estimated_average_price", "average_filled_price", "price"),
+        "estimated_total_value": ("estimated_total_value", "estimated_quote_size", "quote_size", "total_value"),
+        "estimated_base_size": ("estimated_base_size", "base_size"),
+        "estimated_quote_size": ("estimated_quote_size", "quote_size"),
+        "estimated_fee": ("estimated_fee", "commission_total", "fee", "total_fees"),
+        "estimated_slippage": ("estimated_slippage",),
+        "estimated_commission_total": ("estimated_commission_total", "commission_total", "total_fees"),
+        "best_bid": ("best_bid", "best_bid_price"),
+        "best_ask": ("best_ask", "best_ask_price"),
+    }
+    for target, candidates in numeric_fields.items():
+        value = _decimal_field(payload, *candidates)
+        if value is not None:
+            normalized[target] = format(value, "f")
+
+    warning_messages = payload.get("warning_messages") or payload.get("warnings") or []
+    if isinstance(warning_messages, list):
+        normalized["warning_messages"] = [str(item) for item in warning_messages if str(item).strip()]
+    else:
+        normalized["warning_messages"] = []
+
+    failure_reason = payload.get("failure_reason") or payload.get("preview_failure_reason") or payload.get("new_order_failure_reason")
+    if failure_reason is not None:
+        normalized["failure_reason"] = str(failure_reason)
+
+    for key in ("message", "error", "status"):
+        if key in payload and key not in normalized:
+            normalized[key] = payload[key]
+
+    return normalized
 
 
 def parse_coinbase_balances(payload: dict[str, object]) -> ExchangeBalanceSnapshot:
@@ -238,6 +298,58 @@ class CoinbaseAdvancedClient:
         permissions = parse_coinbase_permissions(payload)
         return ExchangePermissionSnapshot(permissions=permissions, verified=len(permissions) > 0)
 
+    async def preview_market_order(
+        self,
+        *,
+        credentials: dict[str, str],
+        environment: str,
+        product_id: str,
+        side: str,
+        quote_size: Decimal | None,
+        base_size: Decimal | None,
+        client_order_id: str | None = None,
+    ) -> ExchangePreviewResult:
+        order_configuration: dict[str, Any]
+        if quote_size is not None:
+            order_configuration = {"market_market_ioc": {"quote_size": format(quote_size, "f")}}
+        else:
+            order_configuration = {"market_market_ioc": {"base_size": format(base_size or Decimal("0"), "f")}}
+
+        request_payload: dict[str, Any] = {
+            "product_id": product_id,
+            "side": side,
+            "order_configuration": order_configuration,
+        }
+        if client_order_id:
+            request_payload["client_order_id"] = client_order_id
+
+        payload, _headers = await self._request_json(
+            method="POST",
+            path="/api/v3/brokerage/orders/preview",
+            credentials=credentials,
+            environment=environment,
+            json_payload=request_payload,
+        )
+        normalized = normalize_coinbase_preview_response(payload)
+
+        return ExchangePreviewResult(
+            preview_id=str(normalized.get("preview_id")) if normalized.get("preview_id") is not None else None,
+            success=bool(payload.get("success", normalized.get("success", True))) if isinstance(payload, dict) else True,
+            failure_reason=str(normalized.get("failure_reason")) if normalized.get("failure_reason") is not None else None,
+            warning_messages=list(normalized.get("warning_messages", [])),
+            estimated_average_price=_decimal_field(normalized, "estimated_average_price"),
+            estimated_total_value=_decimal_field(normalized, "estimated_total_value"),
+            estimated_base_size=_decimal_field(normalized, "estimated_base_size"),
+            estimated_quote_size=_decimal_field(normalized, "estimated_quote_size"),
+            estimated_fee=_decimal_field(normalized, "estimated_fee"),
+            estimated_fee_currency=str(payload.get("estimated_fee_currency")) if payload.get("estimated_fee_currency") is not None else None,
+            estimated_slippage=_decimal_field(normalized, "estimated_slippage"),
+            estimated_commission_total=_decimal_field(normalized, "estimated_commission_total"),
+            best_bid=_decimal_field(normalized, "best_bid"),
+            best_ask=_decimal_field(normalized, "best_ask"),
+            exchange_response_summary=normalized,
+        )
+
     async def _request_json(
         self,
         *,
@@ -246,9 +358,10 @@ class CoinbaseAdvancedClient:
         credentials: dict[str, str],
         environment: str,
         swallow_404: bool = False,
+        json_payload: dict[str, Any] | None = None,
     ) -> tuple[dict[str, object], dict[str, str]]:
         base_url = self._base_url(environment)
-        body = ""
+        body = json.dumps(json_payload) if json_payload is not None else ""
         request_host = base_url.replace("https://", "").replace("http://", "").rstrip("/")
         token = build_coinbase_jwt(
             api_key_name=credentials["api_key"],
@@ -261,6 +374,8 @@ class CoinbaseAdvancedClient:
             "Authorization": f"Bearer {token}",
             "Accept": "application/json",
         }
+        if json_payload is not None:
+            headers["Content-Type"] = "application/json"
 
         try:
             async with httpx.AsyncClient(base_url=base_url, timeout=self.timeout_seconds) as client:

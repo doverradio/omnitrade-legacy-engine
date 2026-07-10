@@ -19,6 +19,7 @@ import {
   type MissionControlIntelligenceTimelineEvent,
 } from "@/lib/api/mission-control";
 import { getExchangeConnections, type ExchangeConnection } from "@/lib/api/exchange-connections";
+import { listCryptoOrderPreviews, type CryptoOrderPreview } from "@/lib/api/crypto-order-previews";
 
 type AccordionKey = "intelligence" | "validationRuns" | "research" | "monitoring" | "infrastructure" | "paperTrading" | "alerts" | "recentTimeline";
 
@@ -350,6 +351,7 @@ export default function MissionControlIntelligenceCenter() {
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const [exchangeConnection, setExchangeConnection] = useState<ExchangeConnection | null>(null);
+  const [latestCryptoPreview, setLatestCryptoPreview] = useState<CryptoOrderPreview | null>(null);
   const [openSections, setOpenSections] = useState<Record<AccordionKey, boolean>>(DEFAULT_OPEN_SECTIONS);
   const [selectedEventId, setSelectedEventId] = useState<string | null>(null);
   const [isMobile, setIsMobile] = useState(false);
@@ -392,15 +394,17 @@ export default function MissionControlIntelligenceCenter() {
       setLoading(true);
       setError(null);
       try {
-        const [next, exchangePayload] = await Promise.all([
+        const [next, exchangePayload, previewItems] = await Promise.all([
           getMissionControlIntelligence(range),
           getExchangeConnections().catch(() => ({ items: [] as ExchangeConnection[] })),
+          listCryptoOrderPreviews(1).catch(() => [] as CryptoOrderPreview[]),
         ]);
         if (!active) {
           return;
         }
         setPayload(next);
         setExchangeConnection(exchangePayload.items.find((item) => item.provider === "coinbase_advanced") ?? null);
+        setLatestCryptoPreview(previewItems[0] ?? null);
       } catch (requestError) {
         if (active) {
           setError(errorMessage(requestError, "Unable to load mission control intelligence."));
@@ -523,6 +527,25 @@ export default function MissionControlIntelligenceCenter() {
 
       {payload ? (
         <div className="space-y-4">
+          <section className="rounded-2xl border border-border/80 bg-slate-950/50 p-4">
+            <div className="flex flex-wrap items-start justify-between gap-3">
+              <div>
+                <h2 className="text-sm font-semibold uppercase tracking-wide text-foreground/85">Order Preview</h2>
+                <p className="mt-1 text-sm text-foreground/75">Read-only preview evidence. No order has been placed.</p>
+              </div>
+              <Link href="/crypto-order-preview" className="rounded-full border border-cyan-400/40 bg-cyan-500/15 px-4 py-2 text-sm font-semibold text-cyan-50">
+                Open Preview Workspace
+              </Link>
+            </div>
+            <div className="mt-3 grid gap-3 sm:grid-cols-2 xl:grid-cols-5">
+              <MetricStat label="Latest Status" value={latestCryptoPreview?.status ?? "None"} helper="Preview only" href="/crypto-order-preview" />
+              <MetricStat label="Latest Amount" value={latestCryptoPreview ? formatCurrency(latestCryptoPreview.requested_amount) : "$0.00"} helper={latestCryptoPreview?.product_id ?? "BTC-USD"} href="/crypto-order-preview" />
+              <MetricStat label="Side" value={latestCryptoPreview?.side ?? "BUY"} helper="Proposal side" href="/crypto-order-preview" />
+              <MetricStat label="Risk Verdict" value={latestCryptoPreview?.risk_verdict?.toUpperCase().replaceAll("_", " ") ?? "UNKNOWN"} helper={latestCryptoPreview?.risk_explanation ?? "Awaiting preview"} href="/crypto-order-preview" />
+              <MetricStat label="Age" value={latestCryptoPreview ? formatTimestamp(latestCryptoPreview.created_at) : "Not available"} helper={latestCryptoPreview ? `Expires ${formatTimestamp(latestCryptoPreview.expires_at)}` : "No preview yet"} href="/crypto-order-preview" />
+            </div>
+          </section>
+
           <AccordionSection id="intelligence" title="Intelligence" open={openSections.intelligence} onToggle={toggleAccordion}>
             <div className="space-y-4">
               <div className="grid gap-3 sm:grid-cols-2 xl:grid-cols-4">

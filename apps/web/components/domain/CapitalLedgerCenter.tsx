@@ -11,6 +11,7 @@ import {
   type CapitalLedgerStatus,
   type CapitalLedgerType,
 } from "@/lib/api/capital-ledger";
+import { listCryptoOrderPreviews, type CryptoOrderPreview } from "@/lib/api/crypto-order-previews";
 
 type AccordionKey =
   | "summary"
@@ -145,6 +146,8 @@ function AccordionSection({
 
 export default function CapitalLedgerCenter() {
   const [payload, setPayload] = useState<CapitalLedgerResponse | null>(null);
+  const [latestPreview, setLatestPreview] = useState<CryptoOrderPreview | null>(null);
+  const [pendingPreviewCount, setPendingPreviewCount] = useState(0);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const [statusFilter, setStatusFilter] = useState<CapitalLedgerStatus>("all");
@@ -160,11 +163,16 @@ export default function CapitalLedgerCenter() {
       setLoading(true);
       setError(null);
       try {
-        const next = await getCapitalLedger({ status: statusFilter, type: typeFilter, page: 1, pageSize: 200 });
+        const [next, previewItems] = await Promise.all([
+          getCapitalLedger({ status: statusFilter, type: typeFilter, page: 1, pageSize: 200 }),
+          listCryptoOrderPreviews(10).catch(() => [] as CryptoOrderPreview[]),
+        ]);
         if (!active) {
           return;
         }
         setPayload(next);
+        setLatestPreview(previewItems[0] ?? null);
+        setPendingPreviewCount(previewItems.filter((item) => ["DRAFT", "VALIDATING", "PREVIEW_REQUESTED"].includes(item.status)).length);
       } catch (requestError) {
         if (active) {
           setError(errorMessage(requestError));
@@ -261,6 +269,39 @@ export default function CapitalLedgerCenter() {
 
       {payload ? (
         <div className="space-y-4">
+          <section className="rounded-2xl border border-border/80 bg-slate-950/50 p-4">
+            <div className="flex flex-wrap items-start justify-between gap-3">
+              <div>
+                <h2 className="text-sm font-semibold uppercase tracking-wide text-foreground/85">Preview Activity</h2>
+                <p className="mt-1 text-sm text-foreground/75">Preview-only activity is visible here and never changes managed capital.</p>
+              </div>
+              <Link href="/crypto-order-preview" className="rounded-full border border-cyan-400/40 bg-cyan-500/15 px-4 py-2 text-sm font-semibold text-cyan-50">
+                Open Preview Workspace
+              </Link>
+            </div>
+            <div className="mt-3 grid gap-3 sm:grid-cols-2 xl:grid-cols-4">
+              <article className="rounded-2xl border border-border bg-background/55 p-4">
+                <p className="text-[11px] uppercase tracking-wide text-foreground/65">Pending Previews</p>
+                <p className="mt-2 text-2xl font-semibold text-foreground">{pendingPreviewCount}</p>
+              </article>
+              <article className="rounded-2xl border border-border bg-background/55 p-4">
+                <p className="text-[11px] uppercase tracking-wide text-foreground/65">Latest Preview</p>
+                <p className="mt-2 text-2xl font-semibold text-foreground">{latestPreview?.status ?? "None"}</p>
+              </article>
+              <article className="rounded-2xl border border-border bg-background/55 p-4">
+                <p className="text-[11px] uppercase tracking-wide text-foreground/65">Proposed Amount</p>
+                <p className="mt-2 text-2xl font-semibold text-foreground">{latestPreview ? formatCurrency(latestPreview.requested_amount) : "Not available"}</p>
+              </article>
+              <article className="rounded-2xl border border-border bg-background/55 p-4">
+                <p className="text-[11px] uppercase tracking-wide text-foreground/65">Preview Status</p>
+                <p className="mt-2 text-2xl font-semibold text-foreground">{latestPreview?.risk_verdict?.toUpperCase().replaceAll("_", " ") ?? "UNKNOWN"}</p>
+              </article>
+            </div>
+            <div className="mt-3 text-sm text-foreground/70">
+              Total Managed Capital remains unchanged while previews are generated, refreshed, or cancelled.
+            </div>
+          </section>
+
           {payload.capital_pools.length === 0 ? (
             <section className="rounded-2xl border border-border bg-background/60 p-4 text-sm text-foreground/75">
               No managed capital found.

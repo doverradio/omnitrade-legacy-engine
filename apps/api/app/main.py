@@ -5,6 +5,7 @@ from fastapi.middleware.cors import CORSMiddleware
 
 from app.api.routes.arena import router as arena_router
 from app.api.routes.backtests import router as backtests_router
+from app.api.routes.crypto_order_previews import router as crypto_order_previews_router
 from app.api.routes.capital import router as capital_router
 from app.api.routes.dashboard import router as dashboard_router
 from app.api.routes.decisions import router as decisions_router
@@ -51,6 +52,7 @@ def create_app() -> FastAPI:
     app.include_router(strategies_router)
     app.include_router(parameter_sets_router)
     app.include_router(backtests_router)
+    app.include_router(crypto_order_previews_router)
     app.include_router(capital_router)
     app.include_router(exchange_connections_router)
     app.include_router(dashboard_router)
