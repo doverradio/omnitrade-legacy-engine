@@ -1,4 +1,4 @@
-import { fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { act, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
 import MissionControlIntelligenceCenter from "@/components/domain/MissionControlIntelligenceCenter";
@@ -197,6 +197,8 @@ function installFetchMock(scenario: "healthy" | "empty" | "degraded" = "healthy"
 
 afterEach(() => {
   vi.unstubAllGlobals();
+  vi.useRealTimers();
+  vi.restoreAllMocks();
 });
 
 describe("MissionControlIntelligenceCenter", () => {
@@ -211,7 +213,7 @@ describe("MissionControlIntelligenceCenter", () => {
     expect(screen.getByText("Prediction Quality")).toBeInTheDocument();
     expect(screen.getByText("Infrastructure Health")).toBeInTheDocument();
     expect(screen.getByText("Recent Timeline")).toBeInTheDocument();
-    expect(screen.getByText("Validation Run Started")).toBeInTheDocument();
+    expect(screen.getByRole("img", { name: "Intelligence timeline chart" })).toBeInTheDocument();
   });
 
   it("switches intelligence range tabs and refetches the selected range", async () => {
@@ -257,21 +259,35 @@ describe("MissionControlIntelligenceCenter", () => {
 
     expect(screen.getByText("Current Campaign")).toBeInTheDocument();
     expect(screen.getByText("No active alerts.")).toBeInTheDocument();
-    expect(screen.getByText("Validation Run Started")).toBeInTheDocument();
+    expect(screen.getAllByText("Validation Run Started").length).toBeGreaterThan(0);
   });
 
-  it("opens the event detail modal on mobile when a chart point is clicked", async () => {
-    installFetchMock("healthy");
+  it("keeps mobile event detail closed by default and closed after refresh until reselected", async () => {
+    const fetchMock = installFetchMock("healthy");
     Object.defineProperty(window, "innerWidth", { value: 375, configurable: true, writable: true });
 
-    render(<MissionControlIntelligenceCenter />);
+    const { rerender } = render(<MissionControlIntelligenceCenter />);
 
     expect(await screen.findByRole("heading", { name: "Mission Control" })).toBeInTheDocument();
+    expect(screen.queryByRole("dialog", { name: "Timeline event detail" })).not.toBeInTheDocument();
 
     fireEvent.click(screen.getByRole("button", { name: /Open Validation Run Started/i }));
 
     expect(await screen.findByRole("dialog", { name: "Timeline event detail" })).toBeInTheDocument();
     expect(screen.getByText("Timestamp")).toBeInTheDocument();
     expect(screen.getByText("Related validation run")).toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole("button", { name: "Close" }));
+
+    await waitFor(() => {
+      expect(screen.queryByRole("dialog", { name: "Timeline event detail" })).not.toBeInTheDocument();
+    });
+
+    rerender(<MissionControlIntelligenceCenter />);
+
+    await waitFor(() => {
+      expect(fetchMock.mock.calls.length).toBeGreaterThan(0);
+    });
+    expect(screen.queryByRole("dialog", { name: "Timeline event detail" })).not.toBeInTheDocument();
   });
 });

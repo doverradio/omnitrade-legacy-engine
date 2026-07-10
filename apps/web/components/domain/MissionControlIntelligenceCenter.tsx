@@ -429,6 +429,9 @@ export default function MissionControlIntelligenceCenter() {
 
   useEffect(() => {
     if (!payload?.timeline_events.length) {
+      if (selectedEventId !== null) {
+        setSelectedEventId(null);
+      }
       return;
     }
 
@@ -442,7 +445,7 @@ export default function MissionControlIntelligenceCenter() {
     }
 
     if (!selectedExists && selectedEventId !== null) {
-      setSelectedEventId(payload.timeline_events[0]?.event_id ?? null);
+      setSelectedEventId(isMobile ? null : (payload.timeline_events[0]?.event_id ?? null));
     }
   }, [isMobile, payload, selectedEventId]);
 
@@ -471,7 +474,7 @@ export default function MissionControlIntelligenceCenter() {
       ]
     : [];
 
-  const selectedTimelineDetail = selectedEvent ?? payload?.timeline_events[0] ?? null;
+  const selectedTimelineDetail = selectedEvent;
 
   function toggleAccordion(key: AccordionKey) {
     setOpenSections((previous) => ({ ...previous, [key]: !previous[key] }));

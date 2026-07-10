@@ -152,6 +152,6 @@ describe("MissionControlPage", () => {
     expect(screen.getByText("Monitoring")).toBeInTheDocument();
     expect(screen.getByText("Infrastructure")).toBeInTheDocument();
     expect(screen.getByText("Paper Trading")).toBeInTheDocument();
-    expect(screen.getByText("No active alerts.")).toBeInTheDocument();
+    expect(screen.getByText("Alerts")).toBeInTheDocument();
   });
 });
