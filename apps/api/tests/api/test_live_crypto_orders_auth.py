@@ -84,6 +84,174 @@ def test_live_crypto_order_prepare_rejects_authenticated_operator_mismatch() -> 
     assert response.json()["error"]["message"] == "Authenticated operator identity mismatch"
 
 
+def test_live_crypto_order_prepare_rejects_expired_bearer_token() -> None:
+    payload = {
+        "live_trading_profile_id": "11111111-1111-1111-1111-111111111111",
+        "crypto_order_preview_id": "22222222-2222-2222-2222-222222222222",
+        "operator_identity": "operator:human",
+        "idempotency_token": "prepare-token",
+    }
+
+    with _create_client() as client:
+        response = client.post(
+            "/live-crypto-orders/prepare-confirmation",
+            json=payload,
+            headers={"Authorization": "Bearer expired:operator:human"},
+        )
+
+    assert response.status_code == 401
+    assert response.json()["error"]["code"] == "unauthorized"
+
+
+def test_live_crypto_order_prepare_rejects_invalid_bearer_token() -> None:
+    payload = {
+        "live_trading_profile_id": "11111111-1111-1111-1111-111111111111",
+        "crypto_order_preview_id": "22222222-2222-2222-2222-222222222222",
+        "operator_identity": "operator:human",
+        "idempotency_token": "prepare-token",
+    }
+
+    with _create_client() as client:
+        response = client.post(
+            "/live-crypto-orders/prepare-confirmation",
+            json=payload,
+            headers={"Authorization": "Bearer invalid:operator:human"},
+        )
+
+    assert response.status_code == 401
+    assert response.json()["error"]["code"] == "unauthorized"
+
+
+def test_live_crypto_order_prepare_rejects_non_operator_token() -> None:
+    payload = {
+        "live_trading_profile_id": "11111111-1111-1111-1111-111111111111",
+        "crypto_order_preview_id": "22222222-2222-2222-2222-222222222222",
+        "operator_identity": "operator:human",
+        "idempotency_token": "prepare-token",
+    }
+
+    with _create_client() as client:
+        response = client.post(
+            "/live-crypto-orders/prepare-confirmation",
+            json=payload,
+            headers={"Authorization": "Bearer service:automation"},
+        )
+
+    assert response.status_code == 403
+    assert response.json()["error"]["code"] == "forbidden"
+
+
+def test_live_crypto_order_dry_run_requires_bearer_auth() -> None:
+    payload = {
+        "live_trading_profile_id": "11111111-1111-1111-1111-111111111111",
+        "crypto_order_preview_id": "22222222-2222-2222-2222-222222222222",
+        "operator_identity": "operator:human",
+        "idempotency_token": "dry-run-token",
+    }
+
+    with _create_client() as client:
+        response = client.post("/live-crypto-orders/dry-run", json=payload)
+
+    assert response.status_code == 401
+    assert response.json()["error"]["code"] == "unauthorized"
+
+
+def test_live_crypto_order_dry_run_rejects_malformed_bearer_auth() -> None:
+    payload = {
+        "live_trading_profile_id": "11111111-1111-1111-1111-111111111111",
+        "crypto_order_preview_id": "22222222-2222-2222-2222-222222222222",
+        "operator_identity": "operator:human",
+        "idempotency_token": "dry-run-token",
+    }
+
+    with _create_client() as client:
+        response = client.post(
+            "/live-crypto-orders/dry-run",
+            json=payload,
+            headers={"Authorization": "Bearer operator :human"},
+        )
+
+    assert response.status_code == 401
+    assert response.json()["error"]["code"] == "unauthorized"
+
+
+def test_live_crypto_order_dry_run_rejects_expired_bearer_token() -> None:
+    payload = {
+        "live_trading_profile_id": "11111111-1111-1111-1111-111111111111",
+        "crypto_order_preview_id": "22222222-2222-2222-2222-222222222222",
+        "operator_identity": "operator:human",
+        "idempotency_token": "dry-run-token",
+    }
+
+    with _create_client() as client:
+        response = client.post(
+            "/live-crypto-orders/dry-run",
+            json=payload,
+            headers={"Authorization": "Bearer expired:operator:human"},
+        )
+
+    assert response.status_code == 401
+    assert response.json()["error"]["code"] == "unauthorized"
+
+
+def test_live_crypto_order_dry_run_rejects_invalid_bearer_token() -> None:
+    payload = {
+        "live_trading_profile_id": "11111111-1111-1111-1111-111111111111",
+        "crypto_order_preview_id": "22222222-2222-2222-2222-222222222222",
+        "operator_identity": "operator:human",
+        "idempotency_token": "dry-run-token",
+    }
+
+    with _create_client() as client:
+        response = client.post(
+            "/live-crypto-orders/dry-run",
+            json=payload,
+            headers={"Authorization": "Bearer invalidsig:operator:human"},
+        )
+
+    assert response.status_code == 401
+    assert response.json()["error"]["code"] == "unauthorized"
+
+
+def test_live_crypto_order_dry_run_rejects_non_operator_token() -> None:
+    payload = {
+        "live_trading_profile_id": "11111111-1111-1111-1111-111111111111",
+        "crypto_order_preview_id": "22222222-2222-2222-2222-222222222222",
+        "operator_identity": "operator:human",
+        "idempotency_token": "dry-run-token",
+    }
+
+    with _create_client() as client:
+        response = client.post(
+            "/live-crypto-orders/dry-run",
+            json=payload,
+            headers={"Authorization": "Bearer service:automation"},
+        )
+
+    assert response.status_code == 403
+    assert response.json()["error"]["code"] == "forbidden"
+
+
+def test_live_crypto_order_dry_run_rejects_authenticated_operator_mismatch() -> None:
+    payload = {
+        "live_trading_profile_id": "11111111-1111-1111-1111-111111111111",
+        "crypto_order_preview_id": "22222222-2222-2222-2222-222222222222",
+        "operator_identity": "operator:human",
+        "idempotency_token": "dry-run-token",
+    }
+
+    with _create_client() as client:
+        response = client.post(
+            "/live-crypto-orders/dry-run",
+            json=payload,
+            headers={"Authorization": "Bearer operator:other"},
+        )
+
+    assert response.status_code == 401
+    assert response.json()["error"]["code"] == "unauthorized"
+    assert response.json()["error"]["message"] == "Authenticated operator identity mismatch"
+
+
 def test_live_crypto_order_submit_fails_closed_when_feature_flag_disabled(monkeypatch: pytest.MonkeyPatch) -> None:
     payload = {
         "live_crypto_order_id": "11111111-1111-1111-1111-111111111111",

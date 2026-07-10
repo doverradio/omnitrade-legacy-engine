@@ -5,6 +5,7 @@ import uuid
 from fastapi import APIRouter, Depends
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.core.security import get_authorized_operator
 from app.db.session import get_db
 from app.schemas.exchange_connections import (
     DisconnectExchangeConnectionRequest,
@@ -41,48 +42,55 @@ async def get_exchange_connections(db: AsyncSession = Depends(get_db)) -> Exchan
 @router.post("/test", response_model=TestExchangeConnectionResponse)
 async def test_connection(
     payload: TestExchangeConnectionRequest,
+    current_user: dict[str, str] = Depends(get_authorized_operator),
 ) -> TestExchangeConnectionResponse:
+    _ = current_user
     return await test_exchange_credentials(payload=payload)
 
 
 @router.post("", response_model=ExchangeConnectionResponse, status_code=201)
 async def save_exchange_connection(
     payload: SaveExchangeConnectionRequest,
+    current_user: dict[str, str] = Depends(get_authorized_operator),
     db: AsyncSession = Depends(get_db),
 ) -> ExchangeConnectionResponse:
-    return await create_exchange_connection(db=db, payload=payload)
+    return await create_exchange_connection(db=db, payload=payload, actor=current_user["id"])
 
 
 @router.post("/{exchange_connection_id}/refresh/balances", response_model=ExchangeConnectionResponse)
 async def refresh_connection_balances(
     exchange_connection_id: uuid.UUID,
+    current_user: dict[str, str] = Depends(get_authorized_operator),
     db: AsyncSession = Depends(get_db),
 ) -> ExchangeConnectionResponse:
-    return await refresh_exchange_balances(db=db, exchange_connection_id=exchange_connection_id)
+    return await refresh_exchange_balances(db=db, exchange_connection_id=exchange_connection_id, actor=current_user["id"])
 
 
 @router.post("/{exchange_connection_id}/refresh/account", response_model=ExchangeConnectionResponse)
 async def refresh_connection_account(
     exchange_connection_id: uuid.UUID,
+    current_user: dict[str, str] = Depends(get_authorized_operator),
     db: AsyncSession = Depends(get_db),
 ) -> ExchangeConnectionResponse:
-    return await refresh_exchange_account(db=db, exchange_connection_id=exchange_connection_id)
+    return await refresh_exchange_account(db=db, exchange_connection_id=exchange_connection_id, actor=current_user["id"])
 
 
 @router.post("/{exchange_connection_id}/refresh/permissions", response_model=ExchangeConnectionResponse)
 async def refresh_connection_permissions(
     exchange_connection_id: uuid.UUID,
+    current_user: dict[str, str] = Depends(get_authorized_operator),
     db: AsyncSession = Depends(get_db),
 ) -> ExchangeConnectionResponse:
-    return await refresh_exchange_permissions(db=db, exchange_connection_id=exchange_connection_id)
+    return await refresh_exchange_permissions(db=db, exchange_connection_id=exchange_connection_id, actor=current_user["id"])
 
 
 @router.post("/{exchange_connection_id}/verify", response_model=ExchangeConnectionResponse)
 async def verify_connection(
     exchange_connection_id: uuid.UUID,
+    current_user: dict[str, str] = Depends(get_authorized_operator),
     db: AsyncSession = Depends(get_db),
 ) -> ExchangeConnectionResponse:
-    return await verify_exchange_connection(db=db, exchange_connection_id=exchange_connection_id)
+    return await verify_exchange_connection(db=db, exchange_connection_id=exchange_connection_id, actor=current_user["id"])
 
 
 @router.get("/{exchange_connection_id}/readiness", response_model=ExchangeReadinessReportResponse)
@@ -97,15 +105,17 @@ async def get_connection_readiness(
 async def rotate_connection_credentials(
     exchange_connection_id: uuid.UUID,
     payload: RotateExchangeCredentialsRequest,
+    current_user: dict[str, str] = Depends(get_authorized_operator),
     db: AsyncSession = Depends(get_db),
 ) -> ExchangeConnectionResponse:
-    return await rotate_exchange_credentials(db=db, exchange_connection_id=exchange_connection_id, payload=payload)
+    return await rotate_exchange_credentials(db=db, exchange_connection_id=exchange_connection_id, payload=payload, actor=current_user["id"])
 
 
 @router.post("/{exchange_connection_id}/disconnect", response_model=DisconnectExchangeConnectionResponse)
 async def disconnect_connection(
     exchange_connection_id: uuid.UUID,
     payload: DisconnectExchangeConnectionRequest,
+    current_user: dict[str, str] = Depends(get_authorized_operator),
     db: AsyncSession = Depends(get_db),
 ) -> DisconnectExchangeConnectionResponse:
-    return await disconnect_exchange_connection(db=db, exchange_connection_id=exchange_connection_id, payload=payload)
+    return await disconnect_exchange_connection(db=db, exchange_connection_id=exchange_connection_id, payload=payload, actor=current_user["id"])

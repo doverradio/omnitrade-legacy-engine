@@ -69,6 +69,7 @@ export default function ExchangeConnectionsCenter() {
   const [rotating, setRotating] = useState(false);
   const [disconnecting, setDisconnecting] = useState(false);
   const [readiness, setReadiness] = useState<ExchangeReadinessReport | null>(null);
+  const [selectedReadinessCode, setSelectedReadinessCode] = useState<string | null>(null);
 
   const [connectionName, setConnectionName] = useState("Primary Coinbase");
   const [environment, setEnvironment] = useState<ExchangeEnvironment>("sandbox");
@@ -265,6 +266,16 @@ export default function ExchangeConnectionsCenter() {
   }
 
   const readinessVerdict = readiness?.verdict ?? coinbaseConnection?.readiness?.verdict ?? "UNKNOWN";
+  const readinessChecks = readiness?.checks ?? coinbaseConnection?.readiness?.checks ?? [];
+  const selectedReadinessCheck = readinessChecks.find((item) => item.code === selectedReadinessCode) ?? null;
+  const dangerousPermissionDetected = readinessChecks.some((item) => item.code === "dangerous_permissions_detected" && item.status === "fail");
+  const wizardStatus = readinessVerdict === "READY_FOR_DRY_RUN"
+    ? "READY FOR DRY RUN"
+    : readinessVerdict === "READY_FOR_OPERATOR_REVIEW"
+      ? "READY FOR OPERATOR REVIEW"
+    : readinessVerdict === "READY_FOR_PREVIEW"
+      ? "READY FOR PREVIEW"
+      : "BLOCKED";
 
   async function refreshOne(connectionId: string, action: "balances" | "account" | "permissions") {
     setRefreshingId(connectionId + action);
@@ -479,14 +490,35 @@ export default function ExchangeConnectionsCenter() {
             <section className="rounded-xl border border-border bg-background/50 p-3">
               <h3 className="text-sm font-semibold text-foreground">Live Readiness</h3>
               <div className="mt-2 grid gap-2 sm:grid-cols-2">
-                {(readiness?.checks ?? coinbaseConnection.readiness?.checks ?? []).map((item) => (
-                  <article key={item.code} className={`rounded-lg border p-2 text-sm ${item.status === "pass" ? "border-emerald-500/40 bg-emerald-500/10 text-emerald-100" : item.status === "fail" ? "border-rose-500/40 bg-rose-500/10 text-rose-100" : "border-amber-500/40 bg-amber-500/10 text-amber-100"}`}>
+                {readinessChecks.map((item) => (
+                  <button key={item.code} type="button" onClick={() => setSelectedReadinessCode(item.code)} className={`rounded-lg border p-2 text-left text-sm ${item.status === "pass" ? "border-emerald-500/40 bg-emerald-500/10 text-emerald-100" : item.status === "fail" ? "border-rose-500/40 bg-rose-500/10 text-rose-100" : "border-amber-500/40 bg-amber-500/10 text-amber-100"}`}>
                     <p className="font-medium">{item.label}</p>
                     <p className="text-xs opacity-90">{item.explanation}</p>
-                    <p className="mt-1 text-[11px] opacity-80">{item.remediation}</p>
-                  </article>
+                  </button>
                 ))}
               </div>
+
+              {selectedReadinessCheck ? (
+                <div className="mt-3 rounded-md border border-border bg-background/40 p-2 text-xs text-foreground/80">
+                  <p className="font-semibold">{selectedReadinessCheck.label}</p>
+                  <p className="mt-1">{selectedReadinessCheck.explanation}</p>
+                  <p className="mt-1">Remediation: {selectedReadinessCheck.remediation}</p>
+                </div>
+              ) : null}
+
+              {dangerousPermissionDetected ? (
+                <div className="mt-3 rounded-md border border-rose-500/40 bg-rose-500/10 p-2 text-xs text-rose-100">
+                  Dangerous permission warning: withdrawal or transfer scope detected. This key is blocked for automatic readiness.
+                </div>
+              ) : null}
+
+              <div className="mt-3 rounded-md border border-border bg-background/40 p-2 text-xs text-foreground/80">
+                <p className="font-semibold">First-Trade Wizard Status</p>
+                <p className="mt-1">
+                  {wizardStatus}
+                </p>
+              </div>
+
               <div className="mt-3 rounded-md border border-border bg-background/40 p-2 text-xs text-foreground/70">
                 Sandbox returns static data and validates shape only. Production verification uses read-only account and balance requests and does not submit orders.
               </div>

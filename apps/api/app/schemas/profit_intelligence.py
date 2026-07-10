@@ -13,6 +13,7 @@ ProfitRange = Literal["24h", "72h", "7d", "30d", "90d", "all"]
 
 class ProfitSeriesPointResponse(BaseModel):
     timestamp: datetime
+    opening_context: bool = False
     paper_equity: Decimal | None = None
     live_equity: Decimal | None = None
     combined_equity: Decimal | None = None
@@ -22,7 +23,9 @@ class ProfitSeriesPointResponse(BaseModel):
     cumulative_net_profit: Decimal | None = None
     drawdown: Decimal | None = None
     trade_count: int = 0
+    source_event_count: int = 0
     source_event_ids: list[str] = Field(default_factory=list)
+    source_event_ids_truncated: bool = False
 
     @field_serializer(
         "paper_equity",

@@ -111,6 +111,33 @@ def _stable_hash(payload: dict[str, Any]) -> str:
     return hashlib.sha256(encoded).hexdigest()
 
 
+_SENSITIVE_SUBSTRINGS = (
+    "secret",
+    "private_key",
+    "api_key",
+    "passphrase",
+    "authorization",
+    "jwt",
+    "token",
+    "signature",
+)
+
+
+def _redact_sensitive(value: Any) -> Any:
+    if isinstance(value, dict):
+        redacted: dict[str, Any] = {}
+        for key, item in value.items():
+            key_l = str(key).lower()
+            if any(fragment in key_l for fragment in _SENSITIVE_SUBSTRINGS):
+                redacted[str(key)] = "[REDACTED]"
+            else:
+                redacted[str(key)] = _redact_sensitive(item)
+        return redacted
+    if isinstance(value, list):
+        return [_redact_sensitive(item) for item in value]
+    return value
+
+
 def _preview_idempotency_key(request: CryptoOrderPreviewCreateRequest, *, actor: str, window_minutes: int) -> str:
     window = int(datetime.now(timezone.utc).timestamp() // (window_minutes * 60))
     payload = {
@@ -225,7 +252,7 @@ def _to_response(record: CryptoOrderPreview) -> CryptoOrderPreviewResponse:
         estimated_balance_after=record.estimated_balance_after,
         failure_reason=record.failure_reason,
         warning_messages=list(record.warning_messages or []),
-        exchange_response_summary=dict(record.exchange_response_summary or {}),
+        exchange_response_summary=_redact_sensitive(dict(record.exchange_response_summary or {})),
         expires_at=record.expires_at,
         generated_by=record.generated_by,  # type: ignore[arg-type]
         audit_correlation_id=record.audit_correlation_id,
@@ -379,7 +406,6 @@ async def create_crypto_order_preview(
             would_breach_daily_loss=False,
             would_breach_drawdown=False,
             has_computable_stop_loss=True,
-            bypass_sizing_rule=False,
             ai_scaled_quantity=None,
         ),
     )
@@ -479,7 +505,7 @@ async def create_crypto_order_preview(
 
     record.preview_id = preview.preview_id
     record.warning_messages = list(preview.warning_messages)
-    record.exchange_response_summary = dict(preview.exchange_response_summary)
+    record.exchange_response_summary = _redact_sensitive(dict(preview.exchange_response_summary))
     record.best_bid = preview.best_bid
     record.best_ask = preview.best_ask
     record.estimated_average_price = preview.estimated_average_price or reference_price
@@ -516,7 +542,7 @@ async def create_crypto_order_preview(
     await _record_audit(
         db=db,
         actor=actor,
-        action="crypto_order_preview_ready",
+        action="PREVIEW_GENERATED",
         entity_id=record.crypto_order_preview_id,
         before_state={"status": "PREVIEW_REQUESTED"},
         after_state={

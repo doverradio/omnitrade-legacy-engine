@@ -26,32 +26,45 @@ def readiness_check(*, code: str, label: str, status: CheckStatus, explanation: 
 def compute_verdict(checks: list[ExchangeReadinessCheckResponse]) -> ExchangeReadinessVerdict:
     by_code = {item.code: item for item in checks}
 
+    credentials_stored = by_code.get("credentials_stored")
     api_reachable = by_code.get("api_reachable")
     auth_valid = by_code.get("authentication_valid")
-    clock_synced = by_code.get("clock_synchronized")
-    permissions = by_code.get("permissions_retrieved")
-    accounts = by_code.get("accounts_retrieved")
-    balances = by_code.get("balances_retrieved")
+    dangerous_permissions = by_code.get("dangerous_permissions_detected")
+    trade_permission = by_code.get("trade_permission_present")
+    permissions_retrieved = by_code.get("permissions_retrieved")
+    account_restricted = by_code.get("account_restricted")
+    product_available = by_code.get("product_btc_usd_available")
+    usd_balance = by_code.get("usd_balance_retrieved")
+    btc_balance = by_code.get("btc_balance_retrieved")
 
-    if api_reachable and api_reachable.status == "fail":
-        return "UNREACHABLE"
+    if credentials_stored and credentials_stored.status == "fail":
+        return "NOT_CONFIGURED"
+
     if auth_valid and auth_valid.status == "fail":
         return "AUTHENTICATION_FAILED"
-    if clock_synced and clock_synced.status == "fail":
-        return "CLOCK_SKEW"
+    if api_reachable and api_reachable.status == "fail":
+        return "AUTHENTICATION_FAILED"
 
-    if permissions and permissions.status == "fail":
-        return "PERMISSION_INSUFFICIENT"
+    if dangerous_permissions and dangerous_permissions.status == "fail":
+        return "PERMISSION_BLOCKED"
+    if permissions_retrieved and permissions_retrieved.status == "fail":
+        return "PERMISSION_BLOCKED"
+    if trade_permission and trade_permission.status == "fail":
+        return "PERMISSION_BLOCKED"
+    if account_restricted and account_restricted.status == "fail":
+        return "ACCOUNT_RESTRICTED"
+    if product_available and product_available.status == "fail":
+        return "PRODUCT_UNAVAILABLE"
 
-    critical_fail = any(item.status == "fail" for item in checks)
-    if critical_fail:
-        return "MISCONFIGURED"
+    balances_available = (usd_balance is None or usd_balance.status == "pass") and (btc_balance is None or btc_balance.status == "pass")
+    if not balances_available:
+        return "BALANCE_UNAVAILABLE"
 
-    if accounts and balances and permissions and accounts.status == "pass" and balances.status == "pass" and permissions.status == "pass":
+    if product_available and product_available.status == "pass" and trade_permission and trade_permission.status == "pass":
+        return "READY_FOR_OPERATOR_REVIEW"
+
+    if auth_valid and auth_valid.status == "pass":
         return "READY_FOR_PREVIEW"
-
-    if api_reachable and auth_valid and api_reachable.status == "pass" and auth_valid.status == "pass":
-        return "READ_ONLY_READY"
 
     return "UNKNOWN"
 

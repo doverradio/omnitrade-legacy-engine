@@ -1,4 +1,5 @@
 import { ApiRequestError } from "@/lib/api/live";
+import { getOperatorAuthHeaders } from "@/lib/api/operator-auth";
 
 export type LiveCryptoOrderStatus =
   | "DRY_RUN_READY"
@@ -60,7 +61,14 @@ export type LiveCryptoOrder = {
 };
 
 export type LiveCryptoOrderReadiness = {
-  overall_verdict: "NOT_CONFIGURED" | "BLOCKED" | "READY_FOR_DRY_RUN" | "DRY_RUN_PASSED" | "READY_FOR_OPERATOR_ENABLEMENT";
+  overall_verdict:
+    | "NOT_CONFIGURED"
+    | "BLOCKED"
+    | "READY_FOR_PREVIEW"
+    | "READY_FOR_DRY_RUN"
+    | "READY_FOR_OPERATOR_REVIEW"
+    | "DRY_RUN_PASSED"
+    | "READY_FOR_OPERATOR_ENABLEMENT";
   live_mode_enabled: boolean;
   live_profile_ready: boolean;
   feature_flag_enabled: boolean;
@@ -71,14 +79,16 @@ export type LiveCryptoOrderReadiness = {
   latest_readiness_age_seconds: number | null;
   latest_price_age_seconds: number | null;
   reason: string | null;
-  checks: Array<{
-    code: string;
-    label: string;
-    status: "pass" | "warn" | "fail";
-    explanation: string;
-    checked_at: string;
-    remediation: string;
-  }>;
+  checks: LiveCryptoOrderReadinessCheck[];
+};
+
+export type LiveCryptoOrderReadinessCheck = {
+  code: string;
+  label: string;
+  status: "pass" | "warn" | "fail";
+  explanation: string;
+  checked_at: string;
+  remediation: string;
 };
 
 export type LiveCryptoOrderPrepareRequest = {
@@ -157,6 +167,7 @@ async function requestJson<T>(path: string, init?: RequestInit): Promise<T> {
     cache: "no-store",
     headers: {
       "Content-Type": "application/json",
+      ...getOperatorAuthHeaders(),
       ...(init?.headers ?? {}),
     },
     ...init,

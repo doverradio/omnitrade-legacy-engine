@@ -13,6 +13,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.config import get_settings
 from app.models.crypto_order_preview import CryptoOrderPreview
 from app.models.exchange_connection import ExchangeConnection
+from app.models.audit_log import AuditLog
 from app.models.live_crypto_order import LiveCryptoOrder
 from app.models.live_trading_event import LiveTradingEvent
 from app.models.live_trading_profile import LiveTradingProfile
@@ -50,6 +51,37 @@ def _serialize_payload(payload: dict[str, Any]) -> str:
 
 def _hash_payload(payload: dict[str, Any]) -> str:
     return hashlib.sha256(_serialize_payload(payload).encode("utf-8")).hexdigest()
+
+
+_SENSITIVE_SUBSTRINGS = (
+    "secret",
+    "private_key",
+    "api_key",
+    "passphrase",
+    "authorization",
+    "jwt",
+    "token",
+    "signature",
+)
+
+
+def _redact_sensitive(value: Any) -> Any:
+    if isinstance(value, dict):
+        redacted: dict[str, Any] = {}
+        for key, item in value.items():
+            key_l = str(key).lower()
+            if any(fragment in key_l for fragment in _SENSITIVE_SUBSTRINGS):
+                redacted[str(key)] = "[REDACTED]"
+            else:
+                redacted[str(key)] = _redact_sensitive(item)
+        return redacted
+    if isinstance(value, list):
+        return [_redact_sensitive(item) for item in value]
+    return value
+
+
+def _replay_key(*, action: str, scope: dict[str, Any], idempotency_token: str) -> str:
+    return _hash_payload({"action": action, "scope": scope, "idempotency_token": idempotency_token})
 
 
 def _decimal(value: Any) -> Decimal:
@@ -135,7 +167,7 @@ def _safe_request_summary(*, request_payload: dict[str, Any], provider_response:
         "order_configuration": request_payload.get("order_configuration"),
     }
     if provider_response is not None:
-        summary["provider_preview"] = provider_response
+        summary["provider_preview"] = _redact_sensitive(provider_response)
     return summary
 
 
@@ -144,6 +176,38 @@ def _age_seconds(earlier: datetime | None, later: datetime | None = None) -> int
         return None
     reference = later or _utcnow()
     return int((reference - earlier).total_seconds())
+
+
+async def _record_audit(
+    *,
+    db: AsyncSession,
+    action: str,
+    actor: str,
+    entity_id: uuid.UUID,
+    before_state: dict[str, Any] | None,
+    after_state: dict[str, Any] | None,
+) -> None:
+    db.add(
+        AuditLog(
+            actor=actor,
+            action=action,
+            entity_type="live_crypto_order",
+            entity_id=entity_id,
+            before_state=before_state,
+            after_state=after_state,
+        )
+    )
+
+
+async def _ensure_not_replayed(*, db: AsyncSession, replay_key: str) -> None:
+    existing = await db.scalar(
+        select(AuditLog.id)
+        .where(AuditLog.entity_type == "live_crypto_order")
+        .where(AuditLog.after_state["replay_key"].astext == replay_key)
+        .limit(1)
+    )
+    if existing is not None:
+        raise PermissionError("idempotency token replay detected")
 
 
 class LiveCryptoOrderService:
@@ -504,6 +568,8 @@ class LiveCryptoOrderService:
         settings = get_settings()
         if not settings.live_crypto_dry_run_enabled:
             raise PermissionError("live crypto dry run is disabled")
+        if not (request.idempotency_token or "").strip():
+            raise PermissionError("idempotency token required for dry run")
 
         profile = await db.scalar(
             select(LiveTradingProfile).where(LiveTradingProfile.id == request.live_trading_profile_id).limit(1)
@@ -578,6 +644,17 @@ class LiveCryptoOrderService:
                 idempotency_token=request.idempotency_token,
             ),
         )
+        replay_key = _replay_key(
+            action="dry_run",
+            scope={
+                "live_trading_profile_id": str(request.live_trading_profile_id),
+                "crypto_order_preview_id": str(request.crypto_order_preview_id),
+                "operator_identity": request.operator_identity,
+            },
+            idempotency_token=(request.idempotency_token or "").strip(),
+        )
+        await _ensure_not_replayed(db=db, replay_key=replay_key)
+
         live_crypto_order.status = "DRY_RUN_BLOCKED" if preflight_errors else "DRY_RUN_READY"
         live_crypto_order.safe_provider_response = {
             **live_crypto_order.safe_provider_response,
@@ -590,6 +667,19 @@ class LiveCryptoOrderService:
             "dry_run_errors": preflight_errors,
         }
         live_crypto_order.updated_at = _utcnow()
+        await _record_audit(
+            db=db,
+            action=live_crypto_order.status,
+            actor=request.operator_identity,
+            entity_id=live_crypto_order.live_crypto_order_id,
+            before_state={"status": "PENDING_CONFIRMATION"},
+            after_state={
+                "status": live_crypto_order.status,
+                "preview_id": str(preview.crypto_order_preview_id),
+                "provider_create_order_called": False,
+                "replay_key": replay_key,
+            },
+        )
         await db.flush()
 
         return LiveCryptoOrderDryRunResponse(
@@ -614,6 +704,19 @@ class LiveCryptoOrderService:
         settings = get_settings()
         if not settings.live_crypto_order_submission_enabled:
             raise PermissionError("live crypto order submission is disabled")
+        if not request.idempotency_token.strip():
+            raise PermissionError("idempotency token required for submit")
+
+        replay_key = _replay_key(
+            action="submit",
+            scope={
+                "live_crypto_order_id": str(request.live_crypto_order_id),
+                "confirmation_challenge_id": str(request.confirmation_challenge_id),
+                "operator_identity": request.operator_identity,
+            },
+            idempotency_token=request.idempotency_token.strip(),
+        )
+        await _ensure_not_replayed(db=db, replay_key=replay_key)
 
         live_order = await db.scalar(
             select(LiveCryptoOrder).where(
@@ -688,6 +791,19 @@ class LiveCryptoOrderService:
             live_order.failure_reason = json.dumps(provider_response)
 
         live_order.updated_at = _utcnow()
+        await _record_audit(
+            db=db,
+            action="SUBMIT_ATTEMPTED",
+            actor=request.operator_identity,
+            entity_id=live_order.live_crypto_order_id,
+            before_state={"status": live_order.status},
+            after_state={
+                "status": live_order.status,
+                "order_submitted": success,
+                "provider_create_order_responded": True,
+                "replay_key": replay_key,
+            },
+        )
         await db.flush()
 
         return LiveCryptoOrderSubmitResponse(

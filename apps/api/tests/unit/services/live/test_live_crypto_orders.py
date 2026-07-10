@@ -79,6 +79,14 @@ class _LiveOrderFakeDb:
         return None
 
 
+class _ReplayDetectedDb(_FakeDb):
+    async def scalar(self, statement):
+        sql = str(statement)
+        if "FROM audit_log" in sql:
+            return 1
+        return None
+
+
 @pytest.mark.asyncio
 async def test_get_readiness_returns_closed_when_profile_missing(monkeypatch: pytest.MonkeyPatch) -> None:
     fake_db = _FakeDb()
@@ -165,6 +173,46 @@ async def test_submit_rejects_when_feature_flag_disabled(monkeypatch: pytest.Mon
                 idempotency_token="token-2",
             ),
         )
+
+
+@pytest.mark.asyncio
+async def test_submit_firewall_does_not_call_create_order_when_feature_flag_disabled(monkeypatch: pytest.MonkeyPatch) -> None:
+    fake_db = _FakeDb()
+    create_order_calls = {"count": 0}
+
+    monkeypatch.setattr(
+        service,
+        "get_settings",
+        lambda: SimpleNamespace(
+            live_crypto_order_submission_enabled=False,
+            live_crypto_max_order_usd=service.Decimal("5"),
+            live_crypto_preview_max_age_seconds=30,
+            live_crypto_balance_max_age_seconds=30,
+            live_crypto_readiness_max_age_seconds=60,
+            live_crypto_price_max_age_seconds=30,
+            live_crypto_confirmation_challenge_minutes=1,
+        ),
+    )
+
+    async def _count_create_order(*_args, **_kwargs):
+        create_order_calls["count"] += 1
+        raise AssertionError("Coinbase create_order must not be called when submission flag is disabled")
+
+    monkeypatch.setattr(service.CoinbaseAdvancedClient, "create_order", _count_create_order)
+
+    with pytest.raises(PermissionError, match="disabled"):
+        await service.service.submit(
+            db=fake_db,
+            request=service.LiveCryptoOrderSubmitRequest(
+                live_crypto_order_id=uuid.uuid4(),
+                confirmation_challenge_id=uuid.uuid4(),
+                confirmation_phrase="BUY BTC",
+                operator_identity="operator:human",
+                idempotency_token="token-firewall",
+            ),
+        )
+
+    assert create_order_calls["count"] == 0
 
 
 @pytest.mark.asyncio
@@ -283,6 +331,37 @@ async def test_dry_run_never_calls_coinbase_create_order(monkeypatch: pytest.Mon
         "Dry run completed. No Coinbase order was submitted.",
         "Dry run blocked. No Coinbase order was submitted.",
     }
+
+
+@pytest.mark.asyncio
+async def test_dry_run_requires_idempotency_token(monkeypatch: pytest.MonkeyPatch) -> None:
+    fake_db = _FakeDb()
+
+    monkeypatch.setattr(
+        service,
+        "get_settings",
+        lambda: SimpleNamespace(
+            live_crypto_order_submission_enabled=False,
+            live_crypto_dry_run_enabled=True,
+            live_crypto_max_order_usd=service.Decimal("5"),
+            live_crypto_preview_max_age_seconds=30,
+            live_crypto_balance_max_age_seconds=30,
+            live_crypto_readiness_max_age_seconds=60,
+            live_crypto_price_max_age_seconds=30,
+            live_crypto_confirmation_challenge_minutes=1,
+        ),
+    )
+
+    with pytest.raises(PermissionError, match="idempotency token required"):
+        await service.service.dry_run(
+            db=fake_db,
+            request=service.LiveCryptoOrderDryRunRequest(
+                live_trading_profile_id=uuid.uuid4(),
+                crypto_order_preview_id=uuid.uuid4(),
+                operator_identity="operator:human",
+                idempotency_token="   ",
+            ),
+        )
 
 
 @pytest.mark.asyncio
@@ -495,6 +574,38 @@ async def test_submit_rejects_unknown_state_without_resubmission(monkeypatch: py
 
 
 @pytest.mark.asyncio
+async def test_submit_rejects_replayed_idempotency_token(monkeypatch: pytest.MonkeyPatch) -> None:
+    db = _ReplayDetectedDb()
+
+    monkeypatch.setattr(
+        service,
+        "get_settings",
+        lambda: SimpleNamespace(
+            live_crypto_order_submission_enabled=True,
+            live_crypto_dry_run_enabled=True,
+            live_crypto_max_order_usd=service.Decimal("5"),
+            live_crypto_preview_max_age_seconds=30,
+            live_crypto_balance_max_age_seconds=30,
+            live_crypto_readiness_max_age_seconds=60,
+            live_crypto_price_max_age_seconds=30,
+            live_crypto_confirmation_challenge_minutes=1,
+        ),
+    )
+
+    with pytest.raises(PermissionError, match="replay"):
+        await service.service.submit(
+            db=db,
+            request=service.LiveCryptoOrderSubmitRequest(
+                live_crypto_order_id=uuid.uuid4(),
+                confirmation_challenge_id=uuid.uuid4(),
+                confirmation_phrase="BUY BTC",
+                operator_identity="operator:human",
+                idempotency_token="submit-replay-token",
+            ),
+        )
+
+
+@pytest.mark.asyncio
 async def test_prepare_confirmation_reuses_existing_live_order_for_repeated_request(monkeypatch: pytest.MonkeyPatch) -> None:
     now = datetime(2026, 7, 9, 12, 0, tzinfo=timezone.utc)
     profile = SimpleNamespace(id=uuid.uuid4())
@@ -605,3 +716,36 @@ def test_safe_request_summary_redacts_secret_fields() -> None:
         "order_configuration": {"market_market_ioc": {"quote_size": "5.00"}},
         "provider_preview": {"ok": True},
     }
+
+
+def test_safe_request_summary_redacts_nested_provider_secrets() -> None:
+    summary = service._safe_request_summary(
+        request_payload={
+            "product_id": "BTC-USD",
+            "side": "BUY",
+            "order_configuration": {"market_market_ioc": {"quote_size": "5.00"}},
+        },
+        provider_response={
+            "ok": True,
+            "api_key": "SENTINEL_API_KEY",
+            "token": "SENTINEL_TOKEN",
+            "nested": {
+                "authorization": "Bearer SENTINEL_AUTH",
+                "passphrase": "SENTINEL_PASSPHRASE",
+                "safe": "value",
+            },
+            "list": [
+                {"jwt": "SENTINEL_JWT"},
+                {"signature": "SENTINEL_SIGNATURE"},
+            ],
+        },
+    )
+
+    provider_preview = summary["provider_preview"]
+    assert provider_preview["api_key"] == "[REDACTED]"
+    assert provider_preview["token"] == "[REDACTED]"
+    assert provider_preview["nested"]["authorization"] == "[REDACTED]"
+    assert provider_preview["nested"]["passphrase"] == "[REDACTED]"
+    assert provider_preview["nested"]["safe"] == "value"
+    assert provider_preview["list"][0]["jwt"] == "[REDACTED]"
+    assert provider_preview["list"][1]["signature"] == "[REDACTED]"

@@ -11,6 +11,8 @@ from app.schemas.mission_control import (
     MissionControlIntelligenceHistoryPointResponse,
     MissionControlIntelligenceMetricResponse,
     MissionControlIntelligenceResponse,
+    MissionControlSnapshotHistoryPointResponse,
+    MissionControlSnapshotHistoryResponse,
     MissionControlIntelligenceTimelineEventResponse,
     MissionControlIntelligenceTrendResponse,
 )
@@ -169,3 +171,70 @@ def test_mission_control_intelligence_route_returns_shape(monkeypatch) -> None:
     assert payload["operations"]["overall_health"] == "green"
     assert payload["validation_runs"]
     assert payload["timeline_events"]
+
+
+def test_mission_control_intelligence_history_route_returns_annotations(monkeypatch) -> None:
+    app = create_app()
+
+    async def _override_db():
+        yield _DummySession()
+
+    async def _history_stub(*_args, **_kwargs):
+        return MissionControlSnapshotHistoryResponse(
+            range="24h",
+            dimension=None,
+            generated_at=datetime(2026, 7, 9, 10, 0, tzinfo=timezone.utc),
+            points=[
+                MissionControlSnapshotHistoryPointResponse(
+                    snapshot_id="snapshot-1",
+                    captured_at=datetime(2026, 7, 9, 10, 0, tzinfo=timezone.utc),
+                    bucket_start=datetime(2026, 7, 9, 10, 0, tzinfo=timezone.utc),
+                    bucket_end=datetime(2026, 7, 9, 10, 15, tzinfo=timezone.utc),
+                    overall_score=82,
+                    confidence="High",
+                    data_completeness=100,
+                    market_awareness_score=80,
+                    decision_quality_score=82,
+                    execution_reliability_score=84,
+                    risk_discipline_score=77,
+                    research_progress_score=79,
+                    adaptation_rate_score=75,
+                    operational_health_score=93,
+                    capital_efficiency_score=81,
+                    profit_performance_score=83,
+                    paper_net_profit="523.55",
+                    live_net_profit="0.00",
+                    combined_net_profit="523.55",
+                    paper_equity="104523.55",
+                    live_equity="0.00",
+                    combined_equity="104523.55",
+                    realized_pnl="523.55",
+                    unrealized_pnl="120.00",
+                    fees="12.50",
+                    drawdown_percent="0.09",
+                    source_counts={"paper_trades": 8},
+                    annotations=[
+                        {
+                            "event_type": "risk_guardrail_triggered",
+                            "title": "Guardrail Triggered",
+                            "required_action": "operator_review",
+                        }
+                    ],
+                    schema_version="v1",
+                )
+            ],
+        )
+
+    app.dependency_overrides.clear()
+    from app.db.session import get_db
+
+    app.dependency_overrides[get_db] = _override_db
+    monkeypatch.setattr("app.api.routes.mission_control.build_snapshot_history", _history_stub)
+
+    with TestClient(app) as client:
+        response = client.get("/mission-control/intelligence/history?range=24h")
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["points"][0]["annotations"][0]["title"] == "Guardrail Triggered"
+    assert payload["points"][0]["annotations"][0]["required_action"] == "operator_review"

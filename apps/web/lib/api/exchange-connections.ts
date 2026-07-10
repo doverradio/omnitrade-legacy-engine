@@ -1,16 +1,19 @@
 import { ApiRequestError } from "@/lib/api/arena";
+import { getOperatorAuthHeaders } from "@/lib/api/operator-auth";
 
 export type ExchangeProvider = "coinbase_advanced";
 export type ExchangeEnvironment = "sandbox" | "production";
 export type ExchangeConnectionStatus = "connected" | "disconnected" | "error";
 export type ExchangeReadinessVerdict
-  = "READY_FOR_PREVIEW"
-  | "READ_ONLY_READY"
-  | "MISCONFIGURED"
-  | "UNREACHABLE"
-  | "PERMISSION_INSUFFICIENT"
-  | "CLOCK_SKEW"
+  = "NOT_CONFIGURED"
   | "AUTHENTICATION_FAILED"
+  | "PERMISSION_BLOCKED"
+  | "ACCOUNT_RESTRICTED"
+  | "BALANCE_UNAVAILABLE"
+  | "PRODUCT_UNAVAILABLE"
+  | "READY_FOR_PREVIEW"
+  | "READY_FOR_DRY_RUN"
+  | "READY_FOR_OPERATOR_REVIEW"
   | "UNKNOWN";
 export type ExchangeReadinessCheckStatus = "pass" | "warn" | "fail";
 
@@ -118,6 +121,7 @@ async function requestJson<T>(path: string, init?: RequestInit): Promise<T> {
     cache: "no-store",
     headers: {
       "Content-Type": "application/json",
+      ...getOperatorAuthHeaders(),
       ...(init?.headers ?? {}),
     },
     ...init,

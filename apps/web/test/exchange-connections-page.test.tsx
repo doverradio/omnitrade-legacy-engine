@@ -40,7 +40,7 @@ function connectedPayload() {
         last_heartbeat_at: "2026-07-09T10:05:00Z",
         last_api_error: null,
         readiness: {
-          verdict: "READ_ONLY_READY",
+          verdict: "READY_FOR_PREVIEW",
           checked_at: "2026-07-09T10:05:00Z",
           checks: [
             {

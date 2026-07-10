@@ -45,6 +45,13 @@ class ExchangePermissionSnapshot:
 
 
 @dataclass(frozen=True, slots=True)
+class ExchangeProductSnapshot:
+    product_id: str
+    available: bool
+    trading_enabled: bool
+
+
+@dataclass(frozen=True, slots=True)
 class ExchangePreviewResult:
     preview_id: str | None
     success: bool
@@ -74,6 +81,9 @@ class ExchangeProviderClient(Protocol):
         ...
 
     async def fetch_permissions(self, *, credentials: dict[str, str], environment: str) -> ExchangePermissionSnapshot:
+        ...
+
+    async def fetch_product(self, *, credentials: dict[str, str], environment: str, product_id: str) -> ExchangeProductSnapshot:
         ...
 
     async def preview_market_order(

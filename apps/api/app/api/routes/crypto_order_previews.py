@@ -5,6 +5,7 @@ import uuid
 from fastapi import APIRouter, Depends, Query
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.core.security import get_authorized_operator
 from app.db.session import get_db
 from app.schemas.crypto_order_previews import (
     CryptoOrderPreviewCancelRequest,
@@ -42,9 +43,10 @@ async def preview_readiness() -> CryptoOrderPreviewReadinessResponse:
 @router.post("", response_model=CryptoOrderPreviewDetailResponse)
 async def create_preview(
     payload: CryptoOrderPreviewCreateRequest,
+    current_user: dict[str, str] = Depends(get_authorized_operator),
     db: AsyncSession = Depends(get_db),
 ) -> CryptoOrderPreviewDetailResponse:
-    return await create_crypto_order_preview(db=db, request=payload)
+    return await create_crypto_order_preview(db=db, request=payload, actor=current_user["id"])
 
 
 @router.get("/{preview_id}", response_model=CryptoOrderPreviewDetailResponse)
@@ -59,15 +61,17 @@ async def get_preview(
 async def refresh_preview(
     preview_id: uuid.UUID,
     payload: CryptoOrderPreviewRefreshRequest | None = None,
+    current_user: dict[str, str] = Depends(get_authorized_operator),
     db: AsyncSession = Depends(get_db),
 ) -> CryptoOrderPreviewDetailResponse:
-    return await refresh_crypto_order_preview(db=db, preview_id=preview_id, payload=payload)
+    return await refresh_crypto_order_preview(db=db, preview_id=preview_id, payload=payload, actor=current_user["id"])
 
 
 @router.post("/{preview_id}/cancel", response_model=CryptoOrderPreviewDetailResponse)
 async def cancel_preview(
     preview_id: uuid.UUID,
     payload: CryptoOrderPreviewCancelRequest,
+    current_user: dict[str, str] = Depends(get_authorized_operator),
     db: AsyncSession = Depends(get_db),
 ) -> CryptoOrderPreviewDetailResponse:
-    return await cancel_crypto_order_preview(db=db, preview_id=preview_id, payload=payload)
+    return await cancel_crypto_order_preview(db=db, preview_id=preview_id, payload=payload, actor=current_user["id"])

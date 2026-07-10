@@ -290,7 +290,14 @@ function installFetchMock(scenario: "healthy" | "empty" | "degraded" = "healthy"
             fees: "12.50",
             drawdown_percent: "0.09",
             source_counts: { paper_trades: 8, decision_records: 82 },
-            annotations: [],
+            annotations: [
+              {
+                event_type: "risk_guardrail_triggered",
+                title: "Guardrail Triggered",
+                required_action: "operator_review",
+                metadata: { severity: "high" },
+              },
+            ],
             schema_version: "v1",
           },
         ],
@@ -489,5 +496,18 @@ describe("MissionControlIntelligenceCenter", () => {
       expect(fetchMock.mock.calls.length).toBeGreaterThan(0);
     });
     expect(screen.queryByRole("dialog", { name: "Timeline event detail" })).not.toBeInTheDocument();
+  });
+
+  it("renders persisted snapshot annotations in the event detail drawer", async () => {
+    installFetchMock("healthy");
+
+    render(<MissionControlIntelligenceCenter />);
+
+    expect(await screen.findByRole("heading", { name: "Mission Control" })).toBeInTheDocument();
+    const snapshotButtons = await screen.findAllByTitle(/Snapshot .*Score/i);
+    fireEvent.click(snapshotButtons[snapshotButtons.length - 1]);
+
+    expect(await screen.findByRole("dialog", { name: "Timeline event detail" })).toBeInTheDocument();
+    expect(screen.getByText("Guardrail Triggered")).toBeInTheDocument();
   });
 });

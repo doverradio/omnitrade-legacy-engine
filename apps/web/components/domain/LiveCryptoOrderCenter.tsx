@@ -9,13 +9,11 @@ import {
   dryRunLiveCryptoOrderConfirmation,
   getLiveCryptoOrderReadiness,
   listLiveCryptoOrders,
-  prepareLiveCryptoOrderConfirmation,
   reconcileLiveCryptoOrder,
-  submitLiveCryptoOrder,
   type LiveCryptoOrder,
   type LiveCryptoOrderDryRunResponse,
-  type LiveCryptoOrderPrepareResponse,
   type LiveCryptoOrderReadiness,
+  type LiveCryptoOrderReadinessCheck,
   type LiveCryptoOrderStatus,
 } from "@/lib/api/live-crypto-orders";
 
@@ -79,14 +77,12 @@ export default function LiveCryptoOrderCenter() {
   const [readiness, setReadiness] = useState<LiveCryptoOrderReadiness | null>(null);
   const [orders, setOrders] = useState<LiveCryptoOrder[]>([]);
   const [selectedOrder, setSelectedOrder] = useState<LiveCryptoOrder | null>(null);
-  const [preparedConfirmation, setPreparedConfirmation] = useState<LiveCryptoOrderPrepareResponse | null>(null);
   const [dryRunResult, setDryRunResult] = useState<LiveCryptoOrderDryRunResponse | null>(null);
+  const [selectedCheck, setSelectedCheck] = useState<LiveCryptoOrderReadinessCheck | null>(null);
   const [statusMessage, setStatusMessage] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [loading, setLoading] = useState(false);
-  const [preparing, setPreparing] = useState(false);
   const [dryRunning, setDryRunning] = useState(false);
-  const [submitting, setSubmitting] = useState(false);
   const [reconciling, setReconciling] = useState(false);
   const [cancelling, setCancelling] = useState(false);
 
@@ -95,8 +91,51 @@ export default function LiveCryptoOrderCenter() {
     [],
   );
 
-  const canSubmit = readiness?.feature_flag_enabled === true && readiness?.live_mode_enabled === true && readiness?.live_profile_ready === true;
   const canDryRun = readiness?.dry_run_enabled === true && profileId.trim().length > 0 && previewId.trim().length > 0;
+
+  const wizardResult = useMemo(() => {
+    const reasons: string[] = [];
+    const checkByCode = new Map((readiness?.checks ?? []).map((check) => [check.code, check]));
+    const requirePass = (code: string, reason: string) => {
+      if (checkByCode.get(code)?.status !== "pass") {
+        reasons.push(reason);
+      }
+    };
+
+    requirePass("production_connection_configured", "Coinbase production connection is missing.");
+    requirePass("trade_permission_present", "Trade permission is missing.");
+    requirePass("balance_available", "USD balance is unavailable for the workflow.");
+    requirePass("risk_engine_healthy", "Risk engine evidence is missing.");
+    requirePass("submission_feature_flag_disabled", "Live submission flag is not disabled.");
+    if ((readiness?.checks ?? []).some((check) => check.code === "withdrawal_permission_not_required" && check.status !== "pass")) {
+      reasons.push("Dangerous withdrawal/transfer permission detected.");
+    }
+    if (!previewId.trim()) {
+      reasons.push("Preview ID is not set.");
+    }
+    if (confirmationPhrase.trim().toUpperCase() !== "BUY BTC") {
+      reasons.push("Typed confirmation must be exactly BUY BTC.");
+    }
+    if (!dryRunResult) {
+      reasons.push("Dry run has not been executed yet.");
+    } else if (dryRunResult.dry_run_status !== "DRY_RUN_READY") {
+      reasons.push("Dry run did not complete in DRY_RUN_READY state.");
+    }
+
+    let status = "BLOCKED";
+    if (reasons.length === 0) {
+      status = "READY FOR OPERATOR REVIEW";
+    } else if (readiness?.overall_verdict === "READY_FOR_DRY_RUN") {
+      status = "READY FOR DRY RUN";
+    } else if (readiness?.overall_verdict === "READY_FOR_PREVIEW") {
+      status = "READY FOR PREVIEW";
+    }
+
+    return {
+      status,
+      reasons,
+    };
+  }, [confirmationPhrase, dryRunResult, previewId, readiness?.checks, readiness?.overall_verdict]);
 
   async function loadWorkspace() {
     if (!profileId.trim()) {
@@ -151,69 +190,6 @@ export default function LiveCryptoOrderCenter() {
     }
   }
 
-  async function prepareConfirmation() {
-    if (!canSubmit) {
-      setError("Live submission is disabled until the server gate is enabled and the profile is live-ready.");
-      return;
-    }
-    if (!profileId.trim() || !previewId.trim()) {
-      setError("Enter both the live trading profile ID and the preview ID.");
-      return;
-    }
-    setPreparing(true);
-    setError(null);
-    setStatusMessage(null);
-    try {
-      const response = await prepareLiveCryptoOrderConfirmation({
-        live_trading_profile_id: profileId.trim(),
-        crypto_order_preview_id: previewId.trim(),
-        operator_identity: operatorIdentity.trim(),
-        idempotency_token: idempotencyToken.trim() || crypto.randomUUID(),
-      });
-      setPreparedConfirmation(response);
-      setSelectedOrder(response.live_crypto_order);
-      setOrders((current) => {
-        const existing = current.filter((item) => item.live_crypto_order_id !== response.live_crypto_order.live_crypto_order_id);
-        return [response.live_crypto_order, ...existing];
-      });
-      setStatusMessage(`Confirmation prepared. Challenge ${response.confirmation_challenge_id}.`);
-    } catch (requestError) {
-      setError(errorMessage(requestError, "Unable to prepare live order confirmation."));
-    } finally {
-      setPreparing(false);
-    }
-  }
-
-  async function submitOrder() {
-    if (!selectedOrder) {
-      setError("Prepare a live order before submitting.");
-      return;
-    }
-    if (!canSubmit) {
-      setError("Live submission is disabled by server gate.");
-      return;
-    }
-    setSubmitting(true);
-    setError(null);
-    setStatusMessage(null);
-    try {
-      const response = await submitLiveCryptoOrder({
-        live_crypto_order_id: selectedOrder.live_crypto_order_id,
-        confirmation_challenge_id: preparedConfirmation?.confirmation_challenge_id ?? selectedOrder.audit_correlation_id,
-        confirmation_phrase: confirmationPhrase.trim(),
-        operator_identity: operatorIdentity.trim(),
-        idempotency_token: idempotencyToken.trim() || crypto.randomUUID(),
-      });
-      setSelectedOrder(response.live_crypto_order);
-      setOrders((current) => current.map((item) => (item.live_crypto_order_id === response.live_crypto_order.live_crypto_order_id ? response.live_crypto_order : item)));
-      setStatusMessage(response.order_submitted ? "Live order submitted." : "Live order submission failed and requires reconciliation.");
-    } catch (requestError) {
-      setError(errorMessage(requestError, "Unable to submit live order."));
-    } finally {
-      setSubmitting(false);
-    }
-  }
-
   async function reconcileOrder() {
     if (!selectedOrder) {
       return;
@@ -265,7 +241,7 @@ export default function LiveCryptoOrderCenter() {
             <p className="text-xs uppercase tracking-[0.3em] text-rose-200/80">LIVE MONEY</p>
             <h1 className="mt-2 text-3xl font-semibold text-foreground">Live Crypto Orders</h1>
             <p className="mt-2 max-w-3xl text-sm text-foreground/75">
-              Prepare a human-confirmed Coinbase Advanced BTC-USD market buy, then explicitly submit it. The backend blocks this flow until the live flag is enabled.
+              Prepare and validate the first Coinbase Advanced BTC-USD workflow in dry-run mode only. Live submission remains fail-closed.
             </p>
           </div>
           <Link href="/live-trading" className="rounded-full border border-border bg-background/50 px-4 py-2 text-sm font-semibold text-foreground transition hover:bg-background/80">
@@ -350,27 +326,11 @@ export default function LiveCryptoOrderCenter() {
             </button>
             <button
               type="button"
-              className="rounded-full border border-amber-400/40 bg-amber-500/15 px-4 py-2 text-sm font-semibold text-amber-50 disabled:cursor-not-allowed disabled:opacity-40"
-              onClick={prepareConfirmation}
-              disabled={preparing || !canSubmit}
-            >
-              {preparing ? "Preparing..." : "Prepare Confirmation"}
-            </button>
-            <button
-              type="button"
               className="rounded-full border border-cyan-400/40 bg-cyan-500/15 px-4 py-2 text-sm font-semibold text-cyan-50 disabled:cursor-not-allowed disabled:opacity-40"
               onClick={runDryRun}
               disabled={dryRunning || !canDryRun}
             >
               {dryRunning ? "Running Dry Run..." : "Run Dry Run"}
-            </button>
-            <button
-              type="button"
-              className="rounded-full border border-emerald-400/40 bg-emerald-500/15 px-4 py-2 text-sm font-semibold text-emerald-50 disabled:cursor-not-allowed disabled:opacity-40"
-              onClick={submitOrder}
-              disabled={submitting || !canSubmit || !selectedOrder || !preparedConfirmation}
-            >
-              {submitting ? "Submitting..." : "Submit Live Order"}
             </button>
             <button
               type="button"
@@ -408,14 +368,18 @@ export default function LiveCryptoOrderCenter() {
             <div className="mt-4 space-y-2 rounded-2xl border border-border bg-background/40 p-3 text-sm text-foreground/80">
               <p className="text-xs uppercase tracking-[0.3em] text-foreground/60">First Live Trade Readiness</p>
               {readiness.checks.map((check) => (
-                <div key={check.code} className="rounded-xl border border-border/80 bg-slate-950/40 p-3">
+                <button
+                  key={check.code}
+                  type="button"
+                  className="block w-full rounded-xl border border-border/80 bg-slate-950/40 p-3 text-left"
+                  onClick={() => setSelectedCheck(check)}
+                >
                   <div className="flex flex-wrap items-center justify-between gap-2">
                     <p className="font-semibold text-foreground">{check.label}</p>
                     <span className="text-xs uppercase tracking-[0.25em] text-foreground/60">{check.status}</span>
                   </div>
                   <p className="mt-1 text-xs text-foreground/70">{check.explanation}</p>
-                  <p className="mt-1 text-xs text-foreground/60">{check.remediation}</p>
-                </div>
+                </button>
               ))}
             </div>
           ) : null}
@@ -429,13 +393,40 @@ export default function LiveCryptoOrderCenter() {
               <p className="mt-1">Coinbase Create Order called: {dryRunResult.provider_create_order_called ? "Yes" : "No"}</p>
             </div>
           ) : null}
-          {preparedConfirmation ? (
+          {selectedCheck ? (
             <div className="mt-3 rounded-2xl border border-cyan-500/40 bg-cyan-500/10 p-3 text-sm text-cyan-50">
-              <p>Confirmation required: {preparedConfirmation.confirmation_phrase_required}</p>
-              <p className="mt-1">Expires: {formatTimestamp(preparedConfirmation.confirmation_expires_at)}</p>
-              <p className="mt-1">Warning: {preparedConfirmation.live_money_warning}</p>
+              <p className="font-semibold">{selectedCheck.label}</p>
+              <p className="mt-1">{selectedCheck.explanation}</p>
+              <p className="mt-1 text-cyan-100/80">Remediation: {selectedCheck.remediation}</p>
             </div>
           ) : null}
+
+          <div className="mt-3 rounded-2xl border border-border bg-background/45 p-3 text-sm text-foreground/80">
+            <p className="text-xs uppercase tracking-[0.25em] text-foreground/60">First-Trade Wizard</p>
+            <ol className="mt-2 space-y-1 list-decimal list-inside">
+              <li>Connect Coinbase</li>
+              <li>Verify credentials</li>
+              <li>Verify permissions</li>
+              <li>Verify balances</li>
+              <li>Verify BTC-USD availability</li>
+              <li>Generate $5 preview</li>
+              <li>Review execution risk</li>
+              <li>Type BUY BTC</li>
+              <li>Run Dry Run</li>
+              <li>Review evidence</li>
+              <li>Keep live submission disabled</li>
+            </ol>
+            <p className="mt-3 font-semibold">{wizardResult.status}</p>
+            {wizardResult.reasons.length > 0 ? (
+              <ul className="mt-2 space-y-1 text-xs text-rose-100/90">
+                {wizardResult.reasons.map((reason) => (
+                  <li key={reason}>- {reason}</li>
+                ))}
+              </ul>
+            ) : (
+              <p className="mt-2 text-xs text-emerald-100/90">Dry run completed. No Coinbase order was submitted.</p>
+            )}
+          </div>
         </article>
       </section>
 

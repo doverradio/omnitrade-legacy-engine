@@ -5,7 +5,7 @@ from decimal import Decimal
 from typing import Literal, TypeAlias
 import uuid
 
-from pydantic import BaseModel, field_serializer
+from pydantic import BaseModel, Field, field_serializer
 
 
 ValidationRunEventCategory: TypeAlias = Literal[
@@ -31,6 +31,7 @@ class ValidationRunCreateRequest(BaseModel):
     enabled_strategies: list[str]
     enabled_research_agents: list[str]
     enabled_research_features: list[str]
+    paper_account_ids: list[uuid.UUID] = Field(default_factory=list)
 
 
 class ValidationRunScorecardResponse(BaseModel):

@@ -5,8 +5,10 @@ from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 from statistics import mean
 
+from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.models.audit_log import AuditLog
 from app.schemas.mission_control import (
     MissionControlIntelligenceHistoryPointResponse,
     MissionControlIntelligenceMetricResponse,
@@ -90,6 +92,8 @@ async def build_mission_control_intelligence(*, db: AsyncSession, range_value: s
         run_events=run_events,
         current_score=current_score,
     )
+    timeline_events.extend(await _load_live_operation_annotations(db=db, generated_at=generated_at, current_score=current_score, operations=operations))
+    timeline_events = sorted(timeline_events, key=lambda item: item.timestamp)
     metric_breakdown = _build_metric_breakdown(
         component_scores=component_scores,
         history=history,
@@ -387,6 +391,69 @@ def _build_timeline_events(
         )
 
     return sorted(timeline, key=lambda item: item.timestamp)
+
+
+async def _load_live_operation_annotations(
+    *,
+    db: AsyncSession,
+    generated_at: datetime,
+    current_score: int,
+    operations: OperationalStatusResponse,
+) -> list[MissionControlIntelligenceTimelineEventResponse]:
+    if not hasattr(db, "execute"):
+        return []
+
+    tracked_actions = {
+        "CONNECTION_VERIFIED",
+        "PREVIEW_GENERATED",
+        "DRY_RUN_READY",
+        "DRY_RUN_BLOCKED",
+        "CREDENTIAL_ROTATED",
+        "CONNECTION_DISCONNECTED",
+    }
+    rows = (
+        await db.execute(
+            select(AuditLog)
+            .where(AuditLog.action.in_(tracked_actions))
+            .order_by(AuditLog.created_at.desc())
+            .limit(20)
+        )
+    ).scalars().all()
+
+    events: list[MissionControlIntelligenceTimelineEventResponse] = []
+    for index, row in enumerate(rows):
+        action = str(row.action)
+        severity = "green"
+        if action in {"DRY_RUN_BLOCKED", "CONNECTION_DISCONNECTED"}:
+            severity = "yellow"
+        if action == "CONNECTION_DISCONNECTED":
+            severity = "red"
+        events.append(
+            MissionControlIntelligenceTimelineEventResponse(
+                event_id=f"live-ops-{row.id}",
+                timestamp=row.created_at,
+                title=action,
+                description=f"Live operations annotation recorded: {action}",
+                related_validation_run=None,
+                health_at_that_moment=_severity_to_health(severity, current_score),
+                paper_equity=operations.monitoring.paper_equity,
+                paper_pnl=_derive_paper_pnl(operations.monitoring.paper_equity),
+                signals=operations.monitoring.signals_generated,
+                trades=operations.monitoring.paper_trades_executed,
+                decision_count=operations.monitoring.decision_records_created,
+                severity=severity,
+                category="live_operations",
+                event_type=action,
+                metadata={
+                    "entity_type": row.entity_type,
+                    "entity_id": None if row.entity_id is None else str(row.entity_id),
+                    "submission_implied": False,
+                    "order_submitted": False,
+                    "index": index,
+                },
+            )
+        )
+    return events
 
 
 def _build_metric_breakdown(

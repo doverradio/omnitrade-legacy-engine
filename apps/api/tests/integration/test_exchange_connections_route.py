@@ -5,6 +5,7 @@ from uuid import UUID
 
 from fastapi.testclient import TestClient
 
+from app.db.session import get_db
 from app.main import create_app
 from app.schemas.exchange_connections import (
     ExchangeBalanceResponse,
@@ -42,7 +43,7 @@ def _connection_response() -> ExchangeConnectionResponse:
         last_heartbeat_at=datetime(2026, 7, 9, 10, 0, tzinfo=timezone.utc),
         last_api_error=None,
         readiness=ExchangeReadinessReportResponse(
-            verdict="READ_ONLY_READY",
+            verdict="READY_FOR_PREVIEW",
             checked_at=datetime(2026, 7, 9, 10, 0, tzinfo=timezone.utc),
             checks=[
                 ExchangeReadinessCheckResponse(
@@ -76,3 +77,49 @@ def test_exchange_connections_route_shape(monkeypatch) -> None:
     assert payload["items"][0]["provider"] == "coinbase_advanced"
     assert payload["items"][0]["credential_mask"]["private_key"] == "********"
     assert payload["items"][0]["balances"][0]["currency"] == "USD"
+
+
+def _create_client(*, raise_server_exceptions: bool = True) -> TestClient:
+    app = create_app()
+
+    async def override_get_db():
+        yield object()
+
+    app.dependency_overrides[get_db] = override_get_db
+    return TestClient(app, raise_server_exceptions=raise_server_exceptions)
+
+
+def test_exchange_connection_save_requires_operator_auth() -> None:
+    payload = {
+        "provider": "coinbase_advanced",
+        "connection_name": "Primary Coinbase",
+        "environment": "production",
+        "api_key_name": "organizations/abc/apiKeys/def",
+        "private_key": "-----BEGIN PRIVATE KEY-----\\nkey\\n-----END PRIVATE KEY-----",
+    }
+
+    with _create_client() as client:
+        response = client.post("/exchange-connections", json=payload)
+
+    assert response.status_code == 401
+    assert response.json()["error"]["code"] == "unauthorized"
+
+
+def test_exchange_connection_save_rejects_expired_operator_token() -> None:
+    payload = {
+        "provider": "coinbase_advanced",
+        "connection_name": "Primary Coinbase",
+        "environment": "production",
+        "api_key_name": "organizations/abc/apiKeys/def",
+        "private_key": "-----BEGIN PRIVATE KEY-----\\nkey\\n-----END PRIVATE KEY-----",
+    }
+
+    with _create_client() as client:
+        response = client.post(
+            "/exchange-connections",
+            json=payload,
+            headers={"Authorization": "Bearer expired:operator:human"},
+        )
+
+    assert response.status_code == 401
+    assert response.json()["error"]["code"] == "unauthorized"

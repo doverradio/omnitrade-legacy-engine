@@ -1,4 +1,5 @@
 import { ApiRequestError } from "@/lib/api/arena";
+import { getOperatorAuthHeaders } from "@/lib/api/operator-auth";
 
 export type CryptoOrderPreviewStatus =
   | "DRAFT"
@@ -121,6 +122,7 @@ async function requestJson<T>(path: string, init?: RequestInit): Promise<T> {
     cache: "no-store",
     headers: {
       "Content-Type": "application/json",
+      ...getOperatorAuthHeaders(),
       ...(init?.headers ?? {}),
     },
     ...init,

@@ -12,6 +12,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.core.errors import InvalidRequestError, NotFoundError
 from app.models.paper_account import PaperAccount
 from app.models.validation_run import ValidationRun
+from app.models.validation_run_paper_account import ValidationRunPaperAccount
 from app.models.validation_run_event import ValidationRunEvent
 from app.models.validation_run_metric import ValidationRunMetric
 from app.models.validation_run_scorecard import ValidationRunScorecard
@@ -220,6 +221,30 @@ async def create_validation_run(*, db: AsyncSession, request: ValidationRunCreat
     db.add(run)
     await db.flush()
 
+    if request.paper_account_ids:
+        requested_ids = sorted(set(request.paper_account_ids), key=str)
+        existing_ids = set(
+            (
+                await db.execute(
+                    select(PaperAccount.id).where(PaperAccount.id.in_(requested_ids))
+                )
+            ).scalars().all()
+        )
+        missing_ids = [str(item) for item in requested_ids if item not in existing_ids]
+        if missing_ids:
+            raise InvalidRequestError(
+                message="One or more paper_account_ids were not found",
+                details={"paper_account_ids": missing_ids},
+            )
+
+        for account_id in requested_ids:
+            db.add(
+                ValidationRunPaperAccount(
+                    validation_run_id=run.validation_run_id,
+                    paper_account_id=account_id,
+                )
+            )
+
     db.add(
         ValidationRunEvent(
             validation_run_id=run.validation_run_id,
@@ -232,6 +257,7 @@ async def create_validation_run(*, db: AsyncSession, request: ValidationRunCreat
                 "metadata": {
                     "status": "DRAFT",
                     "duration_hours": run.duration_hours,
+                    "paper_account_ids": [str(item) for item in request.paper_account_ids],
                 },
             },
         )

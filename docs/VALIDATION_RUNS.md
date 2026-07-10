@@ -23,6 +23,7 @@ Validation Runs persist through restart using:
 - `validation_run_events`
 - `validation_run_metrics`
 - `validation_run_scorecards`
+- `validation_run_paper_accounts`
 
 ### Validation Run Fields
 
@@ -38,8 +39,26 @@ Validation Runs persist through restart using:
 - `enabled_strategies`
 - `enabled_research_agents`
 - `enabled_research_features`
+- `paper_account_ids` (request-time binding scope)
 - `health_score`
 - `result_status`
+
+### Validation Run Account Scope Binding
+
+Validation Runs can be scoped to one or more paper accounts at creation time.
+
+Durable mapping table:
+
+- `validation_run_paper_accounts`
+  - `validation_run_id`
+  - `paper_account_id`
+  - `bound_at`
+
+Guardrails:
+
+- Every requested `paper_account_id` must exist or run creation fails closed.
+- Scope binding is read-only experiment scoping; it does not move capital.
+- Scope binding does not enable live trading.
 
 ### Status Values
 
@@ -67,6 +86,14 @@ Validation Runs persist through restart using:
 - `GET /validation-runs/{id}/metrics`
 
 All endpoints are paper/research-only.
+
+### Create Request Scope Field
+
+`POST /validation-runs` accepts optional scope binding:
+
+- `paper_account_ids: UUID[]` (defaults to empty list)
+
+When provided, these IDs are validated and persisted in `validation_run_paper_accounts`.
 
 ## Start Run Behavior
 

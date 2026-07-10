@@ -17,6 +17,7 @@ from app.services.exchange_connections.providers.base import (
     ExchangeAuthResult,
     ExchangeBalanceItem,
     ExchangeBalanceSnapshot,
+    ExchangeProductSnapshot,
     ExchangePreviewResult,
     ExchangePermissionSnapshot,
 )
@@ -297,6 +298,29 @@ class CoinbaseAdvancedClient:
         )
         permissions = parse_coinbase_permissions(payload)
         return ExchangePermissionSnapshot(permissions=permissions, verified=len(permissions) > 0)
+
+    async def fetch_product(self, *, credentials: dict[str, str], environment: str, product_id: str) -> ExchangeProductSnapshot:
+        payload = await self._request_json(
+            method="GET",
+            path=f"/api/v3/brokerage/products/{product_id}",
+            credentials=credentials,
+            environment=environment,
+            swallow_404=True,
+        )
+
+        available = False
+        trading_enabled = False
+        if isinstance(payload, dict):
+            if payload.get("product_id") == product_id:
+                available = True
+            if bool(payload.get("is_disabled")) is False and bool(payload.get("trading_disabled")) is False:
+                trading_enabled = True
+
+        return ExchangeProductSnapshot(
+            product_id=product_id,
+            available=available,
+            trading_enabled=trading_enabled,
+        )
 
     async def preview_market_order(
         self,

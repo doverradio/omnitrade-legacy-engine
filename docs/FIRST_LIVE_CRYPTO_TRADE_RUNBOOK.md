@@ -32,8 +32,20 @@ Any change to these values requires a fresh readiness review before another dry 
 
 ## Coinbase Permission Guidance
 
-- Trade permission is required for any future live submit path review.
-- Withdrawal permission is not required for first-trade readiness and should remain absent.
+- Minimum required scopes:
+	- read accounts
+	- read balances
+	- read products
+	- read orders
+	- preview orders
+	- create orders (future-governed path only)
+- Never require:
+	- withdrawals
+	- transfers
+	- wallet export
+	- address management
+- Trade permission is required for preview/dry-run readiness.
+- Withdrawal/transfer permission is treated as dangerous and must show a blocking warning.
 - Confirm the production connection is the one being evaluated; sandbox credentials are not evidence for live readiness.
 
 ## Verify The Feature Flag Stays Closed
@@ -51,6 +63,7 @@ Any change to these values requires a fresh readiness review before another dry 
 - Confirm the response shows `DRY_RUN_READY` or `DRY_RUN_BLOCKED` and `provider_create_order_called=false`.
 - Confirm the UI or API message says: `Dry run completed. No Coinbase order was submitted.` when the dry run is successful.
 - Confirm the safe request summary only includes non-secret request fields.
+- Dry-run completion does not authorize live trading.
 
 ## Evidence To Inspect
 

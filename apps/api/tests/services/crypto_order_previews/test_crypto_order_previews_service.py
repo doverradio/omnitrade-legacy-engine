@@ -182,7 +182,7 @@ async def test_preview_rejects_when_connection_not_ready(monkeypatch: pytest.Mon
         last_heartbeat_at=now,
         last_api_error=None,
         last_verified_at=now,
-        last_readiness_verdict="READ_ONLY_READY",
+        last_readiness_verdict="PERMISSION_BLOCKED",
         last_readiness_report=[],
         created_at=now,
         updated_at=now,
@@ -260,3 +260,125 @@ async def test_provider_preview_uses_only_preview_endpoint(monkeypatch: pytest.M
     assert "orders/preview" in captured["path"]
     assert result.preview_id == "preview-xyz"
     assert result.success is True
+
+
+@pytest.mark.asyncio
+async def test_preview_redacts_sensitive_exchange_response_summary(monkeypatch: pytest.MonkeyPatch) -> None:
+    now = datetime.now(timezone.utc)
+    db = _FakeDb()
+    connection = ExchangeConnection(
+        exchange_connection_id=uuid.uuid4(),
+        provider="coinbase_advanced",
+        connection_name="Primary Coinbase",
+        environment="production",
+        status="connected",
+        credentials_encrypted="encrypted",
+        api_key_masked="******1234",
+        api_secret_masked="********",
+        passphrase_configured=True,
+        credentials_valid=True,
+        api_permissions=["view"],
+        account_status="active",
+        balances=[],
+        total_equity_usd=None,
+        last_successful_sync_at=now,
+        last_heartbeat_at=now,
+        last_api_error=None,
+        last_verified_at=now,
+        last_readiness_verdict="READY_FOR_PREVIEW",
+        last_readiness_report=[],
+        created_at=now,
+        updated_at=now,
+    )
+    asset = Asset(
+        id=uuid.uuid4(),
+        symbol="BTC",
+        asset_class="crypto",
+        exchange="coinbase_advanced",
+        base_currency="USD",
+        supports_fractional=True,
+        min_order_notional=Decimal("1"),
+        qty_step_size=Decimal("0.00000001"),
+        is_active=True,
+        created_at=now,
+    )
+
+    class _Provider:
+        async def fetch_balances(self, *, credentials, environment):
+            _ = (credentials, environment)
+            return SimpleNamespace(
+                balances=[
+                    SimpleNamespace(currency="USD", available=Decimal("100.00"), reserved=Decimal("0"), total=Decimal("100.00")),
+                    SimpleNamespace(currency="BTC", available=Decimal("0.50"), reserved=Decimal("0"), total=Decimal("0.50")),
+                ],
+                total_equity_usd=Decimal("100.00"),
+            )
+
+        async def preview_market_order(self, *, credentials, environment, product_id, side, quote_size, base_size, client_order_id=None):
+            _ = (credentials, environment, product_id, side, quote_size, base_size, client_order_id)
+            return ExchangePreviewResult(
+                preview_id="preview-secret",
+                success=True,
+                failure_reason=None,
+                warning_messages=[],
+                estimated_average_price=Decimal("10000.00"),
+                estimated_total_value=Decimal("5.10"),
+                estimated_base_size=Decimal("0.000499"),
+                estimated_quote_size=Decimal("5.00"),
+                estimated_fee=Decimal("0.10"),
+                estimated_fee_currency="USD",
+                estimated_slippage=Decimal("0.01"),
+                estimated_commission_total=Decimal("0.10"),
+                best_bid=Decimal("9995.00"),
+                best_ask=Decimal("10005.00"),
+                exchange_response_summary={
+                    "preview_id": "preview-secret",
+                    "api_key": "SENTINEL_API_KEY",
+                    "token": "SENTINEL_TOKEN",
+                    "nested": {"authorization": "Bearer SENTINEL_AUTH", "safe": "ok"},
+                },
+            )
+
+    async def _load_exchange_connection(*_args, **_kwargs):
+        return connection
+
+    async def _load_asset_and_price(*_args, **_kwargs):
+        return asset, Decimal("10000.00"), now - timedelta(minutes=2)
+
+    async def _global_kill_switch(*_args, **_kwargs):
+        return False
+
+    async def _risk_rules(**_kwargs):
+        return SimpleNamespace(rules={"max_daily_loss_pct": Decimal("0.05"), "max_drawdown_pct": Decimal("0.10")})
+
+    def _evaluate_signal_risk(*_args, **_kwargs):
+        return SimpleNamespace(action=service.RiskDecisionAction.APPROVE, reason_code=None)
+
+    monkeypatch.setattr(service, "_load_exchange_connection", _load_exchange_connection)
+    monkeypatch.setattr(service, "_load_asset_and_price", _load_asset_and_price)
+    monkeypatch.setattr(service, "_get_global_kill_switch", _global_kill_switch)
+    monkeypatch.setattr(service, "get_risk_rules", _risk_rules)
+    monkeypatch.setattr(service, "evaluate_signal_risk", _evaluate_signal_risk)
+    monkeypatch.setattr(service, "get_decrypted_credentials_for_connection", lambda _connection: {"api_key": "key", "api_secret": "secret", "passphrase": "pass"})
+    monkeypatch.setattr(service, "get_exchange_provider", lambda _provider: _Provider())
+
+    response = await service.create_crypto_order_preview(
+        db=db,
+        request=service.CryptoOrderPreviewCreateRequest(
+            exchange_connection_id=connection.exchange_connection_id,
+            environment="production",
+            product_id="BTC-USD",
+            side="BUY",
+            order_type="MARKET",
+            quote_size=Decimal("5.00"),
+            requested_amount_currency="USD",
+            generated_by="operator",
+        ),
+    )
+
+    stored = next(item for item in db.added if isinstance(item, CryptoOrderPreview))
+    assert stored.exchange_response_summary["api_key"] == "[REDACTED]"
+    assert stored.exchange_response_summary["token"] == "[REDACTED]"
+    assert stored.exchange_response_summary["nested"]["authorization"] == "[REDACTED]"
+    assert stored.exchange_response_summary["nested"]["safe"] == "ok"
+    assert response.exchange_response_summary["api_key"] == "[REDACTED]"

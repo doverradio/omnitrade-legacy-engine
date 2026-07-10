@@ -15,6 +15,7 @@ from app.models.live_accounting_record import LiveAccountingRecord
 from app.models.paper_account import PaperAccount
 from app.models.signal import Signal
 from app.models.trade import Trade
+from app.models.validation_run_paper_account import ValidationRunPaperAccount
 from app.schemas.profit_intelligence import (
     ProfitAnnotationResponse,
     ProfitMetricResponse,
@@ -41,6 +42,8 @@ _BUCKET_MINUTES: dict[ProfitRange, int] = {
     "90d": 1440,
     "all": 1440,
 }
+
+_MAX_BUCKET_SOURCE_EVENT_IDS = 10
 
 
 @dataclass(slots=True)
@@ -133,6 +136,8 @@ async def build_profit_metrics(
         db=db,
         start_at=start_at,
         end_at=now,
+        capital_pool_id=capital_pool_id,
+        validation_run_id=validation_run_id,
         strategy_id=strategy_id,
         symbol=symbol,
     )
@@ -276,10 +281,21 @@ async def _build_paper_profit_state(
     db: AsyncSession,
     start_at: datetime | None,
     end_at: datetime,
+    capital_pool_id: str | None,
+    validation_run_id: uuid.UUID | None,
     strategy_id: uuid.UUID | None,
     symbol: str | None,
 ) -> _PaperModeState:
     accounts = (await db.execute(select(PaperAccount).order_by(PaperAccount.created_at.asc()))).scalars().all()
+    account_scope = await _resolve_paper_account_scope_async(
+        db=db,
+        accounts=accounts,
+        capital_pool_id=capital_pool_id,
+        validation_run_id=validation_run_id,
+    )
+    if account_scope is not None:
+        accounts = [item for item in accounts if item.id in account_scope]
+
     source_counts = {"paper_accounts": len(accounts), "paper_trades": 0, "signals": 0, "assets": 0}
     total_starting_equity = _zero()
     total_ending_equity = _zero()
@@ -319,11 +335,12 @@ async def _build_paper_profit_state(
         source_counts["signals"] += len({item.signal_id for item in filtered_rows if item.signal_id is not None})
         source_counts["assets"] += len({item.asset_id for item in filtered_rows})
 
-        prices_at_end = await _load_prices_as_of(db=db, asset_ids=[item.asset_id for item in rows], as_of=end_at)
-        prices_at_start = await _load_prices_as_of(db=db, asset_ids=[item.asset_id for item in rows], as_of=start_at or account.created_at)
+        scoped_rows = filtered_rows
+        prices_at_end = await _load_prices_as_of(db=db, asset_ids=[item.asset_id for item in scoped_rows], as_of=end_at)
+        prices_at_start = await _load_prices_as_of(db=db, asset_ids=[item.asset_id for item in scoped_rows], as_of=start_at or account.created_at)
 
-        start_trades = [item for item in rows if start_at is not None and item.executed_at < start_at]
-        end_trades = [item for item in rows if item.executed_at <= end_at]
+        start_trades = [item for item in scoped_rows if start_at is not None and item.executed_at < start_at]
+        end_trades = [item for item in scoped_rows if item.executed_at <= end_at]
 
         start_snapshot = _compute_snapshot_from_trades(
             starting_balance=_to_decimal(account.starting_balance),
@@ -358,7 +375,7 @@ async def _build_paper_profit_state(
         series = await _build_equity_series(
             db=db,
             starting_balance=_to_decimal(account.starting_balance),
-            trades=rows,
+            trades=scoped_rows,
             start_at=start_at or account.created_at,
             end_at=end_at,
         )
@@ -369,6 +386,7 @@ async def _build_paper_profit_state(
             else:
                 combined_series[point.timestamp] = ProfitSeriesPointResponse(
                     timestamp=point.timestamp,
+                    opening_context=existing.opening_context or point.opening_context,
                     paper_equity=(existing.paper_equity or _zero()) + (point.paper_equity or _zero()),
                     live_equity=None,
                     combined_equity=(existing.combined_equity or _zero()) + (point.paper_equity or _zero()),
@@ -378,7 +396,13 @@ async def _build_paper_profit_state(
                     cumulative_net_profit=(existing.cumulative_net_profit or _zero()) + (point.cumulative_net_profit or _zero()),
                     drawdown=(existing.drawdown or _zero()) + (point.drawdown or _zero()),
                     trade_count=existing.trade_count + point.trade_count,
-                    source_event_ids=existing.source_event_ids + point.source_event_ids,
+                    source_event_count=existing.source_event_count + point.source_event_count,
+                    source_event_ids=_merge_bounded_event_ids(existing.source_event_ids, point.source_event_ids),
+                    source_event_ids_truncated=(
+                        existing.source_event_ids_truncated
+                        or point.source_event_ids_truncated
+                        or len(existing.source_event_ids) + len(point.source_event_ids) > _MAX_BUCKET_SOURCE_EVENT_IDS
+                    ),
                 )
 
         for outcome in ranged_outcomes:
@@ -588,10 +612,12 @@ def _compute_realized_outcomes(*, trades: list[Trade], symbol_by_asset: dict[uui
 async def _build_equity_series(*, db: AsyncSession, starting_balance: Decimal, trades: list[Trade], start_at: datetime, end_at: datetime) -> list[ProfitSeriesPointResponse]:
     if start_at > end_at:
         return []
+
+    buckets = _series_buckets(start_at=start_at, end_at=end_at)
     if not trades:
         return [
             ProfitSeriesPointResponse(
-                timestamp=start_at,
+                timestamp=bucket,
                 paper_equity=starting_balance,
                 combined_equity=starting_balance,
                 cumulative_realized_pnl=_zero(),
@@ -600,24 +626,52 @@ async def _build_equity_series(*, db: AsyncSession, starting_balance: Decimal, t
                 cumulative_net_profit=_zero(),
                 drawdown=_zero(),
                 trade_count=0,
-            ),
-            ProfitSeriesPointResponse(
-                timestamp=end_at,
-                paper_equity=starting_balance,
-                combined_equity=starting_balance,
-                cumulative_realized_pnl=_zero(),
-                cumulative_unrealized_pnl=_zero(),
-                cumulative_fees=_zero(),
-                cumulative_net_profit=_zero(),
-                drawdown=_zero(),
-                trade_count=0,
-            ),
+                source_event_count=0,
+                source_event_ids=[],
+                source_event_ids_truncated=False,
+            )
+            for bucket in buckets
         ]
-    buckets = _build_buckets(start_at, end_at, _BUCKET_MINUTES[_infer_range(start_at, end_at)])
+
     series: list[ProfitSeriesPointResponse] = []
-    peak = starting_balance
-    for bucket in buckets:
+    opening_trades = [item for item in trades if item.executed_at < start_at]
+    opening_snapshot = _compute_snapshot_from_trades(
+        starting_balance=starting_balance,
+        trades=opening_trades,
+        latest_prices_by_asset_id=await _load_prices_as_of(db=db, asset_ids=[item.asset_id for item in trades], as_of=start_at),
+    )
+    opening_outcomes = _compute_realized_outcomes(trades=opening_trades, symbol_by_asset={}, strategy_by_signal={})
+    opening_realized = sum((item.net_outcome for item in opening_outcomes), _zero())
+    opening_fees = sum((item.attributed_fees for item in opening_outcomes), _zero())
+
+    peak = opening_snapshot["equity"]
+    if opening_trades:
+        series.append(
+            ProfitSeriesPointResponse(
+                timestamp=start_at,
+                opening_context=True,
+                paper_equity=opening_snapshot["equity"],
+                combined_equity=opening_snapshot["equity"],
+                cumulative_realized_pnl=opening_realized,
+                cumulative_unrealized_pnl=opening_snapshot["unrealized_pnl"],
+                cumulative_fees=opening_fees,
+                cumulative_net_profit=opening_realized,
+                drawdown=_zero(),
+                trade_count=len(opening_trades),
+                source_event_count=0,
+                source_event_ids=[],
+                source_event_ids_truncated=False,
+            )
+        )
+
+    point_buckets = [item for item in buckets if item > start_at] if opening_trades else buckets
+    prior_bucket: datetime | None = None
+    for bucket in point_buckets:
         relevant_trades = [item for item in trades if item.executed_at <= bucket]
+        if prior_bucket is None:
+            bucket_events = [item for item in trades if item.executed_at >= start_at and item.executed_at <= bucket]
+        else:
+            bucket_events = [item for item in trades if item.executed_at > prior_bucket and item.executed_at <= bucket]
         asset_ids = [item.asset_id for item in relevant_trades]
         prices = await _load_prices_as_of(db=db, asset_ids=asset_ids, as_of=bucket)
         snapshot = _compute_snapshot_from_trades(
@@ -631,6 +685,7 @@ async def _build_equity_series(*, db: AsyncSession, starting_balance: Decimal, t
         if snapshot["equity"] > peak:
             peak = snapshot["equity"]
         drawdown = peak - snapshot["equity"]
+        bucket_source_ids = [str(item.id) for item in bucket_events]
         series.append(
             ProfitSeriesPointResponse(
                 timestamp=bucket,
@@ -641,11 +696,104 @@ async def _build_equity_series(*, db: AsyncSession, starting_balance: Decimal, t
                 cumulative_fees=fees,
                 cumulative_net_profit=realized,
                 drawdown=drawdown,
-                trade_count=len(relevant_trades),
-                source_event_ids=[str(item.id) for item in relevant_trades],
+                trade_count=len([item for item in relevant_trades if item.executed_at >= start_at]),
+                source_event_count=len(bucket_source_ids),
+                source_event_ids=bucket_source_ids[:_MAX_BUCKET_SOURCE_EVENT_IDS],
+                source_event_ids_truncated=len(bucket_source_ids) > _MAX_BUCKET_SOURCE_EVENT_IDS,
             )
         )
+        prior_bucket = bucket
     return series
+
+
+def _merge_bounded_event_ids(left: list[str], right: list[str]) -> list[str]:
+    merged: list[str] = []
+    seen: set[str] = set()
+    for value in [*left, *right]:
+        if value in seen:
+            continue
+        seen.add(value)
+        merged.append(value)
+        if len(merged) >= _MAX_BUCKET_SOURCE_EVENT_IDS:
+            break
+    return merged
+
+
+def _series_buckets(*, start_at: datetime, end_at: datetime) -> list[datetime]:
+    raw_buckets = _build_buckets(start_at, end_at, _BUCKET_MINUTES[_infer_range(start_at, end_at)])
+    buckets = [item for item in raw_buckets if item >= start_at]
+    if not buckets or buckets[0] != start_at:
+        buckets.insert(0, start_at)
+    if buckets[-1] != end_at:
+        buckets.append(end_at)
+    return buckets
+
+
+def _resolve_paper_account_scope(
+    *,
+    accounts: list[PaperAccount],
+    capital_pool_id: str | None,
+    validation_run_id: uuid.UUID | None,
+) -> set[uuid.UUID] | None:
+    scoped_ids: set[uuid.UUID] | None = None
+
+    if capital_pool_id:
+        if capital_pool_id.startswith("paper-account:"):
+            raw_id = capital_pool_id.split(":", 1)[1]
+            try:
+                scoped_ids = {uuid.UUID(raw_id)}
+            except ValueError:
+                scoped_ids = set()
+
+    if validation_run_id is not None:
+        # Validation-run to account mapping is not durably modeled in v1, so fail closed.
+        scoped_ids = set() if scoped_ids is None else scoped_ids.intersection(set())
+
+    if scoped_ids is None:
+        return None
+
+    known_ids = {item.id for item in accounts}
+    return scoped_ids.intersection(known_ids)
+
+
+async def _resolve_paper_account_scope_async(
+    *,
+    db: AsyncSession,
+    accounts: list[PaperAccount],
+    capital_pool_id: str | None,
+    validation_run_id: uuid.UUID | None,
+) -> set[uuid.UUID] | None:
+    scoped_ids = _resolve_paper_account_scope(
+        accounts=accounts,
+        capital_pool_id=capital_pool_id,
+        validation_run_id=None,
+    )
+
+    run_scope_id: uuid.UUID | None = validation_run_id
+    if run_scope_id is None and capital_pool_id and capital_pool_id.startswith("validation-run:"):
+        raw_id = capital_pool_id.split(":", 1)[1]
+        try:
+            run_scope_id = uuid.UUID(raw_id)
+        except ValueError:
+            return set()
+
+    if run_scope_id is not None:
+        run_bound_ids = set(
+            (
+                await db.execute(
+                    select(ValidationRunPaperAccount.paper_account_id).where(
+                        ValidationRunPaperAccount.validation_run_id == run_scope_id
+                    )
+                )
+            ).scalars().all()
+        )
+        scoped_ids = run_bound_ids if scoped_ids is None else scoped_ids.intersection(run_bound_ids)
+
+    if scoped_ids is None:
+        return None
+
+    known_ids = {item.id for item in accounts}
+    return scoped_ids.intersection(known_ids)
 
 
 def _infer_range(start_at: datetime, end_at: datetime) -> ProfitRange:

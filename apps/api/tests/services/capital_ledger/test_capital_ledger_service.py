@@ -298,3 +298,64 @@ async def test_pagination_and_partial_data_completeness(monkeypatch: pytest.Monk
     assert page_one.summary.data_completeness_percent < 100
     assert any(source.startswith("validation_run_metrics") for source in page_one.summary.unavailable_sources)
     assert "research_campaign_allocations" in page_one.summary.unavailable_sources
+
+
+@pytest.mark.asyncio
+async def test_managed_capital_excludes_child_positions(monkeypatch: pytest.MonkeyPatch) -> None:
+    account = _account(
+        account_id="aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa",
+        name="Paper Parent",
+        starting="25",
+        is_active=True,
+    )
+
+    async def _runs(_db):
+        return []
+
+    async def _accounts(_db):
+        return [account]
+
+    async def _campaigns(_db):
+        return []
+
+    async def _metrics(_db):
+        return {}
+
+    async def _trade_counts(_db):
+        return {account.id: 1}
+
+    async def _snapshot(*, db, paper_account_id, starting_balance):
+        _ = (db, paper_account_id, starting_balance)
+        return AccountAccountingSnapshot(
+            cash_balance=Decimal("10"),
+            position_value=Decimal("20"),
+            equity=Decimal("30"),
+            equity_return_usd=Decimal("5"),
+            equity_return_pct=Decimal("0.20"),
+            positions=(
+                PositionAccounting(
+                    asset_id=uuid.UUID("bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb"),
+                    symbol="BTCUSD",
+                    quantity=Decimal("1"),
+                    avg_entry_price=Decimal("15"),
+                    position_value=Decimal("20"),
+                    unrealized_pnl_usd=Decimal("5"),
+                    unrealized_pnl_pct=Decimal("0.33"),
+                ),
+            ),
+        )
+
+    monkeypatch.setattr(service, "_load_validation_runs", _runs)
+    monkeypatch.setattr(service, "_load_paper_accounts", _accounts)
+    monkeypatch.setattr(service, "_load_research_campaigns", _campaigns)
+    monkeypatch.setattr(service, "_load_validation_run_metrics", _metrics)
+    monkeypatch.setattr(service, "_load_trade_counts_by_account", _trade_counts)
+    monkeypatch.setattr(service, "build_account_snapshot", _snapshot)
+
+    result = await service.build_capital_ledger(db=_DummySession())
+
+    # Managed capital must count only the parent funded pool, not child position rows.
+    assert result.summary.total_managed_capital == Decimal("25")
+    assert result.summary.total_current_equity == Decimal("30")
+    position_pool = next(item for item in result.capital_pools if item.capital_pool_type == "position")
+    assert position_pool.current_equity == Decimal("20")

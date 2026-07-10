@@ -12,6 +12,21 @@ Current timeline evidence comes from:
 - research cycle events
 - operational alerts
 - profit/equity series derived from durable paper trading evidence
+- live-operations audit annotations derived from durable audit actions
+
+## Live Operations Timeline Annotations
+
+Mission Control now annotates timeline context using recent durable audit events.
+
+Current tracked actions include:
+- CONNECTION_VERIFIED
+- PREVIEW_GENERATED
+- DRY_RUN_READY
+- DRY_RUN_BLOCKED
+- CREDENTIAL_ROTATED
+- CONNECTION_DISCONNECTED
+
+These annotations are informational evidence only and do not authorize live submission.
 
 ## Profit Tab
 
