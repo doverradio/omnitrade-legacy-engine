@@ -23,6 +23,7 @@ from app.models.decision_explainability_record import DecisionExplainabilityReco
 from app.models.decision_quality_score import DecisionQualityScore
 from app.models.decision_record import DecisionRecord
 from app.models.decision_snapshot import DecisionSnapshot
+from app.models.exchange_connection import ExchangeConnection
 from app.models.model_output import ModelOutput
 from app.models.live_audit_evidence_record import LiveAuditEvidenceRecord
 from app.models.live_accounting_record import LiveAccountingRecord
@@ -80,6 +81,7 @@ __all__ = [
 	"DecisionQualityScore",
 	"DecisionRecord",
 	"DecisionSnapshot",
+	"ExchangeConnection",
 	"ModelOutput",
 	"LiveAuditEvidenceRecord",
 	"LiveAccountingRecord",

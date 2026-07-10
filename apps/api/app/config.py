@@ -17,6 +17,7 @@ class Settings(BaseSettings):
     alpaca_api_key_id: SecretStr | None = None
     alpaca_api_secret_key: SecretStr | None = None
     alpaca_base_url: str = "https://paper-api.alpaca.markets"
+    exchange_credentials_encryption_key: SecretStr | None = None
 
     environment: str = "local"
     log_level: str = "INFO"

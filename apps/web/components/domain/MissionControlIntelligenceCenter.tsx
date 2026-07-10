@@ -18,6 +18,7 @@ import {
   type MissionControlIntelligenceResponse,
   type MissionControlIntelligenceTimelineEvent,
 } from "@/lib/api/mission-control";
+import { getExchangeConnections, type ExchangeConnection } from "@/lib/api/exchange-connections";
 
 type AccordionKey = "intelligence" | "validationRuns" | "research" | "monitoring" | "infrastructure" | "paperTrading" | "alerts" | "recentTimeline";
 
@@ -348,6 +349,7 @@ export default function MissionControlIntelligenceCenter() {
   const [payload, setPayload] = useState<MissionControlIntelligenceResponse | null>(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
+  const [exchangeConnection, setExchangeConnection] = useState<ExchangeConnection | null>(null);
   const [openSections, setOpenSections] = useState<Record<AccordionKey, boolean>>(DEFAULT_OPEN_SECTIONS);
   const [selectedEventId, setSelectedEventId] = useState<string | null>(null);
   const [isMobile, setIsMobile] = useState(false);
@@ -390,11 +392,15 @@ export default function MissionControlIntelligenceCenter() {
       setLoading(true);
       setError(null);
       try {
-        const next = await getMissionControlIntelligence(range);
+        const [next, exchangePayload] = await Promise.all([
+          getMissionControlIntelligence(range),
+          getExchangeConnections().catch(() => ({ items: [] as ExchangeConnection[] })),
+        ]);
         if (!active) {
           return;
         }
         setPayload(next);
+        setExchangeConnection(exchangePayload.items.find((item) => item.provider === "coinbase_advanced") ?? null);
       } catch (requestError) {
         if (active) {
           setError(errorMessage(requestError, "Unable to load mission control intelligence."));
@@ -665,6 +671,14 @@ export default function MissionControlIntelligenceCenter() {
               <MetricStat label="Health Status" value={payload.operations.run_status.health_status.toUpperCase()} />
               <MetricStat label="Uptime" value={payload.operations.run_status.uptime} />
               <MetricStat label="Expected End" value={formatTimestamp(payload.operations.run_status.expected_end)} />
+              <MetricStat
+                label="Exchange Connection"
+                value={exchangeConnection ? exchangeConnection.status.toUpperCase() : "DISCONNECTED"}
+                helper={exchangeConnection
+                  ? `Last Sync ${formatTimestamp(exchangeConnection.last_successful_sync_at)} | ${exchangeConnection.environment.toUpperCase()}`
+                  : "No exchange configured"}
+                href="/exchange-connections"
+              />
             </div>
           </AccordionSection>
 

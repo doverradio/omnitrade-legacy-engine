@@ -13,6 +13,7 @@ dependencies = [
   "sqlalchemy[asyncio]",
   "asyncpg",
   "alembic",
+  "cryptography",
   "pydantic-settings",
   "httpx",
   "pytest",

@@ -8,6 +8,7 @@ from app.api.routes.backtests import router as backtests_router
 from app.api.routes.capital import router as capital_router
 from app.api.routes.dashboard import router as dashboard_router
 from app.api.routes.decisions import router as decisions_router
+from app.api.routes.exchange_connections import router as exchange_connections_router
 from app.api.routes.health import router as health_router
 from app.api.routes.live import router as live_router
 from app.api.routes.mission_control import router as mission_control_router
@@ -51,6 +52,7 @@ def create_app() -> FastAPI:
     app.include_router(parameter_sets_router)
     app.include_router(backtests_router)
     app.include_router(capital_router)
+    app.include_router(exchange_connections_router)
     app.include_router(dashboard_router)
     app.include_router(mission_control_router)
     app.include_router(arena_router)
