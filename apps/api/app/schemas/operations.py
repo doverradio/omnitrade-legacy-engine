@@ -49,3 +49,14 @@ class OperationalStatusResponse(BaseModel):
     research_status: dict[str, str | int | None]
     monitoring: OperationalMonitoringResponse
     alerts: list[OperationalAlertResponse]
+
+
+class OperationalFreshnessItemResponse(BaseModel):
+    source: str
+    latest_timestamp: datetime | None
+    row_count: int
+
+
+class OperationalFreshnessResponse(BaseModel):
+    generated_at: datetime
+    items: list[OperationalFreshnessItemResponse]

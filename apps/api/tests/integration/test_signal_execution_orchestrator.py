@@ -718,3 +718,67 @@ async def test_orchestrator_with_bootstrapped_account_kill_switch_progresses_pas
 
     assert result.execution_status in {"executed", "pending", "rejected"}
     assert session.risk_events[-1].detail["reason_code"] != "account_kill_switch_state_unknown"
+
+
+@pytest.mark.asyncio
+async def test_orchestrator_rejects_sell_without_position_as_structured_execution_rejection() -> None:
+    now = datetime(2026, 7, 6, tzinfo=timezone.utc)
+    account = PaperAccount(
+        id=uuid.uuid4(),
+        owner_user_id=uuid.uuid4(),
+        name="Family Crypto",
+        asset_class="crypto",
+        starting_balance=Decimal("25"),
+        current_cash_balance=Decimal("25"),
+        is_active=True,
+        created_at=now,
+    )
+    asset = Asset(
+        id=uuid.uuid4(),
+        symbol="BTCUSDT",
+        asset_class="crypto",
+        exchange="binance_us",
+        supports_fractional=True,
+        qty_step_size=Decimal("0.00001"),
+        min_order_notional=Decimal("1"),
+        is_active=True,
+    )
+    session = _FakeSession(
+        accounts=[account],
+        assets=[asset],
+        trades=[],
+        candles=[
+            Candle(
+                asset_id=asset.id,
+                interval="1m",
+                open_time=now,
+                close_time=now,
+                open=Decimal("100"),
+                high=Decimal("100"),
+                low=Decimal("100"),
+                close=Decimal("100"),
+                volume=Decimal("1"),
+                source="binance_us",
+            )
+        ],
+    )
+
+    result = await orchestrate_paper_signal_execution(
+        db=session,
+        request=SignalExecutionRequest(
+            signal_id=uuid.uuid4(),
+            paper_account_id=account.id,
+            asset_id=asset.id,
+            side="sell",
+            quantity=Decimal("0.1"),
+        ),
+    )
+
+    assert result.execution_status == "rejected"
+    assert result.outcome == "REJECTED"
+    assert result.reason_code == "INSUFFICIENT_POSITION_QUANTITY"
+    assert result.trade_id is None
+    assert len(session.trades) == 0
+    assert session.accounts[0].current_cash_balance == Decimal("25")
+    assert any(audit.action == "signal_execution_rejected" for audit in session.audit_logs)
+    assert any(event.detail.get("reason_code") == "INSUFFICIENT_POSITION_QUANTITY" for event in session.risk_events)

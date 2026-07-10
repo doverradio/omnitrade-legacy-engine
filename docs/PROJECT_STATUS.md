@@ -1,6 +1,6 @@
 # OmniTrade Decision Intelligence Platform — Project Status
 
-Last Updated: 2026-07-06
+Last Updated: 2026-07-10
 
 ---
 
@@ -10,13 +10,13 @@ Project Stage:
 Pre-MVP
 
 Current Phase:
-Phase 9 — Live Trading Foundation (Complete)
+Operational Resilience + Research/Evolution Activation + Intelligence Timeline v1 (In Progress)
 
 Current Prompt:
-Phase 9 exit review complete; preparing future roadmap planning
+Paper-proving resilience hardening, deterministic research/evolution activation, and intelligence evidence improvements
 
 Overall Completion:
-Approximately 92%
+Approximately 94%
 
 ---
 
@@ -65,6 +65,10 @@ Risk Engine remains the final authority for candidate action evaluation before a
 
 Live Trading Foundation operational surfaces now exist under controlled, governance-gated boundaries.
 
+Live submission remains disabled.
+
+Research activation remains paper-only.
+
 Paper Trading remains the default operating mode.
 
 Human approval remains mandatory for live-mode activation paths.
@@ -85,7 +89,14 @@ No automatic promotion to live capital exists.
 
 # Current Goal
 
-Begin future roadmap planning only.
+Harden the active paper proving pipeline while keeping live trading disabled.
+
+Current operator priorities:
+
+- graceful SELL rejection handling for no-position cases
+- transient database disconnect recovery for read paths and worker cycles
+- deterministic research/evolution activation without OpenAI dependency
+- more evidence-backed validation and intelligence surfaces
 
 Phase progression remains gated by validation, documentation updates, and regression-free handoff before advancing.
 

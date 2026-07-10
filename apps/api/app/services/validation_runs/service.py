@@ -51,10 +51,22 @@ _EVENT_TYPE_CATEGORY = {
     "PAPER_TRADE_SUBMITTED": "execution",
     "PAPER_TRADE_FILLED": "execution",
     "PAPER_TRADE_REJECTED": "execution",
+    "PAPER_EXECUTION_REJECTED": "execution",
     "POSITION_OPENED": "execution",
     "POSITION_CLOSED": "execution",
     "RESEARCH_CAMPAIGN_STARTED": "research",
     "RESEARCH_CAMPAIGN_COMPLETED": "research",
+    "RESEARCH_CYCLE_STARTED": "research",
+    "RESEARCH_CYCLE_FAILED": "research",
+    "CANDIDATE_GENERATED": "research",
+    "CANDIDATE_EVALUATED": "research",
+    "CANDIDATE_REJECTED": "research",
+    "CANDIDATE_PROMOTED": "research",
+    "EVOLUTION_DESCENDANT_CREATED": "research",
+    "TOURNAMENT_STARTED": "research",
+    "TOURNAMENT_COMPLETED": "research",
+    "CHAMPION_SELECTED": "research",
+    "RESEARCH_MEMORY_UPDATED": "research",
     "EVOLUTION_CYCLE_STARTED": "research",
     "EVOLUTION_CYCLE_COMPLETED": "research",
     "CHAMPION_STRATEGY_CHANGED": "research",
@@ -85,12 +97,24 @@ _CATEGORY_EVENT_TYPES = {
         "PAPER_TRADE_SUBMITTED",
         "PAPER_TRADE_FILLED",
         "PAPER_TRADE_REJECTED",
+        "PAPER_EXECUTION_REJECTED",
         "POSITION_OPENED",
         "POSITION_CLOSED",
     },
     "research": {
         "RESEARCH_CAMPAIGN_STARTED",
         "RESEARCH_CAMPAIGN_COMPLETED",
+        "RESEARCH_CYCLE_STARTED",
+        "RESEARCH_CYCLE_FAILED",
+        "CANDIDATE_GENERATED",
+        "CANDIDATE_EVALUATED",
+        "CANDIDATE_REJECTED",
+        "CANDIDATE_PROMOTED",
+        "EVOLUTION_DESCENDANT_CREATED",
+        "TOURNAMENT_STARTED",
+        "TOURNAMENT_COMPLETED",
+        "CHAMPION_SELECTED",
+        "RESEARCH_MEMORY_UPDATED",
         "EVOLUTION_CYCLE_STARTED",
         "EVOLUTION_CYCLE_COMPLETED",
         "CHAMPION_STRATEGY_CHANGED",
@@ -545,14 +569,21 @@ async def _read_current_equity(*, db: AsyncSession) -> Decimal:
 
 
 async def _read_current_champion(*, db: AsyncSession) -> str | None:
-    row = await db.execute(
-        text(
-            "SELECT current_champion "
-            "FROM research_campaign_statistics "
-            "WHERE current_champion IS NOT NULL "
-            "ORDER BY updated_at DESC NULLS LAST LIMIT 1"
+    try:
+        row = await db.execute(
+            text(
+                "SELECT current_champion "
+                "FROM research_campaign_statistics "
+                "WHERE current_champion IS NOT NULL "
+                "ORDER BY updated_at DESC NULLS LAST LIMIT 1"
+            )
         )
-    )
+    except Exception:
+        return None
+
+    if not hasattr(row, "mappings"):
+        return None
+
     item = row.mappings().first()
     return None if item is None else item.get("current_champion")
 
@@ -603,7 +634,12 @@ def _to_event_response(event: ValidationRunEvent) -> ValidationRunEventResponse:
     metadata = payload.get("metadata") if isinstance(payload.get("metadata"), dict) else {}
     category = _event_category(event.event_type)
     title = _safe_text(payload.get("title")) or _title_from_event_type(event.event_type)
-    description = _safe_text(payload.get("description")) or event.message
+    payload_description = _safe_text(payload.get("description"))
+    description = event.message
+    if payload_description:
+        normalized_message = event.message.strip().lower()
+        normalized_payload = payload_description.strip().lower()
+        description = payload_description if normalized_message == normalized_payload else f"{event.message}. {payload_description}"
     severity = _safe_text(payload.get("severity")) or _severity_from_event_type(event.event_type)
 
     return ValidationRunEventResponse(
@@ -637,9 +673,9 @@ def _event_category(event_type: str) -> str:
 def _severity_from_event_type(event_type: str) -> str:
     if event_type in {"FAILURE", "ALERT", "DATABASE_HEALTH_WARNING"}:
         return "red"
-    if event_type in {"WARNING", "RISK_EVENT", "RISK_EVALUATION_STARTED", "RISK_REJECTED", "PAPER_TRADE_REJECTED", "VALIDATION_RUN_CANCELLED"}:
+    if event_type in {"WARNING", "RISK_EVENT", "RISK_EVALUATION_STARTED", "RISK_REJECTED", "PAPER_TRADE_REJECTED", "PAPER_EXECUTION_REJECTED", "VALIDATION_RUN_CANCELLED"}:
         return "yellow"
-    if event_type in {"RESEARCH_CAMPAIGN_STARTED", "RESEARCH_CAMPAIGN_COMPLETED", "EVOLUTION_CYCLE_STARTED", "EVOLUTION_CYCLE_COMPLETED", "CHAMPION_STRATEGY_CHANGED"}:
+    if event_type in {"RESEARCH_CAMPAIGN_STARTED", "RESEARCH_CAMPAIGN_COMPLETED", "RESEARCH_CYCLE_STARTED", "RESEARCH_CYCLE_FAILED", "CANDIDATE_GENERATED", "CANDIDATE_EVALUATED", "CANDIDATE_REJECTED", "CANDIDATE_PROMOTED", "EVOLUTION_DESCENDANT_CREATED", "TOURNAMENT_STARTED", "TOURNAMENT_COMPLETED", "CHAMPION_SELECTED", "RESEARCH_MEMORY_UPDATED", "EVOLUTION_CYCLE_STARTED", "EVOLUTION_CYCLE_COMPLETED", "CHAMPION_STRATEGY_CHANGED"}:
         return "purple"
     if event_type in {"VALIDATION_RUN_STARTED", "VALIDATION_RUN_COMPLETED", "VALIDATION_HEARTBEAT", "DATABASE_RECOVERED", "RISK_APPROVED", "PAPER_TRADE_FILLED", "POSITION_OPENED"}:
         return "green"
@@ -972,9 +1008,9 @@ def _build_scorecards(
             category="Database Health",
             indicator=operations.system_health["database"],
         ),
-        _score_data_ingestion(metrics=metrics, alert_codes=alert_codes),
-        _score_strategy_execution(metrics=metrics),
-        _score_paper_trading(metrics=metrics),
+        _score_data_ingestion(metrics=metrics, operations=operations, alert_codes=alert_codes),
+        _score_strategy_execution(metrics=metrics, operations=operations),
+        _score_paper_trading(metrics=metrics, operations=operations),
         _score_from_indicator(
             category="Research Agents",
             indicator=operations.system_health["research_agent"],
@@ -996,7 +1032,7 @@ def _score_from_indicator(*, category: str, indicator) -> ValidationRunScorecard
     return ValidationRunScorecardResponse(category=category, status="RED", score=20, notes=indicator.detail)
 
 
-def _score_data_ingestion(*, metrics: ValidationRunMetricsResponse, alert_codes: set[str]) -> ValidationRunScorecardResponse:
+def _score_data_ingestion(*, metrics: ValidationRunMetricsResponse, operations: OperationalStatusResponse, alert_codes: set[str]) -> ValidationRunScorecardResponse:
     if "no_new_candles" in alert_codes:
         return ValidationRunScorecardResponse(
             category="Data Ingestion",
@@ -1004,7 +1040,7 @@ def _score_data_ingestion(*, metrics: ValidationRunMetricsResponse, alert_codes:
             score=20,
             notes="No new candles observed",
         )
-    if metrics.candles_processed_during_run <= 0:
+    if metrics.candles_processed_during_run <= 0 and operations.monitoring.candles_processed <= 0:
         return ValidationRunScorecardResponse(
             category="Data Ingestion",
             status="YELLOW",
@@ -1015,24 +1051,40 @@ def _score_data_ingestion(*, metrics: ValidationRunMetricsResponse, alert_codes:
         category="Data Ingestion",
         status="GREEN",
         score=100,
-        notes="Candles are being processed",
+        notes=(
+            "Candles are being processed during this run"
+            if metrics.candles_processed_during_run > 0
+            else "Candles are available and the ingestion pipeline is active"
+        ),
     )
 
 
-def _score_strategy_execution(*, metrics: ValidationRunMetricsResponse) -> ValidationRunScorecardResponse:
-    if metrics.signals_generated_during_run <= 0 and metrics.decision_records_created_during_run <= 0:
+def _score_strategy_execution(*, metrics: ValidationRunMetricsResponse, operations: OperationalStatusResponse) -> ValidationRunScorecardResponse:
+    if (
+        metrics.signals_generated_during_run <= 0
+        and metrics.decision_records_created_during_run <= 0
+        and operations.monitoring.signals_generated <= 0
+        and operations.monitoring.decision_records_created <= 0
+    ):
         return ValidationRunScorecardResponse(
             category="Strategy Execution",
             status="YELLOW",
             score=60,
             notes="No strategy execution output yet",
         )
-    if metrics.signals_generated_during_run > 0 and metrics.decision_records_created_during_run > 0:
+    if (
+        (metrics.signals_generated_during_run > 0 and metrics.decision_records_created_during_run > 0)
+        or (operations.monitoring.signals_generated > 0 and operations.monitoring.decision_records_created > 0)
+    ):
         return ValidationRunScorecardResponse(
             category="Strategy Execution",
             status="GREEN",
             score=100,
-            notes="Signals and decision records are flowing",
+            notes=(
+                "Signals and decision records are flowing during this run"
+                if metrics.signals_generated_during_run > 0 and metrics.decision_records_created_during_run > 0
+                else "Signals and decision records are flowing in the active paper pipeline"
+            ),
         )
     return ValidationRunScorecardResponse(
         category="Strategy Execution",
@@ -1042,15 +1094,19 @@ def _score_strategy_execution(*, metrics: ValidationRunMetricsResponse) -> Valid
     )
 
 
-def _score_paper_trading(*, metrics: ValidationRunMetricsResponse) -> ValidationRunScorecardResponse:
-    if metrics.trades_executed_during_run > 0:
+def _score_paper_trading(*, metrics: ValidationRunMetricsResponse, operations: OperationalStatusResponse) -> ValidationRunScorecardResponse:
+    if metrics.trades_executed_during_run > 0 or operations.monitoring.paper_trades_executed > 0:
         return ValidationRunScorecardResponse(
             category="Paper Trading",
             status="GREEN",
             score=100,
-            notes="Paper trades executed during run",
+            notes=(
+                "Paper trades executed during run"
+                if metrics.trades_executed_during_run > 0
+                else "Paper trades are active in the current proving environment"
+            ),
         )
-    if metrics.signals_generated_during_run > 0:
+    if metrics.signals_generated_during_run > 0 or operations.monitoring.signals_generated > 0:
         return ValidationRunScorecardResponse(
             category="Paper Trading",
             status="YELLOW",

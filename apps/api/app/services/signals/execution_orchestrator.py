@@ -15,6 +15,7 @@ from app.models.asset import Asset
 from app.models.audit_log import AuditLog
 from app.models.candle import Candle
 from app.models.paper_account import PaperAccount
+from app.models.risk_event import RiskEvent
 from app.models.trade import Trade
 from app.services.data.http_client import AsyncHTTPClient
 from app.services.paper.alpaca_paper import submit_alpaca_paper_order
@@ -55,6 +56,22 @@ class SignalExecutionResult:
     broker_order_id: str | None
     venue_status: str | None
     message: str
+    outcome: str = "FAILED"
+    reason_code: str | None = None
+    reason_text: str | None = None
+    reason_details: dict[str, Any] | None = None
+
+
+_EXPECTED_EXECUTION_REJECTION_MESSAGES: dict[str, tuple[str, str]] = {
+    "Insufficient position quantity for sell": (
+        "INSUFFICIENT_POSITION_QUANTITY",
+        "Insufficient position quantity for sell",
+    ),
+    "Insufficient paper cash balance": (
+        "INSUFFICIENT_PAPER_CASH",
+        "Insufficient paper cash balance",
+    ),
+}
 
 
 def _map_common_execution_status(*, venue: str, venue_status: str | None, filled_qty: Decimal | None) -> str:
@@ -79,6 +96,13 @@ def _map_common_execution_status(*, venue: str, venue_status: str | None, filled
         return "failed"
 
     return "pending"
+
+
+def _expected_execution_rejection(exc: InvalidRequestError) -> tuple[str, str] | None:
+    for message, mapped in _EXPECTED_EXECUTION_REJECTION_MESSAGES.items():
+        if exc.message == message:
+            return mapped
+    return None
 
 
 async def orchestrate_paper_signal_execution(
@@ -133,12 +157,16 @@ async def orchestrate_paper_signal_execution(
             paper_account_id=request.paper_account_id,
             asset_id=request.asset_id,
             execution_status="duplicate",
+            outcome="SKIPPED",
             execution_venue=existing_trade.execution_venue,
             is_paper=True,
             trade_id=existing_trade.id,
             broker_order_id=None,
             venue_status="duplicate",
             message="Duplicate execution prevented for signal",
+            reason_code="DUPLICATE_SIGNAL",
+            reason_text="Duplicate execution prevented for signal",
+            reason_details=None,
         )
 
     account = await db.scalar(select(PaperAccount).where(PaperAccount.id == request.paper_account_id))
@@ -245,12 +273,16 @@ async def orchestrate_paper_signal_execution(
             paper_account_id=request.paper_account_id,
             asset_id=request.asset_id,
             execution_status="rejected",
+            outcome="REJECTED",
             execution_venue="risk_engine",
             is_paper=True,
             trade_id=None,
             broker_order_id=None,
             venue_status="rejected",
             message=f"Signal rejected by risk engine: {risk_result.reason_code or 'risk_rejected'}",
+            reason_code=risk_result.reason_code or "risk_rejected",
+            reason_text=f"Signal rejected by risk engine: {risk_result.reason_code or 'risk_rejected'}",
+            reason_details=None,
         )
 
     approved_quantity = risk_result.approved_quantity
@@ -280,6 +312,43 @@ async def orchestrate_paper_signal_execution(
                 actor=request.actor,
                 signal_id=request.signal_id,
             )
+        except InvalidRequestError as exc:
+            expected_rejection = _expected_execution_rejection(exc)
+            if expected_rejection is None:
+                await _audit_signal_execution_failure(
+                    db=db,
+                    request=request,
+                    reason=exc.message,
+                    details=exc.details,
+                    asset=asset,
+                )
+                raise
+
+            reason_code, reason_text = expected_rejection
+            await _record_execution_rejection(
+                db=db,
+                request=request,
+                asset=asset,
+                reason_code=reason_code,
+                reason_text=reason_text,
+                details=exc.details,
+            )
+            return SignalExecutionResult(
+                signal_id=request.signal_id,
+                paper_account_id=request.paper_account_id,
+                asset_id=request.asset_id,
+                execution_status="rejected",
+                outcome="REJECTED",
+                execution_venue="internal_sim",
+                is_paper=True,
+                trade_id=None,
+                broker_order_id=None,
+                venue_status="rejected",
+                message=reason_text,
+                reason_code=reason_code,
+                reason_text=reason_text,
+                reason_details=dict(exc.details),
+            )
         except AppError as exc:
             await _audit_signal_execution_failure(
                 db=db,
@@ -295,12 +364,14 @@ async def orchestrate_paper_signal_execution(
             paper_account_id=request.paper_account_id,
             asset_id=request.asset_id,
             execution_status="executed",
+            outcome="EXECUTED",
             execution_venue="internal_sim",
             is_paper=True,
             trade_id=fill.trade_id,
             broker_order_id=None,
             venue_status="filled",
             message="Signal executed via internal crypto simulator",
+            reason_details=None,
         )
 
     if asset.asset_class == "stock":
@@ -431,6 +502,10 @@ async def orchestrate_paper_signal_execution(
             broker_order_id=venue_result.broker_order_id,
             venue_status=venue_result.status,
             message="Signal submitted to Alpaca paper adapter",
+            outcome="EXECUTED" if mapped_status in {"executed", "pending"} else "FAILED",
+            reason_code=None,
+            reason_text=None,
+            reason_details=None,
         )
 
     raise InvalidRequestError(
@@ -479,6 +554,57 @@ async def _audit_signal_execution_failure(
         },
     )
     db.add(failure_audit)
+    await db.commit()
+
+
+async def _record_execution_rejection(
+    *,
+    db: AsyncSession,
+    request: SignalExecutionRequest,
+    asset: Asset,
+    reason_code: str,
+    reason_text: str,
+    details: dict[str, str | int | float | bool | None] | None,
+) -> None:
+    risk_event = RiskEvent(
+        paper_account_id=request.paper_account_id,
+        related_signal_id=request.signal_id,
+        event_type="execution_rejection",
+        action_taken="blocked",
+        detail={
+            "decision": "reject",
+            "reason_code": reason_code,
+            "reason_text": reason_text,
+            "requested_quantity": format(request.quantity, "f"),
+            "available_quantity": None if details is None else details.get("held_quantity"),
+            "asset_id": str(request.asset_id),
+            "symbol": asset.symbol,
+            "side": request.side,
+        },
+    )
+    db.add(risk_event)
+
+    db.add(
+        AuditLog(
+            actor=request.actor,
+            action="signal_execution_rejected",
+            entity_type="signal",
+            entity_id=request.signal_id,
+            before_state={
+                "paper_account_id": str(request.paper_account_id),
+                "asset_id": str(request.asset_id),
+                "asset_class": asset.asset_class,
+                "side": request.side,
+                "quantity": format(request.quantity, "f"),
+            },
+            after_state={
+                "reason_code": reason_code,
+                "reason_text": reason_text,
+                "details": details or {},
+                "is_paper": True,
+            },
+        )
+    )
     await db.commit()
 
 

@@ -11,8 +11,9 @@ from decimal import Decimal
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.models.audit_log import AuditLog
 from app.core.logging import setup_logging
-from app.db.session import AsyncSessionLocal
+from app.db.session import AsyncSessionLocal, dispose_database_engine, is_retryable_db_connection_error
 from app.models.asset import Asset
 from app.models.candle import Candle
 from app.models.decision_record import DecisionRecord
@@ -20,6 +21,8 @@ from app.models.paper_account import PaperAccount
 from app.models.parameter_set import ParameterSet
 from app.models.signal import Signal as SignalModel
 from app.models.strategy import Strategy as StrategyModel
+from app.models.validation_run import ValidationRun
+from app.models.validation_run_event import ValidationRunEvent
 from app.services.ai_coach.deterministic import evaluate_decision_quality_v0
 from app.services.data.binance_client import BinanceUSClient
 from app.services.data.http_client import AsyncHTTPClient
@@ -30,6 +33,7 @@ from app.services.data.worker_entrypoint import run_ingestion_cycle
 from app.services.decisions.ingestion import ingest_decision_records
 from app.services.replay.default_agent import ReplayPackageNotFoundError, replay_decision_package_v0
 from app.services.replay.identifiers import build_decision_package_id
+from app.services.research_activation import run_deterministic_research_cycle_if_due
 from app.services.signals.execution_orchestrator import SignalExecutionRequest, orchestrate_paper_signal_execution
 from app.services.strategies import StrategyContext, strategy_registry
 from app.services.strategies.registry import StrategyLookupError
@@ -72,8 +76,11 @@ class CycleStats:
     signals_created: int
     execution_candidates: int
     executions_attempted: int
+    executions_rejected: int
+    executions_failed: int
     executions_skipped: int
     decisions_inserted: int
+    research_cycles_started: int
 
 
 async def _load_active_assets(db: AsyncSession) -> list[Asset]:
@@ -167,6 +174,63 @@ async def _load_decision_record_for_signal(
     return result.scalars().first()
 
 
+async def _load_active_validation_run_ids(*, db: AsyncSession) -> list[uuid.UUID]:
+    if not hasattr(db, "execute"):
+        return []
+
+    result = await db.execute(
+        select(ValidationRun.validation_run_id)
+        .where(ValidationRun.status == "RUNNING")
+        .order_by(ValidationRun.started_at.asc(), ValidationRun.validation_run_id.asc())
+    )
+    return list(result.scalars().all())
+
+
+async def _emit_execution_rejection_event(
+    *,
+    db: AsyncSession,
+    signal_id: uuid.UUID,
+    decision_record_id: uuid.UUID | None,
+    asset: Asset,
+    side: str,
+    requested_quantity: Decimal,
+    execution_reason_code: str,
+    execution_reason_text: str,
+    execution_available_quantity: str | None,
+) -> None:
+    validation_run_ids = await _load_active_validation_run_ids(db=db)
+    if not validation_run_ids:
+        return
+
+    event_payload = {
+        "severity": "yellow",
+        "title": "Paper Execution Rejected",
+        "description": execution_reason_text,
+        "metadata": {
+            "signal_id": str(signal_id),
+            "decision_record_id": str(decision_record_id) if decision_record_id is not None else None,
+            "asset_id": str(asset.id),
+            "symbol": asset.symbol,
+            "side": side,
+            "requested_quantity": format(requested_quantity, "f"),
+            "available_quantity": execution_available_quantity,
+            "reason_code": execution_reason_code,
+            "reason_text": execution_reason_text,
+            "validation_run_ids": [str(item) for item in validation_run_ids],
+            "timestamp": datetime.now().astimezone().isoformat(),
+        },
+    }
+    for validation_run_id in validation_run_ids:
+        db.add(
+            ValidationRunEvent(
+                validation_run_id=validation_run_id,
+                event_type="PAPER_EXECUTION_REJECTED",
+                message=execution_reason_text,
+                payload=event_payload,
+            )
+        )
+
+
 async def _produce_research_evidence(
     *,
     db: AsyncSession,
@@ -255,6 +319,8 @@ async def run_orchestration_cycle(
     signals_created = 0
     execution_candidates = 0
     executions_attempted = 0
+    executions_rejected = 0
+    executions_failed = 0
     executions_skipped = 0
     decision_inserted_total = 0
     decision_package_builder = DecisionPackageBuilder()
@@ -290,6 +356,8 @@ async def run_orchestration_cycle(
             continue
 
         for asset in assets:
+            account = None
+            execution = None
             candles = await _load_latest_candles(
                 db,
                 asset_id=asset.id,
@@ -353,18 +421,62 @@ async def run_orchestration_cycle(
                 account = await _load_primary_account_by_asset_class(db, asset_class=asset.asset_class)
                 if account is not None:
                     executions_attempted += 1
-                    execution = await orchestrate_paper_signal_execution(
-                        db=db,
-                        request=SignalExecutionRequest(
-                            signal_id=signal_model.id,
-                            paper_account_id=account.id,
-                            asset_id=asset.id,
-                            side=generated.action,
-                            quantity=config.default_order_quantity,
-                            actor="orchestration_worker",
-                        ),
-                    )
-                    signal_model.status = _signal_status_from_execution_status(execution.execution_status)
+                    try:
+                        execution = await orchestrate_paper_signal_execution(
+                            db=db,
+                            request=SignalExecutionRequest(
+                                signal_id=signal_model.id,
+                                paper_account_id=account.id,
+                                asset_id=asset.id,
+                                side=generated.action,
+                                quantity=config.default_order_quantity,
+                                actor="orchestration_worker",
+                            ),
+                        )
+                    except Exception:
+                        executions_failed += 1
+                        logger.exception(
+                            "paper_execution_failed signal_id=%s asset_id=%s strategy_id=%s action=%s",
+                            signal_model.id,
+                            asset.id,
+                            strategy_row.id,
+                            generated.action,
+                        )
+                        db.add(
+                            AuditLog(
+                                actor="orchestration_worker",
+                                action="orchestration_candidate_failed",
+                                entity_type="signal",
+                                entity_id=signal_model.id,
+                                before_state={
+                                    "strategy_id": str(strategy_row.id),
+                                    "asset_id": str(asset.id),
+                                    "side": generated.action,
+                                },
+                                after_state={
+                                    "outcome": "FAILED",
+                                },
+                            )
+                        )
+                    else:
+                        signal_model.status = _signal_status_from_execution_status(execution.execution_status)
+                        execution_outcome = getattr(
+                            execution,
+                            "outcome",
+                            "REJECTED"
+                            if execution.execution_status == "rejected"
+                            else "SKIPPED"
+                            if execution.execution_status == "duplicate"
+                            else "EXECUTED"
+                            if execution.execution_status in {"executed", "pending"}
+                            else "FAILED",
+                        )
+                        if execution_outcome == "REJECTED":
+                            executions_rejected += 1
+                        elif execution_outcome == "SKIPPED":
+                            executions_skipped += 1
+                        elif execution_outcome == "FAILED":
+                            executions_failed += 1
                 else:
                     executions_skipped += 1
                     logger.info(
@@ -394,6 +506,31 @@ async def run_orchestration_cycle(
 
             decision_record = await _load_decision_record_for_signal(db=db, signal_id=signal_model.id)
             if decision_record is not None:
+                if (
+                    account is not None
+                    and execution is not None
+                    and getattr(execution, "outcome", "REJECTED" if execution.execution_status == "rejected" else None) == "REJECTED"
+                    and getattr(execution, "reason_code", None) is not None
+                    and getattr(execution, "reason_text", None) is not None
+                ):
+                    await _emit_execution_rejection_event(
+                        db=db,
+                        signal_id=signal_model.id,
+                        decision_record_id=decision_record.decision_id,
+                        asset=asset,
+                        side=generated.action,
+                        requested_quantity=config.default_order_quantity,
+                        execution_reason_code=execution.reason_code,
+                        execution_reason_text=execution.reason_text,
+                        execution_available_quantity=(
+                            None
+                            if getattr(execution, "reason_details", None) is None
+                            else str(
+                                execution.reason_details.get("held_quantity")
+                                or execution.reason_details.get("cash_balance")
+                            )
+                        ),
+                    )
                 await _produce_research_evidence(
                     db=db,
                     decision_package_builder=decision_package_builder,
@@ -402,13 +539,20 @@ async def run_orchestration_cycle(
 
             await db.commit()
 
+    research_cycle_result = await run_deterministic_research_cycle_if_due(db=db)
+    if research_cycle_result.started:
+        await db.commit()
+
     return CycleStats(
         ingestion_assets_ok=ingestion_result.successful_assets,
         signals_created=signals_created,
         execution_candidates=execution_candidates,
         executions_attempted=executions_attempted,
+        executions_rejected=executions_rejected,
+        executions_failed=executions_failed,
         executions_skipped=executions_skipped,
         decisions_inserted=decision_inserted_total,
+        research_cycles_started=1 if research_cycle_result.started else 0,
     )
 
 
@@ -428,23 +572,35 @@ async def run_forever() -> None:
         client = BinanceUSClient(http_client)
 
         while True:
+            sleep_seconds = config.poll_interval_seconds
             try:
                 async with AsyncSessionLocal() as db:
                     stats = await run_orchestration_cycle(db, client=client, config=config)
 
                 logger.info(
-                    "Pipeline cycle completed ingestion_assets_ok=%s signals_created=%s execution_candidates=%s executions_attempted=%s executions_skipped=%s decisions_inserted=%s",
+                    "Pipeline cycle completed ingestion_assets_ok=%s signals_created=%s execution_candidates=%s executions_attempted=%s executions_rejected=%s executions_failed=%s executions_skipped=%s decisions_inserted=%s research_cycles_started=%s",
                     stats.ingestion_assets_ok,
                     stats.signals_created,
                     stats.execution_candidates,
                     stats.executions_attempted,
+                    stats.executions_rejected,
+                    stats.executions_failed,
                     stats.executions_skipped,
                     stats.decisions_inserted,
+                    stats.research_cycles_started,
                 )
-            except Exception:
-                logger.exception("Pipeline orchestration cycle failed")
+            except Exception as exc:
+                if is_retryable_db_connection_error(exc):
+                    sleep_seconds = min(30, config.poll_interval_seconds)
+                    await dispose_database_engine()
+                    logger.warning(
+                        "Pipeline orchestration worker detected transient database disconnect; retrying next cycle after bounded backoff",
+                        exc_info=True,
+                    )
+                else:
+                    logger.exception("Pipeline orchestration cycle failed")
 
-            await asyncio.sleep(config.poll_interval_seconds)
+            await asyncio.sleep(sleep_seconds)
 
 
 def main() -> int:

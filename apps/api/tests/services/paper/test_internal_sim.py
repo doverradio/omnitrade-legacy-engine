@@ -298,7 +298,7 @@ async def test_execute_internal_crypto_fill_sell_requires_existing_position() ->
                 paper_account_id=account_id,
                 asset_id=asset_id,
                 side="buy",
-                quantity=Decimal("0.01"),
+                    quantity=Decimal("0.02"),
                 price=Decimal("100"),
                 fee=Decimal("0.01"),
                 is_paper=True,
@@ -314,7 +314,7 @@ async def test_execute_internal_crypto_fill_sell_requires_existing_position() ->
             paper_account_id=account_id,
             asset_id=asset_id,
             side="sell",
-            quantity=Decimal("0.02"),
+            quantity=Decimal("0.03"),
             fee_bps=Decimal("10"),
             slippage_bps=Decimal("5"),
             actor="system",
@@ -322,3 +322,155 @@ async def test_execute_internal_crypto_fill_sell_requires_existing_position() ->
         )
 
     assert "Insufficient position quantity for sell" in str(exc_info.value)
+
+
+@pytest.mark.asyncio
+async def test_execute_internal_crypto_fill_sell_exact_position_succeeds() -> None:
+    account_id = uuid.uuid4()
+    asset_id = uuid.uuid4()
+    now = datetime(2026, 7, 6, tzinfo=timezone.utc)
+
+    session = _FakeSession(
+        accounts=[
+            PaperAccount(
+                id=account_id,
+                owner_user_id=uuid.uuid4(),
+                name="Family Paper",
+                asset_class="crypto",
+                starting_balance=Decimal("25"),
+                current_cash_balance=Decimal("25"),
+                is_active=True,
+                created_at=now,
+            )
+        ],
+        assets=[
+            Asset(
+                id=asset_id,
+                symbol="BTCUSDT",
+                asset_class="crypto",
+                exchange="binance_us",
+                supports_fractional=True,
+                qty_step_size=Decimal("0.00001"),
+                min_order_notional=Decimal("1"),
+                is_active=True,
+            )
+        ],
+        candles=[
+            Candle(
+                asset_id=asset_id,
+                interval="1m",
+                open_time=now,
+                close_time=now,
+                open=Decimal("100"),
+                high=Decimal("100"),
+                low=Decimal("100"),
+                close=Decimal("100"),
+                volume=Decimal("1"),
+                source="binance_us",
+            )
+        ],
+        trades=[
+            Trade(
+                paper_account_id=account_id,
+                asset_id=asset_id,
+                side="buy",
+                    quantity=Decimal("0.02"),
+                price=Decimal("100"),
+                fee=Decimal("0.01"),
+                is_paper=True,
+                execution_venue="internal_sim",
+                executed_at=now,
+            )
+        ],
+    )
+
+    result = await execute_internal_crypto_fill(
+        db=session,
+        paper_account_id=account_id,
+        asset_id=asset_id,
+        side="sell",
+        quantity=Decimal("0.02"),
+        fee_bps=Decimal("10"),
+        slippage_bps=Decimal("5"),
+        actor="system",
+        executed_at=now,
+    )
+
+    assert result.side == "sell"
+    assert len(session.trades) == 2
+
+
+@pytest.mark.asyncio
+async def test_execute_internal_crypto_fill_sell_below_position_succeeds() -> None:
+    account_id = uuid.uuid4()
+    asset_id = uuid.uuid4()
+    now = datetime(2026, 7, 6, tzinfo=timezone.utc)
+
+    session = _FakeSession(
+        accounts=[
+            PaperAccount(
+                id=account_id,
+                owner_user_id=uuid.uuid4(),
+                name="Family Paper",
+                asset_class="crypto",
+                starting_balance=Decimal("25"),
+                current_cash_balance=Decimal("25"),
+                is_active=True,
+                created_at=now,
+            )
+        ],
+        assets=[
+            Asset(
+                id=asset_id,
+                symbol="BTCUSDT",
+                asset_class="crypto",
+                exchange="binance_us",
+                supports_fractional=True,
+                qty_step_size=Decimal("0.00001"),
+                min_order_notional=Decimal("1"),
+                is_active=True,
+            )
+        ],
+        candles=[
+            Candle(
+                asset_id=asset_id,
+                interval="1m",
+                open_time=now,
+                close_time=now,
+                open=Decimal("100"),
+                high=Decimal("100"),
+                low=Decimal("100"),
+                close=Decimal("100"),
+                volume=Decimal("1"),
+                source="binance_us",
+            )
+        ],
+        trades=[
+            Trade(
+                paper_account_id=account_id,
+                asset_id=asset_id,
+                side="buy",
+                    quantity=Decimal("0.03"),
+                price=Decimal("100"),
+                fee=Decimal("0.01"),
+                is_paper=True,
+                execution_venue="internal_sim",
+                executed_at=now,
+            )
+        ],
+    )
+
+    result = await execute_internal_crypto_fill(
+        db=session,
+        paper_account_id=account_id,
+        asset_id=asset_id,
+        side="sell",
+        quantity=Decimal("0.02"),
+        fee_bps=Decimal("10"),
+        slippage_bps=Decimal("5"),
+        actor="system",
+        executed_at=now,
+    )
+
+    assert result.side == "sell"
+    assert len(session.trades) == 2

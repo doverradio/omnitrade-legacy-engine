@@ -10,6 +10,8 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.models.paper_account import PaperAccount
 from app.schemas.operations import (
     OperationalAlertResponse,
+    OperationalFreshnessItemResponse,
+    OperationalFreshnessResponse,
     OperationalHealthIndicatorResponse,
     OperationalMonitoringResponse,
     OperationalRunStatusResponse,
@@ -136,9 +138,9 @@ async def build_operations_status(*, db: AsyncSession) -> OperationalStatusRespo
 
     paper_equity = await _get_paper_equity(db=db)
 
-    last_candle_at = await _max_timestamp(db=db, sql="SELECT MAX(created_at) FROM candles")
-    last_signal_at = await _max_timestamp(db=db, sql="SELECT MAX(created_at) FROM signals")
-    last_trade_at = await _max_timestamp(db=db, sql="SELECT MAX(created_at) FROM trades WHERE is_paper = true")
+    last_candle_at = await _max_timestamp(db=db, sql="SELECT MAX(close_time) FROM candles")
+    last_signal_at = await _max_timestamp(db=db, sql="SELECT MAX(signal_time) FROM signals")
+    last_trade_at = await _max_timestamp(db=db, sql="SELECT MAX(executed_at) FROM trades WHERE is_paper = true")
     last_ingestion_at = get_last_successful_ingestion_at()
 
     day_start = datetime(now.year, now.month, now.day, tzinfo=timezone.utc)
@@ -265,6 +267,40 @@ async def build_operations_status(*, db: AsyncSession) -> OperationalStatusRespo
             research_memory_growth=research_memory_growth,
         ),
         alerts=alerts,
+    )
+
+
+async def build_operational_freshness(*, db: AsyncSession) -> OperationalFreshnessResponse:
+    generated_at = datetime.now(timezone.utc)
+    return OperationalFreshnessResponse(
+        generated_at=generated_at,
+        items=[
+            OperationalFreshnessItemResponse(
+                source="candles",
+                latest_timestamp=await _max_timestamp(db=db, sql="SELECT MAX(close_time) FROM candles"),
+                row_count=await _count(db=db, sql="SELECT COUNT(*) FROM candles"),
+            ),
+            OperationalFreshnessItemResponse(
+                source="signals",
+                latest_timestamp=await _max_timestamp(db=db, sql="SELECT MAX(signal_time) FROM signals"),
+                row_count=await _count(db=db, sql="SELECT COUNT(*) FROM signals"),
+            ),
+            OperationalFreshnessItemResponse(
+                source="decision_records",
+                latest_timestamp=await _max_timestamp(db=db, sql="SELECT MAX(timestamp) FROM decision_records"),
+                row_count=await _count(db=db, sql="SELECT COUNT(*) FROM decision_records"),
+            ),
+            OperationalFreshnessItemResponse(
+                source="trades",
+                latest_timestamp=await _max_timestamp(db=db, sql="SELECT MAX(executed_at) FROM trades WHERE is_paper = true"),
+                row_count=await _count(db=db, sql="SELECT COUNT(*) FROM trades WHERE is_paper = true"),
+            ),
+            OperationalFreshnessItemResponse(
+                source="risk_events",
+                latest_timestamp=await _max_timestamp(db=db, sql="SELECT MAX(created_at) FROM risk_events"),
+                row_count=await _count(db=db, sql="SELECT COUNT(*) FROM risk_events"),
+            ),
+        ],
     )
 
 

@@ -10,6 +10,10 @@ class Settings(BaseSettings):
     model_config = SettingsConfigDict(env_file=".env", env_file_encoding="utf-8", extra="ignore")
 
     database_url: str = "postgresql+asyncpg://postgres:postgres@localhost:5432/omnitrade"
+    database_pool_size: int = Field(default=10, validation_alias="DATABASE_POOL_SIZE")
+    database_max_overflow: int = Field(default=20, validation_alias="DATABASE_MAX_OVERFLOW")
+    database_pool_timeout_seconds: int = Field(default=30, validation_alias="DATABASE_POOL_TIMEOUT_SECONDS")
+    database_pool_recycle_seconds: int = Field(default=1800, validation_alias="DATABASE_POOL_RECYCLE_SECONDS")
     supabase_url: str = "http://localhost:54321"
     supabase_service_role_key: SecretStr | None = None
     supabase_jwt_secret: SecretStr | None = None
@@ -61,6 +65,14 @@ class Settings(BaseSettings):
         default=30,
         validation_alias="LIVE_CRYPTO_PRICE_MAX_AGE_SECONDS",
     )
+    research_evolution_enabled: bool = Field(default=True, validation_alias="RESEARCH_EVOLUTION_ENABLED")
+    research_cycle_interval_minutes: int = Field(default=30, validation_alias="RESEARCH_CYCLE_INTERVAL_MINUTES")
+    research_max_candidates_per_cycle: int = Field(default=6, validation_alias="RESEARCH_MAX_CANDIDATES_PER_CYCLE")
+    research_max_descendants_per_candidate: int = Field(default=3, validation_alias="RESEARCH_MAX_DESCENDANTS_PER_CANDIDATE")
+    research_max_generation: int = Field(default=5, validation_alias="RESEARCH_MAX_GENERATION")
+    research_min_decisions: int = Field(default=50, validation_alias="RESEARCH_MIN_DECISIONS")
+    research_min_actionable_signals: int = Field(default=5, validation_alias="RESEARCH_MIN_ACTIONABLE_SIGNALS")
+    research_min_trades: int = Field(default=3, validation_alias="RESEARCH_MIN_TRADES")
 
     environment: str = "local"
     log_level: str = "INFO"

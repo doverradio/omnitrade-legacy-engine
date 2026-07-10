@@ -389,3 +389,55 @@ async def test_worker_logs_early_continue_reasons(
 
     assert stats.executions_attempted == 0
     assert expected_reason in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_worker_continues_after_structured_execution_rejection(monkeypatch: pytest.MonkeyPatch) -> None:
+    db = _FakeDB()
+    assets = [_asset(), _asset()]
+    strategy = _strategy_row()
+    parameter_set = _parameter_set()
+    account = SimpleNamespace(id=uuid.uuid4())
+    execution_calls = {"count": 0}
+
+    async def _fake_orchestrate(*args, **kwargs):
+        execution_calls["count"] += 1
+        if execution_calls["count"] == 1:
+            return SimpleNamespace(
+                execution_status="rejected",
+                outcome="REJECTED",
+                reason_code="INSUFFICIENT_POSITION_QUANTITY",
+                reason_text="Insufficient position quantity for sell",
+                reason_details={"held_quantity": "0"},
+            )
+        return SimpleNamespace(
+            execution_status="executed",
+            outcome="EXECUTED",
+            reason_code=None,
+            reason_text=None,
+            reason_details=None,
+        )
+
+    import app.services.orchestration.continuous_pipeline_worker as worker_module
+
+    monkeypatch.setattr(worker_module, "run_ingestion_cycle", _fake_ingestion_cycle)
+    monkeypatch.setattr(worker_module, "ingest_decision_records", _fake_decision_ingestion)
+    monkeypatch.setattr(worker_module, "_load_decision_record_for_signal", _async_return(None))
+    monkeypatch.setattr(worker_module, "_produce_research_evidence", _async_return(None))
+    monkeypatch.setattr(worker_module, "_load_active_assets", _async_return(assets))
+    monkeypatch.setattr(worker_module, "_load_active_strategies", _async_return([strategy]))
+    monkeypatch.setattr(worker_module, "_load_latest_parameter_set", _async_return(parameter_set))
+    monkeypatch.setattr(worker_module, "_load_latest_candles", _async_return(_candles(2)))
+    monkeypatch.setattr(worker_module, "_signal_exists", _async_return(False))
+    monkeypatch.setattr(worker_module, "_load_primary_account_by_asset_class", _async_return(account))
+    monkeypatch.setattr(worker_module, "orchestrate_paper_signal_execution", _fake_orchestrate)
+    monkeypatch.setattr(worker_module.strategy_registry, "get", lambda slug: _FixedStrategy("sell"))
+
+    stats = await run_orchestration_cycle(db=db, client=object(), config=_config())
+
+    assert execution_calls["count"] == 2
+    assert stats.signals_created == 2
+    assert stats.execution_candidates == 2
+    assert stats.executions_attempted == 2
+    assert stats.executions_rejected == 1
+    assert stats.executions_failed == 0

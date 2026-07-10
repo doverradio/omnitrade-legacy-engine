@@ -10,7 +10,7 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.logging import setup_logging
-from app.db.session import AsyncSessionLocal
+from app.db.session import AsyncSessionLocal, dispose_database_engine, is_retryable_db_connection_error
 from app.models.asset import Asset
 from app.services.data.binance_client import BinanceClientError, BinanceUSClient
 from app.services.data.candle_writer import upsert_candles
@@ -111,18 +111,30 @@ async def run_forever(poll_interval_seconds: int = MVP_POLL_INTERVAL_SECONDS) ->
         client = BinanceUSClient(http_client)
 
         while True:
-            async with AsyncSessionLocal() as db_session:
-                result = await run_ingestion_cycle(db_session, client)
+            sleep_seconds = poll_interval_seconds
+            try:
+                async with AsyncSessionLocal() as db_session:
+                    result = await run_ingestion_cycle(db_session, client)
 
-            logger.info(
-                "Ingestion cycle completed total_assets=%s successful_assets=%s failed_assets=%s rows_written=%s",
-                result.total_assets,
-                result.successful_assets,
-                result.failed_assets,
-                result.rows_written,
-            )
+                logger.info(
+                    "Ingestion cycle completed total_assets=%s successful_assets=%s failed_assets=%s rows_written=%s",
+                    result.total_assets,
+                    result.successful_assets,
+                    result.failed_assets,
+                    result.rows_written,
+                )
+            except Exception as exc:
+                if is_retryable_db_connection_error(exc):
+                    sleep_seconds = min(30, poll_interval_seconds)
+                    await dispose_database_engine()
+                    logger.warning(
+                        "Ingestion worker detected transient database disconnect; retrying next cycle after bounded backoff",
+                        exc_info=True,
+                    )
+                else:
+                    raise
 
-            await asyncio.sleep(poll_interval_seconds)
+            await asyncio.sleep(sleep_seconds)
 
 
 def main() -> int:
