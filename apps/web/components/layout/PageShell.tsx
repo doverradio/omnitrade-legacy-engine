@@ -17,6 +17,7 @@ const navItems = [
   { href: "/signals", label: "Signals" },
   { href: "/paper-trading", label: "Portfolio Intelligence" },
   { href: "/live-trading", label: "Live Trading Ops" },
+  { href: "/live-crypto-orders", label: "Live Orders" },
   { href: "/risk-monitor", label: "Risk Monitor" },
   { href: "/settings", label: "Settings" },
 ];

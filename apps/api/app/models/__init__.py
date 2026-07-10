@@ -30,6 +30,7 @@ from app.models.live_accounting_record import LiveAccountingRecord
 from app.models.live_approval_event import LiveApprovalEvent
 from app.models.live_execution_event import LiveExecutionEvent
 from app.models.live_execution_quality_metric import LiveExecutionQualityMetric
+from app.models.live_crypto_order import LiveCryptoOrder
 from app.models.live_reconciliation_event import LiveReconciliationEvent
 from app.models.live_resilience_event import LiveResilienceEvent
 from app.models.live_trading_event import LiveTradingEvent
@@ -88,6 +89,7 @@ __all__ = [
 	"LiveApprovalEvent",
 	"LiveExecutionEvent",
 	"LiveExecutionQualityMetric",
+	"LiveCryptoOrder",
 	"LiveReconciliationEvent",
 	"LiveResilienceEvent",
 	"LiveTradingEvent",

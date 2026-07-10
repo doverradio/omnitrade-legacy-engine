@@ -350,6 +350,55 @@ class CoinbaseAdvancedClient:
             exchange_response_summary=normalized,
         )
 
+    async def create_order(
+        self,
+        *,
+        credentials: dict[str, str],
+        environment: str,
+        request_payload: dict[str, Any],
+        idempotency_key: str,
+    ) -> tuple[dict[str, object], dict[str, str]]:
+        return await self._request_json(
+            method="POST",
+            path="/api/v3/brokerage/orders",
+            credentials=credentials,
+            environment=environment,
+            json_payload=request_payload,
+            extra_headers={"X-Idempotency-Key": idempotency_key},
+        )
+
+    async def get_historical_order(
+        self,
+        *,
+        credentials: dict[str, str],
+        environment: str,
+        order_id: str,
+    ) -> tuple[dict[str, object], dict[str, str]]:
+        return await self._request_json(
+            method="GET",
+            path=f"/api/v3/brokerage/orders/historical/{order_id}",
+            credentials=credentials,
+            environment=environment,
+        )
+
+    async def cancel_orders(
+        self,
+        *,
+        credentials: dict[str, str],
+        environment: str,
+        order_ids: list[str],
+        idempotency_key: str,
+    ) -> tuple[dict[str, object], dict[str, str]]:
+        payload = {"order_ids": order_ids}
+        return await self._request_json(
+            method="POST",
+            path="/api/v3/brokerage/orders/batch_cancel",
+            credentials=credentials,
+            environment=environment,
+            json_payload=payload,
+            extra_headers={"X-Idempotency-Key": idempotency_key},
+        )
+
     async def _request_json(
         self,
         *,
@@ -359,6 +408,7 @@ class CoinbaseAdvancedClient:
         environment: str,
         swallow_404: bool = False,
         json_payload: dict[str, Any] | None = None,
+        extra_headers: dict[str, str] | None = None,
     ) -> tuple[dict[str, object], dict[str, str]]:
         base_url = self._base_url(environment)
         body = json.dumps(json_payload) if json_payload is not None else ""
@@ -374,6 +424,8 @@ class CoinbaseAdvancedClient:
             "Authorization": f"Bearer {token}",
             "Accept": "application/json",
         }
+        if extra_headers:
+            headers.update(extra_headers)
         if json_payload is not None:
             headers["Content-Type"] = "application/json"
 

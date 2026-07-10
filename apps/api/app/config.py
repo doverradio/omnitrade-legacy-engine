@@ -25,6 +25,14 @@ class Settings(BaseSettings):
     crypto_preview_market_data_max_age_minutes: int = 15
     crypto_preview_expiration_minutes: int = 5
     crypto_preview_idempotency_window_minutes: int = 5
+    live_crypto_order_submission_enabled: bool = False
+    live_crypto_max_order_usd: Decimal = Decimal("5")
+    live_crypto_preparation_enabled: bool = False
+    live_crypto_confirmation_challenge_minutes: int = 1
+    live_crypto_preview_max_age_seconds: int = 30
+    live_crypto_balance_max_age_seconds: int = 30
+    live_crypto_readiness_max_age_seconds: int = 60
+    live_crypto_price_max_age_seconds: int = 30
 
     environment: str = "local"
     log_level: str = "INFO"
