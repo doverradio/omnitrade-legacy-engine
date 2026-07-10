@@ -16,11 +16,13 @@ from app.schemas.mission_control import (
 )
 from app.schemas.operations import OperationalAlertResponse, OperationalStatusResponse
 from app.schemas.validation_runs import ValidationRunResponse
+from app.services.dashboard_intelligence import build_dashboard_intelligence_score
 from app.services.operations_status import build_operations_status
 from app.services.validation_runs.service import list_validation_run_events, list_validation_runs
 
 _RANGE_CONFIG: dict[str, tuple[int, int]] = {
     "24h": (8, 60),
+    "72h": (12, 6 * 60),
     "7d": (12, 12 * 60),
     "30d": (16, 24 * 60),
     "90d": (20, 3 * 24 * 60),
@@ -46,21 +48,40 @@ async def build_mission_control_intelligence(*, db: AsyncSession, range_value: s
 
     generated_at = datetime.now(timezone.utc)
     operations = await build_operations_status(db=db)
+    dashboard_score = None
+    if hasattr(db, "scalar") and hasattr(db, "execute"):
+        dashboard_score = await build_dashboard_intelligence_score(db=db, range_value=normalized_range)
     validation_runs = await list_validation_runs(db=db)
     selected_validation_run = _pick_selected_run(validation_runs)
     run_events = await _load_run_events(db=db, validation_run=selected_validation_run)
 
     component_scores = _compute_component_scores(operations=operations, validation_runs=validation_runs)
-    current_score = _aggregate_score(component_scores)
-    history = _build_history(
-        generated_at=generated_at,
-        range_value=normalized_range,
-        current_score=current_score,
-        operations=operations,
-        validation_runs=validation_runs,
-        selected_validation_run=selected_validation_run,
-        run_events=run_events,
-    )
+    current_score = dashboard_score.score if dashboard_score is not None else _aggregate_score(component_scores)
+    if dashboard_score is not None:
+        baseline_equity = dashboard_score.timeline[0].equity if dashboard_score.timeline else Decimal("0")
+        history = [
+            MissionControlIntelligenceHistoryPointResponse(
+                timestamp=item.timestamp,
+                score=item.score,
+                paper_equity=format(item.equity, "f"),
+                paper_pnl=format(item.equity - baseline_equity, "f"),
+                signals=operations.monitoring.signals_generated,
+                trades=operations.monitoring.paper_trades_executed,
+                decision_count=operations.monitoring.decision_records_created,
+                health=item.operational_health,
+            )
+            for item in dashboard_score.timeline
+        ]
+    else:
+        history = _build_history(
+            generated_at=generated_at,
+            range_value=normalized_range,
+            current_score=current_score,
+            operations=operations,
+            validation_runs=validation_runs,
+            selected_validation_run=selected_validation_run,
+            run_events=run_events,
+        )
     trend = _build_trend(history=history)
     timeline_events = _build_timeline_events(
         generated_at=generated_at,

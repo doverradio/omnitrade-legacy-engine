@@ -55,6 +55,7 @@ from app.models.validation_run import ValidationRun
 from app.models.validation_run_event import ValidationRunEvent
 from app.models.validation_run_metric import ValidationRunMetric
 from app.models.validation_run_scorecard import ValidationRunScorecard
+from app.models.system_intelligence_snapshot import SystemIntelligenceSnapshot
 
 __all__ = [
 	"Asset",
@@ -114,4 +115,5 @@ __all__ = [
 	"ValidationRunEvent",
 	"ValidationRunMetric",
 	"ValidationRunScorecard",
+	"SystemIntelligenceSnapshot",
 ]

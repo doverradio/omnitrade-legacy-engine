@@ -20,6 +20,7 @@ import {
   type ValidationRunMetrics,
   type ValidationRunScorecard,
 } from "@/lib/api/arena";
+import { useStablePolling } from "@/lib/useStablePolling";
 
 type AccordionKey = "new" | "active" | "scorecard" | "history" | "timeline";
 
@@ -167,8 +168,14 @@ export default function ValidationRunsPage() {
     selectedRunIdRef.current = selectedRunId;
   }, [selectedRunId]);
 
-  const loadTimeline = useCallback(async (runId: string, reset: boolean): Promise<ValidationRunEventListResponse> => {
-    setTimelineLoading(true);
+  const loadTimeline = useCallback(async (
+    runId: string,
+    options: { reset: boolean; silent?: boolean },
+  ): Promise<ValidationRunEventListResponse> => {
+    const { reset, silent = false } = options;
+    if (!silent) {
+      setTimelineLoading(true);
+    }
     try {
       const page = reset ? 1 : timelinePage + 1;
       const result = await getValidationRunEvents(runId, {
@@ -186,7 +193,9 @@ export default function ValidationRunsPage() {
       setTimelineEvents((previous) => (reset ? result.items : [...previous, ...result.items]));
       return result;
     } finally {
-      setTimelineLoading(false);
+      if (!silent) {
+        setTimelineLoading(false);
+      }
     }
   }, [timelinePage, timelineQuery]);
 
@@ -245,31 +254,19 @@ export default function ValidationRunsPage() {
     }
   }, [timelineQuery]);
 
-  useEffect(() => {
-    let active = true;
-
-    async function load() {
-      setLoading(true);
-      setError(null);
-      try {
-        await refreshAll();
-      } catch (fetchError) {
-        if (active) {
-          setError(errorMessage(fetchError, "Failed to load validation runs."));
-        }
-      } finally {
-        if (active) {
-          setLoading(false);
-        }
-      }
-    }
-
-    void load();
-
-    return () => {
-      active = false;
-    };
+  const pollValidationRuns = useCallback(async () => {
+    await refreshAll();
+    return true;
   }, [refreshAll]);
+
+  const polling = useStablePolling(pollValidationRuns, { intervalMs: activeRuns.length > 0 ? 5000 : 15000, enabled: true });
+
+  useEffect(() => {
+    setLoading(polling.initialLoading);
+    if (polling.error) {
+      setError(errorMessage(new Error(polling.error), "Failed to refresh validation runs."));
+    }
+  }, [polling.error, polling.initialLoading]);
 
   useEffect(() => {
     if (!selectedRunId) {
@@ -277,31 +274,10 @@ export default function ValidationRunsPage() {
     }
 
     setError(null);
-    void loadTimeline(selectedRunId, true).catch((timelineError) => {
+    void loadTimeline(selectedRunId, { reset: true }).catch((timelineError) => {
       setError(errorMessage(timelineError, "Failed to load validation run timeline."));
     });
   }, [loadTimeline, selectedRunId, timelineQuery]);
-
-  useEffect(() => {
-    const intervalMs = activeRuns.length > 0 ? 5000 : 15000;
-    const timer = window.setInterval(() => {
-      setError(null);
-      void refreshAll().catch((refreshError) => {
-        setError(errorMessage(refreshError, "Failed to refresh validation runs."));
-      });
-
-      const currentSelectedRunId = selectedRunIdRef.current;
-      if (activeRuns.length > 0 && currentSelectedRunId) {
-        void loadTimeline(currentSelectedRunId, true).catch((timelineError) => {
-          setError(errorMessage(timelineError, "Failed to refresh timeline events."));
-        });
-      }
-    }, intervalMs);
-
-    return () => {
-      window.clearInterval(timer);
-    };
-  }, [activeRuns.length, loadTimeline, refreshAll, timelineQuery]);
 
   const effectiveDuration = durationPreset === "custom" ? Number(customDuration) : Number(durationPreset);
 
@@ -355,7 +331,7 @@ export default function ValidationRunsPage() {
     try {
       const detail = await getValidationRun(runId);
       setActiveDetail(detail);
-      await loadTimeline(runId, true);
+      await loadTimeline(runId, { reset: true });
       if (!metricsByRunId[runId]) {
         const metrics = await getValidationRunMetrics(runId);
         setMetricsByRunId((previous) => ({ ...previous, [runId]: metrics }));
@@ -665,7 +641,7 @@ export default function ValidationRunsPage() {
             if (!selectedRunId) {
               return;
             }
-            void loadTimeline(selectedRunId, false).catch((timelineError) => {
+            void loadTimeline(selectedRunId, { reset: false }).catch((timelineError) => {
               setError(errorMessage(timelineError, "Failed to load more timeline events."));
             });
           }}

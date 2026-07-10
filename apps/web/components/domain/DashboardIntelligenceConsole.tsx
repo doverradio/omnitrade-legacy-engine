@@ -1,7 +1,7 @@
 "use client";
 
 import Link from "next/link";
-import { useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useState } from "react";
 
 import PaperEquityCurvePanel from "@/components/domain/PaperEquityCurvePanel";
 import PaperPerformancePanel from "@/components/domain/PaperPerformancePanel";
@@ -13,6 +13,7 @@ import {
   type DashboardIntelligenceRange,
   type DashboardIntelligenceScore,
 } from "@/lib/api/dashboard";
+import { useStablePolling } from "@/lib/useStablePolling";
 
 type TabId = "intelligence" | "equity" | "strategy" | "pipeline" | "activity";
 
@@ -26,9 +27,11 @@ const TABS: Array<{ id: TabId; label: string }> = [
 
 const RANGE_OPTIONS: Array<{ value: DashboardIntelligenceRange; label: string }> = [
   { value: "24h", label: "Last 24 hours" },
+  { value: "72h", label: "Last 72 hours" },
   { value: "7d", label: "Last 7 days" },
   { value: "30d", label: "Last 30 days" },
   { value: "90d", label: "Last 90 days" },
+  { value: "all", label: "All available" },
 ];
 
 function resolveErrorMessage(error: unknown): string {
@@ -157,34 +160,27 @@ export default function DashboardIntelligenceConsole() {
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
 
+  const fetchDashboardIntelligence = useCallback(
+    async (signal: AbortSignal) => getDashboardIntelligenceScore(range, signal),
+    [range],
+  );
+
+  const polling = useStablePolling(fetchDashboardIntelligence, {
+    intervalMs: 15000,
+    enabled: activeTab === "intelligence",
+  });
+
   useEffect(() => {
-    let active = true;
-
-    async function load() {
-      setLoading(true);
-      setError(null);
-      try {
-        const next = await getDashboardIntelligenceScore(range);
-        if (active) {
-          setPayload(next);
-        }
-      } catch (requestError) {
-        if (active) {
-          setError(resolveErrorMessage(requestError));
-        }
-      } finally {
-        if (active) {
-          setLoading(false);
-        }
-      }
+    setLoading(polling.initialLoading);
+    if (polling.data) {
+      setPayload(polling.data);
     }
-
-    void load();
-
-    return () => {
-      active = false;
-    };
-  }, [range]);
+    if (polling.error) {
+      setError(resolveErrorMessage(new ApiRequestError(polling.error, 500)));
+      return;
+    }
+    setError(null);
+  }, [polling.data, polling.error, polling.initialLoading]);
 
   const score = payload?.score ?? 0;
   const completeness = payload?.data_completeness ?? 0;
@@ -265,6 +261,7 @@ export default function DashboardIntelligenceConsole() {
         </div>
 
         {error ? <p className="mt-4 rounded-xl border border-rose-400/30 bg-rose-500/10 p-3 text-sm text-rose-100">{error}</p> : null}
+        {!loading && polling.refreshing ? <p className="mt-4 text-xs text-cyan-100/70">Refreshing intelligence in background...</p> : null}
 
         <div className="mt-5" role="tabpanel">
           {activeTab === "intelligence" ? (

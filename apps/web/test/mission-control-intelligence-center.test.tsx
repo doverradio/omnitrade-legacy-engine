@@ -174,6 +174,47 @@ function installFetchMock(scenario: "healthy" | "empty" | "degraded" = "healthy"
     const rawUrl = typeof input === "string" ? input : input instanceof URL ? input.toString() : input.url;
     const url = new URL(rawUrl);
 
+    if (url.pathname === "/mission-control/profit") {
+      return jsonResponse(200, {
+        range: url.searchParams.get("range") ?? "24h",
+        mode: url.searchParams.get("mode") ?? "paper",
+        start_at: "2026-07-09T00:00:00Z",
+        end_at: "2026-07-09T10:00:00Z",
+        starting_equity: "100000.00",
+        ending_equity: "104523.55",
+        gross_profit: "700.00",
+        gross_loss: "176.45",
+        realized_pnl: "523.55",
+        unrealized_pnl: "120.00",
+        fees: "12.50",
+        fees_available: true,
+        net_profit: "523.55",
+        total_economic_pnl: "643.55",
+        return_percent: "0.52",
+        peak_equity: "104700.00",
+        max_drawdown_amount: "95.00",
+        max_drawdown_percent: "0.09",
+        winning_trades: 6,
+        losing_trades: 2,
+        breakeven_trades: 0,
+        win_rate: "75.00",
+        profit_factor: "3.97",
+        average_win: "116.67",
+        average_loss: "88.22",
+        largest_win: "200.00",
+        largest_loss: "-95.00",
+        trade_count: 8,
+        open_position_count: 2,
+        equity_series: [],
+        profit_series: [],
+        annotations: [],
+        source_counts: { paper_accounts: 1, paper_trades: 8 },
+        data_completeness: 100,
+        calculation_explanation: "Profit derived from paper trades and marked positions.",
+        generated_at: "2026-07-09T10:00:00Z",
+      });
+    }
+
     if (url.pathname === "/mission-control/intelligence") {
       if (scenario === "empty") {
         return jsonResponse(200, buildPayload(url.searchParams.get("range") ?? "24h"));
@@ -182,6 +223,78 @@ function installFetchMock(scenario: "healthy" | "empty" | "degraded" = "healthy"
         return jsonResponse(200, buildPayload(url.searchParams.get("range") ?? "24h", "yellow"));
       }
       return jsonResponse(200, buildPayload(url.searchParams.get("range") ?? "24h"));
+    }
+
+    if (url.pathname === "/mission-control/intelligence/history") {
+      return jsonResponse(200, {
+        range: url.searchParams.get("range") ?? "24h",
+        dimension: null,
+        generated_at: "2026-07-09T10:00:00Z",
+        points: [
+          {
+            snapshot_id: "snapshot-1",
+            captured_at: "2026-07-09T08:00:00Z",
+            bucket_start: "2026-07-09T08:00:00Z",
+            bucket_end: "2026-07-09T08:15:00Z",
+            overall_score: 78,
+            confidence: "High",
+            data_completeness: 100,
+            market_awareness_score: 75,
+            decision_quality_score: 80,
+            execution_reliability_score: 79,
+            risk_discipline_score: 74,
+            research_progress_score: 73,
+            adaptation_rate_score: 72,
+            operational_health_score: 90,
+            capital_efficiency_score: 81,
+            profit_performance_score: 77,
+            paper_net_profit: "0.00",
+            live_net_profit: "0.00",
+            combined_net_profit: "0.00",
+            paper_equity: "104000.00",
+            live_equity: "0.00",
+            combined_equity: "104000.00",
+            realized_pnl: "0.00",
+            unrealized_pnl: "0.00",
+            fees: "0.00",
+            drawdown_percent: "0.00",
+            source_counts: { paper_trades: 4, decision_records: 40 },
+            annotations: [],
+            schema_version: "v1",
+          },
+          {
+            snapshot_id: "snapshot-2",
+            captured_at: "2026-07-09T10:00:00Z",
+            bucket_start: "2026-07-09T10:00:00Z",
+            bucket_end: "2026-07-09T10:15:00Z",
+            overall_score: 82,
+            confidence: "High",
+            data_completeness: 100,
+            market_awareness_score: 80,
+            decision_quality_score: 82,
+            execution_reliability_score: 83,
+            risk_discipline_score: 75,
+            research_progress_score: 77,
+            adaptation_rate_score: 76,
+            operational_health_score: 94,
+            capital_efficiency_score: 84,
+            profit_performance_score: 82,
+            paper_net_profit: "523.55",
+            live_net_profit: "0.00",
+            combined_net_profit: "523.55",
+            paper_equity: "104523.55",
+            live_equity: "0.00",
+            combined_equity: "104523.55",
+            realized_pnl: "523.55",
+            unrealized_pnl: "120.00",
+            fees: "12.50",
+            drawdown_percent: "0.09",
+            source_counts: { paper_trades: 8, decision_records: 82 },
+            annotations: [],
+            schema_version: "v1",
+          },
+        ],
+      });
     }
 
     if (url.pathname === "/exchange-connections") {
@@ -290,8 +403,8 @@ describe("MissionControlIntelligenceCenter", () => {
     render(<MissionControlIntelligenceCenter />);
 
     expect(await screen.findByRole("heading", { name: "Mission Control" })).toBeInTheDocument();
-    expect(screen.getByText("System Intelligence")).toBeInTheDocument();
-    expect(screen.getByText("82 / 100")).toBeInTheDocument();
+    expect(await screen.findByText("System Intelligence")).toBeInTheDocument();
+    expect((await screen.findAllByText("82 / 100")).length).toBeGreaterThan(0);
     expect(screen.getByText("Prediction Quality")).toBeInTheDocument();
     expect(screen.getByText("Infrastructure Health")).toBeInTheDocument();
     expect(screen.getByText("Order Preview")).toBeInTheDocument();
@@ -306,7 +419,7 @@ describe("MissionControlIntelligenceCenter", () => {
     render(<MissionControlIntelligenceCenter />);
 
     expect(await screen.findByRole("heading", { name: "Mission Control" })).toBeInTheDocument();
-    fireEvent.click(screen.getByRole("button", { name: "7D" }));
+    fireEvent.click(await screen.findByRole("button", { name: "7D" }));
 
     await waitFor(() => {
       expect(
@@ -318,7 +431,7 @@ describe("MissionControlIntelligenceCenter", () => {
       ).toBe(true);
     });
 
-    fireEvent.click(screen.getByRole("button", { name: "ALL" }));
+    fireEvent.click(await screen.findByRole("button", { name: "ALL" }));
 
     await waitFor(() => {
       expect(
@@ -357,11 +470,12 @@ describe("MissionControlIntelligenceCenter", () => {
     expect(await screen.findByRole("heading", { name: "Mission Control" })).toBeInTheDocument();
     expect(screen.queryByRole("dialog", { name: "Timeline event detail" })).not.toBeInTheDocument();
 
-    fireEvent.click(screen.getByRole("button", { name: /Open Validation Run Started/i }));
+    const snapshotButtons = await screen.findAllByTitle(/Snapshot .*Score/i);
+    fireEvent.click(snapshotButtons[0]);
 
     expect(await screen.findByRole("dialog", { name: "Timeline event detail" })).toBeInTheDocument();
     expect(screen.getByText("Timestamp")).toBeInTheDocument();
-    expect(screen.getByText("Related validation run")).toBeInTheDocument();
+    expect(screen.getByText("Trades / Fills")).toBeInTheDocument();
 
     fireEvent.click(screen.getByRole("button", { name: "Close" }));
 

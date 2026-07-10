@@ -6,7 +6,48 @@ type ErrorEnvelope = {
 
 import { ApiRequestError, type OperationalStatus, type ValidationRun, type ValidationRunEventCategory, type ValidationRunEventSeverity } from "@/lib/api/arena";
 
-export type MissionControlIntelligenceRange = "24h" | "7d" | "30d" | "90d" | "all";
+export type MissionControlIntelligenceRange = "24h" | "72h" | "7d" | "30d" | "90d" | "all";
+export type MissionControlProfitRange = "24h" | "72h" | "7d" | "30d" | "90d" | "all";
+export type MissionControlProfitMode = "paper" | "live" | "combined";
+
+export type MissionControlSnapshotHistoryPoint = {
+  snapshot_id: string;
+  captured_at: string;
+  bucket_start: string;
+  bucket_end: string;
+  overall_score: number | null;
+  confidence: string | null;
+  data_completeness: number | null;
+  market_awareness_score: number | null;
+  decision_quality_score: number | null;
+  execution_reliability_score: number | null;
+  risk_discipline_score: number | null;
+  research_progress_score: number | null;
+  adaptation_rate_score: number | null;
+  operational_health_score: number | null;
+  capital_efficiency_score: number | null;
+  profit_performance_score: number | null;
+  paper_net_profit: string | null;
+  live_net_profit: string | null;
+  combined_net_profit: string | null;
+  paper_equity: string | null;
+  live_equity: string | null;
+  combined_equity: string | null;
+  realized_pnl: string | null;
+  unrealized_pnl: string | null;
+  fees: string | null;
+  drawdown_percent: string | null;
+  source_counts: Record<string, number>;
+  annotations: Array<Record<string, unknown>>;
+  schema_version: string;
+};
+
+export type MissionControlSnapshotHistoryResponse = {
+  range: MissionControlIntelligenceRange;
+  dimension: string | null;
+  points: MissionControlSnapshotHistoryPoint[];
+  generated_at: string;
+};
 
 export type MissionControlIntelligenceTrend = {
   direction: "up" | "down" | "flat";
@@ -69,11 +110,75 @@ export type MissionControlIntelligenceResponse = {
   notes: string;
 };
 
+export type MissionControlProfitSeriesPoint = {
+  timestamp: string;
+  paper_equity: string | null;
+  live_equity: string | null;
+  combined_equity: string | null;
+  cumulative_realized_pnl: string | null;
+  cumulative_unrealized_pnl: string | null;
+  cumulative_fees: string | null;
+  cumulative_net_profit: string | null;
+  drawdown: string | null;
+  trade_count: number;
+  source_event_ids: string[];
+};
+
+export type MissionControlProfitAnnotation = {
+  timestamp: string;
+  event_type: string;
+  title: string;
+  description: string;
+  severity: string;
+  source_record_id: string | null;
+  metadata: Record<string, unknown>;
+};
+
+export type MissionControlProfitResponse = {
+  range: MissionControlProfitRange;
+  mode: MissionControlProfitMode;
+  start_at: string | null;
+  end_at: string;
+  starting_equity: string | null;
+  ending_equity: string | null;
+  gross_profit: string | null;
+  gross_loss: string | null;
+  realized_pnl: string | null;
+  unrealized_pnl: string | null;
+  fees: string | null;
+  fees_available: boolean;
+  net_profit: string | null;
+  total_economic_pnl: string | null;
+  return_percent: string | null;
+  peak_equity: string | null;
+  max_drawdown_amount: string | null;
+  max_drawdown_percent: string | null;
+  winning_trades: number;
+  losing_trades: number;
+  breakeven_trades: number;
+  win_rate: string | null;
+  profit_factor: string | null;
+  average_win: string | null;
+  average_loss: string | null;
+  largest_win: string | null;
+  largest_loss: string | null;
+  trade_count: number;
+  open_position_count: number;
+  equity_series: MissionControlProfitSeriesPoint[];
+  profit_series: MissionControlProfitSeriesPoint[];
+  annotations: MissionControlProfitAnnotation[];
+  source_counts: Record<string, number>;
+  data_completeness: number;
+  calculation_explanation: string;
+  generated_at: string;
+};
+
 const API_BASE_URL = process.env.NEXT_PUBLIC_API_BASE_URL ?? "http://localhost:8000";
 
-async function requestJson<T>(path: string): Promise<T> {
+async function requestJson<T>(path: string, signal?: AbortSignal): Promise<T> {
   const response = await fetch(`${API_BASE_URL}${path}`, {
     cache: "no-store",
+    signal,
     headers: {
       "Content-Type": "application/json",
     },
@@ -98,6 +203,30 @@ async function requestJson<T>(path: string): Promise<T> {
 
 export async function getMissionControlIntelligence(
   range: MissionControlIntelligenceRange = "24h",
+  signal?: AbortSignal,
 ): Promise<MissionControlIntelligenceResponse> {
-  return requestJson<MissionControlIntelligenceResponse>(`/mission-control/intelligence?range=${encodeURIComponent(range)}`);
+  return requestJson<MissionControlIntelligenceResponse>(`/mission-control/intelligence?range=${encodeURIComponent(range)}`, signal);
+}
+
+export async function getMissionControlProfit(
+  range: MissionControlProfitRange = "24h",
+  mode: MissionControlProfitMode = "paper",
+  signal?: AbortSignal,
+): Promise<MissionControlProfitResponse> {
+  return requestJson<MissionControlProfitResponse>(
+    `/mission-control/profit?range=${encodeURIComponent(range)}&mode=${encodeURIComponent(mode)}`,
+    signal,
+  );
+}
+
+export async function getMissionControlIntelligenceHistory(
+  range: MissionControlIntelligenceRange = "24h",
+  dimension: string | null = null,
+  signal?: AbortSignal,
+): Promise<MissionControlSnapshotHistoryResponse> {
+  const query = new URLSearchParams({ range });
+  if (dimension) {
+    query.set("dimension", dimension);
+  }
+  return requestJson<MissionControlSnapshotHistoryResponse>(`/mission-control/intelligence/history?${query.toString()}`, signal);
 }

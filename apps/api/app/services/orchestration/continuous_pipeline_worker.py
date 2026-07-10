@@ -35,6 +35,7 @@ from app.services.replay.default_agent import ReplayPackageNotFoundError, replay
 from app.services.replay.identifiers import build_decision_package_id
 from app.services.research_activation import run_deterministic_research_cycle_if_due
 from app.services.signals.execution_orchestrator import SignalExecutionRequest, orchestrate_paper_signal_execution
+from app.services.system_intelligence_snapshots import capture_system_intelligence_snapshot_if_due
 from app.services.strategies import StrategyContext, strategy_registry
 from app.services.strategies.registry import StrategyLookupError
 
@@ -81,6 +82,7 @@ class CycleStats:
     executions_skipped: int
     decisions_inserted: int
     research_cycles_started: int
+    intelligence_snapshots_captured: int
 
 
 async def _load_active_assets(db: AsyncSession) -> list[Asset]:
@@ -542,6 +544,9 @@ async def run_orchestration_cycle(
     research_cycle_result = await run_deterministic_research_cycle_if_due(db=db)
     if research_cycle_result.started:
         await db.commit()
+    snapshot = await capture_system_intelligence_snapshot_if_due(db=db)
+    if snapshot is not None:
+        await db.commit()
 
     return CycleStats(
         ingestion_assets_ok=ingestion_result.successful_assets,
@@ -553,6 +558,7 @@ async def run_orchestration_cycle(
         executions_skipped=executions_skipped,
         decisions_inserted=decision_inserted_total,
         research_cycles_started=1 if research_cycle_result.started else 0,
+        intelligence_snapshots_captured=1 if snapshot is not None else 0,
     )
 
 
@@ -578,7 +584,7 @@ async def run_forever() -> None:
                     stats = await run_orchestration_cycle(db, client=client, config=config)
 
                 logger.info(
-                    "Pipeline cycle completed ingestion_assets_ok=%s signals_created=%s execution_candidates=%s executions_attempted=%s executions_rejected=%s executions_failed=%s executions_skipped=%s decisions_inserted=%s research_cycles_started=%s",
+                    "Pipeline cycle completed ingestion_assets_ok=%s signals_created=%s execution_candidates=%s executions_attempted=%s executions_rejected=%s executions_failed=%s executions_skipped=%s decisions_inserted=%s research_cycles_started=%s intelligence_snapshots_captured=%s",
                     stats.ingestion_assets_ok,
                     stats.signals_created,
                     stats.execution_candidates,
@@ -588,6 +594,7 @@ async def run_forever() -> None:
                     stats.executions_skipped,
                     stats.decisions_inserted,
                     stats.research_cycles_started,
+                    stats.intelligence_snapshots_captured,
                 )
             except Exception as exc:
                 if is_retryable_db_connection_error(exc):

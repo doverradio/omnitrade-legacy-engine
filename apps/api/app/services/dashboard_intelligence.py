@@ -31,9 +31,11 @@ class _RangeConfig:
 
 _RANGE_CONFIG: dict[str, _RangeConfig] = {
     "24h": _RangeConfig(window=timedelta(hours=24), interval_minutes=60),
+    "72h": _RangeConfig(window=timedelta(hours=72), interval_minutes=60),
     "7d": _RangeConfig(window=timedelta(days=7), interval_minutes=24 * 60),
     "30d": _RangeConfig(window=timedelta(days=30), interval_minutes=24 * 60),
     "90d": _RangeConfig(window=timedelta(days=90), interval_minutes=3 * 24 * 60),
+    "all": _RangeConfig(window=timedelta(days=90), interval_minutes=3 * 24 * 60),
 }
 
 _COMPONENT_WEIGHTS = {

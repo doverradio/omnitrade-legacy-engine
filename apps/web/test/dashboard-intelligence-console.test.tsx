@@ -159,9 +159,9 @@ describe("DashboardIntelligenceConsole", () => {
     expect(await screen.findByRole("heading", { name: "System Intelligence Console" })).toBeInTheDocument();
     expect(screen.getByRole("tab", { name: "Intelligence Timeline" })).toBeInTheDocument();
     expect(screen.getByRole("tab", { name: "Paper Equity" })).toBeInTheDocument();
-    expect(screen.getByRole("img", { name: "System intelligence timeline" })).toBeInTheDocument();
-    expect(screen.getByText("Decision Outcome Quality")).toBeInTheDocument();
-    expect(screen.getByText("Paper Performance")).toBeInTheDocument();
+    expect(await screen.findByRole("img", { name: "System intelligence timeline" })).toBeInTheDocument();
+    expect(await screen.findByText("Decision Outcome Quality")).toBeInTheDocument();
+    expect(await screen.findByText("Paper Performance")).toBeInTheDocument();
     expect(screen.getByRole("link", { name: /Latest equity/i })).toHaveAttribute("href", "/capital");
   });
 

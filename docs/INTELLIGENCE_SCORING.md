@@ -17,6 +17,9 @@ Current scoring and timelines rely on persisted or queryable evidence from:
 - research candidate evaluations
 - research memory growth
 - operational health status
+- system intelligence snapshots
+- paper profit / equity series
+- live accounting records where present
 
 ## Confidence
 
@@ -49,3 +52,20 @@ Intelligence views should remain consistent with:
 - validation run evidence
 - paper-only research activity
 - strict live-trading isolation
+
+## Profit Visibility
+
+Profit is now a first-class Mission Control metric.
+
+It must remain visibly separated into:
+- PAPER
+- LIVE
+- COMBINED
+
+Mission Control must not claim live profit where no live fills exist.
+
+## Snapshot Usage
+
+`system_intelligence_snapshots` persists bounded intelligence buckets for future historical timeline rendering.
+
+Snapshots are captured on bounded worker cadence, not on page load.

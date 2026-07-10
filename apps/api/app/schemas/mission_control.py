@@ -67,3 +67,42 @@ class MissionControlIntelligenceResponse(BaseModel):
     validation_runs: list[ValidationRunResponse]
     selected_validation_run_id: str | None
     notes: str
+
+
+class MissionControlSnapshotHistoryPointResponse(BaseModel):
+    snapshot_id: str
+    captured_at: datetime
+    bucket_start: datetime
+    bucket_end: datetime
+    overall_score: int | None
+    confidence: str | None
+    data_completeness: int | None
+    market_awareness_score: int | None
+    decision_quality_score: int | None
+    execution_reliability_score: int | None
+    risk_discipline_score: int | None
+    research_progress_score: int | None
+    adaptation_rate_score: int | None
+    operational_health_score: int | None
+    capital_efficiency_score: int | None
+    profit_performance_score: int | None
+    paper_net_profit: str | None
+    live_net_profit: str | None
+    combined_net_profit: str | None
+    paper_equity: str | None
+    live_equity: str | None
+    combined_equity: str | None
+    realized_pnl: str | None
+    unrealized_pnl: str | None
+    fees: str | None
+    drawdown_percent: str | None
+    source_counts: dict[str, int]
+    annotations: list[dict[str, object]]
+    schema_version: str
+
+
+class MissionControlSnapshotHistoryResponse(BaseModel):
+    range: str
+    dimension: str | None
+    points: list[MissionControlSnapshotHistoryPointResponse]
+    generated_at: datetime

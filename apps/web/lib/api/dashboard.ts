@@ -4,7 +4,7 @@ type ErrorEnvelope = {
   };
 };
 
-export type DashboardIntelligenceRange = "24h" | "7d" | "30d" | "90d";
+export type DashboardIntelligenceRange = "24h" | "72h" | "7d" | "30d" | "90d" | "all";
 
 export type DashboardIntelligenceComponent = {
   name: string;
@@ -55,9 +55,10 @@ export class ApiRequestError extends Error {
   }
 }
 
-async function requestJson<T>(path: string): Promise<T> {
+async function requestJson<T>(path: string, signal?: AbortSignal): Promise<T> {
   const response = await fetch(`${API_BASE_URL}${path}`, {
     cache: "no-store",
+    signal,
     headers: {
       "Content-Type": "application/json",
     },
@@ -80,6 +81,9 @@ async function requestJson<T>(path: string): Promise<T> {
   return (await response.json()) as T;
 }
 
-export async function getDashboardIntelligenceScore(range: DashboardIntelligenceRange = "24h"): Promise<DashboardIntelligenceScore> {
-  return requestJson<DashboardIntelligenceScore>(`/dashboard/intelligence-score?range=${encodeURIComponent(range)}`);
+export async function getDashboardIntelligenceScore(
+  range: DashboardIntelligenceRange = "24h",
+  signal?: AbortSignal,
+): Promise<DashboardIntelligenceScore> {
+  return requestJson<DashboardIntelligenceScore>(`/dashboard/intelligence-score?range=${encodeURIComponent(range)}`, signal);
 }
