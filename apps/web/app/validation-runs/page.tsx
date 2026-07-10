@@ -1,5 +1,6 @@
 "use client";
 
+import Link from "next/link";
 import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from "react";
 
 import ValidationRunTimeline, { type TimelineQuery } from "@/components/domain/ValidationRunTimeline";
@@ -417,7 +418,10 @@ export default function ValidationRunsPage() {
               value={paperCapital}
               onChange={(event) => setPaperCapital(event.target.value)}
             />
-            <span className="mt-1 block text-xs text-foreground/65">Default proving capital is $25 in Small Account Mode.</span>
+            <span className="mt-1 block text-xs text-foreground/65">
+              Default proving capital is $25 in Small Account Mode. 
+              <Link href="/capital" className="font-medium text-cyan-300 hover:text-cyan-200">Open Capital Ledger</Link>
+            </span>
           </label>
 
           <label className="text-sm md:col-span-2">
@@ -562,6 +566,12 @@ export default function ValidationRunsPage() {
                     <p>Progress: {metrics ? `${metrics.elapsed_percentage.toFixed(2)}%` : "--"}</p>
                     <p>Time remaining: {metrics?.time_remaining ?? "--"}</p>
                     <p>Health score: {run.health_score ?? activeDetail?.overall_score ?? 0}</p>
+                    <p>
+                      Paper capital: {formatCurrency(run.paper_capital)}{" "}
+                      <Link href="/capital" className="font-medium text-cyan-300 hover:text-cyan-200">
+                        View Ledger
+                      </Link>
+                    </p>
                     <p>Paper PnL: {metrics ? formatCurrency(metrics.paper_pnl_during_run) : "--"}</p>
                     <p>Alerts: {metrics?.alerts_count ?? 0}</p>
                   </div>

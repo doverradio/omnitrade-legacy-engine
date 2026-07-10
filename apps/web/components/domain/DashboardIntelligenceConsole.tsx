@@ -1,5 +1,6 @@
 "use client";
 
+import Link from "next/link";
 import { useEffect, useMemo, useState } from "react";
 
 import PaperEquityCurvePanel from "@/components/domain/PaperEquityCurvePanel";
@@ -111,10 +112,10 @@ function IntelligenceChart({ data }: { data: DashboardIntelligenceScore["timelin
           <p className="text-[11px] uppercase tracking-wide text-foreground/65">Latest score</p>
           <p className="mt-1 text-xl font-semibold text-foreground">{latest.score}</p>
         </article>
-        <article className="rounded-xl border border-border bg-background/55 p-3">
+        <Link href="/capital" className="rounded-xl border border-border bg-background/55 p-3 transition hover:border-cyan-400/40 hover:bg-cyan-500/10">
           <p className="text-[11px] uppercase tracking-wide text-foreground/65">Latest equity</p>
           <p className="mt-1 text-xl font-semibold text-foreground">{latest.equity}</p>
-        </article>
+        </Link>
         <article className="rounded-xl border border-border bg-background/55 p-3">
           <p className="text-[11px] uppercase tracking-wide text-foreground/65">Decision quality</p>
           <p className="mt-1 text-xl font-semibold text-foreground">{latest.decision_quality}</p>

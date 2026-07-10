@@ -706,6 +706,7 @@ describe("ValidationRunsPage", () => {
     render(<ValidationRunsPage />);
 
     expect(await screen.findByRole("heading", { name: "Validation Runs" })).toBeInTheDocument();
+    expect(screen.getByRole("link", { name: "View Ledger" })).toHaveAttribute("href", "/capital");
     expect(intervalSpy).toHaveBeenCalledWith(expect.any(Function), 5000);
     intervalSpy.mockRestore();
   });

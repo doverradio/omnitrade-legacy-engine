@@ -162,6 +162,7 @@ describe("DashboardIntelligenceConsole", () => {
     expect(screen.getByRole("img", { name: "System intelligence timeline" })).toBeInTheDocument();
     expect(screen.getByText("Decision Outcome Quality")).toBeInTheDocument();
     expect(screen.getByText("Paper Performance")).toBeInTheDocument();
+    expect(screen.getByRole("link", { name: /Latest equity/i })).toHaveAttribute("href", "/capital");
   });
 
   it("renders an empty intelligence state when no timeline data exists", async () => {

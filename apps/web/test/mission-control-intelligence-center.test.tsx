@@ -256,10 +256,12 @@ describe("MissionControlIntelligenceCenter", () => {
 
     fireEvent.click(screen.getByRole("button", { name: /Research/i }));
     fireEvent.click(screen.getByRole("button", { name: /Alerts/i }));
+    fireEvent.click(screen.getByRole("button", { name: /Monitoring/i }));
 
     expect(screen.getByText("Current Campaign")).toBeInTheDocument();
     expect(screen.getByText("No active alerts.")).toBeInTheDocument();
     expect(screen.getAllByText("Validation Run Started").length).toBeGreaterThan(0);
+    expect(screen.getByRole("link", { name: /Open Capital Ledger/i })).toHaveAttribute("href", "/capital");
   });
 
   it("keeps mobile event detail closed by default and closed after refresh until reselected", async () => {

@@ -1,5 +1,6 @@
 "use client";
 
+import Link from "next/link";
 import { useEffect, useMemo, useRef, useState } from "react";
 
 import ValidationRunTimeline from "@/components/domain/ValidationRunTimeline";
@@ -219,12 +220,26 @@ function MetricCard({ metric }: { metric: MissionControlIntelligenceMetric }) {
   );
 }
 
-function MetricStat({ label, value, helper }: { label: string; value: string; helper?: string }) {
-  return (
-    <article className="rounded-2xl border border-border bg-background/55 p-4">
+function MetricStat({ label, value, helper, href }: { label: string; value: string; helper?: string; href?: string }) {
+  const content = (
+    <>
       <p className="text-[11px] uppercase tracking-wide text-foreground/65">{label}</p>
       <p className="mt-2 text-2xl font-semibold text-foreground">{value}</p>
       {helper ? <p className="mt-1 text-xs text-foreground/70">{helper}</p> : null}
+    </>
+  );
+
+  if (href) {
+    return (
+      <Link href={href} className="rounded-2xl border border-border bg-background/55 p-4 transition hover:border-cyan-400/40 hover:bg-cyan-500/10">
+        {content}
+      </Link>
+    );
+  }
+
+  return (
+    <article className="rounded-2xl border border-border bg-background/55 p-4">
+      {content}
     </article>
   );
 }
@@ -626,7 +641,7 @@ export default function MissionControlIntelligenceCenter() {
               <MetricStat label="Signals Today" value={String(payload.operations.monitoring.signals_today)} />
               <MetricStat label="Trades Today" value={String(payload.operations.monitoring.trades_today)} />
               <MetricStat label="Paper Trades" value={String(payload.operations.monitoring.paper_trades_executed)} />
-              <MetricStat label="Paper Equity" value={formatCurrency(payload.operations.monitoring.paper_equity)} />
+              <MetricStat label="Paper Equity" value={formatCurrency(payload.operations.monitoring.paper_equity)} href="/capital" helper="Open Capital Ledger" />
             </div>
           </AccordionSection>
 
@@ -655,7 +670,7 @@ export default function MissionControlIntelligenceCenter() {
 
           <AccordionSection id="paperTrading" title="Paper Trading" open={openSections.paperTrading} onToggle={toggleAccordion}>
             <div className="grid gap-3 sm:grid-cols-2 xl:grid-cols-3">
-              <MetricStat label="Paper Equity" value={formatCurrency(payload.operations.monitoring.paper_equity)} />
+              <MetricStat label="Paper Equity" value={formatCurrency(payload.operations.monitoring.paper_equity)} href="/capital" helper="Open Capital Ledger" />
               <MetricStat label="Current Champion" value={String(payload.operations.monitoring.current_champion ?? payload.operations.research_status.current_champion ?? "None")} />
               <MetricStat label="Paper Trades Executed" value={String(payload.operations.monitoring.paper_trades_executed)} />
               <MetricStat label="Signals Today" value={String(payload.operations.monitoring.signals_today)} />
