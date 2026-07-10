@@ -6,12 +6,14 @@ import { useMemo, useState } from "react";
 import { ApiRequestError } from "@/lib/api/live";
 import {
   cancelLiveCryptoOrder,
+  dryRunLiveCryptoOrderConfirmation,
   getLiveCryptoOrderReadiness,
   listLiveCryptoOrders,
   prepareLiveCryptoOrderConfirmation,
   reconcileLiveCryptoOrder,
   submitLiveCryptoOrder,
   type LiveCryptoOrder,
+  type LiveCryptoOrderDryRunResponse,
   type LiveCryptoOrderPrepareResponse,
   type LiveCryptoOrderReadiness,
   type LiveCryptoOrderStatus,
@@ -59,6 +61,12 @@ function statusClass(status: LiveCryptoOrderStatus): string {
   if (status === "RECONCILIATION_REQUIRED") {
     return "border-amber-500/40 bg-amber-500/10 text-amber-100";
   }
+  if (status === "DRY_RUN_READY") {
+    return "border-emerald-500/40 bg-emerald-500/10 text-emerald-100";
+  }
+  if (status === "DRY_RUN_BLOCKED") {
+    return "border-amber-500/40 bg-amber-500/10 text-amber-100";
+  }
   return "border-cyan-500/40 bg-cyan-500/10 text-cyan-100";
 }
 
@@ -66,16 +74,18 @@ export default function LiveCryptoOrderCenter() {
   const [profileId, setProfileId] = useState("");
   const [previewId, setPreviewId] = useState("");
   const [operatorIdentity, setOperatorIdentity] = useState("operator:human");
-  const [confirmationPhrase, setConfirmationPhrase] = useState("CONFIRM BTC-USD BUY $5");
+  const [confirmationPhrase, setConfirmationPhrase] = useState("BUY BTC");
   const [idempotencyToken, setIdempotencyToken] = useState(() => crypto.randomUUID());
   const [readiness, setReadiness] = useState<LiveCryptoOrderReadiness | null>(null);
   const [orders, setOrders] = useState<LiveCryptoOrder[]>([]);
   const [selectedOrder, setSelectedOrder] = useState<LiveCryptoOrder | null>(null);
   const [preparedConfirmation, setPreparedConfirmation] = useState<LiveCryptoOrderPrepareResponse | null>(null);
+  const [dryRunResult, setDryRunResult] = useState<LiveCryptoOrderDryRunResponse | null>(null);
   const [statusMessage, setStatusMessage] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [loading, setLoading] = useState(false);
   const [preparing, setPreparing] = useState(false);
+  const [dryRunning, setDryRunning] = useState(false);
   const [submitting, setSubmitting] = useState(false);
   const [reconciling, setReconciling] = useState(false);
   const [cancelling, setCancelling] = useState(false);
@@ -86,6 +96,7 @@ export default function LiveCryptoOrderCenter() {
   );
 
   const canSubmit = readiness?.feature_flag_enabled === true && readiness?.live_mode_enabled === true && readiness?.live_profile_ready === true;
+  const canDryRun = readiness?.dry_run_enabled === true && profileId.trim().length > 0 && previewId.trim().length > 0;
 
   async function loadWorkspace() {
     if (!profileId.trim()) {
@@ -108,6 +119,35 @@ export default function LiveCryptoOrderCenter() {
       setError(errorMessage(requestError, "Unable to load live order workspace."));
     } finally {
       setLoading(false);
+    }
+  }
+
+  async function runDryRun() {
+    if (!canDryRun) {
+      setError("Dry run requires readiness to be loaded and the server dry-run flag to be enabled.");
+      return;
+    }
+    setDryRunning(true);
+    setError(null);
+    setStatusMessage(null);
+    try {
+      const response = await dryRunLiveCryptoOrderConfirmation({
+        live_trading_profile_id: profileId.trim(),
+        crypto_order_preview_id: previewId.trim(),
+        operator_identity: operatorIdentity.trim(),
+        idempotency_token: idempotencyToken.trim() || crypto.randomUUID(),
+      });
+      setDryRunResult(response);
+      setSelectedOrder(response.live_crypto_order);
+      setOrders((current) => {
+        const existing = current.filter((item) => item.live_crypto_order_id !== response.live_crypto_order.live_crypto_order_id);
+        return [response.live_crypto_order, ...existing];
+      });
+      setStatusMessage(response.order_submitted ? "Dry run unexpectedly submitted an order." : response.dry_run_message);
+    } catch (requestError) {
+      setError(errorMessage(requestError, "Unable to run live order dry run."));
+    } finally {
+      setDryRunning(false);
     }
   }
 
@@ -318,9 +358,17 @@ export default function LiveCryptoOrderCenter() {
             </button>
             <button
               type="button"
+              className="rounded-full border border-cyan-400/40 bg-cyan-500/15 px-4 py-2 text-sm font-semibold text-cyan-50 disabled:cursor-not-allowed disabled:opacity-40"
+              onClick={runDryRun}
+              disabled={dryRunning || !canDryRun}
+            >
+              {dryRunning ? "Running Dry Run..." : "Run Dry Run"}
+            </button>
+            <button
+              type="button"
               className="rounded-full border border-emerald-400/40 bg-emerald-500/15 px-4 py-2 text-sm font-semibold text-emerald-50 disabled:cursor-not-allowed disabled:opacity-40"
               onClick={submitOrder}
-                disabled={submitting || !canSubmit || !selectedOrder || !preparedConfirmation}
+              disabled={submitting || !canSubmit || !selectedOrder || !preparedConfirmation}
             >
               {submitting ? "Submitting..." : "Submit Live Order"}
             </button>
@@ -347,16 +395,40 @@ export default function LiveCryptoOrderCenter() {
           <p className="text-xs uppercase tracking-[0.3em] text-foreground/60">Server Gate</p>
           <h2 className="mt-2 text-xl font-semibold text-foreground">Readiness</h2>
           <div className="mt-4 space-y-3 text-sm text-foreground/80">
+            <p>Overall verdict: {readiness?.overall_verdict ?? "Not loaded"}</p>
             <p>Feature flag: {readiness ? (readiness.feature_flag_enabled ? "Enabled" : "Disabled") : "Not loaded"}</p>
+            <p>Dry run: {readiness ? (readiness.dry_run_enabled ? "Enabled" : "Disabled") : "Not loaded"}</p>
             <p>Live profile ready: {readiness ? String(readiness.live_profile_ready) : "Not loaded"}</p>
             <p>Live mode enabled: {readiness ? String(readiness.live_mode_enabled) : "Not loaded"}</p>
             <p>Max order size: {readiness ? formatCurrency(readiness.max_order_usd) : "$5.00"}</p>
             <p>Latest preview age: {readiness?.latest_preview_age_seconds ?? "Not available"}</p>
             <p>Gate reason: {readiness?.reason ?? "None"}</p>
           </div>
+          {readiness?.checks?.length ? (
+            <div className="mt-4 space-y-2 rounded-2xl border border-border bg-background/40 p-3 text-sm text-foreground/80">
+              <p className="text-xs uppercase tracking-[0.3em] text-foreground/60">First Live Trade Readiness</p>
+              {readiness.checks.map((check) => (
+                <div key={check.code} className="rounded-xl border border-border/80 bg-slate-950/40 p-3">
+                  <div className="flex flex-wrap items-center justify-between gap-2">
+                    <p className="font-semibold text-foreground">{check.label}</p>
+                    <span className="text-xs uppercase tracking-[0.25em] text-foreground/60">{check.status}</span>
+                  </div>
+                  <p className="mt-1 text-xs text-foreground/70">{check.explanation}</p>
+                  <p className="mt-1 text-xs text-foreground/60">{check.remediation}</p>
+                </div>
+              ))}
+            </div>
+          ) : null}
           <div className="mt-4 rounded-2xl border border-amber-500/40 bg-amber-500/10 p-3 text-sm text-amber-50">
             If the server flag is disabled, the UI refuses submission and keeps the control path closed.
           </div>
+          {dryRunResult ? (
+            <div className="mt-3 rounded-2xl border border-cyan-500/40 bg-cyan-500/10 p-3 text-sm text-cyan-50">
+              <p>Dry run status: {dryRunResult.dry_run_status}</p>
+              <p className="mt-1">{dryRunResult.dry_run_message}</p>
+              <p className="mt-1">Coinbase Create Order called: {dryRunResult.provider_create_order_called ? "Yes" : "No"}</p>
+            </div>
+          ) : null}
           {preparedConfirmation ? (
             <div className="mt-3 rounded-2xl border border-cyan-500/40 bg-cyan-500/10 p-3 text-sm text-cyan-50">
               <p>Confirmation required: {preparedConfirmation.confirmation_phrase_required}</p>

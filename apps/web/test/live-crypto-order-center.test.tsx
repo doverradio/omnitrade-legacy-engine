@@ -55,15 +55,18 @@ function installFetchMock() {
 
     if (url.pathname === "/live-crypto-orders/readiness") {
       return jsonResponse(200, {
+        overall_verdict: "READY_FOR_DRY_RUN",
         live_mode_enabled: false,
         live_profile_ready: false,
         feature_flag_enabled: false,
+        dry_run_enabled: true,
         max_order_usd: "5.00",
         latest_preview_age_seconds: 18,
         latest_balance_age_seconds: 12,
         latest_readiness_age_seconds: 15,
         latest_price_age_seconds: 10,
         reason: "live_submission_disabled",
+        checks: [],
       });
     }
 
@@ -75,13 +78,24 @@ function installFetchMock() {
       return jsonResponse(200, {
         live_crypto_order: orderItem({ status: "PENDING_CONFIRMATION" }),
         confirmation_challenge_id: "challenge-1",
-        confirmation_phrase_required: "CONFIRM BTC-USD BUY $5",
+        confirmation_phrase_required: "BUY BTC",
         confirmation_expires_at: "2026-07-09T10:05:00Z",
         live_money_warning: "LIVE MONEY: operator confirmation required before submission.",
         execution_risk_verdict: "APPROVE",
         preview_age_seconds: 18,
         estimated_usd_balance_after: null,
         usd_balance_before: null,
+      });
+    }
+
+    if (url.pathname === "/live-crypto-orders/dry-run" && (init?.method ?? "GET") === "POST") {
+      return jsonResponse(200, {
+        live_crypto_order: orderItem({ status: "DRY_RUN_READY" }),
+        dry_run_status: "DRY_RUN_READY",
+        dry_run_message: "Dry run completed. No Coinbase order was submitted.",
+        safe_request_summary: { dry_run: true },
+        provider_create_order_called: false,
+        order_submitted: false,
       });
     }
 
@@ -130,8 +144,10 @@ describe("LiveCryptoOrderCenter", () => {
     fireEvent.click(screen.getByRole("button", { name: "Load Readiness" }));
 
     expect(await screen.findByText("Feature flag: Disabled")).toBeInTheDocument();
+    expect(screen.getByText("Dry run: Enabled")).toBeInTheDocument();
     expect(screen.getByRole("button", { name: "Prepare Confirmation" })).toBeDisabled();
     expect(screen.getByRole("button", { name: "Submit Live Order" })).toBeDisabled();
+    expect(screen.getByRole("button", { name: "Run Dry Run" })).toBeEnabled();
     expect(screen.getByText("Recent Live Orders")).toBeInTheDocument();
   });
 
@@ -143,15 +159,18 @@ describe("LiveCryptoOrderCenter", () => {
 
       if (url.pathname === "/live-crypto-orders/readiness") {
         return jsonResponse(200, {
+          overall_verdict: "READY_FOR_OPERATOR_ENABLEMENT",
           live_mode_enabled: true,
           live_profile_ready: true,
           feature_flag_enabled: true,
+          dry_run_enabled: true,
           max_order_usd: "5.00",
           latest_preview_age_seconds: 12,
           latest_balance_age_seconds: 9,
           latest_readiness_age_seconds: 8,
           latest_price_age_seconds: 5,
           reason: null,
+          checks: [],
         });
       }
 
@@ -163,7 +182,7 @@ describe("LiveCryptoOrderCenter", () => {
         return jsonResponse(200, {
           live_crypto_order: orderItem(),
           confirmation_challenge_id: "challenge-1",
-          confirmation_phrase_required: "CONFIRM BTC-USD BUY $5",
+          confirmation_phrase_required: "BUY BTC",
           confirmation_expires_at: "2026-07-09T10:05:00Z",
           live_money_warning: "LIVE MONEY: operator confirmation required before submission.",
           execution_risk_verdict: "APPROVE",
@@ -204,7 +223,7 @@ describe("LiveCryptoOrderCenter", () => {
     expect(await screen.findByText("Feature flag: Enabled")).toBeInTheDocument();
 
     fireEvent.click(screen.getByRole("button", { name: "Prepare Confirmation" }));
-    expect(await screen.findByText(/Confirmation required: CONFIRM BTC-USD BUY \$5/)).toBeInTheDocument();
+    expect(await screen.findByText(/Confirmation required: BUY BTC/)).toBeInTheDocument();
 
     fireEvent.click(screen.getByRole("button", { name: "Submit Live Order" }));
     expect(await screen.findByText("Live order submitted.")).toBeInTheDocument();

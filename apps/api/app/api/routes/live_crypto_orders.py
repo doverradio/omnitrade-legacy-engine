@@ -5,9 +5,13 @@ import uuid
 from fastapi import APIRouter, Depends
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.core.errors import UnauthorizedError
+from app.core.security import get_current_user
 from app.db.session import get_db
 from app.schemas.live_crypto_orders import (
     LiveCryptoOrderCancelRequest,
+    LiveCryptoOrderDryRunRequest,
+    LiveCryptoOrderDryRunResponse,
     LiveCryptoOrderListResponse,
     LiveCryptoOrderPrepareRequest,
     LiveCryptoOrderPrepareResponse,
@@ -52,16 +56,39 @@ async def read_live_crypto_order(
 @router.post("/prepare-confirmation", response_model=LiveCryptoOrderPrepareResponse)
 async def prepare_live_crypto_order_confirmation(
     payload: LiveCryptoOrderPrepareRequest,
+    current_user: dict[str, str] | None = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ) -> LiveCryptoOrderPrepareResponse:
+    if current_user is None:
+        raise UnauthorizedError(message="Authentication required", details={})
+    if current_user["id"] != payload.operator_identity:
+        raise UnauthorizedError(message="Authenticated operator identity mismatch", details={})
     return await service.prepare_confirmation(db=db, request=payload)
+
+
+@router.post("/dry-run", response_model=LiveCryptoOrderDryRunResponse)
+async def dry_run_live_crypto_order_confirmation(
+    payload: LiveCryptoOrderDryRunRequest,
+    current_user: dict[str, str] | None = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+) -> LiveCryptoOrderDryRunResponse:
+    if current_user is None:
+        raise UnauthorizedError(message="Authentication required", details={})
+    if current_user["id"] != payload.operator_identity:
+        raise UnauthorizedError(message="Authenticated operator identity mismatch", details={})
+    return await service.dry_run(db=db, request=payload)
 
 
 @router.post("/submit", response_model=LiveCryptoOrderSubmitResponse)
 async def submit_live_crypto_order(
     payload: LiveCryptoOrderSubmitRequest,
+    current_user: dict[str, str] | None = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ) -> LiveCryptoOrderSubmitResponse:
+    if current_user is None:
+        raise UnauthorizedError(message="Authentication required", details={})
+    if current_user["id"] != payload.operator_identity:
+        raise UnauthorizedError(message="Authenticated operator identity mismatch", details={})
     return await service.submit(db=db, request=payload)
 
 
@@ -69,8 +96,13 @@ async def submit_live_crypto_order(
 async def reconcile_live_crypto_order(
     live_crypto_order_id: uuid.UUID,
     payload: LiveCryptoOrderReconcileRequest,
+    current_user: dict[str, str] | None = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ) -> LiveCryptoOrderReconcileResponse:
+    if current_user is None:
+        raise UnauthorizedError(message="Authentication required", details={})
+    if current_user["id"] != payload.operator_identity:
+        raise UnauthorizedError(message="Authenticated operator identity mismatch", details={})
     return await service.reconcile(db=db, live_crypto_order_id=live_crypto_order_id, request=payload)
 
 
@@ -78,6 +110,11 @@ async def reconcile_live_crypto_order(
 async def cancel_live_crypto_order(
     live_crypto_order_id: uuid.UUID,
     payload: LiveCryptoOrderCancelRequest,
+    current_user: dict[str, str] | None = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ) -> LiveCryptoOrderResponse:
+    if current_user is None:
+        raise UnauthorizedError(message="Authentication required", details={})
+    if current_user["id"] != payload.operator_identity:
+        raise UnauthorizedError(message="Authenticated operator identity mismatch", details={})
     return await service.cancel(db=db, live_crypto_order_id=live_crypto_order_id, request=payload)

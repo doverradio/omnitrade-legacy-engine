@@ -1,6 +1,8 @@
 import { ApiRequestError } from "@/lib/api/live";
 
 export type LiveCryptoOrderStatus =
+  | "DRY_RUN_READY"
+  | "DRY_RUN_BLOCKED"
   | "PENDING_CONFIRMATION"
   | "CONFIRMATION_EXPIRED"
   | "VALIDATING"
@@ -58,15 +60,25 @@ export type LiveCryptoOrder = {
 };
 
 export type LiveCryptoOrderReadiness = {
+  overall_verdict: "NOT_CONFIGURED" | "BLOCKED" | "READY_FOR_DRY_RUN" | "DRY_RUN_PASSED" | "READY_FOR_OPERATOR_ENABLEMENT";
   live_mode_enabled: boolean;
   live_profile_ready: boolean;
   feature_flag_enabled: boolean;
+  dry_run_enabled: boolean;
   max_order_usd: string;
   latest_preview_age_seconds: number | null;
   latest_balance_age_seconds: number | null;
   latest_readiness_age_seconds: number | null;
   latest_price_age_seconds: number | null;
   reason: string | null;
+  checks: Array<{
+    code: string;
+    label: string;
+    status: "pass" | "warn" | "fail";
+    explanation: string;
+    checked_at: string;
+    remediation: string;
+  }>;
 };
 
 export type LiveCryptoOrderPrepareRequest = {
@@ -103,6 +115,17 @@ export type LiveCryptoOrderPrepareResponse = {
   preview_age_seconds: number;
   estimated_usd_balance_after: string | null;
   usd_balance_before: string | null;
+};
+
+export type LiveCryptoOrderDryRunRequest = LiveCryptoOrderPrepareRequest;
+
+export type LiveCryptoOrderDryRunResponse = {
+  live_crypto_order: LiveCryptoOrder;
+  dry_run_status: "DRY_RUN_READY" | "DRY_RUN_BLOCKED";
+  dry_run_message: string;
+  safe_request_summary: Record<string, unknown>;
+  provider_create_order_called: boolean;
+  order_submitted: boolean;
 };
 
 export type LiveCryptoOrderSubmitResponse = {
@@ -179,6 +202,15 @@ export async function prepareLiveCryptoOrderConfirmation(
 ): Promise<LiveCryptoOrderPrepareResponse> {
   return requestJson<LiveCryptoOrderPrepareResponse>("/live-crypto-orders/prepare-confirmation", {
     method: "POST",
+    body: JSON.stringify(payload),
+  });
+}
+
+export async function dryRunLiveCryptoOrderConfirmation(
+  payload: LiveCryptoOrderDryRunRequest,
+): Promise<LiveCryptoOrderDryRunResponse> {
+  return requestJson<LiveCryptoOrderDryRunResponse>('/live-crypto-orders/dry-run', {
+    method: 'POST',
     body: JSON.stringify(payload),
   });
 }

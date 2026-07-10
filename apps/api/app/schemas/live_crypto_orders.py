@@ -9,6 +9,8 @@ from pydantic import BaseModel, Field, field_serializer
 
 
 LiveCryptoOrderStatus = Literal[
+    "DRY_RUN_READY",
+    "DRY_RUN_BLOCKED",
     "PENDING_CONFIRMATION",
     "CONFIRMATION_EXPIRED",
     "VALIDATING",
@@ -37,8 +39,24 @@ LiveCryptoOrderProviderStatus = Literal[
     "UNKNOWN",
 ]
 
+LiveCryptoOrderDryRunStatus = Literal["DRY_RUN_READY", "DRY_RUN_BLOCKED"]
+LiveCryptoOrderReadinessVerdict = Literal[
+    "NOT_CONFIGURED",
+    "BLOCKED",
+    "READY_FOR_DRY_RUN",
+    "DRY_RUN_PASSED",
+    "READY_FOR_OPERATOR_ENABLEMENT",
+]
+
 
 class LiveCryptoOrderPrepareRequest(BaseModel):
+    live_trading_profile_id: UUID
+    crypto_order_preview_id: UUID
+    operator_identity: str = Field(min_length=1, max_length=120)
+    idempotency_token: str | None = None
+
+
+class LiveCryptoOrderDryRunRequest(BaseModel):
     live_trading_profile_id: UUID
     crypto_order_preview_id: UUID
     operator_identity: str = Field(min_length=1, max_length=120)
@@ -60,6 +78,15 @@ class LiveCryptoOrderCancelRequest(BaseModel):
 
 class LiveCryptoOrderReconcileRequest(BaseModel):
     operator_identity: str = Field(min_length=1, max_length=120)
+
+
+class LiveCryptoOrderReadinessCheckResponse(BaseModel):
+    code: str
+    label: str
+    status: Literal["pass", "warn", "fail"]
+    explanation: str
+    checked_at: datetime
+    remediation: str
 
 
 class LiveCryptoOrderResponse(BaseModel):
@@ -101,15 +128,18 @@ class LiveCryptoOrderListResponse(BaseModel):
 
 
 class LiveCryptoOrderReadinessResponse(BaseModel):
+    overall_verdict: LiveCryptoOrderReadinessVerdict
     live_mode_enabled: bool
     live_profile_ready: bool
     feature_flag_enabled: bool
+    dry_run_enabled: bool
     max_order_usd: Decimal
     latest_preview_age_seconds: int | None
     latest_balance_age_seconds: int | None
     latest_readiness_age_seconds: int | None
     latest_price_age_seconds: int | None
     reason: str | None = None
+    checks: list[LiveCryptoOrderReadinessCheckResponse] = Field(default_factory=list)
 
     @field_serializer("max_order_usd", when_used="json")
     def _serialize_max_order(self, value: Decimal) -> str:
@@ -127,11 +157,14 @@ class LiveCryptoOrderPrepareResponse(BaseModel):
     estimated_usd_balance_after: Decimal | None
     usd_balance_before: Decimal | None
 
-    @field_serializer("estimated_usd_balance_after", "usd_balance_before", when_used="json")
-    def _serialize_decimal(self, value: Decimal | None) -> str | None:
-        if value is None:
-            return None
-        return format(value, "f")
+
+class LiveCryptoOrderDryRunResponse(BaseModel):
+    live_crypto_order: LiveCryptoOrderResponse
+    dry_run_status: LiveCryptoOrderDryRunStatus
+    dry_run_message: str
+    safe_request_summary: dict[str, Any]
+    provider_create_order_called: bool
+    order_submitted: bool
 
 
 class LiveCryptoOrderSubmitResponse(BaseModel):

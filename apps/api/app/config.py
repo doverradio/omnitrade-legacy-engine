@@ -29,6 +29,10 @@ class Settings(BaseSettings):
         default=False,
         validation_alias="LIVE_CRYPTO_ORDER_SUBMISSION_ENABLED",
     )
+    live_crypto_dry_run_enabled: bool = Field(
+        default=True,
+        validation_alias="LIVE_CRYPTO_DRY_RUN_ENABLED",
+    )
     live_crypto_max_order_usd: Decimal = Field(
         default=Decimal("5"),
         validation_alias="LIVE_CRYPTO_MAX_ORDER_USD",

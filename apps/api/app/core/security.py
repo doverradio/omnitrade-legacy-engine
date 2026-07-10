@@ -13,6 +13,6 @@ async def get_current_user(
         return None
 
     return {
-        "id": "authenticated_user",
+        "id": credentials.credentials.strip(),
         "scheme": "bearer",
     }
