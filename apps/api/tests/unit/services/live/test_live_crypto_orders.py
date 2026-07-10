@@ -77,3 +77,34 @@ async def test_prepare_confirmation_rejects_when_feature_flag_disabled(monkeypat
                 idempotency_token="token-1",
             ),
         )
+
+
+@pytest.mark.asyncio
+async def test_submit_rejects_when_feature_flag_disabled(monkeypatch: pytest.MonkeyPatch) -> None:
+    fake_db = _FakeDb()
+
+    monkeypatch.setattr(
+        service,
+        "get_settings",
+        lambda: SimpleNamespace(
+            live_crypto_order_submission_enabled=False,
+            live_crypto_max_order_usd=service.Decimal("5"),
+            live_crypto_preview_max_age_seconds=30,
+            live_crypto_balance_max_age_seconds=30,
+            live_crypto_readiness_max_age_seconds=60,
+            live_crypto_price_max_age_seconds=30,
+            live_crypto_confirmation_challenge_minutes=1,
+        ),
+    )
+
+    with pytest.raises(PermissionError, match="disabled"):
+        await service.service.submit(
+            db=fake_db,
+            request=service.LiveCryptoOrderSubmitRequest(
+                live_crypto_order_id=uuid.uuid4(),
+                confirmation_challenge_id=uuid.uuid4(),
+                confirmation_phrase="CONFIRM BTC-USD BUY $5",
+                operator_identity="operator:human",
+                idempotency_token="token-2",
+            ),
+        )

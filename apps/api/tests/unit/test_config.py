@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from decimal import Decimal
+
 from app.config import Settings, get_settings
 
 
@@ -43,3 +45,25 @@ def test_get_settings_still_loads_phase_1_defaults_without_optional_credentials(
     assert settings.alpaca_api_key_id is None
 
     get_settings.cache_clear()
+
+
+def test_live_crypto_settings_load_from_explicit_environment_variables(monkeypatch) -> None:
+    monkeypatch.setenv("LIVE_CRYPTO_ORDER_SUBMISSION_ENABLED", "true")
+    monkeypatch.setenv("LIVE_CRYPTO_MAX_ORDER_USD", "7.50")
+    monkeypatch.setenv("LIVE_CRYPTO_PREPARATION_ENABLED", "true")
+    monkeypatch.setenv("LIVE_CRYPTO_CONFIRMATION_CHALLENGE_MINUTES", "3")
+    monkeypatch.setenv("LIVE_CRYPTO_PREVIEW_MAX_AGE_SECONDS", "45")
+    monkeypatch.setenv("LIVE_CRYPTO_BALANCE_MAX_AGE_SECONDS", "50")
+    monkeypatch.setenv("LIVE_CRYPTO_READINESS_MAX_AGE_SECONDS", "70")
+    monkeypatch.setenv("LIVE_CRYPTO_PRICE_MAX_AGE_SECONDS", "80")
+
+    settings = Settings(_env_file=None)
+
+    assert settings.live_crypto_order_submission_enabled is True
+    assert settings.live_crypto_max_order_usd == Decimal("7.50")
+    assert settings.live_crypto_preparation_enabled is True
+    assert settings.live_crypto_confirmation_challenge_minutes == 3
+    assert settings.live_crypto_preview_max_age_seconds == 45
+    assert settings.live_crypto_balance_max_age_seconds == 50
+    assert settings.live_crypto_readiness_max_age_seconds == 70
+    assert settings.live_crypto_price_max_age_seconds == 80

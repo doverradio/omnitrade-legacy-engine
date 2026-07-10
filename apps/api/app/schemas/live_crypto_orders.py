@@ -48,7 +48,7 @@ class LiveCryptoOrderPrepareRequest(BaseModel):
 class LiveCryptoOrderSubmitRequest(BaseModel):
     live_crypto_order_id: UUID
     confirmation_challenge_id: UUID
-    confirmation_phrase: str = Field(min_length=1, max_length=20)
+    confirmation_phrase: str = Field(min_length=1, max_length=64)
     operator_identity: str = Field(min_length=1, max_length=120)
     idempotency_token: str = Field(min_length=1, max_length=120)
 
