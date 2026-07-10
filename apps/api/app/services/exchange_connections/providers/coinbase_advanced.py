@@ -1,12 +1,13 @@
 from __future__ import annotations
 
-import base64
 from datetime import datetime, timezone
 from decimal import Decimal
-import hashlib
-import hmac
+import email.utils
+import secrets
 
 import httpx
+import jwt
+from cryptography.hazmat.primitives import serialization
 
 from app.core.errors import InvalidRequestError, ServiceUnavailableError
 from app.services.exchange_connections.providers.base import (
@@ -17,6 +18,9 @@ from app.services.exchange_connections.providers.base import (
     ExchangePermissionSnapshot,
 )
 
+JWT_EXP_SECONDS = 120
+CLOCK_SKEW_FAIL_SECONDS = 30
+
 
 def _to_decimal(value: str | int | float | Decimal | None) -> Decimal:
     if value is None:
@@ -24,6 +28,59 @@ def _to_decimal(value: str | int | float | Decimal | None) -> Decimal:
     if isinstance(value, Decimal):
         return value
     return Decimal(str(value))
+
+
+def normalize_private_key(raw_key: str) -> str:
+    key = raw_key.strip()
+    if "\\n" in key:
+        key = key.replace("\\n", "\n")
+    return key
+
+
+def _jwt_algorithm_for_private_key(private_key_pem: str) -> str:
+    normalized = private_key_pem.upper()
+    if "BEGIN EC PRIVATE KEY" in normalized or "BEGIN PRIVATE KEY" in normalized:
+        # PKCS8 private keys may still be Ed25519. We detect by parsing below.
+        pass
+
+    key_obj = serialization.load_pem_private_key(private_key_pem.encode("utf-8"), password=None)
+    class_name = key_obj.__class__.__name__.lower()
+    if "ed25519" in class_name:
+        return "EdDSA"
+    return "ES256"
+
+
+def build_coinbase_jwt(
+    *,
+    api_key_name: str,
+    private_key: str,
+    request_method: str,
+    request_host: str,
+    request_path: str,
+    now: datetime | None = None,
+) -> str:
+    current = now or datetime.now(timezone.utc)
+    nbf = int(current.timestamp())
+    exp = nbf + JWT_EXP_SECONDS
+    uri = f"{request_method.upper()} {request_host}{request_path}"
+    normalized_key = normalize_private_key(private_key)
+    alg = _jwt_algorithm_for_private_key(normalized_key)
+
+    headers = {
+        "typ": "JWT",
+        "kid": api_key_name,
+        "nonce": secrets.token_hex(16),
+        "alg": alg,
+    }
+    payload = {
+        "sub": api_key_name,
+        "iss": "cdp",
+        "aud": ["cdp_service"],
+        "nbf": nbf,
+        "exp": exp,
+        "uri": uri,
+    }
+    return jwt.encode(payload, normalized_key, algorithm=alg, headers=headers)
 
 
 def _mask_permissions(raw_payload: dict[str, object]) -> list[str]:
@@ -42,6 +99,13 @@ def _mask_permissions(raw_payload: dict[str, object]) -> list[str]:
 
 def parse_coinbase_permissions(payload: dict[str, object]) -> list[str]:
     return _mask_permissions(payload)
+
+
+def _permission_flags(permissions: list[str]) -> tuple[bool, bool]:
+    lowered = [item.lower() for item in permissions]
+    withdrawal = any("withdraw" in item or "transfer" in item for item in lowered)
+    trade = any("trade" in item or "order" in item for item in lowered)
+    return withdrawal, trade
 
 
 def parse_coinbase_balances(payload: dict[str, object]) -> ExchangeBalanceSnapshot:
@@ -103,13 +167,13 @@ class CoinbaseAdvancedClient:
     async def test_authentication(self, *, credentials: dict[str, str], environment: str) -> ExchangeAuthResult:
         heartbeat_at = datetime.now(timezone.utc)
         try:
-            accounts_payload = await self._request_json(
+            accounts_payload, accounts_headers = await self._request_json(
                 method="GET",
                 path="/api/v3/brokerage/accounts",
                 credentials=credentials,
                 environment=environment,
             )
-            permissions_payload = await self._request_json(
+            permissions_payload, _perm_headers = await self._request_json(
                 method="GET",
                 path="/api/v3/brokerage/key_permissions",
                 credentials=credentials,
@@ -123,15 +187,25 @@ class CoinbaseAdvancedClient:
                 account_status=None,
                 permissions=[],
                 heartbeat_at=heartbeat_at,
+                clock_skew_seconds=None,
+                withdrawals_permission_granted=False,
+                trade_permission_present=False,
                 error=str(exc),
             )
+
+        permissions = parse_coinbase_permissions(permissions_payload)
+        withdrawals_granted, trade_permission_present = _permission_flags(permissions)
+        clock_skew = self._clock_skew_seconds(accounts_headers)
 
         return ExchangeAuthResult(
             reachable=True,
             authenticated=True,
             account_status=parse_coinbase_account_status(accounts_payload),
-            permissions=parse_coinbase_permissions(permissions_payload),
+            permissions=permissions,
             heartbeat_at=heartbeat_at,
+            clock_skew_seconds=clock_skew,
+            withdrawals_permission_granted=withdrawals_granted,
+            trade_permission_present=trade_permission_present,
             error=None,
         )
 
@@ -172,22 +246,19 @@ class CoinbaseAdvancedClient:
         credentials: dict[str, str],
         environment: str,
         swallow_404: bool = False,
-    ) -> dict[str, object]:
+    ) -> tuple[dict[str, object], dict[str, str]]:
         base_url = self._base_url(environment)
-        timestamp = str(int(datetime.now(timezone.utc).timestamp()))
         body = ""
-        signature = self._sign_request(
-            secret=credentials["api_secret"],
-            timestamp=timestamp,
-            method=method,
-            path=path,
-            body=body,
+        request_host = base_url.replace("https://", "").replace("http://", "").rstrip("/")
+        token = build_coinbase_jwt(
+            api_key_name=credentials["api_key"],
+            private_key=credentials["api_secret"],
+            request_method=method,
+            request_host=request_host,
+            request_path=path,
         )
         headers = {
-            "CB-ACCESS-KEY": credentials["api_key"],
-            "CB-ACCESS-SIGN": signature,
-            "CB-ACCESS-TIMESTAMP": timestamp,
-            "CB-ACCESS-PASSPHRASE": credentials.get("passphrase", ""),
+            "Authorization": f"Bearer {token}",
             "Accept": "application/json",
         }
 
@@ -198,7 +269,7 @@ class CoinbaseAdvancedClient:
             raise ServiceUnavailableError(message="Coinbase API is unreachable", details={"provider": self.provider}) from exc
 
         if swallow_404 and response.status_code == 404:
-            return {}
+            return {}, dict(response.headers)
 
         if response.status_code >= 400:
             raise InvalidRequestError(
@@ -214,7 +285,7 @@ class CoinbaseAdvancedClient:
         if not isinstance(payload, dict):
             raise InvalidRequestError(message="Coinbase API returned unexpected payload", details={"path": path})
 
-        return payload
+        return payload, dict(response.headers)
 
     def _base_url(self, environment: str) -> str:
         normalized = environment.strip().lower()
@@ -222,8 +293,15 @@ class CoinbaseAdvancedClient:
             return "https://api-public.sandbox.exchange.coinbase.com"
         return "https://api.coinbase.com"
 
-    def _sign_request(self, *, secret: str, timestamp: str, method: str, path: str, body: str) -> str:
-        message = f"{timestamp}{method.upper()}{path}{body}".encode("utf-8")
-        key = base64.b64decode(secret.encode("utf-8"))
-        digest = hmac.new(key, message, hashlib.sha256).digest()
-        return base64.b64encode(digest).decode("utf-8")
+    def _clock_skew_seconds(self, response_headers: dict[str, str]) -> int | None:
+        raw_date = response_headers.get("Date") or response_headers.get("date")
+        if raw_date is None:
+            return None
+        try:
+            parsed = email.utils.parsedate_to_datetime(raw_date)
+            if parsed.tzinfo is None:
+                parsed = parsed.replace(tzinfo=timezone.utc)
+            now = datetime.now(timezone.utc)
+            return int(abs((now - parsed.astimezone(timezone.utc)).total_seconds()))
+        except Exception:
+            return None

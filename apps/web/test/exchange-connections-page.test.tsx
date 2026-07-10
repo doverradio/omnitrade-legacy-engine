@@ -24,8 +24,8 @@ function connectedPayload() {
         status: "connected",
         credentials_valid: true,
         credential_mask: {
-          api_key: "******1234",
-          api_secret: "********",
+          api_key_name: "******1234",
+          private_key: "********",
           passphrase: "********",
         },
         api_permissions: ["view", "trade"],
@@ -39,14 +39,28 @@ function connectedPayload() {
         last_successful_sync_at: "2026-07-09T10:00:00Z",
         last_heartbeat_at: "2026-07-09T10:05:00Z",
         last_api_error: null,
-        readiness_checks: [
-          { code: "exchange_connected", label: "Exchange Connected", ok: true, detail: "Connected" },
-          { code: "credentials_valid", label: "Credentials Valid", ok: true, detail: "Validated" },
-          { code: "balances_retrieved", label: "Balances Retrieved", ok: true, detail: "Balances available" },
-          { code: "permissions_verified", label: "Permissions Verified", ok: true, detail: "Permissions available" },
-          { code: "time_synced", label: "Time Synced", ok: true, detail: "Heartbeat fresh" },
-          { code: "api_reachable", label: "API Reachable", ok: true, detail: "Reachable" },
-        ],
+        readiness: {
+          verdict: "READ_ONLY_READY",
+          checked_at: "2026-07-09T10:05:00Z",
+          checks: [
+            {
+              code: "credentials_stored",
+              label: "Credentials Stored",
+              status: "pass",
+              explanation: "Encrypted credentials are present.",
+              checked_at: "2026-07-09T10:05:00Z",
+              remediation: "Save Coinbase API key name and private key in Exchange Connections.",
+            },
+            {
+              code: "balances_retrieved",
+              label: "Balances Retrieved",
+              status: "pass",
+              explanation: "Balances retrieved successfully.",
+              checked_at: "2026-07-09T10:05:00Z",
+              remediation: "Run Verify Connection or Refresh Balances.",
+            },
+          ],
+        },
         updated_at: "2026-07-09T10:05:00Z",
       },
     ],
@@ -76,6 +90,22 @@ function installFetchMock() {
     }
     if (url.pathname.endsWith("/refresh/balances") || url.pathname.endsWith("/refresh/account") || url.pathname.endsWith("/refresh/permissions")) {
       return jsonResponse(200, connectedPayload().items[0]);
+    }
+    if (url.pathname.endsWith("/verify") && init?.method === "POST") {
+      return jsonResponse(200, connectedPayload().items[0]);
+    }
+    if (url.pathname.endsWith("/disconnect") && init?.method === "POST") {
+      return jsonResponse(200, {
+        exchange_connection_id: "11111111-1111-1111-1111-111111111111",
+        disconnected: true,
+        message: "Credentials removed locally. Revoke the API key in Coinbase separately if needed.",
+      });
+    }
+    if (url.pathname.endsWith("/rotate-credentials") && init?.method === "POST") {
+      return jsonResponse(200, connectedPayload().items[0]);
+    }
+    if (url.pathname.endsWith("/readiness") && (!init || !init.method || init.method === "GET")) {
+      return jsonResponse(200, connectedPayload().items[0].readiness);
     }
 
     return jsonResponse(404, {
@@ -131,12 +161,8 @@ describe("ExchangeConnectionsPage", () => {
     render(<ExchangeConnectionsPage />);
 
     expect(await screen.findByText("Live Readiness")).toBeInTheDocument();
-    expect(screen.getByText("Exchange Connected")).toBeInTheDocument();
-    expect(screen.getByText("Credentials Valid")).toBeInTheDocument();
+    expect(screen.getByText("Credentials Stored")).toBeInTheDocument();
     expect(screen.getByText("Balances Retrieved")).toBeInTheDocument();
-    expect(screen.getByText("Permissions Verified")).toBeInTheDocument();
-    expect(screen.getByText("Time Synced")).toBeInTheDocument();
-    expect(screen.getByText("API Reachable")).toBeInTheDocument();
   });
 
   it("tests and saves a connection", async () => {
@@ -145,8 +171,8 @@ describe("ExchangeConnectionsPage", () => {
     render(<ExchangeConnectionsPage />);
     expect(await screen.findByRole("heading", { name: "Exchange Connections" })).toBeInTheDocument();
 
-    fireEvent.change(screen.getByLabelText("API Key"), { target: { value: "key" } });
-    fireEvent.change(screen.getByLabelText("API Secret"), { target: { value: "secret" } });
+    fireEvent.change(screen.getByLabelText("API Key Name"), { target: { value: "key" } });
+    fireEvent.change(screen.getByLabelText("Private Key / API Secret"), { target: { value: "secret" } });
 
     fireEvent.click(screen.getByRole("button", { name: "Test Connection" }));
     expect(await screen.findByText("Connection test succeeded.")).toBeInTheDocument();

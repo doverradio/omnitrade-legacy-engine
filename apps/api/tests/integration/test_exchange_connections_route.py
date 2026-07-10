@@ -12,6 +12,7 @@ from app.schemas.exchange_connections import (
     ExchangeConnectionResponse,
     ExchangeCredentialMaskResponse,
     ExchangeReadinessCheckResponse,
+    ExchangeReadinessReportResponse,
 )
 
 
@@ -25,8 +26,8 @@ def _connection_response() -> ExchangeConnectionResponse:
         status="connected",
         credentials_valid=True,
         credential_mask=ExchangeCredentialMaskResponse(
-            api_key="******1234",
-            api_secret="********",
+            api_key_name="******1234",
+            private_key="********",
             passphrase="********",
         ),
         api_permissions=["view"],
@@ -40,14 +41,20 @@ def _connection_response() -> ExchangeConnectionResponse:
         last_successful_sync_at=datetime(2026, 7, 9, 10, 0, tzinfo=timezone.utc),
         last_heartbeat_at=datetime(2026, 7, 9, 10, 0, tzinfo=timezone.utc),
         last_api_error=None,
-        readiness_checks=[
-            ExchangeReadinessCheckResponse(
-                code="exchange_connected",
-                label="Exchange Connected",
-                ok=True,
-                detail="Connected",
-            )
-        ],
+        readiness=ExchangeReadinessReportResponse(
+            verdict="READ_ONLY_READY",
+            checked_at=datetime(2026, 7, 9, 10, 0, tzinfo=timezone.utc),
+            checks=[
+                ExchangeReadinessCheckResponse(
+                    code="credentials_stored",
+                    label="Credentials Stored",
+                    status="pass",
+                    explanation="Encrypted credentials are present.",
+                    checked_at=datetime(2026, 7, 9, 10, 0, tzinfo=timezone.utc),
+                    remediation="Save Coinbase API key name and private key in Exchange Connections.",
+                )
+            ],
+        ),
         updated_at=datetime(2026, 7, 9, 10, 0, tzinfo=timezone.utc),
     )
 
@@ -67,5 +74,5 @@ def test_exchange_connections_route_shape(monkeypatch) -> None:
     assert response.status_code == 200
     payload = response.json()
     assert payload["items"][0]["provider"] == "coinbase_advanced"
-    assert payload["items"][0]["credential_mask"]["api_secret"] == "********"
+    assert payload["items"][0]["credential_mask"]["private_key"] == "********"
     assert payload["items"][0]["balances"][0]["currency"] == "USD"

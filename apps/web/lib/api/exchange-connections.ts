@@ -3,10 +3,20 @@ import { ApiRequestError } from "@/lib/api/arena";
 export type ExchangeProvider = "coinbase_advanced";
 export type ExchangeEnvironment = "sandbox" | "production";
 export type ExchangeConnectionStatus = "connected" | "disconnected" | "error";
+export type ExchangeReadinessVerdict
+  = "READY_FOR_PREVIEW"
+  | "READ_ONLY_READY"
+  | "MISCONFIGURED"
+  | "UNREACHABLE"
+  | "PERMISSION_INSUFFICIENT"
+  | "CLOCK_SKEW"
+  | "AUTHENTICATION_FAILED"
+  | "UNKNOWN";
+export type ExchangeReadinessCheckStatus = "pass" | "warn" | "fail";
 
 export type ExchangeCredentialMask = {
-  api_key: string;
-  api_secret: string;
+  api_key_name: string;
+  private_key: string;
   passphrase: string | null;
 };
 
@@ -20,8 +30,16 @@ export type ExchangeBalance = {
 export type ExchangeReadinessCheck = {
   code: string;
   label: string;
-  ok: boolean;
-  detail: string;
+  status: ExchangeReadinessCheckStatus;
+  explanation: string;
+  checked_at: string;
+  remediation: string;
+};
+
+export type ExchangeReadinessReport = {
+  verdict: ExchangeReadinessVerdict;
+  checked_at: string;
+  checks: ExchangeReadinessCheck[];
 };
 
 export type ExchangeConnection = {
@@ -40,7 +58,7 @@ export type ExchangeConnection = {
   last_successful_sync_at: string | null;
   last_heartbeat_at: string | null;
   last_api_error: string | null;
-  readiness_checks: ExchangeReadinessCheck[];
+  readiness: ExchangeReadinessReport;
   updated_at: string;
 };
 
@@ -51,9 +69,9 @@ export type ExchangeConnectionListResponse = {
 export type TestExchangeConnectionRequest = {
   provider: ExchangeProvider;
   environment: ExchangeEnvironment;
-  api_key: string;
-  api_secret: string;
-  passphrase: string;
+  api_key_name: string;
+  private_key: string;
+  passphrase?: string;
 };
 
 export type TestExchangeConnectionResponse = {
@@ -69,9 +87,22 @@ export type SaveExchangeConnectionRequest = {
   provider: ExchangeProvider;
   connection_name: string;
   environment: ExchangeEnvironment;
-  api_key: string;
-  api_secret: string;
-  passphrase: string;
+  api_key_name: string;
+  private_key: string;
+  passphrase?: string;
+};
+
+export type RotateExchangeCredentialsRequest = {
+  api_key_name: string;
+  private_key: string;
+  passphrase?: string;
+  confirm_replace: boolean;
+};
+
+export type DisconnectExchangeConnectionResponse = {
+  exchange_connection_id: string;
+  disconnected: boolean;
+  message: string;
 };
 
 const API_BASE_URL = process.env.NEXT_PUBLIC_API_BASE_URL ?? "http://localhost:8000";
@@ -141,5 +172,34 @@ export async function refreshExchangeAccount(exchangeConnectionId: string): Prom
 export async function refreshExchangePermissions(exchangeConnectionId: string): Promise<ExchangeConnection> {
   return requestJson<ExchangeConnection>(`/exchange-connections/${encodeURIComponent(exchangeConnectionId)}/refresh/permissions`, {
     method: "POST",
+  });
+}
+
+export async function verifyExchangeConnection(exchangeConnectionId: string): Promise<ExchangeConnection> {
+  return requestJson<ExchangeConnection>(`/exchange-connections/${encodeURIComponent(exchangeConnectionId)}/verify`, {
+    method: "POST",
+  });
+}
+
+export async function getExchangeReadiness(exchangeConnectionId: string): Promise<ExchangeReadinessReport> {
+  return requestJson<ExchangeReadinessReport>(`/exchange-connections/${encodeURIComponent(exchangeConnectionId)}/readiness`);
+}
+
+export async function rotateExchangeCredentials(
+  exchangeConnectionId: string,
+  payload: RotateExchangeCredentialsRequest,
+): Promise<ExchangeConnection> {
+  return requestJson<ExchangeConnection>(`/exchange-connections/${encodeURIComponent(exchangeConnectionId)}/rotate-credentials`, {
+    method: "POST",
+    body: JSON.stringify(payload),
+  });
+}
+
+export async function disconnectExchangeConnection(
+  exchangeConnectionId: string,
+): Promise<DisconnectExchangeConnectionResponse> {
+  return requestJson<DisconnectExchangeConnectionResponse>(`/exchange-connections/${encodeURIComponent(exchangeConnectionId)}/disconnect`, {
+    method: "POST",
+    body: JSON.stringify({ confirm_disconnect: true }),
   });
 }

@@ -13,6 +13,9 @@ class ExchangeAuthResult:
     account_status: str | None
     permissions: list[str]
     heartbeat_at: datetime
+    clock_skew_seconds: int | None = None
+    withdrawals_permission_granted: bool = False
+    trade_permission_present: bool = False
     error: str | None = None
 
 

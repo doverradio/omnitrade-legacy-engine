@@ -110,16 +110,16 @@ async def test_authentication_and_save_masks_credentials(monkeypatch: pytest.Mon
             provider="coinbase_advanced",
             connection_name="Primary Coinbase",
             environment="sandbox",
-            api_key="api-key-1234",
-            api_secret="api-secret-value",
+            api_key_name="api-key-1234",
+            private_key="api-secret-value",
             passphrase="secret-passphrase",
         ),
     )
 
     assert response.status == "connected"
     assert response.credentials_valid is True
-    assert response.credential_mask.api_key.endswith("1234")
-    assert response.credential_mask.api_secret == "********"
+    assert response.credential_mask.api_key_name.endswith("1234")
+    assert response.credential_mask.private_key == "********"
     assert response.credential_mask.passphrase == "********"
 
     stored_connection = next(item for item in db.added if isinstance(item, ExchangeConnection))
@@ -149,8 +149,8 @@ async def test_test_exchange_credentials_forwarding(monkeypatch: pytest.MonkeyPa
         payload=ExchangeTestConnectionRequest(
             provider="coinbase_advanced",
             environment="production",
-            api_key="k",
-            api_secret="s",
+            api_key_name="k",
+            private_key="s",
             passphrase="p",
         )
     )
