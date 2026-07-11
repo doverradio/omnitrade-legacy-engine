@@ -37,6 +37,7 @@ from app.schemas.live_crypto_orders import (
 )
 from app.core.errors import InvalidRequestError, ServiceUnavailableError
 from app.services.exchange_connections.providers.coinbase_advanced import CoinbaseAdvancedClient
+from app.services.live.accounting_reconciliation import reconcile_live_order_and_fills
 from app.services.live.approval import evaluate_live_approval_gate
 from app.services.live.resilience import evaluate_live_submission_guard
 from app.services.risk.risk_monitor import get_risk_rules
@@ -1437,120 +1438,21 @@ class LiveCryptoOrderService:
         )
         if live_order is None:
             raise LookupError("live crypto order not found")
-
-        connection = await _load_exchange_connection(db=db, exchange_connection_id=live_order.exchange_connection_id)
-        connection_credentials = _load_decrypted_credentials(connection)
-        provider = CoinbaseAdvancedClient()
-        if live_order.provider_order_id:
-            order_response, safe_response = await provider.get_historical_order(
-                credentials=connection_credentials,
-                environment=live_order.environment,
-                order_id=live_order.provider_order_id,
-                client_order_id=live_order.client_order_id,
-            )
-            order = order_response.get("order") if isinstance(order_response, dict) else None
-        else:
-            batch_response, safe_response = await provider.list_historical_orders(
-                credentials=connection_credentials,
-                environment=live_order.environment,
-                product_ids=[live_order.product_id],
-                order_status=_RECONCILIABLE_PROVIDER_STATUSES,
-            )
-            matches = _find_matching_orders(
-                payload=batch_response,
-                client_order_id=live_order.client_order_id,
-                product_id=live_order.product_id,
-            )
-            if len(matches) > 1:
-                live_order.status = "RECONCILIATION_REQUIRED"
-                live_order.failure_code = "provider_order_lookup_conflict"
-                live_order.failure_reason = json.dumps({"match_count": len(matches)})
-                await _record_audit(
-                    db=db,
-                    action="PROVIDER_ID_CONFLICT",
-                    actor=request.operator_identity,
-                    entity_id=live_order.live_crypto_order_id,
-                    before_state=None,
-                    after_state={"status": live_order.status, "match_count": len(matches)},
-                )
-                await db.flush()
-                await _commit_if_supported(db=db)
-                return LiveCryptoOrderReconcileResponse(
-                    live_crypto_order=self._to_response(live_order),
-                    reconciliation_status=live_order.status,
-                    provider_status=live_order.provider_status,
-                    provider_order_id=live_order.provider_order_id,
-                    provider_fill_observed=False,
-                    safe_provider_response=_redact_sensitive(batch_response),
-                )
-            if len(matches) == 0:
-                live_order.status = "RECONCILIATION_REQUIRED"
-                await _record_audit(
-                    db=db,
-                    action="RECONCILIATION_REQUIRED",
-                    actor=request.operator_identity,
-                    entity_id=live_order.live_crypto_order_id,
-                    before_state=None,
-                    after_state={"status": live_order.status, "lookup": "client_order_id_not_found"},
-                )
-                await db.flush()
-                await _commit_if_supported(db=db)
-                return LiveCryptoOrderReconcileResponse(
-                    live_crypto_order=self._to_response(live_order),
-                    reconciliation_status=live_order.status,
-                    provider_status=live_order.provider_status,
-                    provider_order_id=live_order.provider_order_id,
-                    provider_fill_observed=False,
-                    safe_provider_response=_redact_sensitive(batch_response),
-                )
-            order = matches[0]
-            discovered_provider_order_id = order.get("order_id") if isinstance(order.get("order_id"), str) else None
-            if discovered_provider_order_id is not None:
-                live_order.provider_order_id = discovered_provider_order_id
-                live_order.acknowledged_at = live_order.acknowledged_at or _utcnow()
-                await _record_audit(
-                    db=db,
-                    action="ORDER_DISCOVERED_BY_RECONCILIATION",
-                    actor=request.operator_identity,
-                    entity_id=live_order.live_crypto_order_id,
-                    before_state=None,
-                    after_state={"provider_order_id": discovered_provider_order_id},
-                )
-
-        provider_status = order.get("status") if isinstance(order, dict) else None
-        average_filled_price = _decimal(order.get("average_filled_price", "0")) if isinstance(order, dict) else Decimal("0")
-        filled_size = _decimal(order.get("filled_size", "0")) if isinstance(order, dict) else Decimal("0")
-        fill_ratio = filled_size / live_order.requested_quote_size if live_order.requested_quote_size > 0 else None
-        live_order.provider_status = provider_status
-        live_order.safe_provider_response = {
-            **live_order.safe_provider_response,
-            "reconcile": safe_response,
-            "reconciled_by": request.operator_identity,
-        }
-        live_order.status = _order_status_from_provider(provider_status, fill_ratio)
-        if provider_status == "FILLED":
-            live_order.filled_at = _utcnow()
-        elif provider_status == "CANCELLED":
-            live_order.cancelled_at = _utcnow()
-        await _record_audit(
+        outcome = await reconcile_live_order_and_fills(
             db=db,
-            action="RECONCILED",
-            actor=request.operator_identity,
-            entity_id=live_order.live_crypto_order_id,
-            before_state=None,
-            after_state={"status": live_order.status, "provider_status": provider_status, "provider_order_id": live_order.provider_order_id},
+            live_crypto_order_id=live_crypto_order_id,
+            operator_identity=request.operator_identity,
         )
-        live_order.updated_at = _utcnow()
-        await db.flush()
-        await _commit_if_supported(db=db)
+        if hasattr(db, "refresh"):
+            await db.refresh(live_order)
 
         return LiveCryptoOrderReconcileResponse(
             live_crypto_order=self._to_response(live_order),
-            reconciliation_status=live_order.status,
-            provider_status=provider_status,
-            provider_order_id=live_order.provider_order_id,
-            provider_fill_observed=filled_size > 0,
-            safe_provider_response=safe_response,
+            reconciliation_status=str(outcome["reconciliation_status"]),
+            provider_status=None if outcome.get("provider_status") is None else str(outcome["provider_status"]),
+            provider_order_id=None if outcome.get("provider_order_id") is None else str(outcome["provider_order_id"]),
+            provider_fill_observed=bool(outcome.get("provider_fill_observed", False)),
+            safe_provider_response=outcome.get("safe_provider_response", {}),
         )
 
     async def cancel(

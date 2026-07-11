@@ -429,6 +429,21 @@ class CoinbaseAdvancedClient:
             query_params=query_params,
         )
 
+    async def list_historical_fills(
+        self,
+        *,
+        credentials: dict[str, str],
+        environment: str,
+        order_id: str,
+    ) -> tuple[dict[str, object], dict[str, str]]:
+        return await self._request_json(
+            method="GET",
+            path="/api/v3/brokerage/orders/historical/fills",
+            credentials=credentials,
+            environment=environment,
+            query_params={"order_id": order_id},
+        )
+
     async def cancel_orders(
         self,
         *,

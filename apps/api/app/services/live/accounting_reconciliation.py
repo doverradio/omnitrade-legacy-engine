@@ -9,9 +9,13 @@ from decimal import Decimal
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.models.capital_campaign import CapitalCampaign
 from app.models.live_accounting_record import LiveAccountingRecord
 from app.models.live_execution_event import LiveExecutionEvent
+from app.models.live_crypto_order import LiveCryptoOrder
 from app.models.live_reconciliation_event import LiveReconciliationEvent
+from app.models.live_trading_profile import LiveTradingProfile
+from app.services.exchange_connections.providers.coinbase_advanced import CoinbaseAdvancedClient
 from app.services.live.contracts import (
     LiveFillReconciliationRequest,
     LiveOrderReconciliationRequest,
@@ -41,6 +45,441 @@ def build_live_reconciliation_idempotency_key(
         separators=(",", ":"),
     )
     return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
+_RECONCILIATION_TERMINAL_STATUSES = {"filled", "canceled", "rejected"}
+
+
+def _utcnow() -> datetime:
+    return datetime.now(timezone.utc)
+
+
+def _decimal(value: object) -> Decimal:
+    if isinstance(value, Decimal):
+        return value
+    return Decimal(str(value))
+
+
+def _extract_provider_timestamp(*, payload: dict[str, object]) -> datetime | None:
+    for key in ("completion_time", "last_fill_time", "created_time", "created_at"):
+        raw = payload.get(key)
+        if raw is None:
+            continue
+        if isinstance(raw, str):
+            text = raw.replace("Z", "+00:00")
+            try:
+                return datetime.fromisoformat(text)
+            except ValueError:
+                continue
+    return None
+
+
+def _normalize_provider_status(*, provider_status: str | None) -> str:
+    if provider_status is None:
+        return "unknown"
+    status = provider_status.upper()
+    if status in {"OPEN", "PENDING", "QUEUED", "CANCEL_QUEUED", "EDIT_QUEUED"}:
+        return "open"
+    if status == "FILLED":
+        return "filled"
+    if status in {"CANCELLED", "EXPIRED"}:
+        return "canceled"
+    if status == "FAILED":
+        return "rejected"
+    return "unknown"
+
+
+def _safe_json(value: dict[str, object]) -> dict[str, object]:
+    return json.loads(json.dumps(value, default=str))
+
+
+async def _ensure_execution_source(
+    *,
+    db: AsyncSession,
+    live_order: LiveCryptoOrder,
+    profile: LiveTradingProfile,
+) -> LiveExecutionEvent:
+    existing = await db.scalar(
+        select(LiveExecutionEvent)
+        .where(LiveExecutionEvent.idempotency_key == f"live_order_source:{live_order.live_crypto_order_id}")
+        .limit(1)
+    )
+    if existing is not None:
+        return existing
+
+    latest_sequence = await db.scalar(
+        select(func.max(LiveExecutionEvent.sequence_number)).where(LiveExecutionEvent.live_trading_profile_id == profile.id)
+    )
+    sequence_number = int(latest_sequence or 0) + 1
+    recorded_at = datetime.now(timezone.utc)
+    payload = {
+        "live_crypto_order_id": str(live_order.live_crypto_order_id),
+        "client_order_id": live_order.client_order_id,
+        "product_id": live_order.product_id,
+        "side": live_order.side,
+        "order_type": live_order.order_type,
+        "requested_quote_size": format(_decimal(live_order.requested_quote_size), "f"),
+    }
+    event_hash = hashlib.sha256(
+        json.dumps(
+            {
+                "live_trading_profile_id": str(profile.id),
+                "sequence_number": sequence_number,
+                "event_type": "execution_intent_created",
+                "provider_name": live_order.provider,
+                "idempotency_key": f"live_order_source:{live_order.live_crypto_order_id}",
+                "recorded_at": recorded_at.isoformat(),
+                "payload": payload,
+            },
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+    ).hexdigest()
+
+    event = LiveExecutionEvent(
+        idempotency_key=f"live_order_source:{live_order.live_crypto_order_id}",
+        event_hash=event_hash,
+        live_trading_profile_id=profile.id,
+        sequence_number=sequence_number,
+        event_type="execution_intent_created",
+        provider_name=live_order.provider,
+        risk_decision_id=live_order.risk_event_id or uuid.uuid4(),
+        approval_event_id=uuid.UUID(str(live_order.safe_provider_response.get("approval_event_id"))) if live_order.safe_provider_response.get("approval_event_id") else uuid.uuid4(),
+        audit_correlation_id=str(live_order.audit_correlation_id),
+        operating_mode=getattr(profile, "operating_mode", "live"),
+        paper_default_mode=bool(getattr(profile, "paper_default_mode", True)),
+        risk_authority_model=getattr(profile, "risk_authority_model", "risk_engine_final"),
+        event_payload=payload,
+        provenance={"generated_by": "live_reconciliation", "recorded_at": recorded_at.isoformat()},
+        immutable_contract_version="v1",
+        recorded_at=recorded_at,
+    )
+    db.add(event)
+    await db.flush()
+    return event
+
+
+async def reconcile_live_order_and_fills(
+    *,
+    db: AsyncSession,
+    live_crypto_order_id: uuid.UUID,
+    operator_identity: str,
+) -> dict[str, object]:
+    live_order = await db.scalar(
+        select(LiveCryptoOrder)
+        .where(LiveCryptoOrder.live_crypto_order_id == live_crypto_order_id)
+        .with_for_update()
+        .limit(1)
+    )
+    if live_order is None:
+        raise LookupError("live crypto order not found")
+
+    profile_id_raw = (live_order.safe_provider_response or {}).get("live_trading_profile_id")
+    profile_id: uuid.UUID | None = None
+    if profile_id_raw is not None:
+        try:
+            profile_id = uuid.UUID(str(profile_id_raw))
+        except ValueError:
+            profile_id = None
+
+    profile = None
+    if profile_id is not None:
+        profile = await db.scalar(
+            select(LiveTradingProfile)
+            .where(LiveTradingProfile.id == profile_id)
+            .limit(1)
+        )
+    if profile is None:
+        profile = await db.scalar(select(LiveTradingProfile).limit(1))
+    if profile is None:
+        raise LookupError("live trading profile not found")
+
+    source_event = await _ensure_execution_source(db=db, live_order=live_order, profile=profile)
+    campaign = None
+    profile_paper_account_id = getattr(profile, "paper_account_id", None)
+    if profile_paper_account_id is not None:
+        campaign = await db.scalar(
+            select(CapitalCampaign)
+            .where(CapitalCampaign.paper_account_id == profile_paper_account_id)
+            .order_by(CapitalCampaign.updated_at.desc(), CapitalCampaign.id.desc())
+            .limit(1)
+        )
+
+    from app.services.live_crypto_orders import _load_exchange_connection, _load_decrypted_credentials, _find_matching_orders
+
+    connection = await _load_exchange_connection(db=db, exchange_connection_id=live_order.exchange_connection_id)
+    credentials = _load_decrypted_credentials(connection)
+    provider = CoinbaseAdvancedClient()
+
+    provider_order_payload: dict[str, object] | None = None
+    provider_headers: dict[str, str] = {}
+
+    if live_order.provider_order_id:
+        order_payload, provider_headers = await provider.get_historical_order(
+            credentials=credentials,
+            environment=live_order.environment,
+            order_id=live_order.provider_order_id,
+            client_order_id=live_order.client_order_id,
+        )
+        provider_order_payload = order_payload.get("order") if isinstance(order_payload.get("order"), dict) else None
+    else:
+        batch_payload, provider_headers = await provider.list_historical_orders(
+            credentials=credentials,
+            environment=live_order.environment,
+            product_ids=[live_order.product_id],
+            order_status=["PENDING", "OPEN", "QUEUED", "CANCEL_QUEUED", "EDIT_QUEUED", "FILLED", "FAILED", "CANCELLED", "EXPIRED"],
+        )
+        matches = _find_matching_orders(
+            payload=batch_payload,
+            client_order_id=live_order.client_order_id,
+            product_id=live_order.product_id,
+        )
+        if len(matches) > 1:
+            status = "conflict"
+            await record_live_order_reconciliation(
+                db=db,
+                request=LiveOrderReconciliationRequest(
+                    live_trading_profile_id=profile.id,
+                    source_execution_event_id=source_event.id,
+                    provider_name=live_order.provider,
+                    provider_order_id=None,
+                    client_order_id=live_order.client_order_id,
+                    reconciliation_status=status,
+                    live_crypto_order_id=live_order.live_crypto_order_id,
+                    capital_campaign_id=None if campaign is None else campaign.id,
+                    provider_recorded_at=None,
+                    requested_by=operator_identity,
+                    provenance_metadata={"match_count": len(matches), "reason": "provider_id_conflict"},
+                    idempotency_key=f"lco-reconcile:{live_order.live_crypto_order_id}:conflict",
+                ),
+            )
+            live_order.status = "RECONCILIATION_REQUIRED"
+            live_order.failure_code = "provider_order_lookup_conflict"
+            live_order.failure_reason = json.dumps({"match_count": len(matches)})
+            await db.flush()
+            return {"reconciliation_status": live_order.status, "provider_status": live_order.provider_status, "provider_order_id": live_order.provider_order_id, "provider_fill_observed": False, "safe_provider_response": _safe_json(batch_payload)}
+        if len(matches) == 0:
+            await record_live_order_reconciliation(
+                db=db,
+                request=LiveOrderReconciliationRequest(
+                    live_trading_profile_id=profile.id,
+                    source_execution_event_id=source_event.id,
+                    provider_name=live_order.provider,
+                    provider_order_id=None,
+                    client_order_id=live_order.client_order_id,
+                    reconciliation_status="reconciliation_required",
+                    live_crypto_order_id=live_order.live_crypto_order_id,
+                    capital_campaign_id=None if campaign is None else campaign.id,
+                    provider_recorded_at=None,
+                    requested_by=operator_identity,
+                    provenance_metadata={"reason": "provider_order_not_found"},
+                    idempotency_key=f"lco-reconcile:{live_order.live_crypto_order_id}:missing",
+                ),
+            )
+            live_order.status = "RECONCILIATION_REQUIRED"
+            await db.flush()
+            return {"reconciliation_status": live_order.status, "provider_status": live_order.provider_status, "provider_order_id": live_order.provider_order_id, "provider_fill_observed": False, "safe_provider_response": _safe_json(batch_payload)}
+
+        provider_order_payload = matches[0]
+        discovered_provider_order_id = provider_order_payload.get("order_id") if isinstance(provider_order_payload.get("order_id"), str) else None
+        if discovered_provider_order_id and live_order.provider_order_id and live_order.provider_order_id != discovered_provider_order_id:
+            await record_live_order_reconciliation(
+                db=db,
+                request=LiveOrderReconciliationRequest(
+                    live_trading_profile_id=profile.id,
+                    source_execution_event_id=source_event.id,
+                    provider_name=live_order.provider,
+                    provider_order_id=discovered_provider_order_id,
+                    client_order_id=live_order.client_order_id,
+                    reconciliation_status="conflict",
+                    live_crypto_order_id=live_order.live_crypto_order_id,
+                    capital_campaign_id=None if campaign is None else campaign.id,
+                    provider_recorded_at=_extract_provider_timestamp(payload=provider_order_payload),
+                    requested_by=operator_identity,
+                    provenance_metadata={"reason": "provider_order_id_conflict", "existing": live_order.provider_order_id, "new": discovered_provider_order_id},
+                    idempotency_key=f"lco-reconcile:{live_order.live_crypto_order_id}:provider-id-conflict",
+                ),
+            )
+            live_order.status = "RECONCILIATION_REQUIRED"
+            live_order.failure_code = "provider_order_id_conflict"
+            live_order.failure_reason = json.dumps({"existing": live_order.provider_order_id, "new": discovered_provider_order_id})
+            await db.flush()
+            return {"reconciliation_status": live_order.status, "provider_status": live_order.provider_status, "provider_order_id": live_order.provider_order_id, "provider_fill_observed": False, "safe_provider_response": _safe_json(provider_order_payload)}
+
+        live_order.provider_order_id = discovered_provider_order_id or live_order.provider_order_id
+
+    provider_status_raw = None if provider_order_payload is None else provider_order_payload.get("status") if isinstance(provider_order_payload.get("status"), str) else None
+    normalized_status = _normalize_provider_status(provider_status=provider_status_raw)
+    provider_recorded_at = _extract_provider_timestamp(payload=provider_order_payload or {})
+
+    await record_live_order_reconciliation(
+        db=db,
+        request=LiveOrderReconciliationRequest(
+            live_trading_profile_id=profile.id,
+            source_execution_event_id=source_event.id,
+            provider_name=live_order.provider,
+            provider_order_id=live_order.provider_order_id,
+            client_order_id=live_order.client_order_id,
+            reconciliation_status=normalized_status,
+            live_crypto_order_id=live_order.live_crypto_order_id,
+            capital_campaign_id=None if campaign is None else campaign.id,
+            provider_recorded_at=provider_recorded_at,
+            requested_by=operator_identity,
+            provenance_metadata={"provider_status": provider_status_raw, "headers": provider_headers},
+            idempotency_key=f"lco-reconcile:{live_order.live_crypto_order_id}:status:{normalized_status}:{provider_status_raw or 'none'}",
+        ),
+    )
+
+    fill_count = 0
+    fill_events: list[dict[str, object]] = []
+    if live_order.provider_order_id:
+        fills_payload, _fill_headers = await provider.list_historical_fills(
+            credentials=credentials,
+            environment=live_order.environment,
+            order_id=live_order.provider_order_id,
+        )
+        fills = fills_payload.get("fills") if isinstance(fills_payload.get("fills"), list) else []
+        for index, fill in enumerate(fills):
+            if not isinstance(fill, dict):
+                continue
+            provider_fill_id = fill.get("trade_id") if isinstance(fill.get("trade_id"), str) else None
+            if provider_fill_id is None:
+                continue
+            size = _decimal(fill.get("size", "0"))
+            if size <= Decimal("0"):
+                continue
+            price = _decimal(fill.get("price", "0"))
+            fee = _decimal(fill.get("commission", "0"))
+            fee_currency = str(fill.get("commission_currency") or "USD")
+            cumulative = size
+            fill_time = _extract_provider_timestamp(payload=fill)
+
+            result = await record_live_fill_reconciliation(
+                db=db,
+                request=LiveFillReconciliationRequest(
+                    live_trading_profile_id=profile.id,
+                    source_execution_event_id=source_event.id,
+                    provider_name=live_order.provider,
+                    provider_order_id=live_order.provider_order_id,
+                    provider_fill_id=provider_fill_id,
+                    client_order_id=live_order.client_order_id,
+                    symbol=live_order.product_id,
+                    side=live_order.side.lower(),
+                    fill_quantity=format(size, "f"),
+                    cumulative_filled_quantity=format(cumulative, "f"),
+                    order_quantity=format(live_order.requested_quote_size, "f"),
+                    fill_price=format(price, "f"),
+                    fee_amount=format(fee, "f"),
+                    fee_currency=fee_currency,
+                    live_crypto_order_id=live_order.live_crypto_order_id,
+                    capital_campaign_id=None if campaign is None else campaign.id,
+                    provider_fill_timestamp=fill_time,
+                    provider_recorded_at=fill_time,
+                    requested_by=operator_identity,
+                    provenance_metadata={"fill_index": index},
+                    idempotency_key=f"lco-reconcile:{live_order.live_crypto_order_id}:fill:{provider_fill_id}",
+                ),
+            )
+            fill_events.append({"fill_id": provider_fill_id, "status": result.status})
+            fill_count += 1
+
+    accounting_rows = list(
+        await db.scalars(
+            select(LiveAccountingRecord)
+            .where(LiveAccountingRecord.live_crypto_order_id == live_order.live_crypto_order_id)
+            .order_by(LiveAccountingRecord.recorded_at.asc(), LiveAccountingRecord.created_at.asc())
+        )
+    )
+    fill_rows = [row for row in accounting_rows if row.record_type in {"fill_accounting", "partial_fill_accounting"}]
+    total_filled_quantity = sum((_decimal(row.filled_quantity) for row in fill_rows), Decimal("0"))
+    total_quote_notional = sum((_decimal(row.gross_notional) for row in fill_rows), Decimal("0"))
+    total_fees_by_currency: dict[str, Decimal] = {}
+    for row in accounting_rows:
+        total_fees_by_currency[row.fee_currency] = total_fees_by_currency.get(row.fee_currency, Decimal("0")) + _decimal(row.fee_amount)
+
+    weighted_average_fill_price: Decimal | None = None
+    if total_filled_quantity > Decimal("0"):
+        weighted_average_fill_price = total_quote_notional / total_filled_quantity
+
+    quote_currency = "USD"
+    expected_quote_reduction = total_quote_notional + total_fees_by_currency.get(quote_currency, Decimal("0"))
+    post_balance = None
+    for item in connection.balances or []:
+        if str(item.get("currency", "")).upper() == quote_currency:
+            post_balance = _decimal(item.get("available", "0"))
+            break
+    balance_observed = post_balance is not None
+    balance_status = "ok" if balance_observed else "missing"
+
+    preview_fee = _decimal(live_order.safe_provider_response.get("preview_estimated_fee", "0")) if live_order.safe_provider_response.get("preview_estimated_fee") is not None else Decimal("0")
+    provider_fee_total = total_fees_by_currency.get("USD", Decimal("0"))
+    fee_delta = provider_fee_total - preview_fee
+
+    live_order.provider_status = provider_status_raw
+    if normalized_status in {"filled", "canceled", "rejected"}:
+        if normalized_status == "filled" and total_filled_quantity > Decimal("0"):
+            live_order.status = "FILLED"
+            live_order.filled_at = live_order.filled_at or _utcnow()
+        elif normalized_status == "canceled" and total_filled_quantity > Decimal("0"):
+            live_order.status = "PARTIALLY_FILLED"
+            live_order.cancelled_at = live_order.cancelled_at or _utcnow()
+        elif normalized_status == "canceled":
+            live_order.status = "CANCELLED"
+            live_order.cancelled_at = live_order.cancelled_at or _utcnow()
+        else:
+            live_order.status = "REJECTED"
+    elif normalized_status == "unknown":
+        live_order.status = "UNKNOWN"
+    else:
+        live_order.status = "ACKNOWLEDGED"
+
+    if not balance_observed:
+        live_order.status = "RECONCILIATION_REQUIRED"
+        await record_live_order_reconciliation(
+            db=db,
+            request=LiveOrderReconciliationRequest(
+                live_trading_profile_id=profile.id,
+                source_execution_event_id=source_event.id,
+                provider_name=live_order.provider,
+                provider_order_id=live_order.provider_order_id,
+                client_order_id=live_order.client_order_id,
+                reconciliation_status="reconciliation_required",
+                live_crypto_order_id=live_order.live_crypto_order_id,
+                capital_campaign_id=None if campaign is None else campaign.id,
+                provider_recorded_at=None,
+                requested_by=operator_identity,
+                provenance_metadata={"reason": "balance_missing"},
+                idempotency_key=f"lco-reconcile:{live_order.live_crypto_order_id}:balance-missing",
+            ),
+        )
+
+    live_order.safe_provider_response = {
+        **(live_order.safe_provider_response or {}),
+        "reconciliation": {
+            "provider_status": provider_status_raw,
+            "normalized_status": normalized_status,
+            "fill_count": fill_count,
+            "fill_events": fill_events,
+            "total_filled_quantity": format(total_filled_quantity, "f"),
+            "total_quote_notional": format(total_quote_notional, "f"),
+            "weighted_average_fill_price": None if weighted_average_fill_price is None else format(weighted_average_fill_price, "f"),
+            "fees": {currency: format(amount, "f") for currency, amount in total_fees_by_currency.items()},
+            "expected_quote_reduction": format(expected_quote_reduction, "f"),
+            "balance_status": balance_status,
+            "fee_delta_vs_preview": format(fee_delta, "f"),
+            "observed_at": _utcnow().isoformat(),
+        }
+    }
+    live_order.updated_at = _utcnow()
+    await db.flush()
+
+    return {
+        "reconciliation_status": live_order.status,
+        "provider_status": provider_status_raw,
+        "provider_order_id": live_order.provider_order_id,
+        "provider_fill_observed": total_filled_quantity > Decimal("0"),
+        "safe_provider_response": _safe_json(live_order.safe_provider_response.get("reconciliation", {})),
+    }
 
 
 def build_live_reconciliation_event_hash(
@@ -154,6 +593,8 @@ async def record_live_order_reconciliation(
                 payload=payload,
             ),
             live_trading_profile_id=request.live_trading_profile_id,
+            live_crypto_order_id=request.live_crypto_order_id,
+            capital_campaign_id=request.capital_campaign_id,
             source_execution_event_id=request.source_execution_event_id,
             source_execution_event_type="execution_intent_created",
             sequence_number=sequence_number,
@@ -169,6 +610,7 @@ async def record_live_order_reconciliation(
                 **request.provenance_metadata,
             },
             immutable_contract_version="v1",
+            provider_recorded_at=request.provider_recorded_at,
             recorded_at=recorded_at,
         )
         db.add(event)
@@ -300,6 +742,8 @@ async def record_live_fill_reconciliation(
                 payload=payload,
             ),
             live_trading_profile_id=request.live_trading_profile_id,
+            live_crypto_order_id=request.live_crypto_order_id,
+            capital_campaign_id=request.capital_campaign_id,
             source_execution_event_id=request.source_execution_event_id,
             source_execution_event_type="execution_intent_created",
             sequence_number=sequence_number,
@@ -315,6 +759,7 @@ async def record_live_fill_reconciliation(
                 **request.provenance_metadata,
             },
             immutable_contract_version="v1",
+            provider_recorded_at=request.provider_recorded_at,
             recorded_at=recorded_at,
         )
         db.add(event)
@@ -323,6 +768,8 @@ async def record_live_fill_reconciliation(
         accounting = LiveAccountingRecord(
             idempotency_key=f"{idempotency_key}:fill",
             live_trading_profile_id=request.live_trading_profile_id,
+            live_crypto_order_id=request.live_crypto_order_id,
+            capital_campaign_id=request.capital_campaign_id,
             reconciliation_event_id=event.id,
             source_execution_event_id=request.source_execution_event_id,
             source_execution_event_type="execution_intent_created",
@@ -343,6 +790,7 @@ async def record_live_fill_reconciliation(
                 "reconciliation_status": reconciliation_status,
                 **request.provenance_metadata,
             },
+            provider_fill_timestamp=request.provider_fill_timestamp,
             recorded_at=recorded_at,
         )
         db.add(accounting)
@@ -350,6 +798,8 @@ async def record_live_fill_reconciliation(
         fee_attribution = LiveAccountingRecord(
             idempotency_key=f"{idempotency_key}:fee",
             live_trading_profile_id=request.live_trading_profile_id,
+            live_crypto_order_id=request.live_crypto_order_id,
+            capital_campaign_id=request.capital_campaign_id,
             reconciliation_event_id=event.id,
             source_execution_event_id=request.source_execution_event_id,
             source_execution_event_type="execution_intent_created",
@@ -370,6 +820,7 @@ async def record_live_fill_reconciliation(
                 "attribution": "fill_fee",
                 **request.provenance_metadata,
             },
+            provider_fill_timestamp=request.provider_fill_timestamp,
             recorded_at=recorded_at,
         )
         db.add(fee_attribution)

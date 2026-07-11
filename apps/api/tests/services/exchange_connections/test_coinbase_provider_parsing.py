@@ -1,8 +1,12 @@
 from __future__ import annotations
 
 from decimal import Decimal
+from unittest.mock import AsyncMock
+
+import pytest
 
 from app.services.exchange_connections.providers.coinbase_advanced import (
+    CoinbaseAdvancedClient,
     parse_coinbase_account_status,
     parse_coinbase_balances,
     parse_coinbase_permissions,
@@ -55,3 +59,20 @@ def test_account_status_parsing() -> None:
     payload = {"accounts": [{"status": "active"}]}
 
     assert parse_coinbase_account_status(payload) == "active"
+
+
+@pytest.mark.asyncio
+async def test_historical_fills_request_uses_order_id_query_param() -> None:
+    client = CoinbaseAdvancedClient()
+    client._request_json = AsyncMock(return_value=({"fills": []}, {"x-request-id": "abc"}))
+
+    await client.list_historical_fills(
+        credentials={"api_key": "k", "api_secret": "s"},
+        environment="production",
+        order_id="provider-order-1",
+    )
+
+    kwargs = client._request_json.call_args.kwargs
+    assert kwargs["method"] == "GET"
+    assert kwargs["path"] == "/api/v3/brokerage/orders/historical/fills"
+    assert kwargs["query_params"] == {"order_id": "provider-order-1"}

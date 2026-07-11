@@ -194,11 +194,14 @@ class LiveOrderReconciliationRequest:
     live_trading_profile_id: uuid.UUID
     source_execution_event_id: uuid.UUID
     provider_name: str
-    provider_order_id: str
+    provider_order_id: str | None
     client_order_id: str
     reconciliation_status: str
     requested_by: str
     provenance_metadata: dict[str, Any]
+    live_crypto_order_id: uuid.UUID | None = None
+    capital_campaign_id: int | None = None
+    provider_recorded_at: datetime | None = None
     idempotency_key: str | None = None
 
 
@@ -220,6 +223,10 @@ class LiveFillReconciliationRequest:
     fee_currency: str
     requested_by: str
     provenance_metadata: dict[str, Any]
+    live_crypto_order_id: uuid.UUID | None = None
+    capital_campaign_id: int | None = None
+    provider_fill_timestamp: datetime | None = None
+    provider_recorded_at: datetime | None = None
     idempotency_key: str | None = None
 
 

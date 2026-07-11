@@ -1134,7 +1134,11 @@ async def test_reconcile_can_discover_order_by_client_order_id_when_provider_ord
             ]
         }, {"x-request-id": "2"}
 
+    async def _list_fills(*_args, **_kwargs):
+        return {"fills": []}, {"x-request-id": "3"}
+
     monkeypatch.setattr(service.CoinbaseAdvancedClient, "list_historical_orders", _list_orders)
+    monkeypatch.setattr(service.CoinbaseAdvancedClient, "list_historical_fills", _list_fills)
 
     response = await service.service.reconcile(
         db=db,
@@ -1143,4 +1147,4 @@ async def test_reconcile_can_discover_order_by_client_order_id_when_provider_ord
     )
 
     assert response.live_crypto_order.provider_order_id == "provider-order-1"
-    assert response.reconciliation_status in {"SUBMITTED", "UNKNOWN"}
+    assert response.reconciliation_status in {"ACKNOWLEDGED", "UNKNOWN"}

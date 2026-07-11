@@ -11,6 +11,7 @@ from app.models.live_accounting_record import LiveAccountingRecord
 from app.models.live_execution_event import LiveExecutionEvent
 from app.models.live_reconciliation_event import LiveReconciliationEvent
 from app.services.live.accounting_reconciliation import (
+    reconcile_live_order_and_fills,
     record_live_fill_reconciliation,
     record_live_order_reconciliation,
 )
@@ -41,6 +42,10 @@ class _FakeSession:
         self.execution_events = execution_events
         self.reconciliation_events: list[LiveReconciliationEvent] = []
         self.accounting_records: list[LiveAccountingRecord] = []
+        self.live_orders: list[Any] = []
+        self.live_profiles: list[Any] = []
+        self.capital_campaigns: list[Any] = []
+        self.commits = 0
 
     def begin(self) -> _BeginContext:
         return _BeginContext()
@@ -73,6 +78,25 @@ class _FakeSession:
                     return event
             return None
 
+        if "FROM live_crypto_orders" in sql:
+            order_id = params.get("live_crypto_order_id_1") or params.get("live_crypto_order_id_2")
+            for order in self.live_orders:
+                if order.live_crypto_order_id == order_id:
+                    return order
+            return None
+
+        if "FROM live_trading_profiles" in sql:
+            profile_id = params.get("id_1")
+            for profile in self.live_profiles:
+                if profile.id == profile_id:
+                    return profile
+            return self.live_profiles[0] if self.live_profiles else None
+
+        if "FROM capital_campaigns" in sql:
+            account_id = params.get("paper_account_id_1")
+            rows = [item for item in self.capital_campaigns if item.paper_account_id == account_id]
+            return rows[0] if rows else None
+
         return None
 
     async def scalars(self, statement: Any) -> _ScalarRows:
@@ -81,12 +105,23 @@ class _FakeSession:
 
         if "FROM live_accounting_records" in sql:
             rec_id = params.get("reconciliation_event_id_1")
-            rows = [item for item in self.accounting_records if item.reconciliation_event_id == rec_id]
+            order_id = params.get("live_crypto_order_id_1")
+            rows = self.accounting_records
+            if rec_id is not None:
+                rows = [item for item in rows if item.reconciliation_event_id == rec_id]
+            if order_id is not None:
+                rows = [item for item in rows if getattr(item, "live_crypto_order_id", None) == order_id]
             return _ScalarRows(rows)
 
         return _ScalarRows([])
 
     def add(self, obj: Any) -> None:
+        if isinstance(obj, LiveExecutionEvent):
+            if not getattr(obj, "id", None):
+                obj.id = uuid.uuid4()
+            self.execution_events.append(obj)
+            return
+
         if isinstance(obj, LiveReconciliationEvent):
             if not getattr(obj, "id", None):
                 obj.id = uuid.uuid4()
@@ -100,6 +135,9 @@ class _FakeSession:
 
     async def flush(self) -> None:
         return None
+
+    async def commit(self) -> None:
+        self.commits += 1
 
 
 def _execution_event(event_type: str = "execution_intent_created") -> LiveExecutionEvent:
@@ -258,3 +296,134 @@ async def test_fill_reconciliation_fee_and_net_cash_impact_for_buy_and_sell() ->
     sell_fill = next(item for item in session.accounting_records if item.idempotency_key == "fill-rec-key-5:fill")
     assert Decimal(str(buy_fill.net_cash_impact)) < Decimal("0")
     assert Decimal(str(sell_fill.net_cash_impact)) > Decimal("0")
+
+
+@pytest.mark.asyncio
+async def test_canonical_reconciliation_discovers_provider_order_and_persists_fill_evidence(monkeypatch: pytest.MonkeyPatch) -> None:
+    source = _execution_event("execution_intent_created")
+    profile = type("Profile", (), {
+        "id": source.live_trading_profile_id,
+        "paper_account_id": uuid.uuid4(),
+        "operating_mode": "live",
+        "paper_default_mode": True,
+        "risk_authority_model": "risk_engine_final",
+    })()
+    live_order = type("LiveOrder", (), {
+        "live_crypto_order_id": uuid.uuid4(),
+        "provider": "coinbase_advanced",
+        "environment": "production",
+        "exchange_connection_id": uuid.uuid4(),
+        "provider_order_id": None,
+        "client_order_id": "client-order-1",
+        "product_id": "BTC-USD",
+        "side": "BUY",
+        "order_type": "MARKET",
+        "requested_quote_size": Decimal("5.00"),
+        "status": "RECONCILIATION_REQUIRED",
+        "risk_event_id": uuid.uuid4(),
+        "safe_provider_response": {"live_trading_profile_id": str(source.live_trading_profile_id)},
+        "audit_correlation_id": uuid.uuid4(),
+        "provider_status": None,
+        "updated_at": datetime.now(timezone.utc),
+        "filled_at": None,
+        "cancelled_at": None,
+        "failure_code": None,
+        "failure_reason": None,
+        "acknowledged_at": None,
+    })()
+    campaign = type("Campaign", (), {"id": 42, "paper_account_id": profile.paper_account_id, "updated_at": datetime.now(timezone.utc)})()
+    session = _FakeSession(execution_events=[source])
+    session.live_orders = [live_order]
+    session.live_profiles = [profile]
+    session.capital_campaigns = [campaign]
+
+    async def _load_exchange_connection(*_args, **_kwargs):
+        return type("Conn", (), {
+            "exchange_connection_id": live_order.exchange_connection_id,
+            "balances": [{"currency": "USD", "available": "100.00"}],
+        })()
+
+    monkeypatch.setattr("app.services.live_crypto_orders._load_exchange_connection", _load_exchange_connection)
+    monkeypatch.setattr("app.services.live_crypto_orders._load_decrypted_credentials", lambda _c: {"api_key": "k", "api_secret": "s"})
+
+    class _Provider:
+        async def list_historical_orders(self, **_kwargs):
+            return {
+                "orders": [
+                    {
+                        "order_id": "provider-order-1",
+                        "client_order_id": "client-order-1",
+                        "product_id": "BTC-USD",
+                        "status": "FILLED",
+                        "completion_time": "2026-07-10T12:00:00Z",
+                    }
+                ]
+            }, {}
+
+        async def list_historical_fills(self, **_kwargs):
+            return {
+                "fills": [
+                    {
+                        "trade_id": "fill-1",
+                        "price": "100000.00",
+                        "size": "0.00005",
+                        "commission": "0.01",
+                        "commission_currency": "USD",
+                        "created_at": "2026-07-10T12:00:01Z",
+                    }
+                ]
+            }, {}
+
+        async def get_historical_order(self, **_kwargs):
+            return {"order": {}}, {}
+
+    monkeypatch.setattr("app.services.live.accounting_reconciliation.CoinbaseAdvancedClient", _Provider)
+
+    outcome = await reconcile_live_order_and_fills(
+        db=session,
+        live_crypto_order_id=live_order.live_crypto_order_id,
+        operator_identity="operator:human",
+    )
+
+    assert outcome["provider_order_id"] == "provider-order-1"
+    assert isinstance(outcome["provider_fill_observed"], bool)
+    assert len(session.reconciliation_events) >= 2
+    assert len(session.accounting_records) >= 2
+
+
+@pytest.mark.asyncio
+async def test_canonical_reconciliation_handles_duplicate_provider_fill_idempotently(monkeypatch: pytest.MonkeyPatch) -> None:
+    source = _execution_event("execution_intent_created")
+    session = _FakeSession(execution_events=[source])
+
+    first = await record_live_fill_reconciliation(
+        db=session,
+        request=_fill_request(source, idempotency_key="dup-fill-key", provider_fill_id="fill-dup"),
+    )
+    second = await record_live_fill_reconciliation(
+        db=session,
+        request=_fill_request(source, idempotency_key="dup-fill-key", provider_fill_id="fill-dup"),
+    )
+
+    assert first.status == "recorded"
+    assert second.status == "replayed"
+    assert len(session.accounting_records) == 2
+
+
+@pytest.mark.asyncio
+async def test_order_reconciliation_can_record_unresolved_balance_mismatch_status() -> None:
+    source = _execution_event("execution_intent_created")
+    session = _FakeSession(execution_events=[source])
+
+    result = await record_live_order_reconciliation(
+        db=session,
+        request=_order_request(
+            source,
+            idempotency_key="order-rec-balance-mismatch",
+            reconciliation_status="balance_mismatch",
+            provider_order_id=None,
+        ),
+    )
+
+    assert result.accepted is True
+    assert session.reconciliation_events[0].reconciliation_status == "balance_mismatch"
