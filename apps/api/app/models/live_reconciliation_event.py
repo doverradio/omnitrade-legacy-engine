@@ -4,7 +4,7 @@ import uuid
 from datetime import datetime
 from typing import Any
 
-from sqlalchemy import CheckConstraint, DateTime, ForeignKey, Integer, Text, UniqueConstraint, event, text
+from sqlalchemy import CheckConstraint, DateTime, ForeignKey, Index, Integer, Text, UniqueConstraint, event, text
 from sqlalchemy.dialects.postgresql import JSONB, UUID
 from sqlalchemy.orm import Mapped, mapped_column
 
@@ -17,6 +17,8 @@ class LiveReconciliationEvent(Base):
         UniqueConstraint("idempotency_key", name="uq_live_reconciliation_events_idempotency_key"),
         UniqueConstraint("event_hash", name="uq_live_reconciliation_events_event_hash"),
         UniqueConstraint("live_trading_profile_id", "sequence_number", name="uq_live_reconciliation_events_sequence"),
+        Index("ix_lre_live_order", "live_crypto_order_id"),
+        Index("ix_lre_campaign", "capital_campaign_id"),
         CheckConstraint(
             "event_type IN ('order_reconciled','fill_reconciled')",
             name="ck_live_reconciliation_events_event_type",
@@ -26,7 +28,7 @@ class LiveReconciliationEvent(Base):
             name="ck_live_reconciliation_events_source_execution_event_type",
         ),
         CheckConstraint(
-            "reconciliation_status IN ('open','partially_filled','filled','canceled','rejected')",
+            "reconciliation_status IN ('open','partially_filled','filled','canceled','rejected','reconciliation_required','unknown','conflict','balance_mismatch')",
             name="ck_live_reconciliation_events_reconciliation_status",
         ),
         CheckConstraint(
@@ -47,6 +49,16 @@ class LiveReconciliationEvent(Base):
         ForeignKey("live_trading_profiles.id", ondelete="CASCADE"),
         nullable=False,
     )
+    live_crypto_order_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("live_crypto_orders.live_crypto_order_id", ondelete="SET NULL"),
+        nullable=True,
+    )
+    capital_campaign_id: Mapped[int | None] = mapped_column(
+        Integer,
+        ForeignKey("capital_campaigns.id", ondelete="SET NULL"),
+        nullable=True,
+    )
     source_execution_event_id: Mapped[uuid.UUID] = mapped_column(
         UUID(as_uuid=True),
         ForeignKey("live_execution_events.id", ondelete="CASCADE"),
@@ -57,11 +69,12 @@ class LiveReconciliationEvent(Base):
     event_type: Mapped[str] = mapped_column(Text, nullable=False)
     reconciliation_status: Mapped[str] = mapped_column(Text, nullable=False)
     provider_name: Mapped[str] = mapped_column(Text, nullable=False)
-    provider_order_id: Mapped[str] = mapped_column(Text, nullable=False)
+    provider_order_id: Mapped[str | None] = mapped_column(Text, nullable=True)
     provider_fill_id: Mapped[str | None] = mapped_column(Text, nullable=True)
     event_payload: Mapped[dict[str, Any]] = mapped_column(JSONB, nullable=False)
     provenance: Mapped[dict[str, Any]] = mapped_column(JSONB, nullable=False)
     immutable_contract_version: Mapped[str] = mapped_column(Text, nullable=False)
+    provider_recorded_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     recorded_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True),

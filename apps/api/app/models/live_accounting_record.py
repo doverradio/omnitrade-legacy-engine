@@ -5,7 +5,7 @@ from datetime import datetime
 from decimal import Decimal
 from typing import Any
 
-from sqlalchemy import CheckConstraint, DateTime, ForeignKey, Numeric, Text, UniqueConstraint, event, text
+from sqlalchemy import CheckConstraint, DateTime, ForeignKey, Index, Numeric, Text, UniqueConstraint, event, text
 from sqlalchemy.dialects.postgresql import JSONB, UUID
 from sqlalchemy.orm import Mapped, mapped_column
 
@@ -16,6 +16,9 @@ class LiveAccountingRecord(Base):
     __tablename__ = "live_accounting_records"
     __table_args__ = (
         UniqueConstraint("idempotency_key", name="uq_live_accounting_records_idempotency_key"),
+        UniqueConstraint("provider_order_id", "provider_fill_id", "record_type", name="uq_lar_provider_fill_record"),
+        Index("ix_lar_live_order", "live_crypto_order_id"),
+        Index("ix_lar_campaign", "capital_campaign_id"),
         CheckConstraint(
             "record_type IN ('fill_accounting','partial_fill_accounting','fee_attribution')",
             name="ck_live_accounting_records_record_type",
@@ -45,6 +48,15 @@ class LiveAccountingRecord(Base):
         ForeignKey("live_trading_profiles.id", ondelete="CASCADE"),
         nullable=False,
     )
+    live_crypto_order_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("live_crypto_orders.live_crypto_order_id", ondelete="SET NULL"),
+        nullable=True,
+    )
+    capital_campaign_id: Mapped[int | None] = mapped_column(
+        ForeignKey("capital_campaigns.id", ondelete="SET NULL"),
+        nullable=True,
+    )
     reconciliation_event_id: Mapped[uuid.UUID] = mapped_column(
         UUID(as_uuid=True),
         ForeignKey("live_reconciliation_events.id", ondelete="CASCADE"),
@@ -68,6 +80,7 @@ class LiveAccountingRecord(Base):
     fee_currency: Mapped[str] = mapped_column(Text, nullable=False)
     net_cash_impact: Mapped[Decimal] = mapped_column(Numeric, nullable=False)
     provenance: Mapped[dict[str, Any]] = mapped_column(JSONB, nullable=False)
+    provider_fill_timestamp: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     recorded_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True),
