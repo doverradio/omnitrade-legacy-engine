@@ -37,6 +37,21 @@ DEFAULT_PRODUCTION_CRYPTO_PAPER_ACCOUNT_ID = UUID("905a408c-7d8e-4fc7-ad3b-9ff63
 _READY_CONNECTION_VERDICTS = {"READY_FOR_PREVIEW", "READY_FOR_DRY_RUN", "READY_FOR_OPERATOR_REVIEW", "INITIALIZED_BUT_UNFUNDED"}
 
 
+def _annotate_failure_stage(exc: Exception, *, stage: str) -> None:
+    # Keep the original exception type/message and attach only safe stage metadata.
+    if hasattr(exc, "add_note"):
+        notes = getattr(exc, "__notes__", [])
+        marker = f"failure_stage={stage}"
+        if marker in notes:
+            return
+        exc.add_note(marker)
+        return
+    try:
+        setattr(exc, "_failure_stage", stage)
+    except Exception:
+        return
+
+
 def _normalize_exchange_environment(environment: str) -> str:
     normalized = environment.strip().lower()
     if normalized not in {"production", "sandbox"}:
@@ -617,147 +632,169 @@ async def initialize_live_crypto_environment(
     db: AsyncSession,
     request: InitializeLiveCryptoEnvironmentRequest,
 ) -> InitializeLiveCryptoEnvironmentResult:
-    exchange_environment = _normalize_exchange_environment(request.exchange_environment)
-    connection_name = request.exchange_connection_name or _default_connection_name(provider=request.provider, environment=exchange_environment)
-    initial = await inspect_live_crypto_environment(
-        db=db,
-        provider=request.provider,
-        exchange_environment=exchange_environment,
-        paper_account_id=request.paper_account_id,
-    )
+    stage = "normalize_exchange_environment"
+    try:
+        exchange_environment = _normalize_exchange_environment(request.exchange_environment)
+        connection_name = request.exchange_connection_name or _default_connection_name(provider=request.provider, environment=exchange_environment)
 
-    created_exchange = False
-    created_asset = False
-    created_profile = False
-    created_campaign = False
-
-    if initial.exchange_connection_id is None:
-        if not request.exchange_api_key_name or not request.exchange_private_key:
-            if request.provider == "coinbase_advanced":
-                raise ValueError("Coinbase credentials are required when the exchange connection is missing")
-            raise ValueError("Provider credentials are required when the exchange connection is missing")
-        await create_exchange_connection(
+        stage = "inspect_initial_environment"
+        initial = await inspect_live_crypto_environment(
             db=db,
-            payload=SaveExchangeConnectionRequest(
-                provider=request.provider,
-                connection_name=connection_name,
-                environment=exchange_environment,
-                api_key_name=request.exchange_api_key_name,
-                private_key=request.exchange_private_key,
-                passphrase=request.exchange_passphrase,
-            ),
-            actor=request.actor,
+            provider=request.provider,
+            exchange_environment=exchange_environment,
+            paper_account_id=request.paper_account_id,
         )
-        created_exchange = True
 
-    refreshed_readiness = await inspect_live_crypto_environment(
-        db=db,
-        provider=request.provider,
-        exchange_environment=exchange_environment,
-        paper_account_id=request.paper_account_id,
-    )
-    if refreshed_readiness.exchange_connection_id is not None:
-        refreshed = await refresh_exchange_balances(
-            db=db,
-            exchange_connection_id=refreshed_readiness.exchange_connection_id,
-            actor=request.actor,
-        )
-        if refreshed.readiness.verdict not in _READY_CONNECTION_VERDICTS:
-            if request.provider == "coinbase_advanced":
-                raise ValueError("Coinbase readiness check failed; refresh_exchange_balances did not reach ready state")
-            raise ValueError("Provider readiness check failed; refresh_exchange_balances did not reach ready state")
+        created_exchange = False
+        created_asset = False
+        created_profile = False
+        created_campaign = False
 
-    asset_result = await ensure_coinbase_crypto_asset(
-        db=db,
-        request=EnsureCoinbaseAssetRequest(
-            symbol="BTC",
-            base_currency="USD",
-            exchange=_exchange_label(provider=request.provider, environment=exchange_environment),
-            actor=request.actor,
-        ),
-    )
-    created_asset = asset_result.created
-
-    current = await inspect_live_crypto_environment(
-        db=db,
-        provider=request.provider,
-        exchange_environment=exchange_environment,
-        paper_account_id=request.paper_account_id,
-    )
-    if current.paper_account_id is None:
-        raise ValueError("Active crypto paper account is required before initialization can continue")
-
-    if current.live_trading_profile_id is None:
-        registration = await register_live_account(
-            db=db,
-            request=LiveAccountRegistrationRequest(
-                paper_account_id=current.paper_account_id,
-                requested_by=request.actor,
-                registration_source=request.registration_source,
-                live_opt_in=True,
-                governance_approved=True,
-                human_approval_recorded=False,
-                provenance_metadata={
-                    "source": "initialize_live_crypto_environment",
-                    "exchange_environment": exchange_environment,
-                    "exchange_label": _exchange_label(provider=request.provider, environment=exchange_environment),
-                    "provider": request.provider,
-                },
-                idempotency_key=f"init-live-profile:{request.provider}:{exchange_environment}:{current.paper_account_id}",
-            ),
-        )
-        if not registration.accepted:
-            raise ValueError(f"Live trading profile registration rejected: {registration.rejection_reason}")
-        created_profile = True
-
-    current = await inspect_live_crypto_environment(
-        db=db,
-        provider=request.provider,
-        exchange_environment=exchange_environment,
-        paper_account_id=request.paper_account_id,
-    )
-    if current.capital_campaign_id is None:
-        paper_account = await _load_selected_crypto_paper_account(db=db, paper_account_id=request.paper_account_id)
-        if paper_account is None:
-            raise ValueError("Active crypto paper account is required for campaign initialization")
-        await create_capital_campaign(
-            db=db,
-            request=CapitalCampaignCreateRequest(
-                owner=request.campaign_owner,
-                name=(
-                    f"{request.provider} Production Small Account Mode"
-                    if exchange_environment == "production"
-                    else f"{request.provider} Sandbox Small Account Mode"
+        if initial.exchange_connection_id is None:
+            stage = "validate_exchange_credentials"
+            if not request.exchange_api_key_name or not request.exchange_private_key:
+                if request.provider == "coinbase_advanced":
+                    raise ValueError("Coinbase credentials are required when the exchange connection is missing")
+                raise ValueError("Provider credentials are required when the exchange connection is missing")
+            stage = "create_exchange_connection"
+            await create_exchange_connection(
+                db=db,
+                payload=SaveExchangeConnectionRequest(
+                    provider=request.provider,
+                    connection_name=connection_name,
+                    environment=exchange_environment,
+                    api_key_name=request.exchange_api_key_name,
+                    private_key=request.exchange_private_key,
+                    passphrase=request.exchange_passphrase,
                 ),
-                description="Initialized for live-crypto dry-run readiness",
-                status="READY",
-                campaign_type="small_account_mode",
+                actor=request.actor,
+            )
+            created_exchange = True
+
+        stage = "inspect_post_connection_environment"
+        refreshed_readiness = await inspect_live_crypto_environment(
+            db=db,
+            provider=request.provider,
+            exchange_environment=exchange_environment,
+            paper_account_id=request.paper_account_id,
+        )
+        if refreshed_readiness.exchange_connection_id is not None:
+            stage = "refresh_exchange_balances"
+            refreshed = await refresh_exchange_balances(
+                db=db,
+                exchange_connection_id=refreshed_readiness.exchange_connection_id,
+                actor=request.actor,
+            )
+            stage = "validate_provider_readiness"
+            if refreshed.readiness.verdict not in _READY_CONNECTION_VERDICTS:
+                if request.provider == "coinbase_advanced":
+                    raise ValueError("Coinbase readiness check failed; refresh_exchange_balances did not reach ready state")
+                raise ValueError("Provider readiness check failed; refresh_exchange_balances did not reach ready state")
+
+        stage = "ensure_btc_asset"
+        asset_result = await ensure_coinbase_crypto_asset(
+            db=db,
+            request=EnsureCoinbaseAssetRequest(
+                symbol="BTC",
+                base_currency="USD",
                 exchange=_exchange_label(provider=request.provider, environment=exchange_environment),
-                paper_account_id=paper_account.id,
-                validation_run_id=None,
-                strategy_id=None,
-                starting_capital=paper_account.starting_balance,
-                current_equity=paper_account.starting_balance,
-                realized_profit=Decimal("0"),
-                unrealized_profit=Decimal("0"),
-                fees=Decimal("0"),
+                actor=request.actor,
             ),
         )
-        created_campaign = True
+        created_asset = asset_result.created
 
-    final_readiness = await inspect_live_crypto_environment(
-        db=db,
-        provider=request.provider,
-        exchange_environment=exchange_environment,
-        paper_account_id=request.paper_account_id,
-    )
-    return InitializeLiveCryptoEnvironmentResult(
-        created_exchange_connection=created_exchange,
-        created_asset=created_asset,
-        created_live_trading_profile=created_profile,
-        created_capital_campaign=created_campaign,
-        readiness=final_readiness,
-    )
+        stage = "inspect_post_asset_environment"
+        current = await inspect_live_crypto_environment(
+            db=db,
+            provider=request.provider,
+            exchange_environment=exchange_environment,
+            paper_account_id=request.paper_account_id,
+        )
+        if current.paper_account_id is None:
+            stage = "validate_active_crypto_paper_account"
+            raise ValueError("Active crypto paper account is required before initialization can continue")
+
+        if current.live_trading_profile_id is None:
+            stage = "register_live_trading_profile"
+            registration = await register_live_account(
+                db=db,
+                request=LiveAccountRegistrationRequest(
+                    paper_account_id=current.paper_account_id,
+                    requested_by=request.actor,
+                    registration_source=request.registration_source,
+                    live_opt_in=True,
+                    governance_approved=True,
+                    human_approval_recorded=False,
+                    provenance_metadata={
+                        "source": "initialize_live_crypto_environment",
+                        "exchange_environment": exchange_environment,
+                        "exchange_label": _exchange_label(provider=request.provider, environment=exchange_environment),
+                        "provider": request.provider,
+                    },
+                    idempotency_key=f"init-live-profile:{request.provider}:{exchange_environment}:{current.paper_account_id}",
+                ),
+            )
+            stage = "validate_live_trading_profile_registration"
+            if not registration.accepted:
+                raise ValueError(f"Live trading profile registration rejected: {registration.rejection_reason}")
+            created_profile = True
+
+        stage = "inspect_post_profile_environment"
+        current = await inspect_live_crypto_environment(
+            db=db,
+            provider=request.provider,
+            exchange_environment=exchange_environment,
+            paper_account_id=request.paper_account_id,
+        )
+        if current.capital_campaign_id is None:
+            stage = "load_campaign_paper_account"
+            paper_account = await _load_selected_crypto_paper_account(db=db, paper_account_id=request.paper_account_id)
+            if paper_account is None:
+                stage = "validate_campaign_paper_account"
+                raise ValueError("Active crypto paper account is required for campaign initialization")
+            stage = "create_capital_campaign"
+            await create_capital_campaign(
+                db=db,
+                request=CapitalCampaignCreateRequest(
+                    owner=request.campaign_owner,
+                    name=(
+                        f"{request.provider} Production Small Account Mode"
+                        if exchange_environment == "production"
+                        else f"{request.provider} Sandbox Small Account Mode"
+                    ),
+                    description="Initialized for live-crypto dry-run readiness",
+                    status="READY",
+                    campaign_type="small_account_mode",
+                    exchange=_exchange_label(provider=request.provider, environment=exchange_environment),
+                    paper_account_id=paper_account.id,
+                    validation_run_id=None,
+                    strategy_id=None,
+                    starting_capital=paper_account.starting_balance,
+                    current_equity=paper_account.starting_balance,
+                    realized_profit=Decimal("0"),
+                    unrealized_profit=Decimal("0"),
+                    fees=Decimal("0"),
+                ),
+            )
+            created_campaign = True
+
+        stage = "inspect_final_environment"
+        final_readiness = await inspect_live_crypto_environment(
+            db=db,
+            provider=request.provider,
+            exchange_environment=exchange_environment,
+            paper_account_id=request.paper_account_id,
+        )
+        return InitializeLiveCryptoEnvironmentResult(
+            created_exchange_connection=created_exchange,
+            created_asset=created_asset,
+            created_live_trading_profile=created_profile,
+            created_capital_campaign=created_campaign,
+            readiness=final_readiness,
+        )
+    except Exception as exc:
+        _annotate_failure_stage(exc, stage=stage)
+        raise
 
 
 async def generate_fresh_btc_dry_run_preview(

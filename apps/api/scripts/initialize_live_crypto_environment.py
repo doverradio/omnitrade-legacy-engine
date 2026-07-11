@@ -5,6 +5,8 @@ import asyncio
 import getpass
 import inspect
 import os
+import re
+import traceback
 from decimal import Decimal
 from uuid import UUID
 
@@ -111,6 +113,50 @@ def _print_readiness(readiness) -> None:
         state = "READY" if item.ready else "MISSING"
         print(f"{item.label}: {state} - {item.detail}")
     print(f"Overall Ready: {str(readiness.ready).lower()}")
+
+
+def _extract_failure_stage(exc: Exception) -> str:
+    stage_attr = getattr(exc, "_failure_stage", None)
+    if isinstance(stage_attr, str) and stage_attr.strip():
+        return stage_attr.strip()
+
+    note_prefix = "failure_stage="
+    current: BaseException | None = exc
+    while current is not None:
+        stage_attr = getattr(current, "_failure_stage", None)
+        if isinstance(stage_attr, str) and stage_attr.strip():
+            return stage_attr.strip()
+        for note in getattr(current, "__notes__", []):
+            if isinstance(note, str) and note.startswith(note_prefix):
+                value = note[len(note_prefix):].strip()
+                if value:
+                    return value
+        current = current.__cause__
+    return "unknown"
+
+
+def _sanitize_exception_message(message: str) -> str:
+    if not message:
+        return ""
+    patterns = [
+        r"(?i)(api[_ ]?key\s*[=:]\s*)([^\s,;]+)",
+        r"(?i)(api[_ ]?secret\s*[=:]\s*)([^\s,;]+)",
+        r"(?i)(private[_ ]?key\s*[=:]\s*)([^\s,;]+)",
+        r"(?i)(passphrase\s*[=:]\s*)([^\s,;]+)",
+        r"(?i)(token\s*[=:]\s*)([^\s,;]+)",
+    ]
+    redacted = message
+    for pattern in patterns:
+        redacted = re.sub(pattern, r"\1<redacted>", redacted)
+    return redacted
+
+
+def _origin_location(exc: Exception) -> tuple[str, str, int]:
+    trace = traceback.extract_tb(exc.__traceback__)
+    if not trace:
+        return "unknown", "unknown", 0
+    origin = trace[-1]
+    return origin.filename, origin.name, origin.lineno
 
 
 def _validate_safe_flags() -> tuple[bool, str | None]:
@@ -275,6 +321,14 @@ async def _run(args: argparse.Namespace) -> int:
         except Exception as exc:
             print("safe_failure_reason=initialization_failed")
             print(f"error_type={type(exc).__name__}")
+            failure_stage = _extract_failure_stage(exc)
+            filename, function_name, line_number = _origin_location(exc)
+            safe_message = _sanitize_exception_message(str(exc))
+            print(f"failure_stage={failure_stage}")
+            print(f"exception={type(exc).__name__}")
+            print(f"message={safe_message}")
+            print(f"originating_function={function_name}")
+            print(f"location={os.path.basename(filename)}:{line_number}")
             return 1
 
 
