@@ -159,3 +159,114 @@ async def test_test_exchange_credentials_forwarding(monkeypatch: pytest.MonkeyPa
     assert response.permissions == ["view"]
     assert captured["environment"] == "production"
     assert captured["credentials"]["api_key"] == "k"
+
+
+def _connection_for_refresh() -> ExchangeConnection:
+    return ExchangeConnection(
+        exchange_connection_id=uuid.uuid4(),
+        provider="kraken_spot",
+        connection_name="Kraken Prod",
+        environment="production",
+        status="connected",
+        credentials_encrypted="encrypted",
+        api_key_masked="***key",
+        api_secret_masked="********",
+        passphrase_configured=False,
+        credentials_valid=True,
+        api_permissions=[],
+        account_status="active",
+        balances=[],
+        total_equity_usd=None,
+        last_successful_sync_at=None,
+        last_heartbeat_at=None,
+        last_api_error=None,
+        created_at=datetime.now(timezone.utc),
+        updated_at=datetime.now(timezone.utc),
+    )
+
+
+@pytest.mark.asyncio
+async def test_refresh_kraken_zero_usd_without_btc_entry_is_unfunded_not_blocked(monkeypatch: pytest.MonkeyPatch) -> None:
+    connection = _connection_for_refresh()
+
+    class _Provider:
+        async def test_authentication(self, *, credentials, environment):
+            _ = credentials, environment
+            return ExchangeAuthResult(
+                reachable=True,
+                authenticated=True,
+                account_status="active",
+                permissions=["funds_query"],
+                heartbeat_at=datetime.now(timezone.utc),
+                trade_permission_present=False,
+                error=None,
+            )
+
+        async def fetch_balances(self, *, credentials, environment):
+            _ = credentials, environment
+            return SimpleNamespace(
+                balances=[SimpleNamespace(currency="USD", available=Decimal("0"), reserved=Decimal("0"), total=Decimal("0"))],
+                total_equity_usd=Decimal("0"),
+            )
+
+        async def fetch_product(self, *, credentials, environment, product_id):
+            _ = credentials, environment, product_id
+            return SimpleNamespace(available=True, trading_enabled=True)
+
+        async def create_order(self, **_kwargs):
+            raise AssertionError("create_order must not be called during refresh")
+
+    async def _load_connection(*, db, exchange_connection_id):
+        _ = db, exchange_connection_id
+        return connection
+
+    monkeypatch.setattr(service, "_load_connection", _load_connection)
+    monkeypatch.setattr(service, "_decrypt_credentials", lambda _connection: {"api_key": "k", "api_secret": "s", "passphrase": ""})
+    monkeypatch.setattr(service, "get_exchange_provider", lambda _provider: _Provider())
+
+    db = _FakeDb()
+    response = await service.refresh_exchange_balances(db=db, exchange_connection_id=connection.exchange_connection_id)
+
+    assert response.readiness.verdict == "INITIALIZED_BUT_UNFUNDED"
+
+
+@pytest.mark.asyncio
+async def test_refresh_missing_usd_entry_remains_balance_unavailable(monkeypatch: pytest.MonkeyPatch) -> None:
+    connection = _connection_for_refresh()
+
+    class _Provider:
+        async def test_authentication(self, *, credentials, environment):
+            _ = credentials, environment
+            return ExchangeAuthResult(
+                reachable=True,
+                authenticated=True,
+                account_status="active",
+                permissions=["funds_query"],
+                heartbeat_at=datetime.now(timezone.utc),
+                trade_permission_present=False,
+                error=None,
+            )
+
+        async def fetch_balances(self, *, credentials, environment):
+            _ = credentials, environment
+            return SimpleNamespace(
+                balances=[SimpleNamespace(currency="BTC", available=Decimal("0"), reserved=Decimal("0"), total=Decimal("0"))],
+                total_equity_usd=None,
+            )
+
+        async def fetch_product(self, *, credentials, environment, product_id):
+            _ = credentials, environment, product_id
+            return SimpleNamespace(available=True, trading_enabled=True)
+
+    async def _load_connection(*, db, exchange_connection_id):
+        _ = db, exchange_connection_id
+        return connection
+
+    monkeypatch.setattr(service, "_load_connection", _load_connection)
+    monkeypatch.setattr(service, "_decrypt_credentials", lambda _connection: {"api_key": "k", "api_secret": "s", "passphrase": ""})
+    monkeypatch.setattr(service, "get_exchange_provider", lambda _provider: _Provider())
+
+    db = _FakeDb()
+    response = await service.refresh_exchange_balances(db=db, exchange_connection_id=connection.exchange_connection_id)
+
+    assert response.readiness.verdict == "BALANCE_UNAVAILABLE"

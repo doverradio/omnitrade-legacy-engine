@@ -3,6 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
+import json
 from uuid import UUID
 
 from sqlalchemy import select
@@ -130,6 +131,107 @@ def _rehearsal_mode_for_environment(*, provider: str, environment: str) -> str:
     if normalized != "sandbox":
         return "production_live"
     return "controlled_provider_mock" if provider_mock_mode_enabled(provider) else f"{provider}_sandbox"
+
+
+def _report_check_status(*, report, code: str) -> str | None:
+    checks = getattr(report, "checks", None) or []
+    for item in checks:
+        item_code = getattr(item, "code", None)
+        if item_code != code:
+            continue
+        status = getattr(item, "status", None)
+        return None if status is None else str(status)
+    return None
+
+
+def _readiness_reason_codes(*, report) -> tuple[list[str], list[str]]:
+    checks = getattr(report, "checks", None) or []
+    fail_codes: list[str] = []
+    warn_codes: list[str] = []
+    for item in checks:
+        code = getattr(item, "code", None)
+        status = getattr(item, "status", None)
+        if not isinstance(code, str):
+            continue
+        if status == "fail":
+            fail_codes.append(code)
+        elif status == "warn":
+            warn_codes.append(code)
+    return fail_codes, warn_codes
+
+
+def _usd_balance_details(*, balances: list[object]) -> tuple[bool, str | None]:
+    for item in balances:
+        if not hasattr(item, "currency"):
+            continue
+        if str(getattr(item, "currency", "")).upper() != "USD":
+            continue
+        available = getattr(item, "available", None)
+        if available is None:
+            return True, None
+        return True, format(Decimal(str(available)), "f")
+    return False, None
+
+
+def _build_readiness_failure_details(*, refreshed, requested_provider: str, requested_environment: str) -> dict[str, object]:
+    report = getattr(refreshed, "readiness", None)
+    fail_codes, warn_codes = _readiness_reason_codes(report=report)
+    balances = list(getattr(refreshed, "balances", []) or [])
+    usd_balance_known, usd_balance_amount = _usd_balance_details(balances=balances)
+
+    now = datetime.now(timezone.utc)
+
+    def _age_seconds(value: datetime | None) -> int | None:
+        if value is None:
+            return None
+        observed = value if value.tzinfo is not None else value.replace(tzinfo=timezone.utc)
+        return max(0, int((now - observed).total_seconds()))
+
+    readiness_checked_at = None if report is None else getattr(report, "checked_at", None)
+    last_successful_sync_at = getattr(refreshed, "last_successful_sync_at", None)
+    last_heartbeat_at = getattr(refreshed, "last_heartbeat_at", None)
+
+    details: dict[str, object] = {
+        "verdict": None if report is None else getattr(report, "verdict", None),
+        "reason_codes": {
+            "fail": fail_codes,
+            "warn": warn_codes,
+        },
+        "authentication_status": _report_check_status(report=report, code="authentication_valid"),
+        "permissions_status": {
+            "permissions_retrieved": _report_check_status(report=report, code="permissions_retrieved"),
+            "trade_permission_present": _report_check_status(report=report, code="trade_permission_present"),
+            "dangerous_permissions_detected": _report_check_status(report=report, code="dangerous_permissions_detected"),
+        },
+        "balance_readable_status": {
+            "balances_retrieved": _report_check_status(report=report, code="balances_retrieved"),
+            "usd_balance_retrieved": _report_check_status(report=report, code="usd_balance_retrieved"),
+            "btc_balance_retrieved": _report_check_status(report=report, code="btc_balance_retrieved"),
+        },
+        "usd_balance_known": usd_balance_known,
+        "product_readiness_status": {
+            "product_btc_usd_available": _report_check_status(report=report, code="product_btc_usd_available"),
+            "product_trading_enabled": _report_check_status(report=report, code="product_trading_enabled"),
+        },
+        "provider_environment_match": {
+            "provider": str(getattr(refreshed, "provider", "")) == requested_provider,
+            "environment": str(getattr(refreshed, "environment", "")) == requested_environment,
+        },
+        "timestamps": {
+            "readiness_checked_at": None if readiness_checked_at is None else readiness_checked_at.isoformat(),
+            "last_successful_sync_at": None if last_successful_sync_at is None else last_successful_sync_at.isoformat(),
+            "last_heartbeat_at": None if last_heartbeat_at is None else last_heartbeat_at.isoformat(),
+        },
+        "freshness_seconds": {
+            "readiness_checked_at": _age_seconds(readiness_checked_at),
+            "last_successful_sync_at": _age_seconds(last_successful_sync_at),
+            "last_heartbeat_at": _age_seconds(last_heartbeat_at),
+        },
+        "credentials_valid": bool(getattr(refreshed, "credentials_valid", False)),
+    }
+    if usd_balance_known and usd_balance_amount is not None:
+        details["usd_balance_amount"] = usd_balance_amount
+    return details
 
 
 
@@ -687,9 +789,20 @@ async def initialize_live_crypto_environment(
             )
             stage = "validate_provider_readiness"
             if refreshed.readiness.verdict not in _READY_CONNECTION_VERDICTS:
+                safe_details = _build_readiness_failure_details(
+                    refreshed=refreshed,
+                    requested_provider=request.provider,
+                    requested_environment=exchange_environment,
+                )
                 if request.provider == "coinbase_advanced":
-                    raise ValueError("Coinbase readiness check failed; refresh_exchange_balances did not reach ready state")
-                raise ValueError("Provider readiness check failed; refresh_exchange_balances did not reach ready state")
+                    raise ValueError(
+                        "Coinbase readiness check failed; refresh_exchange_balances did not reach ready state"
+                        f"; readiness_details={json.dumps(safe_details, sort_keys=True, separators=(',', ':'))}"
+                    )
+                raise ValueError(
+                    "Provider readiness check failed; refresh_exchange_balances did not reach ready state"
+                    f"; readiness_details={json.dumps(safe_details, sort_keys=True, separators=(',', ':'))}"
+                )
 
         stage = "ensure_btc_asset"
         asset_result = await ensure_coinbase_crypto_asset(

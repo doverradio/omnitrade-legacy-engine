@@ -84,3 +84,34 @@ def test_observable_zero_usd_balance_is_initialized_but_unfunded() -> None:
         _check("product_btc_usd_available", "pass"),
     ]
     assert compute_verdict(checks) == "INITIALIZED_BUT_UNFUNDED"
+
+
+def test_missing_btc_balance_evidence_does_not_block_quote_readiness() -> None:
+    checks = [
+        _check("credentials_stored", "pass"),
+        _check("api_reachable", "pass"),
+        _check("authentication_valid", "pass"),
+        _check("permissions_retrieved", "pass"),
+        _check("dangerous_permissions_detected", "pass"),
+        _check("trade_permission_present", "warn"),
+        _check("usd_balance_retrieved", "pass"),
+        _check("usd_balance_funded", "fail"),
+        _check("btc_balance_retrieved", "fail"),
+        _check("product_btc_usd_available", "pass"),
+    ]
+    assert compute_verdict(checks) == "INITIALIZED_BUT_UNFUNDED"
+
+
+def test_missing_usd_balance_evidence_remains_blocked() -> None:
+    checks = [
+        _check("credentials_stored", "pass"),
+        _check("api_reachable", "pass"),
+        _check("authentication_valid", "pass"),
+        _check("permissions_retrieved", "pass"),
+        _check("dangerous_permissions_detected", "pass"),
+        _check("trade_permission_present", "warn"),
+        _check("usd_balance_retrieved", "fail"),
+        _check("btc_balance_retrieved", "pass"),
+        _check("product_btc_usd_available", "pass"),
+    ]
+    assert compute_verdict(checks) == "BALANCE_UNAVAILABLE"

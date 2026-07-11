@@ -368,11 +368,119 @@ async def test_initialize_fails_closed_when_exchange_readiness_not_ready(monkeyp
         ),
     )
 
-    with pytest.raises(ValueError, match="Coinbase readiness check failed"):
+    with pytest.raises(ValueError, match="Coinbase readiness check failed") as exc_info:
         await service.initialize_live_crypto_environment(
             db=db,
             request=service.InitializeLiveCryptoEnvironmentRequest(actor="operator:human"),
         )
+
+    message = str(exc_info.value)
+    assert "readiness_details=" in message
+    assert '"verdict":"PERMISSION_BLOCKED"' in message
+    assert '"reason_codes"' in message
+
+
+@pytest.mark.asyncio
+async def test_initialize_accepts_kraken_initialized_but_unfunded(monkeypatch: pytest.MonkeyPatch) -> None:
+    db = _FakeDb()
+    db.paper_account = _paper_account()
+    db.connection = _connection()
+
+    async def _ensure_asset(*, db, request):
+        _ = request
+        if db.asset is None:
+            db.asset = _asset()
+        return SimpleNamespace(asset=db.asset, created=True)
+
+    async def _register_live_account(*, db, request):
+        _ = request
+        db.profile = _profile(db.paper_account.id, provider="kraken_spot")
+        return SimpleNamespace(accepted=True, rejection_reason=None)
+
+    async def _create_capital_campaign(*, db, request):
+        _ = request
+        db.campaign = _campaign(db.paper_account.id)
+        return SimpleNamespace(id=db.campaign.id)
+
+    async def _refresh_exchange_balances(*, db, exchange_connection_id, actor):
+        _ = db, exchange_connection_id, actor
+        return SimpleNamespace(readiness=SimpleNamespace(verdict="INITIALIZED_BUT_UNFUNDED"))
+
+    monkeypatch.setattr(service, "ensure_coinbase_crypto_asset", _ensure_asset)
+    monkeypatch.setattr(service, "register_live_account", _register_live_account)
+    monkeypatch.setattr(service, "create_capital_campaign", _create_capital_campaign)
+    monkeypatch.setattr(service, "refresh_exchange_balances", _refresh_exchange_balances)
+    monkeypatch.setattr(
+        service,
+        "get_settings",
+        lambda: SimpleNamespace(
+            live_crypto_order_submission_enabled=False,
+            live_crypto_dry_run_enabled=True,
+            live_crypto_preparation_enabled=True,
+            live_crypto_max_order_usd=Decimal("5"),
+        ),
+    )
+
+    result = await service.initialize_live_crypto_environment(
+        db=db,
+        request=service.InitializeLiveCryptoEnvironmentRequest(
+            actor="operator:human",
+            provider="kraken_spot",
+        ),
+    )
+
+    assert result.created_asset is True
+    assert result.created_live_trading_profile is True
+    assert result.created_capital_campaign is True
+
+
+@pytest.mark.asyncio
+async def test_initialize_retry_after_readiness_failure_is_idempotent_for_connection(monkeypatch: pytest.MonkeyPatch) -> None:
+    db = _FakeDb()
+    db.paper_account = _paper_account()
+
+    calls = {"exchange": 0, "refresh": 0}
+
+    async def _create_exchange_connection(*, db, payload, actor):
+        _ = payload, actor
+        calls["exchange"] += 1
+        db.connection = _connection()
+        return SimpleNamespace(exchange_connection_id=db.connection.exchange_connection_id)
+
+    async def _refresh_exchange_balances(*, db, exchange_connection_id, actor):
+        _ = db, exchange_connection_id, actor
+        calls["refresh"] += 1
+        return SimpleNamespace(readiness=SimpleNamespace(verdict="PERMISSION_BLOCKED"))
+
+    monkeypatch.setattr(service, "create_exchange_connection", _create_exchange_connection)
+    monkeypatch.setattr(service, "refresh_exchange_balances", _refresh_exchange_balances)
+    monkeypatch.setattr(
+        service,
+        "get_settings",
+        lambda: SimpleNamespace(
+            live_crypto_order_submission_enabled=False,
+            live_crypto_dry_run_enabled=True,
+            live_crypto_preparation_enabled=True,
+            live_crypto_max_order_usd=Decimal("5"),
+        ),
+    )
+
+    request = service.InitializeLiveCryptoEnvironmentRequest(
+        actor="operator:human",
+        provider="kraken_spot",
+        exchange_api_key_name="key",
+        exchange_private_key="secret",
+    )
+
+    with pytest.raises(ValueError, match="Provider readiness check failed"):
+        await service.initialize_live_crypto_environment(db=db, request=request)
+    with pytest.raises(ValueError, match="Provider readiness check failed"):
+        await service.initialize_live_crypto_environment(db=db, request=request)
+
+    assert calls["exchange"] == 1
+    assert calls["refresh"] == 2
+    assert db.profile is None
+    assert db.campaign is None
 
 
 @pytest.mark.asyncio

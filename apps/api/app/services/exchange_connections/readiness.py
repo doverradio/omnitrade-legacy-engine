@@ -57,8 +57,10 @@ def compute_verdict(checks: list[ExchangeReadinessCheckResponse]) -> ExchangeRea
     if product_available and product_available.status == "fail":
         return "PRODUCT_UNAVAILABLE"
 
-    balances_available = (usd_balance is None or usd_balance.status == "pass") and (btc_balance is None or btc_balance.status == "pass")
-    if not balances_available:
+    # USD readability is the hard prerequisite for quote-sized BTC-USD BUY initialization checks.
+    # BTC readability remains evidence but does not block readiness by itself.
+    usd_balance_available = usd_balance is None or usd_balance.status == "pass"
+    if not usd_balance_available:
         return "BALANCE_UNAVAILABLE"
 
     if usd_balance_funded is not None and usd_balance_funded.status == "fail":
