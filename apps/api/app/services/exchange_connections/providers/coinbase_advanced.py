@@ -391,18 +391,42 @@ class CoinbaseAdvancedClient:
             extra_headers={"X-Idempotency-Key": idempotency_key},
         )
 
+    async def list_historical_orders(
+        self,
+        *,
+        credentials: dict[str, str],
+        environment: str,
+        product_ids: list[str] | None = None,
+        order_status: list[str] | None = None,
+    ) -> tuple[dict[str, object], dict[str, str]]:
+        query_params: dict[str, Any] = {}
+        if product_ids:
+            query_params["product_ids"] = product_ids
+        if order_status:
+            query_params["order_status"] = order_status
+        return await self._request_json(
+            method="GET",
+            path="/api/v3/brokerage/orders/historical/batch",
+            credentials=credentials,
+            environment=environment,
+            query_params=query_params or None,
+        )
+
     async def get_historical_order(
         self,
         *,
         credentials: dict[str, str],
         environment: str,
         order_id: str,
+        client_order_id: str | None = None,
     ) -> tuple[dict[str, object], dict[str, str]]:
+        query_params = None if client_order_id is None else {"client_order_id": client_order_id}
         return await self._request_json(
             method="GET",
             path=f"/api/v3/brokerage/orders/historical/{order_id}",
             credentials=credentials,
             environment=environment,
+            query_params=query_params,
         )
 
     async def cancel_orders(
@@ -433,6 +457,7 @@ class CoinbaseAdvancedClient:
         swallow_404: bool = False,
         json_payload: dict[str, Any] | None = None,
         extra_headers: dict[str, str] | None = None,
+        query_params: dict[str, Any] | None = None,
     ) -> tuple[dict[str, object], dict[str, str]]:
         base_url = self._base_url(environment)
         body = json.dumps(json_payload) if json_payload is not None else ""
@@ -455,7 +480,7 @@ class CoinbaseAdvancedClient:
 
         try:
             async with httpx.AsyncClient(base_url=base_url, timeout=self.timeout_seconds) as client:
-                response = await client.request(method, path, content=body, headers=headers)
+                response = await client.request(method, path, content=body, headers=headers, params=query_params)
         except httpx.HTTPError as exc:
             raise ServiceUnavailableError(message="Coinbase API is unreachable", details={"provider": self.provider}) from exc
 
@@ -463,9 +488,21 @@ class CoinbaseAdvancedClient:
             return {}, dict(response.headers)
 
         if response.status_code >= 400:
+            response_payload: dict[str, object] | None = None
+            try:
+                parsed = response.json()
+                if isinstance(parsed, dict):
+                    response_payload = parsed
+            except ValueError:
+                response_payload = None
             raise InvalidRequestError(
                 message="Coinbase API request failed",
-                details={"status_code": response.status_code, "path": path},
+                details={
+                    "status_code": response.status_code,
+                    "path": path,
+                    "response": response_payload,
+                    "response_text": response.text[:500],
+                },
             )
 
         try:

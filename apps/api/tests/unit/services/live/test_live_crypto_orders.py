@@ -8,6 +8,7 @@ import pytest
 
 from app.schemas.live_crypto_orders import LiveCryptoOrderPrepareRequest
 from app.services import live_crypto_orders as service
+from app.core.errors import InvalidRequestError, ServiceUnavailableError
 
 
 class _FakeDb:
@@ -85,6 +86,19 @@ class _ReplayDetectedDb(_FakeDb):
         if "FROM audit_log" in sql:
             return 1
         return None
+
+
+class _SubmitStateDb(_LiveOrderFakeDb):
+    def __init__(self, *, profile, preview, live_order, connection) -> None:
+        super().__init__(profile=profile, preview=preview, live_order=live_order, connection=connection)
+        self.audit_logs: list[object] = []
+        self.commits = 0
+
+    def add(self, item):
+        self.audit_logs.append(item)
+
+    async def commit(self):
+        self.commits += 1
 
 
 @pytest.mark.asyncio
@@ -790,3 +804,343 @@ def test_safe_request_summary_redacts_nested_provider_secrets() -> None:
     assert provider_preview["nested"]["safe"] == "value"
     assert provider_preview["list"][0]["jwt"] == "[REDACTED]"
     assert provider_preview["list"][1]["signature"] == "[REDACTED]"
+
+
+def _submit_live_order(*, status: str = "PENDING_CONFIRMATION"):
+    now = datetime(2026, 7, 9, 12, 0, tzinfo=timezone.utc)
+    return SimpleNamespace(
+        live_crypto_order_id=uuid.uuid4(),
+        crypto_order_preview_id=uuid.uuid4(),
+        exchange_connection_id=uuid.uuid4(),
+        provider="coinbase_advanced",
+        environment="production",
+        product_id="BTC-USD",
+        side="BUY",
+        order_type="MARKET",
+        requested_quote_size=service.Decimal("5.00"),
+        client_order_id="stable-client-order-id",
+        status=status,
+        risk_event_id=uuid.uuid4(),
+        decision_record_id=None,
+        validation_run_id=None,
+        provider_order_id=None,
+        provider_status=None,
+        submitted_at=None,
+        acknowledged_at=None,
+        filled_at=None,
+        cancelled_at=None,
+        failure_code=None,
+        failure_reason=None,
+        safe_provider_response={
+            "prepared_by": "operator:human",
+            "approval_event_id": str(uuid.uuid4()),
+            "confirmation_expires_at": (now + timedelta(minutes=1)).isoformat(),
+            "approved_intent_fingerprint": "intent-fingerprint",
+            "evidence_fingerprint": "evidence-fingerprint",
+            "execution_risk_verdict": "approve",
+        },
+        audit_correlation_id=uuid.uuid4(),
+        operator_confirmation_id=uuid.uuid4(),
+        created_at=now,
+        updated_at=now,
+    )
+
+
+def _submit_preview(*, live_trading_profile_id: uuid.UUID, crypto_order_preview_id: uuid.UUID, exchange_connection_id: uuid.UUID):
+    now = datetime(2026, 7, 9, 12, 0, tzinfo=timezone.utc)
+    return SimpleNamespace(
+        crypto_order_preview_id=crypto_order_preview_id,
+        live_trading_profile_id=live_trading_profile_id,
+        exchange_connection_id=exchange_connection_id,
+        provider="coinbase_advanced",
+        environment="production",
+        product_id="BTC-USD",
+        side="BUY",
+        order_type="MARKET",
+        requested_amount=service.Decimal("5.00"),
+        created_at=now - timedelta(seconds=1),
+    )
+
+
+def _submit_connection(*, exchange_connection_id: uuid.UUID):
+    now = datetime(2026, 7, 9, 12, 0, tzinfo=timezone.utc)
+    return SimpleNamespace(
+        exchange_connection_id=exchange_connection_id,
+        last_verified_at=now - timedelta(seconds=1),
+        last_successful_sync_at=now - timedelta(seconds=1),
+        last_heartbeat_at=now - timedelta(seconds=1),
+        balances=[{"currency": "USD", "available": "10.00"}],
+        credentials_encrypted="{}",
+    )
+
+
+@pytest.mark.asyncio
+async def test_second_submit_after_acknowledgement_returns_existing_result_without_provider_call(monkeypatch: pytest.MonkeyPatch) -> None:
+    profile = SimpleNamespace(id=uuid.uuid4())
+    live_order = _submit_live_order(status="ACKNOWLEDGED")
+    live_order.provider_order_id = "provider-order-1"
+    preview = _submit_preview(
+        live_trading_profile_id=profile.id,
+        crypto_order_preview_id=live_order.crypto_order_preview_id,
+        exchange_connection_id=live_order.exchange_connection_id,
+    )
+    connection = _submit_connection(exchange_connection_id=live_order.exchange_connection_id)
+    db = _SubmitStateDb(profile=profile, preview=preview, live_order=live_order, connection=connection)
+
+    monkeypatch.setattr(service, "get_settings", lambda: SimpleNamespace(live_crypto_order_submission_enabled=True))
+
+    async def _raise_if_called(*_args, **_kwargs):
+        raise AssertionError("create_order must not be called for acknowledged orders")
+
+    monkeypatch.setattr(service.CoinbaseAdvancedClient, "create_order", _raise_if_called)
+
+    response = await service.service.submit(
+        db=db,
+        request=service.LiveCryptoOrderSubmitRequest(
+            live_crypto_order_id=live_order.live_crypto_order_id,
+            confirmation_challenge_id=live_order.operator_confirmation_id,
+            confirmation_phrase="BUY BTC",
+            operator_identity="operator:human",
+            idempotency_token="new-click-token",
+        ),
+    )
+
+    assert response.live_crypto_order.status == "ACKNOWLEDGED"
+    assert response.order_submitted is True
+
+
+@pytest.mark.asyncio
+async def test_second_submit_during_reconciliation_required_blocks_without_provider_call(monkeypatch: pytest.MonkeyPatch) -> None:
+    profile = SimpleNamespace(id=uuid.uuid4())
+    live_order = _submit_live_order(status="RECONCILIATION_REQUIRED")
+    preview = _submit_preview(
+        live_trading_profile_id=profile.id,
+        crypto_order_preview_id=live_order.crypto_order_preview_id,
+        exchange_connection_id=live_order.exchange_connection_id,
+    )
+    connection = _submit_connection(exchange_connection_id=live_order.exchange_connection_id)
+    db = _SubmitStateDb(profile=profile, preview=preview, live_order=live_order, connection=connection)
+
+    monkeypatch.setattr(service, "get_settings", lambda: SimpleNamespace(live_crypto_order_submission_enabled=True))
+
+    async def _raise_if_called(*_args, **_kwargs):
+        raise AssertionError("create_order must not be called during reconciliation-required state")
+
+    monkeypatch.setattr(service.CoinbaseAdvancedClient, "create_order", _raise_if_called)
+
+    with pytest.raises(PermissionError, match="reconcile"):
+        await service.service.submit(
+            db=db,
+            request=service.LiveCryptoOrderSubmitRequest(
+                live_crypto_order_id=live_order.live_crypto_order_id,
+                confirmation_challenge_id=live_order.operator_confirmation_id,
+                confirmation_phrase="BUY BTC",
+                operator_identity="operator:human",
+                idempotency_token="new-click-token",
+            ),
+        )
+
+
+@pytest.mark.asyncio
+async def test_explicit_provider_rejection_sets_rejected_without_blind_retry(monkeypatch: pytest.MonkeyPatch) -> None:
+    profile = SimpleNamespace(id=uuid.uuid4())
+    live_order = _submit_live_order(status="PENDING_CONFIRMATION")
+    preview = _submit_preview(
+        live_trading_profile_id=profile.id,
+        crypto_order_preview_id=live_order.crypto_order_preview_id,
+        exchange_connection_id=live_order.exchange_connection_id,
+    )
+    connection = _submit_connection(exchange_connection_id=live_order.exchange_connection_id)
+    db = _SubmitStateDb(profile=profile, preview=preview, live_order=live_order, connection=connection)
+
+    monkeypatch.setattr(
+        service,
+        "get_settings",
+        lambda: SimpleNamespace(
+            live_crypto_order_submission_enabled=True,
+            live_crypto_preview_max_age_seconds=30,
+            live_crypto_readiness_max_age_seconds=60,
+            live_crypto_balance_max_age_seconds=30,
+            live_crypto_price_max_age_seconds=30,
+            live_crypto_max_order_usd=service.Decimal("5"),
+        ),
+    )
+    monkeypatch.setattr(service, "_utcnow", lambda: datetime(2026, 7, 9, 12, 0, tzinfo=timezone.utc))
+    monkeypatch.setattr(service, "_build_intent_fingerprint", lambda **_kwargs: "intent-fingerprint")
+    monkeypatch.setattr(service, "_build_evidence_fingerprint", lambda **_kwargs: "evidence-fingerprint")
+    monkeypatch.setattr(service, "_load_decrypted_credentials", lambda _connection: {"api_key": "key", "api_secret": "secret"})
+
+    async def _risk_context(**_kwargs):
+        return None, service.RiskDecisionAction.APPROVE, service.Decimal("5.00"), live_order.risk_event_id
+
+    monkeypatch.setattr(service, "_build_real_risk_context", _risk_context)
+
+    async def _reject(*_args, **_kwargs):
+        raise InvalidRequestError("Coinbase API request failed", details={"status_code": 400, "response": {"message": "rejected"}})
+
+    monkeypatch.setattr(service.CoinbaseAdvancedClient, "create_order", _reject)
+
+    response = await service.service.submit(
+        db=db,
+        request=service.LiveCryptoOrderSubmitRequest(
+            live_crypto_order_id=live_order.live_crypto_order_id,
+            confirmation_challenge_id=live_order.operator_confirmation_id,
+            confirmation_phrase="BUY BTC",
+            operator_identity="operator:human",
+            idempotency_token="user-click-token",
+        ),
+    )
+
+    assert response.live_crypto_order.status == "REJECTED"
+    assert response.order_submitted is False
+    assert response.live_crypto_order.failure_code == "provider_rejected"
+
+
+@pytest.mark.asyncio
+async def test_transport_failure_after_submission_started_enters_reconciliation_required(monkeypatch: pytest.MonkeyPatch) -> None:
+    profile = SimpleNamespace(id=uuid.uuid4())
+    live_order = _submit_live_order(status="PENDING_CONFIRMATION")
+    preview = _submit_preview(
+        live_trading_profile_id=profile.id,
+        crypto_order_preview_id=live_order.crypto_order_preview_id,
+        exchange_connection_id=live_order.exchange_connection_id,
+    )
+    connection = _submit_connection(exchange_connection_id=live_order.exchange_connection_id)
+    db = _SubmitStateDb(profile=profile, preview=preview, live_order=live_order, connection=connection)
+
+    monkeypatch.setattr(
+        service,
+        "get_settings",
+        lambda: SimpleNamespace(
+            live_crypto_order_submission_enabled=True,
+            live_crypto_preview_max_age_seconds=30,
+            live_crypto_readiness_max_age_seconds=60,
+            live_crypto_balance_max_age_seconds=30,
+            live_crypto_price_max_age_seconds=30,
+            live_crypto_max_order_usd=service.Decimal("5"),
+        ),
+    )
+    monkeypatch.setattr(service, "_utcnow", lambda: datetime(2026, 7, 9, 12, 0, tzinfo=timezone.utc))
+    monkeypatch.setattr(service, "_build_intent_fingerprint", lambda **_kwargs: "intent-fingerprint")
+    monkeypatch.setattr(service, "_build_evidence_fingerprint", lambda **_kwargs: "evidence-fingerprint")
+    monkeypatch.setattr(service, "_load_decrypted_credentials", lambda _connection: {"api_key": "key", "api_secret": "secret"})
+
+    async def _risk_context(**_kwargs):
+        return None, service.RiskDecisionAction.APPROVE, service.Decimal("5.00"), live_order.risk_event_id
+
+    monkeypatch.setattr(service, "_build_real_risk_context", _risk_context)
+
+    async def _ambiguous(*_args, **_kwargs):
+        raise ServiceUnavailableError("Coinbase API is unreachable", details={"provider": "coinbase_advanced"})
+
+    monkeypatch.setattr(service.CoinbaseAdvancedClient, "create_order", _ambiguous)
+
+    response = await service.service.submit(
+        db=db,
+        request=service.LiveCryptoOrderSubmitRequest(
+            live_crypto_order_id=live_order.live_crypto_order_id,
+            confirmation_challenge_id=live_order.operator_confirmation_id,
+            confirmation_phrase="BUY BTC",
+            operator_identity="operator:human",
+            idempotency_token="user-click-token",
+        ),
+    )
+
+    assert response.live_crypto_order.status == "RECONCILIATION_REQUIRED"
+    assert response.live_crypto_order.failure_code == "provider_response_ambiguous"
+
+
+@pytest.mark.asyncio
+async def test_submit_does_not_use_new_client_token_as_provider_identity(monkeypatch: pytest.MonkeyPatch) -> None:
+    profile = SimpleNamespace(id=uuid.uuid4())
+    live_order = _submit_live_order(status="PENDING_CONFIRMATION")
+    preview = _submit_preview(
+        live_trading_profile_id=profile.id,
+        crypto_order_preview_id=live_order.crypto_order_preview_id,
+        exchange_connection_id=live_order.exchange_connection_id,
+    )
+    connection = _submit_connection(exchange_connection_id=live_order.exchange_connection_id)
+    db = _SubmitStateDb(profile=profile, preview=preview, live_order=live_order, connection=connection)
+    seen = {}
+
+    monkeypatch.setattr(
+        service,
+        "get_settings",
+        lambda: SimpleNamespace(
+            live_crypto_order_submission_enabled=True,
+            live_crypto_preview_max_age_seconds=30,
+            live_crypto_readiness_max_age_seconds=60,
+            live_crypto_balance_max_age_seconds=30,
+            live_crypto_price_max_age_seconds=30,
+            live_crypto_max_order_usd=service.Decimal("5"),
+        ),
+    )
+    monkeypatch.setattr(service, "_utcnow", lambda: datetime(2026, 7, 9, 12, 0, tzinfo=timezone.utc))
+    monkeypatch.setattr(service, "_build_intent_fingerprint", lambda **_kwargs: "intent-fingerprint")
+    monkeypatch.setattr(service, "_build_evidence_fingerprint", lambda **_kwargs: "evidence-fingerprint")
+    monkeypatch.setattr(service, "_load_decrypted_credentials", lambda _connection: {"api_key": "key", "api_secret": "secret"})
+
+    async def _risk_context(**_kwargs):
+        return None, service.RiskDecisionAction.APPROVE, service.Decimal("5.00"), live_order.risk_event_id
+
+    monkeypatch.setattr(service, "_build_real_risk_context", _risk_context)
+
+    async def _success(*_args, **kwargs):
+        seen["idempotency_key"] = kwargs["idempotency_key"]
+        return {"success": True, "success_response": {"order_id": "provider-order-1", "status": "OPEN"}}, {"x-request-id": "1"}
+
+    monkeypatch.setattr(service.CoinbaseAdvancedClient, "create_order", _success)
+
+    response = await service.service.submit(
+        db=db,
+        request=service.LiveCryptoOrderSubmitRequest(
+            live_crypto_order_id=live_order.live_crypto_order_id,
+            confirmation_challenge_id=live_order.operator_confirmation_id,
+            confirmation_phrase="BUY BTC",
+            operator_identity="operator:human",
+            idempotency_token="new-user-token",
+        ),
+    )
+
+    assert seen["idempotency_key"] == live_order.client_order_id
+    assert response.live_crypto_order.status == "ACKNOWLEDGED"
+
+
+@pytest.mark.asyncio
+async def test_reconcile_can_discover_order_by_client_order_id_when_provider_order_id_missing(monkeypatch: pytest.MonkeyPatch) -> None:
+    profile = SimpleNamespace(id=uuid.uuid4())
+    live_order = _submit_live_order(status="RECONCILIATION_REQUIRED")
+    live_order.provider_order_id = None
+    preview = _submit_preview(
+        live_trading_profile_id=profile.id,
+        crypto_order_preview_id=live_order.crypto_order_preview_id,
+        exchange_connection_id=live_order.exchange_connection_id,
+    )
+    connection = _submit_connection(exchange_connection_id=live_order.exchange_connection_id)
+    db = _SubmitStateDb(profile=profile, preview=preview, live_order=live_order, connection=connection)
+
+    monkeypatch.setattr(service, "_load_decrypted_credentials", lambda _connection: {"api_key": "key", "api_secret": "secret"})
+
+    async def _list_orders(*_args, **_kwargs):
+        return {
+            "orders": [
+                {
+                    "order_id": "provider-order-1",
+                    "client_order_id": live_order.client_order_id,
+                    "product_id": live_order.product_id,
+                    "status": "OPEN",
+                    "filled_size": "0",
+                }
+            ]
+        }, {"x-request-id": "2"}
+
+    monkeypatch.setattr(service.CoinbaseAdvancedClient, "list_historical_orders", _list_orders)
+
+    response = await service.service.reconcile(
+        db=db,
+        live_crypto_order_id=live_order.live_crypto_order_id,
+        request=service.LiveCryptoOrderReconcileRequest(operator_identity="operator:human"),
+    )
+
+    assert response.live_crypto_order.provider_order_id == "provider-order-1"
+    assert response.reconciliation_status in {"SUBMITTED", "UNKNOWN"}
