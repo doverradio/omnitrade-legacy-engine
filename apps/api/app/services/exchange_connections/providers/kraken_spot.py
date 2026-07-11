@@ -220,12 +220,26 @@ def _normalize_intent_product(product_id: str) -> tuple[str, str]:
 # Kraken Spot REST auth contract:
 # docs.kraken.com/api/docs/guides/spot-rest-auth/
 # API-Sign = base64(HMAC-SHA512(url_path + SHA256(nonce + postdata), base64_decode(secret)))
-def build_kraken_signature(*, url_path: str, payload: dict[str, str], secret_b64: str) -> str:
-    postdata = urllib.parse.urlencode(payload)
-    encoded = (str(payload["nonce"]) + postdata).encode("utf-8")
+def _encode_form_payload(payload: dict[str, str]) -> str:
+    # Kraken private endpoints use form-encoded POST bodies and this exact body must be signed.
+    return urllib.parse.urlencode(payload)
+
+
+def build_kraken_signature_from_encoded_payload(*, url_path: str, nonce: str, encoded_payload: str, secret_b64: str) -> str:
+    encoded = (nonce + encoded_payload).encode("utf-8")
     message = url_path.encode("utf-8") + hashlib.sha256(encoded).digest()
     mac = hmac.new(base64.b64decode(secret_b64), message, hashlib.sha512)
     return base64.b64encode(mac.digest()).decode("utf-8")
+
+
+def build_kraken_signature(*, url_path: str, payload: dict[str, str], secret_b64: str) -> str:
+    postdata = _encode_form_payload(payload)
+    return build_kraken_signature_from_encoded_payload(
+        url_path=url_path,
+        nonce=str(payload["nonce"]),
+        encoded_payload=postdata,
+        secret_b64=secret_b64,
+    )
 
 
 class KrakenSpotClient:
@@ -1035,10 +1049,11 @@ class KrakenSpotClient:
                 )
             return self._mock_sandbox_response(path=path, method="GET", payload=params)
 
-        base_url = "https://api.kraken.com/0"
+        base_url = "https://api.kraken.com"
+        request_path = f"/0{path}"
         try:
             async with httpx.AsyncClient(base_url=base_url, timeout=self.timeout_seconds) as client:
-                response = await client.get(path, params=params)
+                response = await client.get(request_path, params=params)
         except httpx.HTTPError as exc:
             self._last_error_classification = "network_error"
             self._last_error_message = str(exc)
@@ -1074,16 +1089,20 @@ class KrakenSpotClient:
                 )
             return self._mock_sandbox_response(path=path, method="POST", payload=payload)
 
-        base_url = "https://api.kraken.com/0"
+        base_url = "https://api.kraken.com"
         nonce = await self._next_nonce()
         body_payload = {"nonce": nonce, **payload}
         otp = str(credentials.get("passphrase") or "").strip()
         if otp:
             body_payload["otp"] = otp
 
-        signature = build_kraken_signature(
-            url_path=f"/0{path}",
-            payload=body_payload,
+        request_path = f"/0{path}"
+        encoded_body = _encode_form_payload(body_payload)
+
+        signature = build_kraken_signature_from_encoded_payload(
+            url_path=request_path,
+            nonce=nonce,
+            encoded_payload=encoded_body,
             secret_b64=credentials["api_secret"],
         )
         headers = {
@@ -1095,7 +1114,7 @@ class KrakenSpotClient:
 
         try:
             async with httpx.AsyncClient(base_url=base_url, timeout=self.timeout_seconds) as client:
-                response = await client.post(path, content=urllib.parse.urlencode(body_payload), headers=headers)
+                response = await client.post(request_path, content=encoded_body, headers=headers)
         except httpx.HTTPError as exc:
             self._last_error_classification = "network_error"
             self._last_error_message = str(exc)
