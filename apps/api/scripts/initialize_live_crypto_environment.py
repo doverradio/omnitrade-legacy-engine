@@ -2,7 +2,9 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import getpass
 import inspect
+import os
 from decimal import Decimal
 from uuid import UUID
 
@@ -19,10 +21,38 @@ from app.services.live_crypto_environment import (
 )
 
 
+DEFAULT_API_KEY_ENV = "OT_COINBASE_API_KEY_NAME"
+DEFAULT_PRIVATE_KEY_ENV = "OT_COINBASE_PRIVATE_KEY"
+DEFAULT_PASSPHRASE_ENV = "OT_COINBASE_PASSPHRASE"
+
+
 async def _maybe_await(value):
     if inspect.isawaitable(value):
         return await value
     return value
+
+
+def _resolve_credentials(args: argparse.Namespace) -> tuple[str | None, str | None, str | None]:
+    api_key_name = args.exchange_api_key_name or os.getenv(args.exchange_api_key_name_env)
+    private_key = os.getenv(args.exchange_private_key_env)
+    passphrase = os.getenv(args.exchange_passphrase_env)
+
+    if args.prompt_for_credentials:
+        if not api_key_name:
+            api_key_name = input("Coinbase API key name: ").strip()
+        if not private_key:
+            private_key = getpass.getpass("Coinbase private key (hidden): ").strip()
+        if passphrase is None:
+            prompted = getpass.getpass("Coinbase passphrase (hidden, optional): ").strip()
+            passphrase = prompted or None
+
+    if api_key_name is not None:
+        api_key_name = api_key_name.strip() or None
+    if private_key is not None:
+        private_key = private_key.strip() or None
+    if passphrase is not None:
+        passphrase = passphrase.strip() or None
+    return api_key_name, private_key, passphrase
 
 
 def _print_readiness(readiness) -> None:
@@ -52,7 +82,13 @@ async def _run(args: argparse.Namespace) -> int:
         try:
             if args.create_preview:
                 if args.exchange_connection_id is None:
-                    readiness = await _maybe_await(inspect_live_crypto_environment(db=db, exchange_environment=args.exchange_environment))
+                    readiness = await _maybe_await(
+                        inspect_live_crypto_environment(
+                            db=db,
+                            exchange_environment=args.exchange_environment,
+                            paper_account_id=args.paper_account_id,
+                        )
+                    )
                     if readiness.exchange_connection_id is None:
                         print("blocked: exchange connection missing; run --apply first")
                         return 2
@@ -72,7 +108,13 @@ async def _run(args: argparse.Namespace) -> int:
 
             if args.create_approval:
                 if args.live_trading_profile_id is None:
-                    readiness = await _maybe_await(inspect_live_crypto_environment(db=db, exchange_environment=args.exchange_environment))
+                    readiness = await _maybe_await(
+                        inspect_live_crypto_environment(
+                            db=db,
+                            exchange_environment=args.exchange_environment,
+                            paper_account_id=args.paper_account_id,
+                        )
+                    )
                     if readiness.live_trading_profile_id is None:
                         print("blocked: live trading profile missing; run --apply first")
                         return 2
@@ -91,15 +133,17 @@ async def _run(args: argparse.Namespace) -> int:
                 return 0
 
             if args.apply:
+                api_key_name, private_key, passphrase = _resolve_credentials(args)
                 result = await _maybe_await(initialize_live_crypto_environment(
                     db=db,
                     request=InitializeLiveCryptoEnvironmentRequest(
                         actor=args.actor,
+                        paper_account_id=args.paper_account_id,
                         exchange_environment=args.exchange_environment,
                         exchange_connection_name=args.exchange_connection_name,
-                        exchange_api_key_name=args.exchange_api_key_name,
-                        exchange_private_key=args.exchange_private_key,
-                        exchange_passphrase=args.exchange_passphrase,
+                        exchange_api_key_name=api_key_name,
+                        exchange_private_key=private_key,
+                        exchange_passphrase=passphrase,
                         registration_source=args.registration_source,
                         campaign_owner=args.campaign_owner,
                     ),
@@ -111,25 +155,38 @@ async def _run(args: argparse.Namespace) -> int:
                 _print_readiness(result.readiness)
                 return 0
 
-            readiness = await _maybe_await(inspect_live_crypto_environment(db=db, exchange_environment=args.exchange_environment))
+            readiness = await _maybe_await(
+                inspect_live_crypto_environment(
+                    db=db,
+                    exchange_environment=args.exchange_environment,
+                    paper_account_id=args.paper_account_id,
+                )
+            )
             _print_readiness(readiness)
             return 0
         except Exception as exc:
-            print(f"safe_failure_reason={str(exc)}")
+            print("safe_failure_reason=initialization_failed")
+            print(f"error_type={type(exc).__name__}")
             return 1
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Inspect and safely initialize live-crypto dry-run prerequisites")
+    parser = argparse.ArgumentParser(
+        description="Inspect and safely initialize live-crypto dry-run prerequisites",
+        allow_abbrev=False,
+    )
     parser.add_argument("--apply", action="store_true", help="Create only missing operational objects")
     parser.add_argument("--create-preview", action="store_true", help="Generate a fresh BTC-USD BUY $5 preview via preview service")
     parser.add_argument("--create-approval", action="store_true", help="Record first-live-enablement approval via approval workflow")
     parser.add_argument("--exchange-environment", default="production", choices=["production", "sandbox"])
     parser.add_argument("--actor", default="operator:human")
+    parser.add_argument("--paper-account-id", type=UUID, default=UUID("905a408c-7d8e-4fc7-ad3b-9ff637005d73"))
     parser.add_argument("--exchange-connection-name", default="coinbase-production-primary")
     parser.add_argument("--exchange-api-key-name")
-    parser.add_argument("--exchange-private-key")
-    parser.add_argument("--exchange-passphrase")
+    parser.add_argument("--exchange-api-key-name-env", default=DEFAULT_API_KEY_ENV)
+    parser.add_argument("--exchange-private-key-env", default=DEFAULT_PRIVATE_KEY_ENV)
+    parser.add_argument("--exchange-passphrase-env", default=DEFAULT_PASSPHRASE_ENV)
+    parser.add_argument("--prompt-for-credentials", action="store_true")
     parser.add_argument("--registration-source", default="human_production_initializer")
     parser.add_argument("--campaign-owner", default="operator")
     parser.add_argument("--exchange-connection-id", type=UUID)

@@ -54,10 +54,13 @@ async def test_script_inspection_mode_prints_readiness(monkeypatch: pytest.Monke
             create_approval=False,
             exchange_environment="production",
             actor="operator:human",
+            paper_account_id=UUID("905a408c-7d8e-4fc7-ad3b-9ff637005d73"),
             exchange_connection_name="coinbase-production-primary",
             exchange_api_key_name=None,
-            exchange_private_key=None,
-            exchange_passphrase=None,
+            exchange_api_key_name_env="OT_COINBASE_API_KEY_NAME",
+            exchange_private_key_env="OT_COINBASE_PRIVATE_KEY",
+            exchange_passphrase_env="OT_COINBASE_PASSPHRASE",
+            prompt_for_credentials=False,
             registration_source="human_production_initializer",
             campaign_owner="operator",
             exchange_connection_id=None,
@@ -94,10 +97,13 @@ async def test_script_apply_mode_initializes_missing(monkeypatch: pytest.MonkeyP
             create_approval=False,
             exchange_environment="production",
             actor="operator:human",
+            paper_account_id=UUID("905a408c-7d8e-4fc7-ad3b-9ff637005d73"),
             exchange_connection_name="coinbase-production-primary",
             exchange_api_key_name="key",
-            exchange_private_key="secret",
-            exchange_passphrase=None,
+            exchange_api_key_name_env="OT_COINBASE_API_KEY_NAME",
+            exchange_private_key_env="OT_COINBASE_PRIVATE_KEY",
+            exchange_passphrase_env="OT_COINBASE_PASSPHRASE",
+            prompt_for_credentials=False,
             registration_source="human_production_initializer",
             campaign_owner="operator",
             exchange_connection_id=None,
@@ -122,10 +128,13 @@ async def test_script_refuses_when_live_submission_enabled(monkeypatch: pytest.M
             create_approval=False,
             exchange_environment="production",
             actor="operator:human",
+            paper_account_id=UUID("905a408c-7d8e-4fc7-ad3b-9ff637005d73"),
             exchange_connection_name="coinbase-production-primary",
             exchange_api_key_name=None,
-            exchange_private_key=None,
-            exchange_passphrase=None,
+            exchange_api_key_name_env="OT_COINBASE_API_KEY_NAME",
+            exchange_private_key_env="OT_COINBASE_PRIVATE_KEY",
+            exchange_passphrase_env="OT_COINBASE_PASSPHRASE",
+            prompt_for_credentials=False,
             registration_source="human_production_initializer",
             campaign_owner="operator",
             exchange_connection_id=None,
@@ -140,3 +149,74 @@ async def test_script_refuses_when_live_submission_enabled(monkeypatch: pytest.M
 def test_parse_args_mutually_exclusive_modes() -> None:
     with pytest.raises(SystemExit):
         script.parse_args(["--apply", "--create-preview"])
+
+
+def test_parse_args_includes_secure_credential_options() -> None:
+    args = script.parse_args([])
+    assert str(args.paper_account_id) == "905a408c-7d8e-4fc7-ad3b-9ff637005d73"
+    assert args.exchange_api_key_name_env == "OT_COINBASE_API_KEY_NAME"
+    assert args.exchange_private_key_env == "OT_COINBASE_PRIVATE_KEY"
+    assert args.exchange_passphrase_env == "OT_COINBASE_PASSPHRASE"
+
+
+def test_parse_args_rejects_plaintext_secret_flags() -> None:
+    with pytest.raises(SystemExit):
+        script.parse_args(["--exchange-private-key", "plaintext-secret"])
+
+
+def test_resolve_credentials_prefers_env_and_never_echoes_secrets(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("OT_COINBASE_API_KEY_NAME", "api-key-name")
+    monkeypatch.setenv("OT_COINBASE_PRIVATE_KEY", "private-key")
+    monkeypatch.setenv("OT_COINBASE_PASSPHRASE", "passphrase")
+
+    api_key, private_key, passphrase = script._resolve_credentials(
+        SimpleNamespace(
+            exchange_api_key_name=None,
+            exchange_api_key_name_env="OT_COINBASE_API_KEY_NAME",
+            exchange_private_key_env="OT_COINBASE_PRIVATE_KEY",
+            exchange_passphrase_env="OT_COINBASE_PASSPHRASE",
+            prompt_for_credentials=False,
+        )
+    )
+
+    assert api_key == "api-key-name"
+    assert private_key == "private-key"
+    assert passphrase == "passphrase"
+
+
+@pytest.mark.asyncio
+async def test_script_failure_output_redacts_secret_values(monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]) -> None:
+    monkeypatch.setattr(script, "get_settings", lambda: _settings())
+    monkeypatch.setattr(script, "AsyncSessionLocal", lambda: _AsyncSessionLocal(object()))
+    monkeypatch.setenv("OT_COINBASE_PRIVATE_KEY", "super-secret-private-key")
+
+    async def _raise(**_kwargs):
+        raise RuntimeError("operation failed with super-secret-private-key")
+
+    monkeypatch.setattr(script, "initialize_live_crypto_environment", _raise)
+
+    result = await script._run(
+        SimpleNamespace(
+            apply=True,
+            create_preview=False,
+            create_approval=False,
+            exchange_environment="production",
+            actor="operator:human",
+            paper_account_id=UUID("905a408c-7d8e-4fc7-ad3b-9ff637005d73"),
+            exchange_connection_name="coinbase-production-primary",
+            exchange_api_key_name=None,
+            exchange_api_key_name_env="OT_COINBASE_API_KEY_NAME",
+            exchange_private_key_env="OT_COINBASE_PRIVATE_KEY",
+            exchange_passphrase_env="OT_COINBASE_PASSPHRASE",
+            prompt_for_credentials=False,
+            registration_source="human_production_initializer",
+            campaign_owner="operator",
+            exchange_connection_id=None,
+            live_trading_profile_id=None,
+        )
+    )
+
+    captured = capsys.readouterr().out
+    assert result == 1
+    assert "initialization_failed" in captured
+    assert "super-secret-private-key" not in captured

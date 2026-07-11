@@ -40,7 +40,11 @@ class _FakeDb:
 
 
 def _paper_account():
-    return SimpleNamespace(id=uuid4(), starting_balance=Decimal("25"), is_active=True)
+    return SimpleNamespace(id=uuid4(), starting_balance=Decimal("25"), is_active=True, asset_class="crypto")
+
+
+def _stock_account():
+    return SimpleNamespace(id=uuid4(), starting_balance=Decimal("25"), is_active=True, asset_class="stock")
 
 
 def _connection():
@@ -178,10 +182,15 @@ async def test_initialize_creates_only_missing_objects_and_is_idempotent(monkeyp
         db.campaign = _campaign(db.paper_account.id)
         return SimpleNamespace(id=db.campaign.id)
 
+    async def _refresh_exchange_balances(*, db, exchange_connection_id, actor):
+        _ = db, exchange_connection_id, actor
+        return SimpleNamespace(readiness=SimpleNamespace(verdict="READY_FOR_DRY_RUN"))
+
     monkeypatch.setattr(service, "create_exchange_connection", _create_exchange_connection)
     monkeypatch.setattr(service, "ensure_coinbase_crypto_asset", _ensure_asset)
     monkeypatch.setattr(service, "register_live_account", _register_live_account)
     monkeypatch.setattr(service, "create_capital_campaign", _create_capital_campaign)
+    monkeypatch.setattr(service, "refresh_exchange_balances", _refresh_exchange_balances)
     monkeypatch.setattr(
         service,
         "get_settings",
@@ -243,10 +252,15 @@ async def test_partial_initialization_creates_only_missing_campaign(monkeypatch:
         db.campaign = _campaign(db.paper_account.id)
         return SimpleNamespace(id=db.campaign.id)
 
+    async def _refresh_exchange_balances(*, db, exchange_connection_id, actor):
+        _ = db, exchange_connection_id, actor
+        return SimpleNamespace(readiness=SimpleNamespace(verdict="READY_FOR_DRY_RUN"))
+
     monkeypatch.setattr(service, "create_exchange_connection", _create_exchange_connection)
     monkeypatch.setattr(service, "ensure_coinbase_crypto_asset", _ensure_asset)
     monkeypatch.setattr(service, "register_live_account", _register_live_account)
     monkeypatch.setattr(service, "create_capital_campaign", _create_capital_campaign)
+    monkeypatch.setattr(service, "refresh_exchange_balances", _refresh_exchange_balances)
     monkeypatch.setattr(
         service,
         "get_settings",
@@ -292,3 +306,105 @@ async def test_initialize_fails_closed_when_credentials_missing_for_missing_exch
             db=db,
             request=service.InitializeLiveCryptoEnvironmentRequest(actor="operator:human"),
         )
+
+
+@pytest.mark.asyncio
+async def test_initialize_fails_closed_when_exchange_readiness_not_ready(monkeypatch: pytest.MonkeyPatch) -> None:
+    db = _FakeDb()
+    db.paper_account = _paper_account()
+    db.connection = _connection()
+
+    async def _ensure_asset(*, db, request):
+        _ = request
+        if db.asset is None:
+            db.asset = _asset()
+        return SimpleNamespace(asset=db.asset, created=True)
+
+    async def _refresh_exchange_balances(*, db, exchange_connection_id, actor):
+        _ = db, exchange_connection_id, actor
+        return SimpleNamespace(readiness=SimpleNamespace(verdict="PERMISSION_BLOCKED"))
+
+    monkeypatch.setattr(service, "ensure_coinbase_crypto_asset", _ensure_asset)
+    monkeypatch.setattr(service, "refresh_exchange_balances", _refresh_exchange_balances)
+    monkeypatch.setattr(
+        service,
+        "get_settings",
+        lambda: SimpleNamespace(
+            live_crypto_order_submission_enabled=False,
+            live_crypto_dry_run_enabled=True,
+            live_crypto_preparation_enabled=True,
+            live_crypto_max_order_usd=Decimal("5"),
+        ),
+    )
+
+    with pytest.raises(ValueError, match="Coinbase readiness check failed"):
+        await service.initialize_live_crypto_environment(
+            db=db,
+            request=service.InitializeLiveCryptoEnvironmentRequest(actor="operator:human"),
+        )
+
+
+@pytest.mark.asyncio
+async def test_initialize_rejects_non_crypto_paper_account(monkeypatch: pytest.MonkeyPatch) -> None:
+    db = _FakeDb()
+    db.paper_account = _stock_account()
+
+    monkeypatch.setattr(
+        service,
+        "get_settings",
+        lambda: SimpleNamespace(
+            live_crypto_order_submission_enabled=False,
+            live_crypto_dry_run_enabled=True,
+            live_crypto_preparation_enabled=True,
+            live_crypto_max_order_usd=Decimal("5"),
+        ),
+    )
+
+    with pytest.raises(ValueError, match="Selected paper account is not crypto"):
+        await service.inspect_live_crypto_environment(db=db)
+
+
+@pytest.mark.asyncio
+async def test_preview_helper_uses_exact_btc_usd_buy_five_contract(monkeypatch: pytest.MonkeyPatch) -> None:
+    captured: dict[str, object] = {}
+
+    async def _create_preview_stub(*, db, request, actor):
+        _ = db, actor
+        captured["product_id"] = request.product_id
+        captured["side"] = request.side
+        captured["quote_size"] = request.quote_size
+        return SimpleNamespace(crypto_order_preview_id=uuid4(), status="PREVIEW_READY")
+
+    monkeypatch.setattr(service, "create_crypto_order_preview", _create_preview_stub)
+
+    result = await service.generate_fresh_btc_dry_run_preview(
+        db=_FakeDb(),
+        request=service.GeneratePreviewHelperRequest(actor="operator:human", exchange_connection_id=uuid4()),
+    )
+
+    assert result.status == "PREVIEW_READY"
+    assert captured["product_id"] == "BTC-USD"
+    assert captured["side"] == "BUY"
+    assert captured["quote_size"] == Decimal("5")
+
+
+@pytest.mark.asyncio
+async def test_approval_helper_uses_first_live_enablement_checkpoint(monkeypatch: pytest.MonkeyPatch) -> None:
+    captured: dict[str, object] = {}
+
+    async def _approval_stub(*, db, request):
+        _ = db
+        captured["checkpoint_type"] = request.checkpoint_type
+        captured["max_order_usd"] = request.approval_scope.get("max_order_usd")
+        return SimpleNamespace(approval_event_id=uuid4(), approval_state="approved")
+
+    monkeypatch.setattr(service, "record_live_approval_checkpoint", _approval_stub)
+
+    result = await service.record_first_live_enablement_approval(
+        db=_FakeDb(),
+        request=service.RecordApprovalHelperRequest(actor="operator:human", live_trading_profile_id=uuid4()),
+    )
+
+    assert result.approval_state == "approved"
+    assert captured["checkpoint_type"] == "first_live_enablement"
+    assert captured["max_order_usd"] == "5"

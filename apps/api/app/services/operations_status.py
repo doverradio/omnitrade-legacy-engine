@@ -120,19 +120,32 @@ async def build_operations_status(*, db: AsyncSession) -> OperationalStatusRespo
             alerts=alerts,
         )
 
-    live_crypto_state = await inspect_live_crypto_environment(db=db, exchange_environment="production")
-    live_crypto_readiness = LiveCryptoReadinessResponse(
-        ready=live_crypto_state.ready,
-        items=[
-            LiveCryptoReadinessItemResponse(
-                key=item.key,
-                label=item.label,
-                ready=item.ready,
-                detail=item.detail,
-            )
-            for item in live_crypto_state.items
-        ],
-    )
+    try:
+        live_crypto_state = await inspect_live_crypto_environment(db=db, exchange_environment="production")
+        live_crypto_readiness = LiveCryptoReadinessResponse(
+            ready=live_crypto_state.ready,
+            items=[
+                LiveCryptoReadinessItemResponse(
+                    key=item.key,
+                    label=item.label,
+                    ready=item.ready,
+                    detail=item.detail,
+                )
+                for item in live_crypto_state.items
+            ],
+        )
+    except Exception as exc:
+        live_crypto_readiness = LiveCryptoReadinessResponse(
+            ready=False,
+            items=[
+                LiveCryptoReadinessItemResponse(
+                    key="initializer",
+                    label="Initializer",
+                    ready=False,
+                    detail=f"Initialization readiness unavailable: {str(exc)}",
+                )
+            ],
+        )
     if not live_crypto_readiness.ready:
         alerts.append(
             OperationalAlertResponse(

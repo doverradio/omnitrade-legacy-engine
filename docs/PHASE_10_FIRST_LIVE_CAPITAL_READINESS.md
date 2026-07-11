@@ -453,25 +453,50 @@ cd /home/eric/omnitrade-legacy-engine/apps/api && PYTHONPATH=. python3 -m script
 Apply mode (create only missing objects):
 
 ```bash
-cd /home/eric/omnitrade-legacy-engine/apps/api && PYTHONPATH=. python3 -m scripts.initialize_live_crypto_environment \
+cd /home/eric/omnitrade-legacy-engine/apps/api
+export OT_COINBASE_API_KEY_NAME='<coinbase_api_key_name>'
+read -s OT_COINBASE_PRIVATE_KEY && export OT_COINBASE_PRIVATE_KEY
+read -s OT_COINBASE_PASSPHRASE && export OT_COINBASE_PASSPHRASE
+PYTHONPATH=. python3 -m scripts.initialize_live_crypto_environment \
 	--apply \
 	--actor operator:human \
-	--exchange-api-key-name <coinbase_api_key_name> \
-	--exchange-private-key <coinbase_private_key> \
-	--exchange-passphrase <coinbase_passphrase_optional>
+	--paper-account-id 905a408c-7d8e-4fc7-ad3b-9ff637005d73
 ```
+
+Notes:
+
+- private key and passphrase are read with hidden terminal input and are not passed as CLI arguments
+- the initializer uses existing exchange credential encryption and audit workflows
+- rerunning `--apply` never overwrites an existing exchange connection; it only fills missing objects
 
 Explicit helper to generate a fresh preview (not automatic in apply mode):
 
 ```bash
-cd /home/eric/omnitrade-legacy-engine/apps/api && PYTHONPATH=. python3 -m scripts.initialize_live_crypto_environment --create-preview
+cd /home/eric/omnitrade-legacy-engine/apps/api && PYTHONPATH=. python3 -m scripts.initialize_live_crypto_environment \
+	--create-preview \
+	--actor operator:human \
+	--paper-account-id 905a408c-7d8e-4fc7-ad3b-9ff637005d73
 ```
 
 Explicit helper to record first-live-enablement approval (not automatic in apply mode):
 
 ```bash
-cd /home/eric/omnitrade-legacy-engine/apps/api && PYTHONPATH=. python3 -m scripts.initialize_live_crypto_environment --create-approval
+cd /home/eric/omnitrade-legacy-engine/apps/api && PYTHONPATH=. python3 -m scripts.initialize_live_crypto_environment \
+	--create-approval \
+	--actor operator:human \
+	--paper-account-id 905a408c-7d8e-4fc7-ad3b-9ff637005d73
 ```
+
+Recommended production initialization order:
+
+1. inspection mode
+2. `--apply` to create missing exchange/asset/profile/campaign
+3. verify Coinbase readiness verdict from inspection and Operations/Mission Control
+4. explicit `--create-preview`
+5. explicit `--create-approval`
+6. final inspection mode confirmation
+
+The initializer is fail-closed and idempotent at each step; no provider order submission is allowed in this flow.
 
 Expected inspection output shape:
 

@@ -3,7 +3,6 @@ from __future__ import annotations
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
-from typing import Any
 from uuid import UUID
 
 from sqlalchemy import select
@@ -23,10 +22,14 @@ from app.schemas.exchange_connections import SaveExchangeConnectionRequest
 from app.services.assets_service import EnsureCoinbaseAssetRequest, ensure_coinbase_crypto_asset
 from app.services.capital_campaigns.service import create_capital_campaign
 from app.services.crypto_order_previews.service import create_crypto_order_preview
-from app.services.exchange_connections.service import create_exchange_connection
+from app.services.exchange_connections.service import create_exchange_connection, refresh_exchange_balances
 from app.services.live.approval import record_live_approval_checkpoint
 from app.services.live.contracts import LiveAccountRegistrationRequest, LiveApprovalCheckpointRequest
 from app.services.live.registration import register_live_account
+
+
+DEFAULT_PRODUCTION_CRYPTO_PAPER_ACCOUNT_ID = UUID("905a408c-7d8e-4fc7-ad3b-9ff637005d73")
+_READY_CONNECTION_VERDICTS = {"READY_FOR_PREVIEW", "READY_FOR_DRY_RUN", "READY_FOR_OPERATOR_REVIEW"}
 
 
 @dataclass(frozen=True, slots=True)
@@ -52,6 +55,7 @@ class LiveCryptoEnvironmentReadiness:
 @dataclass(frozen=True, slots=True)
 class InitializeLiveCryptoEnvironmentRequest:
     actor: str
+    paper_account_id: UUID = DEFAULT_PRODUCTION_CRYPTO_PAPER_ACCOUNT_ID
     exchange_environment: str = "production"
     exchange_connection_name: str = "coinbase-production-primary"
     exchange_api_key_name: str | None = None
@@ -104,14 +108,19 @@ async def _load_coinbase_connection(*, db: AsyncSession, environment: str) -> Ex
     )
 
 
-async def _load_crypto_paper_account(*, db: AsyncSession) -> PaperAccount | None:
-    return await db.scalar(
+async def _load_selected_crypto_paper_account(*, db: AsyncSession, paper_account_id: UUID) -> PaperAccount | None:
+    paper_account = await db.scalar(
         select(PaperAccount)
-        .where(PaperAccount.asset_class == "crypto")
-        .where(PaperAccount.is_active.is_(True))
-        .order_by(PaperAccount.created_at.asc())
+        .where(PaperAccount.id == paper_account_id)
         .limit(1)
     )
+    if paper_account is None:
+        return None
+    if paper_account.asset_class != "crypto":
+        raise ValueError(f"Selected paper account is not crypto: {paper_account_id}")
+    if not bool(paper_account.is_active):
+        raise ValueError(f"Selected paper account is inactive: {paper_account_id}")
+    return paper_account
 
 
 async def _load_live_profile_for_account(*, db: AsyncSession, paper_account_id: UUID | None) -> LiveTradingProfile | None:
@@ -195,10 +204,15 @@ def _dry_run_gate_ready() -> tuple[bool, str]:
     return True, "dry-run guard configuration is valid"
 
 
-async def inspect_live_crypto_environment(*, db: AsyncSession, exchange_environment: str = "production") -> LiveCryptoEnvironmentReadiness:
+async def inspect_live_crypto_environment(
+    *,
+    db: AsyncSession,
+    exchange_environment: str = "production",
+    paper_account_id: UUID = DEFAULT_PRODUCTION_CRYPTO_PAPER_ACCOUNT_ID,
+) -> LiveCryptoEnvironmentReadiness:
     now = datetime.now(timezone.utc)
     connection = await _load_coinbase_connection(db=db, environment=exchange_environment)
-    paper_account = await _load_crypto_paper_account(db=db)
+    paper_account = await _load_selected_crypto_paper_account(db=db, paper_account_id=paper_account_id)
     profile = await _load_live_profile_for_account(db=db, paper_account_id=paper_account.id if paper_account is not None else None)
     asset = await _load_coinbase_btc_asset(db=db)
     campaign = await _load_campaign_for_account(db=db, paper_account_id=paper_account.id if paper_account is not None else None)
@@ -301,7 +315,11 @@ async def initialize_live_crypto_environment(
     db: AsyncSession,
     request: InitializeLiveCryptoEnvironmentRequest,
 ) -> InitializeLiveCryptoEnvironmentResult:
-    initial = await inspect_live_crypto_environment(db=db, exchange_environment=request.exchange_environment)
+    initial = await inspect_live_crypto_environment(
+        db=db,
+        exchange_environment=request.exchange_environment,
+        paper_account_id=request.paper_account_id,
+    )
 
     created_exchange = False
     created_asset = False
@@ -311,7 +329,7 @@ async def initialize_live_crypto_environment(
     if initial.exchange_connection_id is None:
         if not request.exchange_api_key_name or not request.exchange_private_key:
             raise ValueError("Coinbase credentials are required when the exchange connection is missing")
-        connection = await create_exchange_connection(
+        await create_exchange_connection(
             db=db,
             payload=SaveExchangeConnectionRequest(
                 provider="coinbase_advanced",
@@ -324,8 +342,20 @@ async def initialize_live_crypto_environment(
             actor=request.actor,
         )
         created_exchange = True
-    else:
-        connection = None
+
+    refreshed_readiness = await inspect_live_crypto_environment(
+        db=db,
+        exchange_environment=request.exchange_environment,
+        paper_account_id=request.paper_account_id,
+    )
+    if refreshed_readiness.exchange_connection_id is not None:
+        refreshed = await refresh_exchange_balances(
+            db=db,
+            exchange_connection_id=refreshed_readiness.exchange_connection_id,
+            actor=request.actor,
+        )
+        if refreshed.readiness.verdict not in _READY_CONNECTION_VERDICTS:
+            raise ValueError("Coinbase readiness check failed; refresh_exchange_balances did not reach ready state")
 
     asset_result = await ensure_coinbase_crypto_asset(
         db=db,
@@ -333,7 +363,11 @@ async def initialize_live_crypto_environment(
     )
     created_asset = asset_result.created
 
-    current = await inspect_live_crypto_environment(db=db, exchange_environment=request.exchange_environment)
+    current = await inspect_live_crypto_environment(
+        db=db,
+        exchange_environment=request.exchange_environment,
+        paper_account_id=request.paper_account_id,
+    )
     if current.paper_account_id is None:
         raise ValueError("Active crypto paper account is required before initialization can continue")
 
@@ -355,9 +389,13 @@ async def initialize_live_crypto_environment(
             raise ValueError(f"Live trading profile registration rejected: {registration.rejection_reason}")
         created_profile = True
 
-    current = await inspect_live_crypto_environment(db=db, exchange_environment=request.exchange_environment)
+    current = await inspect_live_crypto_environment(
+        db=db,
+        exchange_environment=request.exchange_environment,
+        paper_account_id=request.paper_account_id,
+    )
     if current.capital_campaign_id is None:
-        paper_account = await _load_crypto_paper_account(db=db)
+        paper_account = await _load_selected_crypto_paper_account(db=db, paper_account_id=request.paper_account_id)
         if paper_account is None:
             raise ValueError("Active crypto paper account is required for campaign initialization")
         await create_capital_campaign(
@@ -381,7 +419,11 @@ async def initialize_live_crypto_environment(
         )
         created_campaign = True
 
-    final_readiness = await inspect_live_crypto_environment(db=db, exchange_environment=request.exchange_environment)
+    final_readiness = await inspect_live_crypto_environment(
+        db=db,
+        exchange_environment=request.exchange_environment,
+        paper_account_id=request.paper_account_id,
+    )
     return InitializeLiveCryptoEnvironmentResult(
         created_exchange_connection=created_exchange,
         created_asset=created_asset,
