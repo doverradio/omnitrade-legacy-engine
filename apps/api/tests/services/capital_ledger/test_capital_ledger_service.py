@@ -749,3 +749,90 @@ async def test_capital_ledger_flags_campaign_mismatch_and_is_deterministic(monke
     assert first_pool.balance_mismatch_state == "material_mismatch"
     assert first_pool.accounting_completion_status == "unresolved"
     assert first_pool.net_quote_capital_effect == second_pool.net_quote_capital_effect
+
+
+@pytest.mark.asyncio
+async def test_capital_ledger_keeps_open_reconciliation_unresolved_even_when_projection_exists(monkeypatch: pytest.MonkeyPatch) -> None:
+    order_id = "aaaaaaaa-0000-0000-0000-000000000004"
+
+    async def _none(_db):
+        return []
+
+    async def _live_rows(_db):
+        return [
+            _live_row(order_id=order_id, record_type="partial_fill_accounting", campaign_id=None, filled_quantity="0.01", gross_notional="100.00"),
+            _live_row(order_id=order_id, record_type="fee_attribution", campaign_id=None, fee_amount="0.10"),
+        ]
+
+    async def _live_orders(_db):
+        return [_live_order(order_id=order_id, campaign_id=None, completion="unresolved", balance_state="ok")]
+
+    async def _live_events(_db):
+        return [_live_reconciliation(order_id=order_id, status="open")]
+
+    async def _metrics(_db):
+        return {}
+
+    async def _trade_counts(_db):
+        return {}
+
+    monkeypatch.setattr(service, "_load_validation_runs", _none)
+    monkeypatch.setattr(service, "_load_paper_accounts", _none)
+    monkeypatch.setattr(service, "_load_research_campaigns", _none)
+    monkeypatch.setattr(service, "_load_capital_campaigns", _none)
+    monkeypatch.setattr(service, "_load_profit_cycles", _none)
+    monkeypatch.setattr(service, "_load_validation_run_metrics", _metrics)
+    monkeypatch.setattr(service, "_load_trade_counts_by_account", _trade_counts)
+    monkeypatch.setattr(service, "_load_live_accounting_records", _live_rows)
+    monkeypatch.setattr(service, "_load_live_orders", _live_orders)
+    monkeypatch.setattr(service, "_load_live_reconciliation_events", _live_events)
+
+    result = await service.build_capital_ledger(db=_DummySession())
+
+    uncategorized = next(item for item in result.capital_pools if item.capital_pool_type == "live_uncategorized")
+    assert uncategorized.accounting_projection_status == "projected"
+    assert uncategorized.provider_reconciliation_status == "open"
+    assert uncategorized.accounting_completion_status == "unresolved"
+
+
+@pytest.mark.asyncio
+async def test_capital_ledger_marks_partial_fill_cancellation_evidence(monkeypatch: pytest.MonkeyPatch) -> None:
+    order_id = "aaaaaaaa-0000-0000-0000-000000000005"
+
+    async def _none(_db):
+        return []
+
+    async def _live_rows(_db):
+        return [
+            _live_row(order_id=order_id, record_type="partial_fill_accounting", campaign_id=None, filled_quantity="0.03", gross_notional="120.00"),
+            _live_row(order_id=order_id, record_type="fee_attribution", campaign_id=None, fee_amount="0.20"),
+        ]
+
+    async def _live_orders(_db):
+        return [_live_order(order_id=order_id, campaign_id=None, completion="unresolved", balance_state="ok")]
+
+    async def _live_events(_db):
+        return [_live_reconciliation(order_id=order_id, status="canceled")]
+
+    async def _metrics(_db):
+        return {}
+
+    async def _trade_counts(_db):
+        return {}
+
+    monkeypatch.setattr(service, "_load_validation_runs", _none)
+    monkeypatch.setattr(service, "_load_paper_accounts", _none)
+    monkeypatch.setattr(service, "_load_research_campaigns", _none)
+    monkeypatch.setattr(service, "_load_capital_campaigns", _none)
+    monkeypatch.setattr(service, "_load_profit_cycles", _none)
+    monkeypatch.setattr(service, "_load_validation_run_metrics", _metrics)
+    monkeypatch.setattr(service, "_load_trade_counts_by_account", _trade_counts)
+    monkeypatch.setattr(service, "_load_live_accounting_records", _live_rows)
+    monkeypatch.setattr(service, "_load_live_orders", _live_orders)
+    monkeypatch.setattr(service, "_load_live_reconciliation_events", _live_events)
+
+    result = await service.build_capital_ledger(db=_DummySession())
+
+    uncategorized = next(item for item in result.capital_pools if item.capital_pool_type == "live_uncategorized")
+    assert "cancellation_partial_fill" in (uncategorized.live_entry_types or [])
+    assert uncategorized.net_quote_capital_effect == Decimal("120.20")

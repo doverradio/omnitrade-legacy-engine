@@ -28,6 +28,14 @@ def _decorator_name(node: ast.AST) -> str | None:
     return None
 
 
+def _called_symbol_name(node: ast.Call) -> str | None:
+    if isinstance(node.func, ast.Name):
+        return node.func.id
+    if isinstance(node.func, ast.Attribute):
+        return node.func.attr
+    return None
+
+
 def test_coinbase_create_order_has_single_sanctioned_application_boundary() -> None:
     violations: list[str] = []
 
@@ -73,3 +81,58 @@ def test_live_create_order_boundary_has_no_retry_wrappers_and_reconciliation_has
 
     assert not boundary_decorators, "Retry decorators are not allowed on live create-order boundary: " + ", ".join(boundary_decorators)
     assert not reconciliation_calls, "Reconciliation code must not call create_order"
+
+
+def test_reconciliation_and_ledger_do_not_execute_profit_policies_or_move_capital() -> None:
+    reconciliation_file = _APP_ROOT / "services" / "live" / "accounting_reconciliation.py"
+    ledger_file = _APP_ROOT / "services" / "capital_ledger" / "service.py"
+
+    forbidden = {
+        "approve_profit_cycle",
+        "reject_profit_cycle",
+        "evaluate_profit_cycle",
+        "upsert_profit_policy",
+        "withdraw",
+        "transfer",
+        "compound",
+        "execute_policy",
+    }
+
+    violations: list[str] = []
+    for label, file_path in (("reconciliation", reconciliation_file), ("capital_ledger", ledger_file)):
+        tree = ast.parse(file_path.read_text(), filename=str(file_path))
+        calls = {
+            name
+            for name in (_called_symbol_name(node) for node in ast.walk(tree) if isinstance(node, ast.Call))
+            if name is not None
+        }
+
+        # Exact policy APIs are forbidden; broad capital-movement names are prefix checked.
+        exact_hits = calls.intersection({
+            "approve_profit_cycle",
+            "reject_profit_cycle",
+            "evaluate_profit_cycle",
+            "upsert_profit_policy",
+            "execute_policy",
+        })
+        prefix_hits = {name for name in calls if name.startswith(("withdraw", "transfer", "compound"))}
+        for name in sorted(exact_hits.union(prefix_hits).intersection(forbidden)):
+            violations.append(f"{label}:{name}")
+
+    assert not violations, "Autonomy boundary violation(s): " + ", ".join(violations)
+
+
+def test_reconciliation_module_has_no_profit_policy_service_imports() -> None:
+    reconciliation_file = _APP_ROOT / "services" / "live" / "accounting_reconciliation.py"
+    tree = ast.parse(reconciliation_file.read_text(), filename=str(reconciliation_file))
+
+    disallowed_imports: list[str] = []
+    for node in ast.walk(tree):
+        if isinstance(node, ast.ImportFrom) and node.module and "capital_campaign_profit" in node.module:
+            disallowed_imports.append(node.module)
+        if isinstance(node, ast.Import):
+            for alias in node.names:
+                if "capital_campaign_profit" in alias.name:
+                    disallowed_imports.append(alias.name)
+
+    assert not disallowed_imports, "Reconciliation must not depend on profit-policy services: " + ", ".join(disallowed_imports)

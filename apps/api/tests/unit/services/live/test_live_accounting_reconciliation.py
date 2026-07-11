@@ -773,3 +773,613 @@ async def test_canonical_reconciliation_flags_campaign_correlation_mismatch(monk
 
     assert outcome["campaign_correlation_status"] == "mismatch"
     assert outcome["accounting_completion_status"] == "unresolved"
+
+
+@pytest.mark.asyncio
+async def test_canonical_reconciliation_audit_failure_marks_unresolved_and_retry_is_idempotent(monkeypatch: pytest.MonkeyPatch) -> None:
+    source = _execution_event("execution_intent_created")
+    profile = type("Profile", (), {
+        "id": source.live_trading_profile_id,
+        "paper_account_id": uuid.uuid4(),
+        "operating_mode": "live",
+        "paper_default_mode": True,
+        "risk_authority_model": "risk_engine_final",
+    })()
+    live_order = type("LiveOrder", (), {
+        "live_crypto_order_id": uuid.uuid4(),
+        "provider": "coinbase_advanced",
+        "environment": "production",
+        "exchange_connection_id": uuid.uuid4(),
+        "provider_order_id": None,
+        "client_order_id": "client-order-audit-retry",
+        "product_id": "BTC-USD",
+        "side": "BUY",
+        "order_type": "MARKET",
+        "requested_quote_size": Decimal("5.00"),
+        "status": "RECONCILIATION_REQUIRED",
+        "risk_event_id": uuid.uuid4(),
+        "safe_provider_response": {
+            "live_trading_profile_id": str(source.live_trading_profile_id),
+            "usd_available_before_submit": "100.00",
+        },
+        "audit_correlation_id": uuid.uuid4(),
+        "provider_status": None,
+        "updated_at": datetime.now(timezone.utc),
+        "filled_at": None,
+        "cancelled_at": None,
+        "failure_code": None,
+        "failure_reason": None,
+        "acknowledged_at": None,
+    })()
+    session = _FakeSession(execution_events=[source])
+    session.live_orders = [live_order]
+    session.live_profiles = [profile]
+
+    async def _load_exchange_connection(*_args, **_kwargs):
+        return type("Conn", (), {
+            "exchange_connection_id": live_order.exchange_connection_id,
+            "balances": [{"currency": "USD", "available": "94.99"}],
+            "last_verified_at": "2026-07-10T12:00:05+00:00",
+            "last_successful_sync_at": "2026-07-10T12:00:05+00:00",
+            "last_heartbeat_at": "2026-07-10T12:00:05+00:00",
+        })()
+
+    monkeypatch.setattr("app.services.live_crypto_orders._load_exchange_connection", _load_exchange_connection)
+    monkeypatch.setattr("app.services.live_crypto_orders._load_decrypted_credentials", lambda _c: {"api_key": "k", "api_secret": "s"})
+    monkeypatch.setattr(
+        "app.services.live.accounting_reconciliation._utcnow",
+        lambda: datetime(2026, 7, 10, 12, 0, 10, tzinfo=timezone.utc),
+    )
+    monkeypatch.setattr(
+        "app.services.live.accounting_reconciliation.get_settings",
+        lambda: type(
+            "Settings",
+            (),
+            {
+                "live_crypto_balance_max_age_seconds": 30,
+                "live_crypto_accounting_balance_tolerance_usd": Decimal("0.02"),
+            },
+        )(),
+    )
+
+    class _Provider:
+        async def list_historical_orders(self, **_kwargs):
+            return {
+                "orders": [
+                    {
+                        "order_id": "provider-order-audit-retry",
+                        "client_order_id": "client-order-audit-retry",
+                        "product_id": "BTC-USD",
+                        "status": "FILLED",
+                        "completion_time": "2026-07-10T12:00:00Z",
+                    }
+                ]
+            }, {}
+
+        async def list_historical_fills(self, **_kwargs):
+            return {
+                "fills": [
+                    {
+                        "trade_id": "fill-audit-retry",
+                        "price": "100000.00",
+                        "size": "0.00005",
+                        "commission": "0.01",
+                        "commission_currency": "USD",
+                        "created_at": "2026-07-10T12:00:01Z",
+                    }
+                ]
+            }, {}
+
+        async def get_historical_order(self, **_kwargs):
+            return {
+                "order": {
+                    "order_id": "provider-order-audit-retry",
+                    "client_order_id": "client-order-audit-retry",
+                    "product_id": "BTC-USD",
+                    "status": "FILLED",
+                    "completion_time": "2026-07-10T12:00:00Z",
+                }
+            }, {}
+
+    monkeypatch.setattr("app.services.live.accounting_reconciliation.CoinbaseAdvancedClient", _Provider)
+
+    call_count = {"audit": 0}
+
+    async def _audit_once_then_ok(*_args, **_kwargs):
+        call_count["audit"] += 1
+        if call_count["audit"] == 1:
+            raise RuntimeError("audit persistence unavailable")
+        return None
+
+    monkeypatch.setattr("app.services.live.accounting_reconciliation.record_live_audit_evidence", _audit_once_then_ok)
+
+    first = await reconcile_live_order_and_fills(
+        db=session,
+        live_crypto_order_id=live_order.live_crypto_order_id,
+        operator_identity="operator:human",
+    )
+    second = await reconcile_live_order_and_fills(
+        db=session,
+        live_crypto_order_id=live_order.live_crypto_order_id,
+        operator_identity="operator:human",
+    )
+
+    assert first["accounting_completion_status"] == "unresolved"
+    assert second["accounting_completion_status"] == "complete"
+    assert len(session.accounting_records) == 2
+    unresolved_events = [
+        item for item in session.reconciliation_events
+        if isinstance(item.provenance, dict) and item.provenance.get("reason") == "audit_persistence_failure"
+    ]
+    assert len(unresolved_events) == 1
+
+
+@pytest.mark.asyncio
+async def test_canonical_reconciliation_marks_unresolved_when_balance_observation_stale(monkeypatch: pytest.MonkeyPatch) -> None:
+    source = _execution_event("execution_intent_created")
+    profile = type("Profile", (), {
+        "id": source.live_trading_profile_id,
+        "paper_account_id": uuid.uuid4(),
+        "operating_mode": "live",
+        "paper_default_mode": True,
+        "risk_authority_model": "risk_engine_final",
+    })()
+    live_order = type("LiveOrder", (), {
+        "live_crypto_order_id": uuid.uuid4(),
+        "provider": "coinbase_advanced",
+        "environment": "production",
+        "exchange_connection_id": uuid.uuid4(),
+        "provider_order_id": None,
+        "client_order_id": "client-order-stale-balance",
+        "product_id": "BTC-USD",
+        "side": "BUY",
+        "order_type": "MARKET",
+        "requested_quote_size": Decimal("5.00"),
+        "status": "RECONCILIATION_REQUIRED",
+        "risk_event_id": uuid.uuid4(),
+        "safe_provider_response": {
+            "live_trading_profile_id": str(source.live_trading_profile_id),
+            "usd_available_before_submit": "100.00",
+        },
+        "audit_correlation_id": uuid.uuid4(),
+        "provider_status": None,
+        "updated_at": datetime.now(timezone.utc),
+        "filled_at": None,
+        "cancelled_at": None,
+        "failure_code": None,
+        "failure_reason": None,
+        "acknowledged_at": None,
+    })()
+    session = _FakeSession(execution_events=[source])
+    session.live_orders = [live_order]
+    session.live_profiles = [profile]
+
+    async def _load_exchange_connection(*_args, **_kwargs):
+        return type("Conn", (), {
+            "exchange_connection_id": live_order.exchange_connection_id,
+            "balances": [{"currency": "USD", "available": "94.99"}],
+            "last_verified_at": "2026-07-10T11:00:05+00:00",
+            "last_successful_sync_at": "2026-07-10T11:00:05+00:00",
+            "last_heartbeat_at": "2026-07-10T11:00:05+00:00",
+        })()
+
+    monkeypatch.setattr("app.services.live_crypto_orders._load_exchange_connection", _load_exchange_connection)
+    monkeypatch.setattr("app.services.live_crypto_orders._load_decrypted_credentials", lambda _c: {"api_key": "k", "api_secret": "s"})
+    monkeypatch.setattr(
+        "app.services.live.accounting_reconciliation._utcnow",
+        lambda: datetime(2026, 7, 10, 12, 0, 10, tzinfo=timezone.utc),
+    )
+    monkeypatch.setattr(
+        "app.services.live.accounting_reconciliation.get_settings",
+        lambda: type(
+            "Settings",
+            (),
+            {
+                "live_crypto_balance_max_age_seconds": 30,
+                "live_crypto_accounting_balance_tolerance_usd": Decimal("0.02"),
+            },
+        )(),
+    )
+
+    class _Provider:
+        async def list_historical_orders(self, **_kwargs):
+            return {
+                "orders": [
+                    {
+                        "order_id": "provider-order-stale-balance",
+                        "client_order_id": "client-order-stale-balance",
+                        "product_id": "BTC-USD",
+                        "status": "FILLED",
+                        "completion_time": "2026-07-10T12:00:00Z",
+                    }
+                ]
+            }, {}
+
+        async def list_historical_fills(self, **_kwargs):
+            return {
+                "fills": [
+                    {
+                        "trade_id": "fill-stale-balance",
+                        "price": "100000.00",
+                        "size": "0.00005",
+                        "commission": "0.01",
+                        "commission_currency": "USD",
+                        "created_at": "2026-07-10T12:00:01Z",
+                    }
+                ]
+            }, {}
+
+        async def get_historical_order(self, **_kwargs):
+            return {"order": {}}, {}
+
+    monkeypatch.setattr("app.services.live.accounting_reconciliation.CoinbaseAdvancedClient", _Provider)
+
+    outcome = await reconcile_live_order_and_fills(
+        db=session,
+        live_crypto_order_id=live_order.live_crypto_order_id,
+        operator_identity="operator:human",
+    )
+
+    assert outcome["balance_mismatch_state"] == "stale"
+    assert outcome["accounting_completion_status"] == "unresolved"
+
+
+@pytest.mark.asyncio
+async def test_canonical_reconciliation_marks_unresolved_when_balance_missing(monkeypatch: pytest.MonkeyPatch) -> None:
+    source = _execution_event("execution_intent_created")
+    profile = type("Profile", (), {
+        "id": source.live_trading_profile_id,
+        "paper_account_id": uuid.uuid4(),
+        "operating_mode": "live",
+        "paper_default_mode": True,
+        "risk_authority_model": "risk_engine_final",
+    })()
+    live_order = type("LiveOrder", (), {
+        "live_crypto_order_id": uuid.uuid4(),
+        "provider": "coinbase_advanced",
+        "environment": "production",
+        "exchange_connection_id": uuid.uuid4(),
+        "provider_order_id": None,
+        "client_order_id": "client-order-missing-balance",
+        "product_id": "BTC-USD",
+        "side": "BUY",
+        "order_type": "MARKET",
+        "requested_quote_size": Decimal("5.00"),
+        "status": "RECONCILIATION_REQUIRED",
+        "risk_event_id": uuid.uuid4(),
+        "safe_provider_response": {
+            "live_trading_profile_id": str(source.live_trading_profile_id),
+            "usd_available_before_submit": "100.00",
+        },
+        "audit_correlation_id": uuid.uuid4(),
+        "provider_status": None,
+        "updated_at": datetime.now(timezone.utc),
+        "filled_at": None,
+        "cancelled_at": None,
+        "failure_code": None,
+        "failure_reason": None,
+        "acknowledged_at": None,
+    })()
+    session = _FakeSession(execution_events=[source])
+    session.live_orders = [live_order]
+    session.live_profiles = [profile]
+
+    async def _load_exchange_connection(*_args, **_kwargs):
+        return type("Conn", (), {
+            "exchange_connection_id": live_order.exchange_connection_id,
+            "balances": [],
+            "last_verified_at": "2026-07-10T12:00:05+00:00",
+            "last_successful_sync_at": "2026-07-10T12:00:05+00:00",
+            "last_heartbeat_at": "2026-07-10T12:00:05+00:00",
+        })()
+
+    monkeypatch.setattr("app.services.live_crypto_orders._load_exchange_connection", _load_exchange_connection)
+    monkeypatch.setattr("app.services.live_crypto_orders._load_decrypted_credentials", lambda _c: {"api_key": "k", "api_secret": "s"})
+    monkeypatch.setattr(
+        "app.services.live.accounting_reconciliation._utcnow",
+        lambda: datetime(2026, 7, 10, 12, 0, 10, tzinfo=timezone.utc),
+    )
+    monkeypatch.setattr(
+        "app.services.live.accounting_reconciliation.get_settings",
+        lambda: type(
+            "Settings",
+            (),
+            {
+                "live_crypto_balance_max_age_seconds": 30,
+                "live_crypto_accounting_balance_tolerance_usd": Decimal("0.02"),
+            },
+        )(),
+    )
+
+    class _Provider:
+        async def list_historical_orders(self, **_kwargs):
+            return {
+                "orders": [
+                    {
+                        "order_id": "provider-order-missing-balance",
+                        "client_order_id": "client-order-missing-balance",
+                        "product_id": "BTC-USD",
+                        "status": "FILLED",
+                        "completion_time": "2026-07-10T12:00:00Z",
+                    }
+                ]
+            }, {}
+
+        async def list_historical_fills(self, **_kwargs):
+            return {
+                "fills": [
+                    {
+                        "trade_id": "fill-missing-balance",
+                        "price": "100000.00",
+                        "size": "0.00005",
+                        "commission": "0.01",
+                        "commission_currency": "USD",
+                        "created_at": "2026-07-10T12:00:01Z",
+                    }
+                ]
+            }, {}
+
+        async def get_historical_order(self, **_kwargs):
+            return {"order": {}}, {}
+
+    monkeypatch.setattr("app.services.live.accounting_reconciliation.CoinbaseAdvancedClient", _Provider)
+
+    outcome = await reconcile_live_order_and_fills(
+        db=session,
+        live_crypto_order_id=live_order.live_crypto_order_id,
+        operator_identity="operator:human",
+    )
+
+    assert outcome["balance_mismatch_state"] == "missing"
+    assert outcome["accounting_completion_status"] == "unresolved"
+
+
+@pytest.mark.asyncio
+async def test_canonical_reconciliation_marks_mismatch_when_campaign_ids_conflict(monkeypatch: pytest.MonkeyPatch) -> None:
+    source = _execution_event("execution_intent_created")
+    profile = type("Profile", (), {
+        "id": source.live_trading_profile_id,
+        "paper_account_id": uuid.uuid4(),
+        "operating_mode": "live",
+        "paper_default_mode": True,
+        "risk_authority_model": "risk_engine_final",
+    })()
+    live_order_id = uuid.uuid4()
+    live_order = type("LiveOrder", (), {
+        "live_crypto_order_id": live_order_id,
+        "provider": "coinbase_advanced",
+        "environment": "production",
+        "exchange_connection_id": uuid.uuid4(),
+        "provider_order_id": None,
+        "client_order_id": "client-order-campaign-conflict",
+        "product_id": "BTC-USD",
+        "side": "BUY",
+        "order_type": "MARKET",
+        "requested_quote_size": Decimal("5.00"),
+        "status": "RECONCILIATION_REQUIRED",
+        "risk_event_id": uuid.uuid4(),
+        "safe_provider_response": {
+            "live_trading_profile_id": str(source.live_trading_profile_id),
+            "capital_campaign_id": 11,
+            "usd_available_before_submit": "100.00",
+        },
+        "audit_correlation_id": uuid.uuid4(),
+        "provider_status": None,
+        "updated_at": datetime.now(timezone.utc),
+        "filled_at": None,
+        "cancelled_at": None,
+        "failure_code": None,
+        "failure_reason": None,
+        "acknowledged_at": None,
+    })()
+    session = _FakeSession(execution_events=[source])
+    session.live_orders = [live_order]
+    session.live_profiles = [profile]
+    session.accounting_records = [
+        LiveAccountingRecord(
+            id=uuid.uuid4(),
+            idempotency_key="existing-campaign-row",
+            live_trading_profile_id=source.live_trading_profile_id,
+            live_crypto_order_id=live_order_id,
+            capital_campaign_id=10,
+            reconciliation_event_id=uuid.uuid4(),
+            source_execution_event_id=source.id,
+            source_execution_event_type="execution_intent_created",
+            record_type="fill_accounting",
+            provider_order_id="provider-order-existing",
+            provider_fill_id="fill-existing",
+            symbol="BTC-USD",
+            side="buy",
+            filled_quantity=Decimal("0.01"),
+            fill_price=Decimal("100000"),
+            gross_notional=Decimal("1000"),
+            fee_amount=Decimal("0"),
+            fee_currency="USD",
+            net_cash_impact=Decimal("-1000"),
+            provenance={"source": "test"},
+            recorded_at=datetime.now(timezone.utc),
+            created_at=datetime.now(timezone.utc),
+        )
+    ]
+
+    async def _load_exchange_connection(*_args, **_kwargs):
+        return type("Conn", (), {
+            "exchange_connection_id": live_order.exchange_connection_id,
+            "balances": [{"currency": "USD", "available": "95.00"}],
+            "last_verified_at": "2026-07-10T12:00:05+00:00",
+            "last_successful_sync_at": "2026-07-10T12:00:05+00:00",
+            "last_heartbeat_at": "2026-07-10T12:00:05+00:00",
+        })()
+
+    monkeypatch.setattr("app.services.live_crypto_orders._load_exchange_connection", _load_exchange_connection)
+    monkeypatch.setattr("app.services.live_crypto_orders._load_decrypted_credentials", lambda _c: {"api_key": "k", "api_secret": "s"})
+    monkeypatch.setattr(
+        "app.services.live.accounting_reconciliation._utcnow",
+        lambda: datetime(2026, 7, 10, 12, 0, 10, tzinfo=timezone.utc),
+    )
+    monkeypatch.setattr(
+        "app.services.live.accounting_reconciliation.get_settings",
+        lambda: type(
+            "Settings",
+            (),
+            {
+                "live_crypto_balance_max_age_seconds": 30,
+                "live_crypto_accounting_balance_tolerance_usd": Decimal("0.01"),
+            },
+        )(),
+    )
+
+    class _Provider:
+        async def list_historical_orders(self, **_kwargs):
+            return {
+                "orders": [
+                    {
+                        "order_id": "provider-order-campaign-conflict",
+                        "client_order_id": "client-order-campaign-conflict",
+                        "product_id": "BTC-USD",
+                        "status": "FILLED",
+                        "completion_time": "2026-07-10T12:00:00Z",
+                    }
+                ]
+            }, {}
+
+        async def list_historical_fills(self, **_kwargs):
+            return {
+                "fills": [
+                    {
+                        "trade_id": "fill-campaign-conflict",
+                        "price": "100000.00",
+                        "size": "0.00005",
+                        "commission": "0.01",
+                        "commission_currency": "USD",
+                        "created_at": "2026-07-10T12:00:01Z",
+                    }
+                ]
+            }, {}
+
+        async def get_historical_order(self, **_kwargs):
+            return {"order": {}}, {}
+
+    monkeypatch.setattr("app.services.live.accounting_reconciliation.CoinbaseAdvancedClient", _Provider)
+
+    outcome = await reconcile_live_order_and_fills(
+        db=session,
+        live_crypto_order_id=live_order.live_crypto_order_id,
+        operator_identity="operator:human",
+    )
+
+    assert outcome["campaign_correlation_status"] == "mismatch"
+    assert outcome["accounting_completion_status"] == "unresolved"
+
+
+@pytest.mark.asyncio
+async def test_canonical_reconciliation_profit_cycle_consistency_for_buy_fill_is_non_realizing(monkeypatch: pytest.MonkeyPatch) -> None:
+    source = _execution_event("execution_intent_created")
+    profile = type("Profile", (), {
+        "id": source.live_trading_profile_id,
+        "paper_account_id": uuid.uuid4(),
+        "operating_mode": "live",
+        "paper_default_mode": True,
+        "risk_authority_model": "risk_engine_final",
+    })()
+    live_order = type("LiveOrder", (), {
+        "live_crypto_order_id": uuid.uuid4(),
+        "provider": "coinbase_advanced",
+        "environment": "production",
+        "exchange_connection_id": uuid.uuid4(),
+        "provider_order_id": None,
+        "client_order_id": "client-order-profit-cycle",
+        "product_id": "BTC-USD",
+        "side": "BUY",
+        "order_type": "MARKET",
+        "requested_quote_size": Decimal("5.00"),
+        "status": "RECONCILIATION_REQUIRED",
+        "risk_event_id": uuid.uuid4(),
+        "safe_provider_response": {
+            "live_trading_profile_id": str(source.live_trading_profile_id),
+            "usd_available_before_submit": "100.00",
+            "preview_estimated_fee": "0.01",
+        },
+        "audit_correlation_id": uuid.uuid4(),
+        "provider_status": None,
+        "updated_at": datetime.now(timezone.utc),
+        "filled_at": None,
+        "cancelled_at": None,
+        "failure_code": None,
+        "failure_reason": None,
+        "acknowledged_at": None,
+    })()
+    session = _FakeSession(execution_events=[source])
+    session.live_orders = [live_order]
+    session.live_profiles = [profile]
+
+    async def _load_exchange_connection(*_args, **_kwargs):
+        return type("Conn", (), {
+            "exchange_connection_id": live_order.exchange_connection_id,
+            "balances": [{"currency": "USD", "available": "94.99"}],
+            "last_verified_at": "2026-07-10T12:00:05+00:00",
+            "last_successful_sync_at": "2026-07-10T12:00:05+00:00",
+            "last_heartbeat_at": "2026-07-10T12:00:05+00:00",
+        })()
+
+    monkeypatch.setattr("app.services.live_crypto_orders._load_exchange_connection", _load_exchange_connection)
+    monkeypatch.setattr("app.services.live_crypto_orders._load_decrypted_credentials", lambda _c: {"api_key": "k", "api_secret": "s"})
+    monkeypatch.setattr(
+        "app.services.live.accounting_reconciliation._utcnow",
+        lambda: datetime(2026, 7, 10, 12, 0, 10, tzinfo=timezone.utc),
+    )
+    monkeypatch.setattr(
+        "app.services.live.accounting_reconciliation.get_settings",
+        lambda: type(
+            "Settings",
+            (),
+            {
+                "live_crypto_balance_max_age_seconds": 30,
+                "live_crypto_accounting_balance_tolerance_usd": Decimal("0.02"),
+            },
+        )(),
+    )
+
+    class _Provider:
+        async def list_historical_orders(self, **_kwargs):
+            return {
+                "orders": [
+                    {
+                        "order_id": "provider-order-profit-cycle",
+                        "client_order_id": "client-order-profit-cycle",
+                        "product_id": "BTC-USD",
+                        "status": "FILLED",
+                        "completion_time": "2026-07-10T12:00:00Z",
+                    }
+                ]
+            }, {}
+
+        async def list_historical_fills(self, **_kwargs):
+            return {
+                "fills": [
+                    {
+                        "trade_id": "fill-profit-cycle",
+                        "price": "100000.00",
+                        "size": "0.00005",
+                        "commission": "0.01",
+                        "commission_currency": "USD",
+                        "created_at": "2026-07-10T12:00:01Z",
+                    }
+                ]
+            }, {}
+
+        async def get_historical_order(self, **_kwargs):
+            return {"order": {}}, {}
+
+    monkeypatch.setattr("app.services.live.accounting_reconciliation.CoinbaseAdvancedClient", _Provider)
+
+    await reconcile_live_order_and_fills(
+        db=session,
+        live_crypto_order_id=live_order.live_crypto_order_id,
+        operator_identity="operator:human",
+    )
+
+    consistency = live_order.safe_provider_response["reconciliation"]["profit_cycle_consistency"]
+    assert consistency["buy_fill_realized_profit"] == "0"
+    assert consistency["distributable_profit_created"] is False
+    assert consistency["fees_reflected"] is True
