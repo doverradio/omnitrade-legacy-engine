@@ -13,7 +13,7 @@ from app.db.base import Base
 class ExchangeConnection(Base):
     __tablename__ = "exchange_connections"
     __table_args__ = (
-        CheckConstraint("provider IN ('coinbase_advanced')", name="ck_exchange_connections_provider"),
+        CheckConstraint("provider IN ('coinbase_advanced','kraken_spot')", name="ck_exchange_connections_provider"),
         CheckConstraint("environment IN ('sandbox', 'production')", name="ck_exchange_connections_environment"),
         CheckConstraint("status IN ('connected', 'disconnected', 'error')", name="ck_exchange_connections_status"),
         Index("ix_exchange_connections_provider_env", "provider", "environment"),

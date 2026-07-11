@@ -123,6 +123,12 @@ def _readiness_from_connection(connection: ExchangeConnection) -> ExchangeReadin
 
 
 def _to_response(connection: ExchangeConnection) -> ExchangeConnectionResponse:
+    provider_label = connection.provider
+    try:
+        provider_label = get_exchange_provider(connection.provider).metadata.display_name
+    except Exception:
+        provider_label = connection.provider
+
     balances_payload = connection.balances or []
     balances: list[ExchangeBalanceResponse] = []
     for item in balances_payload:
@@ -140,7 +146,7 @@ def _to_response(connection: ExchangeConnection) -> ExchangeConnectionResponse:
     return ExchangeConnectionResponse(
         exchange_connection_id=connection.exchange_connection_id,
         provider=connection.provider,
-        provider_label="Coinbase Advanced",
+        provider_label=provider_label,
         connection_name=connection.connection_name,
         environment=connection.environment,
         status=connection.status,

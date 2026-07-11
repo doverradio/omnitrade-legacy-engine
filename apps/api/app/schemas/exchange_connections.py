@@ -8,7 +8,7 @@ from uuid import UUID
 from pydantic import BaseModel, Field, field_serializer
 
 
-ExchangeProvider = Literal["coinbase_advanced"]
+ExchangeProvider = Literal["coinbase_advanced", "kraken_spot"]
 ExchangeEnvironment = Literal["sandbox", "production"]
 ExchangeConnectionStatus = Literal["connected", "disconnected", "error"]
 ExchangeReadinessVerdict = Literal[

@@ -25,7 +25,21 @@ class EnsureCoinbaseAssetResult:
     created: bool
 
 
-async def ensure_coinbase_crypto_asset(*, db: AsyncSession, request: EnsureCoinbaseAssetRequest) -> EnsureCoinbaseAssetResult:
+@dataclass(frozen=True, slots=True)
+class EnsureExchangeAssetRequest:
+    symbol: str
+    base_currency: str
+    exchange: str
+    actor: str
+
+
+@dataclass(frozen=True, slots=True)
+class EnsureExchangeAssetResult:
+    asset: Asset
+    created: bool
+
+
+async def ensure_exchange_crypto_asset(*, db: AsyncSession, request: EnsureExchangeAssetRequest) -> EnsureExchangeAssetResult:
     normalized_symbol = request.symbol.strip().upper()
     existing = await db.scalar(
         select(Asset)
@@ -36,7 +50,7 @@ async def ensure_coinbase_crypto_asset(*, db: AsyncSession, request: EnsureCoinb
         .limit(1)
     )
     if existing is not None:
-        return EnsureCoinbaseAssetResult(asset=existing, created=False)
+        return EnsureExchangeAssetResult(asset=existing, created=False)
 
     asset = Asset(
         symbol=normalized_symbol,
@@ -73,4 +87,17 @@ async def ensure_coinbase_crypto_asset(*, db: AsyncSession, request: EnsureCoinb
     await db.commit()
     if hasattr(db, "refresh"):
         await db.refresh(asset)
-    return EnsureCoinbaseAssetResult(asset=asset, created=True)
+    return EnsureExchangeAssetResult(asset=asset, created=True)
+
+
+async def ensure_coinbase_crypto_asset(*, db: AsyncSession, request: EnsureCoinbaseAssetRequest) -> EnsureCoinbaseAssetResult:
+    result = await ensure_exchange_crypto_asset(
+        db=db,
+        request=EnsureExchangeAssetRequest(
+            symbol=request.symbol,
+            base_currency=request.base_currency,
+            exchange=request.exchange,
+            actor=request.actor,
+        ),
+    )
+    return EnsureCoinbaseAssetResult(asset=result.asset, created=result.created)

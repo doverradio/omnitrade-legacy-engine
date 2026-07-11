@@ -19,6 +19,11 @@ def test_registry_returns_coinbase_provider() -> None:
     assert provider.metadata.provider_key == "coinbase_advanced"
 
 
+def test_registry_returns_kraken_provider() -> None:
+    provider = get_exchange_provider("kraken_spot", environment="production")
+    assert provider.metadata.provider_key == "kraken_spot"
+
+
 def test_registry_rejects_unknown_provider() -> None:
     with pytest.raises(InvalidRequestError, match="Unsupported exchange provider"):
         get_exchange_provider("unknown_provider")
@@ -35,6 +40,7 @@ def test_registry_lists_registered_providers() -> None:
     providers = list_registered_exchange_providers()
     keys = {item.provider_key for item in providers}
     assert "coinbase_advanced" in keys
+    assert "kraken_spot" in keys
 
 
 def test_registry_requires_capabilities_fail_closed() -> None:
@@ -72,3 +78,32 @@ async def test_registry_provider_health_shape() -> None:
     assert health.provider_key == "coinbase_advanced"
     assert health.environment == "sandbox"
     assert "create_order" in health.capability_status
+
+
+def test_registry_kraken_create_order_capability_is_disabled_in_ep2() -> None:
+    metadata = get_exchange_provider_metadata("kraken_spot")
+    assert "create_order" not in metadata.capabilities
+
+
+@pytest.mark.asyncio
+async def test_registry_kraken_submit_fails_closed_in_ep2() -> None:
+    provider = get_exchange_provider("kraken_spot", environment="production")
+    from app.services.exchange_connections.providers.base import ExchangeOrderSubmissionRequest
+
+    result = await provider.submit_order(
+        credentials={"api_key": "k", "api_secret": "s"},
+        environment="production",
+        request=ExchangeOrderSubmissionRequest(
+            product_id="BTC-USD",
+            side="BUY",
+            order_type="MARKET",
+            quote_size=Decimal("5"),
+            base_size=None,
+            client_order_id="client-1",
+            idempotency_key="client-1",
+            raw_payload={},
+        ),
+    )
+    assert result.classification == "rejected"
+    assert result.rejection is not None
+    assert result.rejection.code == "unsupported_capability"

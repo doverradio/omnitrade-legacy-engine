@@ -9,10 +9,12 @@ from app.services.exchange_connections.providers.base import (
     ProviderEnvironment,
 )
 from app.services.exchange_connections.providers.coinbase_advanced import CoinbaseAdvancedClient
+from app.services.exchange_connections.providers.kraken_spot import KrakenSpotClient
 
 
 _PROVIDER_REGISTRY: dict[str, ExchangeProviderClient] = {
     "coinbase_advanced": CoinbaseAdvancedClient(),
+    "kraken_spot": KrakenSpotClient(),
 }
 
 

@@ -23,6 +23,19 @@ from app.services.live_crypto_environment import (
 from scripts.review_live_crypto_dry_run_evidence import verify_dry_run_evidence
 
 
+_PROVIDER_DEFAULT_ENV = {
+    "coinbase_advanced": {
+        "api_key_name": "OT_COINBASE_API_KEY_NAME",
+        "private_key": "OT_COINBASE_PRIVATE_KEY",
+        "passphrase": "OT_COINBASE_PASSPHRASE",
+    },
+    "kraken_spot": {
+        "api_key_name": "OT_KRAKEN_API_KEY",
+        "private_key": "OT_KRAKEN_API_SECRET",
+        "passphrase": "OT_KRAKEN_OTP",
+    },
+}
+
 DEFAULT_API_KEY_ENV = "OT_COINBASE_API_KEY_NAME"
 DEFAULT_PRIVATE_KEY_ENV = "OT_COINBASE_PRIVATE_KEY"
 DEFAULT_PASSPHRASE_ENV = "OT_COINBASE_PASSPHRASE"
@@ -35,9 +48,16 @@ async def _maybe_await(value):
 
 
 def _resolve_credentials(args: argparse.Namespace) -> tuple[str | None, str | None, str | None]:
-    api_key_name = args.exchange_api_key_name or os.getenv(args.exchange_api_key_name_env)
-    private_key = os.getenv(args.exchange_private_key_env)
-    passphrase = os.getenv(args.exchange_passphrase_env)
+    provider = getattr(args, "provider", "coinbase_advanced")
+    defaults = _PROVIDER_DEFAULT_ENV.get(provider, _PROVIDER_DEFAULT_ENV["coinbase_advanced"])
+
+    api_key_env = args.exchange_api_key_name_env or defaults["api_key_name"]
+    private_key_env = args.exchange_private_key_env or defaults["private_key"]
+    passphrase_env = args.exchange_passphrase_env or defaults["passphrase"]
+
+    api_key_name = args.exchange_api_key_name or os.getenv(api_key_env)
+    private_key = os.getenv(private_key_env)
+    passphrase = os.getenv(passphrase_env)
 
     if args.prompt_for_credentials:
         if not api_key_name:
@@ -86,6 +106,7 @@ async def _run(args: argparse.Namespace) -> int:
 
     async with AsyncSessionLocal() as db:
         try:
+            provider = getattr(args, "provider", "coinbase_advanced")
             if getattr(args, "run_rehearsal", False):
                 if args.exchange_environment != "sandbox":
                     print("blocked: rehearsal requires --exchange-environment sandbox")
@@ -95,6 +116,7 @@ async def _run(args: argparse.Namespace) -> int:
                     db=db,
                     request=InitializeLiveCryptoEnvironmentRequest(
                         actor=args.actor,
+                        provider=provider,
                         paper_account_id=args.paper_account_id,
                         exchange_environment=args.exchange_environment,
                         exchange_connection_name=args.exchange_connection_name,
@@ -125,6 +147,7 @@ async def _run(args: argparse.Namespace) -> int:
                     readiness = await _maybe_await(
                         inspect_live_crypto_environment(
                             db=db,
+                            provider=provider,
                             exchange_environment=args.exchange_environment,
                             paper_account_id=args.paper_account_id,
                         )
@@ -152,6 +175,7 @@ async def _run(args: argparse.Namespace) -> int:
                     readiness = await _maybe_await(
                         inspect_live_crypto_environment(
                             db=db,
+                            provider=provider,
                             exchange_environment=args.exchange_environment,
                             paper_account_id=args.paper_account_id,
                         )
@@ -180,6 +204,7 @@ async def _run(args: argparse.Namespace) -> int:
                     db=db,
                     request=InitializeLiveCryptoEnvironmentRequest(
                         actor=args.actor,
+                        provider=provider,
                         paper_account_id=args.paper_account_id,
                         exchange_environment=args.exchange_environment,
                         exchange_connection_name=args.exchange_connection_name,
@@ -200,6 +225,7 @@ async def _run(args: argparse.Namespace) -> int:
             readiness = await _maybe_await(
                 inspect_live_crypto_environment(
                     db=db,
+                    provider=provider,
                     exchange_environment=args.exchange_environment,
                     paper_account_id=args.paper_account_id,
                 )
@@ -209,6 +235,7 @@ async def _run(args: argparse.Namespace) -> int:
                 production_readiness = await _maybe_await(
                     inspect_live_crypto_environment(
                         db=db,
+                        provider=provider,
                         exchange_environment="production",
                         paper_account_id=args.paper_account_id,
                     )
@@ -231,10 +258,11 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--create-preview", action="store_true", help="Generate a fresh BTC-USD BUY $5 preview via preview service")
     parser.add_argument("--create-approval", action="store_true", help="Record first-live-enablement approval via approval workflow")
     parser.add_argument("--run-rehearsal", action="store_true", help="Run full sandbox/mock rehearsal including preview, approval, dry run, and evidence review")
+    parser.add_argument("--provider", default="coinbase_advanced", choices=["coinbase_advanced", "kraken_spot"])
     parser.add_argument("--exchange-environment", default="production", choices=["production", "sandbox"])
     parser.add_argument("--actor", default="operator:human")
     parser.add_argument("--paper-account-id", type=UUID, default=UUID("905a408c-7d8e-4fc7-ad3b-9ff637005d73"))
-    parser.add_argument("--exchange-connection-name", default="coinbase-production-primary")
+    parser.add_argument("--exchange-connection-name")
     parser.add_argument("--exchange-api-key-name")
     parser.add_argument("--exchange-api-key-name-env", default=DEFAULT_API_KEY_ENV)
     parser.add_argument("--exchange-private-key-env", default=DEFAULT_PRIVATE_KEY_ENV)

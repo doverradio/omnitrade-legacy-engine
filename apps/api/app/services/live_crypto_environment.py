@@ -23,6 +23,7 @@ from app.schemas.exchange_connections import SaveExchangeConnectionRequest
 from app.schemas.live_crypto_orders import LiveCryptoOrderDryRunRequest
 from app.services import live_crypto_orders as live_crypto_orders_service
 from app.services.exchange_connections.providers.registry import provider_mock_mode_enabled
+from app.services.exchange_connections.providers.registry import get_exchange_provider_metadata
 from app.services.assets_service import EnsureCoinbaseAssetRequest, ensure_coinbase_crypto_asset
 from app.services.capital_campaigns.service import create_capital_campaign
 from app.services.crypto_order_previews.service import create_crypto_order_preview
@@ -43,9 +44,15 @@ def _normalize_exchange_environment(environment: str) -> str:
     return normalized
 
 
-def _exchange_label(environment: str) -> str:
+def _exchange_label(*, provider: str, environment: str) -> str:
     normalized = _normalize_exchange_environment(environment)
-    return "coinbase_advanced" if normalized == "production" else "coinbase_advanced_sandbox"
+    if normalized == "production":
+        return provider
+    return f"{provider}_sandbox"
+
+
+def _default_connection_name(*, provider: str, environment: str) -> str:
+    return f"{provider}-{environment}-primary"
 
 
 def _profile_environment(profile: LiveTradingProfile | None) -> str | None:
@@ -82,11 +89,11 @@ def _approval_environment(approval: LiveApprovalEvent | None) -> str | None:
         return None
 
 
-def _rehearsal_mode_for_environment(environment: str) -> str:
+def _rehearsal_mode_for_environment(*, provider: str, environment: str) -> str:
     normalized = _normalize_exchange_environment(environment)
     if normalized != "sandbox":
         return "production_live"
-    return "controlled_provider_mock" if provider_mock_mode_enabled("coinbase_advanced") else "coinbase_sandbox"
+    return "controlled_provider_mock" if provider_mock_mode_enabled(provider) else f"{provider}_sandbox"
 
 
 
@@ -113,9 +120,10 @@ class LiveCryptoEnvironmentReadiness:
 @dataclass(frozen=True, slots=True)
 class InitializeLiveCryptoEnvironmentRequest:
     actor: str
+    provider: str = "coinbase_advanced"
     paper_account_id: UUID = DEFAULT_PRODUCTION_CRYPTO_PAPER_ACCOUNT_ID
     exchange_environment: str = "production"
-    exchange_connection_name: str = "coinbase-production-primary"
+    exchange_connection_name: str | None = None
     exchange_api_key_name: str | None = None
     exchange_private_key: str | None = None
     exchange_passphrase: str | None = None
@@ -174,14 +182,18 @@ class LiveCryptoRehearsalResult:
     production_ready: bool
 
 
-async def _load_coinbase_connection(*, db: AsyncSession, environment: str) -> ExchangeConnection | None:
+async def _load_exchange_connection_for_provider(*, db: AsyncSession, provider: str, environment: str) -> ExchangeConnection | None:
     return await db.scalar(
         select(ExchangeConnection)
-        .where(ExchangeConnection.provider == "coinbase_advanced")
+        .where(ExchangeConnection.provider == provider)
         .where(ExchangeConnection.environment == environment)
         .order_by(ExchangeConnection.created_at.desc())
         .limit(1)
     )
+
+
+async def _load_coinbase_connection(*, db: AsyncSession, environment: str) -> ExchangeConnection | None:
+    return await _load_exchange_connection_for_provider(db=db, provider="coinbase_advanced", environment=environment)
 
 
 async def _load_selected_crypto_paper_account(*, db: AsyncSession, paper_account_id: UUID) -> PaperAccount | None:
@@ -345,13 +357,17 @@ def _dry_run_gate_ready() -> tuple[bool, str]:
 async def inspect_live_crypto_environment(
     *,
     db: AsyncSession,
+    provider: str = "coinbase_advanced",
     exchange_environment: str = "production",
     paper_account_id: UUID = DEFAULT_PRODUCTION_CRYPTO_PAPER_ACCOUNT_ID,
 ) -> LiveCryptoEnvironmentReadiness:
     now = datetime.now(timezone.utc)
     exchange_environment = _normalize_exchange_environment(exchange_environment)
-    exchange = _exchange_label(exchange_environment)
-    connection = await _load_coinbase_connection(db=db, environment=exchange_environment)
+    exchange = _exchange_label(provider=provider, environment=exchange_environment)
+    if provider == "coinbase_advanced":
+        connection = await _load_coinbase_connection(db=db, environment=exchange_environment)
+    else:
+        connection = await _load_exchange_connection_for_provider(db=db, provider=provider, environment=exchange_environment)
     paper_account = await _load_selected_crypto_paper_account(db=db, paper_account_id=paper_account_id)
     profile = await _load_live_profile_for_account(
         db=db,
@@ -359,6 +375,12 @@ async def inspect_live_crypto_environment(
         environment=exchange_environment,
     )
     asset = await _load_coinbase_btc_asset_for_exchange(db=db, exchange=exchange)
+    provider_name = provider
+    try:
+        provider_name = get_exchange_provider_metadata(provider).display_name
+    except Exception:
+        provider_name = provider
+
     campaign = await _load_campaign_for_account_exchange(db=db, paper_account_id=paper_account.id if paper_account is not None else None, exchange=exchange)
     preview = await _load_latest_preview(db=db, exchange_connection_id=connection.exchange_connection_id if connection is not None else None)
     approval = await _load_latest_approval(
@@ -382,9 +404,9 @@ async def inspect_live_crypto_environment(
             label="Exchange",
             ready=connection is not None,
             detail=(
-                f"Coinbase {exchange_environment} connection ready ({connection.exchange_connection_id})"
+                f"{provider_name} {exchange_environment} connection ready ({connection.exchange_connection_id})"
                 if connection is not None
-                else f"Coinbase {exchange_environment} connection missing"
+                else f"{provider_name} {exchange_environment} connection missing"
             ),
         ),
         ReadinessItem(
@@ -412,9 +434,9 @@ async def inspect_live_crypto_environment(
             label="Asset",
             ready=asset is not None,
             detail=(
-                f"Coinbase BTC asset ready ({asset.id}) on {exchange}"
+                f"{provider_name} BTC asset ready ({asset.id}) on {exchange}"
                 if asset is not None
-                else f"Coinbase BTC asset missing on {exchange}"
+                else f"{provider_name} BTC asset missing on {exchange}"
             ),
         ),
         ReadinessItem(
@@ -464,8 +486,10 @@ async def initialize_live_crypto_environment(
     request: InitializeLiveCryptoEnvironmentRequest,
 ) -> InitializeLiveCryptoEnvironmentResult:
     exchange_environment = _normalize_exchange_environment(request.exchange_environment)
+    connection_name = request.exchange_connection_name or _default_connection_name(provider=request.provider, environment=exchange_environment)
     initial = await inspect_live_crypto_environment(
         db=db,
+        provider=request.provider,
         exchange_environment=exchange_environment,
         paper_account_id=request.paper_account_id,
     )
@@ -477,12 +501,14 @@ async def initialize_live_crypto_environment(
 
     if initial.exchange_connection_id is None:
         if not request.exchange_api_key_name or not request.exchange_private_key:
-            raise ValueError("Coinbase credentials are required when the exchange connection is missing")
+            if request.provider == "coinbase_advanced":
+                raise ValueError("Coinbase credentials are required when the exchange connection is missing")
+            raise ValueError("Provider credentials are required when the exchange connection is missing")
         await create_exchange_connection(
             db=db,
             payload=SaveExchangeConnectionRequest(
-                provider="coinbase_advanced",
-                connection_name=request.exchange_connection_name,
+                provider=request.provider,
+                connection_name=connection_name,
                 environment=exchange_environment,
                 api_key_name=request.exchange_api_key_name,
                 private_key=request.exchange_private_key,
@@ -494,6 +520,7 @@ async def initialize_live_crypto_environment(
 
     refreshed_readiness = await inspect_live_crypto_environment(
         db=db,
+        provider=request.provider,
         exchange_environment=exchange_environment,
         paper_account_id=request.paper_account_id,
     )
@@ -504,14 +531,16 @@ async def initialize_live_crypto_environment(
             actor=request.actor,
         )
         if refreshed.readiness.verdict not in _READY_CONNECTION_VERDICTS:
-            raise ValueError("Coinbase readiness check failed; refresh_exchange_balances did not reach ready state")
+            if request.provider == "coinbase_advanced":
+                raise ValueError("Coinbase readiness check failed; refresh_exchange_balances did not reach ready state")
+            raise ValueError("Provider readiness check failed; refresh_exchange_balances did not reach ready state")
 
     asset_result = await ensure_coinbase_crypto_asset(
         db=db,
         request=EnsureCoinbaseAssetRequest(
             symbol="BTC",
             base_currency="USD",
-            exchange=_exchange_label(exchange_environment),
+            exchange=_exchange_label(provider=request.provider, environment=exchange_environment),
             actor=request.actor,
         ),
     )
@@ -519,6 +548,7 @@ async def initialize_live_crypto_environment(
 
     current = await inspect_live_crypto_environment(
         db=db,
+        provider=request.provider,
         exchange_environment=exchange_environment,
         paper_account_id=request.paper_account_id,
     )
@@ -538,9 +568,10 @@ async def initialize_live_crypto_environment(
                 provenance_metadata={
                     "source": "initialize_live_crypto_environment",
                     "exchange_environment": exchange_environment,
-                    "exchange_label": _exchange_label(exchange_environment),
+                    "exchange_label": _exchange_label(provider=request.provider, environment=exchange_environment),
+                    "provider": request.provider,
                 },
-                idempotency_key=f"init-live-profile:{exchange_environment}:{current.paper_account_id}",
+                idempotency_key=f"init-live-profile:{request.provider}:{exchange_environment}:{current.paper_account_id}",
             ),
         )
         if not registration.accepted:
@@ -549,6 +580,7 @@ async def initialize_live_crypto_environment(
 
     current = await inspect_live_crypto_environment(
         db=db,
+        provider=request.provider,
         exchange_environment=exchange_environment,
         paper_account_id=request.paper_account_id,
     )
@@ -561,14 +593,14 @@ async def initialize_live_crypto_environment(
             request=CapitalCampaignCreateRequest(
                 owner=request.campaign_owner,
                 name=(
-                    "Production Small Account Mode"
+                    f"{request.provider} Production Small Account Mode"
                     if exchange_environment == "production"
-                    else "Sandbox Small Account Mode"
+                    else f"{request.provider} Sandbox Small Account Mode"
                 ),
                 description="Initialized for live-crypto dry-run readiness",
                 status="READY",
                 campaign_type="small_account_mode",
-                exchange=_exchange_label(exchange_environment),
+                exchange=_exchange_label(provider=request.provider, environment=exchange_environment),
                 paper_account_id=paper_account.id,
                 validation_run_id=None,
                 strategy_id=None,
@@ -583,6 +615,7 @@ async def initialize_live_crypto_environment(
 
     final_readiness = await inspect_live_crypto_environment(
         db=db,
+        provider=request.provider,
         exchange_environment=exchange_environment,
         paper_account_id=request.paper_account_id,
     )
@@ -683,6 +716,7 @@ async def run_live_crypto_rehearsal(
     await initialize_live_crypto_environment(db=db, request=request)
     readiness = await inspect_live_crypto_environment(
         db=db,
+        provider=request.provider,
         exchange_environment=exchange_environment,
         paper_account_id=request.paper_account_id,
     )
@@ -724,7 +758,7 @@ async def run_live_crypto_rehearsal(
             crypto_order_preview_id=preview_id,
             operator_identity=request.actor,
             idempotency_token=(
-                f"rehearsal:{_rehearsal_mode_for_environment(exchange_environment)}:"
+                f"rehearsal:{_rehearsal_mode_for_environment(provider=request.provider, environment=exchange_environment)}:"
                 f"{readiness.live_trading_profile_id}:{preview_id}"
             ),
         ),
@@ -738,6 +772,7 @@ async def run_live_crypto_rehearsal(
     )
     production_readiness = await inspect_live_crypto_environment(
         db=db,
+        provider=request.provider,
         exchange_environment="production",
         paper_account_id=request.paper_account_id,
     )
@@ -745,7 +780,7 @@ async def run_live_crypto_rehearsal(
         raise ValueError("sandbox rehearsal must not mark production ready")
 
     return LiveCryptoRehearsalResult(
-        rehearsal_mode=_rehearsal_mode_for_environment(exchange_environment),
+        rehearsal_mode=_rehearsal_mode_for_environment(provider=request.provider, environment=exchange_environment),
         readiness=readiness,
         preview_created=preview_created,
         approval_created=approval_created,
