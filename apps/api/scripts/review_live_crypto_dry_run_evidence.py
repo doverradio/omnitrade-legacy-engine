@@ -16,6 +16,7 @@ from app.models.audit_log import AuditLog
 from app.models.capital_campaign import CapitalCampaign
 from app.models.capital_campaign_profit_cycle import CapitalCampaignProfitCycle
 from app.models.crypto_order_preview import CryptoOrderPreview
+from app.models.exchange_connection import ExchangeConnection
 from app.models.live_accounting_record import LiveAccountingRecord
 from app.models.live_approval_event import LiveApprovalEvent
 from app.models.live_crypto_order import LiveCryptoOrder
@@ -23,6 +24,7 @@ from app.models.live_reconciliation_event import LiveReconciliationEvent
 from app.models.live_trading_profile import LiveTradingProfile
 from app.models.risk_event import RiskEvent
 from app.services import mission_control_intelligence as mission_control_service
+from app.services.live_crypto_environment import inspect_live_crypto_environment
 
 
 _MISSION_CONTROL_DRY_RUN_EVENTS = {"DRY_RUN_READY", "DRY_RUN_BLOCKED"}
@@ -103,6 +105,37 @@ async def _load_preview_and_profile(
     return preview, profile
 
 
+def _normalize_exchange_environment(environment: str) -> str:
+    normalized = environment.strip().lower()
+    if normalized not in {"production", "sandbox"}:
+        raise ValueError(f"unsupported exchange environment: {environment}")
+    return normalized
+
+
+def _profile_environment(profile: LiveTradingProfile) -> str | None:
+    provenance = profile.provenance_metadata if isinstance(profile.provenance_metadata, dict) else {}
+    explicit = provenance.get("exchange_environment") or provenance.get("environment")
+    if explicit is not None:
+        try:
+            return _normalize_exchange_environment(str(explicit))
+        except ValueError:
+            return None
+    registration_source = str(provenance.get("registration_source") or "").lower()
+    if "sandbox" in registration_source:
+        return "sandbox"
+    if "production" in registration_source or registration_source.startswith("human_"):
+        return "production"
+    return "production"
+
+
+async def _load_connection(*, db, exchange_connection_id) -> ExchangeConnection | None:
+    return await db.scalar(
+        select(ExchangeConnection)
+        .where(ExchangeConnection.exchange_connection_id == exchange_connection_id)
+        .limit(1)
+    )
+
+
 async def _count_rows(db, statement) -> int:
     count = await db.scalar(statement)
     return int(count or 0)
@@ -114,9 +147,11 @@ async def verify_dry_run_evidence(
     live_crypto_order_id: UUID | None,
     audit_correlation_id: UUID | None,
     mission_control_range: str,
+    expected_environment: str = "production",
 ) -> ReviewReport:
     checks: list[ReviewCheck] = []
     settings = get_settings()
+    expected_environment = _normalize_exchange_environment(expected_environment)
     live_order = await _load_live_order(
         db=db,
         live_crypto_order_id=live_crypto_order_id,
@@ -129,6 +164,58 @@ async def verify_dry_run_evidence(
         db=db,
         live_order=live_order,
         approval_event_id=approval_event_id,
+    )
+    connection = await _load_connection(db=db, exchange_connection_id=live_order.exchange_connection_id)
+    approval_event = None
+    if approval_event_id is not None:
+        approval_event = await db.scalar(
+            select(LiveApprovalEvent)
+            .where(LiveApprovalEvent.id == approval_event_id)
+            .limit(1)
+        )
+
+    checks.append(
+        ReviewCheck(
+            "submission_flag_disabled",
+            settings.live_crypto_order_submission_enabled is False,
+            f"live_crypto_order_submission_enabled={settings.live_crypto_order_submission_enabled}",
+        )
+    )
+    checks.append(
+        ReviewCheck(
+            "environment_expected",
+            str(live_order.environment) == expected_environment,
+            f"live_order_environment={live_order.environment}",
+        )
+    )
+    checks.append(
+        ReviewCheck(
+            "preview_environment_matches",
+            str(preview.environment) == expected_environment,
+            f"preview_environment={preview.environment}",
+        )
+    )
+    checks.append(
+        ReviewCheck(
+            "profile_environment_matches",
+            _profile_environment(profile) == expected_environment,
+            f"profile_environment={_profile_environment(profile) or 'missing'}",
+        )
+    )
+    approval_environment = None if approval_event is None or not isinstance(approval_event.approval_scope, dict) else approval_event.approval_scope.get("environment")
+    checks.append(
+        ReviewCheck(
+            "approval_environment_matches",
+            str(approval_environment) == expected_environment,
+            f"approval_environment={approval_environment or 'missing'}",
+        )
+    )
+    checks.append(
+        ReviewCheck(
+            "connection_environment_matches",
+            connection is not None and str(connection.environment) == expected_environment,
+            f"connection_environment={None if connection is None else connection.environment}",
+        )
     )
 
     mode = str(safe_provider_response.get("mode", ""))
@@ -161,13 +248,6 @@ async def verify_dry_run_evidence(
     checks.append(ReviewCheck("intent_fingerprint_present", bool(approved_intent_fingerprint), f"approved_intent_fingerprint={approved_intent_fingerprint}"))
     checks.append(ReviewCheck("evidence_fingerprint_present", bool(evidence_fingerprint), f"evidence_fingerprint={evidence_fingerprint}"))
 
-    approval_event = None
-    if approval_event_id is not None:
-        approval_event = await db.scalar(
-            select(LiveApprovalEvent)
-            .where(LiveApprovalEvent.id == approval_event_id)
-            .limit(1)
-        )
     checks.append(ReviewCheck("approval_event_linked", approval_event is not None, f"approval_event_found={approval_event is not None}"))
 
     risk_event = None
@@ -178,6 +258,31 @@ async def verify_dry_run_evidence(
             .limit(1)
         )
     checks.append(ReviewCheck("risk_event_linked", risk_event is not None, f"risk_event_found={risk_event is not None}"))
+
+    recorded_environment = safe_provider_response.get("exchange_environment")
+    checks.append(
+        ReviewCheck(
+            "safe_environment_matches",
+            str(recorded_environment) == expected_environment,
+            f"safe_exchange_environment={recorded_environment or 'missing'}",
+        )
+    )
+    provider_mock_mode_enabled = bool(safe_provider_response.get("provider_mock_mode_enabled", False))
+    if expected_environment == "sandbox":
+        checks.append(
+            ReviewCheck(
+                "rehearsal_mode_labeled",
+                str(safe_provider_response.get("rehearsal_mode", "")) in {"coinbase_sandbox", "controlled_provider_mock"},
+                f"rehearsal_mode={safe_provider_response.get('rehearsal_mode', 'missing')}",
+            )
+        )
+        checks.append(
+            ReviewCheck(
+                "provider_mock_boundary",
+                provider_mock_mode_enabled in {True, False},
+                f"provider_mock_mode_enabled={provider_mock_mode_enabled}",
+            )
+        )
 
     freshness_checks = {
         "preview_age_seconds": settings.live_crypto_preview_max_age_seconds,
@@ -240,6 +345,35 @@ async def verify_dry_run_evidence(
     ]
     checks.append(ReviewCheck("mission_control_annotation_present", bool(matching_events), f"matching_mission_control_events={len(matching_events)}"))
 
+    mc_items = getattr(getattr(mission_control, "operations", None), "live_crypto_readiness", None)
+    readiness_items = [] if mc_items is None else list(getattr(mc_items, "items", []))
+    if expected_environment == "sandbox":
+        checks.append(
+            ReviewCheck(
+                "mission_control_sandbox_readiness_present",
+                any(getattr(item, "key", None) == "sandbox_exchange_connection" for item in readiness_items),
+                f"sandbox_items={len(readiness_items)}",
+            )
+        )
+        checks.append(
+            ReviewCheck(
+                "mission_control_production_not_ready",
+                any(getattr(item, "key", None) == "production_account_status" and not getattr(item, "ready", False) for item in readiness_items),
+                "production readiness remains false",
+            )
+        )
+
+        production_state = await _maybe_await(
+            inspect_live_crypto_environment(db=db, exchange_environment="production")
+        )
+        checks.append(
+            ReviewCheck(
+                "production_readiness_false",
+                not production_state.ready,
+                f"production_ready={production_state.ready}",
+            )
+        )
+
     return ReviewReport(checks=checks)
 
 
@@ -251,6 +385,7 @@ async def _run_review(args: argparse.Namespace) -> int:
                 live_crypto_order_id=args.live_crypto_order_id,
                 audit_correlation_id=args.audit_correlation_id,
                 mission_control_range=args.mission_control_range,
+                expected_environment=args.expected_environment,
             )
         except Exception as exc:
             print(f"review_failed={str(exc)}")
@@ -270,6 +405,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     group.add_argument("--live-crypto-order-id", type=UUID)
     group.add_argument("--audit-correlation-id", type=UUID)
     parser.add_argument("--mission-control-range", default="24h", choices=["24h", "72h", "7d", "30d", "90d", "all"])
+    parser.add_argument("--expected-environment", default="production", choices=["production", "sandbox"])
     return parser.parse_args(argv)
 
 

@@ -23,6 +23,8 @@ class _AsyncSessionLocal:
 def _settings(**overrides):
     payload = {
         "live_crypto_order_submission_enabled": False,
+        "live_crypto_dry_run_enabled": True,
+        "live_crypto_preparation_enabled": True,
         "live_crypto_max_order_usd": Decimal("5"),
     }
     payload.update(overrides)
@@ -259,3 +261,93 @@ async def test_script_failure_output_redacts_secret_values(monkeypatch: pytest.M
     assert result == 1
     assert "initialization_failed" in captured
     assert "super-secret-private-key" not in captured
+
+
+@pytest.mark.asyncio
+async def test_script_rehearsal_mode_runs_only_in_sandbox(monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]) -> None:
+    monkeypatch.setattr(script, "get_settings", lambda: _settings())
+
+    result = await script._run(
+        SimpleNamespace(
+            apply=False,
+            create_preview=False,
+            create_approval=False,
+            run_rehearsal=True,
+            exchange_environment="production",
+            actor="operator:human",
+            paper_account_id=UUID("905a408c-7d8e-4fc7-ad3b-9ff637005d73"),
+            exchange_connection_name="coinbase-production-primary",
+            exchange_api_key_name=None,
+            exchange_api_key_name_env="OT_COINBASE_API_KEY_NAME",
+            exchange_private_key_env="OT_COINBASE_PRIVATE_KEY",
+            exchange_passphrase_env="OT_COINBASE_PASSPHRASE",
+            prompt_for_credentials=False,
+            registration_source="human_production_initializer",
+            campaign_owner="operator",
+            exchange_connection_id=None,
+            live_trading_profile_id=None,
+        )
+    )
+
+    assert result == 2
+    assert "rehearsal requires --exchange-environment sandbox" in capsys.readouterr().out
+
+
+@pytest.mark.asyncio
+async def test_script_rehearsal_mode_prints_safe_summary(monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]) -> None:
+    monkeypatch.setattr(script, "get_settings", lambda: _settings())
+    monkeypatch.setattr(script, "AsyncSessionLocal", lambda: _AsyncSessionLocal(object()))
+    monkeypatch.setattr(
+        script,
+        "run_live_crypto_rehearsal",
+        lambda **_kwargs: SimpleNamespace(
+            rehearsal_mode="controlled_provider_mock",
+            preview_created=False,
+            approval_created=False,
+            preview_id=UUID("11111111-1111-1111-1111-111111111111"),
+            approval_event_id=UUID("22222222-2222-2222-2222-222222222222"),
+            live_crypto_order_id=UUID("33333333-3333-3333-3333-333333333333"),
+            audit_correlation_id=UUID("44444444-4444-4444-4444-444444444444"),
+            dry_run_status="DRY_RUN_READY",
+            review_passed=True,
+            review_check_count=12,
+            production_ready=False,
+        ),
+    )
+
+    result = await script._run(
+        SimpleNamespace(
+            apply=False,
+            create_preview=False,
+            create_approval=False,
+            run_rehearsal=True,
+            exchange_environment="sandbox",
+            actor="operator:human",
+            paper_account_id=UUID("905a408c-7d8e-4fc7-ad3b-9ff637005d73"),
+            exchange_connection_name="coinbase-sandbox-primary",
+            exchange_api_key_name=None,
+            exchange_api_key_name_env="OT_COINBASE_API_KEY_NAME",
+            exchange_private_key_env="OT_COINBASE_PRIVATE_KEY",
+            exchange_passphrase_env="OT_COINBASE_PASSPHRASE",
+            prompt_for_credentials=False,
+            registration_source="human_sandbox_initializer",
+            campaign_owner="operator",
+            exchange_connection_id=None,
+            live_trading_profile_id=None,
+        )
+    )
+
+    output = capsys.readouterr().out
+    assert result == 0
+    assert "rehearsal_mode=controlled_provider_mock" in output
+    assert "review_summary=PASS" in output
+    assert "sandbox_rehearsal_only=true" in output
+    assert "secret" not in output.lower()
+
+
+def test_parse_args_accepts_rehearsal_mode() -> None:
+    args = script.parse_args(["--run-rehearsal", "--exchange-environment", "sandbox"])
+    assert args.run_rehearsal is True
+
+    with pytest.raises(SystemExit):
+        script.parse_args(["--run-rehearsal", "--create-preview"])

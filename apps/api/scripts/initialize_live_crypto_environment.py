@@ -18,7 +18,9 @@ from app.services.live_crypto_environment import (
     initialize_live_crypto_environment,
     inspect_live_crypto_environment,
     record_first_live_enablement_approval,
+    run_live_crypto_rehearsal,
 )
+from scripts.review_live_crypto_dry_run_evidence import verify_dry_run_evidence
 
 
 DEFAULT_API_KEY_ENV = "OT_COINBASE_API_KEY_NAME"
@@ -67,6 +69,10 @@ def _validate_safe_flags() -> tuple[bool, str | None]:
     settings = get_settings()
     if settings.live_crypto_order_submission_enabled:
         return False, "LIVE_CRYPTO_ORDER_SUBMISSION_ENABLED must remain false"
+    if not settings.live_crypto_dry_run_enabled:
+        return False, "LIVE_CRYPTO_DRY_RUN_ENABLED must be true"
+    if not settings.live_crypto_preparation_enabled:
+        return False, "LIVE_CRYPTO_PREPARATION_ENABLED must be true"
     if Decimal(str(settings.live_crypto_max_order_usd)) != Decimal("5"):
         return False, "LIVE_CRYPTO_MAX_ORDER_USD must equal 5"
     return True, None
@@ -80,6 +86,40 @@ async def _run(args: argparse.Namespace) -> int:
 
     async with AsyncSessionLocal() as db:
         try:
+            if getattr(args, "run_rehearsal", False):
+                if args.exchange_environment != "sandbox":
+                    print("blocked: rehearsal requires --exchange-environment sandbox")
+                    return 2
+                api_key_name, private_key, passphrase = _resolve_credentials(args)
+                result = await _maybe_await(run_live_crypto_rehearsal(
+                    db=db,
+                    request=InitializeLiveCryptoEnvironmentRequest(
+                        actor=args.actor,
+                        paper_account_id=args.paper_account_id,
+                        exchange_environment=args.exchange_environment,
+                        exchange_connection_name=args.exchange_connection_name,
+                        exchange_api_key_name=api_key_name,
+                        exchange_private_key=private_key,
+                        exchange_passphrase=passphrase,
+                        registration_source=args.registration_source,
+                        campaign_owner=args.campaign_owner,
+                    ),
+                    verify_rehearsal_evidence=verify_dry_run_evidence,
+                ))
+                print(f"rehearsal_mode={result.rehearsal_mode}")
+                print(f"preview_created={str(result.preview_created).lower()}")
+                print(f"approval_created={str(result.approval_created).lower()}")
+                print(f"preview_id={result.preview_id}")
+                print(f"approval_event_id={result.approval_event_id}")
+                print(f"live_crypto_order_id={result.live_crypto_order_id}")
+                print(f"audit_correlation_id={result.audit_correlation_id}")
+                print(f"dry_run_status={result.dry_run_status}")
+                print(f"review_summary={'PASS' if result.review_passed else 'FAIL'}")
+                print(f"review_check_count={result.review_check_count}")
+                print(f"production_ready={str(result.production_ready).lower()}")
+                print("sandbox_rehearsal_only=true")
+                return 0 if result.review_passed and not result.production_ready else 1
+
             if args.create_preview:
                 if args.exchange_connection_id is None:
                     readiness = await _maybe_await(
@@ -190,6 +230,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--apply", action="store_true", help="Create only missing operational objects")
     parser.add_argument("--create-preview", action="store_true", help="Generate a fresh BTC-USD BUY $5 preview via preview service")
     parser.add_argument("--create-approval", action="store_true", help="Record first-live-enablement approval via approval workflow")
+    parser.add_argument("--run-rehearsal", action="store_true", help="Run full sandbox/mock rehearsal including preview, approval, dry run, and evidence review")
     parser.add_argument("--exchange-environment", default="production", choices=["production", "sandbox"])
     parser.add_argument("--actor", default="operator:human")
     parser.add_argument("--paper-account-id", type=UUID, default=UUID("905a408c-7d8e-4fc7-ad3b-9ff637005d73"))
@@ -205,9 +246,9 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--live-trading-profile-id", type=UUID)
     args = parser.parse_args(argv)
 
-    active_modes = [args.apply, args.create_preview, args.create_approval]
+    active_modes = [args.apply, args.create_preview, args.create_approval, args.run_rehearsal]
     if sum(1 for item in active_modes if item) > 1:
-        parser.error("Choose only one mode: --apply, --create-preview, or --create-approval")
+        parser.error("Choose only one mode: --apply, --create-preview, --create-approval, or --run-rehearsal")
     return args
 
 

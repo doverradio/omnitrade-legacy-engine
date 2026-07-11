@@ -16,7 +16,7 @@ from app.schemas.mission_control import (
     MissionControlIntelligenceTimelineEventResponse,
     MissionControlIntelligenceTrendResponse,
 )
-from app.schemas.operations import OperationalAlertResponse, OperationalHealthIndicatorResponse, OperationalMonitoringResponse, OperationalRunStatusResponse, OperationalStatusResponse
+from app.schemas.operations import LiveCryptoReadinessItemResponse, LiveCryptoReadinessResponse, OperationalAlertResponse, OperationalHealthIndicatorResponse, OperationalMonitoringResponse, OperationalRunStatusResponse, OperationalStatusResponse
 from app.schemas.validation_runs import ValidationRunResponse
 
 
@@ -98,6 +98,23 @@ def _payload() -> MissionControlIntelligenceResponse:
             signals_today=42,
             trades_today=8,
             research_memory_growth=350,
+        ),
+        live_crypto_readiness=LiveCryptoReadinessResponse(
+            ready=False,
+            items=[
+                LiveCryptoReadinessItemResponse(
+                    key="production_account_status",
+                    label="Production Account Status",
+                    ready=False,
+                    detail="Production account unavailable or not initialized",
+                ),
+                LiveCryptoReadinessItemResponse(
+                    key="sandbox_rehearsal_result",
+                    label="Sandbox Rehearsal Result",
+                    ready=True,
+                    detail="Latest sandbox/mock rehearsal result: DRY_RUN_READY",
+                ),
+            ],
         ),
         alerts=[OperationalAlertResponse(code="worker_stopped", severity="yellow", message="Worker stopped")],
     )
@@ -314,6 +331,17 @@ def _operations_payload(*, paper_equity: str) -> OperationalStatusResponse:
             signals_today=42,
             trades_today=8,
             research_memory_growth=350,
+        ),
+        live_crypto_readiness=LiveCryptoReadinessResponse(
+            ready=False,
+            items=[
+                LiveCryptoReadinessItemResponse(
+                    key="production_account_status",
+                    label="Production Account Status",
+                    ready=False,
+                    detail="Production account unavailable or not initialized",
+                )
+            ],
         ),
         alerts=[],
     )

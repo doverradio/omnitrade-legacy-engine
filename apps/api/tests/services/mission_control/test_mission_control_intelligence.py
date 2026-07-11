@@ -7,7 +7,10 @@ import uuid
 
 import pytest
 
+from app.models.audit_log import AuditLog
 from app.schemas.operations import (
+    LiveCryptoReadinessItemResponse,
+    LiveCryptoReadinessResponse,
     OperationalAlertResponse,
     OperationalHealthIndicatorResponse,
     OperationalMonitoringResponse,
@@ -29,6 +32,24 @@ class _DummySession:
 class _QueryableDummySession:
     async def execute(self, *_args, **_kwargs):
         return None
+
+
+class _AuditDb:
+    def __init__(self, rows) -> None:
+        self.rows = rows
+
+    async def execute(self, *_args, **_kwargs):
+        class _Rows:
+            def __init__(self, values):
+                self._values = values
+
+            def scalars(self):
+                return self
+
+            def all(self):
+                return self._values
+
+        return _Rows(self.rows)
 
 
 def _operations_status(*, alert_count: int = 0, orchestrator_state: str = "green") -> OperationalStatusResponse:
@@ -69,6 +90,23 @@ def _operations_status(*, alert_count: int = 0, orchestrator_state: str = "green
             signals_today=42,
             trades_today=8,
             research_memory_growth=350,
+        ),
+        live_crypto_readiness=LiveCryptoReadinessResponse(
+            ready=False,
+            items=[
+                LiveCryptoReadinessItemResponse(
+                    key="production_account_status",
+                    label="Production Account Status",
+                    ready=False,
+                    detail="Production account unavailable or not initialized",
+                ),
+                LiveCryptoReadinessItemResponse(
+                    key="sandbox_rehearsal_result",
+                    label="Sandbox Rehearsal Result",
+                    ready=True,
+                    detail="Latest sandbox/mock rehearsal result: DRY_RUN_READY",
+                ),
+            ],
         ),
         alerts=alerts,
     )
@@ -218,6 +256,42 @@ async def test_build_mission_control_intelligence_handles_empty_inputs(monkeypat
     assert result.timeline_events
     assert result.history == sorted(result.history, key=lambda item: item.timestamp)
     assert result.notes.startswith("Mission Control Intelligence Center V1")
+
+
+@pytest.mark.asyncio
+async def test_load_live_operation_annotations_include_sandbox_rehearsal_metadata() -> None:
+    row = AuditLog(
+        id=1,
+        actor="operator:human",
+        action="DRY_RUN_READY",
+        entity_type="live_crypto_order",
+        entity_id=uuid.uuid4(),
+        before_state=None,
+        after_state={
+            "mode": "dry_run",
+            "environment": "sandbox",
+            "rehearsal_mode": "controlled_provider_mock",
+            "provider_mock_mode_enabled": True,
+            "submission_skipped": True,
+            "submission_skip_reason": "dry-run skipped",
+        },
+        created_at=datetime(2026, 7, 9, 12, 0, tzinfo=timezone.utc),
+    )
+
+    events = await service._load_live_operation_annotations(
+        db=_AuditDb([row]),
+        generated_at=datetime(2026, 7, 9, 13, 0, tzinfo=timezone.utc),
+        current_score=80,
+        operations=_operations_status(),
+        anchor_equity="25.00",
+        anchor_pnl="0.00",
+        paper_pnl_metadata={},
+    )
+
+    assert events[0].event_type == "DRY_RUN_READY"
+    assert events[0].metadata["environment"] == "sandbox"
+    assert events[0].metadata["rehearsal_mode"] == "controlled_provider_mock"
+    assert events[0].metadata["provider_mock_mode_enabled"] is True
 
 
 @pytest.mark.asyncio

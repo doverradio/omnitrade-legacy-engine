@@ -17,6 +17,7 @@ from app.models.crypto_order_preview import CryptoOrderPreview
 from app.models.exchange_connection import ExchangeConnection
 from app.models.audit_log import AuditLog
 from app.models.live_crypto_order import LiveCryptoOrder
+from app.models.live_approval_event import LiveApprovalEvent
 from app.models.live_trading_event import LiveTradingEvent
 from app.models.live_trading_profile import LiveTradingProfile
 from app.models.paper_account import PaperAccount
@@ -36,7 +37,7 @@ from app.schemas.live_crypto_orders import (
     LiveCryptoOrderSubmitResponse,
 )
 from app.core.errors import InvalidRequestError, ServiceUnavailableError
-from app.services.exchange_connections.providers.coinbase_advanced import CoinbaseAdvancedClient
+from app.services.exchange_connections.providers.coinbase_advanced import CoinbaseAdvancedClient, sandbox_mock_mode_enabled
 from app.services.live.accounting_reconciliation import reconcile_live_order_and_fills
 from app.services.live.approval import evaluate_live_approval_gate
 from app.services.live.resilience import evaluate_live_submission_guard
@@ -101,6 +102,41 @@ def _decimal(value: Any) -> Decimal:
 
 def _quantize_usd(value: Decimal) -> Decimal:
     return value.quantize(Decimal("0.01"), rounding=ROUND_DOWN)
+
+
+def _normalize_exchange_environment(environment: str) -> str:
+    normalized = environment.strip().lower()
+    if normalized not in {"production", "sandbox"}:
+        raise ValueError(f"unsupported exchange environment: {environment}")
+    return normalized
+
+
+def _profile_environment(profile: LiveTradingProfile) -> str | None:
+    provenance = profile.provenance_metadata if isinstance(profile.provenance_metadata, dict) else {}
+    explicit = provenance.get("exchange_environment") or provenance.get("environment")
+    if explicit is not None:
+        try:
+            return _normalize_exchange_environment(str(explicit))
+        except ValueError:
+            return None
+    registration_source = str(provenance.get("registration_source") or "").lower()
+    if "sandbox" in registration_source:
+        return "sandbox"
+    if "production" in registration_source or registration_source.startswith("human_"):
+        return "production"
+    return "production"
+
+
+def _approval_environment(approval_event: LiveApprovalEvent | None) -> str | None:
+    if approval_event is None or not isinstance(approval_event.approval_scope, dict):
+        return None
+    explicit = approval_event.approval_scope.get("environment")
+    if explicit is None:
+        return None
+    try:
+        return _normalize_exchange_environment(str(explicit))
+    except ValueError:
+        return None
 
 
 async def _commit_if_supported(*, db: AsyncSession) -> None:
@@ -527,7 +563,8 @@ async def _evaluate_live_preflight_guards(
     )
     if preview is None:
         raise LookupError("crypto order preview not found")
-    if preview.live_trading_profile_id != profile.id:
+    preview_profile_id = getattr(preview, "live_trading_profile_id", profile.id)
+    if preview_profile_id != profile.id:
         raise ValueError("preview does not belong to the requested live trading profile")
     if preview.side != "BUY" or preview.product_id != "BTC-USD" or preview.order_type != "MARKET":
         raise ValueError("preview is not eligible for live BTC-USD market buy submission")
@@ -538,6 +575,13 @@ async def _evaluate_live_preflight_guards(
     )
 
     connection = await _load_exchange_connection(db=db, exchange_connection_id=preview.exchange_connection_id)
+    preview_environment = _normalize_exchange_environment(preview.environment)
+    connection_environment = _normalize_exchange_environment(connection.environment)
+    profile_environment = _profile_environment(profile)
+    if preview_environment != connection_environment:
+        raise ValueError("preview environment does not match exchange connection environment")
+    if profile_environment != preview_environment:
+        raise ValueError("live trading profile environment does not match preview environment")
     if connection.credentials_valid is not True:
         raise PermissionError("coinbase credential evidence unavailable")
     api_permissions = [str(item).lower() for item in (connection.api_permissions or [])]
@@ -584,6 +628,13 @@ async def _evaluate_live_preflight_guards(
         raise PermissionError(approval_gate.reason or "approval gate rejected")
     if approval_gate.matched_approval_event_id is None:
         raise PermissionError("approval evidence missing")
+    approval_event = await db.scalar(
+        select(LiveApprovalEvent)
+        .where(LiveApprovalEvent.id == approval_gate.matched_approval_event_id)
+        .limit(1)
+    )
+    if _approval_environment(approval_event) != preview_environment:
+        raise PermissionError("approval environment does not match preview environment")
 
     guard_result = await evaluate_live_submission_guard(
         db=db,
@@ -604,6 +655,9 @@ async def _evaluate_live_preflight_guards(
         "profile": profile,
         "preview": preview,
         "connection": connection,
+        "profile_environment": profile_environment,
+        "preview_environment": preview_environment,
+        "connection_environment": connection_environment,
         "requested_quote_size": requested_quote_size,
         "approved_quote_size": approved_quote_size,
         "risk_action": risk_action,
@@ -1079,6 +1133,9 @@ class LiveCryptoOrderService:
             approval_event_id = preflight["approval_event_id"]
             approved_intent_fingerprint = str(preflight["approved_intent_fingerprint"])
             evidence_fingerprint = str(preflight["evidence_fingerprint"])
+            profile_environment = preflight["profile_environment"]
+            preview_environment = preflight["preview_environment"]
+            connection_environment = preflight["connection_environment"]
         except Exception as exc:
             preflight_errors.append(str(exc))
             risk_action = RiskDecisionAction.REJECT
@@ -1106,6 +1163,9 @@ class LiveCryptoOrderService:
             evidence_fingerprint = None
             readiness_result = "blocked"
             kill_switch_result = "unknown"
+            profile_environment = _profile_environment(profile)
+            preview_environment = _normalize_exchange_environment(preview.environment)
+            connection_environment = None
 
         submission_skipped = True
         submission_skip_reason = (
@@ -1151,6 +1211,16 @@ class LiveCryptoOrderService:
             "mode": "dry_run",
             "dry_run": True,
             "dry_run_status": live_crypto_order.status,
+            "exchange_environment": live_crypto_order.environment,
+            "profile_environment": profile_environment,
+            "preview_environment": preview_environment,
+            "connection_environment": connection_environment,
+            "provider_mock_mode_enabled": bool(live_crypto_order.environment == "sandbox" and sandbox_mock_mode_enabled()),
+            "rehearsal_mode": (
+                "controlled_provider_mock"
+                if live_crypto_order.environment == "sandbox" and sandbox_mock_mode_enabled()
+                else ("coinbase_sandbox" if live_crypto_order.environment == "sandbox" else "production_live")
+            ),
             "safe_request_summary": _safe_request_summary(request_payload=_build_live_create_order_payload(live_order=live_crypto_order)),
             "submission_skipped": submission_skipped,
             "submission_skip_reason": submission_skip_reason,
@@ -1188,15 +1258,26 @@ class LiveCryptoOrderService:
             before_state={"status": "PENDING_CONFIRMATION"},
             after_state={
                 "status": live_crypto_order.status,
+                "mode": "dry_run",
+                "environment": live_crypto_order.environment,
                 "preview_id": str(preview.crypto_order_preview_id),
                 "provider_create_order_called": False,
                 "submission_skipped": submission_skipped,
                 "submission_skip_reason": submission_skip_reason,
                 "operator_identity": request.operator_identity,
+                "provider_mock_mode_enabled": bool(live_crypto_order.environment == "sandbox" and sandbox_mock_mode_enabled()),
+                "rehearsal_mode": (
+                    "controlled_provider_mock"
+                    if live_crypto_order.environment == "sandbox" and sandbox_mock_mode_enabled()
+                    else ("coinbase_sandbox" if live_crypto_order.environment == "sandbox" else "production_live")
+                ),
                 "approval_event_id": None if approval_event_id is None else str(approval_event_id),
                 "risk_event_id": None if risk_event_id is None else str(risk_event_id),
                 "approved_intent_fingerprint": approved_intent_fingerprint,
                 "evidence_fingerprint": evidence_fingerprint,
+                "profile_environment": profile_environment,
+                "preview_environment": preview_environment,
+                "connection_environment": connection_environment,
                 "readiness_age_seconds": readiness_age_seconds,
                 "heartbeat_age_seconds": locals().get("heartbeat_age_seconds"),
                 "balance_age_seconds": balance_age_seconds,

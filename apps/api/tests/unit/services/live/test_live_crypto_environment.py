@@ -51,8 +51,13 @@ def _connection():
     return SimpleNamespace(exchange_connection_id=uuid4(), created_at=datetime.now(timezone.utc))
 
 
-def _profile(account_id):
-    return SimpleNamespace(id=uuid4(), paper_account_id=account_id, created_at=datetime.now(timezone.utc))
+def _profile(account_id, *, environment: str = "production"):
+    return SimpleNamespace(
+        id=uuid4(),
+        paper_account_id=account_id,
+        created_at=datetime.now(timezone.utc),
+        provenance_metadata={"exchange_environment": environment, "registration_source": f"human_{environment}_initializer"},
+    )
 
 
 def _asset():
@@ -67,8 +72,13 @@ def _preview(connection_id):
     return SimpleNamespace(crypto_order_preview_id=uuid4(), exchange_connection_id=connection_id, created_at=datetime.now(timezone.utc))
 
 
-def _approval(profile_id):
-    return SimpleNamespace(id=uuid4(), live_trading_profile_id=profile_id, expires_at=datetime.now(timezone.utc).replace(year=2030))
+def _approval(profile_id, *, environment: str = "production"):
+    return SimpleNamespace(
+        id=uuid4(),
+        live_trading_profile_id=profile_id,
+        expires_at=datetime.now(timezone.utc).replace(year=2030),
+        approval_scope={"environment": environment},
+    )
 
 
 @pytest.mark.asyncio
@@ -391,6 +401,8 @@ async def test_preview_helper_uses_exact_btc_usd_buy_five_contract(monkeypatch: 
 @pytest.mark.asyncio
 async def test_approval_helper_uses_first_live_enablement_checkpoint(monkeypatch: pytest.MonkeyPatch) -> None:
     captured: dict[str, object] = {}
+    db = _FakeDb()
+    db.profile = _profile(uuid4())
 
     async def _approval_stub(*, db, request):
         _ = db
@@ -401,8 +413,8 @@ async def test_approval_helper_uses_first_live_enablement_checkpoint(monkeypatch
     monkeypatch.setattr(service, "record_live_approval_checkpoint", _approval_stub)
 
     result = await service.record_first_live_enablement_approval(
-        db=_FakeDb(),
-        request=service.RecordApprovalHelperRequest(actor="operator:human", live_trading_profile_id=uuid4()),
+        db=db,
+        request=service.RecordApprovalHelperRequest(actor="operator:human", live_trading_profile_id=db.profile.id),
     )
 
     assert result.approval_state == "approved"
@@ -450,6 +462,64 @@ async def test_environment_separation_for_asset_and_campaign(monkeypatch: pytest
 
 
 @pytest.mark.asyncio
+async def test_environment_separation_for_connection(monkeypatch: pytest.MonkeyPatch) -> None:
+    db = _FakeDb()
+    db.paper_account = _paper_account()
+
+    async def _load_connection(*, db, environment):
+        _ = db
+        return _connection() if environment == "sandbox" else None
+
+    monkeypatch.setattr(service, "_load_coinbase_connection", _load_connection)
+    monkeypatch.setattr(
+        service,
+        "get_settings",
+        lambda: SimpleNamespace(
+            live_crypto_order_submission_enabled=False,
+            live_crypto_dry_run_enabled=True,
+            live_crypto_preparation_enabled=True,
+            live_crypto_max_order_usd=Decimal("5"),
+        ),
+    )
+
+    production = await service.inspect_live_crypto_environment(db=db, exchange_environment="production")
+    sandbox = await service.inspect_live_crypto_environment(db=db, exchange_environment="sandbox")
+
+    assert next(item for item in production.items if item.key == "exchange_connection").ready is False
+    assert next(item for item in sandbox.items if item.key == "exchange_connection").ready is True
+
+
+@pytest.mark.asyncio
+async def test_environment_separation_for_campaign(monkeypatch: pytest.MonkeyPatch) -> None:
+    db = _FakeDb()
+    db.paper_account = _paper_account()
+
+    async def _load_campaign_for_exchange(*, db, paper_account_id, exchange):
+        _ = db, paper_account_id
+        if exchange == "coinbase_advanced_sandbox":
+            return _campaign(uuid4())
+        return None
+
+    monkeypatch.setattr(service, "_load_campaign_for_account_exchange", _load_campaign_for_exchange)
+    monkeypatch.setattr(
+        service,
+        "get_settings",
+        lambda: SimpleNamespace(
+            live_crypto_order_submission_enabled=False,
+            live_crypto_dry_run_enabled=True,
+            live_crypto_preparation_enabled=True,
+            live_crypto_max_order_usd=Decimal("5"),
+        ),
+    )
+
+    production = await service.inspect_live_crypto_environment(db=db, exchange_environment="production")
+    sandbox = await service.inspect_live_crypto_environment(db=db, exchange_environment="sandbox")
+
+    assert next(item for item in production.items if item.key == "capital_campaign").ready is False
+    assert next(item for item in sandbox.items if item.key == "capital_campaign").ready is True
+
+
+@pytest.mark.asyncio
 async def test_preview_helper_uses_requested_environment(monkeypatch: pytest.MonkeyPatch) -> None:
     captured: dict[str, object] = {}
 
@@ -475,6 +545,8 @@ async def test_preview_helper_uses_requested_environment(monkeypatch: pytest.Mon
 @pytest.mark.asyncio
 async def test_approval_helper_scopes_requested_environment(monkeypatch: pytest.MonkeyPatch) -> None:
     captured: dict[str, object] = {}
+    db = _FakeDb()
+    db.profile = _profile(uuid4(), environment="sandbox")
 
     async def _approval_stub(*, db, request):
         _ = db
@@ -484,12 +556,101 @@ async def test_approval_helper_scopes_requested_environment(monkeypatch: pytest.
     monkeypatch.setattr(service, "record_live_approval_checkpoint", _approval_stub)
 
     await service.record_first_live_enablement_approval(
-        db=_FakeDb(),
+        db=db,
         request=service.RecordApprovalHelperRequest(
             actor="operator:human",
-            live_trading_profile_id=uuid4(),
+            live_trading_profile_id=db.profile.id,
             exchange_environment="sandbox",
         ),
     )
 
     assert captured["environment"] == "sandbox"
+
+
+@pytest.mark.asyncio
+async def test_inspection_does_not_reuse_production_profile_for_sandbox(monkeypatch: pytest.MonkeyPatch) -> None:
+    db = _FakeDb()
+    db.paper_account = _paper_account()
+    db.profile = _profile(db.paper_account.id, environment="production")
+
+    monkeypatch.setattr(
+        service,
+        "get_settings",
+        lambda: SimpleNamespace(
+            live_crypto_order_submission_enabled=False,
+            live_crypto_dry_run_enabled=True,
+            live_crypto_preparation_enabled=True,
+            live_crypto_max_order_usd=Decimal("5"),
+        ),
+    )
+
+    readiness = await service.inspect_live_crypto_environment(db=db, exchange_environment="sandbox")
+
+    profile_item = next(item for item in readiness.items if item.key == "live_trading_profile")
+    assert profile_item.ready is False
+
+
+@pytest.mark.asyncio
+async def test_approval_helper_rejects_profile_environment_mismatch() -> None:
+    db = _FakeDb()
+    db.profile = _profile(uuid4(), environment="production")
+
+    with pytest.raises(ValueError, match="environment mismatch"):
+        await service.record_first_live_enablement_approval(
+            db=db,
+            request=service.RecordApprovalHelperRequest(
+                actor="operator:human",
+                live_trading_profile_id=db.profile.id,
+                exchange_environment="sandbox",
+            ),
+        )
+
+
+@pytest.mark.asyncio
+async def test_rehearsal_rerun_is_idempotent(monkeypatch: pytest.MonkeyPatch) -> None:
+    readiness = SimpleNamespace(
+        ready=True,
+        exchange_connection_id=uuid4(),
+        live_trading_profile_id=uuid4(),
+        paper_account_id=uuid4(),
+        capital_campaign_id=1,
+        crypto_order_preview_id=uuid4(),
+        approval_event_id=uuid4(),
+        items=(),
+    )
+    dry_run_response = SimpleNamespace(
+        live_crypto_order=SimpleNamespace(live_crypto_order_id=uuid4(), audit_correlation_id=uuid4()),
+        dry_run_status="DRY_RUN_READY",
+    )
+
+    async def _initialize_stub(**_kwargs):
+        return None
+
+    async def _inspect_stub(**kwargs):
+        _ = kwargs
+        return readiness if kwargs.get("exchange_environment") == "sandbox" else SimpleNamespace(ready=False)
+
+    async def _review_stub(**_kwargs):
+        return SimpleNamespace(passed=True, checks=[1, 2, 3])
+
+    async def _dry_run_stub(**_kwargs):
+        return dry_run_response
+
+    monkeypatch.setattr(service, "initialize_live_crypto_environment", _initialize_stub)
+    monkeypatch.setattr(service, "inspect_live_crypto_environment", _inspect_stub)
+    monkeypatch.setattr(service.live_crypto_orders_service.service, "dry_run", _dry_run_stub)
+
+    result = await service.run_live_crypto_rehearsal(
+        db=_FakeDb(),
+        request=service.InitializeLiveCryptoEnvironmentRequest(
+            actor="operator:human",
+            exchange_environment="sandbox",
+            registration_source="human_sandbox_initializer",
+        ),
+        verify_rehearsal_evidence=_review_stub,
+    )
+
+    assert result.preview_created is False
+    assert result.approval_created is False
+    assert result.review_passed is True
+    assert result.production_ready is False

@@ -624,6 +624,9 @@ async def _load_live_operation_annotations(
         if action in {"DRY_RUN_READY", "DRY_RUN_BLOCKED"}:
             dry_run_metadata = {
                 "mode": str(after_state.get("mode", "dry_run")),
+                "environment": after_state.get("environment"),
+                "rehearsal_mode": after_state.get("rehearsal_mode"),
+                "provider_mock_mode_enabled": after_state.get("provider_mock_mode_enabled"),
                 "submission_skipped": bool(after_state.get("submission_skipped", True)),
                 "submission_skip_reason": str(after_state.get("submission_skip_reason", "dry_run_submission_skipped")),
                 "approval_event_id": after_state.get("approval_event_id"),

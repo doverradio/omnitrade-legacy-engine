@@ -101,6 +101,51 @@ async def test_sandbox_mock_mode_supports_readiness_and_preview(monkeypatch: pyt
 
 
 @pytest.mark.asyncio
+async def test_sandbox_mock_mode_supports_deterministic_historical_reads(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("OT_COINBASE_SANDBOX_MOCK_MODE", "true")
+    client = CoinbaseAdvancedClient()
+
+    orders, _ = await client.list_historical_orders(
+        credentials={"api_key": "k", "api_secret": "s"},
+        environment="sandbox",
+    )
+    order, _ = await client.get_historical_order(
+        credentials={"api_key": "k", "api_secret": "s"},
+        environment="sandbox",
+        order_id="sandbox-mock-order-1",
+    )
+    fills, _ = await client.list_historical_fills(
+        credentials={"api_key": "k", "api_secret": "s"},
+        environment="sandbox",
+        order_id="sandbox-mock-order-1",
+    )
+
+    assert orders["orders"][0]["order_id"] == "sandbox-mock-order-1"
+    assert order["order"]["order_id"] == "sandbox-mock-order-1"
+    assert fills["fills"][0]["trade_id"] == "sandbox-mock-fill-1"
+
+
+@pytest.mark.asyncio
+async def test_sandbox_mock_mode_short_circuits_network_calls(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("OT_COINBASE_SANDBOX_MOCK_MODE", "true")
+    request_calls = {"count": 0}
+
+    async def _request(*_args, **_kwargs):
+        request_calls["count"] += 1
+        raise AssertionError("network request should not occur in sandbox mock mode")
+
+    monkeypatch.setattr("app.services.exchange_connections.providers.coinbase_advanced.httpx.AsyncClient.request", _request)
+
+    client = CoinbaseAdvancedClient()
+    await client.fetch_balances(
+        credentials={"api_key": "k", "api_secret": "s"},
+        environment="sandbox",
+    )
+
+    assert request_calls["count"] == 0
+
+
+@pytest.mark.asyncio
 async def test_sandbox_mock_mode_is_forbidden_for_production(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("OT_COINBASE_SANDBOX_MOCK_MODE", "true")
     client = CoinbaseAdvancedClient()

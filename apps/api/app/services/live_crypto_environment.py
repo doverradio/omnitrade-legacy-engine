@@ -14,11 +14,15 @@ from app.models.capital_campaign import CapitalCampaign
 from app.models.crypto_order_preview import CryptoOrderPreview
 from app.models.exchange_connection import ExchangeConnection
 from app.models.live_approval_event import LiveApprovalEvent
+from app.models.live_crypto_order import LiveCryptoOrder
 from app.models.live_trading_profile import LiveTradingProfile
 from app.models.paper_account import PaperAccount
 from app.schemas.capital_campaigns import CapitalCampaignCreateRequest
 from app.schemas.crypto_order_previews import CryptoOrderPreviewCreateRequest
 from app.schemas.exchange_connections import SaveExchangeConnectionRequest
+from app.schemas.live_crypto_orders import LiveCryptoOrderDryRunRequest
+from app.services import live_crypto_orders as live_crypto_orders_service
+from app.services.exchange_connections.providers.coinbase_advanced import sandbox_mock_mode_enabled
 from app.services.assets_service import EnsureCoinbaseAssetRequest, ensure_coinbase_crypto_asset
 from app.services.capital_campaigns.service import create_capital_campaign
 from app.services.crypto_order_previews.service import create_crypto_order_preview
@@ -32,9 +36,58 @@ DEFAULT_PRODUCTION_CRYPTO_PAPER_ACCOUNT_ID = UUID("905a408c-7d8e-4fc7-ad3b-9ff63
 _READY_CONNECTION_VERDICTS = {"READY_FOR_PREVIEW", "READY_FOR_DRY_RUN", "READY_FOR_OPERATOR_REVIEW"}
 
 
-def _exchange_label(environment: str) -> str:
+def _normalize_exchange_environment(environment: str) -> str:
     normalized = environment.strip().lower()
+    if normalized not in {"production", "sandbox"}:
+        raise ValueError(f"Unsupported exchange environment: {environment}")
+    return normalized
+
+
+def _exchange_label(environment: str) -> str:
+    normalized = _normalize_exchange_environment(environment)
     return "coinbase_advanced" if normalized == "production" else "coinbase_advanced_sandbox"
+
+
+def _profile_environment(profile: LiveTradingProfile | None) -> str | None:
+    if profile is None:
+        return None
+    provenance = profile.provenance_metadata if isinstance(profile.provenance_metadata, dict) else {}
+    explicit = provenance.get("exchange_environment") or provenance.get("environment")
+    if explicit is not None:
+        try:
+            return _normalize_exchange_environment(str(explicit))
+        except ValueError:
+            return None
+    registration_source = str(provenance.get("registration_source") or "").lower()
+    if "sandbox" in registration_source:
+        return "sandbox"
+    if "production" in registration_source or registration_source.startswith("human_"):
+        return "production"
+    return "production"
+
+
+def _profile_matches_environment(profile: LiveTradingProfile | None, environment: str) -> bool:
+    return _profile_environment(profile) == _normalize_exchange_environment(environment)
+
+
+def _approval_environment(approval: LiveApprovalEvent | None) -> str | None:
+    if approval is None or not isinstance(approval.approval_scope, dict):
+        return None
+    explicit = approval.approval_scope.get("environment")
+    if explicit is None:
+        return None
+    try:
+        return _normalize_exchange_environment(str(explicit))
+    except ValueError:
+        return None
+
+
+def _rehearsal_mode_for_environment(environment: str) -> str:
+    normalized = _normalize_exchange_environment(environment)
+    if normalized != "sandbox":
+        return "production_live"
+    return "controlled_provider_mock" if sandbox_mock_mode_enabled() else "coinbase_sandbox"
+
 
 
 @dataclass(frozen=True, slots=True)
@@ -105,6 +158,22 @@ class RecordApprovalHelperResult:
     approval_state: str
 
 
+@dataclass(frozen=True, slots=True)
+class LiveCryptoRehearsalResult:
+    rehearsal_mode: str
+    readiness: LiveCryptoEnvironmentReadiness
+    preview_created: bool
+    approval_created: bool
+    preview_id: UUID
+    approval_event_id: UUID
+    live_crypto_order_id: UUID
+    audit_correlation_id: UUID
+    dry_run_status: str
+    review_passed: bool
+    review_check_count: int
+    production_ready: bool
+
+
 async def _load_coinbase_connection(*, db: AsyncSession, environment: str) -> ExchangeConnection | None:
     return await db.scalar(
         select(ExchangeConnection)
@@ -130,13 +199,38 @@ async def _load_selected_crypto_paper_account(*, db: AsyncSession, paper_account
     return paper_account
 
 
-async def _load_live_profile_for_account(*, db: AsyncSession, paper_account_id: UUID | None) -> LiveTradingProfile | None:
+async def _load_live_profile_for_account(*, db: AsyncSession, paper_account_id: UUID | None, environment: str) -> LiveTradingProfile | None:
     if paper_account_id is None:
         return None
-    return await db.scalar(
+    if hasattr(db, "execute"):
+        rows = (
+            (
+                await db.execute(
+                    select(LiveTradingProfile)
+                    .where(LiveTradingProfile.paper_account_id == paper_account_id)
+                    .order_by(LiveTradingProfile.created_at.desc())
+                )
+            )
+            .scalars()
+            .all()
+        )
+        for profile in rows:
+            if _profile_matches_environment(profile, environment):
+                return profile
+        return None
+    profile = await db.scalar(
         select(LiveTradingProfile)
         .where(LiveTradingProfile.paper_account_id == paper_account_id)
         .order_by(LiveTradingProfile.created_at.desc())
+        .limit(1)
+    )
+    return profile if _profile_matches_environment(profile, environment) else None
+
+
+async def _load_live_profile_by_id(*, db: AsyncSession, live_trading_profile_id: UUID) -> LiveTradingProfile | None:
+    return await db.scalar(
+        select(LiveTradingProfile)
+        .where(LiveTradingProfile.id == live_trading_profile_id)
         .limit(1)
     )
 
@@ -185,15 +279,44 @@ async def _load_latest_preview(*, db: AsyncSession, exchange_connection_id: UUID
     )
 
 
-async def _load_latest_approval(*, db: AsyncSession, live_trading_profile_id: UUID | None) -> LiveApprovalEvent | None:
+async def _load_latest_approval(*, db: AsyncSession, live_trading_profile_id: UUID | None, environment: str) -> LiveApprovalEvent | None:
     if live_trading_profile_id is None:
         return None
-    return await db.scalar(
+    if hasattr(db, "execute"):
+        rows = (
+            (
+                await db.execute(
+                    select(LiveApprovalEvent)
+                    .where(LiveApprovalEvent.live_trading_profile_id == live_trading_profile_id)
+                    .where(LiveApprovalEvent.checkpoint_type == "first_live_enablement")
+                    .where(LiveApprovalEvent.approval_state == "approved")
+                    .order_by(LiveApprovalEvent.sequence_number.desc())
+                )
+            )
+            .scalars()
+            .all()
+        )
+        for approval in rows:
+            if _approval_environment(approval) == _normalize_exchange_environment(environment):
+                return approval
+        return None
+    approval = await db.scalar(
         select(LiveApprovalEvent)
         .where(LiveApprovalEvent.live_trading_profile_id == live_trading_profile_id)
         .where(LiveApprovalEvent.checkpoint_type == "first_live_enablement")
         .where(LiveApprovalEvent.approval_state == "approved")
         .order_by(LiveApprovalEvent.sequence_number.desc())
+        .limit(1)
+    )
+    return approval if _approval_environment(approval) == _normalize_exchange_environment(environment) else None
+
+
+async def _load_latest_dry_run_order(*, db: AsyncSession, environment: str) -> LiveCryptoOrder | None:
+    return await db.scalar(
+        select(LiveCryptoOrder)
+        .where(LiveCryptoOrder.environment == _normalize_exchange_environment(environment))
+        .where(LiveCryptoOrder.status.in_(["DRY_RUN_READY", "DRY_RUN_BLOCKED"]))
+        .order_by(LiveCryptoOrder.created_at.desc())
         .limit(1)
     )
 
@@ -226,14 +349,23 @@ async def inspect_live_crypto_environment(
     paper_account_id: UUID = DEFAULT_PRODUCTION_CRYPTO_PAPER_ACCOUNT_ID,
 ) -> LiveCryptoEnvironmentReadiness:
     now = datetime.now(timezone.utc)
+    exchange_environment = _normalize_exchange_environment(exchange_environment)
     exchange = _exchange_label(exchange_environment)
     connection = await _load_coinbase_connection(db=db, environment=exchange_environment)
     paper_account = await _load_selected_crypto_paper_account(db=db, paper_account_id=paper_account_id)
-    profile = await _load_live_profile_for_account(db=db, paper_account_id=paper_account.id if paper_account is not None else None)
+    profile = await _load_live_profile_for_account(
+        db=db,
+        paper_account_id=paper_account.id if paper_account is not None else None,
+        environment=exchange_environment,
+    )
     asset = await _load_coinbase_btc_asset_for_exchange(db=db, exchange=exchange)
     campaign = await _load_campaign_for_account_exchange(db=db, paper_account_id=paper_account.id if paper_account is not None else None, exchange=exchange)
     preview = await _load_latest_preview(db=db, exchange_connection_id=connection.exchange_connection_id if connection is not None else None)
-    approval = await _load_latest_approval(db=db, live_trading_profile_id=profile.id if profile is not None else None)
+    approval = await _load_latest_approval(
+        db=db,
+        live_trading_profile_id=profile.id if profile is not None else None,
+        environment=exchange_environment,
+    )
 
     dry_run_ready, dry_run_detail = _dry_run_gate_ready()
     approval_ready = _is_approval_active(approval, now=now)
@@ -260,9 +392,9 @@ async def inspect_live_crypto_environment(
             label="Trading Profile",
             ready=profile is not None,
             detail=(
-                f"Live trading profile ready ({profile.id})"
+                f"Live trading profile ready ({profile.id}) for {exchange_environment}"
                 if profile is not None
-                else "Live trading profile missing"
+                else f"Live trading profile missing for {exchange_environment}"
             ),
         ),
         ReadinessItem(
@@ -290,9 +422,9 @@ async def inspect_live_crypto_environment(
             label="Preview",
             ready=preview is not None,
             detail=(
-                f"Crypto order preview available ({preview.crypto_order_preview_id})"
+                f"Crypto order preview available ({preview.crypto_order_preview_id}) for {exchange_environment}"
                 if preview is not None
-                else "Crypto order preview missing"
+                else f"Crypto order preview missing for {exchange_environment}"
             ),
         ),
         ReadinessItem(
@@ -300,9 +432,9 @@ async def inspect_live_crypto_environment(
             label="Approval",
             ready=approval_ready,
             detail=(
-                f"First live enablement approval ready ({approval.id})"
+                f"First live enablement approval ready ({approval.id}) for {exchange_environment}"
                 if approval_ready and approval is not None
-                else "First live enablement approval missing or expired"
+                else f"First live enablement approval missing or expired for {exchange_environment}"
             ),
         ),
         ReadinessItem(
@@ -331,9 +463,10 @@ async def initialize_live_crypto_environment(
     db: AsyncSession,
     request: InitializeLiveCryptoEnvironmentRequest,
 ) -> InitializeLiveCryptoEnvironmentResult:
+    exchange_environment = _normalize_exchange_environment(request.exchange_environment)
     initial = await inspect_live_crypto_environment(
         db=db,
-        exchange_environment=request.exchange_environment,
+        exchange_environment=exchange_environment,
         paper_account_id=request.paper_account_id,
     )
 
@@ -350,7 +483,7 @@ async def initialize_live_crypto_environment(
             payload=SaveExchangeConnectionRequest(
                 provider="coinbase_advanced",
                 connection_name=request.exchange_connection_name,
-                environment=request.exchange_environment,
+                environment=exchange_environment,
                 api_key_name=request.exchange_api_key_name,
                 private_key=request.exchange_private_key,
                 passphrase=request.exchange_passphrase,
@@ -361,7 +494,7 @@ async def initialize_live_crypto_environment(
 
     refreshed_readiness = await inspect_live_crypto_environment(
         db=db,
-        exchange_environment=request.exchange_environment,
+        exchange_environment=exchange_environment,
         paper_account_id=request.paper_account_id,
     )
     if refreshed_readiness.exchange_connection_id is not None:
@@ -378,7 +511,7 @@ async def initialize_live_crypto_environment(
         request=EnsureCoinbaseAssetRequest(
             symbol="BTC",
             base_currency="USD",
-            exchange=_exchange_label(request.exchange_environment),
+            exchange=_exchange_label(exchange_environment),
             actor=request.actor,
         ),
     )
@@ -386,7 +519,7 @@ async def initialize_live_crypto_environment(
 
     current = await inspect_live_crypto_environment(
         db=db,
-        exchange_environment=request.exchange_environment,
+        exchange_environment=exchange_environment,
         paper_account_id=request.paper_account_id,
     )
     if current.paper_account_id is None:
@@ -402,8 +535,12 @@ async def initialize_live_crypto_environment(
                 live_opt_in=True,
                 governance_approved=True,
                 human_approval_recorded=False,
-                provenance_metadata={"source": "initialize_live_crypto_environment"},
-                idempotency_key=f"init-live-profile:{current.paper_account_id}",
+                provenance_metadata={
+                    "source": "initialize_live_crypto_environment",
+                    "exchange_environment": exchange_environment,
+                    "exchange_label": _exchange_label(exchange_environment),
+                },
+                idempotency_key=f"init-live-profile:{exchange_environment}:{current.paper_account_id}",
             ),
         )
         if not registration.accepted:
@@ -412,7 +549,7 @@ async def initialize_live_crypto_environment(
 
     current = await inspect_live_crypto_environment(
         db=db,
-        exchange_environment=request.exchange_environment,
+        exchange_environment=exchange_environment,
         paper_account_id=request.paper_account_id,
     )
     if current.capital_campaign_id is None:
@@ -425,13 +562,13 @@ async def initialize_live_crypto_environment(
                 owner=request.campaign_owner,
                 name=(
                     "Production Small Account Mode"
-                    if request.exchange_environment == "production"
+                    if exchange_environment == "production"
                     else "Sandbox Small Account Mode"
                 ),
                 description="Initialized for live-crypto dry-run readiness",
                 status="READY",
                 campaign_type="small_account_mode",
-                exchange=_exchange_label(request.exchange_environment),
+                exchange=_exchange_label(exchange_environment),
                 paper_account_id=paper_account.id,
                 validation_run_id=None,
                 strategy_id=None,
@@ -446,7 +583,7 @@ async def initialize_live_crypto_environment(
 
     final_readiness = await inspect_live_crypto_environment(
         db=db,
-        exchange_environment=request.exchange_environment,
+        exchange_environment=exchange_environment,
         paper_account_id=request.paper_account_id,
     )
     return InitializeLiveCryptoEnvironmentResult(
@@ -494,6 +631,15 @@ async def record_first_live_enablement_approval(
     db: AsyncSession,
     request: RecordApprovalHelperRequest,
 ) -> RecordApprovalHelperResult:
+    profile = await _load_live_profile_by_id(db=db, live_trading_profile_id=request.live_trading_profile_id)
+    if profile is None:
+        raise LookupError("live trading profile not found")
+    requested_environment = _normalize_exchange_environment(request.exchange_environment)
+    if _profile_environment(profile) != requested_environment:
+        raise ValueError(
+            f"live trading profile environment mismatch: profile={_profile_environment(profile) or 'missing'} requested={requested_environment}"
+        )
+
     result = await record_live_approval_checkpoint(
         db=db,
         request=LiveApprovalCheckpointRequest(
@@ -501,21 +647,114 @@ async def record_first_live_enablement_approval(
             checkpoint_type="first_live_enablement",
             approver_id=request.actor,
             approver_role="operator",
-            rationale="Production dry-run readiness checkpoint",
+            rationale="Dry-run readiness checkpoint",
             approval_scope={
                 "product": "BTC-USD",
                 "side": "BUY",
                 "max_order_usd": "5",
-                "environment": request.exchange_environment,
+                "environment": requested_environment,
             },
             expires_at=datetime.now(timezone.utc) + timedelta(minutes=30),
             renewal_condition="operator_reapproval_required",
             requested_by=request.actor,
-            provenance_metadata={"source": "initialize_live_crypto_environment"},
-            idempotency_key=f"init-approval:{request.exchange_environment}:{request.live_trading_profile_id}",
+            provenance_metadata={
+                "source": "initialize_live_crypto_environment",
+                "exchange_environment": requested_environment,
+            },
+            idempotency_key=f"init-approval:{requested_environment}:{request.live_trading_profile_id}",
         ),
     )
     return RecordApprovalHelperResult(
         approval_event_id=result.approval_event_id,
         approval_state=result.approval_state,
+    )
+
+
+async def run_live_crypto_rehearsal(
+    *,
+    db: AsyncSession,
+    request: InitializeLiveCryptoEnvironmentRequest,
+    verify_rehearsal_evidence,
+) -> LiveCryptoRehearsalResult:
+    exchange_environment = _normalize_exchange_environment(request.exchange_environment)
+    if exchange_environment != "sandbox":
+        raise ValueError("live crypto rehearsal is sandbox-only; production environment is rejected")
+
+    await initialize_live_crypto_environment(db=db, request=request)
+    readiness = await inspect_live_crypto_environment(
+        db=db,
+        exchange_environment=exchange_environment,
+        paper_account_id=request.paper_account_id,
+    )
+    if readiness.exchange_connection_id is None or readiness.live_trading_profile_id is None:
+        raise ValueError("sandbox rehearsal prerequisites incomplete after initialization")
+
+    preview_created = False
+    preview_id = readiness.crypto_order_preview_id
+    if preview_id is None:
+        preview = await generate_fresh_btc_dry_run_preview(
+            db=db,
+            request=GeneratePreviewHelperRequest(
+                actor=request.actor,
+                exchange_connection_id=readiness.exchange_connection_id,
+                exchange_environment=exchange_environment,
+            ),
+        )
+        preview_id = preview.crypto_order_preview_id
+        preview_created = True
+
+    approval_created = False
+    approval_event_id = readiness.approval_event_id
+    if approval_event_id is None:
+        approval = await record_first_live_enablement_approval(
+            db=db,
+            request=RecordApprovalHelperRequest(
+                actor=request.actor,
+                live_trading_profile_id=readiness.live_trading_profile_id,
+                exchange_environment=exchange_environment,
+            ),
+        )
+        approval_event_id = approval.approval_event_id
+        approval_created = True
+
+    dry_run = await live_crypto_orders_service.service.dry_run(
+        db=db,
+        request=LiveCryptoOrderDryRunRequest(
+            live_trading_profile_id=readiness.live_trading_profile_id,
+            crypto_order_preview_id=preview_id,
+            operator_identity=request.actor,
+            idempotency_token=(
+                f"rehearsal:{_rehearsal_mode_for_environment(exchange_environment)}:"
+                f"{readiness.live_trading_profile_id}:{preview_id}"
+            ),
+        ),
+    )
+    report = await verify_rehearsal_evidence(
+        db=db,
+        live_crypto_order_id=dry_run.live_crypto_order.live_crypto_order_id,
+        audit_correlation_id=None,
+        mission_control_range="24h",
+        expected_environment="sandbox",
+    )
+    production_readiness = await inspect_live_crypto_environment(
+        db=db,
+        exchange_environment="production",
+        paper_account_id=request.paper_account_id,
+    )
+    if production_readiness.ready:
+        raise ValueError("sandbox rehearsal must not mark production ready")
+
+    return LiveCryptoRehearsalResult(
+        rehearsal_mode=_rehearsal_mode_for_environment(exchange_environment),
+        readiness=readiness,
+        preview_created=preview_created,
+        approval_created=approval_created,
+        preview_id=preview_id,
+        approval_event_id=approval_event_id,
+        live_crypto_order_id=dry_run.live_crypto_order.live_crypto_order_id,
+        audit_correlation_id=dry_run.live_crypto_order.audit_correlation_id,
+        dry_run_status=dry_run.dry_run_status,
+        review_passed=report.passed,
+        review_check_count=len(report.checks),
+        production_ready=production_readiness.ready,
     )

@@ -68,6 +68,8 @@ class _FakeDb:
             return self.live_order
         if "FROM crypto_order_previews" in sql:
             return self.preview
+        if "FROM exchange_connections" in sql:
+            return SimpleNamespace(environment=self.preview.environment)
         if "FROM live_trading_profiles" in sql:
             return self.profile
         if "FROM live_approval_events" in sql:
@@ -102,6 +104,7 @@ class _AsyncSessionFactory:
 
 
 class _Settings:
+    live_crypto_order_submission_enabled = False
     live_crypto_preview_max_age_seconds = 30
     live_crypto_readiness_max_age_seconds = 60
     live_crypto_balance_max_age_seconds = 30
@@ -127,7 +130,7 @@ def _build_success_case(*, approval_event: bool = True, risk_event: bool = True)
         autonomous_capital_allocation=False,
         autonomous_strategy_evolution=False,
         automatic_promotion_enabled=False,
-        provenance_metadata={},
+        provenance_metadata={"exchange_environment": "sandbox", "registration_source": "human_sandbox_initializer"},
     )
     preview = CryptoOrderPreview(
         crypto_order_preview_id=uuid4(),
@@ -136,7 +139,7 @@ def _build_success_case(*, approval_event: bool = True, risk_event: bool = True)
         refreshed_from_preview_id=None,
         exchange_connection_id=uuid4(),
         provider="coinbase_advanced",
-        environment="production",
+        environment="sandbox",
         product_id="BTC-USD",
         side="BUY",
         order_type="MARKET",
@@ -177,6 +180,9 @@ def _build_success_case(*, approval_event: bool = True, risk_event: bool = True)
         "mode": "dry_run",
         "submission_skipped": True,
         "submission_skip_reason": "Coinbase order submission intentionally skipped (LIVE_CRYPTO_ORDER_SUBMISSION_ENABLED=false, LIVE_CRYPTO_DRY_RUN_ENABLED=true)",
+        "exchange_environment": "sandbox",
+        "provider_mock_mode_enabled": True,
+        "rehearsal_mode": "controlled_provider_mock",
         "approval_event_id": str(uuid4()) if approval_event else None,
         "risk_event_id": str(preview.risk_event_id) if preview.risk_event_id else None,
         "approved_intent_fingerprint": "intent-fingerprint",
@@ -229,7 +235,7 @@ def _build_success_case(*, approval_event: bool = True, risk_event: bool = True)
             approver_id="operator:human",
             approver_role="operator",
             rationale="approved",
-            approval_scope={},
+            approval_scope={"environment": "sandbox"},
             expires_at=_now(),
             renewal_condition=None,
             event_payload={},
@@ -287,21 +293,33 @@ async def test_review_helper_passes_for_clean_dry_run(monkeypatch: pytest.Monkey
     monkeypatch.setattr(script, "get_settings", lambda: _Settings())
 
     async def _mission_control_stub(**_kwargs):
-        return SimpleNamespace(timeline_events=[SimpleNamespace(event_type="DRY_RUN_READY", metadata={"mode": "dry_run"})])
+        return SimpleNamespace(
+            timeline_events=[SimpleNamespace(event_type="DRY_RUN_READY", metadata={"mode": "dry_run", "environment": "sandbox"})],
+            operations=SimpleNamespace(
+                live_crypto_readiness=SimpleNamespace(
+                    items=[
+                        SimpleNamespace(key="sandbox_exchange_connection", ready=True),
+                        SimpleNamespace(key="production_account_status", ready=False),
+                    ]
+                )
+            ),
+        )
 
     monkeypatch.setattr(mission_control_service, "build_mission_control_intelligence", _mission_control_stub)
+    monkeypatch.setattr(script, "inspect_live_crypto_environment", lambda **_kwargs: SimpleNamespace(ready=False))
 
     report = await script.verify_dry_run_evidence(
         db=db,
         live_crypto_order_id=live_order_id,
         audit_correlation_id=None,
         mission_control_range="24h",
+        expected_environment="sandbox",
     )
 
     assert report.passed is True
     assert any(check.name == "mission_control_annotation_present" and check.passed for check in report.checks)
 
-    result = await script._run_review(SimpleNamespace(live_crypto_order_id=live_order_id, audit_correlation_id=None, mission_control_range="24h"))
+    result = await script._run_review(SimpleNamespace(live_crypto_order_id=live_order_id, audit_correlation_id=None, mission_control_range="24h", expected_environment="sandbox"))
     assert result == 0
     captured = capsys.readouterr().out
     assert "PASS mode" in captured
@@ -320,13 +338,15 @@ async def test_review_helper_passes_for_clean_dry_run(monkeypatch: pytest.Monkey
 async def test_review_helper_fails_on_contradictory_provider_evidence(monkeypatch: pytest.MonkeyPatch, mutator, expected_check: str) -> None:
     db, live_order_id, _ = _build_success_case()
     mutator(db.live_order)
-    monkeypatch.setattr(mission_control_service, "build_mission_control_intelligence", lambda **_kwargs: SimpleNamespace(timeline_events=[]))
+    monkeypatch.setattr(mission_control_service, "build_mission_control_intelligence", lambda **_kwargs: SimpleNamespace(timeline_events=[], operations=SimpleNamespace(live_crypto_readiness=SimpleNamespace(items=[]))))
+    monkeypatch.setattr(script, "inspect_live_crypto_environment", lambda **_kwargs: SimpleNamespace(ready=False))
 
     report = await script.verify_dry_run_evidence(
         db=db,
         live_crypto_order_id=live_order_id,
         audit_correlation_id=None,
         mission_control_range="24h",
+        expected_environment="sandbox",
     )
 
     assert report.passed is False
@@ -338,13 +358,15 @@ async def test_review_helper_fails_on_contradictory_provider_evidence(monkeypatc
 async def test_review_helper_fails_when_accounting_row_exists(monkeypatch: pytest.MonkeyPatch) -> None:
     db, live_order_id, _ = _build_success_case()
     db.live_accounting_count = 1
-    monkeypatch.setattr(mission_control_service, "build_mission_control_intelligence", lambda **_kwargs: SimpleNamespace(timeline_events=[]))
+    monkeypatch.setattr(mission_control_service, "build_mission_control_intelligence", lambda **_kwargs: SimpleNamespace(timeline_events=[], operations=SimpleNamespace(live_crypto_readiness=SimpleNamespace(items=[]))))
+    monkeypatch.setattr(script, "inspect_live_crypto_environment", lambda **_kwargs: SimpleNamespace(ready=False))
 
     report = await script.verify_dry_run_evidence(
         db=db,
         live_crypto_order_id=live_order_id,
         audit_correlation_id=None,
         mission_control_range="24h",
+        expected_environment="sandbox",
     )
 
     assert report.passed is False
@@ -354,17 +376,95 @@ async def test_review_helper_fails_when_accounting_row_exists(monkeypatch: pytes
 @pytest.mark.asyncio
 async def test_review_helper_fails_when_mission_control_annotation_missing(monkeypatch: pytest.MonkeyPatch) -> None:
     db, live_order_id, _ = _build_success_case()
-    monkeypatch.setattr(mission_control_service, "build_mission_control_intelligence", lambda **_kwargs: SimpleNamespace(timeline_events=[]))
+    monkeypatch.setattr(mission_control_service, "build_mission_control_intelligence", lambda **_kwargs: SimpleNamespace(timeline_events=[], operations=SimpleNamespace(live_crypto_readiness=SimpleNamespace(items=[]))))
+    monkeypatch.setattr(script, "inspect_live_crypto_environment", lambda **_kwargs: SimpleNamespace(ready=False))
 
     report = await script.verify_dry_run_evidence(
         db=db,
         live_crypto_order_id=live_order_id,
         audit_correlation_id=None,
         mission_control_range="24h",
+        expected_environment="sandbox",
     )
 
     assert report.passed is False
     assert any(check.name == "mission_control_annotation_present" and not check.passed for check in report.checks)
+
+
+@pytest.mark.asyncio
+async def test_review_helper_fails_when_campaign_mutation_exists(monkeypatch: pytest.MonkeyPatch) -> None:
+    db, live_order_id, _ = _build_success_case()
+    db.capital_audit_count = 1
+    monkeypatch.setattr(mission_control_service, "build_mission_control_intelligence", lambda **_kwargs: SimpleNamespace(timeline_events=[], operations=SimpleNamespace(live_crypto_readiness=SimpleNamespace(items=[]))))
+    monkeypatch.setattr(script, "inspect_live_crypto_environment", lambda **_kwargs: SimpleNamespace(ready=False))
+
+    report = await script.verify_dry_run_evidence(
+        db=db,
+        live_crypto_order_id=live_order_id,
+        audit_correlation_id=None,
+        mission_control_range="24h",
+        expected_environment="sandbox",
+    )
+
+    assert report.passed is False
+    assert any(check.name == "capital_mutation_absent" and not check.passed for check in report.checks)
+
+
+@pytest.mark.asyncio
+async def test_review_helper_fails_when_profit_cycle_mutation_exists(monkeypatch: pytest.MonkeyPatch) -> None:
+    db, live_order_id, _ = _build_success_case()
+    db.profit_cycle_count = 1
+    monkeypatch.setattr(mission_control_service, "build_mission_control_intelligence", lambda **_kwargs: SimpleNamespace(timeline_events=[], operations=SimpleNamespace(live_crypto_readiness=SimpleNamespace(items=[]))))
+    monkeypatch.setattr(script, "inspect_live_crypto_environment", lambda **_kwargs: SimpleNamespace(ready=False))
+
+    report = await script.verify_dry_run_evidence(
+        db=db,
+        live_crypto_order_id=live_order_id,
+        audit_correlation_id=None,
+        mission_control_range="24h",
+        expected_environment="sandbox",
+    )
+
+    assert report.passed is False
+    assert any(check.name == "profit_cycle_mutation_absent" and not check.passed for check in report.checks)
+
+
+@pytest.mark.asyncio
+async def test_review_helper_rejects_environment_mismatch(monkeypatch: pytest.MonkeyPatch) -> None:
+    db, live_order_id, _ = _build_success_case()
+    db.preview.environment = "production"
+    monkeypatch.setattr(mission_control_service, "build_mission_control_intelligence", lambda **_kwargs: SimpleNamespace(timeline_events=[], operations=SimpleNamespace(live_crypto_readiness=SimpleNamespace(items=[]))))
+    monkeypatch.setattr(script, "inspect_live_crypto_environment", lambda **_kwargs: SimpleNamespace(ready=False))
+
+    report = await script.verify_dry_run_evidence(
+        db=db,
+        live_crypto_order_id=live_order_id,
+        audit_correlation_id=None,
+        mission_control_range="24h",
+        expected_environment="sandbox",
+    )
+
+    assert report.passed is False
+    assert any(check.name == "preview_environment_matches" and not check.passed for check in report.checks)
+
+
+@pytest.mark.asyncio
+async def test_review_helper_rejects_fabricated_production_provider_id(monkeypatch: pytest.MonkeyPatch) -> None:
+    db, live_order_id, _ = _build_success_case()
+    db.live_order.provider_order_id = "prod-order-123"
+    monkeypatch.setattr(mission_control_service, "build_mission_control_intelligence", lambda **_kwargs: SimpleNamespace(timeline_events=[], operations=SimpleNamespace(live_crypto_readiness=SimpleNamespace(items=[]))))
+    monkeypatch.setattr(script, "inspect_live_crypto_environment", lambda **_kwargs: SimpleNamespace(ready=False))
+
+    report = await script.verify_dry_run_evidence(
+        db=db,
+        live_crypto_order_id=live_order_id,
+        audit_correlation_id=None,
+        mission_control_range="24h",
+        expected_environment="sandbox",
+    )
+
+    assert report.passed is False
+    assert any(check.name == "provider_order_id_absent" and not check.passed for check in report.checks)
 
 
 def test_review_helper_parse_args_requires_exactly_one_identifier() -> None:
@@ -372,6 +472,7 @@ def test_review_helper_parse_args_requires_exactly_one_identifier() -> None:
     assert str(args.live_crypto_order_id) == "11111111-1111-1111-1111-111111111111"
     assert args.audit_correlation_id is None
     assert args.mission_control_range == "24h"
+    assert args.expected_environment == "production"
 
     args = script.parse_args(["--audit-correlation-id", "22222222-2222-2222-2222-222222222222", "--mission-control-range", "72h"])
     assert args.live_crypto_order_id is None

@@ -31,6 +31,10 @@ def _sandbox_mock_mode_enabled() -> bool:
     return str(os.getenv("OT_COINBASE_SANDBOX_MOCK_MODE", "false")).strip().lower() in {"1", "true", "yes", "on"}
 
 
+def sandbox_mock_mode_enabled() -> bool:
+    return _sandbox_mock_mode_enabled()
+
+
 def _to_decimal(value: str | int | float | Decimal | None) -> Decimal:
     if value is None:
         return Decimal("0")
@@ -606,6 +610,48 @@ class CoinbaseAdvancedClient:
                     "best_bid": "49999",
                     "best_ask": "50001",
                     "warning_messages": [],
+                },
+                headers,
+            )
+        if method_u == "GET" and path == "/api/v3/brokerage/orders/historical/batch":
+            return (
+                {
+                    "orders": [
+                        {
+                            "order_id": "sandbox-mock-order-1",
+                            "client_order_id": "sandbox-mock-client-order-1",
+                            "product_id": "BTC-USD",
+                            "status": "FILLED",
+                        }
+                    ]
+                },
+                headers,
+            )
+        if method_u == "GET" and path == "/api/v3/brokerage/orders/historical/fills":
+            return (
+                {
+                    "fills": [
+                        {
+                            "order_id": "sandbox-mock-order-1",
+                            "trade_id": "sandbox-mock-fill-1",
+                            "product_id": "BTC-USD",
+                            "size": "0.0001",
+                            "price": "50000",
+                        }
+                    ]
+                },
+                headers,
+            )
+        if method_u == "GET" and path.startswith("/api/v3/brokerage/orders/historical/"):
+            order_id = path.rsplit("/", 1)[-1]
+            return (
+                {
+                    "order": {
+                        "order_id": order_id,
+                        "client_order_id": "sandbox-mock-client-order-1",
+                        "product_id": "BTC-USD",
+                        "status": "FILLED",
+                    }
                 },
                 headers,
             )

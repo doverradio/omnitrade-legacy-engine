@@ -504,6 +504,13 @@ Purpose:
 
 - validate secure initialization workflows while production Coinbase account access is under recovery
 - do not treat sandbox rehearsal as production readiness completion
+- official Phase 10.7G rehearsal mode is the controlled provider-mock path unless and until Coinbase sandbox historical-read coverage is proven with real repository evidence
+
+Selected rehearsal mode:
+
+- `controlled_provider_mock`
+- reason: repository/provider-contract coverage proves sandbox-auth, balances, permissions, product, preview, and deterministic mock historical-read paths, but it does not yet prove that a real Coinbase sandbox account reliably supports the full rehearsal workflow, especially historical order reads, in a way that can stand in for production evidence
+- consequence: sandbox/provider-mock rehearsal is operational evidence for isolation and workflow safety only; it is not production-readiness evidence
 
 Sandbox inspection:
 
@@ -533,15 +540,74 @@ Controlled provider-mock rehearsal mode (sandbox only, forbidden in production):
 ```bash
 cd /home/eric/omnitrade-legacy-engine/apps/api
 export OT_COINBASE_SANDBOX_MOCK_MODE=true
-PYTHONPATH=. python3 -m scripts.initialize_live_crypto_environment --exchange-environment sandbox
+PYTHONPATH=. python3 -m scripts.initialize_live_crypto_environment \
+	--run-rehearsal \
+	--exchange-environment sandbox \
+	--actor operator:human \
+	--paper-account-id 905a408c-7d8e-4fc7-ad3b-9ff637005d73 \
+	--registration-source human_sandbox_initializer
+```
+
+Future VPS rehearsal command:
+
+```bash
+cd /home/eric/omnitrade-legacy-engine/apps/api
+export OT_COINBASE_SANDBOX_MOCK_MODE=true
+PYTHONPATH=. python3 -m scripts.initialize_live_crypto_environment \
+	--run-rehearsal \
+	--exchange-environment sandbox \
+	--actor operator:human \
+	--paper-account-id 905a408c-7d8e-4fc7-ad3b-9ff637005d73 \
+	--registration-source human_sandbox_initializer
 ```
 
 Safety boundaries:
 
 - mock mode is blocked for `exchange_environment=production`
+- rehearsal mode is blocked unless `--exchange-environment sandbox` is explicit
 - sandbox readiness is reported separately and never promotes production readiness to true
 - production submission flag remains disabled
 - no production `create_order` call is part of this workflow
+- preview, approval, dry-run evidence, and review remain environment-labeled and are rejected on production/sandbox crossover
+
+Prerequisites:
+
+- `LIVE_CRYPTO_ORDER_SUBMISSION_ENABLED=false`
+- `LIVE_CRYPTO_DRY_RUN_ENABLED=true`
+- `LIVE_CRYPTO_PREPARATION_ENABLED=true`
+- `LIVE_CRYPTO_MAX_ORDER_USD=5`
+- sandbox/mock environment only
+- no production Coinbase credential usage in this rehearsal
+
+Expected safe rehearsal output:
+
+- `rehearsal_mode=controlled_provider_mock` or `rehearsal_mode=coinbase_sandbox`
+- `preview_created=true|false`
+- `approval_created=true|false`
+- `preview_id=<uuid>`
+- `approval_event_id=<uuid>`
+- `live_crypto_order_id=<uuid>`
+- `audit_correlation_id=<uuid>`
+- `dry_run_status=DRY_RUN_READY|DRY_RUN_BLOCKED`
+- `review_summary=PASS|FAIL`
+- `production_ready=false`
+- `sandbox_rehearsal_only=true`
+
+Evidence-review command:
+
+```bash
+cd /home/eric/omnitrade-legacy-engine/apps/api
+PYTHONPATH=. python3 -m scripts.review_live_crypto_dry_run_evidence \
+	--live-crypto-order-id <live_crypto_order_id_from_rehearsal> \
+	--expected-environment sandbox \
+	--mission-control-range 24h
+```
+
+Cleanup policy:
+
+- do not delete rehearsal evidence by default
+- keep sandbox/provider-mock previews, approvals, dry-run order rows, and audit evidence for operator review
+- production evidence remains untouched and must be reviewed separately later
 
 What sandbox/provider-mock rehearsal proves:
 
@@ -552,6 +618,8 @@ What sandbox/provider-mock rehearsal proves:
 - explicit preview helper flow (`BTC-USD`, `BUY`, `$5`)
 - explicit approval helper flow (`first_live_enablement`)
 - dry-run and evidence-review procedure execution path
+- sandbox/mock Mission Control and operations-status separation from production
+- that production submission remained disabled during the rehearsal
 
 What it cannot prove:
 
@@ -559,6 +627,8 @@ What it cannot prove:
 - production USD funding and live account constraints
 - production-only broker-side behavior under real account conditions
 - completion of the production dry-run rung
+- that real Coinbase sandbox behavior matches production behavior under live broker conditions
+- that controlled mock responses prove provider-side execution semantics
 
 Production account recovery checklist (non-sensitive):
 
@@ -570,7 +640,7 @@ Production account recovery checklist (non-sensitive):
 6. Configure VPS IP allowlist if the provider supports it.
 7. Run production initializer inspection and apply.
 8. Run production read-only readiness verification.
-9. Run one production dry run and evidence review.
+9. Run one production dry run and evidence review after sandbox/provider-mock rehearsal is complete.
 10. Obtain operator sign-off on the production dry-run evidence.
 
 Expected inspection output shape:
@@ -588,6 +658,7 @@ Expected inspection output shape:
 Verification after apply:
 
 - rerun inspection mode and confirm only missing items were created
+- rerun rehearsal mode and confirm existing preview/approval/dry-run evidence is reused unless freshness requires regeneration
 - verify Mission Control / Operations status now includes `live_crypto_readiness` with explicit missing reasons when `ready=false`
 - verify live submission remains disabled (`LIVE_CRYPTO_ORDER_SUBMISSION_ENABLED=false`)
 - verify no previews were auto-created in `--apply` mode

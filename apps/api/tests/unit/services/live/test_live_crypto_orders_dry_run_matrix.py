@@ -36,6 +36,7 @@ class _DryRunFakeDb:
         profile: object,
         preview: object,
         connection: object,
+        approval_event: object,
         paper_account: object,
         campaign: object,
         asset: object,
@@ -45,6 +46,7 @@ class _DryRunFakeDb:
         self.profile = profile
         self.preview = preview
         self.connection = connection
+        self.approval_event = approval_event
         self.paper_account = paper_account
         self.campaign = campaign
         self.asset = asset
@@ -67,6 +69,9 @@ class _DryRunFakeDb:
         if "FROM exchange_connections" in sql:
             connection_id = params.get("exchange_connection_id_1")
             return self.connection if getattr(self.connection, "exchange_connection_id", None) == connection_id else None
+        if "FROM live_approval_events" in sql:
+            approval_id = params.get("id_1")
+            return self.approval_event if getattr(self.approval_event, "id", None) == approval_id else None
         if "FROM paper_accounts" in sql:
             account_id = params.get("paper_account_id_1") or params.get("id_1")
             return self.paper_account if getattr(self.paper_account, "id", None) == account_id else None
@@ -155,6 +160,8 @@ def _base_context(
     account_kill_switch_engaged: bool = False,
     live_trading_profile_id: UUID | None = None,
     preview_profile_id: UUID | None = None,
+    profile_environment: str = "production",
+    preview_environment: str = "production",
 ) -> tuple[_DryRunFakeDb, SimpleNamespace, SimpleNamespace, SimpleNamespace]:
     now = _now()
     profile = SimpleNamespace(
@@ -162,13 +169,14 @@ def _base_context(
         paper_account_id=uuid4(),
         operating_mode="live",
         lifecycle_state="enabled",
+        provenance_metadata={"exchange_environment": profile_environment, "registration_source": f"human_{profile_environment}_initializer"},
     )
     preview = SimpleNamespace(
         crypto_order_preview_id=uuid4(),
         live_trading_profile_id=preview_profile_id or profile.id,
         exchange_connection_id=uuid4(),
         provider="coinbase_advanced",
-        environment="production",
+        environment=preview_environment,
         product_id="BTC-USD",
         side="BUY",
         order_type="MARKET",
@@ -192,7 +200,7 @@ def _base_context(
     connection = SimpleNamespace(
         exchange_connection_id=preview.exchange_connection_id,
         provider="coinbase_advanced",
-        environment="production",
+        environment=preview_environment,
         credentials_encrypted="{}",
         api_key_masked="********1234",
         api_secret_masked="********",
@@ -207,12 +215,14 @@ def _base_context(
     paper_account = SimpleNamespace(id=profile.paper_account_id, current_cash_balance=Decimal("100"), starting_balance=Decimal("100"))
     campaign = SimpleNamespace(id=uuid4(), uuid=uuid4(), paper_account_id=paper_account.id, status=campaign_status, starting_capital=Decimal("25"), realized_profit=Decimal("0"))
     asset = SimpleNamespace(id=uuid4(), symbol="BTC", asset_class="crypto", is_active=True, min_order_notional=Decimal("0.01"), qty_step_size=Decimal("0.00000001"), supports_fractional=True)
+    approval_event = SimpleNamespace(id=_APPROVAL_EVENT_ID, approval_scope={"environment": preview_environment})
     global_switch = SimpleNamespace(scope="global", paper_account_id=None, engaged=global_kill_switch_engaged, rearm_required=False)
     account_switch = SimpleNamespace(scope="account", paper_account_id=paper_account.id, engaged=account_kill_switch_engaged, rearm_required=False)
     db = _DryRunFakeDb(
         profile=profile,
         preview=preview,
         connection=connection,
+        approval_event=approval_event,
         paper_account=paper_account,
         campaign=campaign,
         asset=asset,
@@ -519,6 +529,65 @@ async def test_dry_run_blocks_on_preview_ownership_profile_mismatch(monkeypatch:
     assert response.live_crypto_order.provider_order_id is None
     assert response.live_crypto_order.submitted_at is None
     assert response.live_crypto_order.acknowledged_at is None
+
+
+@pytest.mark.asyncio
+async def test_dry_run_rejects_sandbox_preview_with_production_profile(monkeypatch: pytest.MonkeyPatch) -> None:
+    db, profile, preview, _ = _base_context(profile_environment="production", preview_environment="sandbox")
+    _patch_common_success(monkeypatch)
+
+    response = await service.service.dry_run(
+        db=db,
+        request=service.LiveCryptoOrderDryRunRequest(
+            live_trading_profile_id=profile.id,
+            crypto_order_preview_id=preview.crypto_order_preview_id,
+            operator_identity="operator:human",
+            idempotency_token="token-sandbox-preview-prod-profile",
+        ),
+    )
+
+    assert response.dry_run_status == "DRY_RUN_BLOCKED"
+    assert "profile environment does not match preview environment" in response.live_crypto_order.failure_reason
+
+
+@pytest.mark.asyncio
+async def test_dry_run_rejects_production_preview_with_sandbox_profile(monkeypatch: pytest.MonkeyPatch) -> None:
+    db, profile, preview, _ = _base_context(profile_environment="sandbox", preview_environment="production")
+    _patch_common_success(monkeypatch)
+
+    response = await service.service.dry_run(
+        db=db,
+        request=service.LiveCryptoOrderDryRunRequest(
+            live_trading_profile_id=profile.id,
+            crypto_order_preview_id=preview.crypto_order_preview_id,
+            operator_identity="operator:human",
+            idempotency_token="token-prod-preview-sandbox-profile",
+        ),
+    )
+
+    assert response.dry_run_status == "DRY_RUN_BLOCKED"
+    assert "profile environment does not match preview environment" in response.live_crypto_order.failure_reason
+
+
+@pytest.mark.asyncio
+async def test_dry_run_records_sandbox_rehearsal_metadata(monkeypatch: pytest.MonkeyPatch) -> None:
+    db, profile, preview, _ = _base_context(profile_environment="sandbox", preview_environment="sandbox")
+    _patch_common_success(monkeypatch)
+
+    response = await service.service.dry_run(
+        db=db,
+        request=service.LiveCryptoOrderDryRunRequest(
+            live_trading_profile_id=profile.id,
+            crypto_order_preview_id=preview.crypto_order_preview_id,
+            operator_identity="operator:human",
+            idempotency_token="token-sandbox-metadata",
+        ),
+    )
+
+    safe = response.live_crypto_order.safe_provider_response
+    assert safe["exchange_environment"] == "sandbox"
+    assert safe["profile_environment"] == "sandbox"
+    assert safe["preview_environment"] == "sandbox"
 
 
 @pytest.mark.asyncio
