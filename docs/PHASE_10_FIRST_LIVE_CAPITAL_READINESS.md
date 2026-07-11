@@ -440,6 +440,67 @@ Success criteria:
 - the campaign and profit cycle values remain unchanged from the pre-run baseline
 - Mission Control includes the dry-run annotation and the safe response metadata
 
+### Production Initialization and Operational Readiness (Phase 10.7E)
+
+Use this command before any production-equivalent dry run when operational seed objects are missing.
+
+Inspection only (default, read-only):
+
+```bash
+cd /home/eric/omnitrade-legacy-engine/apps/api && PYTHONPATH=. python3 -m scripts.initialize_live_crypto_environment
+```
+
+Apply mode (create only missing objects):
+
+```bash
+cd /home/eric/omnitrade-legacy-engine/apps/api && PYTHONPATH=. python3 -m scripts.initialize_live_crypto_environment \
+	--apply \
+	--actor operator:human \
+	--exchange-api-key-name <coinbase_api_key_name> \
+	--exchange-private-key <coinbase_private_key> \
+	--exchange-passphrase <coinbase_passphrase_optional>
+```
+
+Explicit helper to generate a fresh preview (not automatic in apply mode):
+
+```bash
+cd /home/eric/omnitrade-legacy-engine/apps/api && PYTHONPATH=. python3 -m scripts.initialize_live_crypto_environment --create-preview
+```
+
+Explicit helper to record first-live-enablement approval (not automatic in apply mode):
+
+```bash
+cd /home/eric/omnitrade-legacy-engine/apps/api && PYTHONPATH=. python3 -m scripts.initialize_live_crypto_environment --create-approval
+```
+
+Expected inspection output shape:
+
+- `Database: READY/MISSING`
+- `Exchange: READY/MISSING`
+- `Trading Profile: READY/MISSING`
+- `Campaign: READY/MISSING`
+- `Asset: READY/MISSING`
+- `Preview: READY/MISSING`
+- `Approval: READY/MISSING`
+- `Dry Run: READY/MISSING`
+- `Overall Ready: true/false`
+
+Verification after apply:
+
+- rerun inspection mode and confirm only missing items were created
+- verify Mission Control / Operations status now includes `live_crypto_readiness` with explicit missing reasons when `ready=false`
+- verify live submission remains disabled (`LIVE_CRYPTO_ORDER_SUBMISSION_ENABLED=false`)
+- verify no previews were auto-created in `--apply` mode
+- verify no approvals were fabricated in `--apply` mode
+
+Safe rerun guarantees:
+
+- `--apply` is idempotent and only creates missing objects
+- existing exchange connection is not replaced
+- existing assets are not duplicated
+- existing profile and campaign are preserved
+- repeated runs do not enable submission flags and do not call provider `create_order`
+
 ---
 
 ## Workstream E — Controlled First Live Trade

@@ -10,6 +10,8 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.config import get_settings
 from app.models.paper_account import PaperAccount
 from app.schemas.operations import (
+    LiveCryptoReadinessItemResponse,
+    LiveCryptoReadinessResponse,
     OperationalAlertResponse,
     OperationalFreshnessItemResponse,
     OperationalFreshnessResponse,
@@ -19,6 +21,7 @@ from app.schemas.operations import (
     OperationalStatusResponse,
 )
 from app.services.data.ingestion_status import get_last_successful_ingestion_at
+from app.services.live_crypto_environment import inspect_live_crypto_environment
 from app.services.paper.accounting import build_account_snapshot
 from app.services.research_agents.openai.registry import get_openai_research_agent
 
@@ -57,6 +60,17 @@ async def build_operations_status(*, db: AsyncSession) -> OperationalStatusRespo
 
     alerts: list[OperationalAlertResponse] = []
     if not db_connected:
+        live_crypto_readiness = LiveCryptoReadinessResponse(
+            ready=False,
+            items=[
+                LiveCryptoReadinessItemResponse(
+                    key="database",
+                    label="Database",
+                    ready=False,
+                    detail="Database unavailable",
+                )
+            ],
+        )
         alerts.append(
             OperationalAlertResponse(
                 code="database_unavailable",
@@ -102,7 +116,30 @@ async def build_operations_status(*, db: AsyncSession) -> OperationalStatusRespo
                 trades_today=0,
                 research_memory_growth=0,
             ),
+            live_crypto_readiness=live_crypto_readiness,
             alerts=alerts,
+        )
+
+    live_crypto_state = await inspect_live_crypto_environment(db=db, exchange_environment="production")
+    live_crypto_readiness = LiveCryptoReadinessResponse(
+        ready=live_crypto_state.ready,
+        items=[
+            LiveCryptoReadinessItemResponse(
+                key=item.key,
+                label=item.label,
+                ready=item.ready,
+                detail=item.detail,
+            )
+            for item in live_crypto_state.items
+        ],
+    )
+    if not live_crypto_readiness.ready:
+        alerts.append(
+            OperationalAlertResponse(
+                code="live_crypto_not_ready",
+                severity="yellow",
+                message="Live crypto dry-run prerequisites are incomplete",
+            )
         )
 
     candles_processed = await _count(db=db, sql="SELECT COUNT(*) FROM candles")
@@ -285,6 +322,7 @@ async def build_operations_status(*, db: AsyncSession) -> OperationalStatusRespo
             trades_today=trades_today,
             research_memory_growth=research_memory_growth,
         ),
+        live_crypto_readiness=live_crypto_readiness,
         alerts=alerts,
     )
 

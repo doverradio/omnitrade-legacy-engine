@@ -42,12 +42,25 @@ class OperationalAlertResponse(BaseModel):
     message: str
 
 
+class LiveCryptoReadinessItemResponse(BaseModel):
+    key: str
+    label: str
+    ready: bool
+    detail: str
+
+
+class LiveCryptoReadinessResponse(BaseModel):
+    ready: bool
+    items: list[LiveCryptoReadinessItemResponse]
+
+
 class OperationalStatusResponse(BaseModel):
     overall_health: str
     run_status: OperationalRunStatusResponse
     system_health: dict[str, OperationalHealthIndicatorResponse]
     research_status: dict[str, str | int | None]
     monitoring: OperationalMonitoringResponse
+    live_crypto_readiness: LiveCryptoReadinessResponse
     alerts: list[OperationalAlertResponse]
 
 

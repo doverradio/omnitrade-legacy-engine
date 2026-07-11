@@ -111,6 +111,10 @@ def test_operations_status_heartbeat_endpoint_returns_shape() -> None:
     for metric in required_metrics:
         assert metric in monitoring
 
+    assert "live_crypto_readiness" in payload
+    assert "ready" in payload["live_crypto_readiness"]
+    assert "items" in payload["live_crypto_readiness"]
+
 
 def test_compute_uptime_formats_elapsed_time_without_negative_values() -> None:
     started_at = datetime(2026, 7, 9, 12, 0, tzinfo=timezone.utc)

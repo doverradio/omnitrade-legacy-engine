@@ -223,3 +223,28 @@ def test_dry_run_evidence_review_helper_cannot_call_create_order_or_mutate_envir
                         env_mutations.append("os.environ assignment")
 
     assert not env_mutations, "Dry-run evidence review helper must not mutate environment flags: " + ", ".join(env_mutations)
+
+
+def test_initializer_entrypoint_cannot_call_create_order_or_mutate_environment_flags() -> None:
+    script_file = _APP_ROOT.parent / "scripts" / "initialize_live_crypto_environment.py"
+    tree = ast.parse(script_file.read_text(), filename=str(script_file))
+
+    called_names = {
+        name
+        for name in (_called_symbol_name(node) for node in ast.walk(tree) if isinstance(node, ast.Call))
+        if name is not None
+    }
+    assert "create_order" not in called_names, "Initializer script must not call create_order"
+
+    env_mutations: list[str] = []
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute):
+            if node.func.attr in {"setenv", "putenv"}:
+                env_mutations.append(node.func.attr)
+        if isinstance(node, ast.Assign):
+            for target in node.targets:
+                if isinstance(target, ast.Subscript) and isinstance(target.value, ast.Attribute):
+                    if isinstance(target.value.value, ast.Name) and target.value.value.id == "os" and target.value.attr == "environ":
+                        env_mutations.append("os.environ assignment")
+
+    assert not env_mutations, "Initializer script must not mutate environment flags: " + ", ".join(env_mutations)
