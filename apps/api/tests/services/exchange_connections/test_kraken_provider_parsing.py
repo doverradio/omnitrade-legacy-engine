@@ -4,6 +4,7 @@ import base64
 import hashlib
 import hmac
 from decimal import Decimal
+from types import SimpleNamespace
 import urllib.parse
 
 import pytest
@@ -265,3 +266,90 @@ async def test_kraken_public_request_uses_versioned_uri_path(monkeypatch: pytest
     await client._public_request(path="/public/Time", environment="production", params=None)
     assert captured["base_url"] == "https://api.kraken.com"
     assert captured["path"] == "/0/public/Time"
+
+
+@pytest.mark.asyncio
+async def test_kraken_private_invalid_signature_includes_safe_forensics(monkeypatch: pytest.MonkeyPatch) -> None:
+    client = KrakenSpotClient()
+
+    class _FakeResponse:
+        status_code = 200
+        text = '{"error":["EAPI:Invalid signature"],"result":{}}'
+
+        def __init__(self) -> None:
+            self.extensions = {"http_version": b"HTTP/1.1"}
+            self.history = []
+            self.request = SimpleNamespace(
+                url=SimpleNamespace(path="/0/private/Balance", scheme="https", host="api.kraken.com", query=""),
+                content=b"nonce=1700000000000",
+                headers={"Content-Type": "application/x-www-form-urlencoded"},
+            )
+
+        def json(self):
+            return {"error": ["EAPI:Invalid signature"], "result": {}}
+
+    class _FakeAsyncClient:
+        def __init__(self, *, base_url, timeout):
+            _ = base_url, timeout
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exc_type, exc, tb):
+            return False
+
+        async def post(self, path, content, headers):
+            _ = path, content, headers
+            return _FakeResponse()
+
+    monkeypatch.setattr("app.services.exchange_connections.providers.kraken_spot.httpx.AsyncClient", _FakeAsyncClient)
+
+    async def _next_nonce() -> str:
+        return "1700000000000"
+
+    monkeypatch.setattr(client, "_next_nonce", _next_nonce)
+
+    with pytest.raises(InvalidRequestError) as exc_info:
+        await client._private_request(
+            path="/private/Balance",
+            environment="production",
+            credentials={
+                "api_key": "public-key",
+                "api_secret": "kQH5HW/8p1uGOVjbgWA7FunAmGO8lsSUXNsu3eow76sz84Q18fWxnyRzBHCd3pd5nE9qa99HAZtuZuj6F1huXg==",
+                "passphrase": "",
+            },
+            payload={},
+        )
+
+    details = exc_info.value.details
+    assert isinstance(details, dict)
+    forensics = details.get("forensics")
+    assert isinstance(forensics, dict)
+    assert forensics["kraken_signed_http_method"] == "POST"
+    assert forensics["kraken_signed_uri_path"] == "/0/private/Balance"
+    assert forensics["kraken_transmitted_uri_path"] == "/0/private/Balance"
+    assert forensics["kraken_signed_path_equals_transmitted"] is True
+    assert forensics["kraken_signed_body_equals_transmitted"] is True
+    assert forensics["kraken_signed_nonce_equals_transmitted"] is True
+    assert forensics["kraken_content_type_matches"] is True
+    assert forensics["kraken_api_key_header_present"] is True
+    assert forensics["kraken_api_sign_header_present"] is True
+    assert forensics["kraken_nonce_field_present"] is True
+    assert forensics["kraken_post_form_encoded"] is True
+    assert forensics["kraken_json_payload_used"] is False
+    assert forensics["kraken_url_query_parameters_present"] is False
+    assert forensics["kraken_signature_lengths_equal"] is True
+    assert forensics["kraken_signature_bytes_equal"] is True
+    assert forensics["kraken_first_differing_stage"] is None
+    assert forensics["kraken_body_serialization_matches"] is True
+    assert forensics["kraken_uri_contract_matches"] is True
+    assert forensics["kraken_nonce_generated_and_signed_match"] is True
+    assert forensics["kraken_nonce_signed_and_transmitted_match"] is True
+    assert forensics["kraken_nonce_monotonic"] is True
+    assert isinstance(forensics.get("kraken_contract_checks"), list)
+    assert all(item.get("implementation_matches") is True for item in forensics["kraken_contract_checks"])
+
+    serialized = str(forensics)
+    assert "public-key" not in serialized
+    assert "kQH5HW" not in serialized
+    assert "API-Sign" not in serialized

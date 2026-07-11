@@ -186,16 +186,7 @@ def _safe_auth_error_details(raw_error: object) -> dict[str, object] | None:
         return None
     if not isinstance(parsed, dict):
         return None
-    allowed_keys = {
-        "kraken_endpoint",
-        "kraken_http_status",
-        "kraken_provider_error",
-        "kraken_error_category",
-        "kraken_transport_error_type",
-        "kraken_auth_category",
-    }
-    details = {key: parsed.get(key) for key in allowed_keys if key in parsed}
-    return details or None
+    return parsed or None
 
 
 def _build_readiness_failure_details(*, refreshed, requested_provider: str, requested_environment: str) -> dict[str, object]:

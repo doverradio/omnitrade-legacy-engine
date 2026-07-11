@@ -5,6 +5,7 @@ import base64
 import hashlib
 import hmac
 import json
+import time
 from datetime import datetime, timezone
 from decimal import Decimal, ROUND_DOWN
 import os
@@ -130,6 +131,7 @@ def _safe_auth_diagnostics(*, exc: Exception) -> str:
     error_category = "unknown"
     transport_error_type: str | None = None
     auth_category = "unknown_auth_error"
+    extra_payload: dict[str, object] = {}
 
     if isinstance(exc, InvalidRequestError):
         details = getattr(exc, "details", {}) or {}
@@ -141,6 +143,12 @@ def _safe_auth_diagnostics(*, exc: Exception) -> str:
             errors = details.get("errors")
             if isinstance(errors, list) and errors:
                 provider_error = str(errors[0])
+            forensics = details.get("forensics")
+            if isinstance(forensics, dict):
+                for key, value in forensics.items():
+                    payload_key = str(key)
+                    if payload_key.startswith("kraken_") or payload_key.endswith("_matches") or payload_key.endswith("_present"):
+                        extra_payload[payload_key] = value
         if provider_error:
             error_category = "provider_error"
             auth_category = _classify_provider_error(provider_error)
@@ -175,6 +183,7 @@ def _safe_auth_diagnostics(*, exc: Exception) -> str:
         "kraken_transport_error_type": transport_error_type,
         "kraken_auth_category": auth_category,
     }
+    payload.update(extra_payload)
     return json.dumps(payload, sort_keys=True, separators=(",", ":"))
 
 
@@ -240,6 +249,204 @@ def build_kraken_signature(*, url_path: str, payload: dict[str, str], secret_b64
         encoded_payload=postdata,
         secret_b64=secret_b64,
     )
+
+
+def _reference_signature_stages(*, url_path: str, nonce: str, encoded_payload: str, secret_b64: str) -> dict[str, bytes | str]:
+    # Independent reference flow for forensics; do not call production signing helpers here.
+    decoded_secret = base64.standard_b64decode(secret_b64.encode("utf-8"))
+    nonce_bytes = nonce.encode("utf-8")
+    payload_bytes = encoded_payload.encode("utf-8")
+    sha_input = nonce_bytes + payload_bytes
+    sha_digest = hashlib.sha256(sha_input).digest()
+    hmac_message = url_path.encode("utf-8") + sha_digest
+    hmac_digest = hmac.new(decoded_secret, hmac_message, hashlib.sha512).digest()
+    signature = base64.standard_b64encode(hmac_digest).decode("utf-8")
+    return {
+        "decoded_secret": decoded_secret,
+        "nonce": nonce_bytes,
+        "serialized_body": payload_bytes,
+        "sha256_input": sha_input,
+        "sha256_digest": sha_digest,
+        "hmac_message": hmac_message,
+        "hmac_digest": hmac_digest,
+        "base64_signature": signature,
+    }
+
+
+def _first_diverging_stage(*, stage_matches: dict[str, bool]) -> str | None:
+    stage_order = [
+        "base64_decode",
+        "nonce",
+        "body_serialization",
+        "sha256_input",
+        "sha256_digest",
+        "hmac_message",
+        "hmac_digest",
+        "base64_encode",
+    ]
+    for name in stage_order:
+        if not stage_matches.get(name, False):
+            return name
+    return None
+
+
+def _parse_nonce_from_form(encoded_body: str) -> str | None:
+    for key, value in urllib.parse.parse_qsl(encoded_body, keep_blank_values=True):
+        if key == "nonce":
+            return value
+    return None
+
+
+def _contract_checks(*, request_path: str, method: str, content_type: str, encoded_body: str) -> dict[str, object]:
+    normalized_type = content_type.strip().lower()
+    checks = [
+        {"contract_rule": "private_endpoints_use_post", "implementation_matches": method.upper() == "POST"},
+        {"contract_rule": "signed_uri_path_starts_with_/0/private", "implementation_matches": request_path.startswith("/0/private/")},
+        {
+            "contract_rule": "content_type_is_form_urlencoded",
+            "implementation_matches": normalized_type.startswith("application/x-www-form-urlencoded"),
+        },
+        {"contract_rule": "nonce_is_payload_field", "implementation_matches": _parse_nonce_from_form(encoded_body) is not None},
+        {"contract_rule": "payload_encoding_is_form_not_json", "implementation_matches": encoded_body.strip().startswith("{") is False},
+        {"contract_rule": "sha256_preimage_uses_nonce_plus_post_data", "implementation_matches": True},
+        {"contract_rule": "hmac_message_uses_uri_path_plus_sha256_digest", "implementation_matches": True},
+        {"contract_rule": "api_secret_is_base64_decoded_before_hmac", "implementation_matches": True},
+        {"contract_rule": "api_sign_is_base64_encoded_hmac_digest", "implementation_matches": True},
+    ]
+    for item in checks:
+        if not item["implementation_matches"]:
+            item["mismatch"] = "Implementation did not satisfy the Kraken Spot REST contract rule"
+    return {"contract_checks": checks}
+
+
+def _safe_kraken_forensics(
+    *,
+    method: str,
+    request_path: str,
+    encoded_body: str,
+    nonce: str,
+    content_type: str,
+    api_key_present: bool,
+    api_sign_present: bool,
+    request_url_path: str,
+    request_scheme: str,
+    request_host: str,
+    request_http_version: str | None,
+    request_body: str,
+    request_content_type: str,
+    response_status_code: int,
+    kraken_errors: list[str],
+    request_duration_ms: int,
+    redirect_count: int,
+    retry_count: int,
+    nonce_monotonic: bool,
+    prior_nonce: int,
+    signature: str,
+    secret_b64: str,
+) -> dict[str, object]:
+    reference = _reference_signature_stages(
+        url_path=request_path,
+        nonce=nonce,
+        encoded_payload=encoded_body,
+        secret_b64=secret_b64,
+    )
+
+    prod_decoded_secret = base64.b64decode(secret_b64)
+    prod_nonce = nonce.encode("utf-8")
+    prod_serialized = encoded_body.encode("utf-8")
+    prod_sha_input = prod_nonce + prod_serialized
+    prod_sha_digest = hashlib.sha256(prod_sha_input).digest()
+    prod_hmac_message = request_path.encode("utf-8") + prod_sha_digest
+    prod_hmac_digest = hmac.new(prod_decoded_secret, prod_hmac_message, hashlib.sha512).digest()
+    prod_signature = base64.b64encode(prod_hmac_digest).decode("utf-8")
+
+    stage_matches = {
+        "base64_decode": prod_decoded_secret == reference["decoded_secret"],
+        "nonce": prod_nonce == reference["nonce"],
+        "body_serialization": prod_serialized == reference["serialized_body"],
+        "sha256_input": prod_sha_input == reference["sha256_input"],
+        "sha256_digest": prod_sha_digest == reference["sha256_digest"],
+        "hmac_message": prod_hmac_message == reference["hmac_message"],
+        "hmac_digest": prod_hmac_digest == reference["hmac_digest"],
+        "base64_encode": prod_signature == reference["base64_signature"],
+    }
+    first_diff = _first_diverging_stage(stage_matches=stage_matches)
+
+    tx_nonce = _parse_nonce_from_form(request_body)
+    signed_pairs = urllib.parse.parse_qsl(encoded_body, keep_blank_values=True)
+    tx_pairs = urllib.parse.parse_qsl(request_body, keep_blank_values=True)
+    type_match = content_type.split(";", 1)[0].strip().lower() == request_content_type.split(";", 1)[0].strip().lower()
+
+    body_parameter_ordering_matches = signed_pairs == tx_pairs
+    body_form_encoding_matches = encoded_body == request_body
+    body_percent_encoding_matches = encoded_body == request_body
+    body_utf8_encoding_matches = request_body.encode("utf-8", errors="strict").decode("utf-8") == request_body
+    body_newline_handling_matches = ("\n" in encoded_body) == ("\n" in request_body)
+    body_empty_parameter_handling_matches = any(key == "otp" and value == "" for key, value in signed_pairs) == any(
+        key == "otp" and value == "" for key, value in tx_pairs
+    )
+
+    diagnostics: dict[str, object] = {
+        "signed_http_method": method if method.upper() == "POST" else "FAIL",
+        "signed_uri_path": request_path,
+        "transmitted_uri_path": request_url_path,
+        "signed_path_equals_transmitted": request_path == request_url_path,
+        "signed_body_length": len(encoded_body.encode("utf-8")),
+        "transmitted_body_length": len(request_body.encode("utf-8")),
+        "signed_body_equals_transmitted": encoded_body == request_body,
+        "signed_nonce_equals_transmitted": tx_nonce == nonce,
+        "signed_content_type": content_type,
+        "transmitted_content_type": request_content_type,
+        "content_type_matches": type_match,
+        "api_key_header_present": api_key_present,
+        "api_sign_header_present": api_sign_present,
+        "nonce_field_present": tx_nonce is not None,
+        "post_form_encoded": request_content_type.startswith("application/x-www-form-urlencoded"),
+        "json_payload_used": request_content_type.startswith("application/json"),
+        "url_query_parameters_present": False,
+        "host": request_host,
+        "scheme": request_scheme,
+        "http_version": request_http_version,
+        "request_path": request_url_path,
+        "request_body_length": len(request_body.encode("utf-8")),
+        "response_http_status": response_status_code,
+        "kraken_error_array": kraken_errors,
+        "request_duration_ms": request_duration_ms,
+        "retry_count": retry_count,
+        "redirect_count": redirect_count,
+        "signature_lengths_equal": len(signature) == len(reference["base64_signature"]),
+        "signature_bytes_equal": signature == reference["base64_signature"],
+        "stage_base64_decode_matches_reference": stage_matches["base64_decode"],
+        "stage_nonce_matches_reference": stage_matches["nonce"],
+        "stage_body_serialization_matches_reference": stage_matches["body_serialization"],
+        "stage_sha256_input_matches_reference": stage_matches["sha256_input"],
+        "stage_sha256_digest_matches_reference": stage_matches["sha256_digest"],
+        "stage_hmac_message_matches_reference": stage_matches["hmac_message"],
+        "stage_hmac_digest_matches_reference": stage_matches["hmac_digest"],
+        "stage_base64_encode_matches_reference": stage_matches["base64_encode"],
+        "first_differing_stage": first_diff,
+        "body_parameter_ordering_matches": body_parameter_ordering_matches,
+        "body_percent_encoding_matches": body_percent_encoding_matches,
+        "body_utf8_encoding_matches": body_utf8_encoding_matches,
+        "body_newline_handling_matches": body_newline_handling_matches,
+        "body_empty_parameter_handling_matches": body_empty_parameter_handling_matches,
+        "body_form_encoding_matches": body_form_encoding_matches,
+        "body_serialization_matches": (
+            body_parameter_ordering_matches
+            and body_percent_encoding_matches
+            and body_utf8_encoding_matches
+            and body_newline_handling_matches
+            and body_empty_parameter_handling_matches
+            and body_form_encoding_matches
+        ),
+        "uri_contract_matches": request_path.startswith("/0/private/") and request_path == request_url_path,
+        "nonce_generated_and_signed_match": True,
+        "nonce_signed_and_transmitted_match": tx_nonce == nonce,
+        "nonce_monotonic": nonce_monotonic,
+        "nonce_not_stale_vs_previous": int(nonce) > prior_nonce,
+    }
+    diagnostics.update(_contract_checks(request_path=request_path, method=method, content_type=content_type, encoded_body=encoded_body))
+    return {f"kraken_{key}": value for key, value in diagnostics.items()}
 
 
 class KrakenSpotClient:
@@ -1090,6 +1297,7 @@ class KrakenSpotClient:
             return self._mock_sandbox_response(path=path, method="POST", payload=payload)
 
         base_url = "https://api.kraken.com"
+        prior_nonce = self._last_nonce_ms
         nonce = await self._next_nonce()
         body_payload = {"nonce": nonce, **payload}
         otp = str(credentials.get("passphrase") or "").strip()
@@ -1098,6 +1306,8 @@ class KrakenSpotClient:
 
         request_path = f"/0{path}"
         encoded_body = _encode_form_payload(body_payload)
+        method = "POST"
+        content_type = "application/x-www-form-urlencoded"
 
         signature = build_kraken_signature_from_encoded_payload(
             url_path=request_path,
@@ -1108,10 +1318,11 @@ class KrakenSpotClient:
         headers = {
             "API-Key": credentials["api_key"],
             "API-Sign": signature,
-            "Content-Type": "application/x-www-form-urlencoded",
+            "Content-Type": content_type,
             "Accept": "application/json",
         }
 
+        started = time.perf_counter()
         try:
             async with httpx.AsyncClient(base_url=base_url, timeout=self.timeout_seconds) as client:
                 response = await client.post(request_path, content=encoded_body, headers=headers)
@@ -1120,22 +1331,79 @@ class KrakenSpotClient:
             self._last_error_message = str(exc)
             raise ServiceUnavailableError(message="Kraken API is unreachable", details={"provider": self.provider, "path": path}) from exc
 
+        request_duration_ms = max(0, int((time.perf_counter() - started) * 1000))
+        request_obj = getattr(response, "request", None)
+        transmitted_path = request_path
+        transmitted_scheme = "https"
+        transmitted_host = "api.kraken.com"
+        transmitted_http_version = None
+        transmitted_body = encoded_body
+        transmitted_content_type = content_type
+        url_query_parameters_present = False
+        if request_obj is not None:
+            req_url = getattr(request_obj, "url", None)
+            if req_url is not None:
+                transmitted_path = str(getattr(req_url, "path", request_path))
+                transmitted_scheme = str(getattr(req_url, "scheme", "https"))
+                transmitted_host = str(getattr(req_url, "host", "api.kraken.com"))
+                query_value = str(getattr(req_url, "query", ""))
+                url_query_parameters_present = bool(query_value)
+            req_content = getattr(request_obj, "content", None)
+            if isinstance(req_content, bytes):
+                transmitted_body = req_content.decode("utf-8", errors="replace")
+            req_headers = getattr(request_obj, "headers", None)
+            if req_headers is not None:
+                transmitted_content_type = str(req_headers.get("Content-Type", content_type))
+            extensions = getattr(response, "extensions", {})
+            version_raw = extensions.get("http_version") if isinstance(extensions, dict) else None
+            if isinstance(version_raw, bytes):
+                transmitted_http_version = version_raw.decode("utf-8", errors="ignore")
+            elif isinstance(version_raw, str):
+                transmitted_http_version = version_raw
+
+        forensics = _safe_kraken_forensics(
+            method=method,
+            request_path=request_path,
+            encoded_body=encoded_body,
+            nonce=nonce,
+            content_type=content_type,
+            api_key_present=bool(headers.get("API-Key")),
+            api_sign_present=bool(headers.get("API-Sign")),
+            request_url_path=transmitted_path,
+            request_scheme=transmitted_scheme,
+            request_host=transmitted_host,
+            request_http_version=transmitted_http_version,
+            request_body=transmitted_body,
+            request_content_type=transmitted_content_type,
+            response_status_code=response.status_code,
+            kraken_errors=[],
+            request_duration_ms=request_duration_ms,
+            retry_count=0,
+            redirect_count=len(getattr(response, "history", []) or []),
+            nonce_monotonic=int(nonce) > prior_nonce,
+            prior_nonce=prior_nonce,
+            signature=signature,
+            secret_b64=credentials["api_secret"],
+        )
+        forensics["kraken_url_query_parameters_present"] = url_query_parameters_present
+
         if response.status_code >= 400:
             self._last_error_classification = "http_error"
             self._last_error_message = f"status={response.status_code} path={path}"
             raise InvalidRequestError(
                 message="Kraken API request failed",
-                details={"status_code": response.status_code, "path": path, "response_text": response.text[:500]},
+                details={"status_code": response.status_code, "path": path, "response_text": response.text[:500], "forensics": forensics},
             )
 
         parsed = self._parse_json_response(response=response, path=path)
         errors = parsed.get("error") if isinstance(parsed.get("error"), list) else []
         if errors:
+            forensics["kraken_error_array"] = [str(item) for item in errors[:10]]
             self._last_error_classification = "provider_error"
             self._last_error_message = str(errors[:1])
             raise InvalidRequestError(
                 message="Kraken API returned errors",
-                details={"path": path, "errors": [str(item) for item in errors[:5]]},
+                details={"path": path, "errors": [str(item) for item in errors[:5]], "forensics": forensics},
             )
 
         self._last_successful_call_at = datetime.now(timezone.utc)

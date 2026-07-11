@@ -338,6 +338,69 @@ async def _run(args: argparse.Namespace) -> int:
                     provider_error = auth.get("kraken_provider_error")
                     if isinstance(provider_error, str) and provider_error.strip():
                         print(f"kraken_provider_error={provider_error.strip()}")
+                    forensic_keys = [
+                        "kraken_signed_http_method",
+                        "kraken_signed_uri_path",
+                        "kraken_transmitted_uri_path",
+                        "kraken_signed_path_equals_transmitted",
+                        "kraken_signed_body_length",
+                        "kraken_transmitted_body_length",
+                        "kraken_signed_body_equals_transmitted",
+                        "kraken_signed_nonce_equals_transmitted",
+                        "kraken_signed_content_type",
+                        "kraken_transmitted_content_type",
+                        "kraken_content_type_matches",
+                        "kraken_api_key_header_present",
+                        "kraken_api_sign_header_present",
+                        "kraken_nonce_field_present",
+                        "kraken_post_form_encoded",
+                        "kraken_json_payload_used",
+                        "kraken_url_query_parameters_present",
+                        "kraken_signature_lengths_equal",
+                        "kraken_signature_bytes_equal",
+                        "kraken_stage_base64_decode_matches_reference",
+                        "kraken_stage_nonce_matches_reference",
+                        "kraken_stage_body_serialization_matches_reference",
+                        "kraken_stage_sha256_input_matches_reference",
+                        "kraken_stage_sha256_digest_matches_reference",
+                        "kraken_stage_hmac_message_matches_reference",
+                        "kraken_stage_hmac_digest_matches_reference",
+                        "kraken_stage_base64_encode_matches_reference",
+                        "kraken_first_differing_stage",
+                        "kraken_body_serialization_matches",
+                        "kraken_uri_contract_matches",
+                        "kraken_nonce_generated_and_signed_match",
+                        "kraken_nonce_signed_and_transmitted_match",
+                        "kraken_nonce_monotonic",
+                        "kraken_nonce_not_stale_vs_previous",
+                        "kraken_host",
+                        "kraken_scheme",
+                        "kraken_http_version",
+                        "kraken_request_path",
+                        "kraken_request_body_length",
+                        "kraken_response_http_status",
+                        "kraken_request_duration_ms",
+                        "kraken_retry_count",
+                        "kraken_redirect_count",
+                    ]
+                    for key in forensic_keys:
+                        if key not in auth:
+                            continue
+                        value = auth.get(key)
+                        if isinstance(value, bool):
+                            print(f"{key}={str(value).lower()}")
+                        else:
+                            print(f"{key}={value}")
+                    contract_checks = auth.get("kraken_contract_checks")
+                    if isinstance(contract_checks, list):
+                        for index, item in enumerate(contract_checks, start=1):
+                            if not isinstance(item, dict):
+                                continue
+                            rule = str(item.get("contract_rule", "unknown"))
+                            matches = item.get("implementation_matches")
+                            if isinstance(matches, bool):
+                                print(f"contract_rule_{index}={rule}")
+                                print(f"implementation_matches_{index}={str(matches).lower()}")
                 api_match = readiness_details.get("stored_api_key_matches_env")
                 if isinstance(api_match, bool):
                     print(f"stored_api_key_matches_env={str(api_match).lower()}")
