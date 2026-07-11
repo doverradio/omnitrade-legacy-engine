@@ -26,6 +26,11 @@ class _DummySession:
     pass
 
 
+class _QueryableDummySession:
+    async def execute(self, *_args, **_kwargs):
+        return None
+
+
 def _operations_status(*, alert_count: int = 0, orchestrator_state: str = "green") -> OperationalStatusResponse:
     alerts = [OperationalAlertResponse(code=f"alert-{index}", severity="yellow", message="Worker restart") for index in range(alert_count)]
     return OperationalStatusResponse(
@@ -86,6 +91,13 @@ def _validation_run() -> ValidationRunResponse:
         health_score=88,
         result_status="INCOMPLETE",
     )
+
+
+def _validation_run_with_id(run_id: str) -> ValidationRunResponse:
+    run = _validation_run()
+    payload = run.model_dump()
+    payload["validation_run_id"] = uuid.UUID(run_id)
+    return ValidationRunResponse(**payload)
 
 
 def _events() -> ValidationRunEventListResponse:
@@ -206,6 +218,162 @@ async def test_build_mission_control_intelligence_handles_empty_inputs(monkeypat
     assert result.timeline_events
     assert result.history == sorted(result.history, key=lambda item: item.timestamp)
     assert result.notes.startswith("Mission Control Intelligence Center V1")
+
+
+@pytest.mark.asyncio
+async def test_timeline_pnl_uses_bound_paper_account_baseline_for_25_run(monkeypatch: pytest.MonkeyPatch) -> None:
+    async def _bound_stub(**_kwargs):
+        return Decimal("25"), Decimal("25"), 1
+
+    async def _campaign_stub(**_kwargs):
+        return None
+
+    async def _active_stub(**_kwargs):
+        return None
+
+    monkeypatch.setattr(service, "_bound_accounts_equity_and_baseline", _bound_stub)
+    monkeypatch.setattr(service, "_campaign_equity_and_baseline", _campaign_stub)
+    monkeypatch.setattr(service, "_latest_active_account_equity_and_baseline", _active_stub)
+
+    equity, pnl, metadata = await service._resolve_timeline_equity_and_pnl(
+        db=_QueryableDummySession(),
+        selected_validation_run=_validation_run_with_id("aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa"),
+        fallback_equity="25.00",
+    )
+
+    assert equity == "25.00"
+    assert pnl == "0.00"
+    assert metadata["paper_pnl_source"] == "bound_paper_account"
+
+
+@pytest.mark.asyncio
+async def test_timeline_pnl_supports_legacy_100k_run_when_bound_evidence_exists(monkeypatch: pytest.MonkeyPatch) -> None:
+    async def _bound_stub(**_kwargs):
+        return Decimal("100500"), Decimal("100000"), 1
+
+    async def _campaign_stub(**_kwargs):
+        return None
+
+    async def _active_stub(**_kwargs):
+        return None
+
+    monkeypatch.setattr(service, "_bound_accounts_equity_and_baseline", _bound_stub)
+    monkeypatch.setattr(service, "_campaign_equity_and_baseline", _campaign_stub)
+    monkeypatch.setattr(service, "_latest_active_account_equity_and_baseline", _active_stub)
+
+    equity, pnl, metadata = await service._resolve_timeline_equity_and_pnl(
+        db=_QueryableDummySession(),
+        selected_validation_run=_validation_run_with_id("bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb"),
+        fallback_equity="25.00",
+    )
+
+    assert equity == "100500.00"
+    assert pnl == "500.00"
+    assert metadata["paper_pnl_source"] == "bound_paper_account"
+
+
+@pytest.mark.asyncio
+async def test_timeline_pnl_supports_two_simultaneous_25_runs(monkeypatch: pytest.MonkeyPatch) -> None:
+    async def _bound_stub(**_kwargs):
+        return Decimal("50"), Decimal("50"), 2
+
+    async def _campaign_stub(**_kwargs):
+        return None
+
+    async def _active_stub(**_kwargs):
+        return None
+
+    monkeypatch.setattr(service, "_bound_accounts_equity_and_baseline", _bound_stub)
+    monkeypatch.setattr(service, "_campaign_equity_and_baseline", _campaign_stub)
+    monkeypatch.setattr(service, "_latest_active_account_equity_and_baseline", _active_stub)
+
+    equity, pnl, metadata = await service._resolve_timeline_equity_and_pnl(
+        db=_QueryableDummySession(),
+        selected_validation_run=_validation_run_with_id("cccccccc-cccc-cccc-cccc-cccccccccccc"),
+        fallback_equity="25.00",
+    )
+
+    assert equity == "50.00"
+    assert pnl == "0.00"
+    assert metadata["paper_pnl_bound_account_count"] == 2
+
+
+@pytest.mark.asyncio
+async def test_timeline_pnl_uses_campaign_linked_capital_when_account_binding_missing(monkeypatch: pytest.MonkeyPatch) -> None:
+    async def _bound_stub(**_kwargs):
+        return None
+
+    async def _campaign_stub(**_kwargs):
+        return Decimal("30"), Decimal("25"), 1
+
+    async def _active_stub(**_kwargs):
+        return None
+
+    monkeypatch.setattr(service, "_bound_accounts_equity_and_baseline", _bound_stub)
+    monkeypatch.setattr(service, "_campaign_equity_and_baseline", _campaign_stub)
+    monkeypatch.setattr(service, "_latest_active_account_equity_and_baseline", _active_stub)
+
+    equity, pnl, metadata = await service._resolve_timeline_equity_and_pnl(
+        db=_QueryableDummySession(),
+        selected_validation_run=_validation_run_with_id("dddddddd-dddd-dddd-dddd-dddddddddddd"),
+        fallback_equity="25.00",
+    )
+
+    assert equity == "30.00"
+    assert pnl == "5.00"
+    assert metadata["paper_pnl_source"] == "campaign_opening_capital"
+
+
+@pytest.mark.asyncio
+async def test_timeline_pnl_falls_back_to_active_account_when_binding_is_missing(monkeypatch: pytest.MonkeyPatch) -> None:
+    async def _bound_stub(**_kwargs):
+        return None
+
+    async def _campaign_stub(**_kwargs):
+        return None
+
+    async def _active_stub(**_kwargs):
+        return Decimal("25"), Decimal("25"), uuid.UUID("eeeeeeee-eeee-eeee-eeee-eeeeeeeeeeee")
+
+    monkeypatch.setattr(service, "_bound_accounts_equity_and_baseline", _bound_stub)
+    monkeypatch.setattr(service, "_campaign_equity_and_baseline", _campaign_stub)
+    monkeypatch.setattr(service, "_latest_active_account_equity_and_baseline", _active_stub)
+
+    equity, pnl, metadata = await service._resolve_timeline_equity_and_pnl(
+        db=_QueryableDummySession(),
+        selected_validation_run=_validation_run_with_id("ffffffff-ffff-ffff-ffff-ffffffffffff"),
+        fallback_equity="25.00",
+    )
+
+    assert equity == "25.00"
+    assert pnl == "0.00"
+    assert metadata["paper_pnl_status"] == "fallback_unbound"
+
+
+@pytest.mark.asyncio
+async def test_timeline_pnl_marks_unresolved_when_no_evidence_is_available(monkeypatch: pytest.MonkeyPatch) -> None:
+    async def _bound_stub(**_kwargs):
+        return None
+
+    async def _campaign_stub(**_kwargs):
+        return None
+
+    async def _active_stub(**_kwargs):
+        return None
+
+    monkeypatch.setattr(service, "_bound_accounts_equity_and_baseline", _bound_stub)
+    monkeypatch.setattr(service, "_campaign_equity_and_baseline", _campaign_stub)
+    monkeypatch.setattr(service, "_latest_active_account_equity_and_baseline", _active_stub)
+
+    equity, pnl, metadata = await service._resolve_timeline_equity_and_pnl(
+        db=_QueryableDummySession(),
+        selected_validation_run=_validation_run_with_id("11111111-2222-3333-4444-555555555555"),
+        fallback_equity="25.00",
+    )
+
+    assert equity == "25.00"
+    assert pnl is None
+    assert metadata["paper_pnl_status"] == "baseline_unresolved"
 
 
 def test_managed_capital_calculation_no_campaigns() -> None:

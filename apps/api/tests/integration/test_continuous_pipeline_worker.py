@@ -392,6 +392,59 @@ async def test_worker_logs_early_continue_reasons(
 
 
 @pytest.mark.asyncio
+async def test_worker_records_research_cycle_started_in_stats(monkeypatch: pytest.MonkeyPatch) -> None:
+    db = _FakeDB()
+
+    import app.services.orchestration.continuous_pipeline_worker as worker_module
+
+    monkeypatch.setattr(worker_module, "run_ingestion_cycle", _fake_ingestion_cycle)
+    monkeypatch.setattr(worker_module, "_load_active_assets", _async_return([]))
+    monkeypatch.setattr(worker_module, "_load_active_strategies", _async_return([]))
+    monkeypatch.setattr(
+        worker_module,
+        "run_deterministic_research_cycle_if_due",
+        _async_return(
+            SimpleNamespace(
+                started=True,
+                reason=None,
+                campaign_id=uuid.uuid4(),
+                candidates_generated=2,
+                candidates_evaluated=2,
+                descendants_generated=1,
+                champion="Deterministic Champion",
+            )
+        ),
+    )
+    monkeypatch.setattr(worker_module, "capture_system_intelligence_snapshot_if_due", _async_return(None))
+
+    stats = await run_orchestration_cycle(db=db, client=object(), config=_config())
+
+    assert stats.research_cycles_started == 1
+    assert db.commits >= 1
+
+
+@pytest.mark.asyncio
+async def test_worker_isolates_research_cycle_failures(monkeypatch: pytest.MonkeyPatch) -> None:
+    db = _FakeDB()
+
+    async def _raise_research(*_args, **_kwargs):
+        raise RuntimeError("research failure")
+
+    import app.services.orchestration.continuous_pipeline_worker as worker_module
+
+    monkeypatch.setattr(worker_module, "run_ingestion_cycle", _fake_ingestion_cycle)
+    monkeypatch.setattr(worker_module, "_load_active_assets", _async_return([]))
+    monkeypatch.setattr(worker_module, "_load_active_strategies", _async_return([]))
+    monkeypatch.setattr(worker_module, "run_deterministic_research_cycle_if_due", _raise_research)
+    monkeypatch.setattr(worker_module, "capture_system_intelligence_snapshot_if_due", _async_return(None))
+
+    stats = await run_orchestration_cycle(db=db, client=object(), config=_config())
+
+    assert stats.ingestion_assets_ok == 1
+    assert stats.research_cycles_started == 0
+
+
+@pytest.mark.asyncio
 async def test_worker_continues_after_structured_execution_rejection(monkeypatch: pytest.MonkeyPatch) -> None:
     db = _FakeDB()
     assets = [_asset(), _asset()]

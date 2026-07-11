@@ -65,6 +65,12 @@ class MissionControlIntelligenceResponse(BaseModel):
     metric_breakdown: list[MissionControlIntelligenceMetricResponse]
     operations: OperationalStatusResponse
     total_managed_capital: str | None = None
+    campaigns_near_profit_target: int = 0
+    campaigns_at_target: int = 0
+    profit_eligible_for_compounding: str | None = None
+    profit_recommended_for_withdrawal: str | None = None
+    profit_awaiting_review: str | None = None
+    active_compounding_policies: int = 0
     validation_runs: list[ValidationRunResponse]
     selected_validation_run_id: str | None
     notes: str

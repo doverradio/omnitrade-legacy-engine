@@ -1,7 +1,17 @@
 import { ApiRequestError } from "@/lib/api/arena";
 
 export type CapitalLedgerStatus = "all" | "active" | "inactive" | "completed" | "cancelled";
-export type CapitalLedgerType = "all" | "paper_account" | "validation_run" | "research_campaign" | "strategy_allocation" | "position";
+export type CapitalLedgerType =
+  | "all"
+  | "paper_account"
+  | "validation_run"
+  | "research_campaign"
+  | "strategy_allocation"
+  | "position"
+  | "compounding_recommendation"
+  | "withdrawal_recommendation"
+  | "profit_reserve"
+  | "policy_review";
 
 export type CapitalLedgerSummary = {
   total_managed_capital: string;

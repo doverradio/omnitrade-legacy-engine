@@ -135,10 +135,35 @@ function buildPayload(totalManaged: string, empty = false) {
             child_allocations_count: 0,
             notes: "Strategy child allocation.",
           },
+          {
+            capital_pool_id: "campaign-profit-cycle:cycle-a:compound",
+            capital_pool_type: "compounding_recommendation",
+            name: "Campaign A Compounding Recommendation",
+            status: "inactive",
+            starting_capital: null,
+            current_equity: null,
+            allocated_capital: null,
+            available_capital: null,
+            reserved_capital: null,
+            realized_pnl: null,
+            unrealized_pnl: null,
+            pnl_percent: null,
+            started_at: "2026-07-09T00:00:00Z",
+            completed_at: null,
+            related_entity_type: "capital_campaign",
+            related_entity_id: "campaign-a",
+            related_page_url: "/capital-campaigns/11111111-1111-1111-1111-111111111111",
+            capital_campaign_uuid: "11111111-1111-1111-1111-111111111111",
+            capital_campaign_name: "Campaign Link",
+            capital_campaign_status: "RUNNING",
+            parent_capital_pool_id: null,
+            child_allocations_count: 0,
+            notes: "Recommendation evidence only. No funds moved.",
+          },
         ],
     page: 1,
     page_size: 200,
-    total: empty ? 0 : 4,
+    total: empty ? 0 : 5,
     has_more: false,
   };
 }
@@ -274,6 +299,17 @@ describe("CapitalPage", () => {
     fireEvent.click(screen.getByRole("button", { name: /Inactive \/ Archive/i }));
 
     expect(await screen.findByText("Run C")).toBeInTheDocument();
+  });
+
+  it("renders recommendation-only labels without changing managed totals", async () => {
+    installFetchMock("with-data");
+
+    render(<CapitalPage />);
+
+    expect(await screen.findByRole("heading", { name: "Capital Ledger" })).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: /Capital Pools/i }));
+    expect(await screen.findByText("compounding recommendation")).toBeInTheDocument();
+    expect(screen.getAllByText("$50.00").length).toBeGreaterThan(0);
   });
 
   it("renders empty state when no pools exist", async () => {

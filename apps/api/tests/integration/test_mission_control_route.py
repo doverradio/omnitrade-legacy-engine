@@ -21,7 +21,48 @@ from app.schemas.validation_runs import ValidationRunResponse
 
 
 class _DummySession:
-    pass
+    async def execute(self, statement, params=None):
+        _ = (statement, params)
+        return _ResultWithScalar(0)
+
+
+class _ValidationEventResponse:
+    def __init__(self, items):
+        self.items = items
+
+
+def _run_event() -> object:
+    return type(
+        "RunEvent",
+        (),
+        {
+            "id": 1,
+            "timestamp": datetime(2026, 7, 9, 0, 0, tzinfo=timezone.utc),
+            "title": "Validation Event",
+            "description": "Validation event emitted",
+            "validation_run_id": "11111111-1111-1111-1111-111111111111",
+            "category": "system",
+            "event_type": "VALIDATION_EVENT",
+            "severity": "green",
+            "metadata": {},
+        },
+    )()
+
+
+class _ResultWithScalar:
+    def __init__(self, value):
+        self._value = value
+
+    def scalar_one_or_none(self):
+        return self._value
+
+    def mappings(self):
+        return self
+
+    def first(self):
+        return self._value
+
+
 
 
 def _payload() -> MissionControlIntelligenceResponse:
@@ -238,3 +279,192 @@ def test_mission_control_intelligence_history_route_returns_annotations(monkeypa
     payload = response.json()
     assert payload["points"][0]["annotations"][0]["title"] == "Guardrail Triggered"
     assert payload["points"][0]["annotations"][0]["required_action"] == "operator_review"
+
+
+def _operations_payload(*, paper_equity: str) -> OperationalStatusResponse:
+    return OperationalStatusResponse(
+        overall_health="green",
+        run_status=OperationalRunStatusResponse(
+            run_id="run-1",
+            started_at=datetime(2026, 7, 9, 0, 0, tzinfo=timezone.utc),
+            expected_end=datetime(2026, 7, 12, 0, 0, tzinfo=timezone.utc),
+            uptime="24:00:00",
+            current_phase="researching",
+            health_status="green",
+        ),
+        system_health={
+            "api": OperationalHealthIndicatorResponse(state="green", detail="API responsive"),
+            "orchestrator": OperationalHealthIndicatorResponse(state="green", detail="Heartbeat active"),
+            "database": OperationalHealthIndicatorResponse(state="green", detail="Database connected"),
+            "research_agent": OperationalHealthIndicatorResponse(state="green", detail="OpenAI research adapter available"),
+        },
+        research_status={"current_campaign": "Campaign Alpha", "current_champion": "RSI Mean Reversion", "campaign_status": "RUNNING"},
+        monitoring=OperationalMonitoringResponse(
+            candles_processed=120000,
+            signals_generated=900,
+            paper_trades_executed=120,
+            decision_records_created=900,
+            replay_count=140,
+            candidate_count=80,
+            campaign_count=3,
+            laboratory_runs=25,
+            evolution_count=44,
+            current_champion="RSI Mean Reversion",
+            paper_equity=paper_equity,
+            signals_today=42,
+            trades_today=8,
+            research_memory_growth=350,
+        ),
+        alerts=[],
+    )
+
+
+def _validation_run() -> ValidationRunResponse:
+    return ValidationRunResponse(
+        validation_run_id="11111111-1111-1111-1111-111111111111",
+        name="72h Proving",
+        objective="Validate stability",
+        duration_hours=72,
+        status="RUNNING",
+        started_at=datetime(2026, 7, 9, 0, 0, tzinfo=timezone.utc),
+        expected_end_at=datetime(2026, 7, 12, 0, 0, tzinfo=timezone.utc),
+        completed_at=None,
+        paper_capital=Decimal("25"),
+        enabled_strategies=["MA Crossover"],
+        enabled_research_agents=["Baseline"],
+        enabled_research_features=["Laboratory"],
+        health_score=88,
+        result_status="INCOMPLETE",
+    )
+
+
+def test_mission_control_intelligence_route_uses_evidence_backed_bound_account_pnl(monkeypatch) -> None:
+    app = create_app()
+
+    async def _read(operation, *, operation_name):
+        _ = operation_name
+        return await operation(_DummySession())
+
+    async def _operations_stub(*_args, **_kwargs):
+        return _operations_payload(paper_equity="25")
+
+    async def _runs_stub(*_args, **_kwargs):
+        return [_validation_run()]
+
+    async def _events_stub(*_args, **_kwargs):
+        return _ValidationEventResponse([_run_event()])
+
+    async def _campaign_metrics_stub(*_args, **_kwargs):
+        return {
+            "campaigns_near_profit_target": 0,
+            "campaigns_at_target": 0,
+            "profit_eligible_for_compounding": Decimal("0"),
+            "profit_recommended_for_withdrawal": Decimal("0"),
+            "profit_awaiting_review": Decimal("0"),
+            "active_compounding_policies": 0,
+        }
+
+    async def _total_capital_stub(*_args, **_kwargs):
+        return Decimal("25")
+
+    async def _no_live_annotations(*_args, **_kwargs):
+        return []
+
+    async def _timeline_stub(*_args, **_kwargs):
+        return (
+            "25.00",
+            "0.00",
+            {
+                "paper_pnl_source": "bound_paper_account",
+                "paper_pnl_status": "evidence_backed",
+                "paper_pnl_baseline": "25.00",
+                "paper_pnl_bound_account_count": 1,
+            },
+        )
+
+    monkeypatch.setattr("app.api.routes.mission_control.run_read_with_retry", _read)
+    monkeypatch.setattr("app.services.mission_control_intelligence.build_operations_status", _operations_stub)
+    monkeypatch.setattr("app.services.mission_control_intelligence.list_validation_runs", _runs_stub)
+    monkeypatch.setattr("app.services.mission_control_intelligence.list_validation_run_events", _events_stub)
+    monkeypatch.setattr("app.services.mission_control_intelligence._load_total_managed_capital", _total_capital_stub)
+    monkeypatch.setattr("app.services.mission_control_intelligence._load_campaign_profit_metrics", _campaign_metrics_stub)
+    monkeypatch.setattr("app.services.mission_control_intelligence._resolve_timeline_equity_and_pnl", _timeline_stub)
+    monkeypatch.setattr("app.services.mission_control_intelligence._load_live_operation_annotations", _no_live_annotations)
+
+    with TestClient(app) as client:
+        response = client.get("/mission-control/intelligence?range=24h")
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["timeline_events"]
+    metadata = payload["timeline_events"][0]["metadata"]
+    assert metadata["paper_pnl_source"] == "bound_paper_account"
+    assert metadata["paper_pnl_status"] == "evidence_backed"
+    assert payload["timeline_events"][0]["paper_pnl"] == "0.00"
+
+
+def test_mission_control_intelligence_route_marks_unresolved_baseline_without_fabricated_pnl(monkeypatch) -> None:
+    app = create_app()
+
+    async def _read(operation, *, operation_name):
+        _ = operation_name
+        return await operation(_DummySession())
+
+    async def _operations_stub(*_args, **_kwargs):
+        return _operations_payload(paper_equity="25")
+
+    async def _runs_stub(*_args, **_kwargs):
+        return [_validation_run()]
+
+    async def _events_stub(*_args, **_kwargs):
+        return _ValidationEventResponse([_run_event()])
+
+    async def _campaign_metrics_stub(*_args, **_kwargs):
+        return {
+            "campaigns_near_profit_target": 0,
+            "campaigns_at_target": 0,
+            "profit_eligible_for_compounding": Decimal("0"),
+            "profit_recommended_for_withdrawal": Decimal("0"),
+            "profit_awaiting_review": Decimal("0"),
+            "active_compounding_policies": 0,
+        }
+
+    async def _total_capital_stub(*_args, **_kwargs):
+        return Decimal("25")
+
+    async def _no_live_annotations(*_args, **_kwargs):
+        return []
+
+    async def _timeline_stub(*_args, **_kwargs):
+        return (
+            "25.00",
+            None,
+            {
+                "paper_pnl_source": "unavailable",
+                "paper_pnl_status": "baseline_unresolved",
+            },
+        )
+
+    async def _paper_equity_stub(*_args, **_kwargs):
+        return Decimal("25")
+
+    monkeypatch.setattr("app.api.routes.mission_control.run_read_with_retry", _read)
+    monkeypatch.setattr("app.services.mission_control_intelligence.build_operations_status", _operations_stub)
+    monkeypatch.setattr("app.services.mission_control_intelligence.list_validation_runs", _runs_stub)
+    monkeypatch.setattr("app.services.mission_control_intelligence.list_validation_run_events", _events_stub)
+    monkeypatch.setattr("app.services.mission_control_intelligence._load_total_managed_capital", _total_capital_stub)
+    monkeypatch.setattr("app.services.mission_control_intelligence._load_campaign_profit_metrics", _campaign_metrics_stub)
+    monkeypatch.setattr("app.services.mission_control_intelligence._resolve_timeline_equity_and_pnl", _timeline_stub)
+    monkeypatch.setattr("app.services.mission_control_intelligence._load_live_operation_annotations", _no_live_annotations)
+
+    with TestClient(app) as client:
+        response = client.get("/mission-control/intelligence?range=24h")
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["timeline_events"]
+    metadata = payload["timeline_events"][0]["metadata"]
+    assert metadata["paper_pnl_source"] == "unavailable"
+    assert metadata["paper_pnl_status"] == "baseline_unresolved"
+    assert payload["timeline_events"][0]["paper_pnl"] is None
+

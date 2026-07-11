@@ -106,6 +106,12 @@ export type MissionControlIntelligenceResponse = {
   metric_breakdown: MissionControlIntelligenceMetric[];
   operations: OperationalStatus;
   total_managed_capital: string | null;
+  campaigns_near_profit_target: number;
+  campaigns_at_target: number;
+  profit_eligible_for_compounding: string | null;
+  profit_recommended_for_withdrawal: string | null;
+  profit_awaiting_review: string | null;
+  active_compounding_policies: number;
   validation_runs: ValidationRun[];
   selected_validation_run_id: string | null;
   notes: string;

@@ -485,3 +485,72 @@ async def test_capital_ledger_without_campaign_links_keeps_totals_and_null_metad
     assert validation_pool.capital_campaign_name is None
     assert validation_pool.capital_campaign_status is None
     assert result.summary.total_managed_capital == Decimal("25")
+
+
+@pytest.mark.asyncio
+async def test_capital_ledger_recommendation_rows_do_not_change_managed_capital(monkeypatch: pytest.MonkeyPatch) -> None:
+    run = _run(
+        run_id="11111111-1111-1111-1111-111111111111",
+        name="Run A",
+        status="RUNNING",
+        paper_capital="25",
+        strategies=[],
+    )
+    campaign = _campaign(
+        campaign_id=1,
+        campaign_uuid="99999999-9999-9999-9999-999999999999",
+        name="Campaign A",
+        status="RUNNING",
+        paper_account_id=None,
+        validation_run_id="11111111-1111-1111-1111-111111111111",
+    )
+    cycle = SimpleNamespace(
+        cycle_uuid=uuid.UUID("22222222-2222-2222-2222-222222222222"),
+        capital_campaign_id=1,
+        cycle_number=1,
+        cycle_id=1,
+        calculated_at=datetime(2026, 7, 10, 0, 0, tzinfo=timezone.utc),
+        completed_at=None,
+        status="REVIEW_REQUIRED",
+        compound_amount=Decimal("5"),
+        withdrawal_amount=Decimal("4"),
+        reserve_amount=Decimal("1"),
+    )
+
+    async def _runs(_db):
+        return [run]
+
+    async def _accounts(_db):
+        return []
+
+    async def _campaigns(_db):
+        return []
+
+    async def _capital_campaigns(_db):
+        return [campaign]
+
+    async def _profit_cycles(_db):
+        return [cycle]
+
+    async def _metrics(_db):
+        return {run.validation_run_id: service._ValidationMetricSnapshot(current_equity=Decimal("25"), trades=0)}
+
+    async def _trade_counts(_db):
+        return {}
+
+    monkeypatch.setattr(service, "_load_validation_runs", _runs)
+    monkeypatch.setattr(service, "_load_paper_accounts", _accounts)
+    monkeypatch.setattr(service, "_load_research_campaigns", _campaigns)
+    monkeypatch.setattr(service, "_load_capital_campaigns", _capital_campaigns)
+    monkeypatch.setattr(service, "_load_profit_cycles", _profit_cycles)
+    monkeypatch.setattr(service, "_load_validation_run_metrics", _metrics)
+    monkeypatch.setattr(service, "_load_trade_counts_by_account", _trade_counts)
+
+    result = await service.build_capital_ledger(db=_DummySession())
+
+    assert result.summary.total_managed_capital == Decimal("25")
+    recommendation_types = {item.capital_pool_type for item in result.capital_pools}
+    assert "compounding_recommendation" in recommendation_types
+    assert "withdrawal_recommendation" in recommendation_types
+    assert "profit_reserve" in recommendation_types
+    assert "policy_review" in recommendation_types

@@ -58,6 +58,18 @@ Visible operator metrics include:
 - current equity
 - maximum drawdown
 
+Campaign-profit intelligence metrics also include:
+
+- campaigns near profit target
+- campaigns at target
+- profit eligible for compounding
+- profit recommended for withdrawal
+- profit awaiting review
+- active compounding policies
+
+These metrics summarize recommendation-state evidence only.
+They do not initiate execution.
+
 ## Tabs
 
 Current primary tabs:

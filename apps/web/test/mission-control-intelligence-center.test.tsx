@@ -147,6 +147,12 @@ function buildPayload(range: string, severity: "green" | "yellow" | "red" = "gre
       alerts: severity === "green" ? [] : [{ code: "worker_stopped", severity, message: "Worker stopped" }],
     },
     total_managed_capital: "125.00",
+    campaigns_near_profit_target: 2,
+    campaigns_at_target: 1,
+    profit_eligible_for_compounding: "14.50",
+    profit_recommended_for_withdrawal: "9.10",
+    profit_awaiting_review: "6.00",
+    active_compounding_policies: 3,
     validation_runs: [
       {
         validation_run_id: "11111111-1111-1111-1111-111111111111",
@@ -405,6 +411,19 @@ afterEach(() => {
 });
 
 describe("MissionControlIntelligenceCenter", () => {
+  it("shows campaign profit metric cards", async () => {
+    installFetchMock("healthy");
+
+    render(<MissionControlIntelligenceCenter />);
+
+    expect(await screen.findByText("Campaigns Near Profit Target")).toBeInTheDocument();
+    expect(screen.getByText("Campaigns at Target")).toBeInTheDocument();
+    expect(screen.getByText("Profit Eligible for Compounding")).toBeInTheDocument();
+    expect(screen.getByText("Profit Recommended for Withdrawal")).toBeInTheDocument();
+    expect(screen.getByText("Profit Awaiting Review")).toBeInTheDocument();
+    expect(screen.getByText("Active Compounding Policies")).toBeInTheDocument();
+  });
+
   it("renders the hero intelligence timeline, score cards, and recent timeline", async () => {
     installFetchMock("healthy");
 

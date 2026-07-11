@@ -1,15 +1,18 @@
-# Capital Campaigns Foundation (Phase 1)
+# Capital Campaigns Foundation (Phase 1 + Phase 2)
 
 ## Scope
 
-Capital Campaigns Foundation introduces a new campaign-scoped capital domain model.
+Capital Campaigns Foundation introduces campaign-scoped capital domain models.
 
-This phase is data-model and CRUD foundation only.
+Phase 1 delivered campaign CRUD and lifecycle management.
+
+Phase 2 adds profit policy configuration and profit-cycle accounting recommendations.
 
 It does not:
 
 - enable live automation
 - enable automatic withdrawals
+- execute withdrawals or transfers
 - enable multi-user custody
 - change existing trading behavior
 
@@ -90,6 +93,17 @@ Capital Campaign -> Validation Runs -> Paper Accounts -> Trades -> Positions -> 
 - `PATCH /capital-campaigns/{campaign_uuid}`
 - `DELETE /capital-campaigns/{campaign_uuid}`
 
+Phase 2 API additions:
+
+- `POST /capital-campaigns/{campaign_uuid}/profit-policy`
+- `GET /capital-campaigns/{campaign_uuid}/profit-policy`
+- `PATCH /capital-campaigns/{campaign_uuid}/profit-policy`
+- `POST /capital-campaigns/{campaign_uuid}/profit-cycles/evaluate`
+- `GET /capital-campaigns/{campaign_uuid}/profit-cycles`
+- `GET /capital-campaigns/{campaign_uuid}/profit-cycles/{cycle_uuid}`
+- `POST /capital-campaigns/{campaign_uuid}/profit-cycles/{cycle_uuid}/approve`
+- `POST /capital-campaigns/{campaign_uuid}/profit-cycles/{cycle_uuid}/reject`
+
 Delete behavior is non-destructive in Phase 1.
 
 `DELETE` archives the campaign by setting status to `ARCHIVED`.
@@ -130,11 +144,46 @@ Capital Ledger pools include optional campaign linkage fields when a mapping is 
 
 Existing ledger semantics remain unchanged and backward compatible.
 
-## Phase 1 Limitations
+Phase 2 recommendation rows may also be linked to campaigns for cycle evidence:
 
-Phase 1 does not include:
+- `compounding_recommendation`
+- `withdrawal_recommendation`
+- `profit_reserve`
+- `policy_review`
+
+These rows are accounting evidence only and do not change managed-capital totals.
+
+## Profit Policy and Cycle Model (Phase 2)
+
+Phase 2 adds durable policy and cycle tables:
+
+- `capital_campaign_profit_policies`
+- `capital_campaign_profit_cycles`
+
+Policy configuration includes:
+
+- policy type
+- target amount or target percent
+- compounding and withdrawal percentages
+- reserve controls
+- optional protected-principal and max-capital boundaries
+- cooldown and approval requirements
+
+Cycle evaluations include:
+
+- eligibility calculations from durable realized profit/equity state
+- recommendation split (compound/withdraw/reserve)
+- target progress and reach state
+- idempotent fingerprinting
+- approval/rejection review trail
+
+Cycle outputs are recommendations, not execution directives.
+
+## Limitations
+
+Current foundation does not include:
 
 - automatic withdrawals
-- automatic compounding
+- automatic compounding execution
 - autonomous live trading control
 - multi-user custody

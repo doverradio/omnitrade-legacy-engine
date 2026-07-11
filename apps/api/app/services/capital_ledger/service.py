@@ -9,6 +9,7 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.models.capital_campaign import CapitalCampaign
+from app.models.capital_campaign_profit_cycle import CapitalCampaignProfitCycle
 from app.models.paper_account import PaperAccount
 from app.models.research_campaign import ResearchCampaign
 from app.models.trade import Trade
@@ -28,7 +29,18 @@ STATUS_ALL = "all"
 TYPE_ALL = "all"
 
 _STATUS_OPTIONS = {STATUS_ALL, "active", "inactive", "completed", "cancelled"}
-_TYPE_OPTIONS = {TYPE_ALL, "paper_account", "validation_run", "research_campaign", "strategy_allocation", "position"}
+_TYPE_OPTIONS = {
+    TYPE_ALL,
+    "paper_account",
+    "validation_run",
+    "research_campaign",
+    "strategy_allocation",
+    "position",
+    "compounding_recommendation",
+    "withdrawal_recommendation",
+    "profit_reserve",
+    "policy_review",
+}
 
 
 @dataclass(frozen=True, slots=True)
@@ -113,6 +125,20 @@ async def _load_capital_campaigns(db: AsyncSession) -> list[CapitalCampaign]:
     return (await db.execute(select(CapitalCampaign).order_by(CapitalCampaign.created_at.desc()))).scalars().all()
 
 
+async def _load_profit_cycles(db: AsyncSession) -> list[CapitalCampaignProfitCycle]:
+    if not hasattr(db, "execute"):
+        return []
+    return (
+        await db.execute(
+            select(CapitalCampaignProfitCycle).order_by(
+                CapitalCampaignProfitCycle.capital_campaign_id.asc(),
+                CapitalCampaignProfitCycle.cycle_number.desc(),
+                CapitalCampaignProfitCycle.cycle_id.desc(),
+            )
+        )
+    ).scalars().all()
+
+
 async def _load_trade_counts_by_account(db: AsyncSession) -> dict[uuid.UUID, int]:
     rows = (
         await db.execute(select(Trade.paper_account_id, Trade.id).order_by(Trade.paper_account_id.asc()))
@@ -153,14 +179,22 @@ async def build_capital_ledger(
     paper_accounts = await _load_paper_accounts(db)
     research_campaigns = await _load_research_campaigns(db)
     capital_campaigns = await _load_capital_campaigns(db)
+    profit_cycles = await _load_profit_cycles(db)
 
     campaign_by_validation_run_id: dict[uuid.UUID, CapitalCampaign] = {}
     campaign_by_paper_account_id: dict[uuid.UUID, CapitalCampaign] = {}
+    campaign_by_id: dict[int, CapitalCampaign] = {}
     for campaign in capital_campaigns:
+        campaign_by_id[campaign.id] = campaign
         if campaign.validation_run_id is not None and campaign.validation_run_id not in campaign_by_validation_run_id:
             campaign_by_validation_run_id[campaign.validation_run_id] = campaign
         if campaign.paper_account_id is not None and campaign.paper_account_id not in campaign_by_paper_account_id:
             campaign_by_paper_account_id[campaign.paper_account_id] = campaign
+
+    latest_cycle_by_campaign_id: dict[int, CapitalCampaignProfitCycle] = {}
+    for cycle in profit_cycles:
+        if cycle.capital_campaign_id not in latest_cycle_by_campaign_id:
+            latest_cycle_by_campaign_id[cycle.capital_campaign_id] = cycle
 
     metric_by_run = await _load_validation_run_metrics(db)
     trade_counts_by_account = await _load_trade_counts_by_account(db)
@@ -348,6 +382,132 @@ async def build_capital_ledger(
     # Research campaigns are included only when independently funded. v1 has no durable funded-allocation table.
     if research_campaigns:
         unavailable_sources.append("research_campaign_allocations")
+
+    # Recommendation-only entries do not change top-level managed/equity totals.
+    for campaign_id, cycle in latest_cycle_by_campaign_id.items():
+        campaign = campaign_by_id.get(campaign_id)
+        if campaign is None:
+            continue
+
+        base_id = f"campaign-profit-cycle:{cycle.cycle_uuid}"
+        started_at = cycle.calculated_at
+        review_status: CapitalPoolStatus = "inactive" if cycle.status in {"REVIEW_REQUIRED", "BELOW_TARGET", "TARGET_REACHED"} else "completed"
+
+        if cycle.compound_amount > 0:
+            pools.append(
+                CapitalPoolResponse(
+                    capital_pool_id=f"{base_id}:compound",
+                    capital_pool_type="compounding_recommendation",
+                    name=f"{campaign.name} Compounding Recommendation",
+                    status=review_status,
+                    starting_capital=None,
+                    current_equity=None,
+                    allocated_capital=None,
+                    available_capital=None,
+                    reserved_capital=None,
+                    realized_pnl=None,
+                    unrealized_pnl=None,
+                    pnl_percent=None,
+                    started_at=started_at,
+                    completed_at=cycle.completed_at,
+                    related_entity_type="capital_campaign",
+                    related_entity_id=str(campaign.uuid),
+                    related_page_url=f"/capital-campaigns/{campaign.uuid}",
+                    capital_campaign_uuid=str(campaign.uuid),
+                    capital_campaign_name=campaign.name,
+                    capital_campaign_status=campaign.status,
+                    parent_capital_pool_id=None,
+                    child_allocations_count=0,
+                    notes="Recommendation evidence only. No funds moved.",
+                )
+            )
+
+        if cycle.withdrawal_amount > 0:
+            pools.append(
+                CapitalPoolResponse(
+                    capital_pool_id=f"{base_id}:withdraw",
+                    capital_pool_type="withdrawal_recommendation",
+                    name=f"{campaign.name} Withdrawal Recommendation",
+                    status=review_status,
+                    starting_capital=None,
+                    current_equity=None,
+                    allocated_capital=None,
+                    available_capital=None,
+                    reserved_capital=None,
+                    realized_pnl=None,
+                    unrealized_pnl=None,
+                    pnl_percent=None,
+                    started_at=started_at,
+                    completed_at=cycle.completed_at,
+                    related_entity_type="capital_campaign",
+                    related_entity_id=str(campaign.uuid),
+                    related_page_url=f"/capital-campaigns/{campaign.uuid}",
+                    capital_campaign_uuid=str(campaign.uuid),
+                    capital_campaign_name=campaign.name,
+                    capital_campaign_status=campaign.status,
+                    parent_capital_pool_id=None,
+                    child_allocations_count=0,
+                    notes="Recommendation evidence only. No transfer or payout executed.",
+                )
+            )
+
+        if cycle.reserve_amount > 0:
+            pools.append(
+                CapitalPoolResponse(
+                    capital_pool_id=f"{base_id}:reserve",
+                    capital_pool_type="profit_reserve",
+                    name=f"{campaign.name} Profit Reserve",
+                    status="inactive",
+                    starting_capital=None,
+                    current_equity=None,
+                    allocated_capital=None,
+                    available_capital=None,
+                    reserved_capital=None,
+                    realized_pnl=None,
+                    unrealized_pnl=None,
+                    pnl_percent=None,
+                    started_at=started_at,
+                    completed_at=cycle.completed_at,
+                    related_entity_type="capital_campaign",
+                    related_entity_id=str(campaign.uuid),
+                    related_page_url=f"/capital-campaigns/{campaign.uuid}",
+                    capital_campaign_uuid=str(campaign.uuid),
+                    capital_campaign_name=campaign.name,
+                    capital_campaign_status=campaign.status,
+                    parent_capital_pool_id=None,
+                    child_allocations_count=0,
+                    notes="Reserve recommendation evidence only. Totals unchanged.",
+                )
+            )
+
+        if cycle.status == "REVIEW_REQUIRED":
+            pools.append(
+                CapitalPoolResponse(
+                    capital_pool_id=f"{base_id}:review",
+                    capital_pool_type="policy_review",
+                    name=f"{campaign.name} Policy Review",
+                    status="inactive",
+                    starting_capital=None,
+                    current_equity=None,
+                    allocated_capital=None,
+                    available_capital=None,
+                    reserved_capital=None,
+                    realized_pnl=None,
+                    unrealized_pnl=None,
+                    pnl_percent=None,
+                    started_at=started_at,
+                    completed_at=cycle.completed_at,
+                    related_entity_type="capital_campaign",
+                    related_entity_id=str(campaign.uuid),
+                    related_page_url=f"/capital-campaigns/{campaign.uuid}",
+                    capital_campaign_uuid=str(campaign.uuid),
+                    capital_campaign_name=campaign.name,
+                    capital_campaign_status=campaign.status,
+                    parent_capital_pool_id=None,
+                    child_allocations_count=0,
+                    notes="Operator review required. Accounting recommendation only.",
+                )
+            )
 
     # De-duplicate source warnings while preserving order.
     deduped_unavailable: list[str] = []

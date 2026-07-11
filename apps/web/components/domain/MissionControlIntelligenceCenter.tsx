@@ -1015,6 +1015,42 @@ export default function MissionControlIntelligenceCenter() {
         helper: "Current paper champion",
         href: "/strategy-lab",
       },
+      {
+        label: "Campaigns Near Profit Target",
+        value: String(payload?.campaigns_near_profit_target ?? 0),
+        helper: "80-99% toward configured target",
+        href: "/capital-campaigns",
+      },
+      {
+        label: "Campaigns at Target",
+        value: String(payload?.campaigns_at_target ?? 0),
+        helper: "Target threshold reached",
+        href: "/capital-campaigns",
+      },
+      {
+        label: "Profit Eligible for Compounding",
+        value: formatCurrency(payload?.profit_eligible_for_compounding ?? null),
+        helper: "Recommendation-only",
+        href: "/capital-campaigns",
+      },
+      {
+        label: "Profit Recommended for Withdrawal",
+        value: formatCurrency(payload?.profit_recommended_for_withdrawal ?? null),
+        helper: "Recommendation-only",
+        href: "/capital-campaigns",
+      },
+      {
+        label: "Profit Awaiting Review",
+        value: formatCurrency(payload?.profit_awaiting_review ?? null),
+        helper: "Operator action required",
+        href: "/capital-campaigns",
+      },
+      {
+        label: "Active Compounding Policies",
+        value: String(payload?.active_compounding_policies ?? 0),
+        helper: "Policy count",
+        href: "/capital-campaigns",
+      },
     ];
   }, [payload, profitAllPaper?.net_profit, profit24hPaper?.net_profit, profit72hPaper?.net_profit, profit?.ending_equity, range, profitMode]);
 

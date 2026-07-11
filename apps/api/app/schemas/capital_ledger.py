@@ -8,7 +8,17 @@ from pydantic import BaseModel, field_serializer
 
 
 CapitalPoolStatus = Literal["active", "inactive", "completed", "cancelled"]
-CapitalPoolType = Literal["paper_account", "validation_run", "research_campaign", "strategy_allocation", "position"]
+CapitalPoolType = Literal[
+    "paper_account",
+    "validation_run",
+    "research_campaign",
+    "strategy_allocation",
+    "position",
+    "compounding_recommendation",
+    "withdrawal_recommendation",
+    "profit_reserve",
+    "policy_review",
+]
 
 
 class CapitalLedgerSummaryResponse(BaseModel):

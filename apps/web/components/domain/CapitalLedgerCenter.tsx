@@ -47,6 +47,10 @@ const TYPE_OPTIONS: Array<{ value: CapitalLedgerType; label: string }> = [
   { value: "research_campaign", label: "Research Campaign" },
   { value: "strategy_allocation", label: "Strategy Allocation" },
   { value: "position", label: "Position" },
+  { value: "compounding_recommendation", label: "Compounding Recommendation" },
+  { value: "withdrawal_recommendation", label: "Withdrawal Recommendation" },
+  { value: "profit_reserve", label: "Profit Reserve" },
+  { value: "policy_review", label: "Policy Review" },
 ];
 
 const DEFAULT_OPEN: Record<AccordionKey, boolean> = {

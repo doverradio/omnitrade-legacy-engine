@@ -10,6 +10,10 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.models.audit_log import AuditLog
 from app.models.capital_campaign import CapitalCampaign
+from app.models.capital_campaign_profit_cycle import CapitalCampaignProfitCycle
+from app.models.capital_campaign_profit_policy import CapitalCampaignProfitPolicy
+from app.models.paper_account import PaperAccount
+from app.models.validation_run_paper_account import ValidationRunPaperAccount
 from app.schemas.mission_control import (
     MissionControlIntelligenceHistoryPointResponse,
     MissionControlIntelligenceMetricResponse,
@@ -19,6 +23,7 @@ from app.schemas.mission_control import (
 )
 from app.schemas.operations import OperationalAlertResponse, OperationalStatusResponse
 from app.schemas.validation_runs import ValidationRunResponse
+from app.services.paper.accounting import build_account_snapshot
 from app.services.dashboard_intelligence import build_dashboard_intelligence_score
 from app.services.operations_status import build_operations_status
 from app.services.validation_runs.service import list_validation_run_events, list_validation_runs
@@ -61,6 +66,7 @@ async def build_mission_control_intelligence(*, db: AsyncSession, range_value: s
     component_scores = _compute_component_scores(operations=operations, validation_runs=validation_runs)
     current_score = dashboard_score.score if dashboard_score is not None else _aggregate_score(component_scores)
     total_managed_capital = await _load_total_managed_capital(db=db)
+    campaign_profit_metrics = await _load_campaign_profit_metrics(db=db)
     if dashboard_score is not None:
         baseline_equity = dashboard_score.timeline[0].equity if dashboard_score.timeline else Decimal("0")
         history = [
@@ -87,14 +93,32 @@ async def build_mission_control_intelligence(*, db: AsyncSession, range_value: s
             run_events=run_events,
         )
     trend = _build_trend(history=history)
+    timeline_equity, timeline_pnl, timeline_pnl_metadata = await _resolve_timeline_equity_and_pnl(
+        db=db,
+        selected_validation_run=selected_validation_run,
+        fallback_equity=operations.monitoring.paper_equity,
+    )
     timeline_events = _build_timeline_events(
         generated_at=generated_at,
         operations=operations,
         selected_validation_run=selected_validation_run,
         run_events=run_events,
         current_score=current_score,
+        anchor_equity=timeline_equity,
+        anchor_pnl=timeline_pnl,
+        paper_pnl_metadata=timeline_pnl_metadata,
     )
-    timeline_events.extend(await _load_live_operation_annotations(db=db, generated_at=generated_at, current_score=current_score, operations=operations))
+    timeline_events.extend(
+        await _load_live_operation_annotations(
+            db=db,
+            generated_at=generated_at,
+            current_score=current_score,
+            operations=operations,
+            anchor_equity=timeline_equity,
+            anchor_pnl=timeline_pnl,
+            paper_pnl_metadata=timeline_pnl_metadata,
+        )
+    )
     timeline_events = sorted(timeline_events, key=lambda item: item.timestamp)
     metric_breakdown = _build_metric_breakdown(
         component_scores=component_scores,
@@ -117,6 +141,12 @@ async def build_mission_control_intelligence(*, db: AsyncSession, range_value: s
         metric_breakdown=metric_breakdown,
         operations=operations,
         total_managed_capital=None if total_managed_capital is None else format(total_managed_capital, "f"),
+        campaigns_near_profit_target=campaign_profit_metrics["campaigns_near_profit_target"],
+        campaigns_at_target=campaign_profit_metrics["campaigns_at_target"],
+        profit_eligible_for_compounding=format(campaign_profit_metrics["profit_eligible_for_compounding"], "f"),
+        profit_recommended_for_withdrawal=format(campaign_profit_metrics["profit_recommended_for_withdrawal"], "f"),
+        profit_awaiting_review=format(campaign_profit_metrics["profit_awaiting_review"], "f"),
+        active_compounding_policies=campaign_profit_metrics["active_compounding_policies"],
         validation_runs=validation_runs,
         selected_validation_run_id=None if selected_validation_run is None else str(selected_validation_run.validation_run_id),
         notes=(
@@ -188,6 +218,113 @@ def _calculate_total_managed_capital(campaigns: list[CapitalCampaign]) -> Decima
         seen_campaign_ids.add(campaign_id)
 
     return total
+
+
+async def _load_campaign_profit_metrics(*, db: AsyncSession) -> dict[str, int | Decimal]:
+    if not hasattr(db, "execute"):
+        return {
+            "campaigns_near_profit_target": 0,
+            "campaigns_at_target": 0,
+            "profit_eligible_for_compounding": Decimal("0"),
+            "profit_recommended_for_withdrawal": Decimal("0"),
+            "profit_awaiting_review": Decimal("0"),
+            "active_compounding_policies": 0,
+        }
+
+    campaigns = (
+        (
+            await db.execute(
+                select(CapitalCampaign).order_by(CapitalCampaign.created_at.desc(), CapitalCampaign.id.desc())
+            )
+        )
+        .scalars()
+        .all()
+    )
+    active_policies = (
+        (
+            await db.execute(
+                select(CapitalCampaignProfitPolicy).where(CapitalCampaignProfitPolicy.is_active.is_(True))
+            )
+        )
+        .scalars()
+        .all()
+    )
+    latest_cycles = (
+        (
+            await db.execute(
+                select(CapitalCampaignProfitCycle)
+                .order_by(
+                    CapitalCampaignProfitCycle.capital_campaign_id.asc(),
+                    CapitalCampaignProfitCycle.cycle_number.desc(),
+                    CapitalCampaignProfitCycle.cycle_id.desc(),
+                )
+            )
+        )
+        .scalars()
+        .all()
+    )
+
+    latest_cycle_by_campaign: dict[int, CapitalCampaignProfitCycle] = {}
+    for cycle in latest_cycles:
+        if cycle.capital_campaign_id not in latest_cycle_by_campaign:
+            latest_cycle_by_campaign[cycle.capital_campaign_id] = cycle
+
+    policy_by_campaign: dict[int, CapitalCampaignProfitPolicy] = {item.capital_campaign_id: item for item in active_policies}
+
+    near_target = 0
+    at_target = 0
+    eligible_for_compounding = Decimal("0")
+    recommended_for_withdrawal = Decimal("0")
+    awaiting_review = Decimal("0")
+    active_compounding_policies = 0
+
+    for campaign in campaigns:
+        policy = policy_by_campaign.get(campaign.id)
+        if policy is None:
+            continue
+
+        if policy.policy_type in {"FULL_COMPOUND", "PARTIAL_COMPOUND", "WITHDRAW_AND_COMPOUND", "PROTECTED_PRINCIPAL"}:
+            active_compounding_policies += 1
+
+        realized_profit = Decimal(str(campaign.realized_profit))
+        progress_candidates: list[Decimal] = []
+        reached = False
+
+        if policy.profit_target_amount is not None and policy.profit_target_amount > 0:
+            progress = (realized_profit / Decimal(str(policy.profit_target_amount))) * Decimal("100")
+            progress_candidates.append(progress)
+            if progress >= Decimal("100"):
+                reached = True
+
+        if policy.profit_target_percent is not None and policy.profit_target_percent > 0 and campaign.starting_capital > 0:
+            realized_percent = (realized_profit / Decimal(str(campaign.starting_capital))) * Decimal("100")
+            progress = (realized_percent / Decimal(str(policy.profit_target_percent))) * Decimal("100")
+            progress_candidates.append(progress)
+            if progress >= Decimal("100"):
+                reached = True
+
+        if reached:
+            at_target += 1
+        elif progress_candidates and max(progress_candidates) >= Decimal("80"):
+            near_target += 1
+
+        cycle = latest_cycle_by_campaign.get(campaign.id)
+        if cycle is None:
+            continue
+
+        eligible_for_compounding += Decimal(str(cycle.compound_amount))
+        recommended_for_withdrawal += Decimal(str(cycle.withdrawal_amount))
+        if cycle.status == "REVIEW_REQUIRED":
+            awaiting_review += Decimal(str(cycle.compound_amount + cycle.withdrawal_amount))
+
+    return {
+        "campaigns_near_profit_target": near_target,
+        "campaigns_at_target": at_target,
+        "profit_eligible_for_compounding": eligible_for_compounding,
+        "profit_recommended_for_withdrawal": recommended_for_withdrawal,
+        "profit_awaiting_review": awaiting_review,
+        "active_compounding_policies": active_compounding_policies,
+    }
 
 
 def _compute_component_scores(*, operations: OperationalStatusResponse, validation_runs: list[ValidationRunResponse]) -> _ComponentScores:
@@ -385,14 +522,18 @@ def _build_timeline_events(
     selected_validation_run: ValidationRunResponse | None,
     run_events,
     current_score: int,
+    anchor_equity: str,
+    anchor_pnl: str | None,
+    paper_pnl_metadata: dict[str, object],
 ) -> list[MissionControlIntelligenceTimelineEventResponse]:
     timeline: list[MissionControlIntelligenceTimelineEventResponse] = []
-    anchor_equity = operations.monitoring.paper_equity
-    anchor_pnl = _derive_paper_pnl(anchor_equity)
     current_health = current_score
 
     for item in run_events:
         severity = str(getattr(item, "severity", "gray"))
+        event_metadata = dict(item.metadata or {})
+        for key, value in paper_pnl_metadata.items():
+            event_metadata.setdefault(key, value)
         timeline.append(
             MissionControlIntelligenceTimelineEventResponse(
                 event_id=f"validation-{item.id}",
@@ -409,11 +550,14 @@ def _build_timeline_events(
                 severity=severity,
                 category=item.category,
                 event_type=item.event_type,
-                metadata=item.metadata,
+                metadata=event_metadata,
             )
         )
 
     for offset, alert in enumerate(operations.alerts):
+        alert_metadata: dict[str, object] = {"code": alert.code}
+        for key, value in paper_pnl_metadata.items():
+            alert_metadata.setdefault(key, value)
         timeline.append(
             MissionControlIntelligenceTimelineEventResponse(
                 event_id=f"alert-{alert.code}",
@@ -430,7 +574,7 @@ def _build_timeline_events(
                 severity=alert.severity,
                 category="system",
                 event_type=alert.code,
-                metadata={"code": alert.code},
+                metadata=alert_metadata,
             )
         )
 
@@ -443,6 +587,9 @@ async def _load_live_operation_annotations(
     generated_at: datetime,
     current_score: int,
     operations: OperationalStatusResponse,
+    anchor_equity: str,
+    anchor_pnl: str | None,
+    paper_pnl_metadata: dict[str, object],
 ) -> list[MissionControlIntelligenceTimelineEventResponse]:
     if not hasattr(db, "execute"):
         return []
@@ -480,8 +627,8 @@ async def _load_live_operation_annotations(
                 description=f"Live operations annotation recorded: {action}",
                 related_validation_run=None,
                 health_at_that_moment=_severity_to_health(severity, current_score),
-                paper_equity=operations.monitoring.paper_equity,
-                paper_pnl=_derive_paper_pnl(operations.monitoring.paper_equity),
+                paper_equity=anchor_equity,
+                paper_pnl=anchor_pnl,
                 signals=operations.monitoring.signals_generated,
                 trades=operations.monitoring.paper_trades_executed,
                 decision_count=operations.monitoring.decision_records_created,
@@ -494,6 +641,7 @@ async def _load_live_operation_annotations(
                     "submission_implied": False,
                     "order_submitted": False,
                     "index": index,
+                    **paper_pnl_metadata,
                 },
             )
         )
@@ -618,9 +766,180 @@ def _decimal_from_string(value: str) -> Decimal:
         return Decimal("0")
 
 
-def _derive_paper_pnl(paper_equity: str) -> str:
-    equity = _decimal_from_string(paper_equity)
-    baseline = Decimal("100000")
+async def _resolve_timeline_equity_and_pnl(
+    *,
+    db: AsyncSession,
+    selected_validation_run: ValidationRunResponse | None,
+    fallback_equity: str,
+) -> tuple[str, str | None, dict[str, object]]:
+    fallback_equity_decimal = _decimal_from_string(fallback_equity)
+
+    if not hasattr(db, "execute"):
+        return (
+            format(fallback_equity_decimal.quantize(Decimal("0.01")), "f"),
+            None,
+            {
+                "paper_pnl_source": "unavailable",
+                "paper_pnl_status": "baseline_unresolved",
+            },
+        )
+
+    if selected_validation_run is not None:
+        bound = await _bound_accounts_equity_and_baseline(
+            db=db,
+            validation_run_id=selected_validation_run.validation_run_id,
+        )
+        if bound is not None:
+            equity, baseline, account_count = bound
+            return (
+                format(equity.quantize(Decimal("0.01")), "f"),
+                _format_pnl(equity=equity, baseline=baseline),
+                {
+                    "paper_pnl_source": "bound_paper_account",
+                    "paper_pnl_status": "evidence_backed",
+                    "paper_pnl_baseline": format(baseline.quantize(Decimal("0.01")), "f"),
+                    "paper_pnl_bound_account_count": account_count,
+                },
+            )
+
+        campaign = await _campaign_equity_and_baseline(
+            db=db,
+            validation_run_id=selected_validation_run.validation_run_id,
+        )
+        if campaign is not None:
+            equity, baseline, campaign_count = campaign
+            return (
+                format(equity.quantize(Decimal("0.01")), "f"),
+                _format_pnl(equity=equity, baseline=baseline),
+                {
+                    "paper_pnl_source": "campaign_opening_capital",
+                    "paper_pnl_status": "evidence_backed",
+                    "paper_pnl_baseline": format(baseline.quantize(Decimal("0.01")), "f"),
+                    "paper_pnl_campaign_count": campaign_count,
+                },
+            )
+
+    active_account = await _latest_active_account_equity_and_baseline(db=db)
+    if active_account is not None:
+        equity, baseline, account_id = active_account
+        return (
+            format(equity.quantize(Decimal("0.01")), "f"),
+            _format_pnl(equity=equity, baseline=baseline),
+            {
+                "paper_pnl_source": "fallback_active_paper_account",
+                "paper_pnl_status": "fallback_unbound",
+                "paper_pnl_baseline": format(baseline.quantize(Decimal("0.01")), "f"),
+                "paper_account_id": str(account_id),
+            },
+        )
+
+    return (
+        format(fallback_equity_decimal.quantize(Decimal("0.01")), "f"),
+        None,
+        {
+            "paper_pnl_source": "unavailable",
+            "paper_pnl_status": "baseline_unresolved",
+        },
+    )
+
+
+async def _bound_accounts_equity_and_baseline(
+    *,
+    db: AsyncSession,
+    validation_run_id,
+) -> tuple[Decimal, Decimal, int] | None:
+    account_ids = (
+        (
+            await db.execute(
+                select(ValidationRunPaperAccount.paper_account_id)
+                .where(ValidationRunPaperAccount.validation_run_id == validation_run_id)
+                .order_by(ValidationRunPaperAccount.bound_at.asc())
+            )
+        )
+        .scalars()
+        .all()
+    )
+    if not account_ids:
+        return None
+
+    accounts = (
+        (
+            await db.execute(
+                select(PaperAccount)
+                .where(PaperAccount.id.in_(account_ids))
+                .order_by(PaperAccount.created_at.asc())
+            )
+        )
+        .scalars()
+        .all()
+    )
+    if not accounts:
+        return None
+
+    baseline = Decimal("0")
+    equity = Decimal("0")
+    for account in accounts:
+        snapshot = await build_account_snapshot(
+            db=db,
+            paper_account_id=account.id,
+            starting_balance=account.starting_balance,
+        )
+        baseline += Decimal(str(account.starting_balance))
+        equity += Decimal(str(snapshot.equity))
+    return equity, baseline, len(accounts)
+
+
+async def _campaign_equity_and_baseline(
+    *,
+    db: AsyncSession,
+    validation_run_id,
+) -> tuple[Decimal, Decimal, int] | None:
+    campaigns = (
+        (
+            await db.execute(
+                select(CapitalCampaign)
+                .where(CapitalCampaign.validation_run_id == validation_run_id)
+                .order_by(CapitalCampaign.created_at.asc(), CapitalCampaign.id.asc())
+            )
+        )
+        .scalars()
+        .all()
+    )
+    if not campaigns:
+        return None
+
+    baseline = Decimal("0")
+    equity = Decimal("0")
+    for campaign in campaigns:
+        baseline += Decimal(str(campaign.starting_capital))
+        equity += Decimal(str(campaign.current_equity))
+    return equity, baseline, len(campaigns)
+
+
+async def _latest_active_account_equity_and_baseline(
+    *,
+    db: AsyncSession,
+) -> tuple[Decimal, Decimal, object] | None:
+    account = await db.scalar(
+        select(PaperAccount)
+        .where(PaperAccount.is_active.is_(True))
+        .order_by(PaperAccount.created_at.desc())
+        .limit(1)
+    )
+    if account is None:
+        return None
+
+    snapshot = await build_account_snapshot(
+        db=db,
+        paper_account_id=account.id,
+        starting_balance=account.starting_balance,
+    )
+    return Decimal(str(snapshot.equity)), Decimal(str(account.starting_balance)), account.id
+
+
+def _format_pnl(*, equity: Decimal, baseline: Decimal) -> str | None:
+    if baseline <= 0:
+        return None
     return format((equity - baseline).quantize(Decimal("0.01")), "f")
 
 

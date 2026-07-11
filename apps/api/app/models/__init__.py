@@ -16,6 +16,8 @@ from app.models.audit_log import AuditLog
 from app.models.backtest import Backtest
 from app.models.backtest_trade import BacktestTrade
 from app.models.capital_campaign import CapitalCampaign
+from app.models.capital_campaign_profit_cycle import CapitalCampaignProfitCycle
+from app.models.capital_campaign_profit_policy import CapitalCampaignProfitPolicy
 from app.models.candle import Candle
 from app.models.decision_alternative_action import DecisionAlternativeAction
 from app.models.decision_counterfactual_result import DecisionCounterfactualResult
@@ -77,6 +79,8 @@ __all__ = [
 	"Backtest",
 	"BacktestTrade",
 	"CapitalCampaign",
+	"CapitalCampaignProfitCycle",
+	"CapitalCampaignProfitPolicy",
 	"Candle",
 	"DecisionAlternativeAction",
 	"DecisionCounterfactualResult",

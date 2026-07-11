@@ -86,6 +86,24 @@ Campaign linkage is optional and backward compatible:
 
 No second accounting database is introduced.
 
+## Profit Recommendation Pools (Phase 2)
+
+Capital Ledger now includes recommendation-only campaign-profit pool types derived from the latest profit-cycle evidence:
+
+- `compounding_recommendation`
+- `withdrawal_recommendation`
+- `profit_reserve`
+- `policy_review`
+
+These rows are intentionally non-funding rows.
+
+Rules:
+
+1. They do not increase Managed Capital.
+2. They do not change parent pool principal.
+3. They are evidence and operator-review context only.
+4. They do not move funds or call broker APIs.
+
 ## Read-Only Scope
 
 Capital Ledger v1 performs no writes:

@@ -541,9 +541,27 @@ async def run_orchestration_cycle(
 
             await db.commit()
 
-    research_cycle_result = await run_deterministic_research_cycle_if_due(db=db)
-    if research_cycle_result.started:
-        await db.commit()
+    research_cycles_started = 0
+    try:
+        research_cycle_result = await run_deterministic_research_cycle_if_due(db=db)
+    except Exception:
+        logger.exception("Deterministic research cycle failed; continuing orchestration cycle without research outputs")
+        research_cycle_result = None
+    else:
+        if research_cycle_result.started:
+            await db.commit()
+            research_cycles_started = 1
+        logger.info(
+            "research_cycle_check started=%s reason=%s campaign_id=%s candidates_generated=%s candidates_evaluated=%s descendants_generated=%s champion=%s",
+            research_cycle_result.started,
+            research_cycle_result.reason,
+            research_cycle_result.campaign_id,
+            research_cycle_result.candidates_generated,
+            research_cycle_result.candidates_evaluated,
+            research_cycle_result.descendants_generated,
+            research_cycle_result.champion,
+        )
+
     snapshot = await capture_system_intelligence_snapshot_if_due(db=db)
     if snapshot is not None:
         await db.commit()
@@ -557,7 +575,7 @@ async def run_orchestration_cycle(
         executions_failed=executions_failed,
         executions_skipped=executions_skipped,
         decisions_inserted=decision_inserted_total,
-        research_cycles_started=1 if research_cycle_result.started else 0,
+        research_cycles_started=research_cycles_started,
         intelligence_snapshots_captured=1 if snapshot is not None else 0,
     )
 

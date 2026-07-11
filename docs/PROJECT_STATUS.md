@@ -14,6 +14,7 @@ Operational Resilience + Research/Evolution Activation + Intelligence Timeline v
 
 Autonomous Capital Management:
 Phase 1 Capital Campaigns Foundation (Complete)
+Phase 2 Capital Campaign Profit Policies + Compounding Foundation v1 (Implemented, validation in progress)
 
 Current Prompt:
 Paper-proving resilience hardening, deterministic research/evolution activation, and intelligence evidence improvements
@@ -22,6 +23,8 @@ Overall Completion:
 Approximately 94%
 
 Capital Campaigns Foundation adds campaign CRUD, lifecycle controls, Mission Control managed-capital integration, and optional Capital Ledger campaign linkage without changing live-trading safety boundaries.
+
+Phase 2 adds campaign-level profit policy and cycle recommendation modeling, approval workflows, and recommendation-only ledger/timeline intelligence integration while keeping live submission disabled and fund movement out of scope.
 
 ---
 
