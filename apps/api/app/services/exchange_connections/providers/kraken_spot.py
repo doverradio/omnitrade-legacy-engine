@@ -297,6 +297,33 @@ def _parse_nonce_from_form(encoded_body: str) -> str | None:
     return None
 
 
+def _decode_url_query(query_raw: object) -> str:
+    if query_raw is None:
+        return ""
+    if isinstance(query_raw, bytes):
+        return query_raw.decode("utf-8", errors="ignore")
+    return str(query_raw)
+
+
+def _query_forensics(*, query_raw: object, encoded_body: str) -> dict[str, object]:
+    query_text = _decode_url_query(query_raw)
+    query_has_text = len(query_text) > 0
+    query_pairs = urllib.parse.parse_qsl(query_text, keep_blank_values=True)
+    body_pairs = urllib.parse.parse_qsl(encoded_body, keep_blank_values=True)
+    body_keys = {key for key, _value in body_pairs}
+    query_keys = {key for key, _value in query_pairs}
+    duplicated_keys = body_keys.intersection(query_keys)
+    nonce_in_query = any(key == "nonce" for key, _value in query_pairs)
+    return {
+        "url_query_parameters_present": query_has_text,
+        "final_url_has_query": query_has_text,
+        "final_query_component_length": len(query_text),
+        "final_query_parameter_count": len(query_pairs),
+        "form_fields_duplicated_into_url_query": len(duplicated_keys) > 0,
+        "nonce_present_in_url_query": nonce_in_query,
+    }
+
+
 def _contract_checks(*, request_path: str, method: str, content_type: str, encoded_body: str) -> dict[str, object]:
     normalized_type = content_type.strip().lower()
     checks = [
@@ -1339,15 +1366,24 @@ class KrakenSpotClient:
         transmitted_http_version = None
         transmitted_body = encoded_body
         transmitted_content_type = content_type
-        url_query_parameters_present = False
+        query_forensics = {
+            "url_query_parameters_present": False,
+            "final_url_has_query": False,
+            "final_query_component_length": 0,
+            "final_query_parameter_count": 0,
+            "form_fields_duplicated_into_url_query": False,
+            "nonce_present_in_url_query": False,
+        }
         if request_obj is not None:
             req_url = getattr(request_obj, "url", None)
             if req_url is not None:
                 transmitted_path = str(getattr(req_url, "path", request_path))
                 transmitted_scheme = str(getattr(req_url, "scheme", "https"))
                 transmitted_host = str(getattr(req_url, "host", "api.kraken.com"))
-                query_value = str(getattr(req_url, "query", ""))
-                url_query_parameters_present = bool(query_value)
+                query_forensics = _query_forensics(
+                    query_raw=getattr(req_url, "query", ""),
+                    encoded_body=encoded_body,
+                )
             req_content = getattr(request_obj, "content", None)
             if isinstance(req_content, bytes):
                 transmitted_body = req_content.decode("utf-8", errors="replace")
@@ -1385,7 +1421,38 @@ class KrakenSpotClient:
             signature=signature,
             secret_b64=credentials["api_secret"],
         )
-        forensics["kraken_url_query_parameters_present"] = url_query_parameters_present
+        forensics["kraken_url_query_parameters_present"] = bool(query_forensics["url_query_parameters_present"])
+        forensics["kraken_final_url_has_query"] = bool(query_forensics["final_url_has_query"])
+        forensics["kraken_final_query_component_length"] = int(query_forensics["final_query_component_length"])
+        forensics["kraken_final_query_parameter_count"] = int(query_forensics["final_query_parameter_count"])
+        forensics["kraken_form_fields_duplicated_into_url_query"] = bool(query_forensics["form_fields_duplicated_into_url_query"])
+        forensics["kraken_nonce_present_in_url_query"] = bool(query_forensics["nonce_present_in_url_query"])
+        final_request_path = transmitted_path
+        forensics["kraken_final_request_path"] = final_request_path
+        forensics["kraken_query_contains_question_mark"] = "?" in final_request_path
+        forensics["kraken_prepared_method"] = method
+        forensics["kraken_prepared_url_path"] = request_path
+        forensics["kraken_prepared_query_string_present"] = bool(query_forensics["url_query_parameters_present"])
+        forensics["kraken_prepared_body_length"] = len(encoded_body.encode("utf-8"))
+        forensics["kraken_prepared_content_type"] = content_type
+        forensics["kraken_header_name_presence"] = {
+            "api_key": bool(headers.get("API-Key")),
+            "api_sign": bool(headers.get("API-Sign")),
+            "content_type": bool(headers.get("Content-Type")),
+        }
+        forensics["kraken_prepared_body_hash_equals_signed_body_hash"] = (
+            hashlib.sha256(encoded_body.encode("utf-8")).hexdigest()
+            == hashlib.sha256(transmitted_body.encode("utf-8")).hexdigest()
+        )
+        redirect_modified_url = False
+        history = list(getattr(response, "history", []) or [])
+        if history:
+            first_request = getattr(history[0], "request", None)
+            first_url = getattr(first_request, "url", None)
+            if first_url is not None:
+                first_path = str(getattr(first_url, "path", ""))
+                redirect_modified_url = first_path != final_request_path
+        forensics["kraken_redirect_modified_url"] = redirect_modified_url
 
         if response.status_code >= 400:
             self._last_error_classification = "http_error"

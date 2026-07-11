@@ -280,7 +280,7 @@ async def test_kraken_private_invalid_signature_includes_safe_forensics(monkeypa
             self.extensions = {"http_version": b"HTTP/1.1"}
             self.history = []
             self.request = SimpleNamespace(
-                url=SimpleNamespace(path="/0/private/Balance", scheme="https", host="api.kraken.com", query=""),
+                url=SimpleNamespace(path="/0/private/Balance", scheme="https", host="api.kraken.com", query=b""),
                 content=b"nonce=1700000000000",
                 headers={"Content-Type": "application/x-www-form-urlencoded"},
             )
@@ -338,6 +338,20 @@ async def test_kraken_private_invalid_signature_includes_safe_forensics(monkeypa
     assert forensics["kraken_post_form_encoded"] is True
     assert forensics["kraken_json_payload_used"] is False
     assert forensics["kraken_url_query_parameters_present"] is False
+    assert forensics["kraken_final_url_has_query"] is False
+    assert forensics["kraken_final_query_component_length"] == 0
+    assert forensics["kraken_final_query_parameter_count"] == 0
+    assert forensics["kraken_form_fields_duplicated_into_url_query"] is False
+    assert forensics["kraken_nonce_present_in_url_query"] is False
+    assert forensics["kraken_prepared_method"] == "POST"
+    assert forensics["kraken_prepared_url_path"] == "/0/private/Balance"
+    assert forensics["kraken_prepared_query_string_present"] is False
+    assert forensics["kraken_prepared_body_length"] > 0
+    assert forensics["kraken_prepared_content_type"] == "application/x-www-form-urlencoded"
+    assert forensics["kraken_prepared_body_hash_equals_signed_body_hash"] is True
+    assert forensics["kraken_final_request_path"] == "/0/private/Balance"
+    assert forensics["kraken_query_contains_question_mark"] is False
+    assert forensics["kraken_redirect_modified_url"] is False
     assert forensics["kraken_signature_lengths_equal"] is True
     assert forensics["kraken_signature_bytes_equal"] is True
     assert forensics["kraken_first_differing_stage"] is None
@@ -353,3 +367,65 @@ async def test_kraken_private_invalid_signature_includes_safe_forensics(monkeypa
     assert "public-key" not in serialized
     assert "kQH5HW" not in serialized
     assert "API-Sign" not in serialized
+
+
+@pytest.mark.asyncio
+async def test_kraken_private_forensics_detects_real_query_string(monkeypatch: pytest.MonkeyPatch) -> None:
+    client = KrakenSpotClient()
+
+    class _FakeResponse:
+        status_code = 200
+        text = '{"error":["EAPI:Invalid signature"],"result":{}}'
+
+        def __init__(self) -> None:
+            self.extensions = {"http_version": b"HTTP/1.1"}
+            self.history = []
+            self.request = SimpleNamespace(
+                url=SimpleNamespace(path="/0/private/Balance", scheme="https", host="api.kraken.com", query=b"trace=1"),
+                content=b"nonce=1700000000001",
+                headers={"Content-Type": "application/x-www-form-urlencoded"},
+            )
+
+        def json(self):
+            return {"error": ["EAPI:Invalid signature"], "result": {}}
+
+    class _FakeAsyncClient:
+        def __init__(self, *, base_url, timeout):
+            _ = base_url, timeout
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exc_type, exc, tb):
+            return False
+
+        async def post(self, path, content, headers):
+            _ = path, content, headers
+            return _FakeResponse()
+
+    monkeypatch.setattr("app.services.exchange_connections.providers.kraken_spot.httpx.AsyncClient", _FakeAsyncClient)
+
+    async def _next_nonce() -> str:
+        return "1700000000001"
+
+    monkeypatch.setattr(client, "_next_nonce", _next_nonce)
+
+    with pytest.raises(InvalidRequestError) as exc_info:
+        await client._private_request(
+            path="/private/Balance",
+            environment="production",
+            credentials={
+                "api_key": "public-key",
+                "api_secret": "kQH5HW/8p1uGOVjbgWA7FunAmGO8lsSUXNsu3eow76sz84Q18fWxnyRzBHCd3pd5nE9qa99HAZtuZuj6F1huXg==",
+                "passphrase": "",
+            },
+            payload={},
+        )
+
+    forensics = exc_info.value.details["forensics"]
+    assert forensics["kraken_url_query_parameters_present"] is True
+    assert forensics["kraken_final_url_has_query"] is True
+    assert forensics["kraken_final_query_component_length"] == 7
+    assert forensics["kraken_final_query_parameter_count"] == 1
+    assert forensics["kraken_form_fields_duplicated_into_url_query"] is False
+    assert forensics["kraken_nonce_present_in_url_query"] is False
