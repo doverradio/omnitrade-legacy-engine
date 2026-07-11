@@ -26,6 +26,78 @@ Capital Campaigns Foundation adds campaign CRUD, lifecycle controls, Mission Con
 
 Phase 2 adds campaign-level profit policy and cycle recommendation modeling, approval workflows, and recommendation-only ledger/timeline intelligence integration while keeping live submission disabled and fund movement out of scope.
 
+## Execution Provider Status
+
+Primary Objective:
+Safely execute OmniTrade's first real live trade using the first healthy production execution provider.
+
+The platform is now provider-neutral.
+
+Execution providers are interchangeable implementations of the Execution Provider Layer.
+
+### Current Providers
+
+Kraken
+
+Status:
+Primary production execution provider.
+
+Reason:
+
+- Active verified operator account.
+- API credentials configured.
+- Current implementation target.
+- Critical path to first live trade.
+
+Current Progress:
+
+- Provider registered.
+- Provider abstraction implemented.
+- Initialization work in progress.
+- Readiness work in progress.
+- Production dry-run path in progress.
+- Live submission implementation in progress.
+
+Coinbase
+
+Status:
+Secondary execution provider.
+
+Reason:
+
+- Legacy account associated with the original email address was confirmed by Coinbase as closed.
+- Coinbase support is no longer on the critical path.
+- Future verified Coinbase account remains planned.
+- Coinbase support continues through the Execution Provider Layer.
+
+Current Progress:
+
+- Provider abstraction implemented.
+- Existing Coinbase integration preserved.
+- Future production account onboarding deferred.
+
+### Architecture Decision
+
+Execution providers are now first-class architectural components.
+
+No exchange may become a permanent single point of failure.
+
+The first successful production trade may execute through whichever provider reaches production readiness first.
+
+### Future Providers
+
+The current architecture is intentionally designed to support future providers such as:
+
+- Coinbase
+- Kraken
+- Gemini
+- Interactive Brokers
+- Alpaca
+- Kalshi
+- Others
+
+without requiring changes to the Decision Engine, Risk Engine, Capital Ledger, or Mission Control.
+
 ---
 
 # Project Vision

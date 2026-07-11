@@ -24,6 +24,7 @@ from app.services.exchange_connections.providers.base import (
     ExchangePreviewResult,
     ExchangeProductSnapshot,
     ExchangeProviderAmbiguousResponse,
+    ExchangeProviderFee,
     ExchangeProviderHealth,
     ExchangeProviderMetadata,
     ExchangeProviderOrder,
@@ -99,6 +100,33 @@ def _looks_like_permission_denied(exc: Exception) -> bool:
     return "permission" in lowered or "denied" in lowered
 
 
+def _redact_sensitive(value: Any) -> Any:
+    secret_tokens = {
+        "api_key",
+        "api_secret",
+        "authorization",
+        "signature",
+        "api-sign",
+        "api_sign",
+        "otp",
+        "passphrase",
+        "token",
+        "jwt",
+    }
+    if isinstance(value, dict):
+        redacted: dict[str, Any] = {}
+        for key, nested in value.items():
+            lowered = str(key).strip().lower()
+            if lowered in secret_tokens:
+                redacted[str(key)] = "[REDACTED]"
+            else:
+                redacted[str(key)] = _redact_sensitive(nested)
+        return redacted
+    if isinstance(value, list):
+        return [_redact_sensitive(item) for item in value]
+    return value
+
+
 def _normalize_intent_product(product_id: str) -> tuple[str, str]:
     normalized = product_id.strip().upper()
     if normalized in {"BTC-USD", "XBT-USD", "BTC/USD", "XBT/USD", "XBTUSD"}:
@@ -137,6 +165,13 @@ class KrakenSpotClient:
             "product_lookup",
             "price_evidence",
             "preview_market_order",
+            "create_order",
+            "stable_client_order_id",
+            "order_lookup_provider_id",
+            "order_lookup_client_id",
+            "order_lookup_history",
+            "fill_lookup",
+            "fee_reporting",
             "sandbox",
             "controlled_mock",
             "health_observability",
@@ -457,21 +492,282 @@ class KrakenSpotClient:
         environment: str,
         request: ExchangeOrderSubmissionRequest,
     ) -> ExchangeOrderSubmissionResult:
-        _ = credentials
-        _ = environment
-        _ = request
+        if request.side.upper() != "BUY" or request.order_type.upper() != "MARKET":
+            return ExchangeOrderSubmissionResult(
+                classification="rejected",
+                order=None,
+                rejection=ExchangeProviderRejection(
+                    code="unsupported_order_shape",
+                    message="Kraken submission supports only MARKET BUY in this execution profile",
+                    retryable=False,
+                    provider_status=None,
+                    safe_details={"side": request.side, "order_type": request.order_type},
+                ),
+                ambiguous=None,
+                raw_response={},
+                safe_headers={},
+            )
+        if request.quote_size is None or request.quote_size <= Decimal("0"):
+            return ExchangeOrderSubmissionResult(
+                classification="rejected",
+                order=None,
+                rejection=ExchangeProviderRejection(
+                    code="invalid_quote_size",
+                    message="Kraken market buy submission requires quote_size > 0",
+                    retryable=False,
+                    provider_status=None,
+                    safe_details={"quote_size": None if request.quote_size is None else format(request.quote_size, "f")},
+                ),
+                ambiguous=None,
+                raw_response={},
+                safe_headers={},
+            )
+
+        normalized_product, target_pair = _normalize_intent_product(request.product_id)
+        pair_info = await self._load_pair_info(environment=environment, normalized_pair=target_pair)
+        if pair_info is None:
+            return ExchangeOrderSubmissionResult(
+                classification="rejected",
+                order=None,
+                rejection=ExchangeProviderRejection(
+                    code="product_unavailable",
+                    message="Kraken pair metadata unavailable for submission",
+                    retryable=False,
+                    provider_status=None,
+                    safe_details={"product_id": normalized_product, "pair": target_pair},
+                ),
+                ambiguous=None,
+                raw_response={},
+                safe_headers={},
+            )
+
+        altname = str(pair_info.get("altname") or "XBTUSD")
+        pair_decimals = int(pair_info.get("pair_decimals") or 1)
+        lot_decimals = int(pair_info.get("lot_decimals") or 8)
+        ordermin = _to_decimal(pair_info.get("ordermin"))
+        costmin = _to_decimal(pair_info.get("costmin"))
+
+        quote_size = _quantize(request.quote_size, pair_decimals)
+        if quote_size <= Decimal("0"):
+            return ExchangeOrderSubmissionResult(
+                classification="rejected",
+                order=None,
+                rejection=ExchangeProviderRejection(
+                    code="quote_size_quantized_to_zero",
+                    message="Kraken quote_size underflows provider precision",
+                    retryable=False,
+                    provider_status=None,
+                    safe_details={"requested_quote_size": format(request.quote_size, "f"), "pair_decimals": pair_decimals},
+                ),
+                ambiguous=None,
+                raw_response={},
+                safe_headers={},
+            )
+        if quote_size > request.quote_size:
+            return ExchangeOrderSubmissionResult(
+                classification="rejected",
+                order=None,
+                rejection=ExchangeProviderRejection(
+                    code="quote_size_precision_conflict",
+                    message="Kraken quote_size precision would increase requested amount",
+                    retryable=False,
+                    provider_status=None,
+                    safe_details={
+                        "requested_quote_size": format(request.quote_size, "f"),
+                        "quantized_quote_size": format(quote_size, "f"),
+                        "pair_decimals": pair_decimals,
+                    },
+                ),
+                ambiguous=None,
+                raw_response={},
+                safe_headers={},
+            )
+
+        ticker_payload = await self._public_request(path="/public/Ticker", environment=environment, params={"pair": altname})
+        ticker_result = ticker_payload.get("result") if isinstance(ticker_payload.get("result"), dict) else {}
+        ticker_row = next(iter(ticker_result.values()), None) if isinstance(ticker_result, dict) and ticker_result else None
+        if not isinstance(ticker_row, dict):
+            return ExchangeOrderSubmissionResult(
+                classification="ambiguous",
+                order=None,
+                rejection=None,
+                ambiguous=ExchangeProviderAmbiguousResponse(
+                    reason="ticker_unavailable",
+                    safe_details={"pair": altname},
+                ),
+                raw_response=_redact_sensitive(ticker_payload),
+                safe_headers={},
+            )
+        ask_arr = ticker_row.get("a") if isinstance(ticker_row.get("a"), list) else []
+        best_ask = _to_decimal(ask_arr[0] if len(ask_arr) > 0 else None)
+        if best_ask <= Decimal("0"):
+            return ExchangeOrderSubmissionResult(
+                classification="ambiguous",
+                order=None,
+                rejection=None,
+                ambiguous=ExchangeProviderAmbiguousResponse(
+                    reason="best_ask_unavailable",
+                    safe_details={"pair": altname},
+                ),
+                raw_response={"pair": altname},
+                safe_headers={},
+            )
+
+        estimated_base_size = _quantize(quote_size / best_ask, lot_decimals)
+        if ordermin > Decimal("0") and estimated_base_size < ordermin:
+            return ExchangeOrderSubmissionResult(
+                classification="rejected",
+                order=None,
+                rejection=ExchangeProviderRejection(
+                    code="below_min_order_size",
+                    message="Kraken estimated base size below ordermin",
+                    retryable=False,
+                    provider_status=None,
+                    safe_details={
+                        "estimated_base_size": format(estimated_base_size, "f"),
+                        "ordermin": format(ordermin, "f"),
+                        "lot_decimals": lot_decimals,
+                    },
+                ),
+                ambiguous=None,
+                raw_response={},
+                safe_headers={},
+            )
+        if costmin > Decimal("0") and quote_size < costmin:
+            return ExchangeOrderSubmissionResult(
+                classification="rejected",
+                order=None,
+                rejection=ExchangeProviderRejection(
+                    code="below_min_order_cost",
+                    message="Kraken quote size below costmin",
+                    retryable=False,
+                    provider_status=None,
+                    safe_details={"quote_size": format(quote_size, "f"), "costmin": format(costmin, "f")},
+                ),
+                ambiguous=None,
+                raw_response={},
+                safe_headers={},
+            )
+
+        payload = {
+            "ordertype": "market",
+            "type": "buy",
+            "pair": altname,
+            "volume": format(quote_size, "f"),
+            "oflags": "fciq,viqc",
+            "timeinforce": "IOC",
+            "cl_ord_id": request.client_order_id,
+        }
+
+        try:
+            provider_response = await self._private_request(
+                path="/private/AddOrder",
+                environment=environment,
+                credentials=credentials,
+                payload=payload,
+            )
+        except InvalidRequestError as exc:
+            details = exc.details if isinstance(exc.details, dict) else {}
+            errors = details.get("errors") if isinstance(details.get("errors"), list) else []
+            status_code = details.get("status_code")
+            if isinstance(status_code, int) and status_code >= 500:
+                return ExchangeOrderSubmissionResult(
+                    classification="ambiguous",
+                    order=None,
+                    rejection=None,
+                    ambiguous=ExchangeProviderAmbiguousResponse(
+                        reason="provider_http_5xx",
+                        safe_details={"status_code": status_code, "path": details.get("path")},
+                    ),
+                    raw_response={},
+                    safe_headers={},
+                )
+            rejection_code = "provider_rejected"
+            if any("insufficient" in str(item).lower() for item in errors):
+                rejection_code = "insufficient_funds"
+            elif any("invalid nonce" in str(item).lower() for item in errors):
+                rejection_code = "invalid_nonce"
+            elif any("invalid arguments" in str(item).lower() for item in errors):
+                rejection_code = "invalid_arguments"
+            return ExchangeOrderSubmissionResult(
+                classification="rejected",
+                order=None,
+                rejection=ExchangeProviderRejection(
+                    code=rejection_code,
+                    message="Kraken order rejected",
+                    retryable=False,
+                    provider_status=None,
+                    safe_details={"errors": [str(item) for item in errors[:5]], "path": details.get("path")},
+                ),
+                ambiguous=None,
+                raw_response={},
+                safe_headers={},
+            )
+        except ServiceUnavailableError as exc:
+            return ExchangeOrderSubmissionResult(
+                classification="ambiguous",
+                order=None,
+                rejection=None,
+                ambiguous=ExchangeProviderAmbiguousResponse(
+                    reason="provider_transport_unavailable",
+                    safe_details={"error_type": exc.__class__.__name__},
+                ),
+                raw_response={},
+                safe_headers={},
+            )
+        except Exception as exc:
+            return ExchangeOrderSubmissionResult(
+                classification="ambiguous",
+                order=None,
+                rejection=None,
+                ambiguous=ExchangeProviderAmbiguousResponse(
+                    reason="provider_exception_before_classification",
+                    safe_details={"error_type": exc.__class__.__name__, "message": str(exc)},
+                ),
+                raw_response={},
+                safe_headers={},
+            )
+
+        result = provider_response.get("result") if isinstance(provider_response.get("result"), dict) else {}
+        txids = result.get("txid") if isinstance(result.get("txid"), list) else []
+        provider_order_id = str(txids[0]) if txids else None
+        if provider_order_id is None:
+            return ExchangeOrderSubmissionResult(
+                classification="ambiguous",
+                order=ExchangeProviderOrder(
+                    provider_order_id=None,
+                    client_order_id=request.client_order_id,
+                    product_id=normalized_product,
+                    side="BUY",
+                    status="UNKNOWN",
+                    submitted_at=datetime.now(timezone.utc),
+                    acknowledged_at=None,
+                    raw=_redact_sensitive(provider_response),
+                ),
+                rejection=None,
+                ambiguous=ExchangeProviderAmbiguousResponse(
+                    reason="missing_provider_order_id",
+                    safe_details={"result_keys": sorted(result.keys()) if isinstance(result, dict) else []},
+                ),
+                raw_response=_redact_sensitive(provider_response),
+                safe_headers={},
+            )
+
         return ExchangeOrderSubmissionResult(
-            classification="rejected",
-            order=None,
-            rejection=ExchangeProviderRejection(
-                code="unsupported_capability",
-                message="Kraken order submission is not enabled in EP-2",
-                retryable=False,
-                provider_status=None,
-                safe_details={"provider": self.provider, "capability": "create_order"},
+            classification="success",
+            order=ExchangeProviderOrder(
+                provider_order_id=provider_order_id,
+                client_order_id=request.client_order_id,
+                product_id=normalized_product,
+                side="BUY",
+                status="OPEN",
+                submitted_at=datetime.now(timezone.utc),
+                acknowledged_at=datetime.now(timezone.utc),
+                raw=_redact_sensitive(provider_response),
             ),
+            rejection=None,
             ambiguous=None,
-            raw_response={},
+            raw_response=_redact_sensitive(provider_response),
             safe_headers={},
         )
 
@@ -484,11 +780,90 @@ class KrakenSpotClient:
         client_order_id: str | None,
         product_id: str | None,
     ) -> ExchangeProviderOrder | None:
-        _ = credentials
-        _ = environment
-        _ = provider_order_id
-        _ = client_order_id
-        _ = product_id
+        normalized_product = None
+        normalized_pair = None
+        if product_id is not None:
+            normalized_product, normalized_pair = _normalize_intent_product(product_id)
+
+        open_payload = await self._private_request(
+            path="/private/OpenOrders",
+            environment=environment,
+            credentials=credentials,
+            payload={"cl_ord_id": client_order_id} if client_order_id else {},
+        )
+        open_rows = (open_payload.get("result") or {}).get("open") if isinstance(open_payload.get("result"), dict) else {}
+        if isinstance(open_rows, dict):
+            for txid, row in open_rows.items():
+                if not isinstance(row, dict):
+                    continue
+                if provider_order_id is not None and str(txid) != provider_order_id:
+                    continue
+                if client_order_id is not None and str(row.get("cl_ord_id") or "") != client_order_id:
+                    continue
+                pair = str((row.get("descr") or {}).get("pair") or "") if isinstance(row.get("descr"), dict) else ""
+                if normalized_pair is not None and pair.replace("-", "/").upper() != normalized_pair.upper():
+                    continue
+                status = str(row.get("status") or "open").upper()
+                return ExchangeProviderOrder(
+                    provider_order_id=str(txid),
+                    client_order_id=str(row.get("cl_ord_id") or client_order_id) if (row.get("cl_ord_id") or client_order_id) else None,
+                    product_id=normalized_product,
+                    side=str((row.get("descr") or {}).get("type") or "").upper() if isinstance(row.get("descr"), dict) else None,
+                    status=status,
+                    submitted_at=_parse_kraken_timestamp(row),
+                    acknowledged_at=_parse_kraken_timestamp(row),
+                    raw=_redact_sensitive(row),
+                )
+
+        closed_query: dict[str, str] = {"trades": "true"}
+        if client_order_id:
+            closed_query["cl_ord_id"] = client_order_id
+        closed_payload = await self._private_request(
+            path="/private/ClosedOrders",
+            environment=environment,
+            credentials=credentials,
+            payload=closed_query,
+        )
+        closed_rows = (closed_payload.get("result") or {}).get("closed") if isinstance(closed_payload.get("result"), dict) else {}
+        if not isinstance(closed_rows, dict):
+            return None
+        for txid, row in closed_rows.items():
+            if not isinstance(row, dict):
+                continue
+            if provider_order_id is not None and str(txid) != provider_order_id:
+                continue
+            if client_order_id is not None and str(row.get("cl_ord_id") or "") != client_order_id:
+                continue
+            pair = str((row.get("descr") or {}).get("pair") or "") if isinstance(row.get("descr"), dict) else ""
+            if normalized_pair is not None and pair.replace("-", "/").upper() != normalized_pair.upper():
+                continue
+            raw_status = str(row.get("status") or "").lower()
+            vol = _to_decimal(row.get("vol"))
+            vol_exec = _to_decimal(row.get("vol_exec"))
+            if raw_status in {"canceled", "expired"}:
+                status = "CANCELLED"
+            elif raw_status == "closed" and vol > Decimal("0") and vol_exec >= vol:
+                status = "FILLED"
+            elif raw_status == "closed" and vol_exec > Decimal("0"):
+                status = "PARTIALLY_FILLED"
+            elif raw_status == "closed":
+                status = "CLOSED"
+            elif raw_status == "pending":
+                status = "PENDING"
+            elif raw_status == "open":
+                status = "OPEN"
+            else:
+                status = raw_status.upper() if raw_status else "UNKNOWN"
+            return ExchangeProviderOrder(
+                provider_order_id=str(txid),
+                client_order_id=str(row.get("cl_ord_id") or client_order_id) if (row.get("cl_ord_id") or client_order_id) else None,
+                product_id=normalized_product,
+                side=str((row.get("descr") or {}).get("type") or "").upper() if isinstance(row.get("descr"), dict) else None,
+                status=status,
+                submitted_at=_parse_kraken_timestamp(row),
+                acknowledged_at=_parse_kraken_timestamp(row),
+                raw=_redact_sensitive(row),
+            )
         return None
 
     async def list_fills(
@@ -498,10 +873,47 @@ class KrakenSpotClient:
         environment: str,
         provider_order_id: str,
     ) -> list[ExchangeProviderFill]:
-        _ = credentials
-        _ = environment
-        _ = provider_order_id
-        return []
+        payload = await self._private_request(
+            path="/private/TradesHistory",
+            environment=environment,
+            credentials=credentials,
+            payload={"trades": "false", "without_count": "true"},
+        )
+        rows = (payload.get("result") or {}).get("trades") if isinstance(payload.get("result"), dict) else {}
+        if not isinstance(rows, dict):
+            return []
+
+        fills: list[ExchangeProviderFill] = []
+        for trade_txid, item in rows.items():
+            if not isinstance(item, dict):
+                continue
+            if str(item.get("ordertxid") or "") != provider_order_id:
+                continue
+            size = _to_decimal(item.get("vol"))
+            price = _to_decimal(item.get("price"))
+            if size <= Decimal("0") or price <= Decimal("0"):
+                continue
+            fee_amount = _to_decimal(item.get("fee"))
+            fee_currency = "USD"
+            pair = str(item.get("pair") or "").upper()
+            if pair.endswith("EUR"):
+                fee_currency = "EUR"
+            elif pair.endswith("USD"):
+                fee_currency = "USD"
+            occurred_at = _parse_kraken_timestamp(item)
+            fills.append(
+                ExchangeProviderFill(
+                    provider_fill_id=str(item.get("trade_id") or trade_txid),
+                    provider_order_id=provider_order_id,
+                    product_id=None,
+                    size=size,
+                    price=price,
+                    fee=None if fee_amount <= Decimal("0") else ExchangeProviderFee(amount=fee_amount, currency=fee_currency),
+                    occurred_at=occurred_at,
+                    raw=_redact_sensitive(item),
+                )
+            )
+        return fills
 
     async def _load_pair_info(self, *, environment: str, normalized_pair: str) -> dict[str, Any] | None:
         payload = await self._public_request(path="/public/AssetPairs", environment=environment, params={"assetVersion": "1"})
@@ -644,6 +1056,14 @@ class KrakenSpotClient:
             return {"error": [], "result": {"closed": {}, "count": 0}}
         if path == "/private/Ledgers":
             return {"error": [], "result": {"ledger": {}, "count": 0}}
+        if path == "/private/AddOrder":
+            return {"error": [], "result": {"descr": {"order": "buy 5.0 XBTUSD @ market"}, "txid": ["MOCK-KRAKEN-TX-1"]}}
+        if path == "/private/OpenOrders":
+            return {"error": [], "result": {"open": {}}}
+        if path == "/private/ClosedOrders":
+            return {"error": [], "result": {"closed": {}, "count": 0}}
+        if path == "/private/TradesHistory":
+            return {"error": [], "result": {"trades": {}, "count": 0}}
         if path == "/public/AssetPairs":
             return {
                 "error": [],

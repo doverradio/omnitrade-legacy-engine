@@ -86,11 +86,13 @@ def _normalize_provider_status(*, provider_status: str | None) -> str:
     status = provider_status.upper()
     if status in {"OPEN", "PENDING", "QUEUED", "CANCEL_QUEUED", "EDIT_QUEUED"}:
         return "open"
-    if status == "FILLED":
+    if status in {"FILLED", "CLOSED"}:
         return "filled"
-    if status in {"CANCELLED", "EXPIRED"}:
+    if status in {"PARTIALLY_FILLED", "PARTIAL"}:
+        return "partially_filled"
+    if status in {"CANCELLED", "CANCELED", "EXPIRED"}:
         return "canceled"
-    if status == "FAILED":
+    if status in {"FAILED", "REJECTED"}:
         return "rejected"
     return "unknown"
 

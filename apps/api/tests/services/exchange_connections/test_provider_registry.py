@@ -80,15 +80,43 @@ async def test_registry_provider_health_shape() -> None:
     assert "create_order" in health.capability_status
 
 
-def test_registry_kraken_create_order_capability_is_disabled_in_ep2() -> None:
+def test_registry_kraken_create_order_capability_is_enabled_for_ep4() -> None:
     metadata = get_exchange_provider_metadata("kraken_spot")
-    assert "create_order" not in metadata.capabilities
+    assert "create_order" in metadata.capabilities
 
 
 @pytest.mark.asyncio
-async def test_registry_kraken_submit_fails_closed_in_ep2() -> None:
+async def test_registry_kraken_submit_supports_exact_one_contract(monkeypatch: pytest.MonkeyPatch) -> None:
     provider = get_exchange_provider("kraken_spot", environment="production")
     from app.services.exchange_connections.providers.base import ExchangeOrderSubmissionRequest
+
+    async def _public(*, path, **_kwargs):
+        if path == "/public/AssetPairs":
+            return {
+                "error": [],
+                "result": {
+                    "XXBTZUSD": {
+                        "altname": "XBTUSD",
+                        "wsname": "XBT/USD",
+                        "base": "BTC",
+                        "quote": "USD",
+                        "status": "online",
+                        "pair_decimals": 1,
+                        "lot_decimals": 8,
+                        "ordermin": "0.00005",
+                        "costmin": "0.5",
+                    }
+                },
+            }
+        return {"error": [], "result": {"XXBTZUSD": {"a": ["50000.0", "1", "1"], "b": ["49999.0", "1", "1"]}}}
+
+    async def _private(*, path, **_kwargs):
+        if path == "/private/AddOrder":
+            return {"error": [], "result": {"txid": ["OID-1"]}}
+        raise AssertionError(f"unexpected path {path}")
+
+    monkeypatch.setattr(provider, "_public_request", _public)
+    monkeypatch.setattr(provider, "_private_request", _private)
 
     result = await provider.submit_order(
         credentials={"api_key": "k", "api_secret": "s"},
@@ -104,6 +132,6 @@ async def test_registry_kraken_submit_fails_closed_in_ep2() -> None:
             raw_payload={},
         ),
     )
-    assert result.classification == "rejected"
-    assert result.rejection is not None
-    assert result.rejection.code == "unsupported_capability"
+    assert result.classification == "success"
+    assert result.order is not None
+    assert result.order.provider_order_id == "OID-1"
