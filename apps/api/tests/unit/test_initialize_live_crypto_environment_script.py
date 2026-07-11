@@ -360,6 +360,52 @@ async def test_script_failure_output_redacts_secret_values(monkeypatch: pytest.M
 
 
 @pytest.mark.asyncio
+async def test_script_failure_output_surfaces_safe_kraken_auth_and_credential_consistency(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    monkeypatch.setattr(script, "get_settings", lambda: _settings())
+    monkeypatch.setattr(script, "AsyncSessionLocal", lambda: _AsyncSessionLocal(object()))
+
+    async def _raise(**_kwargs):
+        raise ValueError(
+            "Provider readiness check failed; refresh_exchange_balances did not reach ready state; "
+            "readiness_details={\"authentication_diagnostics\":{\"kraken_auth_category\":\"invalid_signature\",\"kraken_provider_error\":\"EAPI:Invalid signature\"},\"stored_api_key_matches_env\":false,\"stored_api_secret_matches_env\":true}"
+        )
+
+    monkeypatch.setattr(script, "initialize_live_crypto_environment", _raise)
+
+    result = await script._run(
+        SimpleNamespace(
+            apply=True,
+            create_preview=False,
+            create_approval=False,
+            exchange_environment="production",
+            actor="operator:human",
+            paper_account_id=UUID("905a408c-7d8e-4fc7-ad3b-9ff637005d73"),
+            exchange_connection_name="kraken-production-primary",
+            exchange_api_key_name=None,
+            exchange_api_key_name_env="KRAKEN_API_KEY",
+            exchange_private_key_env="KRAKEN_API_SECRET",
+            exchange_passphrase_env="KRAKEN_OTP",
+            prompt_for_credentials=False,
+            registration_source="human_production_initializer",
+            campaign_owner="operator",
+            exchange_connection_id=None,
+            live_trading_profile_id=None,
+            provider="kraken_spot",
+        )
+    )
+
+    output = capsys.readouterr().out
+    assert result == 1
+    assert "kraken_auth_category=invalid_signature" in output
+    assert "kraken_provider_error=EAPI:Invalid signature" in output
+    assert "stored_api_key_matches_env=false" in output
+    assert "stored_api_secret_matches_env=true" in output
+
+
+@pytest.mark.asyncio
 async def test_script_rehearsal_mode_runs_only_in_sandbox(monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]) -> None:
     monkeypatch.setattr(script, "get_settings", lambda: _settings())
 

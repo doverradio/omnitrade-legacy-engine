@@ -28,7 +28,11 @@ from app.services.exchange_connections.providers.registry import get_exchange_pr
 from app.services.assets_service import EnsureCoinbaseAssetRequest, ensure_coinbase_crypto_asset
 from app.services.capital_campaigns.service import create_capital_campaign
 from app.services.crypto_order_previews.service import create_crypto_order_preview
-from app.services.exchange_connections.service import create_exchange_connection, refresh_exchange_balances
+from app.services.exchange_connections.service import (
+    create_exchange_connection,
+    get_decrypted_credentials_for_connection,
+    refresh_exchange_balances,
+)
 from app.services.live.approval import record_live_approval_checkpoint
 from app.services.live.contracts import LiveAccountRegistrationRequest, LiveApprovalCheckpointRequest
 from app.services.live.registration import register_live_account
@@ -173,6 +177,27 @@ def _usd_balance_details(*, balances: list[object]) -> tuple[bool, str | None]:
     return False, None
 
 
+def _safe_auth_error_details(raw_error: object) -> dict[str, object] | None:
+    if not isinstance(raw_error, str) or not raw_error.strip():
+        return None
+    try:
+        parsed = json.loads(raw_error)
+    except Exception:
+        return None
+    if not isinstance(parsed, dict):
+        return None
+    allowed_keys = {
+        "kraken_endpoint",
+        "kraken_http_status",
+        "kraken_provider_error",
+        "kraken_error_category",
+        "kraken_transport_error_type",
+        "kraken_auth_category",
+    }
+    details = {key: parsed.get(key) for key in allowed_keys if key in parsed}
+    return details or None
+
+
 def _build_readiness_failure_details(*, refreshed, requested_provider: str, requested_environment: str) -> dict[str, object]:
     report = getattr(refreshed, "readiness", None)
     fail_codes, warn_codes = _readiness_reason_codes(report=report)
@@ -229,9 +254,48 @@ def _build_readiness_failure_details(*, refreshed, requested_provider: str, requ
         },
         "credentials_valid": bool(getattr(refreshed, "credentials_valid", False)),
     }
+    safe_auth_details = _safe_auth_error_details(getattr(refreshed, "last_api_error", None))
+    if safe_auth_details is not None:
+        details["authentication_diagnostics"] = safe_auth_details
     if usd_balance_known and usd_balance_amount is not None:
         details["usd_balance_amount"] = usd_balance_amount
     return details
+
+
+async def _credential_consistency_with_request(
+    *,
+    db: AsyncSession,
+    exchange_connection_id: UUID,
+    request: InitializeLiveCryptoEnvironmentRequest,
+) -> dict[str, bool | None]:
+    connection = await db.scalar(
+        select(ExchangeConnection)
+        .where(ExchangeConnection.exchange_connection_id == exchange_connection_id)
+        .limit(1)
+    )
+    if connection is None:
+        return {
+            "stored_api_key_matches_env": None,
+            "stored_api_secret_matches_env": None,
+        }
+
+    try:
+        decrypted = get_decrypted_credentials_for_connection(connection)
+    except Exception:
+        return {
+            "stored_api_key_matches_env": None,
+            "stored_api_secret_matches_env": None,
+        }
+
+    stored_key = str(decrypted.get("api_key") or "").strip() or None
+    stored_secret = str(decrypted.get("api_secret") or "").strip() or None
+    requested_key = str(request.exchange_api_key_name or "").strip() or None
+    requested_secret = str(request.exchange_private_key or "").strip() or None
+
+    return {
+        "stored_api_key_matches_env": None if requested_key is None else stored_key == requested_key,
+        "stored_api_secret_matches_env": None if requested_secret is None else stored_secret == requested_secret,
+    }
 
 
 
@@ -793,6 +857,13 @@ async def initialize_live_crypto_environment(
                     refreshed=refreshed,
                     requested_provider=request.provider,
                     requested_environment=exchange_environment,
+                )
+                safe_details.update(
+                    await _credential_consistency_with_request(
+                        db=db,
+                        exchange_connection_id=refreshed_readiness.exchange_connection_id,
+                        request=request,
+                    )
                 )
                 if request.provider == "coinbase_advanced":
                     raise ValueError(

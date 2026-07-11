@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import base64
 import hashlib
 import hmac
@@ -100,6 +101,83 @@ def _looks_like_permission_denied(exc: Exception) -> bool:
     return "permission" in lowered or "denied" in lowered
 
 
+def _endpoint_label(path: str | None) -> str | None:
+    if path is None:
+        return None
+    value = path.strip()
+    if not value:
+        return None
+    return value.rsplit("/", 1)[-1]
+
+
+def _classify_provider_error(provider_error: str | None) -> str:
+    lowered = (provider_error or "").lower()
+    if "invalid key" in lowered:
+        return "invalid_key"
+    if "invalid signature" in lowered:
+        return "invalid_signature"
+    if "invalid nonce" in lowered or "nonce" in lowered:
+        return "invalid_nonce"
+    if "permission" in lowered or "denied" in lowered:
+        return "permission_denied"
+    return "provider_error"
+
+
+def _safe_auth_diagnostics(*, exc: Exception) -> str:
+    endpoint: str | None = None
+    http_status: int | None = None
+    provider_error: str | None = None
+    error_category = "unknown"
+    transport_error_type: str | None = None
+    auth_category = "unknown_auth_error"
+
+    if isinstance(exc, InvalidRequestError):
+        details = getattr(exc, "details", {}) or {}
+        if isinstance(details, dict):
+            endpoint = _endpoint_label(details.get("path") if isinstance(details.get("path"), str) else None)
+            status_raw = details.get("status_code")
+            if isinstance(status_raw, int):
+                http_status = status_raw
+            errors = details.get("errors")
+            if isinstance(errors, list) and errors:
+                provider_error = str(errors[0])
+        if provider_error:
+            error_category = "provider_error"
+            auth_category = _classify_provider_error(provider_error)
+        elif http_status is not None:
+            error_category = "http_error"
+            auth_category = "http_rejected"
+        else:
+            error_category = "invalid_request"
+            auth_category = "request_rejected"
+    elif isinstance(exc, ServiceUnavailableError):
+        details = getattr(exc, "details", {}) or {}
+        if isinstance(details, dict):
+            endpoint = _endpoint_label(details.get("path") if isinstance(details.get("path"), str) else None)
+        cause = getattr(exc, "__cause__", None)
+        transport_error_type = None if cause is None else cause.__class__.__name__
+        lowered = str(exc).lower()
+        error_category = "transport_error"
+        if "timed out" in lowered or (transport_error_type and "timeout" in transport_error_type.lower()):
+            auth_category = "transport_timeout"
+        else:
+            auth_category = "transport_error"
+    else:
+        transport_error_type = exc.__class__.__name__
+        error_category = "unexpected_error"
+        auth_category = "unexpected_error"
+
+    payload = {
+        "kraken_endpoint": endpoint,
+        "kraken_http_status": http_status,
+        "kraken_provider_error": provider_error,
+        "kraken_error_category": error_category,
+        "kraken_transport_error_type": transport_error_type,
+        "kraken_auth_category": auth_category,
+    }
+    return json.dumps(payload, sort_keys=True, separators=(",", ":"))
+
+
 def _redact_sensitive(value: Any) -> Any:
     secret_tokens = {
         "api_key",
@@ -183,6 +261,16 @@ class KrakenSpotClient:
         self._last_successful_call_at: datetime | None = None
         self._last_error_classification: str | None = None
         self._last_error_message: str | None = None
+        self._nonce_lock = asyncio.Lock()
+        self._last_nonce_ms = 0
+
+    async def _next_nonce(self) -> str:
+        async with self._nonce_lock:
+            now_ms = int(datetime.now(timezone.utc).timestamp() * 1000)
+            if now_ms <= self._last_nonce_ms:
+                now_ms = self._last_nonce_ms + 1
+            self._last_nonce_ms = now_ms
+            return str(now_ms)
 
     @property
     def metadata(self) -> ExchangeProviderMetadata:
@@ -217,8 +305,10 @@ class KrakenSpotClient:
             _ = await self._private_request(path="/private/Balance", environment=environment, credentials=credentials, payload={})
             permission_snapshot = await self.fetch_permissions(credentials=credentials, environment=environment)
         except Exception as exc:
+            error_summary = _safe_auth_diagnostics(exc=exc)
+            reachable = isinstance(exc, InvalidRequestError)
             return ExchangeAuthResult(
-                reachable=False,
+                reachable=reachable,
                 authenticated=False,
                 account_status=None,
                 permissions=[],
@@ -226,7 +316,7 @@ class KrakenSpotClient:
                 clock_skew_seconds=None,
                 withdrawals_permission_granted=False,
                 trade_permission_present=False,
-                error=str(exc),
+                error=error_summary,
             )
 
         server_unix = None
@@ -952,7 +1042,7 @@ class KrakenSpotClient:
         except httpx.HTTPError as exc:
             self._last_error_classification = "network_error"
             self._last_error_message = str(exc)
-            raise ServiceUnavailableError(message="Kraken API is unreachable", details={"provider": self.provider}) from exc
+            raise ServiceUnavailableError(message="Kraken API is unreachable", details={"provider": self.provider, "path": path}) from exc
 
         if response.status_code >= 400:
             self._last_error_classification = "http_error"
@@ -985,7 +1075,7 @@ class KrakenSpotClient:
             return self._mock_sandbox_response(path=path, method="POST", payload=payload)
 
         base_url = "https://api.kraken.com/0"
-        nonce = str(int(datetime.now(timezone.utc).timestamp() * 1000))
+        nonce = await self._next_nonce()
         body_payload = {"nonce": nonce, **payload}
         otp = str(credentials.get("passphrase") or "").strip()
         if otp:
@@ -1009,7 +1099,7 @@ class KrakenSpotClient:
         except httpx.HTTPError as exc:
             self._last_error_classification = "network_error"
             self._last_error_message = str(exc)
-            raise ServiceUnavailableError(message="Kraken API is unreachable", details={"provider": self.provider}) from exc
+            raise ServiceUnavailableError(message="Kraken API is unreachable", details={"provider": self.provider, "path": path}) from exc
 
         if response.status_code >= 400:
             self._last_error_classification = "http_error"

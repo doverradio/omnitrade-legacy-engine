@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import asyncio
+import json
 from datetime import datetime, timezone
 from decimal import Decimal
 
@@ -59,8 +61,76 @@ async def test_conformance_04_credential_failure_classification(monkeypatch: pyt
 
     auth = await client.test_authentication(credentials={"api_key": "k", "api_secret": "s"}, environment="production")
     assert auth.authenticated is False
-    assert auth.reachable is False
+    assert auth.reachable is True
     assert auth.error is not None
+    payload = json.loads(auth.error)
+    assert payload["kraken_auth_category"] == "invalid_key"
+    assert payload["kraken_provider_error"] == "EAPI:Invalid key"
+
+
+@pytest.mark.asyncio
+async def test_conformance_auth_classifies_invalid_signature(monkeypatch: pytest.MonkeyPatch) -> None:
+    client = KrakenSpotClient()
+
+    async def _public(**_kwargs):
+        return {"error": [], "result": {"unixtime": 1700000000}}
+
+    async def _private(**_kwargs):
+        raise InvalidRequestError(message="Kraken API returned errors", details={"path": "/private/Balance", "errors": ["EAPI:Invalid signature"]})
+
+    monkeypatch.setattr(client, "_public_request", _public)
+    monkeypatch.setattr(client, "_private_request", _private)
+
+    auth = await client.test_authentication(credentials={"api_key": "k", "api_secret": "s"}, environment="production")
+    payload = json.loads(auth.error or "{}")
+    assert payload["kraken_auth_category"] == "invalid_signature"
+    assert payload["kraken_endpoint"] == "Balance"
+
+
+@pytest.mark.asyncio
+async def test_conformance_auth_classifies_invalid_nonce(monkeypatch: pytest.MonkeyPatch) -> None:
+    client = KrakenSpotClient()
+
+    async def _public(**_kwargs):
+        return {"error": [], "result": {"unixtime": 1700000000}}
+
+    async def _private(**_kwargs):
+        raise InvalidRequestError(message="Kraken API returned errors", details={"errors": ["EAPI:Invalid nonce"]})
+
+    monkeypatch.setattr(client, "_public_request", _public)
+    monkeypatch.setattr(client, "_private_request", _private)
+
+    auth = await client.test_authentication(credentials={"api_key": "k", "api_secret": "s"}, environment="production")
+    payload = json.loads(auth.error or "{}")
+    assert payload["kraken_auth_category"] == "invalid_nonce"
+
+
+@pytest.mark.asyncio
+async def test_conformance_auth_classifies_http_rejected(monkeypatch: pytest.MonkeyPatch) -> None:
+    client = KrakenSpotClient()
+
+    async def _public(**_kwargs):
+        return {"error": [], "result": {"unixtime": 1700000000}}
+
+    async def _private(**_kwargs):
+        raise InvalidRequestError(message="Kraken API request failed", details={"path": "/private/Balance", "status_code": 401})
+
+    monkeypatch.setattr(client, "_public_request", _public)
+    monkeypatch.setattr(client, "_private_request", _private)
+
+    auth = await client.test_authentication(credentials={"api_key": "k", "api_secret": "s"}, environment="production")
+    payload = json.loads(auth.error or "{}")
+    assert payload["kraken_auth_category"] == "http_rejected"
+    assert payload["kraken_http_status"] == 401
+
+
+@pytest.mark.asyncio
+async def test_conformance_nonce_monotonic_even_under_concurrency() -> None:
+    client = KrakenSpotClient()
+    values = await asyncio.gather(*[client._next_nonce() for _ in range(30)])
+    numeric = [int(item) for item in values]
+    assert numeric == sorted(numeric)
+    assert len(set(numeric)) == len(numeric)
 
 
 @pytest.mark.asyncio

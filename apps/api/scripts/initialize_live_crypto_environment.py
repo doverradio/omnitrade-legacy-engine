@@ -4,6 +4,7 @@ import argparse
 import asyncio
 import getpass
 import inspect
+import json
 import os
 import traceback
 from decimal import Decimal
@@ -141,6 +142,21 @@ def _origin_location(exc: Exception) -> tuple[str, str, int]:
         return "unknown", "unknown", 0
     origin = trace[-1]
     return origin.filename, origin.name, origin.lineno
+
+
+def _extract_readiness_details(message: str) -> dict[str, object] | None:
+    marker = "readiness_details="
+    index = message.find(marker)
+    if index < 0:
+        return None
+    payload = message[index + len(marker):].strip()
+    if not payload:
+        return None
+    try:
+        parsed = json.loads(payload)
+    except Exception:
+        return None
+    return parsed if isinstance(parsed, dict) else None
 
 
 def _validate_safe_flags() -> tuple[bool, str | None]:
@@ -307,10 +323,27 @@ async def _run(args: argparse.Namespace) -> int:
             print(f"error_type={type(exc).__name__}")
             failure_stage = _extract_failure_stage(exc)
             filename, function_name, line_number = _origin_location(exc)
-            safe_message = redact_message_for_diagnostics(str(exc))
+            raw_message = str(exc)
+            safe_message = redact_message_for_diagnostics(raw_message)
             print(f"failure_stage={failure_stage}")
             print(f"exception={type(exc).__name__}")
             print(f"message={safe_message}")
+            readiness_details = _extract_readiness_details(raw_message)
+            if isinstance(readiness_details, dict):
+                auth = readiness_details.get("authentication_diagnostics")
+                if isinstance(auth, dict):
+                    auth_category = auth.get("kraken_auth_category")
+                    if isinstance(auth_category, str) and auth_category.strip():
+                        print(f"kraken_auth_category={auth_category.strip()}")
+                    provider_error = auth.get("kraken_provider_error")
+                    if isinstance(provider_error, str) and provider_error.strip():
+                        print(f"kraken_provider_error={provider_error.strip()}")
+                api_match = readiness_details.get("stored_api_key_matches_env")
+                if isinstance(api_match, bool):
+                    print(f"stored_api_key_matches_env={str(api_match).lower()}")
+                secret_match = readiness_details.get("stored_api_secret_matches_env")
+                if isinstance(secret_match, bool):
+                    print(f"stored_api_secret_matches_env={str(secret_match).lower()}")
             print(f"originating_function={function_name}")
             print(f"location={os.path.basename(filename)}:{line_number}")
             return 1
