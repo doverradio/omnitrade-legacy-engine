@@ -379,6 +379,67 @@ Verification:
 - confirm the approval and risk identifiers are surfaced in the read model
 - confirm the safe failure reason is visible when the run is blocked
 
+Evidence review helper:
+
+```bash
+cd /home/eric/omnitrade-legacy-engine/apps/api && PYTHONPATH=. python3 -m scripts.review_live_crypto_dry_run_evidence \
+	--live-crypto-order-id <live_crypto_order_uuid>
+```
+
+Use `--audit-correlation-id <uuid>` when the dry-run correlation is the only persisted identifier available. The helper exits `0` only when the persisted evidence is internally consistent and the read models remain read-only.
+
+Read-only verification queries:
+
+```sql
+-- Latest dry-run live order and safe evidence
+select live_crypto_order_id, crypto_order_preview_id, status, provider_order_id, submitted_at, acknowledged_at, filled_at, safe_provider_response, audit_correlation_id
+from live_crypto_orders
+where live_crypto_order_id = :live_crypto_order_id;
+
+-- Approval and risk evidence linked from the safe response
+select id, live_trading_profile_id, approval_state, checkpoint_type, approver_id, expires_at
+from live_approval_events
+where id = :approval_event_id;
+
+select id, paper_account_id, related_signal_id, event_type, action_taken, detail
+from risk_events
+where id = :risk_event_id;
+
+-- Mission Control visibility
+select related_events
+from mission_control_intelligence
+where range = :range;
+
+-- No provider submission or settlement side effects
+select count(*) as reconciliation_rows
+from live_reconciliation_events
+where live_crypto_order_id = :live_crypto_order_id;
+
+select count(*) as accounting_rows
+from live_accounting_records
+where live_crypto_order_id = :live_crypto_order_id;
+
+-- No capital mutation for the linked campaign and profit cycle
+select id, status, starting_capital, current_equity, realized_profit, unrealized_profit, fees, roi
+from capital_campaigns
+where paper_account_id = :paper_account_id;
+
+select id, status, settlement_state, opening_capital, eligible_profit, compound_amount, withdrawal_amount, reserve_amount, closing_campaign_capital
+from capital_campaign_profit_cycles
+where capital_campaign_id = :capital_campaign_id;
+```
+
+Success criteria:
+
+- `provider_order_id` remains null
+- `submitted_at` remains null
+- `acknowledged_at` remains null
+- `filled_at` remains null
+- no reconciliation row exists for the live order
+- no accounting row exists for the live order
+- the campaign and profit cycle values remain unchanged from the pre-run baseline
+- Mission Control includes the dry-run annotation and the safe response metadata
+
 ---
 
 ## Workstream E — Controlled First Live Trade
