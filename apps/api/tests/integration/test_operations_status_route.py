@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from datetime import datetime, timezone
 from decimal import Decimal
+from types import SimpleNamespace
 
 from fastapi.testclient import TestClient
 
@@ -225,3 +226,42 @@ def test_operations_status_surfaces_research_disabled_state(monkeypatch) -> None
     assert response.status_code == 200
     payload = response.json()
     assert payload["research_status"]["feature_state"] == "disabled"
+
+
+def test_operations_status_does_not_treat_sandbox_success_as_production_ready(monkeypatch) -> None:
+    app = create_app()
+    fake_db = _DurableCountsSession()
+
+    async def _read(operation, *, operation_name):
+        _ = operation_name
+        return await operation(fake_db)
+
+    async def _paper_equity_stub(*_args, **_kwargs):
+        return Decimal("25")
+
+    async def _inspect_stub(*, db, exchange_environment, paper_account_id=None):
+        _ = db, paper_account_id
+        if exchange_environment == "production":
+            return SimpleNamespace(
+                ready=False,
+                exchange_connection_id=None,
+                items=(SimpleNamespace(key="exchange_connection", label="Exchange", ready=False, detail="missing"),),
+            )
+        return SimpleNamespace(
+            ready=True,
+            exchange_connection_id="sandbox-connection",
+            items=(SimpleNamespace(key="exchange_connection", label="Exchange", ready=True, detail="ready"),),
+        )
+
+    monkeypatch.setattr("app.api.routes.operations.run_read_with_retry", _read)
+    monkeypatch.setattr("app.services.operations_status._get_paper_equity", _paper_equity_stub)
+    monkeypatch.setattr("app.services.operations_status.inspect_live_crypto_environment", _inspect_stub)
+
+    with TestClient(app) as client:
+        response = client.get("/operations/status")
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["live_crypto_readiness"]["ready"] is False
+    assert any(item["key"] == "sandbox_exchange_connection" and item["ready"] for item in payload["live_crypto_readiness"]["items"])
+    assert any(item["key"] == "production_account_status" and not item["ready"] for item in payload["live_crypto_readiness"]["items"])

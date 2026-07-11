@@ -32,6 +32,11 @@ DEFAULT_PRODUCTION_CRYPTO_PAPER_ACCOUNT_ID = UUID("905a408c-7d8e-4fc7-ad3b-9ff63
 _READY_CONNECTION_VERDICTS = {"READY_FOR_PREVIEW", "READY_FOR_DRY_RUN", "READY_FOR_OPERATOR_REVIEW"}
 
 
+def _exchange_label(environment: str) -> str:
+    normalized = environment.strip().lower()
+    return "coinbase_advanced" if normalized == "production" else "coinbase_advanced_sandbox"
+
+
 @dataclass(frozen=True, slots=True)
 class ReadinessItem:
     key: str
@@ -78,6 +83,7 @@ class InitializeLiveCryptoEnvironmentResult:
 class GeneratePreviewHelperRequest:
     actor: str
     exchange_connection_id: UUID
+    exchange_environment: str = "production"
 
 
 @dataclass(frozen=True, slots=True)
@@ -90,6 +96,7 @@ class GeneratePreviewHelperResult:
 class RecordApprovalHelperRequest:
     actor: str
     live_trading_profile_id: UUID
+    exchange_environment: str = "production"
 
 
 @dataclass(frozen=True, slots=True)
@@ -135,11 +142,15 @@ async def _load_live_profile_for_account(*, db: AsyncSession, paper_account_id: 
 
 
 async def _load_coinbase_btc_asset(*, db: AsyncSession) -> Asset | None:
+    raise RuntimeError("_load_coinbase_btc_asset requires explicit exchange label")
+
+
+async def _load_coinbase_btc_asset_for_exchange(*, db: AsyncSession, exchange: str) -> Asset | None:
     return await db.scalar(
         select(Asset)
         .where(Asset.symbol == "BTC")
         .where(Asset.asset_class == "crypto")
-        .where(Asset.exchange == "coinbase_advanced")
+        .where(Asset.exchange == exchange)
         .where(Asset.is_active.is_(True))
         .order_by(Asset.created_at.desc())
         .limit(1)
@@ -147,12 +158,16 @@ async def _load_coinbase_btc_asset(*, db: AsyncSession) -> Asset | None:
 
 
 async def _load_campaign_for_account(*, db: AsyncSession, paper_account_id: UUID | None) -> CapitalCampaign | None:
+    raise RuntimeError("_load_campaign_for_account requires explicit exchange label")
+
+
+async def _load_campaign_for_account_exchange(*, db: AsyncSession, paper_account_id: UUID | None, exchange: str) -> CapitalCampaign | None:
     if paper_account_id is None:
         return None
     return await db.scalar(
         select(CapitalCampaign)
         .where(CapitalCampaign.paper_account_id == paper_account_id)
-        .where(CapitalCampaign.exchange == "coinbase_advanced")
+        .where(CapitalCampaign.exchange == exchange)
         .order_by(CapitalCampaign.created_at.desc(), CapitalCampaign.id.desc())
         .limit(1)
     )
@@ -211,11 +226,12 @@ async def inspect_live_crypto_environment(
     paper_account_id: UUID = DEFAULT_PRODUCTION_CRYPTO_PAPER_ACCOUNT_ID,
 ) -> LiveCryptoEnvironmentReadiness:
     now = datetime.now(timezone.utc)
+    exchange = _exchange_label(exchange_environment)
     connection = await _load_coinbase_connection(db=db, environment=exchange_environment)
     paper_account = await _load_selected_crypto_paper_account(db=db, paper_account_id=paper_account_id)
     profile = await _load_live_profile_for_account(db=db, paper_account_id=paper_account.id if paper_account is not None else None)
-    asset = await _load_coinbase_btc_asset(db=db)
-    campaign = await _load_campaign_for_account(db=db, paper_account_id=paper_account.id if paper_account is not None else None)
+    asset = await _load_coinbase_btc_asset_for_exchange(db=db, exchange=exchange)
+    campaign = await _load_campaign_for_account_exchange(db=db, paper_account_id=paper_account.id if paper_account is not None else None, exchange=exchange)
     preview = await _load_latest_preview(db=db, exchange_connection_id=connection.exchange_connection_id if connection is not None else None)
     approval = await _load_latest_approval(db=db, live_trading_profile_id=profile.id if profile is not None else None)
 
@@ -234,9 +250,9 @@ async def inspect_live_crypto_environment(
             label="Exchange",
             ready=connection is not None,
             detail=(
-                f"Coinbase production connection ready ({connection.exchange_connection_id})"
+                f"Coinbase {exchange_environment} connection ready ({connection.exchange_connection_id})"
                 if connection is not None
-                else "Coinbase production connection missing"
+                else f"Coinbase {exchange_environment} connection missing"
             ),
         ),
         ReadinessItem(
@@ -254,9 +270,9 @@ async def inspect_live_crypto_environment(
             label="Campaign",
             ready=campaign is not None,
             detail=(
-                f"Capital campaign ready ({campaign.uuid})"
+                f"Capital campaign ready ({campaign.uuid}) for {exchange_environment}"
                 if campaign is not None
-                else "Capital campaign missing"
+                else f"Capital campaign missing for {exchange_environment}"
             ),
         ),
         ReadinessItem(
@@ -264,9 +280,9 @@ async def inspect_live_crypto_environment(
             label="Asset",
             ready=asset is not None,
             detail=(
-                f"Coinbase BTC asset ready ({asset.id})"
+                f"Coinbase BTC asset ready ({asset.id}) on {exchange}"
                 if asset is not None
-                else "Coinbase BTC asset missing"
+                else f"Coinbase BTC asset missing on {exchange}"
             ),
         ),
         ReadinessItem(
@@ -359,7 +375,12 @@ async def initialize_live_crypto_environment(
 
     asset_result = await ensure_coinbase_crypto_asset(
         db=db,
-        request=EnsureCoinbaseAssetRequest(symbol="BTC", base_currency="USD", actor=request.actor),
+        request=EnsureCoinbaseAssetRequest(
+            symbol="BTC",
+            base_currency="USD",
+            exchange=_exchange_label(request.exchange_environment),
+            actor=request.actor,
+        ),
     )
     created_asset = asset_result.created
 
@@ -402,11 +423,15 @@ async def initialize_live_crypto_environment(
             db=db,
             request=CapitalCampaignCreateRequest(
                 owner=request.campaign_owner,
-                name="Production Small Account Mode",
+                name=(
+                    "Production Small Account Mode"
+                    if request.exchange_environment == "production"
+                    else "Sandbox Small Account Mode"
+                ),
                 description="Initialized for live-crypto dry-run readiness",
                 status="READY",
                 campaign_type="small_account_mode",
-                exchange="coinbase_advanced",
+                exchange=_exchange_label(request.exchange_environment),
                 paper_account_id=paper_account.id,
                 validation_run_id=None,
                 strategy_id=None,
@@ -442,7 +467,7 @@ async def generate_fresh_btc_dry_run_preview(
         db=db,
         request=CryptoOrderPreviewCreateRequest(
             exchange_connection_id=request.exchange_connection_id,
-            environment="production",
+            environment=request.exchange_environment,
             product_id="BTC-USD",
             side="BUY",
             order_type="MARKET",
@@ -481,13 +506,13 @@ async def record_first_live_enablement_approval(
                 "product": "BTC-USD",
                 "side": "BUY",
                 "max_order_usd": "5",
-                "environment": "production",
+                "environment": request.exchange_environment,
             },
             expires_at=datetime.now(timezone.utc) + timedelta(minutes=30),
             renewal_condition="operator_reapproval_required",
             requested_by=request.actor,
             provenance_metadata={"source": "initialize_live_crypto_environment"},
-            idempotency_key=f"init-approval:{request.live_trading_profile_id}",
+            idempotency_key=f"init-approval:{request.exchange_environment}:{request.live_trading_profile_id}",
         ),
     )
     return RecordApprovalHelperResult(

@@ -4,6 +4,7 @@ import json
 from datetime import datetime, timezone
 from decimal import Decimal
 import email.utils
+import os
 import secrets
 from typing import Any
 
@@ -24,6 +25,10 @@ from app.services.exchange_connections.providers.base import (
 
 JWT_EXP_SECONDS = 120
 CLOCK_SKEW_FAIL_SECONDS = 30
+
+
+def _sandbox_mock_mode_enabled() -> bool:
+    return str(os.getenv("OT_COINBASE_SANDBOX_MOCK_MODE", "false")).strip().lower() in {"1", "true", "yes", "on"}
 
 
 def _to_decimal(value: str | int | float | Decimal | None) -> Decimal:
@@ -271,7 +276,7 @@ class CoinbaseAdvancedClient:
         )
 
     async def fetch_balances(self, *, credentials: dict[str, str], environment: str) -> ExchangeBalanceSnapshot:
-        payload = await self._request_json(
+        payload, _headers = await self._request_json(
             method="GET",
             path="/api/v3/brokerage/accounts",
             credentials=credentials,
@@ -280,7 +285,7 @@ class CoinbaseAdvancedClient:
         return parse_coinbase_balances(payload)
 
     async def fetch_account(self, *, credentials: dict[str, str], environment: str) -> ExchangeAccountSnapshot:
-        payload = await self._request_json(
+        payload, _headers = await self._request_json(
             method="GET",
             path="/api/v3/brokerage/accounts",
             credentials=credentials,
@@ -289,7 +294,7 @@ class CoinbaseAdvancedClient:
         return ExchangeAccountSnapshot(account_status=parse_coinbase_account_status(payload))
 
     async def fetch_permissions(self, *, credentials: dict[str, str], environment: str) -> ExchangePermissionSnapshot:
-        payload = await self._request_json(
+        payload, _headers = await self._request_json(
             method="GET",
             path="/api/v3/brokerage/key_permissions",
             credentials=credentials,
@@ -300,7 +305,7 @@ class CoinbaseAdvancedClient:
         return ExchangePermissionSnapshot(permissions=permissions, verified=len(permissions) > 0)
 
     async def fetch_product(self, *, credentials: dict[str, str], environment: str, product_id: str) -> ExchangeProductSnapshot:
-        payload = await self._request_json(
+        payload, _headers = await self._request_json(
             method="GET",
             path=f"/api/v3/brokerage/products/{product_id}",
             credentials=credentials,
@@ -474,6 +479,14 @@ class CoinbaseAdvancedClient:
         extra_headers: dict[str, str] | None = None,
         query_params: dict[str, Any] | None = None,
     ) -> tuple[dict[str, object], dict[str, str]]:
+        if _sandbox_mock_mode_enabled():
+            if environment.strip().lower() == "production":
+                raise InvalidRequestError(
+                    message="Sandbox mock mode is forbidden for production environment",
+                    details={"environment": environment},
+                )
+            return self._mock_sandbox_response(path=path, method=method, json_payload=json_payload)
+
         base_url = self._base_url(environment)
         body = json.dumps(json_payload) if json_payload is not None else ""
         request_host = base_url.replace("https://", "").replace("http://", "").rstrip("/")
@@ -535,6 +548,72 @@ class CoinbaseAdvancedClient:
         if normalized == "sandbox":
             return "https://api-public.sandbox.exchange.coinbase.com"
         return "https://api.coinbase.com"
+
+    def _mock_sandbox_response(
+        self,
+        *,
+        path: str,
+        method: str,
+        json_payload: dict[str, Any] | None,
+    ) -> tuple[dict[str, object], dict[str, str]]:
+        now = datetime.now(timezone.utc)
+        headers = {"Date": email.utils.format_datetime(now)}
+        method_u = method.upper()
+
+        if method_u == "GET" and path == "/api/v3/brokerage/accounts":
+            return (
+                {
+                    "accounts": [
+                        {
+                            "available_balance": {"currency": "USD", "value": "100.00"},
+                            "hold": {"value": "0.00"},
+                            "status": "active",
+                        },
+                        {
+                            "available_balance": {"currency": "BTC", "value": "0.002"},
+                            "hold": {"value": "0.000"},
+                            "status": "active",
+                        },
+                    ]
+                },
+                headers,
+            )
+        if method_u == "GET" and path == "/api/v3/brokerage/key_permissions":
+            return ({"permissions": ["view", "trade"]}, headers)
+        if method_u == "GET" and path == "/api/v3/brokerage/products/BTC-USD":
+            return (
+                {
+                    "product_id": "BTC-USD",
+                    "is_disabled": False,
+                    "trading_disabled": False,
+                },
+                headers,
+            )
+        if method_u == "POST" and path == "/api/v3/brokerage/orders/preview":
+            side = "BUY"
+            if json_payload and "side" in json_payload:
+                side = str(json_payload.get("side"))
+            return (
+                {
+                    "success": True,
+                    "preview_id": f"sandbox-preview-{int(now.timestamp())}",
+                    "product_id": "BTC-USD",
+                    "side": side,
+                    "estimated_average_price": "50000",
+                    "estimated_quote_size": "5",
+                    "estimated_base_size": "0.0001",
+                    "estimated_fee": "0.01",
+                    "best_bid": "49999",
+                    "best_ask": "50001",
+                    "warning_messages": [],
+                },
+                headers,
+            )
+
+        raise InvalidRequestError(
+            message="Sandbox mock mode does not implement requested Coinbase endpoint",
+            details={"method": method_u, "path": path},
+        )
 
     def _clock_skew_seconds(self, response_headers: dict[str, str]) -> int | None:
         raw_date = response_headers.get("Date") or response_headers.get("date")

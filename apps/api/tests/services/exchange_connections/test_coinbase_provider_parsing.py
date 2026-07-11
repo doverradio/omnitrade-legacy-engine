@@ -5,6 +5,7 @@ from unittest.mock import AsyncMock
 
 import pytest
 
+from app.core.errors import InvalidRequestError
 from app.services.exchange_connections.providers.coinbase_advanced import (
     CoinbaseAdvancedClient,
     parse_coinbase_account_status,
@@ -76,3 +77,37 @@ async def test_historical_fills_request_uses_order_id_query_param() -> None:
     assert kwargs["method"] == "GET"
     assert kwargs["path"] == "/api/v3/brokerage/orders/historical/fills"
     assert kwargs["query_params"] == {"order_id": "provider-order-1"}
+
+
+@pytest.mark.asyncio
+async def test_sandbox_mock_mode_supports_readiness_and_preview(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("OT_COINBASE_SANDBOX_MOCK_MODE", "true")
+    client = CoinbaseAdvancedClient()
+
+    auth = await client.test_authentication(
+        credentials={"api_key": "k", "api_secret": "s"},
+        environment="sandbox",
+    )
+    product = await client.fetch_product(
+        credentials={"api_key": "k", "api_secret": "s"},
+        environment="sandbox",
+        product_id="BTC-USD",
+    )
+
+    assert auth.authenticated is True
+    assert "trade" in [item.lower() for item in auth.permissions]
+    assert product.available is True
+    assert product.trading_enabled is True
+
+
+@pytest.mark.asyncio
+async def test_sandbox_mock_mode_is_forbidden_for_production(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("OT_COINBASE_SANDBOX_MOCK_MODE", "true")
+    client = CoinbaseAdvancedClient()
+
+    with pytest.raises(InvalidRequestError, match="forbidden for production"):
+        await client.fetch_product(
+            credentials={"api_key": "k", "api_secret": "s"},
+            environment="production",
+            product_id="BTC-USD",
+        )

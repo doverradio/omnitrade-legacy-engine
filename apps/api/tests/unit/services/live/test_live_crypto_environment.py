@@ -408,3 +408,88 @@ async def test_approval_helper_uses_first_live_enablement_checkpoint(monkeypatch
     assert result.approval_state == "approved"
     assert captured["checkpoint_type"] == "first_live_enablement"
     assert captured["max_order_usd"] == "5"
+
+
+@pytest.mark.asyncio
+async def test_environment_separation_for_asset_and_campaign(monkeypatch: pytest.MonkeyPatch) -> None:
+    db = _FakeDb()
+    db.paper_account = _paper_account()
+
+    async def _load_asset_for_exchange(*, db, exchange):
+        _ = db
+        if exchange == "coinbase_advanced_sandbox":
+            return _asset()
+        return None
+
+    async def _load_campaign_for_exchange(*, db, paper_account_id, exchange):
+        _ = db, paper_account_id
+        if exchange == "coinbase_advanced_sandbox":
+            return _campaign(uuid4())
+        return None
+
+    monkeypatch.setattr(service, "_load_coinbase_btc_asset_for_exchange", _load_asset_for_exchange)
+    monkeypatch.setattr(service, "_load_campaign_for_account_exchange", _load_campaign_for_exchange)
+    monkeypatch.setattr(
+        service,
+        "get_settings",
+        lambda: SimpleNamespace(
+            live_crypto_order_submission_enabled=False,
+            live_crypto_dry_run_enabled=True,
+            live_crypto_preparation_enabled=True,
+            live_crypto_max_order_usd=Decimal("5"),
+        ),
+    )
+
+    production = await service.inspect_live_crypto_environment(db=db, exchange_environment="production")
+    sandbox = await service.inspect_live_crypto_environment(db=db, exchange_environment="sandbox")
+
+    production_asset = next(item for item in production.items if item.key == "asset")
+    sandbox_asset = next(item for item in sandbox.items if item.key == "asset")
+    assert production_asset.ready is False
+    assert sandbox_asset.ready is True
+
+
+@pytest.mark.asyncio
+async def test_preview_helper_uses_requested_environment(monkeypatch: pytest.MonkeyPatch) -> None:
+    captured: dict[str, object] = {}
+
+    async def _create_preview_stub(*, db, request, actor):
+        _ = db, actor
+        captured["environment"] = request.environment
+        return SimpleNamespace(crypto_order_preview_id=uuid4(), status="PREVIEW_READY")
+
+    monkeypatch.setattr(service, "create_crypto_order_preview", _create_preview_stub)
+
+    await service.generate_fresh_btc_dry_run_preview(
+        db=_FakeDb(),
+        request=service.GeneratePreviewHelperRequest(
+            actor="operator:human",
+            exchange_connection_id=uuid4(),
+            exchange_environment="sandbox",
+        ),
+    )
+
+    assert captured["environment"] == "sandbox"
+
+
+@pytest.mark.asyncio
+async def test_approval_helper_scopes_requested_environment(monkeypatch: pytest.MonkeyPatch) -> None:
+    captured: dict[str, object] = {}
+
+    async def _approval_stub(*, db, request):
+        _ = db
+        captured["environment"] = request.approval_scope.get("environment")
+        return SimpleNamespace(approval_event_id=uuid4(), approval_state="approved")
+
+    monkeypatch.setattr(service, "record_live_approval_checkpoint", _approval_stub)
+
+    await service.record_first_live_enablement_approval(
+        db=_FakeDb(),
+        request=service.RecordApprovalHelperRequest(
+            actor="operator:human",
+            live_trading_profile_id=uuid4(),
+            exchange_environment="sandbox",
+        ),
+    )
+
+    assert captured["environment"] == "sandbox"

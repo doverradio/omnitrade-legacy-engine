@@ -100,6 +100,7 @@ async def _run(args: argparse.Namespace) -> int:
                     request=GeneratePreviewHelperRequest(
                         actor=args.actor,
                         exchange_connection_id=exchange_connection_id,
+                        exchange_environment=args.exchange_environment,
                     ),
                 ))
                 print(f"preview_created_id={result.crypto_order_preview_id}")
@@ -126,6 +127,7 @@ async def _run(args: argparse.Namespace) -> int:
                     request=RecordApprovalHelperRequest(
                         actor=args.actor,
                         live_trading_profile_id=live_trading_profile_id,
+                        exchange_environment=args.exchange_environment,
                     ),
                 ))
                 print(f"approval_event_id={result.approval_event_id}")
@@ -163,6 +165,16 @@ async def _run(args: argparse.Namespace) -> int:
                 )
             )
             _print_readiness(readiness)
+            if args.exchange_environment == "sandbox":
+                production_readiness = await _maybe_await(
+                    inspect_live_crypto_environment(
+                        db=db,
+                        exchange_environment="production",
+                        paper_account_id=args.paper_account_id,
+                    )
+                )
+                print(f"production_ready={str(production_readiness.ready).lower()}")
+                print("sandbox_rehearsal_only=true")
             return 0
         except Exception as exc:
             print("safe_failure_reason=initialization_failed")

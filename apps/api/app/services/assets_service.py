@@ -15,6 +15,7 @@ from app.models.audit_log import AuditLog
 class EnsureCoinbaseAssetRequest:
     symbol: str
     base_currency: str
+    exchange: str
     actor: str
 
 
@@ -30,7 +31,7 @@ async def ensure_coinbase_crypto_asset(*, db: AsyncSession, request: EnsureCoinb
         select(Asset)
         .where(Asset.symbol == normalized_symbol)
         .where(Asset.asset_class == "crypto")
-        .where(Asset.exchange == "coinbase_advanced")
+        .where(Asset.exchange == request.exchange)
         .order_by(Asset.created_at.desc())
         .limit(1)
     )
@@ -40,7 +41,7 @@ async def ensure_coinbase_crypto_asset(*, db: AsyncSession, request: EnsureCoinb
     asset = Asset(
         symbol=normalized_symbol,
         asset_class="crypto",
-        exchange="coinbase_advanced",
+        exchange=request.exchange,
         base_currency=request.base_currency.strip().upper(),
         supports_fractional=True,
         min_order_notional=Decimal("5"),

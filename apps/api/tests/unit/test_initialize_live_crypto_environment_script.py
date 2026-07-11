@@ -75,6 +75,45 @@ async def test_script_inspection_mode_prints_readiness(monkeypatch: pytest.Monke
 
 
 @pytest.mark.asyncio
+async def test_script_sandbox_inspection_prints_production_boundary(monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]) -> None:
+    monkeypatch.setattr(script, "get_settings", lambda: _settings())
+    monkeypatch.setattr(script, "AsyncSessionLocal", lambda: _AsyncSessionLocal(object()))
+
+    def _inspect(**kwargs):
+        if kwargs.get("exchange_environment") == "production":
+            return _readiness(ready=False)
+        return _readiness(ready=True)
+
+    monkeypatch.setattr(script, "inspect_live_crypto_environment", _inspect)
+
+    result = await script._run(
+        SimpleNamespace(
+            apply=False,
+            create_preview=False,
+            create_approval=False,
+            exchange_environment="sandbox",
+            actor="operator:human",
+            paper_account_id=UUID("905a408c-7d8e-4fc7-ad3b-9ff637005d73"),
+            exchange_connection_name="coinbase-production-primary",
+            exchange_api_key_name=None,
+            exchange_api_key_name_env="OT_COINBASE_API_KEY_NAME",
+            exchange_private_key_env="OT_COINBASE_PRIVATE_KEY",
+            exchange_passphrase_env="OT_COINBASE_PASSPHRASE",
+            prompt_for_credentials=False,
+            registration_source="human_production_initializer",
+            campaign_owner="operator",
+            exchange_connection_id=None,
+            live_trading_profile_id=None,
+        )
+    )
+
+    assert result == 0
+    captured = capsys.readouterr().out
+    assert "production_ready=false" in captured
+    assert "sandbox_rehearsal_only=true" in captured
+
+
+@pytest.mark.asyncio
 async def test_script_apply_mode_initializes_missing(monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]) -> None:
     monkeypatch.setattr(script, "get_settings", lambda: _settings())
     monkeypatch.setattr(script, "AsyncSessionLocal", lambda: _AsyncSessionLocal(object()))

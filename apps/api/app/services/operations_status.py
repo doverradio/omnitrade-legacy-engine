@@ -121,18 +121,56 @@ async def build_operations_status(*, db: AsyncSession) -> OperationalStatusRespo
         )
 
     try:
-        live_crypto_state = await inspect_live_crypto_environment(db=db, exchange_environment="production")
+        production_state = await inspect_live_crypto_environment(db=db, exchange_environment="production")
+        sandbox_state = await inspect_live_crypto_environment(db=db, exchange_environment="sandbox")
+
+        combined_items: list[LiveCryptoReadinessItemResponse] = []
+        combined_items.extend(
+            LiveCryptoReadinessItemResponse(
+                key=f"production_{item.key}",
+                label=f"Production {item.label}",
+                ready=item.ready,
+                detail=item.detail,
+            )
+            for item in production_state.items
+        )
+        combined_items.extend(
+            LiveCryptoReadinessItemResponse(
+                key=f"sandbox_{item.key}",
+                label=f"Sandbox {item.label}",
+                ready=item.ready,
+                detail=item.detail,
+            )
+            for item in sandbox_state.items
+        )
+        combined_items.append(
+            LiveCryptoReadinessItemResponse(
+                key="production_account_status",
+                label="Production Account Status",
+                ready=production_state.exchange_connection_id is not None,
+                detail=(
+                    "Production Coinbase account connection detected"
+                    if production_state.exchange_connection_id is not None
+                    else "Production account unavailable or not initialized"
+                ),
+            )
+        )
+        combined_items.append(
+            LiveCryptoReadinessItemResponse(
+                key="rehearsal_boundary",
+                label="Rehearsal Boundary",
+                ready=not (sandbox_state.ready and not production_state.ready),
+                detail=(
+                    "Sandbox initialized but production initialization/dry run still pending"
+                    if sandbox_state.ready and not production_state.ready
+                    else "Sandbox and production readiness boundary remains explicit"
+                ),
+            )
+        )
+
         live_crypto_readiness = LiveCryptoReadinessResponse(
-            ready=live_crypto_state.ready,
-            items=[
-                LiveCryptoReadinessItemResponse(
-                    key=item.key,
-                    label=item.label,
-                    ready=item.ready,
-                    detail=item.detail,
-                )
-                for item in live_crypto_state.items
-            ],
+            ready=production_state.ready,
+            items=combined_items,
         )
     except Exception as exc:
         live_crypto_readiness = LiveCryptoReadinessResponse(

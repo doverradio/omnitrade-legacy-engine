@@ -498,6 +498,81 @@ Recommended production initialization order:
 
 The initializer is fail-closed and idempotent at each step; no provider order submission is allowed in this flow.
 
+### Sandbox Rehearsal and Recovery Contingency (Phase 10.7G)
+
+Purpose:
+
+- validate secure initialization workflows while production Coinbase account access is under recovery
+- do not treat sandbox rehearsal as production readiness completion
+
+Sandbox inspection:
+
+```bash
+cd /home/eric/omnitrade-legacy-engine/apps/api && PYTHONPATH=. python3 -m scripts.initialize_live_crypto_environment \
+	--exchange-environment sandbox \
+	--actor operator:human \
+	--paper-account-id 905a408c-7d8e-4fc7-ad3b-9ff637005d73
+```
+
+Sandbox apply using secure credentials:
+
+```bash
+cd /home/eric/omnitrade-legacy-engine/apps/api
+export OT_COINBASE_API_KEY_NAME='<coinbase_sandbox_api_key_name>'
+read -s OT_COINBASE_PRIVATE_KEY && export OT_COINBASE_PRIVATE_KEY
+read -s OT_COINBASE_PASSPHRASE && export OT_COINBASE_PASSPHRASE
+PYTHONPATH=. python3 -m scripts.initialize_live_crypto_environment \
+	--apply \
+	--exchange-environment sandbox \
+	--actor operator:human \
+	--paper-account-id 905a408c-7d8e-4fc7-ad3b-9ff637005d73
+```
+
+Controlled provider-mock rehearsal mode (sandbox only, forbidden in production):
+
+```bash
+cd /home/eric/omnitrade-legacy-engine/apps/api
+export OT_COINBASE_SANDBOX_MOCK_MODE=true
+PYTHONPATH=. python3 -m scripts.initialize_live_crypto_environment --exchange-environment sandbox
+```
+
+Safety boundaries:
+
+- mock mode is blocked for `exchange_environment=production`
+- sandbox readiness is reported separately and never promotes production readiness to true
+- production submission flag remains disabled
+- no production `create_order` call is part of this workflow
+
+What sandbox/provider-mock rehearsal proves:
+
+- secure credential ingestion path
+- encrypted exchange connection persistence
+- readiness workflow execution
+- environment-labeled asset/profile/campaign initialization
+- explicit preview helper flow (`BTC-USD`, `BUY`, `$5`)
+- explicit approval helper flow (`first_live_enablement`)
+- dry-run and evidence-review procedure execution path
+
+What it cannot prove:
+
+- real production Coinbase account accessibility and permission state
+- production USD funding and live account constraints
+- production-only broker-side behavior under real account conditions
+- completion of the production dry-run rung
+
+Production account recovery checklist (non-sensitive):
+
+1. Verify production Coinbase account access is restored.
+2. Confirm funded USD balance is available for dry-run readiness checks.
+3. Confirm Advanced Trade access is enabled.
+4. Create least-privilege API key with view and trade permissions only.
+5. Confirm withdrawal/transfer permissions are not granted.
+6. Configure VPS IP allowlist if the provider supports it.
+7. Run production initializer inspection and apply.
+8. Run production read-only readiness verification.
+9. Run one production dry run and evidence review.
+10. Obtain operator sign-off on the production dry-run evidence.
+
 Expected inspection output shape:
 
 - `Database: READY/MISSING`
