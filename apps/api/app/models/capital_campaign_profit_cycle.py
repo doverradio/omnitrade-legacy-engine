@@ -17,14 +17,14 @@ class CapitalCampaignProfitCycle(Base):
     __table_args__ = (
         CheckConstraint(
             "status IN ('CALCULATING','BELOW_TARGET','TARGET_REACHED','REVIEW_REQUIRED','APPROVED','COMPOUNDING_RECOMMENDED','WITHDRAWAL_RECOMMENDED','COMPLETED','CANCELLED','ERROR')",
-            name="ck_capital_campaign_profit_cycles_status",
+            name="ck_ccpc_status",
         ),
-        CheckConstraint("settlement_state IN ('SETTLED','SETTLEMENT_UNKNOWN')", name="ck_capital_campaign_profit_cycles_settlement_state"),
-        Index("ix_capital_campaign_profit_cycles_uuid", "cycle_uuid", unique=True),
-        Index("ix_capital_campaign_profit_cycles_campaign_id", "capital_campaign_id"),
-        Index("ix_capital_campaign_profit_cycles_policy_id", "profit_policy_id"),
-        Index("ix_capital_campaign_profit_cycles_status", "status"),
-        UniqueConstraint("capital_campaign_id", "cycle_number", name="uq_capital_campaign_profit_cycles_campaign_cycle_number"),
+        CheckConstraint("settlement_state IN ('SETTLED','SETTLEMENT_UNKNOWN')", name="ck_ccpc_settlement"),
+        Index("ix_ccpc_uuid", "cycle_uuid", unique=True),
+        Index("ix_ccpc_campaign", "capital_campaign_id"),
+        Index("ix_ccpc_policy", "profit_policy_id"),
+        Index("ix_ccpc_status", "status"),
+        UniqueConstraint("capital_campaign_id", "cycle_number", name="uq_ccpc_campaign_cycle"),
     )
 
     cycle_id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)

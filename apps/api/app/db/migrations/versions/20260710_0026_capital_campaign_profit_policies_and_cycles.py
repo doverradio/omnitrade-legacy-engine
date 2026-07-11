@@ -42,27 +42,27 @@ def upgrade() -> None:
         sa.Column("updated_at", sa.DateTime(timezone=True), server_default=sa.text("now()"), nullable=False),
         sa.CheckConstraint(
             "policy_type IN ('HOLD_PROFIT','FULL_COMPOUND','PARTIAL_COMPOUND','WITHDRAW_PROFIT','WITHDRAW_AND_COMPOUND','PROTECTED_PRINCIPAL','MANUAL_REVIEW')",
-            name="ck_capital_campaign_profit_policies_type",
+            name="ck_ccpp_policy_type",
         ),
-        sa.CheckConstraint("compound_percent >= 0 AND compound_percent <= 100", name="ck_capital_campaign_profit_policies_compound_percent"),
-        sa.CheckConstraint("withdraw_percent >= 0 AND withdraw_percent <= 100", name="ck_capital_campaign_profit_policies_withdraw_percent"),
-        sa.CheckConstraint("compound_percent + withdraw_percent <= 100", name="ck_capital_campaign_profit_policies_alloc_percent_sum"),
-        sa.CheckConstraint("profit_target_amount IS NULL OR profit_target_amount > 0", name="ck_capital_campaign_profit_policies_target_amount_positive"),
-        sa.CheckConstraint("profit_target_percent IS NULL OR profit_target_percent > 0", name="ck_capital_campaign_profit_policies_target_percent_positive"),
-        sa.CheckConstraint("minimum_realized_profit >= 0", name="ck_capital_campaign_profit_policies_min_realized_profit_nonnegative"),
-        sa.CheckConstraint("minimum_cash_reserve >= 0", name="ck_capital_campaign_profit_policies_min_cash_reserve_nonnegative"),
-        sa.CheckConstraint("fee_reserve_percent >= 0", name="ck_capital_campaign_profit_policies_fee_reserve_nonnegative"),
-        sa.CheckConstraint("tax_reserve_percent >= 0", name="ck_capital_campaign_profit_policies_tax_reserve_nonnegative"),
+        sa.CheckConstraint("compound_percent >= 0 AND compound_percent <= 100", name="ck_ccpp_compound_pct"),
+        sa.CheckConstraint("withdraw_percent >= 0 AND withdraw_percent <= 100", name="ck_ccpp_withdraw_pct"),
+        sa.CheckConstraint("compound_percent + withdraw_percent <= 100", name="ck_ccpp_pct_total"),
+        sa.CheckConstraint("profit_target_amount IS NULL OR profit_target_amount > 0", name="ck_ccpp_target_amount"),
+        sa.CheckConstraint("profit_target_percent IS NULL OR profit_target_percent > 0", name="ck_ccpp_target_percent"),
+        sa.CheckConstraint("minimum_realized_profit >= 0", name="ck_ccpp_min_profit"),
+        sa.CheckConstraint("minimum_cash_reserve >= 0", name="ck_ccpp_cash_reserve"),
+        sa.CheckConstraint("fee_reserve_percent >= 0", name="ck_ccpp_fee_reserve"),
+        sa.CheckConstraint("tax_reserve_percent >= 0", name="ck_ccpp_tax_reserve"),
         sa.CheckConstraint(
             "maximum_campaign_capital IS NULL OR protected_principal_amount IS NULL OR maximum_campaign_capital > protected_principal_amount",
-            name="ck_capital_campaign_profit_policies_max_capital_gt_protected_principal",
+            name="ck_ccpp_max_capital",
         ),
         sa.ForeignKeyConstraint(["capital_campaign_id"], ["capital_campaigns.id"], ondelete="CASCADE"),
         sa.PrimaryKeyConstraint("policy_id"),
     )
-    op.create_index("ix_capital_campaign_profit_policies_uuid", "capital_campaign_profit_policies", ["policy_uuid"], unique=True)
-    op.create_index("ix_capital_campaign_profit_policies_campaign_id", "capital_campaign_profit_policies", ["capital_campaign_id"])
-    op.create_index("ix_capital_campaign_profit_policies_active", "capital_campaign_profit_policies", ["is_active"])
+    op.create_index("ix_ccpp_uuid", "capital_campaign_profit_policies", ["policy_uuid"], unique=True)
+    op.create_index("ix_ccpp_campaign", "capital_campaign_profit_policies", ["capital_campaign_id"])
+    op.create_index("ix_ccpp_active", "capital_campaign_profit_policies", ["is_active"])
 
     op.create_table(
         "capital_campaign_profit_cycles",
@@ -93,28 +93,28 @@ def upgrade() -> None:
         sa.Column("updated_at", sa.DateTime(timezone=True), server_default=sa.text("now()"), nullable=False),
         sa.CheckConstraint(
             "status IN ('CALCULATING','BELOW_TARGET','TARGET_REACHED','REVIEW_REQUIRED','APPROVED','COMPOUNDING_RECOMMENDED','WITHDRAWAL_RECOMMENDED','COMPLETED','CANCELLED','ERROR')",
-            name="ck_capital_campaign_profit_cycles_status",
+            name="ck_ccpc_status",
         ),
-        sa.CheckConstraint("settlement_state IN ('SETTLED','SETTLEMENT_UNKNOWN')", name="ck_capital_campaign_profit_cycles_settlement_state"),
+        sa.CheckConstraint("settlement_state IN ('SETTLED','SETTLEMENT_UNKNOWN')", name="ck_ccpc_settlement"),
         sa.ForeignKeyConstraint(["capital_campaign_id"], ["capital_campaigns.id"], ondelete="CASCADE"),
         sa.ForeignKeyConstraint(["profit_policy_id"], ["capital_campaign_profit_policies.policy_id"], ondelete="CASCADE"),
         sa.PrimaryKeyConstraint("cycle_id"),
-        sa.UniqueConstraint("capital_campaign_id", "cycle_number", name="uq_capital_campaign_profit_cycles_campaign_cycle_number"),
+        sa.UniqueConstraint("capital_campaign_id", "cycle_number", name="uq_ccpc_campaign_cycle"),
     )
-    op.create_index("ix_capital_campaign_profit_cycles_uuid", "capital_campaign_profit_cycles", ["cycle_uuid"], unique=True)
-    op.create_index("ix_capital_campaign_profit_cycles_campaign_id", "capital_campaign_profit_cycles", ["capital_campaign_id"])
-    op.create_index("ix_capital_campaign_profit_cycles_policy_id", "capital_campaign_profit_cycles", ["profit_policy_id"])
-    op.create_index("ix_capital_campaign_profit_cycles_status", "capital_campaign_profit_cycles", ["status"])
+    op.create_index("ix_ccpc_uuid", "capital_campaign_profit_cycles", ["cycle_uuid"], unique=True)
+    op.create_index("ix_ccpc_campaign", "capital_campaign_profit_cycles", ["capital_campaign_id"])
+    op.create_index("ix_ccpc_policy", "capital_campaign_profit_cycles", ["profit_policy_id"])
+    op.create_index("ix_ccpc_status", "capital_campaign_profit_cycles", ["status"])
 
 
 def downgrade() -> None:
-    op.drop_index("ix_capital_campaign_profit_cycles_status", table_name="capital_campaign_profit_cycles")
-    op.drop_index("ix_capital_campaign_profit_cycles_policy_id", table_name="capital_campaign_profit_cycles")
-    op.drop_index("ix_capital_campaign_profit_cycles_campaign_id", table_name="capital_campaign_profit_cycles")
-    op.drop_index("ix_capital_campaign_profit_cycles_uuid", table_name="capital_campaign_profit_cycles")
+    op.drop_index("ix_ccpc_status", table_name="capital_campaign_profit_cycles")
+    op.drop_index("ix_ccpc_policy", table_name="capital_campaign_profit_cycles")
+    op.drop_index("ix_ccpc_campaign", table_name="capital_campaign_profit_cycles")
+    op.drop_index("ix_ccpc_uuid", table_name="capital_campaign_profit_cycles")
     op.drop_table("capital_campaign_profit_cycles")
 
-    op.drop_index("ix_capital_campaign_profit_policies_active", table_name="capital_campaign_profit_policies")
-    op.drop_index("ix_capital_campaign_profit_policies_campaign_id", table_name="capital_campaign_profit_policies")
-    op.drop_index("ix_capital_campaign_profit_policies_uuid", table_name="capital_campaign_profit_policies")
+    op.drop_index("ix_ccpp_active", table_name="capital_campaign_profit_policies")
+    op.drop_index("ix_ccpp_campaign", table_name="capital_campaign_profit_policies")
+    op.drop_index("ix_ccpp_uuid", table_name="capital_campaign_profit_policies")
     op.drop_table("capital_campaign_profit_policies")

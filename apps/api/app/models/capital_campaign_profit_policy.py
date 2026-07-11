@@ -16,24 +16,24 @@ class CapitalCampaignProfitPolicy(Base):
     __table_args__ = (
         CheckConstraint(
             "policy_type IN ('HOLD_PROFIT','FULL_COMPOUND','PARTIAL_COMPOUND','WITHDRAW_PROFIT','WITHDRAW_AND_COMPOUND','PROTECTED_PRINCIPAL','MANUAL_REVIEW')",
-            name="ck_capital_campaign_profit_policies_type",
+            name="ck_ccpp_policy_type",
         ),
-        CheckConstraint("compound_percent >= 0 AND compound_percent <= 100", name="ck_capital_campaign_profit_policies_compound_percent"),
-        CheckConstraint("withdraw_percent >= 0 AND withdraw_percent <= 100", name="ck_capital_campaign_profit_policies_withdraw_percent"),
-        CheckConstraint("compound_percent + withdraw_percent <= 100", name="ck_capital_campaign_profit_policies_alloc_percent_sum"),
-        CheckConstraint("profit_target_amount IS NULL OR profit_target_amount > 0", name="ck_capital_campaign_profit_policies_target_amount_positive"),
-        CheckConstraint("profit_target_percent IS NULL OR profit_target_percent > 0", name="ck_capital_campaign_profit_policies_target_percent_positive"),
-        CheckConstraint("minimum_realized_profit >= 0", name="ck_capital_campaign_profit_policies_min_realized_profit_nonnegative"),
-        CheckConstraint("minimum_cash_reserve >= 0", name="ck_capital_campaign_profit_policies_min_cash_reserve_nonnegative"),
-        CheckConstraint("fee_reserve_percent >= 0", name="ck_capital_campaign_profit_policies_fee_reserve_nonnegative"),
-        CheckConstraint("tax_reserve_percent >= 0", name="ck_capital_campaign_profit_policies_tax_reserve_nonnegative"),
+        CheckConstraint("compound_percent >= 0 AND compound_percent <= 100", name="ck_ccpp_compound_pct"),
+        CheckConstraint("withdraw_percent >= 0 AND withdraw_percent <= 100", name="ck_ccpp_withdraw_pct"),
+        CheckConstraint("compound_percent + withdraw_percent <= 100", name="ck_ccpp_pct_total"),
+        CheckConstraint("profit_target_amount IS NULL OR profit_target_amount > 0", name="ck_ccpp_target_amount"),
+        CheckConstraint("profit_target_percent IS NULL OR profit_target_percent > 0", name="ck_ccpp_target_percent"),
+        CheckConstraint("minimum_realized_profit >= 0", name="ck_ccpp_min_profit"),
+        CheckConstraint("minimum_cash_reserve >= 0", name="ck_ccpp_cash_reserve"),
+        CheckConstraint("fee_reserve_percent >= 0", name="ck_ccpp_fee_reserve"),
+        CheckConstraint("tax_reserve_percent >= 0", name="ck_ccpp_tax_reserve"),
         CheckConstraint(
             "maximum_campaign_capital IS NULL OR protected_principal_amount IS NULL OR maximum_campaign_capital > protected_principal_amount",
-            name="ck_capital_campaign_profit_policies_max_capital_gt_protected_principal",
+            name="ck_ccpp_max_capital",
         ),
-        Index("ix_capital_campaign_profit_policies_uuid", "policy_uuid", unique=True),
-        Index("ix_capital_campaign_profit_policies_campaign_id", "capital_campaign_id"),
-        Index("ix_capital_campaign_profit_policies_active", "is_active"),
+        Index("ix_ccpp_uuid", "policy_uuid", unique=True),
+        Index("ix_ccpp_campaign", "capital_campaign_id"),
+        Index("ix_ccpp_active", "is_active"),
     )
 
     policy_id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
