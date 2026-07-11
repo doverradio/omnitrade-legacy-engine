@@ -179,7 +179,7 @@ def _build_success_case(*, approval_event: bool = True, risk_event: bool = True)
     safe_provider_response = {
         "mode": "dry_run",
         "submission_skipped": True,
-        "submission_skip_reason": "Coinbase order submission intentionally skipped (LIVE_CRYPTO_ORDER_SUBMISSION_ENABLED=false, LIVE_CRYPTO_DRY_RUN_ENABLED=true)",
+        "submission_skip_reason": "Provider order submission intentionally skipped (LIVE_CRYPTO_ORDER_SUBMISSION_ENABLED=false, LIVE_CRYPTO_DRY_RUN_ENABLED=true)",
         "exchange_environment": "sandbox",
         "provider_mock_mode_enabled": True,
         "rehearsal_mode": "controlled_provider_mock",
@@ -235,7 +235,7 @@ def _build_success_case(*, approval_event: bool = True, risk_event: bool = True)
             approver_id="operator:human",
             approver_role="operator",
             rationale="approved",
-            approval_scope={"environment": "sandbox"},
+            approval_scope={"environment": "sandbox", "provider": "coinbase_advanced"},
             expires_at=_now(),
             renewal_condition=None,
             event_payload={},

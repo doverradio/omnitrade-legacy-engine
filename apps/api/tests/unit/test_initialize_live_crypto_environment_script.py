@@ -200,6 +200,13 @@ def test_parse_args_includes_secure_credential_options() -> None:
     assert args.exchange_passphrase_env == "OT_COINBASE_PASSPHRASE"
 
 
+def test_parse_args_kraken_uses_provider_specific_default_resolution() -> None:
+    args = script.parse_args(["--provider", "kraken_spot"])
+    assert args.exchange_api_key_name_env is None
+    assert args.exchange_private_key_env is None
+    assert args.exchange_passphrase_env is None
+
+
 def test_parse_args_rejects_plaintext_secret_flags() -> None:
     with pytest.raises(SystemExit):
         script.parse_args(["--exchange-private-key", "plaintext-secret"])
@@ -223,6 +230,87 @@ def test_resolve_credentials_prefers_env_and_never_echoes_secrets(monkeypatch: p
     assert api_key == "api-key-name"
     assert private_key == "private-key"
     assert passphrase == "passphrase"
+
+
+def test_resolve_credentials_reads_kraken_from_canonical_env_names(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(script, "get_settings", lambda: SimpleNamespace())
+    monkeypatch.setenv("KRAKEN_API_KEY", "kraken-key")
+    monkeypatch.setenv("KRAKEN_API_SECRET", "kraken-secret")
+
+    api_key, private_key, passphrase = script._resolve_credentials(
+        SimpleNamespace(
+            provider="kraken_spot",
+            exchange_api_key_name=None,
+            exchange_api_key_name_env=None,
+            exchange_private_key_env=None,
+            exchange_passphrase_env=None,
+            prompt_for_credentials=False,
+        )
+    )
+
+    assert api_key == "kraken-key"
+    assert private_key == "kraken-secret"
+    assert passphrase is None
+
+
+def test_resolve_credentials_supports_legacy_kraken_env_aliases(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(script, "get_settings", lambda: SimpleNamespace())
+    monkeypatch.setenv("OT_KRAKEN_API_KEY", "legacy-key")
+    monkeypatch.setenv("OT_KRAKEN_API_SECRET", "legacy-secret")
+
+    api_key, private_key, passphrase = script._resolve_credentials(
+        SimpleNamespace(
+            provider="kraken_spot",
+            exchange_api_key_name=None,
+            exchange_api_key_name_env=None,
+            exchange_private_key_env=None,
+            exchange_passphrase_env=None,
+            prompt_for_credentials=False,
+        )
+    )
+
+    assert api_key == "legacy-key"
+    assert private_key == "legacy-secret"
+    assert passphrase is None
+
+
+@pytest.mark.parametrize(
+    "env_name,env_value,expected_api,expected_secret",
+    [
+        ("KRAKEN_API_KEY", "", None, "kraken-secret"),
+        ("KRAKEN_API_SECRET", "", "kraken-key", None),
+        ("KRAKEN_API_KEY", None, None, "kraken-secret"),
+        ("KRAKEN_API_SECRET", None, "kraken-key", None),
+    ],
+)
+def test_resolve_credentials_fails_closed_for_missing_or_blank_kraken_values(
+    monkeypatch: pytest.MonkeyPatch,
+    env_name: str,
+    env_value: str | None,
+    expected_api: str | None,
+    expected_secret: str | None,
+) -> None:
+    monkeypatch.setattr(script, "get_settings", lambda: SimpleNamespace())
+    monkeypatch.setenv("KRAKEN_API_KEY", "kraken-key")
+    monkeypatch.setenv("KRAKEN_API_SECRET", "kraken-secret")
+    if env_value is None:
+        monkeypatch.delenv(env_name, raising=False)
+    else:
+        monkeypatch.setenv(env_name, env_value)
+
+    api_key, private_key, _passphrase = script._resolve_credentials(
+        SimpleNamespace(
+            provider="kraken_spot",
+            exchange_api_key_name=None,
+            exchange_api_key_name_env=None,
+            exchange_private_key_env=None,
+            exchange_passphrase_env=None,
+            prompt_for_credentials=False,
+        )
+    )
+
+    assert api_key == expected_api
+    assert private_key == expected_secret
 
 
 @pytest.mark.asyncio

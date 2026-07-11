@@ -88,6 +88,17 @@ def _canonical_asset(asset: str) -> str:
     return mapping.get(base, base)
 
 
+def _looks_like_permission_denied(exc: Exception) -> bool:
+    if not isinstance(exc, InvalidRequestError):
+        return False
+    details = getattr(exc, "details", {}) or {}
+    errors = details.get("errors") if isinstance(details, dict) else None
+    if not isinstance(errors, list):
+        return False
+    lowered = " ".join(str(item).lower() for item in errors)
+    return "permission" in lowered or "denied" in lowered
+
+
 def _normalize_intent_product(product_id: str) -> tuple[str, str]:
     normalized = product_id.strip().upper()
     if normalized in {"BTC-USD", "XBT-USD", "BTC/USD", "XBT/USD", "XBTUSD"}:
@@ -169,6 +180,7 @@ class KrakenSpotClient:
         try:
             time_payload = await self._public_request(path="/public/Time", environment=environment, params=None)
             _ = await self._private_request(path="/private/Balance", environment=environment, credentials=credentials, payload={})
+            permission_snapshot = await self.fetch_permissions(credentials=credentials, environment=environment)
         except Exception as exc:
             return ExchangeAuthResult(
                 reachable=False,
@@ -197,11 +209,14 @@ class KrakenSpotClient:
             reachable=True,
             authenticated=True,
             account_status="active",
-            permissions=["funds_query"],
+            permissions=permission_snapshot.permissions,
             heartbeat_at=heartbeat_at,
             clock_skew_seconds=clock_skew,
             withdrawals_permission_granted=False,
-            trade_permission_present=False,
+            trade_permission_present=(
+                "open_order_query" in permission_snapshot.permissions
+                or "closed_order_query" in permission_snapshot.permissions
+            ),
             error=None,
         )
 
@@ -236,8 +251,24 @@ class KrakenSpotClient:
         return ExchangeAccountSnapshot(account_status="active")
 
     async def fetch_permissions(self, *, credentials: dict[str, str], environment: str) -> ExchangePermissionSnapshot:
+        permissions = ["funds_query"]
         _ = await self._private_request(path="/private/Balance", environment=environment, credentials=credentials, payload={})
-        return ExchangePermissionSnapshot(permissions=["funds_query"], verified=True)
+
+        probes = (
+            ("/private/OpenOrders", "open_order_query"),
+            ("/private/ClosedOrders", "closed_order_query"),
+            ("/private/Ledgers", "ledger_query"),
+        )
+        for path, permission_name in probes:
+            try:
+                await self._private_request(path=path, environment=environment, credentials=credentials, payload={})
+            except Exception as exc:
+                if _looks_like_permission_denied(exc):
+                    continue
+                raise
+            permissions.append(permission_name)
+
+        return ExchangePermissionSnapshot(permissions=permissions, verified=True)
 
     async def fetch_product(self, *, credentials: dict[str, str], environment: str, product_id: str) -> ExchangeProductSnapshot:
         _ = credentials
@@ -607,6 +638,12 @@ class KrakenSpotClient:
             return {"error": [], "result": {"unixtime": int(datetime.now(timezone.utc).timestamp())}}
         if path == "/private/Balance":
             return {"error": [], "result": {"ZUSD": "100.00", "XXBT": "0.001"}}
+        if path == "/private/OpenOrders":
+            return {"error": [], "result": {"open": {}}}
+        if path == "/private/ClosedOrders":
+            return {"error": [], "result": {"closed": {}, "count": 0}}
+        if path == "/private/Ledgers":
+            return {"error": [], "result": {"ledger": {}, "count": 0}}
         if path == "/public/AssetPairs":
             return {
                 "error": [],

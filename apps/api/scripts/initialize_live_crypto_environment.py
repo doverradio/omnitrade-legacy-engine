@@ -25,20 +25,46 @@ from scripts.review_live_crypto_dry_run_evidence import verify_dry_run_evidence
 
 _PROVIDER_DEFAULT_ENV = {
     "coinbase_advanced": {
-        "api_key_name": "OT_COINBASE_API_KEY_NAME",
-        "private_key": "OT_COINBASE_PRIVATE_KEY",
-        "passphrase": "OT_COINBASE_PASSPHRASE",
+        "api_key_name": ("OT_COINBASE_API_KEY_NAME",),
+        "private_key": ("OT_COINBASE_PRIVATE_KEY",),
+        "passphrase": ("OT_COINBASE_PASSPHRASE",),
+        "settings_api_key": "coinbase_api_key_name",
+        "settings_private_key": "coinbase_private_key",
+        "settings_passphrase": "coinbase_passphrase",
+        "label": "Coinbase",
     },
     "kraken_spot": {
-        "api_key_name": "OT_KRAKEN_API_KEY",
-        "private_key": "OT_KRAKEN_API_SECRET",
-        "passphrase": "OT_KRAKEN_OTP",
+        "api_key_name": ("KRAKEN_API_KEY", "OT_KRAKEN_API_KEY"),
+        "private_key": ("KRAKEN_API_SECRET", "OT_KRAKEN_API_SECRET"),
+        "passphrase": ("KRAKEN_OTP", "OT_KRAKEN_OTP"),
+        "settings_api_key": "kraken_api_key",
+        "settings_private_key": "kraken_api_secret",
+        "settings_passphrase": "kraken_otp",
+        "label": "Kraken",
     },
 }
 
 DEFAULT_API_KEY_ENV = "OT_COINBASE_API_KEY_NAME"
 DEFAULT_PRIVATE_KEY_ENV = "OT_COINBASE_PRIVATE_KEY"
 DEFAULT_PASSPHRASE_ENV = "OT_COINBASE_PASSPHRASE"
+
+
+def _read_first_nonblank_env(names: tuple[str, ...]) -> str | None:
+    for name in names:
+        value = os.getenv(name)
+        if value is not None and value.strip():
+            return value.strip()
+    return None
+
+
+def _read_secret_setting(settings, attribute: str) -> str | None:
+    value = getattr(settings, attribute, None)
+    if value is None:
+        return None
+    if hasattr(value, "get_secret_value"):
+        value = value.get_secret_value()
+    text = str(value).strip()
+    return text or None
 
 
 async def _maybe_await(value):
@@ -50,22 +76,24 @@ async def _maybe_await(value):
 def _resolve_credentials(args: argparse.Namespace) -> tuple[str | None, str | None, str | None]:
     provider = getattr(args, "provider", "coinbase_advanced")
     defaults = _PROVIDER_DEFAULT_ENV.get(provider, _PROVIDER_DEFAULT_ENV["coinbase_advanced"])
+    settings = get_settings()
 
-    api_key_env = args.exchange_api_key_name_env or defaults["api_key_name"]
-    private_key_env = args.exchange_private_key_env or defaults["private_key"]
-    passphrase_env = args.exchange_passphrase_env or defaults["passphrase"]
+    api_key_env_names = ((args.exchange_api_key_name_env,) if getattr(args, "exchange_api_key_name_env", None) else defaults["api_key_name"])
+    private_key_env_names = ((args.exchange_private_key_env,) if getattr(args, "exchange_private_key_env", None) else defaults["private_key"])
+    passphrase_env_names = ((args.exchange_passphrase_env,) if getattr(args, "exchange_passphrase_env", None) else defaults["passphrase"])
 
-    api_key_name = args.exchange_api_key_name or os.getenv(api_key_env)
-    private_key = os.getenv(private_key_env)
-    passphrase = os.getenv(passphrase_env)
+    api_key_name = args.exchange_api_key_name or _read_first_nonblank_env(api_key_env_names) or _read_secret_setting(settings, defaults["settings_api_key"])
+    private_key = _read_first_nonblank_env(private_key_env_names) or _read_secret_setting(settings, defaults["settings_private_key"])
+    passphrase = _read_first_nonblank_env(passphrase_env_names) or _read_secret_setting(settings, defaults["settings_passphrase"])
+    provider_label = str(defaults["label"])
 
     if args.prompt_for_credentials:
         if not api_key_name:
-            api_key_name = input("Coinbase API key name: ").strip()
+            api_key_name = input(f"{provider_label} API key: ").strip()
         if not private_key:
-            private_key = getpass.getpass("Coinbase private key (hidden): ").strip()
+            private_key = getpass.getpass(f"{provider_label} API secret (hidden): ").strip()
         if passphrase is None:
-            prompted = getpass.getpass("Coinbase passphrase (hidden, optional): ").strip()
+            prompted = getpass.getpass(f"{provider_label} passphrase/OTP (hidden, optional): ").strip()
             passphrase = prompted or None
 
     if api_key_name is not None:
@@ -191,6 +219,7 @@ async def _run(args: argparse.Namespace) -> int:
                     request=RecordApprovalHelperRequest(
                         actor=args.actor,
                         live_trading_profile_id=live_trading_profile_id,
+                        provider=provider,
                         exchange_environment=args.exchange_environment,
                     ),
                 ))
@@ -273,6 +302,14 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--exchange-connection-id", type=UUID)
     parser.add_argument("--live-trading-profile-id", type=UUID)
     args = parser.parse_args(argv)
+
+    if args.provider == "kraken_spot":
+        if args.exchange_api_key_name_env == DEFAULT_API_KEY_ENV:
+            args.exchange_api_key_name_env = None
+        if args.exchange_private_key_env == DEFAULT_PRIVATE_KEY_ENV:
+            args.exchange_private_key_env = None
+        if args.exchange_passphrase_env == DEFAULT_PASSPHRASE_ENV:
+            args.exchange_passphrase_env = None
 
     active_modes = [args.apply, args.create_preview, args.create_approval, args.run_rehearsal]
     if sum(1 for item in active_modes if item) > 1:

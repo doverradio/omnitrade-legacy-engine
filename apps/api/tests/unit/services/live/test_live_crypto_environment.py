@@ -48,20 +48,36 @@ def _stock_account():
 
 
 def _connection():
-    return SimpleNamespace(exchange_connection_id=uuid4(), created_at=datetime.now(timezone.utc))
+    return SimpleNamespace(
+        exchange_connection_id=uuid4(),
+        created_at=datetime.now(timezone.utc),
+        credentials_valid=True,
+        last_readiness_verdict="READY_FOR_OPERATOR_REVIEW",
+        last_readiness_report=[
+            {"code": "usd_balance_retrieved", "status": "pass"},
+            {"code": "product_btc_usd_available", "status": "pass"},
+        ],
+        balances=[{"currency": "USD", "available": "10.00"}],
+    )
 
 
-def _profile(account_id, *, environment: str = "production"):
+def _profile(account_id, *, environment: str = "production", provider: str = "coinbase_advanced"):
     return SimpleNamespace(
         id=uuid4(),
         paper_account_id=account_id,
         created_at=datetime.now(timezone.utc),
-        provenance_metadata={"exchange_environment": environment, "registration_source": f"human_{environment}_initializer"},
+        provenance_metadata={"exchange_environment": environment, "registration_source": f"human_{environment}_initializer", "provider": provider},
     )
 
 
 def _asset():
-    return SimpleNamespace(id=uuid4(), created_at=datetime.now(timezone.utc))
+    return SimpleNamespace(
+        id=uuid4(),
+        created_at=datetime.now(timezone.utc),
+        min_order_notional=Decimal("5"),
+        qty_step_size=Decimal("0.00000001"),
+        supports_fractional=True,
+    )
 
 
 def _campaign(account_id):
@@ -69,7 +85,12 @@ def _campaign(account_id):
 
 
 def _preview(connection_id):
-    return SimpleNamespace(crypto_order_preview_id=uuid4(), exchange_connection_id=connection_id, created_at=datetime.now(timezone.utc))
+    return SimpleNamespace(
+        crypto_order_preview_id=uuid4(),
+        exchange_connection_id=connection_id,
+        created_at=datetime.now(timezone.utc),
+        expires_at=datetime.now(timezone.utc).replace(year=2030),
+    )
 
 
 def _approval(profile_id, *, environment: str = "production"):
@@ -77,7 +98,7 @@ def _approval(profile_id, *, environment: str = "production"):
         id=uuid4(),
         live_trading_profile_id=profile_id,
         expires_at=datetime.now(timezone.utc).replace(year=2030),
-        approval_scope={"environment": environment},
+        approval_scope={"environment": environment, "provider": "coinbase_advanced"},
     )
 
 
@@ -408,6 +429,7 @@ async def test_approval_helper_uses_first_live_enablement_checkpoint(monkeypatch
         _ = db
         captured["checkpoint_type"] = request.checkpoint_type
         captured["max_order_usd"] = request.approval_scope.get("max_order_usd")
+        captured["provider"] = request.approval_scope.get("provider")
         return SimpleNamespace(approval_event_id=uuid4(), approval_state="approved")
 
     monkeypatch.setattr(service, "record_live_approval_checkpoint", _approval_stub)
@@ -420,6 +442,7 @@ async def test_approval_helper_uses_first_live_enablement_checkpoint(monkeypatch
     assert result.approval_state == "approved"
     assert captured["checkpoint_type"] == "first_live_enablement"
     assert captured["max_order_usd"] == "5"
+    assert captured["provider"] == "coinbase_advanced"
 
 
 @pytest.mark.asyncio
@@ -546,11 +569,12 @@ async def test_preview_helper_uses_requested_environment(monkeypatch: pytest.Mon
 async def test_approval_helper_scopes_requested_environment(monkeypatch: pytest.MonkeyPatch) -> None:
     captured: dict[str, object] = {}
     db = _FakeDb()
-    db.profile = _profile(uuid4(), environment="sandbox")
+    db.profile = _profile(uuid4(), environment="sandbox", provider="kraken_spot")
 
     async def _approval_stub(*, db, request):
         _ = db
         captured["environment"] = request.approval_scope.get("environment")
+        captured["provider"] = request.approval_scope.get("provider")
         return SimpleNamespace(approval_event_id=uuid4(), approval_state="approved")
 
     monkeypatch.setattr(service, "record_live_approval_checkpoint", _approval_stub)
@@ -560,11 +584,13 @@ async def test_approval_helper_scopes_requested_environment(monkeypatch: pytest.
         request=service.RecordApprovalHelperRequest(
             actor="operator:human",
             live_trading_profile_id=db.profile.id,
+            provider="kraken_spot",
             exchange_environment="sandbox",
         ),
     )
 
     assert captured["environment"] == "sandbox"
+    assert captured["provider"] == "kraken_spot"
 
 
 @pytest.mark.asyncio
@@ -602,6 +628,23 @@ async def test_approval_helper_rejects_profile_environment_mismatch() -> None:
                 actor="operator:human",
                 live_trading_profile_id=db.profile.id,
                 exchange_environment="sandbox",
+            ),
+        )
+
+
+@pytest.mark.asyncio
+async def test_approval_helper_rejects_profile_provider_mismatch() -> None:
+    db = _FakeDb()
+    db.profile = _profile(uuid4(), environment="production", provider="coinbase_advanced")
+
+    with pytest.raises(ValueError, match="provider mismatch"):
+        await service.record_first_live_enablement_approval(
+            db=db,
+            request=service.RecordApprovalHelperRequest(
+                actor="operator:human",
+                live_trading_profile_id=db.profile.id,
+                provider="kraken_spot",
+                exchange_environment="production",
             ),
         )
 

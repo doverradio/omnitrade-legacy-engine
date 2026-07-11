@@ -77,6 +77,20 @@ def _balance_amount(connection: ExchangeConnection, currency: str) -> Decimal:
     return Decimal("0")
 
 
+def _has_balance_currency(connection: ExchangeConnection, currency: str) -> bool:
+    for item in (connection.balances or []):
+        if str(item.get("currency", "")).upper() == currency.upper():
+            return True
+    return False
+
+
+def _provider_label(provider: str) -> str:
+    try:
+        return get_exchange_provider(provider).metadata.display_name
+    except Exception:
+        return provider
+
+
 def _default_readiness() -> ExchangeReadinessReportResponse:
     return build_report(
         checks=[
@@ -299,6 +313,7 @@ async def create_exchange_connection(
     )
 
     initial_readiness = await _build_and_persist_readiness_for_auth_result(
+        provider=payload.provider,
         auth_result=auth_result,
         credentials_stored=True,
         encryption_key_configured=True,
@@ -306,12 +321,14 @@ async def create_exchange_connection(
         balances_retrieved=False,
         permissions_retrieved=len(auth_result.permissions) > 0,
         usd_balance_retrieved=False,
+        usd_balance_funded=False,
         btc_balance_retrieved=False,
         dangerous_permissions_detected=_has_dangerous_permissions(auth_result.permissions),
         product_btc_usd_available=False,
         product_trading_enabled=False,
         account_restricted=_is_account_restricted(auth_result.account_status),
         rate_limit_status_available=False,
+        trade_permission_required=payload.provider != "kraken_spot",
     )
 
     credentials_encrypted = encrypt_credential_payload(
@@ -426,19 +443,22 @@ async def refresh_exchange_balances(
         product_trading_enabled = product_snapshot.trading_enabled
 
     readiness = await _build_and_persist_readiness_for_auth_result(
+        provider=connection.provider,
         auth_result=auth_result,
         credentials_stored=bool(connection.credentials_encrypted),
         encryption_key_configured=True,
         accounts_retrieved=auth_result.authenticated,
         balances_retrieved=balances_retrieved,
         permissions_retrieved=len(connection.api_permissions or []) > 0,
-        usd_balance_retrieved=_balance_amount(connection, "USD") > Decimal("0"),
-        btc_balance_retrieved=_balance_amount(connection, "BTC") >= Decimal("0"),
+        usd_balance_retrieved=_has_balance_currency(connection, "USD"),
+        usd_balance_funded=_balance_amount(connection, "USD") > Decimal("0"),
+        btc_balance_retrieved=_has_balance_currency(connection, "BTC"),
         dangerous_permissions_detected=_has_dangerous_permissions(connection.api_permissions),
         product_btc_usd_available=product_btc_usd_available,
         product_trading_enabled=product_trading_enabled,
         account_restricted=_is_account_restricted(connection.account_status),
         rate_limit_status_available=auth_result.reachable,
+        trade_permission_required=connection.provider != "kraken_spot",
     )
     connection.last_verified_at = readiness.checked_at
     connection.last_readiness_verdict = readiness.verdict
@@ -488,19 +508,22 @@ async def refresh_exchange_account(
         product_snapshot = await provider.fetch_product(credentials=credentials, environment=connection.environment, product_id="BTC-USD")
 
     readiness = await _build_and_persist_readiness_for_auth_result(
+        provider=connection.provider,
         auth_result=auth_result,
         credentials_stored=bool(connection.credentials_encrypted),
         encryption_key_configured=True,
         accounts_retrieved=auth_result.authenticated,
         balances_retrieved=len(connection.balances or []) > 0,
         permissions_retrieved=len(connection.api_permissions or []) > 0,
-        usd_balance_retrieved=_balance_amount(connection, "USD") > Decimal("0"),
-        btc_balance_retrieved=_balance_amount(connection, "BTC") >= Decimal("0"),
+        usd_balance_retrieved=_has_balance_currency(connection, "USD"),
+        usd_balance_funded=_balance_amount(connection, "USD") > Decimal("0"),
+        btc_balance_retrieved=_has_balance_currency(connection, "BTC"),
         dangerous_permissions_detected=_has_dangerous_permissions(connection.api_permissions),
         product_btc_usd_available=bool(product_snapshot and product_snapshot.available),
         product_trading_enabled=bool(product_snapshot and product_snapshot.trading_enabled),
         account_restricted=_is_account_restricted(connection.account_status),
         rate_limit_status_available=auth_result.reachable,
+        trade_permission_required=connection.provider != "kraken_spot",
     )
     connection.last_verified_at = readiness.checked_at
     connection.last_readiness_verdict = readiness.verdict
@@ -549,19 +572,22 @@ async def refresh_exchange_permissions(
         product_snapshot = await provider.fetch_product(credentials=credentials, environment=connection.environment, product_id="BTC-USD")
 
     readiness = await _build_and_persist_readiness_for_auth_result(
+        provider=connection.provider,
         auth_result=auth_result,
         credentials_stored=bool(connection.credentials_encrypted),
         encryption_key_configured=True,
         accounts_retrieved=auth_result.authenticated,
         balances_retrieved=len(connection.balances or []) > 0,
         permissions_retrieved=len(connection.api_permissions or []) > 0,
-        usd_balance_retrieved=_balance_amount(connection, "USD") > Decimal("0"),
-        btc_balance_retrieved=_balance_amount(connection, "BTC") >= Decimal("0"),
+        usd_balance_retrieved=_has_balance_currency(connection, "USD"),
+        usd_balance_funded=_balance_amount(connection, "USD") > Decimal("0"),
+        btc_balance_retrieved=_has_balance_currency(connection, "BTC"),
         dangerous_permissions_detected=_has_dangerous_permissions(connection.api_permissions),
         product_btc_usd_available=bool(product_snapshot and product_snapshot.available),
         product_trading_enabled=bool(product_snapshot and product_snapshot.trading_enabled),
         account_restricted=_is_account_restricted(connection.account_status),
         rate_limit_status_available=auth_result.reachable,
+        trade_permission_required=connection.provider != "kraken_spot",
     )
     connection.last_verified_at = readiness.checked_at
     connection.last_readiness_verdict = readiness.verdict
@@ -587,6 +613,7 @@ async def refresh_exchange_permissions(
 
 async def _build_and_persist_readiness_for_auth_result(
     *,
+    provider: str,
     auth_result: ExchangeAuthResult,
     credentials_stored: bool,
     encryption_key_configured: bool,
@@ -594,13 +621,16 @@ async def _build_and_persist_readiness_for_auth_result(
     balances_retrieved: bool,
     permissions_retrieved: bool,
     usd_balance_retrieved: bool,
+    usd_balance_funded: bool,
     btc_balance_retrieved: bool,
     dangerous_permissions_detected: bool,
     product_btc_usd_available: bool,
     product_trading_enabled: bool,
     account_restricted: bool,
     rate_limit_status_available: bool,
+    trade_permission_required: bool,
 ) -> ExchangeReadinessReportResponse:
+    provider_label = _provider_label(provider)
     checks: list[ExchangeReadinessCheckResponse] = []
     checks.append(
         readiness_check(
@@ -608,7 +638,7 @@ async def _build_and_persist_readiness_for_auth_result(
             label="Credentials Stored",
             status="pass" if credentials_stored else "fail",
             explanation="Encrypted credentials are present." if credentials_stored else "No encrypted credentials are stored.",
-            remediation="Save Coinbase API key name and private key in Exchange Connections.",
+            remediation=f"Save {provider_label} API credentials in Exchange Connections.",
         )
     )
     checks.append(
@@ -623,10 +653,10 @@ async def _build_and_persist_readiness_for_auth_result(
     checks.append(
         readiness_check(
             code="jwt_generation",
-            label="JWT Generation",
+            label="Credential Signing",
             status="pass" if auth_result.error is None else "fail",
-            explanation="JWT generated for current request binding." if auth_result.error is None else "JWT generation failed.",
-            remediation="Confirm Coinbase key name, private key format, and newline escaping.",
+            explanation="Credential signing inputs generated for the current request binding." if auth_result.error is None else "Credential signing failed.",
+            remediation=f"Confirm the stored {provider_label} credential format and secret encoding.",
         )
     )
     checks.append(
@@ -634,8 +664,8 @@ async def _build_and_persist_readiness_for_auth_result(
             code="api_reachable",
             label="API Reachable",
             status="pass" if auth_result.reachable else "fail",
-            explanation="Coinbase API endpoint reachable." if auth_result.reachable else "Coinbase API unreachable.",
-            remediation="Check egress network access and Coinbase status page.",
+            explanation=f"{provider_label} API endpoint reachable." if auth_result.reachable else f"{provider_label} API unreachable.",
+            remediation=f"Check egress network access and {provider_label} status information.",
         )
     )
     checks.append(
@@ -644,7 +674,7 @@ async def _build_and_persist_readiness_for_auth_result(
             label="Authentication Valid",
             status="pass" if auth_result.authenticated else "fail",
             explanation="Authenticated read-only request succeeded." if auth_result.authenticated else "Authentication failed.",
-            remediation="Verify key name and private key pairing in Coinbase Developer Platform.",
+            remediation=f"Verify the stored {provider_label} credential pair and account access.",
         )
     )
     checks.append(
@@ -675,7 +705,7 @@ async def _build_and_persist_readiness_for_auth_result(
                 if permissions_retrieved
                 else "Permissions endpoint did not return values; permission state is unknown."
             ),
-            remediation="Use a key that supports permission introspection and rerun verification.",
+            remediation=f"Use a {provider_label} key that supports permission introspection where available, then rerun verification.",
         )
     )
 
@@ -700,24 +730,28 @@ async def _build_and_persist_readiness_for_auth_result(
             label="Dangerous Permissions",
             status="fail" if dangerous_permissions_detected else "pass",
             explanation=(
-                "No withdrawal/transfer permission detected."
+                "No dangerous transfer or withdrawal permission detected."
                 if not dangerous_permissions_detected
                 else "Withdrawal or transfer permission detected; this key is not eligible for automatic readiness."
             ),
-            remediation="Use least-privilege Coinbase key and disable withdrawal/transfer scopes.",
+            remediation=f"Use a least-privilege {provider_label} key and remove dangerous funding scopes.",
         )
     )
     checks.append(
         readiness_check(
             code="trade_permission_present",
             label="Trade Permission Present",
-            status="pass" if auth_result.trade_permission_present else "fail",
+            status=("pass" if auth_result.trade_permission_present else ("fail" if trade_permission_required else "warn")),
             explanation=(
                 "Trade permission is present."
                 if auth_result.trade_permission_present
-                else "Trade permission not present."
+                else (
+                    "Trade permission could not be verified from provider-visible permission evidence."
+                    if not trade_permission_required
+                    else "Trade permission not present."
+                )
             ),
-            remediation="Enable trade/order permission for preview and dry-run readiness.",
+            remediation=f"Enable the minimum {provider_label} order permission required for preview and dry-run readiness.",
         )
     )
 
@@ -726,8 +760,17 @@ async def _build_and_persist_readiness_for_auth_result(
             code="usd_balance_retrieved",
             label="USD Balance Retrieved",
             status="pass" if usd_balance_retrieved else "fail",
-            explanation="USD balance was retrieved and is available." if usd_balance_retrieved else "USD balance is unavailable.",
-            remediation="Confirm USD account access and non-zero available balance.",
+            explanation="USD balance was retrieved; the balance may be zero." if usd_balance_retrieved else "USD balance could not be observed.",
+            remediation=f"Confirm {provider_label} USD cash-balance visibility.",
+        )
+    )
+    checks.append(
+        readiness_check(
+            code="usd_balance_funded",
+            label="USD Balance Funded",
+            status="pass" if usd_balance_funded else "fail",
+            explanation="USD balance is funded for a small live trade." if usd_balance_funded else "USD balance is observable but unfunded or below the current live-trade threshold.",
+            remediation=f"Fund the {provider_label} USD cash balance before live dry-run or trade execution.",
         )
     )
     checks.append(
@@ -736,7 +779,7 @@ async def _build_and_persist_readiness_for_auth_result(
             label="BTC Balance Retrieved",
             status="pass" if btc_balance_retrieved else "fail",
             explanation="BTC balance endpoint returned successfully." if btc_balance_retrieved else "BTC balance is unavailable.",
-            remediation="Confirm BTC account access for read checks.",
+            remediation=f"Confirm {provider_label} BTC balance visibility for read checks.",
         )
     )
     checks.append(
@@ -744,8 +787,8 @@ async def _build_and_persist_readiness_for_auth_result(
             code="product_btc_usd_available",
             label="BTC-USD Product Available",
             status="pass" if product_btc_usd_available else "fail",
-            explanation="BTC-USD is available on Coinbase Advanced." if product_btc_usd_available else "BTC-USD product endpoint unavailable.",
-            remediation="Confirm BTC-USD product availability on the connected account.",
+            explanation=f"BTC-USD is available on {provider_label}." if product_btc_usd_available else "BTC-USD product endpoint unavailable.",
+            remediation=f"Confirm BTC-USD product availability on the connected {provider_label} account.",
         )
     )
     checks.append(
@@ -763,7 +806,7 @@ async def _build_and_persist_readiness_for_auth_result(
             label="Account Not Restricted",
             status="pass" if not account_restricted else "fail",
             explanation="Account status is not restricted." if not account_restricted else "Account appears restricted.",
-            remediation="Resolve account restrictions in Coinbase before proceeding.",
+            remediation=f"Resolve account restrictions in {provider_label} before proceeding.",
         )
     )
     checks.append(
@@ -828,19 +871,22 @@ async def verify_exchange_connection(
         product_trading_enabled = product_snapshot.trading_enabled
 
     readiness = await _build_and_persist_readiness_for_auth_result(
+        provider=connection.provider,
         auth_result=auth_result,
         credentials_stored=bool(connection.credentials_encrypted),
         encryption_key_configured=True,
         accounts_retrieved=accounts_retrieved,
         balances_retrieved=balances_retrieved,
         permissions_retrieved=permissions_retrieved,
-        usd_balance_retrieved=_balance_amount(connection, "USD") > Decimal("0"),
-        btc_balance_retrieved=_balance_amount(connection, "BTC") >= Decimal("0"),
+        usd_balance_retrieved=_has_balance_currency(connection, "USD"),
+        usd_balance_funded=_balance_amount(connection, "USD") > Decimal("0"),
+        btc_balance_retrieved=_has_balance_currency(connection, "BTC"),
         dangerous_permissions_detected=_has_dangerous_permissions(connection.api_permissions),
         product_btc_usd_available=product_btc_usd_available,
         product_trading_enabled=product_trading_enabled,
         account_restricted=_is_account_restricted(connection.account_status),
         rate_limit_status_available=auth_result.reachable,
+        trade_permission_required=connection.provider != "kraken_spot",
     )
     connection.last_verified_at = readiness.checked_at
     connection.last_readiness_verdict = readiness.verdict
@@ -928,19 +974,22 @@ async def rotate_exchange_credentials(
     _apply_auth_result(connection, auth_result)
 
     readiness = await _build_and_persist_readiness_for_auth_result(
+        provider=connection.provider,
         auth_result=auth_result,
         credentials_stored=True,
         encryption_key_configured=True,
         accounts_retrieved=auth_result.authenticated,
         balances_retrieved=len(connection.balances or []) > 0,
         permissions_retrieved=len(connection.api_permissions or []) > 0,
-        usd_balance_retrieved=_balance_amount(connection, "USD") > Decimal("0"),
-        btc_balance_retrieved=_balance_amount(connection, "BTC") >= Decimal("0"),
+        usd_balance_retrieved=_has_balance_currency(connection, "USD"),
+        usd_balance_funded=_balance_amount(connection, "USD") > Decimal("0"),
+        btc_balance_retrieved=_has_balance_currency(connection, "BTC"),
         dangerous_permissions_detected=_has_dangerous_permissions(connection.api_permissions),
         product_btc_usd_available=False,
         product_trading_enabled=False,
         account_restricted=_is_account_restricted(connection.account_status),
         rate_limit_status_available=auth_result.reachable,
+        trade_permission_required=connection.provider != "kraken_spot",
     )
     connection.last_verified_at = readiness.checked_at
     connection.last_readiness_verdict = readiness.verdict

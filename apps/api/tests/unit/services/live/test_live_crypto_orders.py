@@ -361,8 +361,8 @@ async def test_dry_run_never_calls_coinbase_create_order(monkeypatch: pytest.Mon
     assert "LIVE_CRYPTO_DRY_RUN_ENABLED=true" in response.submission_skip_reason
     assert response.dry_run_status in {"DRY_RUN_READY", "DRY_RUN_BLOCKED"}
     assert response.dry_run_message in {
-        "Dry run completed. No Coinbase order was submitted.",
-        "Dry run blocked. No Coinbase order was submitted.",
+        "Dry run completed. No provider order was submitted.",
+        "Dry run blocked. No provider order was submitted.",
     }
 
 
@@ -514,6 +514,9 @@ async def test_prepare_and_dry_run_use_same_preflight_guard_path(monkeypatch: py
     )
     connection = SimpleNamespace(
         exchange_connection_id=preview.exchange_connection_id,
+        provider="coinbase_advanced",
+        credentials_valid=True,
+        api_permissions=["view", "trade"],
         last_verified_at=now - timedelta(seconds=1),
         last_successful_sync_at=now - timedelta(seconds=1),
         last_heartbeat_at=now - timedelta(seconds=1),
@@ -629,6 +632,9 @@ async def test_prepare_confirmation_allows_preview_one_second_before_expiration(
     )
     connection = SimpleNamespace(
         exchange_connection_id=preview.exchange_connection_id,
+        provider="coinbase_advanced",
+        credentials_valid=True,
+        api_permissions=["view", "trade"],
         last_verified_at=now - timedelta(seconds=1),
         last_successful_sync_at=now - timedelta(seconds=1),
         last_heartbeat_at=now - timedelta(seconds=1),
@@ -732,6 +738,9 @@ async def test_prepare_confirmation_blocks_preview_at_exact_expiration(monkeypat
     )
     connection = SimpleNamespace(
         exchange_connection_id=preview.exchange_connection_id,
+        provider="coinbase_advanced",
+        credentials_valid=True,
+        api_permissions=["view", "trade"],
         last_verified_at=now - timedelta(seconds=1),
         last_successful_sync_at=now - timedelta(seconds=1),
         last_heartbeat_at=now - timedelta(seconds=1),
@@ -924,6 +933,9 @@ async def test_prepare_confirmation_reuses_existing_live_order_for_repeated_requ
     )
     connection = SimpleNamespace(
         exchange_connection_id=preview.exchange_connection_id,
+        provider="coinbase_advanced",
+        credentials_valid=True,
+        api_permissions=["view", "trade"],
         last_verified_at=now - timedelta(seconds=1),
         last_successful_sync_at=now - timedelta(seconds=1),
         last_heartbeat_at=now - timedelta(seconds=1),

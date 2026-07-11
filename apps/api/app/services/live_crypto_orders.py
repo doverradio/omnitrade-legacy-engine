@@ -133,6 +133,16 @@ def _profile_environment(profile: LiveTradingProfile) -> str | None:
     return "production"
 
 
+def _profile_provider(profile: LiveTradingProfile) -> str | None:
+    provenance_raw = getattr(profile, "provenance_metadata", None)
+    provenance = provenance_raw if isinstance(provenance_raw, dict) else {}
+    provider = provenance.get("provider")
+    if provider is None:
+        return "coinbase_advanced"
+    value = str(provider).strip().lower()
+    return value or "coinbase_advanced"
+
+
 def _approval_environment(approval_event: LiveApprovalEvent | None) -> str | None:
     if approval_event is None or not isinstance(approval_event.approval_scope, dict):
         return None
@@ -143,6 +153,29 @@ def _approval_environment(approval_event: LiveApprovalEvent | None) -> str | Non
         return _normalize_exchange_environment(str(explicit))
     except ValueError:
         return None
+
+
+def _approval_provider(approval_event: LiveApprovalEvent | None) -> str | None:
+    if approval_event is None or not isinstance(approval_event.approval_scope, dict):
+        return None
+    provider = approval_event.approval_scope.get("provider")
+    if provider is None:
+        return "coinbase_advanced"
+    value = str(provider).strip().lower()
+    return value or "coinbase_advanced"
+
+
+def _effective_live_provider(*, profile: LiveTradingProfile, preview: CryptoOrderPreview, connection: ExchangeConnection) -> str:
+    provider = str(getattr(preview, "provider", "") or getattr(connection, "provider", "") or (_profile_provider(profile) or "coinbase_advanced")).strip().lower()
+    return provider or "coinbase_advanced"
+
+
+def _provider_submission_evidence_ready(connection: ExchangeConnection) -> bool:
+    permissions = {str(item).lower() for item in (getattr(connection, "api_permissions", []) or [])}
+    provider = str(getattr(connection, "provider", "coinbase_advanced") or "coinbase_advanced").strip().lower()
+    if provider == "kraken_spot":
+        return bool(getattr(connection, "credentials_valid", False)) and bool(permissions.intersection({"funds_query", "open_order_query", "closed_order_query", "ledger_query"}))
+    return "trade" in permissions
 
 
 async def _commit_if_supported(*, db: AsyncSession) -> None:
@@ -589,9 +622,8 @@ async def _evaluate_live_preflight_guards(
     if profile_environment != preview_environment:
         raise ValueError("live trading profile environment does not match preview environment")
     if getattr(connection, "credentials_valid", True) is not True:
-        raise PermissionError("coinbase credential evidence unavailable")
-    api_permissions = [str(item).lower() for item in (getattr(connection, "api_permissions", ["trade"]) or [])]
-    if "trade" not in api_permissions:
+        raise PermissionError("provider credential evidence unavailable")
+    if not _provider_submission_evidence_ready(connection):
         raise PermissionError("trade permission missing")
     now = _utcnow()
     preview_age_seconds = _require_fresh_timestamp(
@@ -641,6 +673,8 @@ async def _evaluate_live_preflight_guards(
     )
     if approval_event is not None and _approval_environment(approval_event) != preview_environment:
         raise PermissionError("approval environment does not match preview environment")
+    if approval_event is not None and _approval_provider(approval_event) != _effective_live_provider(profile=profile, preview=preview, connection=connection):
+        raise PermissionError("approval provider does not match preview provider")
 
     guard_result = await evaluate_live_submission_guard(
         db=db,
@@ -753,9 +787,9 @@ def _build_dry_run_response(*, live_order: LiveCryptoOrder) -> LiveCryptoOrderDr
         ),
         dry_run_status=live_order.status,
         dry_run_message=(
-            "Dry run completed. No Coinbase order was submitted."
+            "Dry run completed. No provider order was submitted."
             if not dry_run_errors
-            else "Dry run blocked. No Coinbase order was submitted."
+            else "Dry run blocked. No provider order was submitted."
         ),
         safe_request_summary=safe_provider_response.get("safe_request_summary", {}),
         provider_create_order_called=False,
@@ -858,24 +892,24 @@ class LiveCryptoOrderService:
                 ),
                 _make_check(
                     code="production_connection_configured",
-                    label="Coinbase Production Connection Configured",
+                    label="Production Connection Configured",
                     status="pass" if latest_connection and latest_connection.environment == "production" else "fail",
-                    explanation="A production Coinbase connection is available for the approved preview.",
-                    remediation="Use a production Coinbase Advanced connection for the live order path.",
+                    explanation="A production provider connection is available for the approved preview.",
+                    remediation="Use a production provider connection for the live order path.",
                 ),
                 _make_check(
                     code="credentials_valid",
                     label="Credentials Valid",
                     status="pass" if latest_connection and latest_connection.credentials_valid else "fail",
-                    explanation="Stored Coinbase credentials validated on the last connection sync.",
+                    explanation="Stored provider credentials validated on the last connection sync.",
                     remediation="Refresh the exchange connection credentials.",
                 ),
                 _make_check(
                     code="trade_permission_present",
                     label="Trading Permission Present",
-                    status="pass" if latest_connection and "trade" in (latest_connection.api_permissions or []) else "fail",
-                    explanation="Trade permission is present on the connected Coinbase account.",
-                    remediation="Grant trade permission on the Coinbase API key.",
+                    status="pass" if latest_connection and _provider_submission_evidence_ready(latest_connection) else "fail",
+                    explanation="Submission-related permission evidence is present on the connected provider account.",
+                    remediation="Grant the minimum provider order permissions required for first-trade readiness.",
                 ),
                 _make_check(
                     code="withdrawal_permission_not_required",
@@ -889,7 +923,7 @@ class LiveCryptoOrderService:
                     label="Balance Available",
                     status="pass" if latest_connection and any(item.get("currency") == "USD" and Decimal(str(item.get("available", "0"))) > 0 for item in (latest_connection.balances or [])) else "fail",
                     explanation="USD balance is available for a $5 BTC-USD buy.",
-                    remediation="Fund the Coinbase account before operator enablement.",
+                    remediation="Fund the provider account before operator enablement.",
                 ),
                 _make_check(
                     code="btc_usd_available",
@@ -1175,7 +1209,7 @@ class LiveCryptoOrderService:
 
         submission_skipped = True
         submission_skip_reason = (
-            "Coinbase order submission intentionally skipped "
+            "Provider order submission intentionally skipped "
             f"(LIVE_CRYPTO_ORDER_SUBMISSION_ENABLED={str(settings.live_crypto_order_submission_enabled).lower()}, "
             f"LIVE_CRYPTO_DRY_RUN_ENABLED={str(settings.live_crypto_dry_run_enabled).lower()})"
         )
@@ -1225,7 +1259,7 @@ class LiveCryptoOrderService:
             "rehearsal_mode": (
                 "controlled_provider_mock"
                 if live_crypto_order.environment == "sandbox" and provider_mock_mode_enabled(live_crypto_order.provider)
-                else ("coinbase_sandbox" if live_crypto_order.environment == "sandbox" else "production_live")
+                else (f"{live_crypto_order.provider}_sandbox" if live_crypto_order.environment == "sandbox" else "production_live")
             ),
             "safe_request_summary": _safe_request_summary(request_payload=_build_live_create_order_payload(live_order=live_crypto_order)),
             "submission_skipped": submission_skipped,
@@ -1275,7 +1309,7 @@ class LiveCryptoOrderService:
                 "rehearsal_mode": (
                     "controlled_provider_mock"
                     if live_crypto_order.environment == "sandbox" and provider_mock_mode_enabled(live_crypto_order.provider)
-                    else ("coinbase_sandbox" if live_crypto_order.environment == "sandbox" else "production_live")
+                    else (f"{live_crypto_order.provider}_sandbox" if live_crypto_order.environment == "sandbox" else "production_live")
                 ),
                 "approval_event_id": None if approval_event_id is None else str(approval_event_id),
                 "risk_event_id": None if risk_event_id is None else str(risk_event_id),

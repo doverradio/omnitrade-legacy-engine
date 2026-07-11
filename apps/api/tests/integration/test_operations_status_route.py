@@ -239,8 +239,8 @@ def test_operations_status_does_not_treat_sandbox_success_as_production_ready(mo
     async def _paper_equity_stub(*_args, **_kwargs):
         return Decimal("25")
 
-    async def _inspect_stub(*, db, exchange_environment, paper_account_id=None):
-        _ = db, paper_account_id
+    async def _inspect_stub(*, db, provider, exchange_environment, paper_account_id=None):
+        _ = db, provider, paper_account_id
         if exchange_environment == "production":
             return SimpleNamespace(
                 ready=False,
@@ -263,5 +263,5 @@ def test_operations_status_does_not_treat_sandbox_success_as_production_ready(mo
     assert response.status_code == 200
     payload = response.json()
     assert payload["live_crypto_readiness"]["ready"] is False
-    assert any(item["key"] == "sandbox_exchange_connection" and item["ready"] for item in payload["live_crypto_readiness"]["items"])
-    assert any(item["key"] == "production_account_status" and not item["ready"] for item in payload["live_crypto_readiness"]["items"])
+    assert any(item["key"].endswith("sandbox_exchange_connection") and item["ready"] for item in payload["live_crypto_readiness"]["items"])
+    assert any(item["key"].endswith("production_account_status") and not item["ready"] for item in payload["live_crypto_readiness"]["items"])

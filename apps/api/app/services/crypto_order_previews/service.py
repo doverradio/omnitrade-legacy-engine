@@ -41,6 +41,12 @@ SUPPORTED_SIDE = {"BUY", "SELL"}
 SUPPORTED_ORDER_TYPE = {"MARKET"}
 SUPPORTED_AMOUNT_CURRENCY = {"USD", "BTC"}
 REFERENCE_INTERVALS = ("1m", "5m", "15m", "1h", "1d")
+_PREVIEW_READY_CONNECTION_VERDICTS = {
+    "READY_FOR_PREVIEW",
+    "READY_FOR_DRY_RUN",
+    "READY_FOR_OPERATOR_REVIEW",
+    "INITIALIZED_BUT_UNFUNDED",
+}
 
 
 @dataclass(frozen=True, slots=True)
@@ -180,7 +186,7 @@ async def _load_exchange_connection(db: AsyncSession, exchange_connection_id: uu
 async def _load_asset_and_price(db: AsyncSession, product_id: str) -> tuple[Asset, Decimal, datetime]:
     normalized_product = product_id.strip().upper()
     if "-" not in normalized_product:
-        raise InvalidRequestError(message="product_id must be a Coinbase spot pair like BTC-USD", details={"product_id": product_id})
+        raise InvalidRequestError(message="product_id must be a normalized spot pair like BTC-USD", details={"product_id": product_id})
     base_symbol, quote_symbol = normalized_product.split("-", 1)
     if quote_symbol != "USD":
         raise InvalidRequestError(message="Only USD quote products are supported in v1", details={"product_id": product_id})
@@ -324,7 +330,7 @@ async def create_crypto_order_preview(
         )
     if connection.credentials_encrypted in {"", None}:
         raise InvalidRequestError(message="Exchange credentials are not configured", details={"exchange_connection_id": str(connection.exchange_connection_id)})
-    if connection.last_readiness_verdict != "READY_FOR_PREVIEW":
+    if connection.last_readiness_verdict not in _PREVIEW_READY_CONNECTION_VERDICTS:
         raise InvalidRequestError(
             message="Exchange connection is not ready for preview",
             details={"readiness_verdict": connection.last_readiness_verdict or "UNKNOWN"},
@@ -491,7 +497,7 @@ async def create_crypto_order_preview(
     await _record_audit(
         db=db,
         actor=actor,
-        action="crypto_order_preview_coinbase_requested",
+        action="crypto_order_preview_provider_requested",
         entity_id=record.crypto_order_preview_id,
         before_state={"status": "PREVIEW_REQUESTED"},
         after_state={"status": "PREVIEW_REQUESTED"},
@@ -525,8 +531,8 @@ async def create_crypto_order_preview(
     if not preview.success:
         record.status = "PREVIEW_FAILED"
         record.risk_verdict = "approved_for_preview"
-        record.risk_explanation = "Risk engine approved preview; Coinbase preview returned a failure."
-        record.failure_reason = preview.failure_reason or "coinbase_preview_failed"
+        record.risk_explanation = "Risk engine approved preview; provider preview returned a failure."
+        record.failure_reason = preview.failure_reason or "provider_preview_failed"
         await _record_audit(
             db=db,
             actor=actor,

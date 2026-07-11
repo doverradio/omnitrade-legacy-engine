@@ -470,7 +470,7 @@ async def test_dry_run_blocks_on_invalid_quote_amounts(
 @pytest.mark.parametrize(
     "case_name,credentials_valid,api_permissions,connection_delta,expected_reason",
     [
-        ("missing_coinbase_credentials", False, ["view", "trade"], timedelta(seconds=1), "coinbase credential evidence unavailable"),
+        ("missing_coinbase_credentials", False, ["view", "trade"], timedelta(seconds=1), "provider credential evidence unavailable"),
         ("missing_trade_permission", True, ["view"], timedelta(seconds=1), "trade permission missing"),
         ("exchange_connection_not_ready", True, ["view", "trade"], timedelta(seconds=60), "readiness evidence is stale"),
     ],

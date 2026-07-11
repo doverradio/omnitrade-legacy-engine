@@ -62,12 +62,12 @@ def _response(*, status: str = "DRY_RUN_READY", failure_reason: str | None = Non
     return SimpleNamespace(
         live_crypto_order=live_order,
         dry_run_status=status,
-        dry_run_message="Dry run blocked. No Coinbase order was submitted." if status != "DRY_RUN_READY" else "Dry run completed. No Coinbase order was submitted.",
+        dry_run_message="Dry run blocked. No provider order was submitted." if status != "DRY_RUN_READY" else "Dry run completed. No provider order was submitted.",
         safe_request_summary={"product_id": "BTC-USD"},
         provider_create_order_called=False,
         order_submitted=False,
         submission_skipped=True,
-        submission_skip_reason="Coinbase order submission intentionally skipped (LIVE_CRYPTO_ORDER_SUBMISSION_ENABLED=false, LIVE_CRYPTO_DRY_RUN_ENABLED=true)",
+        submission_skip_reason="Provider order submission intentionally skipped (LIVE_CRYPTO_ORDER_SUBMISSION_ENABLED=false, LIVE_CRYPTO_DRY_RUN_ENABLED=true)",
     )
 
 

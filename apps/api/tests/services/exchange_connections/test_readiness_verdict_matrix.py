@@ -68,3 +68,19 @@ def test_minimum_permission_and_product_evidence_ready_for_operator_review() -> 
         _check("product_btc_usd_available", "pass"),
     ]
     assert compute_verdict(checks) == "READY_FOR_OPERATOR_REVIEW"
+
+
+def test_observable_zero_usd_balance_is_initialized_but_unfunded() -> None:
+    checks = [
+        _check("credentials_stored", "pass"),
+        _check("api_reachable", "pass"),
+        _check("authentication_valid", "pass"),
+        _check("permissions_retrieved", "pass"),
+        _check("dangerous_permissions_detected", "pass"),
+        _check("trade_permission_present", "warn"),
+        _check("usd_balance_retrieved", "pass"),
+        _check("usd_balance_funded", "fail"),
+        _check("btc_balance_retrieved", "pass"),
+        _check("product_btc_usd_available", "pass"),
+    ]
+    assert compute_verdict(checks) == "INITIALIZED_BUT_UNFUNDED"

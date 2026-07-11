@@ -272,7 +272,8 @@ async def verify_dry_run_evidence(
         checks.append(
             ReviewCheck(
                 "rehearsal_mode_labeled",
-                str(safe_provider_response.get("rehearsal_mode", "")) in {"coinbase_sandbox", "controlled_provider_mock"},
+                str(safe_provider_response.get("rehearsal_mode", "")) == "controlled_provider_mock"
+                or str(safe_provider_response.get("rehearsal_mode", "")).endswith("_sandbox"),
                 f"rehearsal_mode={safe_provider_response.get('rehearsal_mode', 'missing')}",
             )
         )

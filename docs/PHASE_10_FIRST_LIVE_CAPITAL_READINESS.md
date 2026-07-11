@@ -469,6 +469,24 @@ Notes:
 - the initializer uses existing exchange credential encryption and audit workflows
 - rerunning `--apply` never overwrites an existing exchange connection; it only fills missing objects
 
+Kraken EP-3 production initialization uses the same entrypoint with explicit provider selection and no plaintext secret CLI arguments:
+
+```bash
+cd /home/eric/omnitrade-legacy-engine/apps/api && PYTHONPATH=. python3 -m scripts.initialize_live_crypto_environment \
+	--apply \
+	--provider kraken_spot \
+	--exchange-environment production \
+	--actor operator:human \
+	--paper-account-id 905a408c-7d8e-4fc7-ad3b-9ff637005d73
+```
+
+Kraken credential contract:
+
+- canonical names: `KRAKEN_API_KEY`, `KRAKEN_API_SECRET`
+- optional OTP/passphrase: `KRAKEN_OTP`
+- legacy aliases remain supported: `OT_KRAKEN_API_KEY`, `OT_KRAKEN_API_SECRET`, `OT_KRAKEN_OTP`
+- credentials may be loaded from `apps/api/.env` through `app/config.py` or from exported environment variables
+
 Explicit helper to generate a fresh preview (not automatic in apply mode):
 
 ```bash

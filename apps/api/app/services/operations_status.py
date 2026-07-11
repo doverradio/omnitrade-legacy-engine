@@ -22,6 +22,7 @@ from app.schemas.operations import (
     OperationalStatusResponse,
 )
 from app.services.data.ingestion_status import get_last_successful_ingestion_at
+from app.services.exchange_connections.providers.registry import list_registered_exchange_providers
 from app.services.live_crypto_environment import inspect_live_crypto_environment
 from app.services.paper.accounting import build_account_snapshot
 from app.services.research_agents.openai.registry import get_openai_research_agent
@@ -48,9 +49,10 @@ def compute_uptime(*, started_at: datetime, now: datetime | None = None) -> str:
     return f"{hours:02d}:{minutes:02d}:{seconds:02d}"
 
 
-async def _latest_dry_run_status(*, db: AsyncSession, environment: str) -> str | None:
+async def _latest_dry_run_status(*, db: AsyncSession, provider: str, environment: str) -> str | None:
     row = await db.scalar(
         select(LiveCryptoOrder)
+        .where(LiveCryptoOrder.provider == provider)
         .where(LiveCryptoOrder.environment == environment)
         .where(LiveCryptoOrder.status.in_(["DRY_RUN_READY", "DRY_RUN_BLOCKED"]))
         .order_by(LiveCryptoOrder.created_at.desc())
@@ -133,81 +135,66 @@ async def build_operations_status(*, db: AsyncSession) -> OperationalStatusRespo
         )
 
     try:
-        production_state = await inspect_live_crypto_environment(db=db, exchange_environment="production")
-        sandbox_state = await inspect_live_crypto_environment(db=db, exchange_environment="sandbox")
-        production_dry_run_status = await _latest_dry_run_status(db=db, environment="production")
-        sandbox_dry_run_status = await _latest_dry_run_status(db=db, environment="sandbox")
+        provider_states: list[tuple[str, str, object]] = []
+        for metadata in list_registered_exchange_providers():
+            provider_states.append((metadata.provider_key, "production", await inspect_live_crypto_environment(db=db, provider=metadata.provider_key, exchange_environment="production")))
+            provider_states.append((metadata.provider_key, "sandbox", await inspect_live_crypto_environment(db=db, provider=metadata.provider_key, exchange_environment="sandbox")))
 
         combined_items: list[LiveCryptoReadinessItemResponse] = []
-        combined_items.extend(
-            LiveCryptoReadinessItemResponse(
-                key=f"production_{item.key}",
-                label=f"Production {item.label}",
-                ready=item.ready,
-                detail=item.detail,
+        any_production_ready = False
+        for provider_key, environment, state in provider_states:
+            any_production_ready = any_production_ready or (environment == "production" and bool(state.ready))
+            combined_items.extend(
+                LiveCryptoReadinessItemResponse(
+                    key=f"{provider_key}_{environment}_{item.key}",
+                    label=f"{provider_key} {environment.title()} {item.label}",
+                    ready=item.ready,
+                    detail=item.detail,
+                )
+                for item in state.items
             )
-            for item in production_state.items
-        )
-        combined_items.extend(
-            LiveCryptoReadinessItemResponse(
-                key=f"sandbox_{item.key}",
-                label=f"Sandbox {item.label}",
-                ready=item.ready,
-                detail=item.detail,
-            )
-            for item in sandbox_state.items
-        )
-        combined_items.append(
-            LiveCryptoReadinessItemResponse(
-                key="production_account_status",
-                label="Production Account Status",
-                ready=production_state.exchange_connection_id is not None,
-                detail=(
-                    "Production Coinbase account connection detected"
-                    if production_state.exchange_connection_id is not None
-                    else "Production account unavailable or not initialized"
-                ),
-            )
-        )
-        combined_items.append(
-            LiveCryptoReadinessItemResponse(
-                key="sandbox_rehearsal_result",
-                label="Sandbox Rehearsal Result",
-                ready=sandbox_dry_run_status == "DRY_RUN_READY",
-                detail=(
-                    f"Latest sandbox/mock rehearsal result: {sandbox_dry_run_status}"
-                    if sandbox_dry_run_status is not None
-                    else "Sandbox/mock rehearsal not executed"
-                ),
-            )
-        )
-        combined_items.append(
-            LiveCryptoReadinessItemResponse(
-                key="production_dry_run_executed",
-                label="Production Dry Run Executed",
-                ready=production_dry_run_status == "DRY_RUN_READY",
-                detail=(
-                    f"Latest production dry run result: {production_dry_run_status}"
-                    if production_dry_run_status is not None
-                    else "Production dry run not executed"
-                ),
-            )
-        )
-        combined_items.append(
-            LiveCryptoReadinessItemResponse(
-                key="rehearsal_boundary",
-                label="Rehearsal Boundary",
-                ready=not (sandbox_state.ready and not production_state.ready),
-                detail=(
-                    "Sandbox initialized but production initialization/dry run still pending"
-                    if sandbox_state.ready and not production_state.ready
-                    else "Sandbox and production readiness boundary remains explicit"
-                ),
-            )
-        )
+            dry_run_status = await _latest_dry_run_status(db=db, provider=provider_key, environment=environment)
+            if environment == "production":
+                combined_items.append(
+                    LiveCryptoReadinessItemResponse(
+                        key=f"{provider_key}_production_account_status",
+                        label=f"{provider_key} Production Account Status",
+                        ready=state.exchange_connection_id is not None,
+                        detail=(
+                            f"{provider_key} production account connection detected"
+                            if state.exchange_connection_id is not None
+                            else f"{provider_key} production account unavailable or not initialized"
+                        ),
+                    )
+                )
+                combined_items.append(
+                    LiveCryptoReadinessItemResponse(
+                        key=f"{provider_key}_production_dry_run_executed",
+                        label=f"{provider_key} Production Dry Run Executed",
+                        ready=dry_run_status == "DRY_RUN_READY",
+                        detail=(
+                            f"Latest {provider_key} production dry run result: {dry_run_status}"
+                            if dry_run_status is not None
+                            else f"{provider_key} production dry run not executed"
+                        ),
+                    )
+                )
+            else:
+                combined_items.append(
+                    LiveCryptoReadinessItemResponse(
+                        key=f"{provider_key}_sandbox_rehearsal_result",
+                        label=f"{provider_key} Sandbox Rehearsal Result",
+                        ready=dry_run_status == "DRY_RUN_READY",
+                        detail=(
+                            f"Latest {provider_key} sandbox/mock rehearsal result: {dry_run_status}"
+                            if dry_run_status is not None
+                            else f"{provider_key} sandbox/mock rehearsal not executed"
+                        ),
+                    )
+                )
 
         live_crypto_readiness = LiveCryptoReadinessResponse(
-            ready=production_state.ready,
+            ready=any_production_ready,
             items=combined_items,
         )
     except Exception as exc:
@@ -230,7 +217,7 @@ async def build_operations_status(*, db: AsyncSession) -> OperationalStatusRespo
                 message="Live crypto dry-run prerequisites are incomplete",
             )
         )
-    if any(item.key == "sandbox_rehearsal_result" and item.ready for item in live_crypto_readiness.items):
+    if any(item.key.endswith("sandbox_rehearsal_result") and item.ready for item in live_crypto_readiness.items):
         alerts.append(
             OperationalAlertResponse(
                 code="sandbox_rehearsal_non_production",

@@ -2,7 +2,7 @@ from functools import lru_cache
 import json
 from decimal import Decimal
 
-from pydantic import Field, SecretStr
+from pydantic import AliasChoices, Field, SecretStr
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -22,6 +22,21 @@ class Settings(BaseSettings):
     alpaca_api_key_id: SecretStr | None = None
     alpaca_api_secret_key: SecretStr | None = None
     alpaca_base_url: str = "https://paper-api.alpaca.markets"
+    coinbase_api_key_name: SecretStr | None = Field(default=None, validation_alias="OT_COINBASE_API_KEY_NAME")
+    coinbase_private_key: SecretStr | None = Field(default=None, validation_alias="OT_COINBASE_PRIVATE_KEY")
+    coinbase_passphrase: SecretStr | None = Field(default=None, validation_alias="OT_COINBASE_PASSPHRASE")
+    kraken_api_key: SecretStr | None = Field(
+        default=None,
+        validation_alias=AliasChoices("KRAKEN_API_KEY", "OT_KRAKEN_API_KEY"),
+    )
+    kraken_api_secret: SecretStr | None = Field(
+        default=None,
+        validation_alias=AliasChoices("KRAKEN_API_SECRET", "OT_KRAKEN_API_SECRET"),
+    )
+    kraken_otp: SecretStr | None = Field(
+        default=None,
+        validation_alias=AliasChoices("KRAKEN_OTP", "OT_KRAKEN_OTP"),
+    )
     exchange_credentials_encryption_key: SecretStr | None = None
     crypto_preview_max_quote_size_usd: Decimal = Decimal("25")
     crypto_preview_default_quote_size_usd: Decimal = Decimal("5")

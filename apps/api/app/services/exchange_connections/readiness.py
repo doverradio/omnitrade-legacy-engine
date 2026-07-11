@@ -35,6 +35,7 @@ def compute_verdict(checks: list[ExchangeReadinessCheckResponse]) -> ExchangeRea
     account_restricted = by_code.get("account_restricted")
     product_available = by_code.get("product_btc_usd_available")
     usd_balance = by_code.get("usd_balance_retrieved")
+    usd_balance_funded = by_code.get("usd_balance_funded")
     btc_balance = by_code.get("btc_balance_retrieved")
 
     if credentials_stored and credentials_stored.status == "fail":
@@ -60,7 +61,10 @@ def compute_verdict(checks: list[ExchangeReadinessCheckResponse]) -> ExchangeRea
     if not balances_available:
         return "BALANCE_UNAVAILABLE"
 
-    if product_available and product_available.status == "pass" and trade_permission and trade_permission.status == "pass":
+    if usd_balance_funded is not None and usd_balance_funded.status == "fail":
+        return "INITIALIZED_BUT_UNFUNDED"
+
+    if product_available and product_available.status == "pass" and (trade_permission is None or trade_permission.status != "fail"):
         return "READY_FOR_OPERATOR_REVIEW"
 
     if auth_valid and auth_valid.status == "pass":
