@@ -234,11 +234,12 @@ async def test_provider_preview_uses_only_preview_endpoint(monkeypatch: pytest.M
         async def __aexit__(self, exc_type, exc, tb):
             return None
 
-        async def request(self, method, path, content=None, headers=None):
+        async def request(self, method, path, content=None, headers=None, params=None):
             captured["method"] = method
             captured["path"] = path
             captured["content"] = content
             captured["headers"] = headers
+            captured["params"] = params
             return _Response()
 
     monkeypatch.setattr("app.services.exchange_connections.providers.coinbase_advanced.httpx.AsyncClient", lambda **kwargs: _Client())

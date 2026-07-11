@@ -403,7 +403,7 @@ async def test_canonical_reconciliation_discovers_provider_order_and_persists_fi
         async def get_historical_order(self, **_kwargs):
             return {"order": {}}, {}
 
-    monkeypatch.setattr("app.services.live.accounting_reconciliation.CoinbaseAdvancedClient", _Provider)
+    monkeypatch.setattr("app.services.live.accounting_reconciliation.get_exchange_provider", lambda *_args, **_kwargs: _Provider())
 
     outcome = await reconcile_live_order_and_fills(
         db=session,
@@ -553,7 +553,7 @@ async def test_canonical_reconciliation_marks_unresolved_when_balance_materially
         async def get_historical_order(self, **_kwargs):
             return {"order": {}}, {}
 
-    monkeypatch.setattr("app.services.live.accounting_reconciliation.CoinbaseAdvancedClient", _Provider)
+    monkeypatch.setattr("app.services.live.accounting_reconciliation.get_exchange_provider", lambda *_args, **_kwargs: _Provider())
 
     outcome = await reconcile_live_order_and_fills(
         db=session,
@@ -663,7 +663,7 @@ async def test_canonical_reconciliation_accepts_tolerated_rounding_balance_diffe
         async def get_historical_order(self, **_kwargs):
             return {"order": {}}, {}
 
-    monkeypatch.setattr("app.services.live.accounting_reconciliation.CoinbaseAdvancedClient", _Provider)
+    monkeypatch.setattr("app.services.live.accounting_reconciliation.get_exchange_provider", lambda *_args, **_kwargs: _Provider())
 
     outcome = await reconcile_live_order_and_fills(
         db=session,
@@ -763,7 +763,7 @@ async def test_canonical_reconciliation_flags_campaign_correlation_mismatch(monk
         async def get_historical_order(self, **_kwargs):
             return {"order": {}}, {}
 
-    monkeypatch.setattr("app.services.live.accounting_reconciliation.CoinbaseAdvancedClient", _Provider)
+    monkeypatch.setattr("app.services.live.accounting_reconciliation.get_exchange_provider", lambda *_args, **_kwargs: _Provider())
 
     outcome = await reconcile_live_order_and_fills(
         db=session,
@@ -881,7 +881,7 @@ async def test_canonical_reconciliation_audit_failure_marks_unresolved_and_retry
                 }
             }, {}
 
-    monkeypatch.setattr("app.services.live.accounting_reconciliation.CoinbaseAdvancedClient", _Provider)
+    monkeypatch.setattr("app.services.live.accounting_reconciliation.get_exchange_provider", lambda *_args, **_kwargs: _Provider())
 
     call_count = {"audit": 0}
 
@@ -1012,7 +1012,7 @@ async def test_canonical_reconciliation_marks_unresolved_when_balance_observatio
         async def get_historical_order(self, **_kwargs):
             return {"order": {}}, {}
 
-    monkeypatch.setattr("app.services.live.accounting_reconciliation.CoinbaseAdvancedClient", _Provider)
+    monkeypatch.setattr("app.services.live.accounting_reconciliation.get_exchange_provider", lambda *_args, **_kwargs: _Provider())
 
     outcome = await reconcile_live_order_and_fills(
         db=session,
@@ -1122,7 +1122,7 @@ async def test_canonical_reconciliation_marks_unresolved_when_balance_missing(mo
         async def get_historical_order(self, **_kwargs):
             return {"order": {}}, {}
 
-    monkeypatch.setattr("app.services.live.accounting_reconciliation.CoinbaseAdvancedClient", _Provider)
+    monkeypatch.setattr("app.services.live.accounting_reconciliation.get_exchange_provider", lambda *_args, **_kwargs: _Provider())
 
     outcome = await reconcile_live_order_and_fills(
         db=session,
@@ -1260,7 +1260,7 @@ async def test_canonical_reconciliation_marks_mismatch_when_campaign_ids_conflic
         async def get_historical_order(self, **_kwargs):
             return {"order": {}}, {}
 
-    monkeypatch.setattr("app.services.live.accounting_reconciliation.CoinbaseAdvancedClient", _Provider)
+    monkeypatch.setattr("app.services.live.accounting_reconciliation.get_exchange_provider", lambda *_args, **_kwargs: _Provider())
 
     outcome = await reconcile_live_order_and_fills(
         db=session,
@@ -1371,7 +1371,7 @@ async def test_canonical_reconciliation_profit_cycle_consistency_for_buy_fill_is
         async def get_historical_order(self, **_kwargs):
             return {"order": {}}, {}
 
-    monkeypatch.setattr("app.services.live.accounting_reconciliation.CoinbaseAdvancedClient", _Provider)
+    monkeypatch.setattr("app.services.live.accounting_reconciliation.get_exchange_provider", lambda *_args, **_kwargs: _Provider())
 
     await reconcile_live_order_and_fills(
         db=session,

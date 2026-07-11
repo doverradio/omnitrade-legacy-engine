@@ -8,6 +8,10 @@ _APP_ROOT = Path(__file__).resolve().parents[2] / "app"
 _ALLOWED_CREATE_ORDER_CALLERS = {
     Path("services/live_crypto_orders.py"),
 }
+_ALLOWED_COINBASE_IMPORTERS = {
+    Path("services/exchange_connections/providers/registry.py"),
+    Path("services/exchange_connections/providers/coinbase_advanced.py"),
+}
 
 
 def _python_files() -> list[Path]:
@@ -53,6 +57,20 @@ def test_coinbase_create_order_has_single_sanctioned_application_boundary() -> N
             violations.append(str(relative))
 
     assert not violations, "Unexpected live order provider callers: " + ", ".join(sorted(violations))
+
+
+def test_generic_services_do_not_import_coinbase_client_directly() -> None:
+    violations: list[str] = []
+
+    for file_path in _python_files():
+        tree = ast.parse(file_path.read_text(), filename=str(file_path))
+        relative = file_path.relative_to(_APP_ROOT)
+        for node in ast.walk(tree):
+            if isinstance(node, ast.ImportFrom) and node.module == "app.services.exchange_connections.providers.coinbase_advanced":
+                if relative not in _ALLOWED_COINBASE_IMPORTERS:
+                    violations.append(str(relative))
+
+    assert not violations, "Direct Coinbase imports must stay inside provider adapter/registry: " + ", ".join(sorted(set(violations)))
 
 
 def test_live_create_order_boundary_has_no_retry_wrappers_and_reconciliation_has_no_create_order() -> None:
@@ -173,6 +191,34 @@ def test_dry_run_path_does_not_call_submission_or_capital_movement_symbols() -> 
     prefix_hits = {name for name in called_names if name.startswith(("withdraw", "transfer", "compound"))}
     violations = sorted(exact_hits.union(prefix_hits))
     assert not violations, "Dry-run autonomy boundary violation(s): " + ", ".join(violations)
+
+
+def test_provider_registry_cannot_enable_submission_flag() -> None:
+    registry_file = _APP_ROOT / "services" / "exchange_connections" / "providers" / "registry.py"
+    tree = ast.parse(registry_file.read_text(), filename=str(registry_file))
+
+    forbidden_targets: list[str] = []
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Assign):
+            for target in node.targets:
+                if isinstance(target, ast.Attribute) and target.attr == "live_crypto_order_submission_enabled":
+                    forbidden_targets.append("attribute_assign")
+                if isinstance(target, ast.Subscript):
+                    forbidden_targets.append("subscript_assign")
+
+    assert not forbidden_targets, "Provider registry must not mutate submission flags"
+
+
+def test_mission_control_and_venue_intelligence_cannot_call_create_order() -> None:
+    mission_control_file = _APP_ROOT / "services" / "mission_control_intelligence.py"
+    venue_doc_file = _APP_ROOT.parents[2] / "docs" / "VENUE_INTELLIGENCE_ENGINE.md"
+
+    mission_tree = ast.parse(mission_control_file.read_text(), filename=str(mission_control_file))
+    mission_calls = [node for node in ast.walk(mission_tree) if isinstance(node, ast.Call) and _is_create_order_call(node)]
+    assert not mission_calls, "Mission Control service must not call create_order"
+
+    venue_text = venue_doc_file.read_text().lower()
+    assert "create_order" not in venue_text, "Venue Intelligence docs must not define create_order execution paths"
 
 
 def test_safe_vps_entrypoint_cannot_call_create_order_or_mutate_environment_flags() -> None:

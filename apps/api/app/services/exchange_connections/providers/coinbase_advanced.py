@@ -14,13 +14,23 @@ from cryptography.hazmat.primitives import serialization
 
 from app.core.errors import InvalidRequestError, ServiceUnavailableError
 from app.services.exchange_connections.providers.base import (
+    ExchangeOrderSubmissionRequest,
+    ExchangeOrderSubmissionResult,
     ExchangeAccountSnapshot,
     ExchangeAuthResult,
     ExchangeBalanceItem,
     ExchangeBalanceSnapshot,
+    ExchangeProviderAmbiguousResponse,
+    ExchangeProviderFee,
+    ExchangeProviderFill,
+    ExchangeProviderHealth,
+    ExchangeProviderMetadata,
+    ExchangeProviderOrder,
+    ExchangeProviderRejection,
     ExchangeProductSnapshot,
     ExchangePreviewResult,
     ExchangePermissionSnapshot,
+    ProviderCapability,
 )
 
 JWT_EXP_SECONDS = 120
@@ -133,6 +143,23 @@ def _decimal_field(payload: dict[str, Any], *names: str) -> Decimal | None:
     return None
 
 
+def _provider_timestamp(payload: dict[str, Any]) -> datetime | None:
+    for key in ("completion_time", "last_fill_time", "created_time", "created_at"):
+        raw = payload.get(key)
+        if raw is None:
+            continue
+        if isinstance(raw, str):
+            text = raw.replace("Z", "+00:00")
+            try:
+                parsed = datetime.fromisoformat(text)
+                if parsed.tzinfo is None:
+                    return parsed.replace(tzinfo=timezone.utc)
+                return parsed.astimezone(timezone.utc)
+            except ValueError:
+                continue
+    return None
+
+
 def normalize_coinbase_preview_response(payload: dict[str, Any]) -> dict[str, Any]:
     normalized: dict[str, Any] = {}
     for key in (
@@ -230,9 +257,61 @@ def parse_coinbase_account_status(payload: dict[str, object]) -> str | None:
 
 class CoinbaseAdvancedClient:
     provider = "coinbase_advanced"
+    _metadata = ExchangeProviderMetadata(
+        provider_key="coinbase_advanced",
+        display_name="Coinbase Advanced",
+        supported_environments=("production", "sandbox"),
+        supported_asset_classes=("crypto",),
+        capabilities=(
+            "authentication",
+            "permissions",
+            "account_readiness",
+            "balance_read",
+            "product_lookup",
+            "price_evidence",
+            "preview_market_order",
+            "create_order",
+            "stable_client_order_id",
+            "order_lookup_provider_id",
+            "order_lookup_client_id",
+            "order_lookup_history",
+            "fill_lookup",
+            "fee_reporting",
+            "sandbox",
+            "controlled_mock",
+            "health_observability",
+        ),
+    )
 
     def __init__(self, *, timeout_seconds: float = 12.0) -> None:
         self.timeout_seconds = timeout_seconds
+        self._last_successful_call_at: datetime | None = None
+        self._last_error_classification: str | None = None
+        self._last_error_message: str | None = None
+
+    @property
+    def metadata(self) -> ExchangeProviderMetadata:
+        return self._metadata
+
+    def supports_capability(self, capability: ProviderCapability) -> bool:
+        return capability in self._metadata.capabilities
+
+    def mock_mode_enabled(self) -> bool:
+        return _sandbox_mock_mode_enabled()
+
+    async def current_health(self, *, environment: str) -> ExchangeProviderHealth:
+        capability_status = {capability: "supported" for capability in self._metadata.capabilities}
+        if environment not in self._metadata.supported_environments:
+            capability_status["environment"] = "unsupported"
+        return ExchangeProviderHealth(
+            provider_key=self._metadata.provider_key,
+            environment=environment,
+            last_successful_call_at=self._last_successful_call_at,
+            last_error_classification=self._last_error_classification,
+            last_error_message=self._last_error_message,
+            supports_latency=False,
+            capability_status=capability_status,
+        )
 
     async def test_authentication(self, *, credentials: dict[str, str], environment: str) -> ExchangeAuthResult:
         heartbeat_at = datetime.now(timezone.utc)
@@ -400,6 +479,179 @@ class CoinbaseAdvancedClient:
             extra_headers={"X-Idempotency-Key": idempotency_key},
         )
 
+    async def submit_order(
+        self,
+        *,
+        credentials: dict[str, str],
+        environment: str,
+        request: ExchangeOrderSubmissionRequest,
+    ) -> ExchangeOrderSubmissionResult:
+        try:
+            provider_response, safe_headers = await self.create_order(
+                credentials=credentials,
+                environment=environment,
+                request_payload=request.raw_payload,
+                idempotency_key=request.idempotency_key,
+            )
+        except InvalidRequestError as exc:
+            details = exc.details if isinstance(exc.details, dict) else {}
+            return ExchangeOrderSubmissionResult(
+                classification="rejected",
+                order=None,
+                rejection=ExchangeProviderRejection(
+                    code="provider_rejected",
+                    message=str(exc),
+                    retryable=False,
+                    provider_status=None,
+                    safe_details={"error": details, "message": str(exc)},
+                ),
+                ambiguous=None,
+                raw_response={},
+                safe_headers={},
+            )
+        except Exception as exc:
+            return ExchangeOrderSubmissionResult(
+                classification="ambiguous",
+                order=None,
+                rejection=None,
+                ambiguous=ExchangeProviderAmbiguousResponse(
+                    reason="provider_exception_before_classification",
+                    safe_details={"error_type": exc.__class__.__name__, "message": str(exc)},
+                ),
+                raw_response={},
+                safe_headers={},
+            )
+
+        order_payload = provider_response.get("order") if isinstance(provider_response.get("order"), dict) else {}
+        provider_order_id = order_payload.get("order_id") if isinstance(order_payload.get("order_id"), str) else None
+        provider_status = order_payload.get("status") if isinstance(order_payload.get("status"), str) else None
+        success = bool(provider_response.get("success", False))
+
+        order = ExchangeProviderOrder(
+            provider_order_id=provider_order_id,
+            client_order_id=order_payload.get("client_order_id") if isinstance(order_payload.get("client_order_id"), str) else request.client_order_id,
+            product_id=order_payload.get("product_id") if isinstance(order_payload.get("product_id"), str) else request.product_id,
+            side=order_payload.get("side") if isinstance(order_payload.get("side"), str) else request.side,
+            status=provider_status,
+            submitted_at=_provider_timestamp(order_payload),
+            acknowledged_at=_provider_timestamp(order_payload),
+            raw=order_payload,
+        )
+
+        if success and provider_order_id is not None:
+            return ExchangeOrderSubmissionResult(
+                classification="success",
+                order=order,
+                rejection=None,
+                ambiguous=None,
+                raw_response=provider_response,
+                safe_headers=safe_headers,
+            )
+
+        return ExchangeOrderSubmissionResult(
+            classification="ambiguous",
+            order=order,
+            rejection=None,
+            ambiguous=ExchangeProviderAmbiguousResponse(
+                reason="provider_response_ambiguous",
+                safe_details={"success": success, "provider_order_id": provider_order_id, "provider_status": provider_status},
+            ),
+            raw_response=provider_response,
+            safe_headers=safe_headers,
+        )
+
+    async def lookup_order(
+        self,
+        *,
+        credentials: dict[str, str],
+        environment: str,
+        provider_order_id: str | None,
+        client_order_id: str | None,
+        product_id: str | None,
+    ) -> ExchangeProviderOrder | None:
+        payload: dict[str, object] | None = None
+        if provider_order_id is not None:
+            order_payload, _headers = await self.get_historical_order(
+                credentials=credentials,
+                environment=environment,
+                order_id=provider_order_id,
+                client_order_id=client_order_id,
+            )
+            payload = order_payload.get("order") if isinstance(order_payload.get("order"), dict) else None
+        else:
+            list_payload, _headers = await self.list_historical_orders(
+                credentials=credentials,
+                environment=environment,
+                product_ids=None if product_id is None else [product_id],
+                order_status=["PENDING", "OPEN", "QUEUED", "CANCEL_QUEUED", "EDIT_QUEUED", "FILLED", "FAILED", "CANCELLED", "EXPIRED"],
+            )
+            rows = list_payload.get("orders") if isinstance(list_payload.get("orders"), list) else []
+            for item in rows:
+                if not isinstance(item, dict):
+                    continue
+                if client_order_id is not None and str(item.get("client_order_id", "")) != client_order_id:
+                    continue
+                if product_id is not None and str(item.get("product_id", "")) != product_id:
+                    continue
+                payload = item
+                break
+
+        if not isinstance(payload, dict):
+            return None
+
+        return ExchangeProviderOrder(
+            provider_order_id=payload.get("order_id") if isinstance(payload.get("order_id"), str) else provider_order_id,
+            client_order_id=payload.get("client_order_id") if isinstance(payload.get("client_order_id"), str) else client_order_id,
+            product_id=payload.get("product_id") if isinstance(payload.get("product_id"), str) else product_id,
+            side=payload.get("side") if isinstance(payload.get("side"), str) else None,
+            status=payload.get("status") if isinstance(payload.get("status"), str) else None,
+            submitted_at=_provider_timestamp(payload),
+            acknowledged_at=_provider_timestamp(payload),
+            raw=payload,
+        )
+
+    async def list_fills(
+        self,
+        *,
+        credentials: dict[str, str],
+        environment: str,
+        provider_order_id: str,
+    ) -> list[ExchangeProviderFill]:
+        payload, _headers = await self.list_historical_fills(
+            credentials=credentials,
+            environment=environment,
+            order_id=provider_order_id,
+        )
+        fills_payload = payload.get("fills") if isinstance(payload.get("fills"), list) else []
+        fills: list[ExchangeProviderFill] = []
+        for item in fills_payload:
+            if not isinstance(item, dict):
+                continue
+            size = _decimal_field(item, "size") or Decimal("0")
+            price = _decimal_field(item, "price") or Decimal("0")
+            if size <= Decimal("0") or price <= Decimal("0"):
+                continue
+            fee_amount = _decimal_field(item, "commission")
+            fee = None
+            if fee_amount is not None:
+                fee = ExchangeProviderFee(
+                    amount=fee_amount,
+                    currency=str(item.get("commission_currency") or "USD"),
+                )
+            fills.append(
+                ExchangeProviderFill(
+                    provider_fill_id=item.get("trade_id") if isinstance(item.get("trade_id"), str) else None,
+                    provider_order_id=item.get("order_id") if isinstance(item.get("order_id"), str) else provider_order_id,
+                    product_id=item.get("product_id") if isinstance(item.get("product_id"), str) else None,
+                    size=size,
+                    price=price,
+                    fee=fee,
+                    occurred_at=_provider_timestamp(item),
+                    raw=item,
+                )
+            )
+        return fills
+
     async def list_historical_orders(
         self,
         *,
@@ -514,12 +766,16 @@ class CoinbaseAdvancedClient:
             async with httpx.AsyncClient(base_url=base_url, timeout=self.timeout_seconds) as client:
                 response = await client.request(method, path, content=body, headers=headers, params=query_params)
         except httpx.HTTPError as exc:
+            self._last_error_classification = "network_error"
+            self._last_error_message = str(exc)
             raise ServiceUnavailableError(message="Coinbase API is unreachable", details={"provider": self.provider}) from exc
 
         if swallow_404 and response.status_code == 404:
             return {}, dict(response.headers)
 
         if response.status_code >= 400:
+            self._last_error_classification = "http_error"
+            self._last_error_message = f"status={response.status_code} path={path}"
             response_payload: dict[str, object] | None = None
             try:
                 parsed = response.json()
@@ -543,7 +799,13 @@ class CoinbaseAdvancedClient:
             raise InvalidRequestError(message="Coinbase API returned invalid JSON", details={"path": path}) from exc
 
         if not isinstance(payload, dict):
+            self._last_error_classification = "protocol_error"
+            self._last_error_message = "unexpected_payload"
             raise InvalidRequestError(message="Coinbase API returned unexpected payload", details={"path": path})
+
+        self._last_successful_call_at = datetime.now(timezone.utc)
+        self._last_error_classification = None
+        self._last_error_message = None
 
         return payload, dict(response.headers)
 

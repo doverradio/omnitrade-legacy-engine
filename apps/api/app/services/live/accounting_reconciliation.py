@@ -16,7 +16,10 @@ from app.models.live_execution_event import LiveExecutionEvent
 from app.models.live_crypto_order import LiveCryptoOrder
 from app.models.live_reconciliation_event import LiveReconciliationEvent
 from app.models.live_trading_profile import LiveTradingProfile
-from app.services.exchange_connections.providers.coinbase_advanced import CoinbaseAdvancedClient
+from app.services.exchange_connections.providers.registry import (
+    get_exchange_provider,
+    require_provider_capabilities,
+)
 from app.services.live.audit_compliance import record_live_audit_evidence
 from app.services.live.contracts import (
     LiveAuditEvidenceRequest,
@@ -277,112 +280,119 @@ async def reconcile_live_order_and_fills(
         profile=profile,
     )
 
-    from app.services.live_crypto_orders import _load_exchange_connection, _load_decrypted_credentials, _find_matching_orders
+    from app.services.live_crypto_orders import _load_exchange_connection, _load_decrypted_credentials
 
     connection = await _load_exchange_connection(db=db, exchange_connection_id=live_order.exchange_connection_id)
     credentials = _load_decrypted_credentials(connection)
-    provider = CoinbaseAdvancedClient()
+    require_provider_capabilities(
+        provider=live_order.provider,
+        operation="reconcile_live_order",
+        required=("order_lookup_history", "fill_lookup"),
+        environment=live_order.environment,
+    )
+    provider = get_exchange_provider(live_order.provider, environment=live_order.environment)
 
-    provider_order_payload: dict[str, object] | None = None
-    provider_headers: dict[str, str] = {}
-
-    if live_order.provider_order_id:
-        order_payload, provider_headers = await provider.get_historical_order(
+    if hasattr(provider, "lookup_order"):
+        provider_order = await provider.lookup_order(
             credentials=credentials,
             environment=live_order.environment,
-            order_id=live_order.provider_order_id,
-            client_order_id=live_order.client_order_id,
-        )
-        provider_order_payload = order_payload.get("order") if isinstance(order_payload.get("order"), dict) else None
-    else:
-        batch_payload, provider_headers = await provider.list_historical_orders(
-            credentials=credentials,
-            environment=live_order.environment,
-            product_ids=[live_order.product_id],
-            order_status=["PENDING", "OPEN", "QUEUED", "CANCEL_QUEUED", "EDIT_QUEUED", "FILLED", "FAILED", "CANCELLED", "EXPIRED"],
-        )
-        matches = _find_matching_orders(
-            payload=batch_payload,
+            provider_order_id=live_order.provider_order_id,
             client_order_id=live_order.client_order_id,
             product_id=live_order.product_id,
         )
-        if len(matches) > 1:
-            status = "conflict"
-            await record_live_order_reconciliation(
-                db=db,
-                request=LiveOrderReconciliationRequest(
-                    live_trading_profile_id=profile.id,
-                    source_execution_event_id=source_event.id,
-                    provider_name=live_order.provider,
-                    provider_order_id=None,
-                    client_order_id=live_order.client_order_id,
-                    reconciliation_status=status,
-                    live_crypto_order_id=live_order.live_crypto_order_id,
-                    capital_campaign_id=None if campaign is None else campaign.id,
-                    provider_recorded_at=None,
-                    requested_by=operator_identity,
-                    provenance_metadata={"match_count": len(matches), "reason": "provider_id_conflict"},
-                    idempotency_key=f"lco-reconcile:{live_order.live_crypto_order_id}:conflict",
-                ),
+    else:
+        payload: dict[str, object] | None = None
+        if live_order.provider_order_id:
+            order_payload, _headers = await provider.get_historical_order(
+                credentials=credentials,
+                environment=live_order.environment,
+                order_id=live_order.provider_order_id,
+                client_order_id=live_order.client_order_id,
             )
-            live_order.status = "RECONCILIATION_REQUIRED"
-            live_order.failure_code = "provider_order_lookup_conflict"
-            live_order.failure_reason = json.dumps({"match_count": len(matches)})
-            await db.flush()
-            return {"reconciliation_status": live_order.status, "provider_status": live_order.provider_status, "provider_order_id": live_order.provider_order_id, "provider_fill_observed": False, "safe_provider_response": _safe_json(batch_payload)}
-        if len(matches) == 0:
-            await record_live_order_reconciliation(
-                db=db,
-                request=LiveOrderReconciliationRequest(
-                    live_trading_profile_id=profile.id,
-                    source_execution_event_id=source_event.id,
-                    provider_name=live_order.provider,
-                    provider_order_id=None,
-                    client_order_id=live_order.client_order_id,
-                    reconciliation_status="reconciliation_required",
-                    live_crypto_order_id=live_order.live_crypto_order_id,
-                    capital_campaign_id=None if campaign is None else campaign.id,
-                    provider_recorded_at=None,
-                    requested_by=operator_identity,
-                    provenance_metadata={"reason": "provider_order_not_found"},
-                    idempotency_key=f"lco-reconcile:{live_order.live_crypto_order_id}:missing",
-                ),
+            payload = order_payload.get("order") if isinstance(order_payload.get("order"), dict) else None
+        else:
+            list_payload, _headers = await provider.list_historical_orders(
+                credentials=credentials,
+                environment=live_order.environment,
+                product_ids=[live_order.product_id],
+                order_status=["PENDING", "OPEN", "QUEUED", "CANCEL_QUEUED", "EDIT_QUEUED", "FILLED", "FAILED", "CANCELLED", "EXPIRED"],
             )
-            live_order.status = "RECONCILIATION_REQUIRED"
-            await db.flush()
-            return {"reconciliation_status": live_order.status, "provider_status": live_order.provider_status, "provider_order_id": live_order.provider_order_id, "provider_fill_observed": False, "safe_provider_response": _safe_json(batch_payload)}
+            rows = list_payload.get("orders") if isinstance(list_payload.get("orders"), list) else []
+            for item in rows:
+                if not isinstance(item, dict):
+                    continue
+                if str(item.get("client_order_id", "")) != live_order.client_order_id:
+                    continue
+                if str(item.get("product_id", "")) != live_order.product_id:
+                    continue
+                payload = item
+                break
+        provider_order = None
+        if isinstance(payload, dict):
+            from app.services.exchange_connections.providers.base import ExchangeProviderOrder
 
-        provider_order_payload = matches[0]
-        discovered_provider_order_id = provider_order_payload.get("order_id") if isinstance(provider_order_payload.get("order_id"), str) else None
-        if discovered_provider_order_id and live_order.provider_order_id and live_order.provider_order_id != discovered_provider_order_id:
-            await record_live_order_reconciliation(
-                db=db,
-                request=LiveOrderReconciliationRequest(
-                    live_trading_profile_id=profile.id,
-                    source_execution_event_id=source_event.id,
-                    provider_name=live_order.provider,
-                    provider_order_id=discovered_provider_order_id,
-                    client_order_id=live_order.client_order_id,
-                    reconciliation_status="conflict",
-                    live_crypto_order_id=live_order.live_crypto_order_id,
-                    capital_campaign_id=None if campaign is None else campaign.id,
-                    provider_recorded_at=_extract_provider_timestamp(payload=provider_order_payload),
-                    requested_by=operator_identity,
-                    provenance_metadata={"reason": "provider_order_id_conflict", "existing": live_order.provider_order_id, "new": discovered_provider_order_id},
-                    idempotency_key=f"lco-reconcile:{live_order.live_crypto_order_id}:provider-id-conflict",
-                ),
+            provider_order = ExchangeProviderOrder(
+                provider_order_id=payload.get("order_id") if isinstance(payload.get("order_id"), str) else live_order.provider_order_id,
+                client_order_id=payload.get("client_order_id") if isinstance(payload.get("client_order_id"), str) else live_order.client_order_id,
+                product_id=payload.get("product_id") if isinstance(payload.get("product_id"), str) else live_order.product_id,
+                side=payload.get("side") if isinstance(payload.get("side"), str) else None,
+                status=payload.get("status") if isinstance(payload.get("status"), str) else None,
+                submitted_at=_extract_provider_timestamp(payload=payload),
+                acknowledged_at=_extract_provider_timestamp(payload=payload),
+                raw=payload,
             )
-            live_order.status = "RECONCILIATION_REQUIRED"
-            live_order.failure_code = "provider_order_id_conflict"
-            live_order.failure_reason = json.dumps({"existing": live_order.provider_order_id, "new": discovered_provider_order_id})
-            await db.flush()
-            return {"reconciliation_status": live_order.status, "provider_status": live_order.provider_status, "provider_order_id": live_order.provider_order_id, "provider_fill_observed": False, "safe_provider_response": _safe_json(provider_order_payload)}
+    if provider_order is None:
+        await record_live_order_reconciliation(
+            db=db,
+            request=LiveOrderReconciliationRequest(
+                live_trading_profile_id=profile.id,
+                source_execution_event_id=source_event.id,
+                provider_name=live_order.provider,
+                provider_order_id=None,
+                client_order_id=live_order.client_order_id,
+                reconciliation_status="reconciliation_required",
+                live_crypto_order_id=live_order.live_crypto_order_id,
+                capital_campaign_id=None if campaign is None else campaign.id,
+                provider_recorded_at=None,
+                requested_by=operator_identity,
+                provenance_metadata={"reason": "provider_order_not_found"},
+                idempotency_key=f"lco-reconcile:{live_order.live_crypto_order_id}:missing",
+            ),
+        )
+        live_order.status = "RECONCILIATION_REQUIRED"
+        await db.flush()
+        return {"reconciliation_status": live_order.status, "provider_status": live_order.provider_status, "provider_order_id": live_order.provider_order_id, "provider_fill_observed": False, "safe_provider_response": {"reason": "provider_order_not_found"}}
 
-        live_order.provider_order_id = discovered_provider_order_id or live_order.provider_order_id
+    discovered_provider_order_id = provider_order.provider_order_id
+    if discovered_provider_order_id and live_order.provider_order_id and live_order.provider_order_id != discovered_provider_order_id:
+        await record_live_order_reconciliation(
+            db=db,
+            request=LiveOrderReconciliationRequest(
+                live_trading_profile_id=profile.id,
+                source_execution_event_id=source_event.id,
+                provider_name=live_order.provider,
+                provider_order_id=discovered_provider_order_id,
+                client_order_id=live_order.client_order_id,
+                reconciliation_status="conflict",
+                live_crypto_order_id=live_order.live_crypto_order_id,
+                capital_campaign_id=None if campaign is None else campaign.id,
+                provider_recorded_at=provider_order.submitted_at,
+                requested_by=operator_identity,
+                provenance_metadata={"reason": "provider_order_id_conflict", "existing": live_order.provider_order_id, "new": discovered_provider_order_id},
+                idempotency_key=f"lco-reconcile:{live_order.live_crypto_order_id}:provider-id-conflict",
+            ),
+        )
+        live_order.status = "RECONCILIATION_REQUIRED"
+        live_order.failure_code = "provider_order_id_conflict"
+        live_order.failure_reason = json.dumps({"existing": live_order.provider_order_id, "new": discovered_provider_order_id})
+        await db.flush()
+        return {"reconciliation_status": live_order.status, "provider_status": live_order.provider_status, "provider_order_id": live_order.provider_order_id, "provider_fill_observed": False, "safe_provider_response": _safe_json(provider_order.raw)}
 
-    provider_status_raw = None if provider_order_payload is None else provider_order_payload.get("status") if isinstance(provider_order_payload.get("status"), str) else None
+    live_order.provider_order_id = discovered_provider_order_id or live_order.provider_order_id
+
+    provider_status_raw = provider_order.status
     normalized_status = _normalize_provider_status(provider_status=provider_status_raw)
-    provider_recorded_at = _extract_provider_timestamp(payload=provider_order_payload or {})
+    provider_recorded_at = provider_order.submitted_at
 
     order_reconciliation = await record_live_order_reconciliation(
         db=db,
@@ -397,7 +407,7 @@ async def reconcile_live_order_and_fills(
             capital_campaign_id=None if campaign is None else campaign.id,
             provider_recorded_at=provider_recorded_at,
             requested_by=operator_identity,
-            provenance_metadata={"provider_status": provider_status_raw, "headers": provider_headers},
+            provenance_metadata={"provider_status": provider_status_raw, "source": "provider_contract_lookup"},
             idempotency_key=f"lco-reconcile:{live_order.live_crypto_order_id}:status:{normalized_status}:{provider_status_raw or 'none'}",
         ),
     )
@@ -405,26 +415,55 @@ async def reconcile_live_order_and_fills(
     fill_count = 0
     fill_events: list[dict[str, object]] = []
     if live_order.provider_order_id:
-        fills_payload, _fill_headers = await provider.list_historical_fills(
-            credentials=credentials,
-            environment=live_order.environment,
-            order_id=live_order.provider_order_id,
-        )
-        fills = fills_payload.get("fills") if isinstance(fills_payload.get("fills"), list) else []
+        if hasattr(provider, "list_fills"):
+            fills = await provider.list_fills(
+                credentials=credentials,
+                environment=live_order.environment,
+                provider_order_id=live_order.provider_order_id,
+            )
+        else:
+            fills_payload, _fill_headers = await provider.list_historical_fills(
+                credentials=credentials,
+                environment=live_order.environment,
+                order_id=live_order.provider_order_id,
+            )
+            rows = fills_payload.get("fills") if isinstance(fills_payload.get("fills"), list) else []
+            fills = []
+            from app.services.exchange_connections.providers.base import ExchangeProviderFee, ExchangeProviderFill
+
+            for item in rows:
+                if not isinstance(item, dict):
+                    continue
+                size = _decimal(item.get("size", "0"))
+                price = _decimal(item.get("price", "0"))
+                if size <= Decimal("0") or price <= Decimal("0"):
+                    continue
+                fee_amount = _decimal(item.get("commission", "0")) if item.get("commission") is not None else None
+                fee = None if fee_amount is None else ExchangeProviderFee(amount=fee_amount, currency=str(item.get("commission_currency") or "USD"))
+                fills.append(
+                    ExchangeProviderFill(
+                        provider_fill_id=item.get("trade_id") if isinstance(item.get("trade_id"), str) else None,
+                        provider_order_id=item.get("order_id") if isinstance(item.get("order_id"), str) else live_order.provider_order_id,
+                        product_id=item.get("product_id") if isinstance(item.get("product_id"), str) else live_order.product_id,
+                        size=size,
+                        price=price,
+                        fee=fee,
+                        occurred_at=_extract_provider_timestamp(payload=item),
+                        raw=item,
+                    )
+                )
         for index, fill in enumerate(fills):
-            if not isinstance(fill, dict):
-                continue
-            provider_fill_id = fill.get("trade_id") if isinstance(fill.get("trade_id"), str) else None
+            provider_fill_id = fill.provider_fill_id
             if provider_fill_id is None:
                 continue
-            size = _decimal(fill.get("size", "0"))
+            size = _decimal(fill.size)
             if size <= Decimal("0"):
                 continue
-            price = _decimal(fill.get("price", "0"))
-            fee = _decimal(fill.get("commission", "0"))
-            fee_currency = str(fill.get("commission_currency") or "USD")
+            price = _decimal(fill.price)
+            fee = _decimal("0") if fill.fee is None else _decimal(fill.fee.amount)
+            fee_currency = "USD" if fill.fee is None else str(fill.fee.currency)
             cumulative = size
-            fill_time = _extract_provider_timestamp(payload=fill)
+            fill_time = fill.occurred_at
 
             result = await record_live_fill_reconciliation(
                 db=db,

@@ -101,6 +101,10 @@ class _SubmitStateDb(_LiveOrderFakeDb):
         self.commits += 1
 
 
+def _provider_stub(**methods):
+    return SimpleNamespace(**methods)
+
+
 @pytest.mark.asyncio
 async def test_get_readiness_returns_closed_when_profile_missing(monkeypatch: pytest.MonkeyPatch) -> None:
     fake_db = _FakeDb()
@@ -215,7 +219,11 @@ async def test_submit_firewall_does_not_call_create_order_when_feature_flag_disa
         create_order_calls["count"] += 1
         raise AssertionError("Coinbase create_order must not be called when submission flag is disabled")
 
-    monkeypatch.setattr(service.CoinbaseAdvancedClient, "create_order", _count_create_order)
+    monkeypatch.setattr(
+        service,
+        "get_exchange_provider",
+        lambda *_args, **_kwargs: _provider_stub(create_order=_count_create_order),
+    )
 
     with pytest.raises(PermissionError, match="disabled"):
         await service.service.submit(
@@ -330,7 +338,11 @@ async def test_dry_run_never_calls_coinbase_create_order(monkeypatch: pytest.Mon
     async def _raise_if_called(*_args, **_kwargs):
         raise AssertionError("Coinbase Create Order must not be called during dry run")
 
-    monkeypatch.setattr(service.CoinbaseAdvancedClient, "create_order", _raise_if_called)
+    monkeypatch.setattr(
+        service,
+        "get_exchange_provider",
+        lambda *_args, **_kwargs: _provider_stub(create_order=_raise_if_called),
+    )
 
     response = await service.service.dry_run(
         db=fake_db,
@@ -1110,7 +1122,11 @@ async def test_second_submit_after_acknowledgement_returns_existing_result_witho
     async def _raise_if_called(*_args, **_kwargs):
         raise AssertionError("create_order must not be called for acknowledged orders")
 
-    monkeypatch.setattr(service.CoinbaseAdvancedClient, "create_order", _raise_if_called)
+    monkeypatch.setattr(
+        service,
+        "get_exchange_provider",
+        lambda *_args, **_kwargs: _provider_stub(create_order=_raise_if_called),
+    )
 
     response = await service.service.submit(
         db=db,
@@ -1144,7 +1160,11 @@ async def test_second_submit_during_reconciliation_required_blocks_without_provi
     async def _raise_if_called(*_args, **_kwargs):
         raise AssertionError("create_order must not be called during reconciliation-required state")
 
-    monkeypatch.setattr(service.CoinbaseAdvancedClient, "create_order", _raise_if_called)
+    monkeypatch.setattr(
+        service,
+        "get_exchange_provider",
+        lambda *_args, **_kwargs: _provider_stub(create_order=_raise_if_called),
+    )
 
     with pytest.raises(PermissionError, match="reconcile"):
         await service.service.submit(
@@ -1196,7 +1216,11 @@ async def test_explicit_provider_rejection_sets_rejected_without_blind_retry(mon
     async def _reject(*_args, **_kwargs):
         raise InvalidRequestError("Coinbase API request failed", details={"status_code": 400, "response": {"message": "rejected"}})
 
-    monkeypatch.setattr(service.CoinbaseAdvancedClient, "create_order", _reject)
+    monkeypatch.setattr(
+        service,
+        "get_exchange_provider",
+        lambda *_args, **_kwargs: _provider_stub(create_order=_reject),
+    )
 
     response = await service.service.submit(
         db=db,
@@ -1251,7 +1275,11 @@ async def test_transport_failure_after_submission_started_enters_reconciliation_
     async def _ambiguous(*_args, **_kwargs):
         raise ServiceUnavailableError("Coinbase API is unreachable", details={"provider": "coinbase_advanced"})
 
-    monkeypatch.setattr(service.CoinbaseAdvancedClient, "create_order", _ambiguous)
+    monkeypatch.setattr(
+        service,
+        "get_exchange_provider",
+        lambda *_args, **_kwargs: _provider_stub(create_order=_ambiguous),
+    )
 
     response = await service.service.submit(
         db=db,
@@ -1307,7 +1335,11 @@ async def test_submit_does_not_use_new_client_token_as_provider_identity(monkeyp
         seen["idempotency_key"] = kwargs["idempotency_key"]
         return {"success": True, "success_response": {"order_id": "provider-order-1", "status": "OPEN"}}, {"x-request-id": "1"}
 
-    monkeypatch.setattr(service.CoinbaseAdvancedClient, "create_order", _success)
+    monkeypatch.setattr(
+        service,
+        "get_exchange_provider",
+        lambda *_args, **_kwargs: _provider_stub(create_order=_success),
+    )
 
     response = await service.service.submit(
         db=db,
@@ -1355,8 +1387,10 @@ async def test_reconcile_can_discover_order_by_client_order_id_when_provider_ord
     async def _list_fills(*_args, **_kwargs):
         return {"fills": []}, {"x-request-id": "3"}
 
-    monkeypatch.setattr(service.CoinbaseAdvancedClient, "list_historical_orders", _list_orders)
-    monkeypatch.setattr(service.CoinbaseAdvancedClient, "list_historical_fills", _list_fills)
+    monkeypatch.setattr(
+        "app.services.live.accounting_reconciliation.get_exchange_provider",
+        lambda *_args, **_kwargs: _provider_stub(list_historical_orders=_list_orders, list_historical_fills=_list_fills),
+    )
 
     response = await service.service.reconcile(
         db=db,

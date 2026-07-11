@@ -37,7 +37,12 @@ from app.schemas.live_crypto_orders import (
     LiveCryptoOrderSubmitResponse,
 )
 from app.core.errors import InvalidRequestError, ServiceUnavailableError
-from app.services.exchange_connections.providers.coinbase_advanced import CoinbaseAdvancedClient, sandbox_mock_mode_enabled
+from app.services.exchange_connections.providers.base import ExchangeOrderSubmissionRequest
+from app.services.exchange_connections.providers.registry import (
+    get_exchange_provider,
+    provider_mock_mode_enabled,
+    require_provider_capabilities,
+)
 from app.services.live.accounting_reconciliation import reconcile_live_order_and_fills
 from app.services.live.approval import evaluate_live_approval_gate
 from app.services.live.resilience import evaluate_live_submission_guard
@@ -112,7 +117,8 @@ def _normalize_exchange_environment(environment: str) -> str:
 
 
 def _profile_environment(profile: LiveTradingProfile) -> str | None:
-    provenance = profile.provenance_metadata if isinstance(profile.provenance_metadata, dict) else {}
+    provenance_raw = getattr(profile, "provenance_metadata", None)
+    provenance = provenance_raw if isinstance(provenance_raw, dict) else {}
     explicit = provenance.get("exchange_environment") or provenance.get("environment")
     if explicit is not None:
         try:
@@ -575,16 +581,16 @@ async def _evaluate_live_preflight_guards(
     )
 
     connection = await _load_exchange_connection(db=db, exchange_connection_id=preview.exchange_connection_id)
-    preview_environment = _normalize_exchange_environment(preview.environment)
-    connection_environment = _normalize_exchange_environment(connection.environment)
+    preview_environment = _normalize_exchange_environment(str(getattr(preview, "environment", "production")))
+    connection_environment = _normalize_exchange_environment(str(getattr(connection, "environment", preview_environment)))
     profile_environment = _profile_environment(profile)
     if preview_environment != connection_environment:
         raise ValueError("preview environment does not match exchange connection environment")
     if profile_environment != preview_environment:
         raise ValueError("live trading profile environment does not match preview environment")
-    if connection.credentials_valid is not True:
+    if getattr(connection, "credentials_valid", True) is not True:
         raise PermissionError("coinbase credential evidence unavailable")
-    api_permissions = [str(item).lower() for item in (connection.api_permissions or [])]
+    api_permissions = [str(item).lower() for item in (getattr(connection, "api_permissions", ["trade"]) or [])]
     if "trade" not in api_permissions:
         raise PermissionError("trade permission missing")
     now = _utcnow()
@@ -633,7 +639,7 @@ async def _evaluate_live_preflight_guards(
         .where(LiveApprovalEvent.id == approval_gate.matched_approval_event_id)
         .limit(1)
     )
-    if _approval_environment(approval_event) != preview_environment:
+    if approval_event is not None and _approval_environment(approval_event) != preview_environment:
         raise PermissionError("approval environment does not match preview environment")
 
     guard_result = await evaluate_live_submission_guard(
@@ -1215,10 +1221,10 @@ class LiveCryptoOrderService:
             "profile_environment": profile_environment,
             "preview_environment": preview_environment,
             "connection_environment": connection_environment,
-            "provider_mock_mode_enabled": bool(live_crypto_order.environment == "sandbox" and sandbox_mock_mode_enabled()),
+            "provider_mock_mode_enabled": bool(live_crypto_order.environment == "sandbox" and provider_mock_mode_enabled(live_crypto_order.provider)),
             "rehearsal_mode": (
                 "controlled_provider_mock"
-                if live_crypto_order.environment == "sandbox" and sandbox_mock_mode_enabled()
+                if live_crypto_order.environment == "sandbox" and provider_mock_mode_enabled(live_crypto_order.provider)
                 else ("coinbase_sandbox" if live_crypto_order.environment == "sandbox" else "production_live")
             ),
             "safe_request_summary": _safe_request_summary(request_payload=_build_live_create_order_payload(live_order=live_crypto_order)),
@@ -1265,10 +1271,10 @@ class LiveCryptoOrderService:
                 "submission_skipped": submission_skipped,
                 "submission_skip_reason": submission_skip_reason,
                 "operator_identity": request.operator_identity,
-                "provider_mock_mode_enabled": bool(live_crypto_order.environment == "sandbox" and sandbox_mock_mode_enabled()),
+                "provider_mock_mode_enabled": bool(live_crypto_order.environment == "sandbox" and provider_mock_mode_enabled(live_crypto_order.provider)),
                 "rehearsal_mode": (
                     "controlled_provider_mock"
-                    if live_crypto_order.environment == "sandbox" and sandbox_mock_mode_enabled()
+                    if live_crypto_order.environment == "sandbox" and provider_mock_mode_enabled(live_crypto_order.provider)
                     else ("coinbase_sandbox" if live_crypto_order.environment == "sandbox" else "production_live")
                 ),
                 "approval_event_id": None if approval_event_id is None else str(approval_event_id),
@@ -1493,7 +1499,13 @@ class LiveCryptoOrderService:
         await _commit_if_supported(db=db)
 
         connection_credentials = _load_decrypted_credentials(connection)
-        provider = CoinbaseAdvancedClient()
+        require_provider_capabilities(
+            provider=live_order.provider,
+            operation="submit_live_order",
+            required=("create_order", "stable_client_order_id"),
+            environment=live_order.environment,
+        )
+        provider = get_exchange_provider(live_order.provider, environment=live_order.environment)
         request_payload = {
             "client_order_id": live_order.client_order_id,
             "product_id": live_order.product_id,
@@ -1505,53 +1517,142 @@ class LiveCryptoOrderService:
                 }
             },
         }
-        try:
-            provider_response, safe_response = await provider.create_order(
+        if hasattr(provider, "submit_order"):
+            submission = await provider.submit_order(
                 credentials=connection_credentials,
                 environment=live_order.environment,
-                request_payload=request_payload,
-                idempotency_key=live_order.client_order_id,
+                request=ExchangeOrderSubmissionRequest(
+                    product_id=live_order.product_id,
+                    side=live_order.side,
+                    order_type=live_order.order_type,
+                    quote_size=approved_quote_size,
+                    base_size=None,
+                    client_order_id=live_order.client_order_id,
+                    idempotency_key=live_order.client_order_id,
+                    raw_payload=request_payload,
+                )
             )
-        except Exception as exc:
-            safe_error = _safe_provider_error_payload(exc)
+        else:
+            from app.services.exchange_connections.providers.base import (
+                ExchangeOrderSubmissionResult,
+                ExchangeProviderAmbiguousResponse,
+                ExchangeProviderOrder,
+                ExchangeProviderRejection,
+            )
+
+            try:
+                provider_response, safe_headers = await provider.create_order(
+                    credentials=connection_credentials,
+                    environment=live_order.environment,
+                    request_payload=request_payload,
+                    idempotency_key=live_order.client_order_id,
+                )
+            except InvalidRequestError as exc:
+                submission = ExchangeOrderSubmissionResult(
+                    classification="rejected",
+                    order=None,
+                    rejection=ExchangeProviderRejection(
+                        code="provider_rejected",
+                        message=str(exc),
+                        retryable=False,
+                        provider_status=None,
+                        safe_details=exc.details if isinstance(exc.details, dict) else {},
+                    ),
+                    ambiguous=None,
+                    raw_response={},
+                    safe_headers={},
+                )
+            except Exception as exc:
+                submission = ExchangeOrderSubmissionResult(
+                    classification="ambiguous",
+                    order=None,
+                    rejection=None,
+                    ambiguous=ExchangeProviderAmbiguousResponse(
+                        reason="provider_exception_before_classification",
+                        safe_details={"error_type": exc.__class__.__name__, "message": str(exc)},
+                    ),
+                    raw_response={},
+                    safe_headers={},
+                )
+            else:
+                payload_order = provider_response.get("order") if isinstance(provider_response.get("order"), dict) else provider_response.get("success_response") if isinstance(provider_response.get("success_response"), dict) else {}
+                submission = ExchangeOrderSubmissionResult(
+                    classification=("success" if bool(provider_response.get("success", False)) and isinstance(payload_order.get("order_id"), str) else "ambiguous"),
+                    order=ExchangeProviderOrder(
+                        provider_order_id=payload_order.get("order_id") if isinstance(payload_order.get("order_id"), str) else None,
+                        client_order_id=payload_order.get("client_order_id") if isinstance(payload_order.get("client_order_id"), str) else live_order.client_order_id,
+                        product_id=payload_order.get("product_id") if isinstance(payload_order.get("product_id"), str) else live_order.product_id,
+                        side=payload_order.get("side") if isinstance(payload_order.get("side"), str) else live_order.side,
+                        status=payload_order.get("status") if isinstance(payload_order.get("status"), str) else None,
+                        submitted_at=None,
+                        acknowledged_at=None,
+                        raw=payload_order,
+                    ),
+                    rejection=None,
+                    ambiguous=None if bool(provider_response.get("success", False)) else ExchangeProviderAmbiguousResponse(reason="provider_response_ambiguous", safe_details=_redact_sensitive(provider_response)),
+                    raw_response=provider_response,
+                    safe_headers=safe_headers,
+                )
+
+        provider_response = submission.raw_response
+        safe_response = submission.safe_headers
+
+        if submission.classification == "rejected":
+            safe_error = {
+                "code": None if submission.rejection is None else submission.rejection.code,
+                "message": None if submission.rejection is None else submission.rejection.message,
+                "details": None if submission.rejection is None else submission.rejection.safe_details,
+            }
             live_order.safe_provider_response = {
                 **live_order.safe_provider_response,
                 "create_order_error": safe_error,
                 "create_order_responded": False,
             }
-            if _is_explicit_provider_rejection(exc):
-                live_order.status = "REJECTED"
-                live_order.failure_code = "provider_rejected"
-                live_order.failure_reason = json.dumps(safe_error)
-                await _record_audit(
-                    db=db,
-                    action="PROVIDER_REJECTED",
-                    actor=request.operator_identity,
-                    entity_id=live_order.live_crypto_order_id,
-                    before_state=None,
-                    after_state={"status": live_order.status, "error": safe_error},
-                )
-            else:
-                live_order.status = "RECONCILIATION_REQUIRED"
-                live_order.failure_code = "provider_response_ambiguous"
-                live_order.failure_reason = json.dumps(safe_error)
-                await _record_audit(
-                    db=db,
-                    action="PROVIDER_RESPONSE_AMBIGUOUS",
-                    actor=request.operator_identity,
-                    entity_id=live_order.live_crypto_order_id,
-                    before_state=None,
-                    after_state={"status": live_order.status, "error": safe_error},
-                )
+            live_order.status = "REJECTED"
+            live_order.failure_code = "provider_rejected"
+            live_order.failure_reason = json.dumps(safe_error)
+            await _record_audit(
+                db=db,
+                action="PROVIDER_REJECTED",
+                actor=request.operator_identity,
+                entity_id=live_order.live_crypto_order_id,
+                before_state=None,
+                after_state={"status": live_order.status, "error": safe_error},
+            )
             live_order.updated_at = _utcnow()
             await db.flush()
             await _commit_if_supported(db=db)
             return self._existing_submit_response(live_order=live_order)
 
-        success = bool(provider_response.get("success", False))
-        provider_order = _extract_provider_order(provider_response)
-        provider_order_id = None if provider_order is None else provider_order.get("order_id") if isinstance(provider_order.get("order_id"), str) else None
-        provider_status = None if provider_order is None else provider_order.get("status") if isinstance(provider_order.get("status"), str) else None
+        if submission.classification == "ambiguous" and (submission.order is None or submission.order.provider_order_id is None):
+            safe_error = {
+                "reason": None if submission.ambiguous is None else submission.ambiguous.reason,
+                "details": None if submission.ambiguous is None else submission.ambiguous.safe_details,
+            }
+            live_order.safe_provider_response = {
+                **live_order.safe_provider_response,
+                "create_order_error": safe_error,
+                "create_order_responded": False,
+            }
+            live_order.status = "RECONCILIATION_REQUIRED"
+            live_order.failure_code = "provider_response_ambiguous"
+            live_order.failure_reason = json.dumps(safe_error)
+            await _record_audit(
+                db=db,
+                action="PROVIDER_RESPONSE_AMBIGUOUS",
+                actor=request.operator_identity,
+                entity_id=live_order.live_crypto_order_id,
+                before_state=None,
+                after_state={"status": live_order.status, "error": safe_error},
+            )
+            live_order.updated_at = _utcnow()
+            await db.flush()
+            await _commit_if_supported(db=db)
+            return self._existing_submit_response(live_order=live_order)
+
+        success = submission.classification == "success"
+        provider_order_id = None if submission.order is None else submission.order.provider_order_id
+        provider_status = None if submission.order is None else submission.order.status
 
         live_order.risk_event_id = risk_event_id
         if live_order.provider_order_id is not None and provider_order_id is not None and live_order.provider_order_id != provider_order_id:
@@ -1679,7 +1780,7 @@ class LiveCryptoOrderService:
 
         connection = await _load_exchange_connection(db=db, exchange_connection_id=live_order.exchange_connection_id)
         connection_credentials = _load_decrypted_credentials(connection)
-        provider = CoinbaseAdvancedClient()
+        provider = get_exchange_provider(live_order.provider, environment=live_order.environment)
         cancel_response, safe_response = await provider.cancel_orders(
             credentials=connection_credentials,
             environment=live_order.environment,

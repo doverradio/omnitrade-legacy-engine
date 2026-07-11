@@ -831,3 +831,29 @@ Success is not defined as making a profit.
 Success is:
 
 > OmniTrade safely submitted, recorded, reconciled, explained, and accounted for exactly one tightly capped real-capital order under explicit human control, then returned itself to a disabled live-submission posture with complete evidence and no ambiguity about what occurred.
+
+---
+
+## EP-1 Execution Provider Layer Impact
+
+EP-1 introduced provider-contract and registry hardening without changing live-order safety behavior.
+
+Confirmed impact:
+
+- Coinbase behavior preserved for readiness, preview, submission, lookup, and reconciliation paths
+- generic submission and reconciliation orchestration now depend on provider contract methods rather than direct Coinbase client construction
+- capability gates are explicit and fail closed before provider-backed operations
+- architecture boundaries now assert single sanctioned create_order boundary and no generic Coinbase imports outside adapter/registry
+
+Not changed by EP-1:
+
+- live submission remains disabled unless explicitly enabled by controlled operator process
+- Risk Engine remains final authority
+- human approval remains mandatory
+- order cap remains $5
+- no automatic provider selection or failover
+
+Readiness interpretation:
+
+- provider abstraction reduces future multi-provider integration risk and shortens the next-provider implementation path
+- provider abstraction does not itself mark first live trade ready

@@ -27,9 +27,11 @@ from app.schemas.exchange_connections import (
 )
 from app.services.exchange_connections.crypto import decrypt_credential_payload, encrypt_credential_payload
 from app.services.exchange_connections.providers.base import ExchangeAuthResult
-from app.services.exchange_connections.providers.coinbase_advanced import CLOCK_SKEW_FAIL_SECONDS
 from app.services.exchange_connections.providers.registry import get_exchange_provider
 from app.services.exchange_connections.readiness import build_report, readiness_check
+
+
+_DEFAULT_CLOCK_SKEW_FAIL_SECONDS = 30
 
 
 def _mask_api_key(value: str) -> str:
@@ -671,7 +673,7 @@ async def _build_and_persist_readiness_for_auth_result(
         )
     )
 
-    clock_ok = auth_result.clock_skew_seconds is None or auth_result.clock_skew_seconds <= CLOCK_SKEW_FAIL_SECONDS
+    clock_ok = auth_result.clock_skew_seconds is None or auth_result.clock_skew_seconds <= _DEFAULT_CLOCK_SKEW_FAIL_SECONDS
     checks.append(
         readiness_check(
             code="clock_synchronized",

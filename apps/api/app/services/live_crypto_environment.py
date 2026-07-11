@@ -22,7 +22,7 @@ from app.schemas.crypto_order_previews import CryptoOrderPreviewCreateRequest
 from app.schemas.exchange_connections import SaveExchangeConnectionRequest
 from app.schemas.live_crypto_orders import LiveCryptoOrderDryRunRequest
 from app.services import live_crypto_orders as live_crypto_orders_service
-from app.services.exchange_connections.providers.coinbase_advanced import sandbox_mock_mode_enabled
+from app.services.exchange_connections.providers.registry import provider_mock_mode_enabled
 from app.services.assets_service import EnsureCoinbaseAssetRequest, ensure_coinbase_crypto_asset
 from app.services.capital_campaigns.service import create_capital_campaign
 from app.services.crypto_order_previews.service import create_crypto_order_preview
@@ -86,7 +86,7 @@ def _rehearsal_mode_for_environment(environment: str) -> str:
     normalized = _normalize_exchange_environment(environment)
     if normalized != "sandbox":
         return "production_live"
-    return "controlled_provider_mock" if sandbox_mock_mode_enabled() else "coinbase_sandbox"
+    return "controlled_provider_mock" if provider_mock_mode_enabled("coinbase_advanced") else "coinbase_sandbox"
 
 
 

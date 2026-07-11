@@ -215,7 +215,11 @@ async def test_safe_vps_dry_run_script_does_not_call_create_order(monkeypatch: p
         called["count"] += 1
         raise AssertionError("create_order must not be called by the safe VPS script")
 
-    monkeypatch.setattr(live_crypto_orders_service.CoinbaseAdvancedClient, "create_order", _raise_if_called)
+    monkeypatch.setattr(
+        live_crypto_orders_service,
+        "get_exchange_provider",
+        lambda *_args, **_kwargs: SimpleNamespace(create_order=_raise_if_called),
+    )
     monkeypatch.setattr(live_crypto_orders_service.service, "dry_run", lambda **_kwargs: _response(status="DRY_RUN_READY"))
 
     result = await script._run_dry_run(

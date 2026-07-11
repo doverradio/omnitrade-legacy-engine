@@ -31,7 +31,7 @@ from app.schemas.crypto_order_previews import (
 )
 from app.services.exchange_connections.service import get_decrypted_credentials_for_connection
 from app.services.exchange_connections.providers.base import ExchangeAuthResult, ExchangePreviewResult
-from app.services.exchange_connections.providers.registry import get_exchange_provider
+from app.services.exchange_connections.providers.registry import get_exchange_provider, require_provider_capabilities
 from app.services.risk.risk_context import RISK_POLICY_DEFAULTS
 from app.services.risk.risk_engine import RiskDecisionAction, RiskEvaluationContext, RiskEvaluationRequest, evaluate_signal_risk
 from app.services.risk.risk_monitor import get_risk_rules
@@ -311,8 +311,12 @@ async def create_crypto_order_preview(
 ) -> CryptoOrderPreviewResponse:
     settings = get_settings()
     connection = await _load_exchange_connection(db, request.exchange_connection_id)
-    if connection.provider != "coinbase_advanced":
-        raise InvalidRequestError(message="Only Coinbase Advanced is supported", details={"provider": connection.provider})
+    require_provider_capabilities(
+        provider=connection.provider,
+        operation="create_crypto_order_preview",
+        required=("preview_market_order", "balance_read", "product_lookup", "price_evidence"),
+        environment=connection.environment,
+    )
     if connection.environment != request.environment:
         raise InvalidRequestError(
             message="Requested environment does not match the verified exchange connection",
