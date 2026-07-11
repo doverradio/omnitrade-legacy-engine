@@ -623,6 +623,7 @@ async def _load_live_operation_annotations(
         dry_run_metadata: dict[str, object] = {}
         if action in {"DRY_RUN_READY", "DRY_RUN_BLOCKED"}:
             dry_run_metadata = {
+                "mode": str(after_state.get("mode", "dry_run")),
                 "submission_skipped": bool(after_state.get("submission_skipped", True)),
                 "submission_skip_reason": str(after_state.get("submission_skip_reason", "dry_run_submission_skipped")),
                 "approval_event_id": after_state.get("approval_event_id"),
@@ -630,11 +631,15 @@ async def _load_live_operation_annotations(
                 "approved_intent_fingerprint": after_state.get("approved_intent_fingerprint"),
                 "evidence_fingerprint": after_state.get("evidence_fingerprint"),
                 "readiness_age_seconds": after_state.get("readiness_age_seconds"),
+                "heartbeat_age_seconds": after_state.get("heartbeat_age_seconds"),
                 "balance_age_seconds": after_state.get("balance_age_seconds"),
                 "price_age_seconds": after_state.get("price_age_seconds"),
+                "readiness_result": after_state.get("readiness_result"),
+                "kill_switch_result": after_state.get("kill_switch_result"),
                 "requested_quote_size": after_state.get("requested_quote_size"),
                 "approved_quote_size": after_state.get("approved_quote_size"),
                 "max_order_usd": after_state.get("max_order_usd"),
+                "failure_reason": after_state.get("failure_reason"),
             }
         events.append(
             MissionControlIntelligenceTimelineEventResponse(

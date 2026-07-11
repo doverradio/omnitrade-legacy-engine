@@ -173,3 +173,28 @@ def test_dry_run_path_does_not_call_submission_or_capital_movement_symbols() -> 
     prefix_hits = {name for name in called_names if name.startswith(("withdraw", "transfer", "compound"))}
     violations = sorted(exact_hits.union(prefix_hits))
     assert not violations, "Dry-run autonomy boundary violation(s): " + ", ".join(violations)
+
+
+def test_safe_vps_entrypoint_cannot_call_create_order_or_mutate_environment_flags() -> None:
+    script_file = _APP_ROOT.parent / "scripts" / "run_live_crypto_dry_run.py"
+    tree = ast.parse(script_file.read_text(), filename=str(script_file))
+
+    called_names = {
+        name
+        for name in (_called_symbol_name(node) for node in ast.walk(tree) if isinstance(node, ast.Call))
+        if name is not None
+    }
+    assert "create_order" not in called_names, "Safe VPS script must not call create_order"
+
+    env_mutations: list[str] = []
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute):
+            if node.func.attr in {"setenv", "putenv"}:
+                env_mutations.append(node.func.attr)
+        if isinstance(node, ast.Assign):
+            for target in node.targets:
+                if isinstance(target, ast.Subscript) and isinstance(target.value, ast.Attribute):
+                    if isinstance(target.value.value, ast.Name) and target.value.value.id == "os" and target.value.attr == "environ":
+                        env_mutations.append("os.environ assignment")
+
+    assert not env_mutations, "Safe VPS script must not mutate environment flags: " + ", ".join(env_mutations)

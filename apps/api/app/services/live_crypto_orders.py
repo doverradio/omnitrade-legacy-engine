@@ -538,6 +538,11 @@ async def _evaluate_live_preflight_guards(
     )
 
     connection = await _load_exchange_connection(db=db, exchange_connection_id=preview.exchange_connection_id)
+    if connection.credentials_valid is not True:
+        raise PermissionError("coinbase credential evidence unavailable")
+    api_permissions = [str(item).lower() for item in (connection.api_permissions or [])]
+    if "trade" not in api_permissions:
+        raise PermissionError("trade permission missing")
     now = _utcnow()
     preview_age_seconds = _require_fresh_timestamp(
         label="preview",
@@ -548,6 +553,12 @@ async def _evaluate_live_preflight_guards(
     readiness_age_seconds = _require_fresh_timestamp(
         label="readiness",
         observed_at=connection.last_verified_at,
+        now=now,
+        max_age_seconds=settings.live_crypto_readiness_max_age_seconds,
+    )
+    heartbeat_age_seconds = _require_fresh_timestamp(
+        label="heartbeat",
+        observed_at=connection.last_heartbeat_at,
         now=now,
         max_age_seconds=settings.live_crypto_readiness_max_age_seconds,
     )
@@ -600,8 +611,11 @@ async def _evaluate_live_preflight_guards(
         "approval_event_id": approval_gate.matched_approval_event_id,
         "preview_age_seconds": preview_age_seconds,
         "readiness_age_seconds": readiness_age_seconds,
+        "heartbeat_age_seconds": heartbeat_age_seconds,
         "balance_age_seconds": balance_age_seconds,
         "price_age_seconds": price_age_seconds,
+        "readiness_result": "ready",
+        "kill_switch_result": "clear",
         "approved_intent_fingerprint": _build_intent_fingerprint(
             preview=preview,
             operator_identity=operator_identity,
@@ -642,6 +656,53 @@ async def _ensure_not_replayed(*, db: AsyncSession, replay_key: str) -> None:
     )
     if existing is not None:
         raise PermissionError("idempotency token replay detected")
+
+
+def _build_dry_run_response(*, live_order: LiveCryptoOrder) -> LiveCryptoOrderDryRunResponse:
+    safe_provider_response = live_order.safe_provider_response or {}
+    dry_run_errors = safe_provider_response.get("dry_run_errors") or []
+    return LiveCryptoOrderDryRunResponse(  # type: ignore[arg-type]
+        live_crypto_order=LiveCryptoOrderResponse(
+            live_crypto_order_id=live_order.live_crypto_order_id,
+            crypto_order_preview_id=live_order.crypto_order_preview_id,
+            exchange_connection_id=live_order.exchange_connection_id,
+            provider=live_order.provider,
+            environment=live_order.environment,
+            product_id=live_order.product_id,
+            side=live_order.side,
+            order_type=live_order.order_type,
+            requested_quote_size=live_order.requested_quote_size,
+            client_order_id=live_order.client_order_id,
+            status=live_order.status,
+            risk_event_id=live_order.risk_event_id,
+            decision_record_id=live_order.decision_record_id,
+            validation_run_id=live_order.validation_run_id,
+            provider_order_id=live_order.provider_order_id,
+            provider_status=live_order.provider_status,
+            submitted_at=live_order.submitted_at,
+            acknowledged_at=live_order.acknowledged_at,
+            filled_at=live_order.filled_at,
+            cancelled_at=live_order.cancelled_at,
+            failure_code=live_order.failure_code,
+            failure_reason=live_order.failure_reason,
+            safe_provider_response=safe_provider_response,
+            audit_correlation_id=live_order.audit_correlation_id,
+            operator_confirmation_id=live_order.operator_confirmation_id,
+            created_at=live_order.created_at,
+            updated_at=live_order.updated_at,
+        ),
+        dry_run_status=live_order.status,
+        dry_run_message=(
+            "Dry run completed. No Coinbase order was submitted."
+            if not dry_run_errors
+            else "Dry run blocked. No Coinbase order was submitted."
+        ),
+        safe_request_summary=safe_provider_response.get("safe_request_summary", {}),
+        provider_create_order_called=False,
+        order_submitted=False,
+        submission_skipped=bool(safe_provider_response.get("submission_skipped", True)),
+        submission_skip_reason=str(safe_provider_response.get("submission_skip_reason", "dry_run_submission_skipped")),
+    )
 
 
 class LiveCryptoOrderService:
@@ -1037,11 +1098,14 @@ class LiveCryptoOrderService:
             approved_quote_size = _quantize_usd(_decimal(preview.requested_amount))
             preview_age_seconds = _age_seconds(preview.created_at)
             readiness_age_seconds = None
+            heartbeat_age_seconds = None
             balance_age_seconds = None
             price_age_seconds = _age_seconds(preview.created_at)
             approval_event_id = None
             approved_intent_fingerprint = None
             evidence_fingerprint = None
+            readiness_result = "blocked"
+            kill_switch_result = "unknown"
 
         submission_skipped = True
         submission_skip_reason = (
@@ -1062,6 +1126,13 @@ class LiveCryptoOrderService:
                 idempotency_token=request.idempotency_token,
             ),
         )
+        if live_crypto_order.status in {"DRY_RUN_READY", "DRY_RUN_BLOCKED"} and bool((live_crypto_order.safe_provider_response or {}).get("dry_run", False)):
+            stored_safe = live_crypto_order.safe_provider_response or {}
+            if stored_safe.get("approved_intent_fingerprint") != approved_intent_fingerprint:
+                raise PermissionError("approved intent fingerprint mismatch")
+            if stored_safe.get("evidence_fingerprint") != evidence_fingerprint:
+                raise PermissionError("approval evidence fingerprint mismatch")
+            return _build_dry_run_response(live_order=live_crypto_order)
         live_crypto_order.requested_quote_size = approved_quote_size
         replay_key = _replay_key(
             action="dry_run",
@@ -1077,6 +1148,7 @@ class LiveCryptoOrderService:
         live_crypto_order.status = "DRY_RUN_BLOCKED" if preflight_errors else "DRY_RUN_READY"
         live_crypto_order.safe_provider_response = {
             **live_crypto_order.safe_provider_response,
+            "mode": "dry_run",
             "dry_run": True,
             "dry_run_status": live_crypto_order.status,
             "safe_request_summary": _safe_request_summary(request_payload=_build_live_create_order_payload(live_order=live_crypto_order)),
@@ -1086,8 +1158,11 @@ class LiveCryptoOrderService:
             "preview_id": str(preview.crypto_order_preview_id),
             "preview_age_seconds": preview_age_seconds,
             "readiness_age_seconds": readiness_age_seconds,
+            "heartbeat_age_seconds": locals().get("heartbeat_age_seconds"),
             "balance_age_seconds": balance_age_seconds,
             "price_age_seconds": price_age_seconds,
+            "readiness_result": locals().get("readiness_result", "ready"),
+            "kill_switch_result": locals().get("kill_switch_result", "clear"),
             "dry_run_errors": preflight_errors,
             "approval_event_id": None if approval_event_id is None else str(approval_event_id),
             "risk_event_id": None if risk_event_id is None else str(risk_event_id),
@@ -1100,7 +1175,10 @@ class LiveCryptoOrderService:
             "approved_quote_size": format(_quantize_usd(approved_quote_size), "f"),
             "max_order_usd": format(settings.live_crypto_max_order_usd, "f"),
             "execution_risk_verdict": risk_action.value,
+            "failure_reason": None if not preflight_errors else "; ".join(preflight_errors),
         }
+        live_crypto_order.failure_code = None if not preflight_errors else "dry_run_blocked"
+        live_crypto_order.failure_reason = None if not preflight_errors else "; ".join(preflight_errors)
         live_crypto_order.updated_at = _utcnow()
         await _record_audit(
             db=db,
@@ -1120,8 +1198,11 @@ class LiveCryptoOrderService:
                 "approved_intent_fingerprint": approved_intent_fingerprint,
                 "evidence_fingerprint": evidence_fingerprint,
                 "readiness_age_seconds": readiness_age_seconds,
+                "heartbeat_age_seconds": locals().get("heartbeat_age_seconds"),
                 "balance_age_seconds": balance_age_seconds,
                 "price_age_seconds": price_age_seconds,
+                "readiness_result": locals().get("readiness_result", "ready"),
+                "kill_switch_result": locals().get("kill_switch_result", "clear"),
                 "requested_quote_size": format(_quantize_usd(_decimal(preview.requested_amount)), "f"),
                 "approved_quote_size": format(_quantize_usd(approved_quote_size), "f"),
                 "max_order_usd": format(settings.live_crypto_max_order_usd, "f"),
@@ -1132,18 +1213,7 @@ class LiveCryptoOrderService:
         await _commit_if_supported(db=db)
 
         return LiveCryptoOrderDryRunResponse(
-            live_crypto_order=self._to_response(live_crypto_order),
-            dry_run_status=live_crypto_order.status,
-            dry_run_message=(
-                "Dry run completed. No Coinbase order was submitted."
-                if not preflight_errors
-                else "Dry run blocked. No Coinbase order was submitted."
-            ),
-            safe_request_summary=live_crypto_order.safe_provider_response["safe_request_summary"],
-            provider_create_order_called=False,
-            order_submitted=False,
-            submission_skipped=submission_skipped,
-            submission_skip_reason=submission_skip_reason,
+            **_build_dry_run_response(live_order=live_crypto_order).model_dump(),
         )
 
     async def submit(

@@ -322,6 +322,63 @@ Complete:
 
 All drills must produce operator-visible, auditable outcomes.
 
+### Safe VPS Dry Run Procedure
+
+Use this operator entrypoint for a production-equivalent Coinbase dry run while live submission remains disabled.
+
+Prerequisites:
+
+- `LIVE_CRYPTO_ORDER_SUBMISSION_ENABLED=false`
+- `LIVE_CRYPTO_DRY_RUN_ENABLED=true`
+- `LIVE_CRYPTO_PREPARATION_ENABLED=true`
+- `LIVE_CRYPTO_MAX_ORDER_USD=5`
+- fresh Coinbase readiness evidence already exists in the database
+- operator authentication is available
+
+Command:
+
+```bash
+cd /home/eric/omnitrade-legacy-engine/apps/api && PYTHONPATH=. python3 -m scripts.run_live_crypto_dry_run \
+	--live-trading-profile-id <profile_uuid> \
+	--crypto-order-preview-id <preview_uuid> \
+	--operator-identity operator:human \
+	--idempotency-token <unique_token>
+```
+
+Expected success output:
+
+- dry-run mode
+- submission skipped
+- local order ID
+- client order ID
+- operator identity
+- product
+- side
+- quote amount
+- approval event ID
+- RiskEvent ID
+- evidence-age summary
+- cap
+- final result status
+
+Expected blocked behavior:
+
+- the command exits nonzero when required evidence is missing, stale, future-dated, inconsistent, or unavailable
+- the command never enables live submission
+- the command never calls Coinbase create_order
+- the command never fabricates provider order IDs, acknowledgements, fills, or fees
+- the command never mutates Capital Ledger deployment, campaign capital, Profit Cycles, withdrawals, or compounding
+
+Verification:
+
+- check the persisted live-order record through the existing live crypto order API
+- check Mission Control intelligence for the dry-run annotation metadata
+- confirm `mode=dry_run`
+- confirm `submission_skipped=true`
+- confirm provider-order fields remain unavailable
+- confirm the approval and risk identifiers are surfaced in the read model
+- confirm the safe failure reason is visible when the run is blocked
+
 ---
 
 ## Workstream E — Controlled First Live Trade
