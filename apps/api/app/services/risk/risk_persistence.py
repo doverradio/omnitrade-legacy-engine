@@ -27,6 +27,7 @@ class RiskDecisionPersistenceRequest:
 
 @dataclass(frozen=True, slots=True)
 class RiskDecisionPersistenceResult:
+    risk_event_id: uuid.UUID
     risk_event_action: str
     risk_event_type: str
     risk_event_reason_code: str | None
@@ -124,6 +125,7 @@ async def _persist_risk_decision_without_begin(
     audit_written = False
 
     db.add(risk_event)
+    await db.flush()
 
     if request.state_change_action is not None:
         audit = AuditLog(
@@ -138,6 +140,7 @@ async def _persist_risk_decision_without_begin(
         audit_written = True
 
     return RiskDecisionPersistenceResult(
+        risk_event_id=risk_event.id,
         risk_event_action=action_taken,
         risk_event_type=event_type,
         risk_event_reason_code=result.reason_code,

@@ -99,7 +99,8 @@ async def test_get_readiness_returns_closed_when_profile_missing(monkeypatch: py
             live_crypto_dry_run_enabled=True,
             live_crypto_max_order_usd=service.Decimal("5"),
             live_crypto_preview_max_age_seconds=30,
-            live_crypto_balance_max_age_seconds=30,
+                live_crypto_preparation_enabled=True,
+                live_crypto_balance_max_age_seconds=30,
             live_crypto_readiness_max_age_seconds=60,
             live_crypto_price_max_age_seconds=30,
             live_crypto_confirmation_challenge_minutes=1,
@@ -125,7 +126,8 @@ async def test_prepare_confirmation_rejects_when_feature_flag_disabled(monkeypat
             live_crypto_order_submission_enabled=False,
             live_crypto_max_order_usd=service.Decimal("5"),
             live_crypto_preview_max_age_seconds=30,
-            live_crypto_balance_max_age_seconds=30,
+                live_crypto_preparation_enabled=True,
+                live_crypto_balance_max_age_seconds=30,
             live_crypto_readiness_max_age_seconds=60,
             live_crypto_price_max_age_seconds=30,
             live_crypto_confirmation_challenge_minutes=1,
@@ -155,7 +157,8 @@ async def test_submit_rejects_when_feature_flag_disabled(monkeypatch: pytest.Mon
             live_crypto_order_submission_enabled=False,
             live_crypto_max_order_usd=service.Decimal("5"),
             live_crypto_preview_max_age_seconds=30,
-            live_crypto_balance_max_age_seconds=30,
+                live_crypto_preparation_enabled=True,
+                live_crypto_balance_max_age_seconds=30,
             live_crypto_readiness_max_age_seconds=60,
             live_crypto_price_max_age_seconds=30,
             live_crypto_confirmation_challenge_minutes=1,
@@ -256,7 +259,8 @@ async def test_dry_run_never_calls_coinbase_create_order(monkeypatch: pytest.Mon
             live_crypto_dry_run_enabled=True,
             live_crypto_max_order_usd=service.Decimal("5"),
             live_crypto_preview_max_age_seconds=30,
-            live_crypto_balance_max_age_seconds=30,
+                live_crypto_preparation_enabled=True,
+                live_crypto_balance_max_age_seconds=30,
             live_crypto_readiness_max_age_seconds=60,
             live_crypto_price_max_age_seconds=30,
             live_crypto_confirmation_challenge_minutes=1,
@@ -371,6 +375,7 @@ async def test_prepare_confirmation_allows_preview_one_second_before_expiration(
     preview = SimpleNamespace(
         crypto_order_preview_id=uuid.uuid4(),
         live_trading_profile_id=profile.id,
+        exchange_connection_id=uuid.uuid4(),
         provider="coinbase_advanced",
         product_id="BTC-USD",
         side="BUY",
@@ -378,7 +383,14 @@ async def test_prepare_confirmation_allows_preview_one_second_before_expiration(
         requested_amount=service.Decimal("5.00"),
         created_at=now - timedelta(seconds=29),
     )
-    db = _LiveOrderFakeDb(profile=profile, preview=preview)
+    connection = SimpleNamespace(
+        exchange_connection_id=preview.exchange_connection_id,
+        last_verified_at=now - timedelta(seconds=1),
+        last_successful_sync_at=now - timedelta(seconds=1),
+        last_heartbeat_at=now - timedelta(seconds=1),
+        balances=[{"currency": "USD", "available": "10.00"}],
+    )
+    db = _LiveOrderFakeDb(profile=profile, preview=preview, connection=connection)
 
     monkeypatch.setattr(
         service,
@@ -388,7 +400,8 @@ async def test_prepare_confirmation_allows_preview_one_second_before_expiration(
             live_crypto_dry_run_enabled=True,
             live_crypto_max_order_usd=service.Decimal("5"),
             live_crypto_preview_max_age_seconds=30,
-            live_crypto_balance_max_age_seconds=30,
+                live_crypto_preparation_enabled=True,
+                live_crypto_balance_max_age_seconds=30,
             live_crypto_readiness_max_age_seconds=60,
             live_crypto_price_max_age_seconds=30,
             live_crypto_confirmation_challenge_minutes=1,
@@ -396,13 +409,16 @@ async def test_prepare_confirmation_allows_preview_one_second_before_expiration(
     )
     monkeypatch.setattr(service, "_utcnow", lambda: now)
     async def _approval_gate(**_kwargs):
-        return SimpleNamespace(approved=True, reason=None)
+        return SimpleNamespace(allowed=True, reason=None, matched_approval_event_id=uuid.uuid4())
 
     async def _submission_guard(**_kwargs):
         return SimpleNamespace(allowed=True, reason=None)
 
     async def _persist_risk_decision(**_kwargs):
         return SimpleNamespace(id=uuid.uuid4())
+
+    async def _risk_context(**_kwargs):
+        return None, service.RiskDecisionAction.APPROVE, service.Decimal("5.00"), uuid.uuid4()
 
     async def _get_or_create_live_order(*_args, **_kwargs):
         return SimpleNamespace(
@@ -439,6 +455,7 @@ async def test_prepare_confirmation_allows_preview_one_second_before_expiration(
     monkeypatch.setattr(service, "evaluate_live_submission_guard", _submission_guard)
     monkeypatch.setattr(service, "evaluate_signal_risk", lambda *_args, **_kwargs: SimpleNamespace(action=service.RiskDecisionAction.APPROVE))
     monkeypatch.setattr(service, "persist_risk_decision", _persist_risk_decision)
+    monkeypatch.setattr(service, "_build_real_risk_context", _risk_context)
     monkeypatch.setattr(service.LiveCryptoOrderService, "_get_or_create_live_order", _get_or_create_live_order)
 
     response = await service.service.prepare_confirmation(
@@ -461,6 +478,7 @@ async def test_prepare_confirmation_blocks_preview_at_exact_expiration(monkeypat
     preview = SimpleNamespace(
         crypto_order_preview_id=uuid.uuid4(),
         live_trading_profile_id=profile.id,
+        exchange_connection_id=uuid.uuid4(),
         provider="coinbase_advanced",
         product_id="BTC-USD",
         side="BUY",
@@ -468,7 +486,14 @@ async def test_prepare_confirmation_blocks_preview_at_exact_expiration(monkeypat
         requested_amount=service.Decimal("5.00"),
         created_at=now - timedelta(seconds=30),
     )
-    db = _LiveOrderFakeDb(profile=profile, preview=preview)
+    connection = SimpleNamespace(
+        exchange_connection_id=preview.exchange_connection_id,
+        last_verified_at=now - timedelta(seconds=1),
+        last_successful_sync_at=now - timedelta(seconds=1),
+        last_heartbeat_at=now - timedelta(seconds=1),
+        balances=[{"currency": "USD", "available": "10.00"}],
+    )
+    db = _LiveOrderFakeDb(profile=profile, preview=preview, connection=connection)
 
     monkeypatch.setattr(
         service,
@@ -478,7 +503,8 @@ async def test_prepare_confirmation_blocks_preview_at_exact_expiration(monkeypat
             live_crypto_dry_run_enabled=True,
             live_crypto_max_order_usd=service.Decimal("5"),
             live_crypto_preview_max_age_seconds=30,
-            live_crypto_balance_max_age_seconds=30,
+                live_crypto_preparation_enabled=True,
+                live_crypto_balance_max_age_seconds=30,
             live_crypto_readiness_max_age_seconds=60,
             live_crypto_price_max_age_seconds=30,
             live_crypto_confirmation_challenge_minutes=1,
@@ -486,7 +512,7 @@ async def test_prepare_confirmation_blocks_preview_at_exact_expiration(monkeypat
     )
     monkeypatch.setattr(service, "_utcnow", lambda: now)
 
-    with pytest.raises(ValueError, match="too old"):
+    with pytest.raises(PermissionError, match="stale"):
         await service.service.prepare_confirmation(
             db=db,
             request=LiveCryptoOrderPrepareRequest(
@@ -553,7 +579,8 @@ async def test_submit_rejects_unknown_state_without_resubmission(monkeypatch: py
             live_crypto_dry_run_enabled=True,
             live_crypto_max_order_usd=service.Decimal("5"),
             live_crypto_preview_max_age_seconds=30,
-            live_crypto_balance_max_age_seconds=30,
+                live_crypto_preparation_enabled=True,
+                live_crypto_balance_max_age_seconds=30,
             live_crypto_readiness_max_age_seconds=60,
             live_crypto_price_max_age_seconds=30,
             live_crypto_confirmation_challenge_minutes=1,
@@ -585,7 +612,8 @@ async def test_submit_rejects_replayed_idempotency_token(monkeypatch: pytest.Mon
             live_crypto_dry_run_enabled=True,
             live_crypto_max_order_usd=service.Decimal("5"),
             live_crypto_preview_max_age_seconds=30,
-            live_crypto_balance_max_age_seconds=30,
+                live_crypto_preparation_enabled=True,
+                live_crypto_balance_max_age_seconds=30,
             live_crypto_readiness_max_age_seconds=60,
             live_crypto_price_max_age_seconds=30,
             live_crypto_confirmation_challenge_minutes=1,
@@ -612,6 +640,7 @@ async def test_prepare_confirmation_reuses_existing_live_order_for_repeated_requ
     preview = SimpleNamespace(
         crypto_order_preview_id=uuid.uuid4(),
         live_trading_profile_id=profile.id,
+        exchange_connection_id=uuid.uuid4(),
         provider="coinbase_advanced",
         product_id="BTC-USD",
         side="BUY",
@@ -649,7 +678,14 @@ async def test_prepare_confirmation_reuses_existing_live_order_for_repeated_requ
         created_at=now,
         updated_at=now,
     )
-    db = _LiveOrderFakeDb(profile=profile, preview=preview, live_order=existing_live_order)
+    connection = SimpleNamespace(
+        exchange_connection_id=preview.exchange_connection_id,
+        last_verified_at=now - timedelta(seconds=1),
+        last_successful_sync_at=now - timedelta(seconds=1),
+        last_heartbeat_at=now - timedelta(seconds=1),
+        balances=[{"currency": "USD", "available": "10.00"}],
+    )
+    db = _LiveOrderFakeDb(profile=profile, preview=preview, live_order=existing_live_order, connection=connection)
 
     monkeypatch.setattr(
         service,
@@ -659,7 +695,8 @@ async def test_prepare_confirmation_reuses_existing_live_order_for_repeated_requ
             live_crypto_dry_run_enabled=True,
             live_crypto_max_order_usd=service.Decimal("5"),
             live_crypto_preview_max_age_seconds=30,
-            live_crypto_balance_max_age_seconds=30,
+                live_crypto_preparation_enabled=True,
+                live_crypto_balance_max_age_seconds=30,
             live_crypto_readiness_max_age_seconds=60,
             live_crypto_price_max_age_seconds=30,
             live_crypto_confirmation_challenge_minutes=1,
@@ -668,7 +705,7 @@ async def test_prepare_confirmation_reuses_existing_live_order_for_repeated_requ
     monkeypatch.setattr(service, "_utcnow", lambda: now)
 
     async def _approval_gate(**_kwargs):
-        return SimpleNamespace(approved=True, reason=None)
+        return SimpleNamespace(allowed=True, reason=None, matched_approval_event_id=uuid.uuid4())
 
     async def _submission_guard(**_kwargs):
         return SimpleNamespace(allowed=True, reason=None)
@@ -676,10 +713,14 @@ async def test_prepare_confirmation_reuses_existing_live_order_for_repeated_requ
     async def _persist_risk_decision(**_kwargs):
         return SimpleNamespace(id=uuid.uuid4())
 
+    async def _risk_context(**_kwargs):
+        return None, service.RiskDecisionAction.APPROVE, service.Decimal("5.00"), uuid.uuid4()
+
     monkeypatch.setattr(service, "evaluate_live_approval_gate", _approval_gate)
     monkeypatch.setattr(service, "evaluate_live_submission_guard", _submission_guard)
     monkeypatch.setattr(service, "evaluate_signal_risk", lambda *_args, **_kwargs: SimpleNamespace(action=service.RiskDecisionAction.APPROVE))
     monkeypatch.setattr(service, "persist_risk_decision", _persist_risk_decision)
+    monkeypatch.setattr(service, "_build_real_risk_context", _risk_context)
 
     response = await service.service.prepare_confirmation(
         db=db,

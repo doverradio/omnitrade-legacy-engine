@@ -7,6 +7,7 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.errors import InvalidRequestError
+from app.core.security import get_authorized_operator
 from app.db.session import get_db
 from app.models.live_approval_event import LiveApprovalEvent
 from app.models.live_reconciliation_event import LiveReconciliationEvent
@@ -195,6 +196,7 @@ async def read_live_approvals_status(
 @router.post("/approvals/checkpoints", response_model=LiveApprovalEventResponse)
 async def create_live_approval_checkpoint(
     payload: LiveApprovalCheckpointCreateRequest,
+    current_user: dict[str, str] = Depends(get_authorized_operator),
     db: AsyncSession = Depends(get_db),
 ) -> LiveApprovalEventResponse:
     result = await record_live_approval_checkpoint(
@@ -202,13 +204,13 @@ async def create_live_approval_checkpoint(
         request=LiveApprovalCheckpointRequest(
             live_trading_profile_id=payload.live_trading_profile_id,
             checkpoint_type=payload.checkpoint_type,
-            approver_id=payload.approver_id,
+            approver_id=current_user["id"],
             approver_role=payload.approver_role,
             rationale=payload.rationale,
             approval_scope=payload.approval_scope,
             expires_at=payload.expires_at,
             renewal_condition=payload.renewal_condition,
-            requested_by=payload.requested_by,
+            requested_by=current_user["id"],
             provenance_metadata=payload.provenance_metadata,
             idempotency_key=payload.idempotency_key,
         ),
@@ -229,6 +231,7 @@ async def create_live_approval_checkpoint(
 @router.post("/approvals/revoke", response_model=LiveApprovalEventResponse)
 async def revoke_live_approval_checkpoint(
     payload: LiveApprovalStateChangeCreateRequest,
+    current_user: dict[str, str] = Depends(get_authorized_operator),
     db: AsyncSession = Depends(get_db),
 ) -> LiveApprovalEventResponse:
     result = await revoke_live_approval(
@@ -236,11 +239,11 @@ async def revoke_live_approval_checkpoint(
         request=LiveApprovalStateChangeRequest(
             live_trading_profile_id=payload.live_trading_profile_id,
             checkpoint_type=payload.checkpoint_type,
-            approver_id=payload.approver_id,
+            approver_id=current_user["id"],
             approver_role=payload.approver_role,
             rationale=payload.rationale,
             approval_scope=payload.approval_scope,
-            requested_by=payload.requested_by,
+            requested_by=current_user["id"],
             provenance_metadata=payload.provenance_metadata,
             idempotency_key=payload.idempotency_key,
         ),
@@ -261,6 +264,7 @@ async def revoke_live_approval_checkpoint(
 @router.post("/approvals/suspend", response_model=LiveApprovalEventResponse)
 async def suspend_live_approval_checkpoint(
     payload: LiveApprovalStateChangeCreateRequest,
+    current_user: dict[str, str] = Depends(get_authorized_operator),
     db: AsyncSession = Depends(get_db),
 ) -> LiveApprovalEventResponse:
     result = await suspend_live_approval(
@@ -268,11 +272,11 @@ async def suspend_live_approval_checkpoint(
         request=LiveApprovalStateChangeRequest(
             live_trading_profile_id=payload.live_trading_profile_id,
             checkpoint_type=payload.checkpoint_type,
-            approver_id=payload.approver_id,
+            approver_id=current_user["id"],
             approver_role=payload.approver_role,
             rationale=payload.rationale,
             approval_scope=payload.approval_scope,
-            requested_by=payload.requested_by,
+            requested_by=current_user["id"],
             provenance_metadata=payload.provenance_metadata,
             idempotency_key=payload.idempotency_key,
         ),

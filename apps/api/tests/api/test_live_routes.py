@@ -210,3 +210,166 @@ def test_registration_status_requires_identifier() -> None:
     assert response.status_code == 400
     payload = response.json()
     assert payload["error"]["code"] == "invalid_request"
+
+
+def test_live_approval_checkpoint_requires_operator_auth(monkeypatch) -> None:
+    app = create_app()
+
+    async def _override_get_db():
+        yield _FakeSession()
+
+    from app.db.session import get_db
+
+    app.dependency_overrides[get_db] = _override_get_db
+
+    with TestClient(app) as client:
+        response = client.post(
+            "/live/approvals/checkpoints",
+            json={
+                "live_trading_profile_id": str(uuid.uuid4()),
+                "checkpoint_type": "first_live_enablement",
+                "approver_id": "forged:body",
+                "approver_role": "risk_owner",
+                "rationale": "approved",
+                "approval_scope": {"scope": ["x"]},
+                "requested_by": "forged:body",
+            },
+        )
+
+    assert response.status_code == 401
+    assert response.json()["error"]["code"] == "unauthorized"
+
+
+def test_live_approval_checkpoint_rejects_non_operator_token() -> None:
+    app = create_app()
+
+    async def _override_get_db():
+        yield _FakeSession()
+
+    from app.db.session import get_db
+
+    app.dependency_overrides[get_db] = _override_get_db
+
+    with TestClient(app) as client:
+        response = client.post(
+            "/live/approvals/checkpoints",
+            json={
+                "live_trading_profile_id": str(uuid.uuid4()),
+                "checkpoint_type": "first_live_enablement",
+                "approver_id": "forged:body",
+                "approver_role": "risk_owner",
+                "rationale": "approved",
+                "approval_scope": {"scope": ["x"]},
+                "requested_by": "forged:body",
+            },
+            headers={"Authorization": "Bearer service:automation"},
+        )
+
+    assert response.status_code == 403
+    assert response.json()["error"]["code"] == "forbidden"
+
+
+def test_live_approval_checkpoint_uses_authenticated_actor_identity(monkeypatch) -> None:
+    app = create_app()
+    captured = {}
+
+    async def _override_get_db():
+        yield _FakeSession()
+
+    async def _record_stub(*, db, request):
+        _ = db
+        captured["approver_id"] = request.approver_id
+        captured["requested_by"] = request.requested_by
+        captured["approver_role"] = request.approver_role
+        return type(
+            "ApprovalResult",
+            (),
+            {
+                "approval_event_id": uuid.uuid4(),
+                "live_trading_profile_id": request.live_trading_profile_id,
+                "checkpoint_type": request.checkpoint_type,
+                "approval_state": "approved",
+                "lifecycle_state": "enabled",
+                "operating_mode": "live",
+                "expires_at": None,
+                "renewal_condition": None,
+                "idempotency_key": request.idempotency_key or "approval-key",
+            },
+        )()
+
+    from app.db.session import get_db
+
+    app.dependency_overrides[get_db] = _override_get_db
+    monkeypatch.setattr("app.api.routes.live.record_live_approval_checkpoint", _record_stub)
+
+    with TestClient(app) as client:
+        response = client.post(
+            "/live/approvals/checkpoints",
+            json={
+                "live_trading_profile_id": str(uuid.uuid4()),
+                "checkpoint_type": "first_live_enablement",
+                "approver_id": "forged:body",
+                "approver_role": "risk_owner",
+                "rationale": "approved",
+                "approval_scope": {"scope": ["x"]},
+                "requested_by": "forged:body",
+            },
+            headers={"Authorization": "Bearer operator:human"},
+        )
+
+    assert response.status_code == 200
+    assert captured["approver_id"] == "operator:human"
+    assert captured["requested_by"] == "operator:human"
+    assert captured["approver_role"] == "risk_owner"
+
+
+def test_live_approval_revoke_uses_authenticated_actor_identity(monkeypatch) -> None:
+    app = create_app()
+    captured = {}
+
+    async def _override_get_db():
+        yield _FakeSession()
+
+    async def _revoke_stub(*, db, request):
+        _ = db
+        captured["approver_id"] = request.approver_id
+        captured["requested_by"] = request.requested_by
+        return type(
+            "ApprovalResult",
+            (),
+            {
+                "approval_event_id": uuid.uuid4(),
+                "live_trading_profile_id": request.live_trading_profile_id,
+                "checkpoint_type": request.checkpoint_type,
+                "approval_state": "revoked",
+                "lifecycle_state": "suspended",
+                "operating_mode": "paper",
+                "expires_at": None,
+                "renewal_condition": None,
+                "idempotency_key": request.idempotency_key or "approval-key",
+            },
+        )()
+
+    from app.db.session import get_db
+
+    app.dependency_overrides[get_db] = _override_get_db
+    monkeypatch.setattr("app.api.routes.live.revoke_live_approval", _revoke_stub)
+
+    with TestClient(app) as client:
+        response = client.post(
+            "/live/approvals/revoke",
+            json={
+                "live_trading_profile_id": str(uuid.uuid4()),
+                "checkpoint_type": "first_live_enablement",
+                "approver_id": "forged:body",
+                "approver_role": "risk_owner",
+                "rationale": "revoke",
+                "approval_scope": {"scope": ["x"]},
+                "requested_by": "forged:body",
+            },
+            headers={"Authorization": "Bearer operator:human"},
+        )
+
+    assert response.status_code == 200
+    assert captured["approver_id"] == "operator:human"
+    assert captured["requested_by"] == "operator:human"

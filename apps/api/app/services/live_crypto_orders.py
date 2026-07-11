@@ -11,12 +11,16 @@ from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import get_settings
+from app.models.asset import Asset
+from app.models.capital_campaign import CapitalCampaign
 from app.models.crypto_order_preview import CryptoOrderPreview
 from app.models.exchange_connection import ExchangeConnection
 from app.models.audit_log import AuditLog
 from app.models.live_crypto_order import LiveCryptoOrder
 from app.models.live_trading_event import LiveTradingEvent
 from app.models.live_trading_profile import LiveTradingProfile
+from app.models.paper_account import PaperAccount
+from app.models.risk_kill_switch import RiskKillSwitch
 from app.models.risk_event import RiskEvent
 from app.schemas.live_crypto_orders import (
     LiveCryptoOrderCancelRequest,
@@ -34,11 +38,13 @@ from app.schemas.live_crypto_orders import (
 from app.services.exchange_connections.providers.coinbase_advanced import CoinbaseAdvancedClient
 from app.services.live.approval import evaluate_live_approval_gate
 from app.services.live.resilience import evaluate_live_submission_guard
+from app.services.risk.risk_monitor import get_risk_rules
 from app.services.risk.risk_engine import RiskDecisionAction, RiskEvaluationContext, RiskEvaluationRequest, evaluate_signal_risk
 from app.services.risk.risk_persistence import RiskDecisionPersistenceRequest, persist_risk_decision
 
 
 CONFIRMATION_PHRASE = "BUY BTC"
+_USD_SCALE = Decimal("0.01")
 
 
 def _utcnow() -> datetime:
@@ -92,6 +98,269 @@ def _decimal(value: Any) -> Decimal:
 
 def _quantize_usd(value: Decimal) -> Decimal:
     return value.quantize(Decimal("0.01"), rounding=ROUND_DOWN)
+
+
+async def _commit_if_supported(*, db: AsyncSession) -> None:
+    if hasattr(db, "commit"):
+        await db.commit()
+
+
+def _precision_scale(value: Decimal) -> int:
+    exponent = value.as_tuple().exponent
+    return 0 if exponent >= 0 else -exponent
+
+
+def _validate_quote_size(*, requested_quote_size: Decimal, max_order_usd: Decimal) -> Decimal:
+    if requested_quote_size <= Decimal("0"):
+        raise ValueError("quote size must be greater than zero")
+    if _precision_scale(requested_quote_size) > 2:
+        raise ValueError("quote size exceeds supported USD precision")
+    normalized = _quantize_usd(requested_quote_size)
+    if normalized != requested_quote_size:
+        raise ValueError("quote size must match provider-supported USD precision")
+    if normalized > max_order_usd:
+        raise ValueError("quote size exceeds live order size limit")
+    return normalized
+
+
+def _extract_usd_available_balance(connection: ExchangeConnection) -> Decimal:
+    for item in connection.balances or []:
+        if str(item.get("currency", "")).upper() != "USD":
+            continue
+        value = _decimal(item.get("available", "0"))
+        if value < Decimal("0"):
+            raise ValueError("USD balance evidence is invalid")
+        return value
+    raise ValueError("USD balance evidence missing")
+
+
+async def _load_paper_account(*, db: AsyncSession, paper_account_id: uuid.UUID) -> PaperAccount:
+    account = await db.scalar(select(PaperAccount).where(PaperAccount.id == paper_account_id).limit(1))
+    if account is None:
+        raise LookupError("paper account not found for live profile")
+    return account
+
+
+async def _load_asset_for_product(*, db: AsyncSession, product_id: str) -> Asset:
+    normalized = product_id.strip().upper()
+    if "-" not in normalized:
+        raise ValueError("product_id must be a spot pair like BTC-USD")
+    base_symbol, quote_symbol = normalized.split("-", 1)
+    if quote_symbol != "USD":
+        raise ValueError("only USD quote products are supported")
+
+    asset = await db.scalar(
+        select(Asset)
+        .where(Asset.symbol == base_symbol)
+        .where(Asset.asset_class == "crypto")
+        .where(Asset.is_active.is_(True))
+        .order_by(Asset.created_at.desc())
+        .limit(1)
+    )
+    if asset is None:
+        raise LookupError("active asset not found for live product")
+    return asset
+
+
+async def _load_active_campaign_for_account(*, db: AsyncSession, paper_account_id: uuid.UUID) -> CapitalCampaign | None:
+    return await db.scalar(
+        select(CapitalCampaign)
+        .where(CapitalCampaign.paper_account_id == paper_account_id)
+        .order_by(CapitalCampaign.updated_at.desc(), CapitalCampaign.id.desc())
+        .limit(1)
+    )
+
+
+async def _load_kill_switch_state(*, db: AsyncSession, scope: str, account_id: uuid.UUID | None) -> RiskKillSwitch:
+    switch = await db.scalar(
+        select(RiskKillSwitch)
+        .where(RiskKillSwitch.scope == scope)
+        .where(RiskKillSwitch.paper_account_id == account_id)
+        .limit(1)
+    )
+    if switch is None:
+        raise PermissionError(f"{scope} kill switch state unavailable")
+    return switch
+
+
+def _resolve_reference_price(*, preview: CryptoOrderPreview) -> Decimal:
+    for candidate in (
+        preview.estimated_average_price,
+        preview.best_ask,
+        preview.best_bid,
+    ):
+        if candidate is not None and _decimal(candidate) > Decimal("0"):
+            return _decimal(candidate)
+
+    if preview.estimated_total_value is not None and preview.estimated_base_size is not None:
+        base_size = _decimal(preview.estimated_base_size)
+        if base_size > Decimal("0"):
+            return _decimal(preview.estimated_total_value) / base_size
+
+    raise ValueError("price evidence unavailable for live submission")
+
+
+def _require_fresh_timestamp(*, label: str, observed_at: datetime | None, now: datetime, max_age_seconds: int) -> int:
+    if observed_at is None:
+        raise PermissionError(f"{label} timestamp missing")
+    observed_utc = observed_at.astimezone(timezone.utc)
+    if observed_utc > now:
+        raise PermissionError(f"{label} timestamp is in the future")
+    age_seconds = int((now - observed_utc).total_seconds())
+    if age_seconds >= max_age_seconds:
+        raise PermissionError(f"{label} evidence is stale")
+    return age_seconds
+
+
+def _build_intent_fingerprint(
+    *,
+    preview: CryptoOrderPreview,
+    operator_identity: str,
+    requested_quote_size: Decimal,
+    approval_event_id: uuid.UUID,
+) -> str:
+    return _hash_payload(
+        {
+            "preview_id": str(preview.crypto_order_preview_id),
+            "operator_identity": operator_identity,
+            "approval_event_id": str(approval_event_id),
+            "product_id": preview.product_id,
+            "side": preview.side,
+            "order_type": preview.order_type,
+            "requested_quote_size": format(requested_quote_size, "f"),
+        }
+    )
+
+
+def _build_evidence_fingerprint(*, preview: CryptoOrderPreview, connection: ExchangeConnection) -> str:
+    return _hash_payload(
+        {
+            "preview_id": str(preview.crypto_order_preview_id),
+            "preview_created_at": preview.created_at.isoformat(),
+            "readiness_verified_at": None if connection.last_verified_at is None else connection.last_verified_at.isoformat(),
+            "balance_synced_at": None if connection.last_successful_sync_at is None else connection.last_successful_sync_at.isoformat(),
+            "heartbeat_at": None if connection.last_heartbeat_at is None else connection.last_heartbeat_at.isoformat(),
+        }
+    )
+
+
+async def _audit_guard_failure(
+    *,
+    db: AsyncSession,
+    actor: str,
+    entity_id: uuid.UUID | None,
+    action: str,
+    reason: str,
+    metadata: dict[str, Any],
+) -> None:
+    await _record_audit(
+        db=db,
+        action=action,
+        actor=actor,
+        entity_id=entity_id or uuid.uuid4(),
+        before_state=None,
+        after_state={"reason": reason, **metadata},
+    )
+    if entity_id is not None:
+        await _commit_if_supported(db=db)
+
+
+async def _build_real_risk_context(
+    *,
+    db: AsyncSession,
+    profile: LiveTradingProfile,
+    preview: CryptoOrderPreview,
+    connection: ExchangeConnection,
+    operator_identity: str,
+) -> tuple[RiskEvent | None, RiskDecisionAction, Decimal, uuid.UUID]:
+    paper_account = await _load_paper_account(db=db, paper_account_id=profile.paper_account_id)
+    campaign = await _load_active_campaign_for_account(db=db, paper_account_id=paper_account.id)
+    if campaign is not None and campaign.status == "PAUSED":
+        raise PermissionError("linked capital campaign is paused")
+
+    asset = await _load_asset_for_product(db=db, product_id=preview.product_id)
+    reference_price = _resolve_reference_price(preview=preview)
+    requested_quote_size = _validate_quote_size(
+        requested_quote_size=_decimal(preview.requested_amount),
+        max_order_usd=get_settings().live_crypto_max_order_usd,
+    )
+    requested_base_quantity = requested_quote_size / reference_price
+    available_usd_balance = _extract_usd_available_balance(connection)
+
+    global_switch = await _load_kill_switch_state(db=db, scope="global", account_id=None)
+    account_switch = await _load_kill_switch_state(db=db, scope="account", account_id=paper_account.id)
+
+    rules = await get_risk_rules(db=db, account_id=paper_account.id)
+    governed_capital = min(_decimal(paper_account.current_cash_balance), available_usd_balance)
+    if governed_capital <= Decimal("0"):
+        raise PermissionError("governed capital evidence unavailable")
+
+    risk_result = evaluate_signal_risk(
+        request=RiskEvaluationRequest(
+            signal_id=preview.crypto_order_preview_id,
+            paper_account_id=paper_account.id,
+            asset_id=asset.id,
+            side="buy",
+            quantity=requested_base_quantity,
+            account_equity=governed_capital,
+            max_position_size_pct=Decimal(str(rules.rules["max_position_size_pct"])),
+            min_order_notional=_decimal(getattr(asset, "min_order_notional", None)) if getattr(asset, "min_order_notional", None) is not None else _USD_SCALE,
+            qty_step_size=_decimal(getattr(asset, "qty_step_size", None)) if getattr(asset, "qty_step_size", None) is not None else None,
+            supports_fractional=bool(getattr(asset, "supports_fractional", True)),
+            start_of_day_equity=_decimal(paper_account.starting_balance),
+            current_equity=_decimal(paper_account.current_cash_balance),
+            max_daily_loss_pct=Decimal(str(rules.rules["max_daily_loss_pct"])),
+            high_water_mark_equity=max(_decimal(paper_account.starting_balance), _decimal(paper_account.current_cash_balance)),
+            max_drawdown_pct=Decimal(str(rules.rules["max_drawdown_pct"])),
+            global_kill_switch_engaged_state=bool(global_switch.engaged),
+            global_kill_switch_rearm_required=bool(global_switch.rearm_required),
+            global_kill_switch_rearmed_by_human=(not bool(global_switch.rearm_required)),
+            global_kill_switch_state_observed=True,
+            account_kill_switch_engaged_state=bool(account_switch.engaged),
+            account_kill_switch_rearm_required=bool(account_switch.rearm_required),
+            account_kill_switch_rearmed_by_human=(not bool(account_switch.rearm_required)),
+            account_kill_switch_state_observed=True,
+            actor=operator_identity,
+        ),
+        reference_price=reference_price,
+        context=RiskEvaluationContext(
+            global_kill_switch_engaged=bool(global_switch.engaged),
+            account_trading_paused=(campaign is not None and campaign.status == "PAUSED"),
+            asset_in_no_trade_zone=False,
+            pair_in_cooldown=False,
+            would_breach_daily_loss=False,
+            would_breach_drawdown=False,
+            has_computable_stop_loss=True,
+            bypass_sizing_rule=False,
+        ),
+    )
+    if risk_result.action == RiskDecisionAction.REJECT:
+        persist_result = await persist_risk_decision(
+            db=db,
+            request=RiskDecisionPersistenceRequest(
+                paper_account_id=paper_account.id,
+                signal_id=preview.crypto_order_preview_id,
+                actor=operator_identity,
+                evaluation_result=risk_result,
+            ),
+        )
+        raise PermissionError(f"risk engine rejected live order: {risk_result.reason_code or risk_result.action.value}")
+
+    persist_result = await persist_risk_decision(
+        db=db,
+        request=RiskDecisionPersistenceRequest(
+            paper_account_id=paper_account.id,
+            signal_id=preview.crypto_order_preview_id,
+            actor=operator_identity,
+            evaluation_result=risk_result,
+        ),
+    )
+    approved_quote_size = _quantize_usd(risk_result.approved_quantity * reference_price)
+    approved_quote_size = _validate_quote_size(
+        requested_quote_size=approved_quote_size,
+        max_order_usd=get_settings().live_crypto_max_order_usd,
+    )
+    return None, risk_result.action, approved_quote_size, persist_result.risk_event_id
 
 
 async def _load_exchange_connection(*, db: AsyncSession, exchange_connection_id: uuid.UUID) -> ExchangeConnection:
@@ -457,7 +726,25 @@ class LiveCryptoOrderService:
         operator_confirmation_token: str | None = None,
     ) -> LiveCryptoOrderPrepareResponse:
         settings = get_settings()
+        if not settings.live_crypto_preparation_enabled:
+            await _audit_guard_failure(
+                db=db,
+                actor=request.operator_identity,
+                entity_id=request.crypto_order_preview_id,
+                action="PREPARATION_DISABLED",
+                reason="live preparation is disabled",
+                metadata={"live_trading_profile_id": str(request.live_trading_profile_id)},
+            )
+            raise PermissionError("live crypto order preparation is disabled")
         if not settings.live_crypto_order_submission_enabled:
+            await _audit_guard_failure(
+                db=db,
+                actor=request.operator_identity,
+                entity_id=request.crypto_order_preview_id,
+                action="SUBMISSION_FEATURE_DISABLED",
+                reason="live submission is disabled",
+                metadata={"live_trading_profile_id": str(request.live_trading_profile_id)},
+            )
             raise PermissionError("live crypto order submission is disabled")
 
         profile = await db.scalar(
@@ -477,23 +764,47 @@ class LiveCryptoOrderService:
             raise ValueError("preview does not belong to the requested live trading profile")
         if preview.side != "BUY" or preview.product_id != "BTC-USD" or preview.order_type != "MARKET":
             raise ValueError("preview is not eligible for live BTC-USD market buy submission")
-        requested_quote_size = _decimal(preview.requested_amount)
-        if requested_quote_size > settings.live_crypto_max_order_usd:
-            raise ValueError("preview exceeds live order size limit")
+        requested_quote_size = _validate_quote_size(
+            requested_quote_size=_decimal(preview.requested_amount),
+            max_order_usd=settings.live_crypto_max_order_usd,
+        )
 
-        preview_age_seconds = _age_seconds(preview.created_at)
-        if preview_age_seconds is None:
-            raise ValueError("linked preview timestamp missing")
-        if preview_age_seconds >= settings.live_crypto_preview_max_age_seconds:
-            raise ValueError("preview is too old for submission")
+        connection = await _load_exchange_connection(db=db, exchange_connection_id=preview.exchange_connection_id)
+        now = _utcnow()
+        preview_age_seconds = _require_fresh_timestamp(
+            label="preview",
+            observed_at=preview.created_at,
+            now=now,
+            max_age_seconds=settings.live_crypto_preview_max_age_seconds,
+        )
+        _require_fresh_timestamp(
+            label="readiness",
+            observed_at=connection.last_verified_at,
+            now=now,
+            max_age_seconds=settings.live_crypto_readiness_max_age_seconds,
+        )
+        _require_fresh_timestamp(
+            label="balance",
+            observed_at=connection.last_successful_sync_at,
+            now=now,
+            max_age_seconds=settings.live_crypto_balance_max_age_seconds,
+        )
+        _require_fresh_timestamp(
+            label="price",
+            observed_at=preview.created_at,
+            now=now,
+            max_age_seconds=settings.live_crypto_price_max_age_seconds,
+        )
 
         approval_gate = await evaluate_live_approval_gate(
             db=db,
             live_trading_profile_id=profile.id,
             checkpoint_type="first_live_enablement",
         )
-        if not approval_gate.approved:
+        if not approval_gate.allowed:
             raise PermissionError(approval_gate.reason or "approval gate rejected")
+        if approval_gate.matched_approval_event_id is None:
+            raise PermissionError("approval evidence missing")
 
         guard_result = await evaluate_live_submission_guard(
             db=db,
@@ -502,40 +813,13 @@ class LiveCryptoOrderService:
         if not guard_result.allowed:
             raise PermissionError(guard_result.reason or "submission guard rejected")
 
-        risk_request = RiskEvaluationRequest(
-            signal_id=uuid.uuid4(),
-            paper_account_id=profile.id,
-            asset_id=uuid.uuid4(),
-            side="BUY",
-            quantity=requested_quote_size,
-            account_equity=requested_quote_size,
-            current_equity=requested_quote_size,
-            actor=request.operator_identity,
-        )
-        risk_context = RiskEvaluationContext(
-            global_kill_switch_engaged=False,
-            account_trading_paused=False,
-            asset_in_no_trade_zone=False,
-            pair_in_cooldown=False,
-            would_breach_daily_loss=False,
-            would_breach_drawdown=False,
-            has_computable_stop_loss=True,
-            bypass_sizing_rule=False,
-        )
-        risk_result = evaluate_signal_risk(request=risk_request, context=risk_context, reference_price=requested_quote_size)
-        if risk_result.action != RiskDecisionAction.APPROVE:
-            raise PermissionError(f"risk engine rejected live order: {risk_result.action.value}")
-
-        await persist_risk_decision(
+        _risk_event, risk_action, approved_quote_size, risk_event_id = await _build_real_risk_context(
             db=db,
-            request=RiskDecisionPersistenceRequest(
-                paper_account_id=profile.id,
-                signal_id=risk_request.signal_id,
-                actor=request.operator_identity,
-                evaluation_result=risk_result,
-            ),
+            profile=profile,
+            preview=preview,
+            connection=connection,
+            operator_identity=request.operator_identity,
         )
-        risk_event_id = uuid.uuid4()
 
         confirmation_challenge_id = uuid.uuid4()
         confirmation_expires_at = _utcnow() + timedelta(minutes=settings.live_crypto_confirmation_challenge_minutes)
@@ -546,6 +830,36 @@ class LiveCryptoOrderService:
             risk_event_id=risk_event_id,
             request=request,
         )
+        live_crypto_order.requested_quote_size = approved_quote_size
+        live_crypto_order.operator_confirmation_id = confirmation_challenge_id
+        live_crypto_order.safe_provider_response = {
+            **live_crypto_order.safe_provider_response,
+            "prepared_by": request.operator_identity,
+            "approval_event_id": str(approval_gate.matched_approval_event_id),
+            "confirmation_expires_at": confirmation_expires_at.isoformat(),
+            "approved_intent_fingerprint": _build_intent_fingerprint(
+                preview=preview,
+                operator_identity=request.operator_identity,
+                requested_quote_size=approved_quote_size,
+                approval_event_id=approval_gate.matched_approval_event_id,
+            ),
+            "evidence_fingerprint": _build_evidence_fingerprint(preview=preview, connection=connection),
+            "execution_risk_verdict": risk_action.value,
+        }
+        await _record_audit(
+            db=db,
+            action="PREPARE_CONFIRMATION",
+            actor=request.operator_identity,
+            entity_id=live_crypto_order.live_crypto_order_id,
+            before_state=None,
+            after_state={
+                "status": live_crypto_order.status,
+                "risk_event_id": str(risk_event_id),
+                "requested_quote_size": format(approved_quote_size, "f"),
+                "approval_event_id": str(approval_gate.matched_approval_event_id),
+            },
+        )
+        await _commit_if_supported(db=db)
 
         return LiveCryptoOrderPrepareResponse(
             live_crypto_order=self._to_response(live_crypto_order),
@@ -553,7 +867,7 @@ class LiveCryptoOrderService:
             confirmation_phrase_required=CONFIRMATION_PHRASE,
             confirmation_expires_at=confirmation_expires_at,
             live_money_warning="LIVE MONEY: operator confirmation required before submission.",
-            execution_risk_verdict=risk_result.action.value,
+            execution_risk_verdict=risk_action.value,
             preview_age_seconds=preview_age_seconds,
             estimated_usd_balance_after=None,
             usd_balance_before=None,
@@ -584,6 +898,7 @@ class LiveCryptoOrderService:
         )
         if preview is None:
             raise LookupError("crypto order preview not found")
+        connection = await _load_exchange_connection(db=db, exchange_connection_id=preview.exchange_connection_id)
 
         preflight_errors: list[str] = []
         if preview.live_trading_profile_id != profile.id:
@@ -591,52 +906,69 @@ class LiveCryptoOrderService:
         if preview.side != "BUY" or preview.product_id != "BTC-USD" or preview.order_type != "MARKET":
             preflight_errors.append("preview is not eligible for live BTC-USD market buy submission")
 
-        requested_quote_size = _decimal(preview.requested_amount)
-        if requested_quote_size > settings.live_crypto_max_order_usd:
-            preflight_errors.append("preview exceeds live order size limit")
+        try:
+            _validate_quote_size(
+                requested_quote_size=_decimal(preview.requested_amount),
+                max_order_usd=settings.live_crypto_max_order_usd,
+            )
+        except Exception as exc:
+            preflight_errors.append(str(exc))
 
-        preview_age_seconds = _age_seconds(preview.created_at)
-        if preview_age_seconds is None:
-            preflight_errors.append("preview timestamp missing")
+        try:
+            preview_age_seconds = _require_fresh_timestamp(
+                label="preview",
+                observed_at=preview.created_at,
+                now=_utcnow(),
+                max_age_seconds=settings.live_crypto_preview_max_age_seconds,
+            )
+            _require_fresh_timestamp(
+                label="readiness",
+                observed_at=connection.last_verified_at,
+                now=_utcnow(),
+                max_age_seconds=settings.live_crypto_readiness_max_age_seconds,
+            )
+            _require_fresh_timestamp(
+                label="balance",
+                observed_at=connection.last_successful_sync_at,
+                now=_utcnow(),
+                max_age_seconds=settings.live_crypto_balance_max_age_seconds,
+            )
+            _require_fresh_timestamp(
+                label="price",
+                observed_at=preview.created_at,
+                now=_utcnow(),
+                max_age_seconds=settings.live_crypto_price_max_age_seconds,
+            )
+        except Exception as exc:
+            preflight_errors.append(str(exc))
             preview_age_seconds = 0
-        if preview_age_seconds >= settings.live_crypto_preview_max_age_seconds:
-            preflight_errors.append("preview is too old for submission")
 
-        if not (await evaluate_live_approval_gate(db=db, live_trading_profile_id=profile.id, checkpoint_type="first_live_enablement")).allowed:
+        approval_gate = await evaluate_live_approval_gate(db=db, live_trading_profile_id=profile.id, checkpoint_type="first_live_enablement")
+        if not approval_gate.allowed:
             preflight_errors.append("approval gate rejected")
 
         if not (await evaluate_live_submission_guard(db=db, live_trading_profile_id=profile.id)).allowed:
             preflight_errors.append("submission guard rejected")
 
-        risk_request = RiskEvaluationRequest(
-            signal_id=uuid.uuid4(),
-            paper_account_id=profile.id,
-            asset_id=uuid.uuid4(),
-            side="BUY",
-            quantity=requested_quote_size,
-            account_equity=requested_quote_size,
-            current_equity=requested_quote_size,
-            actor=request.operator_identity,
-        )
-        risk_context = RiskEvaluationContext(
-            global_kill_switch_engaged=False,
-            account_trading_paused=False,
-            asset_in_no_trade_zone=False,
-            pair_in_cooldown=False,
-            would_breach_daily_loss=False,
-            would_breach_drawdown=False,
-            has_computable_stop_loss=True,
-            bypass_sizing_rule=False,
-        )
-        risk_result = evaluate_signal_risk(request=risk_request, context=risk_context, reference_price=requested_quote_size)
-        if risk_result.action != RiskDecisionAction.APPROVE:
-            preflight_errors.append(f"risk engine rejected live order: {risk_result.action.value}")
+        risk_event_id = None
+        try:
+            _risk_event, risk_action, approved_quote_size, risk_event_id = await _build_real_risk_context(
+                db=db,
+                profile=profile,
+                preview=preview,
+                connection=connection,
+                operator_identity=request.operator_identity,
+            )
+        except Exception as exc:
+            preflight_errors.append(str(exc))
+            risk_action = RiskDecisionAction.REJECT
+            approved_quote_size = _decimal(preview.requested_amount)
 
         live_crypto_order = await self._get_or_create_live_order(
             db=db,
             preview=preview,
             profile=profile,
-            risk_event_id=uuid.uuid4(),
+            risk_event_id=risk_event_id,
             request=LiveCryptoOrderPrepareRequest(
                 live_trading_profile_id=request.live_trading_profile_id,
                 crypto_order_preview_id=request.crypto_order_preview_id,
@@ -644,6 +976,7 @@ class LiveCryptoOrderService:
                 idempotency_token=request.idempotency_token,
             ),
         )
+        live_crypto_order.requested_quote_size = approved_quote_size
         replay_key = _replay_key(
             action="dry_run",
             scope={
@@ -665,6 +998,10 @@ class LiveCryptoOrderService:
             "preview_id": str(preview.crypto_order_preview_id),
             "preview_age_seconds": preview_age_seconds,
             "dry_run_errors": preflight_errors,
+            "approval_event_id": None
+            if getattr(approval_gate, "matched_approval_event_id", None) is None
+            else str(approval_gate.matched_approval_event_id),
+            "execution_risk_verdict": risk_action.value,
         }
         live_crypto_order.updated_at = _utcnow()
         await _record_audit(
@@ -681,6 +1018,7 @@ class LiveCryptoOrderService:
             },
         )
         await db.flush()
+        await _commit_if_supported(db=db)
 
         return LiveCryptoOrderDryRunResponse(
             live_crypto_order=self._to_response(live_crypto_order),
@@ -703,6 +1041,14 @@ class LiveCryptoOrderService:
     ) -> LiveCryptoOrderSubmitResponse:
         settings = get_settings()
         if not settings.live_crypto_order_submission_enabled:
+            await _audit_guard_failure(
+                db=db,
+                actor=request.operator_identity,
+                entity_id=request.live_crypto_order_id,
+                action="SUBMISSION_FEATURE_DISABLED",
+                reason="live submission is disabled",
+                metadata={},
+            )
             raise PermissionError("live crypto order submission is disabled")
         if not request.idempotency_token.strip():
             raise PermissionError("idempotency token required for submit")
@@ -731,6 +1077,8 @@ class LiveCryptoOrderService:
             raise PermissionError("confirmation phrase mismatch")
         if request.operator_identity != live_order.safe_provider_response.get("prepared_by"):
             raise PermissionError("operator identity mismatch")
+        if live_order.operator_confirmation_id != request.confirmation_challenge_id:
+            raise PermissionError("confirmation challenge mismatch")
 
         preview = await db.scalar(
             select(CryptoOrderPreview).where(
@@ -739,13 +1087,85 @@ class LiveCryptoOrderService:
         )
         if preview is None:
             raise LookupError("linked preview not found")
-        preview_age_seconds = _age_seconds(preview.created_at)
-        if preview_age_seconds is None:
-            raise ValueError("linked preview timestamp missing")
-        if preview_age_seconds >= settings.live_crypto_preview_max_age_seconds:
-            raise ValueError("linked preview is too old")
 
         connection = await _load_exchange_connection(db=db, exchange_connection_id=live_order.exchange_connection_id)
+        profile = await db.scalar(
+            select(LiveTradingProfile).where(LiveTradingProfile.id == preview.live_trading_profile_id).limit(1)
+        )
+        if profile is None:
+            raise LookupError("linked live trading profile not found")
+        approval_expires_at = live_order.safe_provider_response.get("confirmation_expires_at")
+        if approval_expires_at is None:
+            raise PermissionError("confirmation approval evidence missing")
+        expires_at = datetime.fromisoformat(str(approval_expires_at))
+        if expires_at <= _utcnow():
+            live_order.status = "CONFIRMATION_EXPIRED"
+            await _record_audit(
+                db=db,
+                action="CONFIRMATION_EXPIRED",
+                actor=request.operator_identity,
+                entity_id=live_order.live_crypto_order_id,
+                before_state=None,
+                after_state={"status": live_order.status},
+            )
+            await _commit_if_supported(db=db)
+            raise PermissionError("confirmation approval expired")
+
+        now = _utcnow()
+        _require_fresh_timestamp(
+            label="preview",
+            observed_at=preview.created_at,
+            now=now,
+            max_age_seconds=settings.live_crypto_preview_max_age_seconds,
+        )
+        _require_fresh_timestamp(
+            label="readiness",
+            observed_at=connection.last_verified_at,
+            now=now,
+            max_age_seconds=settings.live_crypto_readiness_max_age_seconds,
+        )
+        _require_fresh_timestamp(
+            label="balance",
+            observed_at=connection.last_successful_sync_at,
+            now=now,
+            max_age_seconds=settings.live_crypto_balance_max_age_seconds,
+        )
+        _require_fresh_timestamp(
+            label="price",
+            observed_at=preview.created_at,
+            now=now,
+            max_age_seconds=settings.live_crypto_price_max_age_seconds,
+        )
+        _validate_quote_size(
+            requested_quote_size=live_order.requested_quote_size,
+            max_order_usd=settings.live_crypto_max_order_usd,
+        )
+
+        approval_event_id = live_order.safe_provider_response.get("approval_event_id")
+        if approval_event_id is None:
+            raise PermissionError("approval binding missing")
+        approved_intent_fingerprint = live_order.safe_provider_response.get("approved_intent_fingerprint")
+        expected_intent_fingerprint = _build_intent_fingerprint(
+            preview=preview,
+            operator_identity=request.operator_identity,
+            requested_quote_size=live_order.requested_quote_size,
+            approval_event_id=uuid.UUID(str(approval_event_id)),
+        )
+        if approved_intent_fingerprint != expected_intent_fingerprint:
+            raise PermissionError("approved intent fingerprint mismatch")
+        if live_order.safe_provider_response.get("evidence_fingerprint") != _build_evidence_fingerprint(preview=preview, connection=connection):
+            raise PermissionError("approval evidence fingerprint mismatch")
+
+        _risk_event, risk_action, approved_quote_size, risk_event_id = await _build_real_risk_context(
+            db=db,
+            profile=profile,
+            preview=preview,
+            connection=connection,
+            operator_identity=request.operator_identity,
+        )
+        if approved_quote_size != live_order.requested_quote_size:
+            raise PermissionError("approved order intent no longer matches current risk-approved sizing")
+
         connection_credentials = _load_decrypted_credentials(connection)
         provider = CoinbaseAdvancedClient()
         request_payload = {
@@ -754,7 +1174,7 @@ class LiveCryptoOrderService:
             "side": live_order.side,
             "order_configuration": {
                 "market_market_ioc": {
-                    "quote_size": format(live_order.requested_quote_size, "f"),
+                    "quote_size": format(approved_quote_size, "f"),
                     "rfq_disabled": True,
                 }
             },
@@ -773,6 +1193,7 @@ class LiveCryptoOrderService:
             provider_order_id = success_response.get("order_id") if isinstance(success_response.get("order_id"), str) else None
             provider_status = success_response.get("status") if isinstance(success_response.get("status"), str) else None
 
+        live_order.risk_event_id = risk_event_id
         live_order.provider_order_id = provider_order_id
         live_order.provider_status = provider_status or live_order.provider_status
         live_order.submitted_at = _utcnow()
@@ -782,9 +1203,11 @@ class LiveCryptoOrderService:
             "create_order_payload": request_payload,
             "create_order_success": success,
             "create_order_responded": True,
+            "execution_risk_verdict": risk_action.value,
         }
         if success and provider_order_id is not None:
             live_order.status = "SUBMITTED"
+            live_order.acknowledged_at = _utcnow()
         else:
             live_order.status = "RECONCILIATION_REQUIRED"
             live_order.failure_code = "coinbase_order_create_failed"
@@ -801,10 +1224,12 @@ class LiveCryptoOrderService:
                 "status": live_order.status,
                 "order_submitted": success,
                 "provider_create_order_responded": True,
+                "risk_event_id": str(risk_event_id),
                 "replay_key": replay_key,
             },
         )
         await db.flush()
+        await _commit_if_supported(db=db)
 
         return LiveCryptoOrderSubmitResponse(
             live_crypto_order=self._to_response(live_order),
