@@ -9,6 +9,7 @@ from decimal import Decimal
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.config import get_settings
 from app.models.capital_campaign import CapitalCampaign
 from app.models.live_accounting_record import LiveAccountingRecord
 from app.models.live_execution_event import LiveExecutionEvent
@@ -16,7 +17,9 @@ from app.models.live_crypto_order import LiveCryptoOrder
 from app.models.live_reconciliation_event import LiveReconciliationEvent
 from app.models.live_trading_profile import LiveTradingProfile
 from app.services.exchange_connections.providers.coinbase_advanced import CoinbaseAdvancedClient
+from app.services.live.audit_compliance import record_live_audit_evidence
 from app.services.live.contracts import (
+    LiveAuditEvidenceRequest,
     LiveFillReconciliationRequest,
     LiveOrderReconciliationRequest,
     LiveReconciliationResult,
@@ -91,6 +94,79 @@ def _normalize_provider_status(*, provider_status: str | None) -> str:
 
 def _safe_json(value: dict[str, object]) -> dict[str, object]:
     return json.loads(json.dumps(value, default=str))
+
+
+def _safe_int(value: object) -> int | None:
+    if isinstance(value, int):
+        return value
+    if isinstance(value, str):
+        text = value.strip()
+        if text.isdigit():
+            return int(text)
+    return None
+
+
+def _safe_datetime(value: object) -> datetime | None:
+    if isinstance(value, datetime):
+        return value
+    if isinstance(value, str):
+        text = value.replace("Z", "+00:00")
+        try:
+            return datetime.fromisoformat(text)
+        except ValueError:
+            return None
+    return None
+
+
+def _event_is_stale(*, now: datetime, observed_at: datetime | None, max_age_seconds: int) -> bool:
+    if observed_at is None:
+        return True
+    if observed_at.tzinfo is None:
+        observed_at = observed_at.replace(tzinfo=timezone.utc)
+    return (now - observed_at).total_seconds() > max_age_seconds
+
+
+async def _resolve_campaign_for_live_order(
+    *,
+    db: AsyncSession,
+    live_order: LiveCryptoOrder,
+    profile: LiveTradingProfile,
+) -> tuple[CapitalCampaign | None, str]:
+    row_campaign_ids = set(
+        await db.scalars(
+            select(LiveAccountingRecord.capital_campaign_id)
+            .where(LiveAccountingRecord.live_crypto_order_id == live_order.live_crypto_order_id)
+            .where(LiveAccountingRecord.capital_campaign_id.is_not(None))
+        )
+    )
+    row_campaign_ids.update(
+        set(
+            await db.scalars(
+                select(LiveReconciliationEvent.capital_campaign_id)
+                .where(LiveReconciliationEvent.live_crypto_order_id == live_order.live_crypto_order_id)
+                .where(LiveReconciliationEvent.capital_campaign_id.is_not(None))
+            )
+        )
+    )
+
+    typed_campaign_id = _safe_int((live_order.safe_provider_response or {}).get("capital_campaign_id"))
+    if typed_campaign_id is not None:
+        row_campaign_ids.add(typed_campaign_id)
+
+    if len(row_campaign_ids) > 1:
+        return None, "mismatch"
+    if not row_campaign_ids:
+        return None, "uncategorized"
+
+    campaign_id = next(iter(row_campaign_ids))
+    campaign = await db.scalar(select(CapitalCampaign).where(CapitalCampaign.id == campaign_id).limit(1))
+    if campaign is None:
+        return None, "mismatch"
+
+    profile_paper_account_id = getattr(profile, "paper_account_id", None)
+    if campaign.paper_account_id is not None and profile_paper_account_id is not None and campaign.paper_account_id != profile_paper_account_id:
+        return None, "mismatch"
+    return campaign, "verified"
 
 
 async def _ensure_execution_source(
@@ -195,15 +271,11 @@ async def reconcile_live_order_and_fills(
         raise LookupError("live trading profile not found")
 
     source_event = await _ensure_execution_source(db=db, live_order=live_order, profile=profile)
-    campaign = None
-    profile_paper_account_id = getattr(profile, "paper_account_id", None)
-    if profile_paper_account_id is not None:
-        campaign = await db.scalar(
-            select(CapitalCampaign)
-            .where(CapitalCampaign.paper_account_id == profile_paper_account_id)
-            .order_by(CapitalCampaign.updated_at.desc(), CapitalCampaign.id.desc())
-            .limit(1)
-        )
+    campaign, campaign_correlation_status = await _resolve_campaign_for_live_order(
+        db=db,
+        live_order=live_order,
+        profile=profile,
+    )
 
     from app.services.live_crypto_orders import _load_exchange_connection, _load_decrypted_credentials, _find_matching_orders
 
@@ -312,7 +384,7 @@ async def reconcile_live_order_and_fills(
     normalized_status = _normalize_provider_status(provider_status=provider_status_raw)
     provider_recorded_at = _extract_provider_timestamp(payload=provider_order_payload or {})
 
-    await record_live_order_reconciliation(
+    order_reconciliation = await record_live_order_reconciliation(
         db=db,
         request=LiveOrderReconciliationRequest(
             live_trading_profile_id=profile.id,
@@ -402,14 +474,53 @@ async def reconcile_live_order_and_fills(
         weighted_average_fill_price = total_quote_notional / total_filled_quantity
 
     quote_currency = "USD"
+    settings = get_settings()
+    balance_tolerance = _decimal(settings.live_crypto_accounting_balance_tolerance_usd)
     expected_quote_reduction = total_quote_notional + total_fees_by_currency.get(quote_currency, Decimal("0"))
+
+    pre_balance = None
+    for key in ("usd_available_before_submit", "usd_balance_before_submit", "usd_balance_before"):
+        raw = (live_order.safe_provider_response or {}).get(key)
+        if raw is not None:
+            pre_balance = _decimal(raw)
+            break
+
     post_balance = None
     for item in connection.balances or []:
         if str(item.get("currency", "")).upper() == quote_currency:
             post_balance = _decimal(item.get("available", "0"))
             break
-    balance_observed = post_balance is not None
-    balance_status = "ok" if balance_observed else "missing"
+
+    now = _utcnow()
+    balance_observed_at = (
+        _safe_datetime(getattr(connection, "last_verified_at", None))
+        or _safe_datetime(getattr(connection, "last_successful_sync_at", None))
+        or _safe_datetime(getattr(connection, "last_heartbeat_at", None))
+    )
+    is_stale_balance = _event_is_stale(
+        now=now,
+        observed_at=balance_observed_at,
+        max_age_seconds=int(settings.live_crypto_balance_max_age_seconds),
+    )
+
+    balance_mismatch_state = "ok"
+    if expected_quote_reduction <= Decimal("0"):
+        balance_mismatch_state = "not_required"
+    elif post_balance is None:
+        balance_mismatch_state = "missing"
+    elif is_stale_balance:
+        balance_mismatch_state = "stale"
+    elif pre_balance is None:
+        balance_mismatch_state = "missing"
+    else:
+        observed_reduction = pre_balance - post_balance
+        delta = abs(observed_reduction - expected_quote_reduction)
+        if delta > balance_tolerance:
+            balance_mismatch_state = "material_mismatch"
+        elif delta > Decimal("0"):
+            balance_mismatch_state = "tolerated"
+
+    balance_status = "ok" if balance_mismatch_state in {"ok", "tolerated", "not_required"} else "mismatch"
 
     preview_fee = _decimal(live_order.safe_provider_response.get("preview_estimated_fee", "0")) if live_order.safe_provider_response.get("preview_estimated_fee") is not None else Decimal("0")
     provider_fee_total = total_fees_by_currency.get("USD", Decimal("0"))
@@ -433,8 +544,75 @@ async def reconcile_live_order_and_fills(
     else:
         live_order.status = "ACKNOWLEDGED"
 
-    if not balance_observed:
+    if balance_mismatch_state in {"missing", "stale", "material_mismatch"}:
         live_order.status = "RECONCILIATION_REQUIRED"
+        mismatch_status = "balance_mismatch" if balance_mismatch_state == "material_mismatch" else "reconciliation_required"
+        await record_live_order_reconciliation(
+            db=db,
+            request=LiveOrderReconciliationRequest(
+                live_trading_profile_id=profile.id,
+                source_execution_event_id=source_event.id,
+                provider_name=live_order.provider,
+                provider_order_id=live_order.provider_order_id,
+                client_order_id=live_order.client_order_id,
+                reconciliation_status=mismatch_status,
+                live_crypto_order_id=live_order.live_crypto_order_id,
+                capital_campaign_id=None if campaign is None else campaign.id,
+                provider_recorded_at=None,
+                requested_by=operator_identity,
+                provenance_metadata={
+                    "reason": "balance_evidence_unresolved",
+                    "balance_mismatch_state": balance_mismatch_state,
+                },
+                idempotency_key=f"lco-reconcile:{live_order.live_crypto_order_id}:balance-unresolved:{balance_mismatch_state}",
+            ),
+        )
+
+    accounting_projection_status = "projected" if total_filled_quantity > Decimal("0") else "not_projected"
+    accounting_complete = (
+        normalized_status in _RECONCILIATION_TERMINAL_STATUSES
+        and campaign_correlation_status != "mismatch"
+        and balance_mismatch_state not in {"missing", "stale", "material_mismatch"}
+    )
+    accounting_completion_status = "complete" if accounting_complete else "unresolved"
+
+    if campaign_correlation_status == "mismatch":
+        live_order.status = "RECONCILIATION_REQUIRED"
+
+    audit_evidence_written = True
+    try:
+        await record_live_audit_evidence(
+            db=db,
+            request=LiveAuditEvidenceRequest(
+                live_trading_profile_id=profile.id,
+                event_type="order_lifecycle_evidence",
+                attributable_actor_id=operator_identity,
+                attributable_actor_role="operator",
+                action_name="CAPITAL_LEDGER_PROJECTION_GENERATED",
+                action_source="live_reconciliation",
+                action_summary="Projected live accounting evidence for capital ledger read model.",
+                evidence_payload={
+                    "live_crypto_order_id": str(live_order.live_crypto_order_id),
+                    "provider_order_id": live_order.provider_order_id,
+                    "client_order_id": live_order.client_order_id,
+                    "filled_quantity": format(total_filled_quantity, "f"),
+                    "gross_filled_notional": format(total_quote_notional, "f"),
+                    "provider_fee_usd": format(provider_fee_total, "f"),
+                    "net_quote_capital_effect": format(expected_quote_reduction, "f"),
+                    "campaign_correlation_status": campaign_correlation_status,
+                    "accounting_projection_status": accounting_projection_status,
+                },
+                provenance_metadata={"phase": "10.6C"},
+                live_execution_event_id=source_event.id,
+                live_reconciliation_event_id=order_reconciliation.reconciliation_event_id,
+            ),
+        )
+    except Exception:
+        audit_evidence_written = False
+        accounting_completion_status = "unresolved"
+        live_order.status = "RECONCILIATION_REQUIRED"
+
+    if not audit_evidence_written:
         await record_live_order_reconciliation(
             db=db,
             request=LiveOrderReconciliationRequest(
@@ -448,13 +626,14 @@ async def reconcile_live_order_and_fills(
                 capital_campaign_id=None if campaign is None else campaign.id,
                 provider_recorded_at=None,
                 requested_by=operator_identity,
-                provenance_metadata={"reason": "balance_missing"},
-                idempotency_key=f"lco-reconcile:{live_order.live_crypto_order_id}:balance-missing",
+                provenance_metadata={"reason": "audit_persistence_failure"},
+                idempotency_key=f"lco-reconcile:{live_order.live_crypto_order_id}:audit-unresolved",
             ),
         )
 
     live_order.safe_provider_response = {
         **(live_order.safe_provider_response or {}),
+        "capital_campaign_id": None if campaign is None else campaign.id,
         "reconciliation": {
             "provider_status": provider_status_raw,
             "normalized_status": normalized_status,
@@ -466,6 +645,20 @@ async def reconcile_live_order_and_fills(
             "fees": {currency: format(amount, "f") for currency, amount in total_fees_by_currency.items()},
             "expected_quote_reduction": format(expected_quote_reduction, "f"),
             "balance_status": balance_status,
+            "balance_mismatch_state": balance_mismatch_state,
+            "balance_tolerance_usd": format(balance_tolerance, "f"),
+            "balance_observed_at": None if balance_observed_at is None else balance_observed_at.isoformat(),
+            "campaign_correlation_status": campaign_correlation_status,
+            "accounting_projection_status": accounting_projection_status,
+            "accounting_completion_status": accounting_completion_status,
+            "net_quote_capital_effect": format(expected_quote_reduction, "f"),
+            "profit_cycle_consistency": {
+                "buy_fill_realized_profit": "0",
+                "distributable_profit_created": False,
+                "fees_reflected": provider_fee_total > Decimal("0"),
+                "partial_fill_non_overstated": total_quote_notional <= _decimal(live_order.requested_quote_size),
+                "cancellation_partial_consistent": normalized_status != "canceled" or total_filled_quantity >= Decimal("0"),
+            },
             "fee_delta_vs_preview": format(fee_delta, "f"),
             "observed_at": _utcnow().isoformat(),
         }
@@ -478,6 +671,14 @@ async def reconcile_live_order_and_fills(
         "provider_status": provider_status_raw,
         "provider_order_id": live_order.provider_order_id,
         "provider_fill_observed": total_filled_quantity > Decimal("0"),
+        "campaign_correlation_status": campaign_correlation_status,
+        "accounting_projection_status": accounting_projection_status,
+        "accounting_completion_status": accounting_completion_status,
+        "balance_mismatch_state": balance_mismatch_state,
+        "filled_quantity": format(total_filled_quantity, "f"),
+        "gross_filled_notional": format(total_quote_notional, "f"),
+        "provider_fees": format(provider_fee_total, "f"),
+        "net_quote_capital_effect": format(expected_quote_reduction, "f"),
         "safe_provider_response": _safe_json(live_order.safe_provider_response.get("reconciliation", {})),
     }
 

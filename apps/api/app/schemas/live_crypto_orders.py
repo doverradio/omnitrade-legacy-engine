@@ -182,5 +182,13 @@ class LiveCryptoOrderReconcileResponse(BaseModel):
     provider_status: str | None
     provider_order_id: str | None
     provider_fill_observed: bool
+    campaign_correlation_status: str | None = None
+    accounting_projection_status: str | None = None
+    accounting_completion_status: str | None = None
+    balance_mismatch_state: str | None = None
+    filled_quantity: str | None = None
+    gross_filled_notional: str | None = None
+    provider_fees: str | None = None
+    net_quote_capital_effect: str | None = None
     safe_provider_response: dict[str, Any]
 

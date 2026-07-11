@@ -1147,4 +1147,4 @@ async def test_reconcile_can_discover_order_by_client_order_id_when_provider_ord
     )
 
     assert response.live_crypto_order.provider_order_id == "provider-order-1"
-    assert response.reconciliation_status in {"ACKNOWLEDGED", "UNKNOWN"}
+    assert response.reconciliation_status in {"ACKNOWLEDGED", "UNKNOWN", "RECONCILIATION_REQUIRED"}

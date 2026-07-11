@@ -10,6 +10,9 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.models.capital_campaign import CapitalCampaign
 from app.models.capital_campaign_profit_cycle import CapitalCampaignProfitCycle
+from app.models.live_accounting_record import LiveAccountingRecord
+from app.models.live_crypto_order import LiveCryptoOrder
+from app.models.live_reconciliation_event import LiveReconciliationEvent
 from app.models.paper_account import PaperAccount
 from app.models.research_campaign import ResearchCampaign
 from app.models.trade import Trade
@@ -34,6 +37,8 @@ _TYPE_OPTIONS = {
     "paper_account",
     "validation_run",
     "research_campaign",
+    "live_campaign",
+    "live_uncategorized",
     "strategy_allocation",
     "position",
     "compounding_recommendation",
@@ -47,6 +52,25 @@ _TYPE_OPTIONS = {
 class _ValidationMetricSnapshot:
     current_equity: Decimal | None
     trades: int
+
+
+@dataclass(frozen=True, slots=True)
+class _LiveCampaignProjection:
+    campaign_id: int | None
+    pool_type: CapitalPoolType
+    pool_id: str
+    pool_name: str
+    status: CapitalPoolStatus
+    campaign_correlation_status: str
+    provider_reconciliation_status: str
+    accounting_projection_status: str
+    accounting_completion_status: str
+    balance_mismatch_state: str
+    filled_quantity: Decimal
+    gross_filled_notional: Decimal
+    provider_fees: Decimal
+    net_quote_capital_effect: Decimal
+    live_entry_types: tuple[str, ...]
 
 
 def _zero() -> Decimal:
@@ -150,6 +174,203 @@ async def _load_trade_counts_by_account(db: AsyncSession) -> dict[uuid.UUID, int
     return counts
 
 
+async def _load_live_accounting_records(db: AsyncSession) -> list[LiveAccountingRecord]:
+    if not hasattr(db, "execute"):
+        return []
+    return (
+        await db.execute(
+            select(LiveAccountingRecord).order_by(LiveAccountingRecord.recorded_at.asc(), LiveAccountingRecord.created_at.asc())
+        )
+    ).scalars().all()
+
+
+async def _load_live_orders(db: AsyncSession) -> list[LiveCryptoOrder]:
+    if not hasattr(db, "execute"):
+        return []
+    return (
+        await db.execute(select(LiveCryptoOrder).order_by(LiveCryptoOrder.created_at.asc(), LiveCryptoOrder.live_crypto_order_id.asc()))
+    ).scalars().all()
+
+
+async def _load_live_reconciliation_events(db: AsyncSession) -> list[LiveReconciliationEvent]:
+    if not hasattr(db, "execute"):
+        return []
+    return (
+        await db.execute(
+            select(LiveReconciliationEvent).order_by(LiveReconciliationEvent.recorded_at.asc(), LiveReconciliationEvent.sequence_number.asc())
+        )
+    ).scalars().all()
+
+
+def _project_live_campaign_pools(
+    *,
+    accounting_records: list[LiveAccountingRecord],
+    live_orders: list[LiveCryptoOrder],
+    reconciliation_events: list[LiveReconciliationEvent],
+    campaigns: dict[int, CapitalCampaign],
+) -> list[_LiveCampaignProjection]:
+    if not accounting_records and not live_orders:
+        return []
+
+    orders_by_id = {item.live_crypto_order_id: item for item in live_orders}
+    latest_reconciliation_by_order: dict[uuid.UUID, LiveReconciliationEvent] = {}
+    for event in reconciliation_events:
+        if event.live_crypto_order_id is None:
+            continue
+        latest_reconciliation_by_order[event.live_crypto_order_id] = event
+
+    per_order: dict[uuid.UUID, dict[str, object]] = {}
+    for row in accounting_records:
+        if row.live_crypto_order_id is None:
+            continue
+        order_bucket = per_order.setdefault(
+            row.live_crypto_order_id,
+            {
+                "campaign_ids": set(),
+                "filled_quantity": _zero(),
+                "gross_filled_notional": _zero(),
+                "provider_fees": _zero(),
+                "provider_fees_non_usd": _zero(),
+                "live_entry_types": set(),
+            },
+        )
+        if row.capital_campaign_id is not None:
+            order_bucket["campaign_ids"].add(row.capital_campaign_id)
+
+        if row.record_type in {"fill_accounting", "partial_fill_accounting"}:
+            order_bucket["filled_quantity"] += _to_decimal(row.filled_quantity) or _zero()
+            order_bucket["gross_filled_notional"] += _to_decimal(row.gross_notional) or _zero()
+            order_bucket["live_entry_types"].update(["live_capital_deployment", "asset_received"])
+        if row.record_type == "fee_attribution":
+            fee_amount = _to_decimal(row.fee_amount) or _zero()
+            if str(row.fee_currency).upper() == "USD":
+                order_bucket["provider_fees"] += fee_amount
+            else:
+                order_bucket["provider_fees_non_usd"] += fee_amount
+            order_bucket["live_entry_types"].add("provider_fee")
+
+    # Keep orders without fill rows visible as canceled/unresolved evidence when they exist.
+    for order_id, order in orders_by_id.items():
+        per_order.setdefault(
+            order_id,
+            {
+                "campaign_ids": set(),
+                "filled_quantity": _zero(),
+                "gross_filled_notional": _zero(),
+                "provider_fees": _zero(),
+                "provider_fees_non_usd": _zero(),
+                "live_entry_types": set(),
+            },
+        )
+        campaign_id_raw = (order.safe_provider_response or {}).get("capital_campaign_id")
+        if isinstance(campaign_id_raw, int):
+            per_order[order_id]["campaign_ids"].add(campaign_id_raw)
+
+    grouped: dict[str, dict[str, object]] = {}
+    for order_id, order_view in per_order.items():
+        order = orders_by_id.get(order_id)
+        latest_reconciliation = latest_reconciliation_by_order.get(order_id)
+        campaign_ids = set(order_view["campaign_ids"])
+        correlation_status = "uncategorized"
+        campaign_id: int | None = None
+        if len(campaign_ids) > 1:
+            correlation_status = "mismatch"
+        elif len(campaign_ids) == 1:
+            campaign_id = next(iter(campaign_ids))
+            correlation_status = "verified" if campaign_id in campaigns else "mismatch"
+
+        pool_key = "uncategorized" if campaign_id is None or correlation_status == "mismatch" else f"campaign:{campaign_id}"
+        bucket = grouped.setdefault(
+            pool_key,
+            {
+                "campaign_id": campaign_id if correlation_status == "verified" else None,
+                "filled_quantity": _zero(),
+                "gross_filled_notional": _zero(),
+                "provider_fees": _zero(),
+                "net_quote_capital_effect": _zero(),
+                "provider_reconciliation_status": "unknown",
+                "accounting_projection_status": "not_projected",
+                "accounting_completion_status": "unresolved",
+                "balance_mismatch_state": "unknown",
+                "campaign_correlation_status": correlation_status,
+                "live_entry_types": set(),
+                "status": "inactive",
+            },
+        )
+
+        filled_quantity = order_view["filled_quantity"]
+        gross_notional = order_view["gross_filled_notional"]
+        provider_fees = order_view["provider_fees"]
+        net_quote_effect = gross_notional + provider_fees
+
+        bucket["filled_quantity"] += filled_quantity
+        bucket["gross_filled_notional"] += gross_notional
+        bucket["provider_fees"] += provider_fees
+        bucket["net_quote_capital_effect"] += net_quote_effect
+        bucket["live_entry_types"].update(order_view["live_entry_types"])
+
+        if filled_quantity > _zero():
+            bucket["accounting_projection_status"] = "projected"
+            bucket["status"] = "active"
+
+        reconciliation_status = "unknown"
+        if latest_reconciliation is not None:
+            reconciliation_status = latest_reconciliation.reconciliation_status
+        elif order is not None and order.provider_status is not None:
+            reconciliation_status = str(order.provider_status).lower()
+        bucket["provider_reconciliation_status"] = reconciliation_status
+
+        order_reconciliation = ((order.safe_provider_response or {}).get("reconciliation") if order is not None else None) or {}
+        completion_status = str(order_reconciliation.get("accounting_completion_status") or "unresolved")
+        balance_state = str(order_reconciliation.get("balance_mismatch_state") or "unknown")
+        bucket["accounting_completion_status"] = "complete" if bucket["accounting_completion_status"] == "complete" and completion_status == "complete" else completion_status
+        if balance_state in {"material_mismatch", "stale", "missing"}:
+            bucket["balance_mismatch_state"] = balance_state
+        elif bucket["balance_mismatch_state"] == "unknown":
+            bucket["balance_mismatch_state"] = balance_state
+
+        if reconciliation_status == "canceled" and filled_quantity <= _zero():
+            bucket["live_entry_types"].add("cancellation_no_fill")
+        if reconciliation_status == "canceled" and filled_quantity > _zero():
+            bucket["live_entry_types"].add("cancellation_partial_fill")
+        if reconciliation_status in {"balance_mismatch", "reconciliation_required", "conflict"} or balance_state in {"material_mismatch", "stale", "missing"}:
+            bucket["live_entry_types"].add("reconciliation_adjustment_evidence")
+
+        if correlation_status == "mismatch":
+            bucket["campaign_correlation_status"] = "mismatch"
+            bucket["accounting_completion_status"] = "unresolved"
+
+    projections: list[_LiveCampaignProjection] = []
+    for key, item in grouped.items():
+        campaign_id = item["campaign_id"]
+        campaign = campaigns.get(campaign_id) if campaign_id is not None else None
+        is_uncategorized = key == "uncategorized"
+        pool_name = "Uncategorized Live Orders" if is_uncategorized else f"{campaign.name} Live Accounting"
+        pool_id = "live-uncategorized" if is_uncategorized else f"live-campaign:{campaign.uuid}"
+        pool_type: CapitalPoolType = "live_uncategorized" if is_uncategorized else "live_campaign"
+
+        projections.append(
+            _LiveCampaignProjection(
+                campaign_id=campaign_id,
+                pool_type=pool_type,
+                pool_id=pool_id,
+                pool_name=pool_name,
+                status=item["status"],
+                campaign_correlation_status=item["campaign_correlation_status"],
+                provider_reconciliation_status=item["provider_reconciliation_status"],
+                accounting_projection_status=item["accounting_projection_status"],
+                accounting_completion_status=item["accounting_completion_status"],
+                balance_mismatch_state=item["balance_mismatch_state"],
+                filled_quantity=item["filled_quantity"],
+                gross_filled_notional=item["gross_filled_notional"],
+                provider_fees=item["provider_fees"],
+                net_quote_capital_effect=item["net_quote_capital_effect"],
+                live_entry_types=tuple(sorted(item["live_entry_types"])),
+            )
+        )
+    return projections
+
+
 async def build_capital_ledger(
     *,
     db: AsyncSession,
@@ -180,6 +401,9 @@ async def build_capital_ledger(
     research_campaigns = await _load_research_campaigns(db)
     capital_campaigns = await _load_capital_campaigns(db)
     profit_cycles = await _load_profit_cycles(db)
+    live_accounting_records = await _load_live_accounting_records(db)
+    live_orders = await _load_live_orders(db)
+    live_reconciliation_events = await _load_live_reconciliation_events(db)
 
     campaign_by_validation_run_id: dict[uuid.UUID, CapitalCampaign] = {}
     campaign_by_paper_account_id: dict[uuid.UUID, CapitalCampaign] = {}
@@ -190,6 +414,13 @@ async def build_capital_ledger(
             campaign_by_validation_run_id[campaign.validation_run_id] = campaign
         if campaign.paper_account_id is not None and campaign.paper_account_id not in campaign_by_paper_account_id:
             campaign_by_paper_account_id[campaign.paper_account_id] = campaign
+
+    live_projection_rows = _project_live_campaign_pools(
+        accounting_records=live_accounting_records,
+        live_orders=live_orders,
+        reconciliation_events=live_reconciliation_events,
+        campaigns=campaign_by_id,
+    )
 
     latest_cycle_by_campaign_id: dict[int, CapitalCampaignProfitCycle] = {}
     for cycle in profit_cycles:
@@ -382,6 +613,47 @@ async def build_capital_ledger(
     # Research campaigns are included only when independently funded. v1 has no durable funded-allocation table.
     if research_campaigns:
         unavailable_sources.append("research_campaign_allocations")
+
+    for projection in live_projection_rows:
+        campaign = campaign_by_id.get(projection.campaign_id) if projection.campaign_id is not None else None
+        pools.append(
+            CapitalPoolResponse(
+                capital_pool_id=projection.pool_id,
+                capital_pool_type=projection.pool_type,
+                name=projection.pool_name,
+                status=projection.status,
+                starting_capital=None,
+                current_equity=None,
+                allocated_capital=projection.net_quote_capital_effect,
+                available_capital=None,
+                reserved_capital=projection.net_quote_capital_effect,
+                realized_pnl=_zero(),
+                unrealized_pnl=_zero(),
+                pnl_percent=None,
+                started_at=generated_at,
+                completed_at=None,
+                related_entity_type="capital_campaign" if campaign is not None else "live_crypto_order",
+                related_entity_id=str(campaign.uuid) if campaign is not None else "uncategorized",
+                related_page_url=(f"/capital-campaigns/{campaign.uuid}" if campaign is not None else "/capital/ledger"),
+                capital_campaign_uuid=None if campaign is None else str(campaign.uuid),
+                capital_campaign_name=None if campaign is None else campaign.name,
+                capital_campaign_status=None if campaign is None else campaign.status,
+                accounting_source="live",
+                provider_reconciliation_status=projection.provider_reconciliation_status,
+                accounting_projection_status=projection.accounting_projection_status,
+                accounting_completion_status=projection.accounting_completion_status,
+                balance_mismatch_state=projection.balance_mismatch_state,
+                campaign_correlation_status=projection.campaign_correlation_status,
+                filled_quantity=projection.filled_quantity,
+                gross_filled_notional=projection.gross_filled_notional,
+                provider_fees=projection.provider_fees,
+                net_quote_capital_effect=projection.net_quote_capital_effect,
+                live_entry_types=list(projection.live_entry_types),
+                parent_capital_pool_id=None,
+                child_allocations_count=0,
+                notes="Live accounting projection derived from append-only provider reconciliation records.",
+            )
+        )
 
     # Recommendation-only entries do not change top-level managed/equity totals.
     for campaign_id, cycle in latest_cycle_by_campaign_id.items():

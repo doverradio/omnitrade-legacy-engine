@@ -1452,6 +1452,14 @@ class LiveCryptoOrderService:
             provider_status=None if outcome.get("provider_status") is None else str(outcome["provider_status"]),
             provider_order_id=None if outcome.get("provider_order_id") is None else str(outcome["provider_order_id"]),
             provider_fill_observed=bool(outcome.get("provider_fill_observed", False)),
+            campaign_correlation_status=None if outcome.get("campaign_correlation_status") is None else str(outcome.get("campaign_correlation_status")),
+            accounting_projection_status=None if outcome.get("accounting_projection_status") is None else str(outcome.get("accounting_projection_status")),
+            accounting_completion_status=None if outcome.get("accounting_completion_status") is None else str(outcome.get("accounting_completion_status")),
+            balance_mismatch_state=None if outcome.get("balance_mismatch_state") is None else str(outcome.get("balance_mismatch_state")),
+            filled_quantity=None if outcome.get("filled_quantity") is None else str(outcome.get("filled_quantity")),
+            gross_filled_notional=None if outcome.get("gross_filled_notional") is None else str(outcome.get("gross_filled_notional")),
+            provider_fees=None if outcome.get("provider_fees") is None else str(outcome.get("provider_fees")),
+            net_quote_capital_effect=None if outcome.get("net_quote_capital_effect") is None else str(outcome.get("net_quote_capital_effect")),
             safe_provider_response=outcome.get("safe_provider_response", {}),
         )
 

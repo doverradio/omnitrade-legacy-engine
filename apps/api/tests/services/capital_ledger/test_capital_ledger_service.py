@@ -50,6 +50,54 @@ def _campaign(*, campaign_id: int, campaign_uuid: str, name: str, status: str, p
     )
 
 
+def _live_row(
+    *,
+    order_id: str,
+    record_type: str,
+    campaign_id: int | None,
+    fee_currency: str = "USD",
+    filled_quantity: str = "0",
+    gross_notional: str = "0",
+    fee_amount: str = "0",
+):
+    return SimpleNamespace(
+        live_crypto_order_id=uuid.UUID(order_id),
+        record_type=record_type,
+        capital_campaign_id=campaign_id,
+        fee_currency=fee_currency,
+        filled_quantity=Decimal(filled_quantity),
+        gross_notional=Decimal(gross_notional),
+        fee_amount=Decimal(fee_amount),
+        recorded_at=datetime(2026, 7, 10, 0, 0, tzinfo=timezone.utc),
+        created_at=datetime(2026, 7, 10, 0, 0, tzinfo=timezone.utc),
+    )
+
+
+def _live_order(*, order_id: str, campaign_id: int | None = None, completion: str = "complete", balance_state: str = "ok"):
+    payload = {}
+    if campaign_id is not None:
+        payload["capital_campaign_id"] = campaign_id
+    payload["reconciliation"] = {
+        "accounting_completion_status": completion,
+        "balance_mismatch_state": balance_state,
+    }
+    return SimpleNamespace(
+        live_crypto_order_id=uuid.UUID(order_id),
+        provider_status="FILLED",
+        safe_provider_response=payload,
+        created_at=datetime(2026, 7, 10, 0, 0, tzinfo=timezone.utc),
+    )
+
+
+def _live_reconciliation(*, order_id: str, status: str):
+    return SimpleNamespace(
+        live_crypto_order_id=uuid.UUID(order_id),
+        reconciliation_status=status,
+        sequence_number=1,
+        recorded_at=datetime(2026, 7, 10, 0, 0, tzinfo=timezone.utc),
+    )
+
+
 @pytest.mark.asyncio
 async def test_empty_ledger_returns_zero_summary(monkeypatch: pytest.MonkeyPatch) -> None:
     async def _no_runs(_db):
@@ -554,3 +602,150 @@ async def test_capital_ledger_recommendation_rows_do_not_change_managed_capital(
     assert "withdrawal_recommendation" in recommendation_types
     assert "profit_reserve" in recommendation_types
     assert "policy_review" in recommendation_types
+
+
+@pytest.mark.asyncio
+async def test_capital_ledger_projects_live_full_fill_with_fee_and_campaign_link(monkeypatch: pytest.MonkeyPatch) -> None:
+    campaign = _campaign(
+        campaign_id=7,
+        campaign_uuid="77777777-7777-7777-7777-777777777777",
+        name="Live Campaign",
+        status="RUNNING",
+        paper_account_id=None,
+        validation_run_id=None,
+    )
+    order_id = "aaaaaaaa-0000-0000-0000-000000000001"
+
+    async def _none(_db):
+        return []
+
+    async def _capital_campaigns(_db):
+        return [campaign]
+
+    async def _live_rows(_db):
+        return [
+            _live_row(order_id=order_id, record_type="fill_accounting", campaign_id=7, filled_quantity="0.10", gross_notional="500.00", fee_amount="0"),
+            _live_row(order_id=order_id, record_type="fee_attribution", campaign_id=7, fee_amount="1.25"),
+        ]
+
+    async def _live_orders(_db):
+        return [_live_order(order_id=order_id, campaign_id=7, completion="complete", balance_state="ok")]
+
+    async def _live_events(_db):
+        return [_live_reconciliation(order_id=order_id, status="filled")]
+
+    async def _metrics(_db):
+        return {}
+
+    async def _trade_counts(_db):
+        return {}
+
+    monkeypatch.setattr(service, "_load_validation_runs", _none)
+    monkeypatch.setattr(service, "_load_paper_accounts", _none)
+    monkeypatch.setattr(service, "_load_research_campaigns", _none)
+    monkeypatch.setattr(service, "_load_capital_campaigns", _capital_campaigns)
+    monkeypatch.setattr(service, "_load_profit_cycles", _none)
+    monkeypatch.setattr(service, "_load_validation_run_metrics", _metrics)
+    monkeypatch.setattr(service, "_load_trade_counts_by_account", _trade_counts)
+    monkeypatch.setattr(service, "_load_live_accounting_records", _live_rows)
+    monkeypatch.setattr(service, "_load_live_orders", _live_orders)
+    monkeypatch.setattr(service, "_load_live_reconciliation_events", _live_events)
+
+    result = await service.build_capital_ledger(db=_DummySession())
+
+    live_pool = next(item for item in result.capital_pools if item.capital_pool_type == "live_campaign")
+    assert live_pool.accounting_source == "live"
+    assert live_pool.filled_quantity == Decimal("0.10")
+    assert live_pool.gross_filled_notional == Decimal("500.00")
+    assert live_pool.provider_fees == Decimal("1.25")
+    assert live_pool.net_quote_capital_effect == Decimal("501.25")
+    assert live_pool.campaign_correlation_status == "verified"
+    assert live_pool.accounting_completion_status == "complete"
+
+
+@pytest.mark.asyncio
+async def test_capital_ledger_projects_canceled_unfilled_as_no_deployment(monkeypatch: pytest.MonkeyPatch) -> None:
+    order_id = "aaaaaaaa-0000-0000-0000-000000000002"
+
+    async def _none(_db):
+        return []
+
+    async def _live_rows(_db):
+        return []
+
+    async def _live_orders(_db):
+        return [_live_order(order_id=order_id, campaign_id=None, completion="complete", balance_state="not_required")]
+
+    async def _live_events(_db):
+        return [_live_reconciliation(order_id=order_id, status="canceled")]
+
+    async def _metrics(_db):
+        return {}
+
+    async def _trade_counts(_db):
+        return {}
+
+    monkeypatch.setattr(service, "_load_validation_runs", _none)
+    monkeypatch.setattr(service, "_load_paper_accounts", _none)
+    monkeypatch.setattr(service, "_load_research_campaigns", _none)
+    monkeypatch.setattr(service, "_load_capital_campaigns", _none)
+    monkeypatch.setattr(service, "_load_profit_cycles", _none)
+    monkeypatch.setattr(service, "_load_validation_run_metrics", _metrics)
+    monkeypatch.setattr(service, "_load_trade_counts_by_account", _trade_counts)
+    monkeypatch.setattr(service, "_load_live_accounting_records", _live_rows)
+    monkeypatch.setattr(service, "_load_live_orders", _live_orders)
+    monkeypatch.setattr(service, "_load_live_reconciliation_events", _live_events)
+
+    result = await service.build_capital_ledger(db=_DummySession())
+
+    uncategorized = next(item for item in result.capital_pools if item.capital_pool_type == "live_uncategorized")
+    assert uncategorized.net_quote_capital_effect == Decimal("0")
+    assert uncategorized.accounting_projection_status == "not_projected"
+    assert "cancellation_no_fill" in (uncategorized.live_entry_types or [])
+
+
+@pytest.mark.asyncio
+async def test_capital_ledger_flags_campaign_mismatch_and_is_deterministic(monkeypatch: pytest.MonkeyPatch) -> None:
+    order_id = "aaaaaaaa-0000-0000-0000-000000000003"
+
+    async def _none(_db):
+        return []
+
+    async def _live_rows(_db):
+        return [
+            _live_row(order_id=order_id, record_type="fill_accounting", campaign_id=10, filled_quantity="0.05", gross_notional="250.00"),
+            _live_row(order_id=order_id, record_type="fee_attribution", campaign_id=11, fee_amount="0.25"),
+        ]
+
+    async def _live_orders(_db):
+        return [_live_order(order_id=order_id, campaign_id=None, completion="unresolved", balance_state="material_mismatch")]
+
+    async def _live_events(_db):
+        return [_live_reconciliation(order_id=order_id, status="balance_mismatch")]
+
+    async def _metrics(_db):
+        return {}
+
+    async def _trade_counts(_db):
+        return {}
+
+    monkeypatch.setattr(service, "_load_validation_runs", _none)
+    monkeypatch.setattr(service, "_load_paper_accounts", _none)
+    monkeypatch.setattr(service, "_load_research_campaigns", _none)
+    monkeypatch.setattr(service, "_load_capital_campaigns", _none)
+    monkeypatch.setattr(service, "_load_profit_cycles", _none)
+    monkeypatch.setattr(service, "_load_validation_run_metrics", _metrics)
+    monkeypatch.setattr(service, "_load_trade_counts_by_account", _trade_counts)
+    monkeypatch.setattr(service, "_load_live_accounting_records", _live_rows)
+    monkeypatch.setattr(service, "_load_live_orders", _live_orders)
+    monkeypatch.setattr(service, "_load_live_reconciliation_events", _live_events)
+
+    first = await service.build_capital_ledger(db=_DummySession())
+    second = await service.build_capital_ledger(db=_DummySession())
+
+    first_pool = next(item for item in first.capital_pools if item.capital_pool_type == "live_uncategorized")
+    second_pool = next(item for item in second.capital_pools if item.capital_pool_type == "live_uncategorized")
+    assert first_pool.campaign_correlation_status == "mismatch"
+    assert first_pool.balance_mismatch_state == "material_mismatch"
+    assert first_pool.accounting_completion_status == "unresolved"
+    assert first_pool.net_quote_capital_effect == second_pool.net_quote_capital_effect

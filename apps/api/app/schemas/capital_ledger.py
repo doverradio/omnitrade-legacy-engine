@@ -12,6 +12,8 @@ CapitalPoolType = Literal[
     "paper_account",
     "validation_run",
     "research_campaign",
+    "live_campaign",
+    "live_uncategorized",
     "strategy_allocation",
     "position",
     "compounding_recommendation",
@@ -75,6 +77,17 @@ class CapitalPoolResponse(BaseModel):
     capital_campaign_uuid: str | None = None
     capital_campaign_name: str | None = None
     capital_campaign_status: str | None = None
+    accounting_source: Literal["paper", "live"] | None = None
+    provider_reconciliation_status: str | None = None
+    accounting_projection_status: str | None = None
+    accounting_completion_status: str | None = None
+    balance_mismatch_state: str | None = None
+    campaign_correlation_status: str | None = None
+    filled_quantity: Decimal | None = None
+    gross_filled_notional: Decimal | None = None
+    provider_fees: Decimal | None = None
+    net_quote_capital_effect: Decimal | None = None
+    live_entry_types: list[str] | None = None
     parent_capital_pool_id: str | None = None
     child_allocations_count: int
     notes: str | None = None
@@ -87,6 +100,10 @@ class CapitalPoolResponse(BaseModel):
         "reserved_capital",
         "realized_pnl",
         "unrealized_pnl",
+        "filled_quantity",
+        "gross_filled_notional",
+        "provider_fees",
+        "net_quote_capital_effect",
         when_used="json",
     )
     def serialize_optional_decimal_fields(self, value: Decimal | None) -> str | None:

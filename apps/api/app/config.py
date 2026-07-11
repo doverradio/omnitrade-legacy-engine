@@ -65,6 +65,10 @@ class Settings(BaseSettings):
         default=30,
         validation_alias="LIVE_CRYPTO_PRICE_MAX_AGE_SECONDS",
     )
+    live_crypto_accounting_balance_tolerance_usd: Decimal = Field(
+        default=Decimal("0.01"),
+        validation_alias="LIVE_CRYPTO_ACCOUNTING_BALANCE_TOLERANCE_USD",
+    )
     research_evolution_enabled: bool = Field(default=True, validation_alias="RESEARCH_EVOLUTION_ENABLED")
     research_cycle_interval_minutes: int = Field(default=30, validation_alias="RESEARCH_CYCLE_INTERVAL_MINUTES")
     research_max_candidates_per_cycle: int = Field(default=6, validation_alias="RESEARCH_MAX_CANDIDATES_PER_CYCLE")
