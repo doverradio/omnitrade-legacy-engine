@@ -5,12 +5,12 @@ import asyncio
 import getpass
 import inspect
 import os
-import re
 import traceback
 from decimal import Decimal
 from uuid import UUID
 
 from app.config import get_settings
+from app.core.redaction import redact_message_for_diagnostics
 from app.db.session import AsyncSessionLocal
 from app.services.live_crypto_environment import (
     GeneratePreviewHelperRequest,
@@ -133,22 +133,6 @@ def _extract_failure_stage(exc: Exception) -> str:
                     return value
         current = current.__cause__
     return "unknown"
-
-
-def _sanitize_exception_message(message: str) -> str:
-    if not message:
-        return ""
-    patterns = [
-        r"(?i)(api[_ ]?key\s*[=:]\s*)([^\s,;]+)",
-        r"(?i)(api[_ ]?secret\s*[=:]\s*)([^\s,;]+)",
-        r"(?i)(private[_ ]?key\s*[=:]\s*)([^\s,;]+)",
-        r"(?i)(passphrase\s*[=:]\s*)([^\s,;]+)",
-        r"(?i)(token\s*[=:]\s*)([^\s,;]+)",
-    ]
-    redacted = message
-    for pattern in patterns:
-        redacted = re.sub(pattern, r"\1<redacted>", redacted)
-    return redacted
 
 
 def _origin_location(exc: Exception) -> tuple[str, str, int]:
@@ -323,7 +307,7 @@ async def _run(args: argparse.Namespace) -> int:
             print(f"error_type={type(exc).__name__}")
             failure_stage = _extract_failure_stage(exc)
             filename, function_name, line_number = _origin_location(exc)
-            safe_message = _sanitize_exception_message(str(exc))
+            safe_message = redact_message_for_diagnostics(str(exc))
             print(f"failure_stage={failure_stage}")
             print(f"exception={type(exc).__name__}")
             print(f"message={safe_message}")

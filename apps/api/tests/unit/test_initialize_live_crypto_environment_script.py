@@ -345,10 +345,18 @@ async def test_script_failure_output_redacts_secret_values(monkeypatch: pytest.M
         )
     )
 
-    captured = capsys.readouterr().out
+    captured_io = capsys.readouterr()
+    captured = captured_io.out
     assert result == 1
     assert "initialization_failed" in captured
+    assert "error_type=RuntimeError" in captured
+    assert "failure_stage=" in captured
+    assert "exception=RuntimeError" in captured
+    assert "message=" in captured
+    assert "originating_function=" in captured
+    assert "location=" in captured
     assert "super-secret-private-key" not in captured
+    assert "super-secret-private-key" not in captured_io.err
 
 
 @pytest.mark.asyncio
