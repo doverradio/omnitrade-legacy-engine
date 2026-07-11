@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from contextlib import asynccontextmanager, nullcontext
 from datetime import datetime, timezone
 from typing import Any
 import uuid
@@ -29,6 +30,17 @@ from app.services.research_memory.interface import (
 )
 
 
+@asynccontextmanager
+async def _transaction_scope(db: AsyncSession):
+    if not hasattr(db, "begin") or not hasattr(db, "in_transaction"):
+        yield
+        return
+
+    manager = db.begin_nested() if db.in_transaction() else db.begin()
+    async with manager:
+        yield
+
+
 class ResearchPersistenceRepository:
     async def record_laboratory_run(
         self,
@@ -39,82 +51,87 @@ class ResearchPersistenceRepository:
         evaluations: list[CandidateEvaluation],
         campaign_id: uuid.UUID | None = None,
     ) -> None:
-        run_row = ResearchLaboratoryRunModel(
-            run_id=run.laboratory_run_id,
-            started_at=run.started_at,
-            completed_at=run.completed_at,
-            participating_agents=list(run.participating_agents),
-            status=run.status,
-            generated_candidates=run.generated_candidates,
-            evaluated_candidates=run.evaluated_candidates,
-            metadata_json={},
-        )
-        db.add(run_row)
+        async with _transaction_scope(db):
+            run_row = ResearchLaboratoryRunModel(
+                run_id=run.laboratory_run_id,
+                started_at=run.started_at,
+                completed_at=run.completed_at,
+                participating_agents=list(run.participating_agents),
+                status=run.status,
+                generated_candidates=run.generated_candidates,
+                evaluated_candidates=run.evaluated_candidates,
+                metadata_json={},
+            )
+            db.add(run_row)
+            # Persist the parent before any child row or query-triggered autoflush can reference it.
+            await db.flush()
 
-        for agent_name in run.participating_agents:
-            db.add(
-                ResearchAgentActivityModel(
-                    laboratory_run_id=run.laboratory_run_id,
-                    campaign_id=campaign_id,
-                    agent_name=agent_name,
-                    activity_type="laboratory_participation",
-                    metadata_json={"status": run.status},
+            no_autoflush = getattr(db, "no_autoflush", nullcontext())
+            with no_autoflush:
+                for agent_name in run.participating_agents:
+                    db.add(
+                        ResearchAgentActivityModel(
+                            laboratory_run_id=run.laboratory_run_id,
+                            campaign_id=campaign_id,
+                            agent_name=agent_name,
+                            activity_type="laboratory_participation",
+                            metadata_json={"status": run.status},
+                        )
+                    )
+
+                evaluation_map = {item.candidate_id: item for item in evaluations}
+                for candidate in candidates:
+                    evaluation = evaluation_map.get(candidate.candidate_id)
+                    row = await self._upsert_candidate(
+                        db=db,
+                        candidate_id=candidate.candidate_id,
+                        laboratory_run_id=run.laboratory_run_id,
+                        campaign_id=campaign_id,
+                        parent_candidate_id=None,
+                        originating_agent=candidate.originating_agent,
+                        strategy_name=candidate.strategy_name,
+                        description=candidate.description,
+                        parameter_set=dict(candidate.parameter_set),
+                        rationale=candidate.rationale,
+                        status="EVALUATED" if evaluation is not None else candidate.status,
+                        generation=1,
+                        mutation_reason=None,
+                        parameter_diff=[],
+                        generated_at=candidate.generated_at,
+                    )
+                    if evaluation is not None:
+                        await self._record_evaluation(
+                            db=db,
+                            evaluation=evaluation,
+                            candidate_id=row.candidate_id,
+                            laboratory_run_id=run.laboratory_run_id,
+                        )
+
+                    db.add(
+                        ResearchMemoryEntryModel(
+                            entry_type="laboratory_candidate",
+                            laboratory_run_id=run.laboratory_run_id,
+                            candidate_id=row.candidate_id,
+                            payload={
+                                "originating_agent": row.originating_agent,
+                                "strategy_name": row.strategy_name,
+                                "status": row.status,
+                            },
+                        )
+                    )
+
+                db.add(
+                    ResearchMemoryEntryModel(
+                        entry_type="laboratory_run",
+                        laboratory_run_id=run.laboratory_run_id,
+                        candidate_id=None,
+                        payload={
+                            "status": run.status,
+                            "generated_candidates": run.generated_candidates,
+                            "evaluated_candidates": run.evaluated_candidates,
+                        },
+                    )
                 )
-            )
-
-        evaluation_map = {item.candidate_id: item for item in evaluations}
-        for candidate in candidates:
-            evaluation = evaluation_map.get(candidate.candidate_id)
-            row = await self._upsert_candidate(
-                db=db,
-                candidate_id=candidate.candidate_id,
-                laboratory_run_id=run.laboratory_run_id,
-                campaign_id=campaign_id,
-                parent_candidate_id=None,
-                originating_agent=candidate.originating_agent,
-                strategy_name=candidate.strategy_name,
-                description=candidate.description,
-                parameter_set=dict(candidate.parameter_set),
-                rationale=candidate.rationale,
-                status="EVALUATED" if evaluation is not None else candidate.status,
-                generation=1,
-                mutation_reason=None,
-                parameter_diff=[],
-                generated_at=candidate.generated_at,
-            )
-            if evaluation is not None:
-                await self._record_evaluation(
-                    db=db,
-                    evaluation=evaluation,
-                    candidate_id=row.candidate_id,
-                    laboratory_run_id=run.laboratory_run_id,
-                )
-
-            db.add(
-                ResearchMemoryEntryModel(
-                    entry_type="laboratory_candidate",
-                    laboratory_run_id=run.laboratory_run_id,
-                    candidate_id=row.candidate_id,
-                    payload={
-                        "originating_agent": row.originating_agent,
-                        "strategy_name": row.strategy_name,
-                        "status": row.status,
-                    },
-                )
-            )
-
-        db.add(
-            ResearchMemoryEntryModel(
-                entry_type="laboratory_run",
-                laboratory_run_id=run.laboratory_run_id,
-                candidate_id=None,
-                payload={
-                    "status": run.status,
-                    "generated_candidates": run.generated_candidates,
-                    "evaluated_candidates": run.evaluated_candidates,
-                },
-            )
-        )
 
     async def record_evolved_candidates(
         self,

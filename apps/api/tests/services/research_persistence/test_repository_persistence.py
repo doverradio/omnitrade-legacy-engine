@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 import uuid
 
@@ -69,6 +70,129 @@ class _FakeDb:
                     return stats
             return None
         return None
+
+
+class _TransactionalFakeDb:
+    def __init__(self, *, fail_flush_on_type: str | None = None, fail_once: bool = False) -> None:
+        self._pending: list[object] = []
+        self._persisted: dict[str, list[object]] = {}
+        self._autoflush_enabled = True
+        self._transaction_depth = 0
+        self._snapshots: list[tuple[list[object], dict[str, list[object]], list[tuple[str, ...]], int]] = []
+        self.fail_flush_on_type = fail_flush_on_type
+        self.fail_once = fail_once
+        self.flush_history: list[tuple[str, ...]] = []
+        self.autoflush_count = 0
+        self.flush_count = 0
+
+    def add(self, obj: object) -> None:
+        self._pending.append(obj)
+
+    @property
+    def no_autoflush(self):
+        db = self
+
+        class _NoAutoflush:
+            def __enter__(self):
+                db._autoflush_enabled = False
+                return None
+
+            def __exit__(self, exc_type, exc, tb):
+                db._autoflush_enabled = True
+                return False
+
+        return _NoAutoflush()
+
+    def in_transaction(self) -> bool:
+        return self._transaction_depth > 0
+
+    @asynccontextmanager
+    async def begin(self):
+        async with self._transaction_context():
+            yield self
+
+    @asynccontextmanager
+    async def begin_nested(self):
+        async with self._transaction_context():
+            yield self
+
+    @asynccontextmanager
+    async def _transaction_context(self):
+        pending_snapshot = list(self._pending)
+        persisted_snapshot = {key: list(value) for key, value in self._persisted.items()}
+        flush_history_len = len(self.flush_history)
+        autoflush_snapshot = self.autoflush_count
+        self._transaction_depth += 1
+        self._snapshots.append((pending_snapshot, persisted_snapshot, list(self.flush_history), autoflush_snapshot))
+        try:
+            yield self
+        except Exception:
+            self._pending = pending_snapshot
+            self._persisted = persisted_snapshot
+            self.flush_history = self.flush_history[:flush_history_len]
+            self.autoflush_count = autoflush_snapshot
+            raise
+        else:
+            if self._pending:
+                await self.flush()
+        finally:
+            self._snapshots.pop()
+            self._transaction_depth -= 1
+
+    async def flush(self) -> None:
+        self.flush_count += 1
+        batch = tuple(obj.__class__.__name__ for obj in self._pending)
+        self.flush_history.append(batch)
+
+        if self.fail_flush_on_type is not None and any(item == self.fail_flush_on_type for item in batch):
+            if not self.fail_once or self.fail_flush_on_type is not None:
+                failing_type = self.fail_flush_on_type
+                if self.fail_once:
+                    self.fail_flush_on_type = None
+                raise RuntimeError(f"forced flush failure for {failing_type}")
+
+        persisted_run_ids = {
+            getattr(item, "run_id")
+            for item in self._persisted.get("ResearchLaboratoryRun", [])
+        }
+        for obj in self._pending:
+            if obj.__class__.__name__ == "ResearchAgentActivity":
+                if getattr(obj, "laboratory_run_id") not in persisted_run_ids and not any(
+                    pending.__class__.__name__ == "ResearchLaboratoryRun" and getattr(pending, "run_id") == getattr(obj, "laboratory_run_id")
+                    for pending in self._pending
+                ):
+                    raise RuntimeError("child flush attempted before parent laboratory run persisted")
+
+        pending_now = list(self._pending)
+        self._pending.clear()
+        for obj in pending_now:
+            self._persisted.setdefault(obj.__class__.__name__, []).append(obj)
+
+    async def scalar(self, statement):
+        if self._autoflush_enabled and self._pending:
+            self.autoflush_count += 1
+            await self.flush()
+
+        sql = str(statement)
+        if "FROM research_candidates" in sql:
+            for candidate in self._persisted.get("ResearchCandidate", []):
+                if str(candidate.candidate_id) in sql:
+                    return candidate
+            return None
+        if "FROM research_candidate_evaluations" in sql:
+            for evaluation in self._persisted.get("ResearchCandidateEvaluation", []):
+                if str(evaluation.evaluation_id) in sql:
+                    return evaluation
+            return None
+        if "FROM research_candidate_lineage" in sql:
+            for lineage in self._persisted.get("ResearchCandidateLineage", []):
+                if str(lineage.candidate_id) in sql:
+                    return lineage
+            return None
+        return None
+
+    def persisted(self, class_name: str) -> list[object]:
+        return list(self._persisted.get(class_name, []))
 
 
 def _run() -> ResearchLaboratoryRun:
@@ -145,6 +269,149 @@ async def test_record_laboratory_run_persists_candidates_runs_and_memory_entries
     assert "research_laboratory_runs" in tables
     assert "research_candidates" in tables
     assert "research_memory_entries" in tables
+
+
+@pytest.mark.asyncio
+async def test_record_laboratory_run_flushes_parent_before_child_activity_rows() -> None:
+    db = _TransactionalFakeDb()
+    repository = ResearchPersistenceRepository()
+    candidate_id = uuid.uuid4()
+
+    await repository.record_laboratory_run(
+        db=db,
+        run=_run(),
+        candidates=[_candidate(candidate_id)],
+        evaluations=[_evaluation(candidate_id)],
+        campaign_id=uuid.uuid4(),
+    )
+
+    assert db.flush_history[0] == ("ResearchLaboratoryRun",)
+    assert len(db.persisted("ResearchAgentActivity")) == 1
+
+
+@pytest.mark.asyncio
+async def test_record_laboratory_run_persists_multiple_activity_rows() -> None:
+    db = _TransactionalFakeDb()
+    repository = ResearchPersistenceRepository()
+    run = ResearchLaboratoryRun(
+        laboratory_run_id=uuid.uuid4(),
+        started_at=datetime(2026, 7, 10, 10, 0, tzinfo=timezone.utc),
+        completed_at=datetime(2026, 7, 10, 10, 1, tzinfo=timezone.utc),
+        participating_agents=("Baseline Research Agent", "OpenAI Sandbox"),
+        generated_candidates=0,
+        evaluated_candidates=0,
+        status="COMPLETED",
+    )
+
+    await repository.record_laboratory_run(
+        db=db,
+        run=run,
+        candidates=[],
+        evaluations=[],
+        campaign_id=uuid.uuid4(),
+    )
+
+    activities = db.persisted("ResearchAgentActivity")
+    assert len(activities) == 2
+    assert {item.agent_name for item in activities} == {"Baseline Research Agent", "OpenAI Sandbox"}
+    assert {item.laboratory_run_id for item in activities} == {run.laboratory_run_id}
+
+
+@pytest.mark.asyncio
+async def test_candidate_queries_do_not_trigger_premature_autoflush() -> None:
+    db = _TransactionalFakeDb()
+    repository = ResearchPersistenceRepository()
+    candidate_id = uuid.uuid4()
+
+    await repository.record_laboratory_run(
+        db=db,
+        run=_run(),
+        candidates=[_candidate(candidate_id)],
+        evaluations=[_evaluation(candidate_id)],
+        campaign_id=uuid.uuid4(),
+    )
+
+    assert db.autoflush_count == 0
+    assert db.flush_count >= 2
+
+
+@pytest.mark.asyncio
+async def test_failure_after_parent_flush_rolls_back_complete_laboratory_write() -> None:
+    db = _TransactionalFakeDb(fail_flush_on_type="ResearchCandidate")
+    repository = ResearchPersistenceRepository()
+    candidate_id = uuid.uuid4()
+
+    with pytest.raises(RuntimeError, match="forced flush failure"):
+        await repository.record_laboratory_run(
+            db=db,
+            run=_run(),
+            candidates=[_candidate(candidate_id)],
+            evaluations=[_evaluation(candidate_id)],
+            campaign_id=uuid.uuid4(),
+        )
+
+    assert db.persisted("ResearchLaboratoryRun") == []
+    assert db.persisted("ResearchAgentActivity") == []
+    assert db.persisted("ResearchCandidate") == []
+    assert db.persisted("ResearchMemoryEntry") == []
+
+
+@pytest.mark.asyncio
+async def test_session_remains_usable_after_rollback() -> None:
+    db = _TransactionalFakeDb(fail_flush_on_type="ResearchCandidate", fail_once=True)
+    repository = ResearchPersistenceRepository()
+    candidate_id = uuid.uuid4()
+
+    with pytest.raises(RuntimeError, match="forced flush failure"):
+        await repository.record_laboratory_run(
+            db=db,
+            run=_run(),
+            candidates=[_candidate(candidate_id)],
+            evaluations=[_evaluation(candidate_id)],
+            campaign_id=uuid.uuid4(),
+        )
+
+    retry_candidate_id = uuid.uuid4()
+    await repository.record_laboratory_run(
+        db=db,
+        run=_run(),
+        candidates=[_candidate(retry_candidate_id)],
+        evaluations=[_evaluation(retry_candidate_id)],
+        campaign_id=uuid.uuid4(),
+    )
+
+    assert len(db.persisted("ResearchLaboratoryRun")) == 1
+    assert len(db.persisted("ResearchAgentActivity")) == 1
+    assert len(db.persisted("ResearchCandidate")) == 1
+
+
+@pytest.mark.asyncio
+async def test_successful_retry_after_rollback_persists_single_completed_run() -> None:
+    db = _TransactionalFakeDb(fail_flush_on_type="ResearchCandidate", fail_once=True)
+    repository = ResearchPersistenceRepository()
+    run = _run()
+    candidate_id = uuid.uuid4()
+
+    with pytest.raises(RuntimeError, match="forced flush failure"):
+        await repository.record_laboratory_run(
+            db=db,
+            run=run,
+            candidates=[_candidate(candidate_id)],
+            evaluations=[_evaluation(candidate_id)],
+            campaign_id=uuid.uuid4(),
+        )
+
+    await repository.record_laboratory_run(
+        db=db,
+        run=run,
+        candidates=[_candidate(candidate_id)],
+        evaluations=[_evaluation(candidate_id)],
+        campaign_id=uuid.uuid4(),
+    )
+
+    persisted_runs = db.persisted("ResearchLaboratoryRun")
+    assert len(persisted_runs) == 1
+    assert persisted_runs[0].run_id == run.laboratory_run_id
 
 
 @pytest.mark.asyncio
