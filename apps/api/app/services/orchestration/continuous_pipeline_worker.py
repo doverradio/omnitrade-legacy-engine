@@ -41,6 +41,20 @@ from app.services.strategies.registry import StrategyLookupError
 
 logger = logging.getLogger(__name__)
 
+_RESEARCH_STATUS_EVENT_TYPES = {
+    "disabled": "RESEARCH_CYCLE_DISABLED",
+    "skipped": "RESEARCH_CYCLE_SKIPPED",
+    "successful": "RESEARCH_CYCLE_SUCCEEDED",
+    "failed": "RESEARCH_CYCLE_FAILED",
+}
+
+_RESEARCH_STATUS_SEVERITIES = {
+    "disabled": "yellow",
+    "skipped": "blue",
+    "successful": "green",
+    "failed": "red",
+}
+
 
 @dataclass(frozen=True, slots=True)
 class WorkerConfig:
@@ -256,6 +270,73 @@ async def _produce_research_evidence(
 
     quality_result = evaluate_replay_result_v0(replay_result=replay_result)
     _ = evaluate_decision_quality_v0(decision_quality_result=quality_result)
+
+
+def _safe_research_failure_reason(exc: Exception) -> str:
+    return f"research_cycle_exception:{exc.__class__.__name__}"
+
+
+async def _rollback_active_session(*, db: AsyncSession) -> None:
+    if not hasattr(db, "rollback"):
+        return
+    await db.rollback()
+
+
+async def _record_research_cycle_status(
+    *,
+    db: AsyncSession,
+    status: str,
+    reason: str | None,
+    campaign_id: uuid.UUID | None,
+    candidates_generated: int,
+    candidates_evaluated: int,
+    descendants_generated: int,
+    champion: str | None,
+    error_type: str | None = None,
+) -> None:
+    recorded_at = datetime.now().astimezone()
+    after_state = {
+        "status": status,
+        "reason": reason,
+        "campaign_id": str(campaign_id) if campaign_id is not None else None,
+        "candidates_generated": candidates_generated,
+        "candidates_evaluated": candidates_evaluated,
+        "descendants_generated": descendants_generated,
+        "champion": champion,
+        "error_type": error_type,
+        "recorded_at": recorded_at.isoformat(),
+    }
+    db.add(
+        AuditLog(
+            actor="orchestration_worker",
+            action=f"research_cycle_{status}",
+            entity_type="research_cycle",
+            entity_id=campaign_id,
+            before_state=None,
+            after_state=after_state,
+        )
+    )
+
+    validation_run_ids = await _load_active_validation_run_ids(db=db)
+    if not validation_run_ids:
+        return
+
+    event_type = _RESEARCH_STATUS_EVENT_TYPES[status]
+    event_payload = {
+        "severity": _RESEARCH_STATUS_SEVERITIES[status],
+        "title": f"Research Cycle {status.title()}",
+        "description": reason or f"Research cycle {status}.",
+        "metadata": after_state,
+    }
+    for validation_run_id in validation_run_ids:
+        db.add(
+            ValidationRunEvent(
+                validation_run_id=validation_run_id,
+                event_type=event_type,
+                message=str(event_payload["description"]),
+                payload=event_payload,
+            )
+        )
 
 
 def _to_strategy_context(
@@ -544,13 +625,44 @@ async def run_orchestration_cycle(
     research_cycles_started = 0
     try:
         research_cycle_result = await run_deterministic_research_cycle_if_due(db=db)
-    except Exception:
+    except Exception as exc:
+        await _rollback_active_session(db=db)
+        failure_reason = _safe_research_failure_reason(exc)
+        await _record_research_cycle_status(
+            db=db,
+            status="failed",
+            reason=failure_reason,
+            campaign_id=None,
+            candidates_generated=0,
+            candidates_evaluated=0,
+            descendants_generated=0,
+            champion=None,
+            error_type=exc.__class__.__name__,
+        )
+        await db.commit()
         logger.exception("Deterministic research cycle failed; continuing orchestration cycle without research outputs")
         research_cycle_result = None
     else:
         if research_cycle_result.started:
             await db.commit()
             research_cycles_started = 1
+            research_status = "successful"
+        elif research_cycle_result.reason == "research_disabled":
+            research_status = "disabled"
+        else:
+            research_status = "skipped"
+
+        await _record_research_cycle_status(
+            db=db,
+            status=research_status,
+            reason=research_cycle_result.reason,
+            campaign_id=research_cycle_result.campaign_id,
+            candidates_generated=research_cycle_result.candidates_generated,
+            candidates_evaluated=research_cycle_result.candidates_evaluated,
+            descendants_generated=research_cycle_result.descendants_generated,
+            champion=research_cycle_result.champion,
+        )
+        await db.commit()
         logger.info(
             "research_cycle_check started=%s reason=%s campaign_id=%s candidates_generated=%s candidates_evaluated=%s descendants_generated=%s champion=%s",
             research_cycle_result.started,

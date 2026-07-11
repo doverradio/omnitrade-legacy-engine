@@ -63,6 +63,10 @@ class _DurableCountsSession:
             return _ResultWithScalar(None)
         if "FROM research_campaign_statistics" in sql:
             return _ResultWithScalar(None)
+        if "FROM audit_log" in sql and "ORDER BY created_at DESC" in sql:
+            return _ResultWithScalar(None)
+        if "FROM audit_log" in sql and "action = 'research_cycle_failed'" in sql:
+            return _ResultWithScalar({"failure_count": 0})
         return _ResultWithScalar(0)
 
     async def scalar(self, _statement):
@@ -149,3 +153,71 @@ def test_operations_status_uses_durable_research_record_counts(monkeypatch) -> N
     assert monitoring["laboratory_runs"] == 5
     assert monitoring["evolution_count"] == 4
     assert monitoring["research_memory_growth"] == 6
+
+
+class _ResearchFailureStatusSession(_DurableCountsSession):
+    async def execute(self, statement, params=None):
+        sql = str(statement)
+        if "FROM audit_log" in sql and "ORDER BY created_at DESC" in sql:
+            return _ResultWithScalar(
+                {
+                    "after_state": {
+                        "status": "failed",
+                        "reason": "research_cycle_exception:RuntimeError",
+                        "recorded_at": "2026-07-10T12:00:00+00:00",
+                    },
+                    "created_at": datetime(2026, 7, 10, 12, 0, tzinfo=timezone.utc),
+                }
+            )
+        if "FROM audit_log" in sql and "action = 'research_cycle_failed'" in sql:
+            return _ResultWithScalar({"failure_count": 2})
+        return await super().execute(statement, params=params)
+
+
+def test_operations_status_surfaces_research_failure_visibility(monkeypatch) -> None:
+    app = create_app()
+    fake_db = _ResearchFailureStatusSession()
+
+    async def _read(operation, *, operation_name):
+        _ = operation_name
+        return await operation(fake_db)
+
+    async def _paper_equity_stub(*_args, **_kwargs):
+        return Decimal("25")
+
+    monkeypatch.setattr("app.api.routes.operations.run_read_with_retry", _read)
+    monkeypatch.setattr("app.services.operations_status._get_paper_equity", _paper_equity_stub)
+
+    with TestClient(app) as client:
+        response = client.get("/operations/status")
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["overall_health"] == "yellow"
+    assert payload["research_status"]["last_cycle_status"] == "failed"
+    assert payload["research_status"]["last_cycle_reason"] == "research_cycle_exception:RuntimeError"
+    assert payload["research_status"]["recent_failure_count"] == 2
+    assert any(item["code"] == "research_cycle_failures" for item in payload["alerts"])
+
+
+def test_operations_status_surfaces_research_disabled_state(monkeypatch) -> None:
+    app = create_app()
+    fake_db = _DurableCountsSession()
+
+    async def _read(operation, *, operation_name):
+        _ = operation_name
+        return await operation(fake_db)
+
+    async def _paper_equity_stub(*_args, **_kwargs):
+        return Decimal("25")
+
+    monkeypatch.setattr("app.api.routes.operations.run_read_with_retry", _read)
+    monkeypatch.setattr("app.services.operations_status._get_paper_equity", _paper_equity_stub)
+    monkeypatch.setattr("app.services.operations_status.get_settings", lambda: type("Settings", (), {"research_evolution_enabled": False})())
+
+    with TestClient(app) as client:
+        response = client.get("/operations/status")
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["research_status"]["feature_state"] == "disabled"

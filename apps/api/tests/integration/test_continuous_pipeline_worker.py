@@ -7,6 +7,7 @@ from decimal import Decimal
 from types import SimpleNamespace
 
 import pytest
+from sqlalchemy.exc import PendingRollbackError
 
 from app.services.orchestration.continuous_pipeline_worker import WorkerConfig, run_orchestration_cycle
 from app.services.strategies.base import Signal
@@ -17,6 +18,7 @@ class _FakeDB:
     def __init__(self) -> None:
         self.added: list[object] = []
         self.commits = 0
+        self.rollbacks = 0
 
     def add(self, obj: object) -> None:
         self.added.append(obj)
@@ -28,6 +30,41 @@ class _FakeDB:
 
     async def commit(self) -> None:
         self.commits += 1
+
+    async def rollback(self) -> None:
+        self.rollbacks += 1
+
+
+class _RecoveryAwareDB(_FakeDB):
+    def __init__(self) -> None:
+        super().__init__()
+        self.pending: list[object] = []
+        self.committed: list[object] = []
+        self.failed_transaction = False
+        self.snapshot_writes = 0
+
+    def add(self, obj: object) -> None:
+        if self.failed_transaction:
+            raise PendingRollbackError("research transaction pending rollback", None, None)
+        self.added.append(obj)
+        self.pending.append(obj)
+
+    async def flush(self) -> None:
+        if self.failed_transaction:
+            raise PendingRollbackError("research transaction pending rollback", None, None)
+        await super().flush()
+
+    async def commit(self) -> None:
+        if self.failed_transaction:
+            raise PendingRollbackError("research transaction pending rollback", None, None)
+        self.commits += 1
+        self.committed.extend(self.pending)
+        self.pending.clear()
+
+    async def rollback(self) -> None:
+        self.rollbacks += 1
+        self.failed_transaction = False
+        self.pending.clear()
 
 
 class _FixedStrategy:
@@ -442,6 +479,160 @@ async def test_worker_isolates_research_cycle_failures(monkeypatch: pytest.Monke
 
     assert stats.ingestion_assets_ok == 1
     assert stats.research_cycles_started == 0
+    assert db.rollbacks == 1
+
+
+@pytest.mark.asyncio
+async def test_research_failure_triggers_rollback_and_later_operation_succeeds(monkeypatch: pytest.MonkeyPatch) -> None:
+    db = _RecoveryAwareDB()
+
+    async def _raise_research(*_args, **_kwargs):
+        db.add(SimpleNamespace(__class__=SimpleNamespace(__name__="ResearchLaboratoryRun"), kind="research_parent"))
+        db.add(SimpleNamespace(__class__=SimpleNamespace(__name__="ResearchAgentActivity"), kind="research_child"))
+        db.failed_transaction = True
+        raise RuntimeError("forced research persistence failure")
+
+    async def _snapshot_after_failure(*, db):
+        db.add(SimpleNamespace(kind="snapshot_record"))
+        db.snapshot_writes += 1
+        return SimpleNamespace(snapshot_id=uuid.uuid4())
+
+    import app.services.orchestration.continuous_pipeline_worker as worker_module
+
+    monkeypatch.setattr(worker_module, "run_ingestion_cycle", _fake_ingestion_cycle)
+    monkeypatch.setattr(worker_module, "_load_active_assets", _async_return([]))
+    monkeypatch.setattr(worker_module, "_load_active_strategies", _async_return([]))
+    monkeypatch.setattr(worker_module, "run_deterministic_research_cycle_if_due", _raise_research)
+    monkeypatch.setattr(worker_module, "capture_system_intelligence_snapshot_if_due", _snapshot_after_failure)
+
+    stats = await run_orchestration_cycle(db=db, client=object(), config=_config())
+
+    assert stats.research_cycles_started == 0
+    assert db.rollbacks == 1
+    assert db.snapshot_writes == 1
+    assert all(getattr(item, "kind", None) != "research_parent" for item in db.committed)
+    assert all(getattr(item, "kind", None) != "research_child" for item in db.committed)
+    assert any(getattr(item, "kind", None) == "snapshot_record" for item in db.committed)
+
+
+@pytest.mark.asyncio
+async def test_previously_committed_work_remains_intact_after_research_failure(monkeypatch: pytest.MonkeyPatch) -> None:
+    db = _RecoveryAwareDB()
+    asset = _asset()
+    strategy = _strategy_row()
+    parameter_set = _parameter_set()
+    account = SimpleNamespace(id=uuid.uuid4())
+
+    async def _fake_orchestrate(*args, **kwargs):
+        return SimpleNamespace(execution_status="executed", outcome="EXECUTED")
+
+    async def _raise_research(*_args, **_kwargs):
+        db.add(SimpleNamespace(kind="research_parent"))
+        db.failed_transaction = True
+        raise RuntimeError("forced research persistence failure")
+
+    import app.services.orchestration.continuous_pipeline_worker as worker_module
+
+    monkeypatch.setattr(worker_module, "run_ingestion_cycle", _fake_ingestion_cycle)
+    monkeypatch.setattr(worker_module, "ingest_decision_records", _fake_decision_ingestion)
+    monkeypatch.setattr(worker_module, "_load_decision_record_for_signal", _async_return(None))
+    monkeypatch.setattr(worker_module, "_produce_research_evidence", _async_return(None))
+    monkeypatch.setattr(worker_module, "_load_active_assets", _async_return([asset]))
+    monkeypatch.setattr(worker_module, "_load_active_strategies", _async_return([strategy]))
+    monkeypatch.setattr(worker_module, "_load_latest_parameter_set", _async_return(parameter_set))
+    monkeypatch.setattr(worker_module, "_load_latest_candles", _async_return(_candles(2)))
+    monkeypatch.setattr(worker_module, "_signal_exists", _async_return(False))
+    monkeypatch.setattr(worker_module, "_load_primary_account_by_asset_class", _async_return(account))
+    monkeypatch.setattr(worker_module, "orchestrate_paper_signal_execution", _fake_orchestrate)
+    monkeypatch.setattr(worker_module.strategy_registry, "get", lambda slug: _FixedStrategy("buy"))
+    monkeypatch.setattr(worker_module, "run_deterministic_research_cycle_if_due", _raise_research)
+    monkeypatch.setattr(worker_module, "capture_system_intelligence_snapshot_if_due", _async_return(None))
+
+    stats = await run_orchestration_cycle(db=db, client=object(), config=_config())
+
+    assert stats.signals_created == 1
+    assert db.rollbacks == 1
+    assert any(item.__class__.__name__ == "Signal" for item in db.committed)
+    assert not any(getattr(item, "kind", None) == "research_parent" for item in db.committed)
+
+
+@pytest.mark.asyncio
+async def test_repeated_research_failures_do_not_corrupt_worker_session(monkeypatch: pytest.MonkeyPatch) -> None:
+    db = _RecoveryAwareDB()
+
+    async def _raise_research(*_args, **_kwargs):
+        db.add(SimpleNamespace(kind="research_parent"))
+        db.failed_transaction = True
+        raise RuntimeError("forced research persistence failure")
+
+    async def _snapshot_after_failure(*, db):
+        db.add(SimpleNamespace(kind="snapshot_record"))
+        db.snapshot_writes += 1
+        return SimpleNamespace(snapshot_id=uuid.uuid4())
+
+    import app.services.orchestration.continuous_pipeline_worker as worker_module
+
+    monkeypatch.setattr(worker_module, "run_ingestion_cycle", _fake_ingestion_cycle)
+    monkeypatch.setattr(worker_module, "_load_active_assets", _async_return([]))
+    monkeypatch.setattr(worker_module, "_load_active_strategies", _async_return([]))
+    monkeypatch.setattr(worker_module, "run_deterministic_research_cycle_if_due", _raise_research)
+    monkeypatch.setattr(worker_module, "capture_system_intelligence_snapshot_if_due", _snapshot_after_failure)
+
+    first = await run_orchestration_cycle(db=db, client=object(), config=_config())
+    second = await run_orchestration_cycle(db=db, client=object(), config=_config())
+
+    assert first.research_cycles_started == 0
+    assert second.research_cycles_started == 0
+    assert db.rollbacks == 2
+    assert db.snapshot_writes == 2
+
+
+@pytest.mark.asyncio
+async def test_research_disabled_mode_leaves_non_research_work_intact(monkeypatch: pytest.MonkeyPatch) -> None:
+    db = _FakeDB()
+    asset = _asset()
+    strategy = _strategy_row()
+    parameter_set = _parameter_set()
+
+    import app.services.orchestration.continuous_pipeline_worker as worker_module
+
+    monkeypatch.setattr(worker_module, "run_ingestion_cycle", _fake_ingestion_cycle)
+    monkeypatch.setattr(worker_module, "ingest_decision_records", _fake_decision_ingestion)
+    monkeypatch.setattr(worker_module, "_load_decision_record_for_signal", _async_return(None))
+    monkeypatch.setattr(worker_module, "_produce_research_evidence", _async_return(None))
+    monkeypatch.setattr(worker_module, "_load_active_assets", _async_return([asset]))
+    monkeypatch.setattr(worker_module, "_load_active_strategies", _async_return([strategy]))
+    monkeypatch.setattr(worker_module, "_load_latest_parameter_set", _async_return(parameter_set))
+    monkeypatch.setattr(worker_module, "_load_latest_candles", _async_return(_candles(2)))
+    monkeypatch.setattr(worker_module, "_signal_exists", _async_return(False))
+    monkeypatch.setattr(worker_module, "_load_primary_account_by_asset_class", _async_return(None))
+    monkeypatch.setattr(worker_module.strategy_registry, "get", lambda slug: _FixedStrategy("hold"))
+    monkeypatch.setattr(
+        worker_module,
+        "run_deterministic_research_cycle_if_due",
+        _async_return(
+            SimpleNamespace(
+                started=False,
+                reason="research_disabled",
+                campaign_id=None,
+                candidates_generated=0,
+                candidates_evaluated=0,
+                descendants_generated=0,
+                champion=None,
+            )
+        ),
+    )
+    monkeypatch.setattr(worker_module, "capture_system_intelligence_snapshot_if_due", _async_return(None))
+
+    stats = await run_orchestration_cycle(db=db, client=object(), config=_config())
+
+    assert stats.ingestion_assets_ok == 1
+    assert stats.signals_created == 1
+    assert stats.research_cycles_started == 0
+    assert any(
+        item.__class__.__name__ == "AuditLog" and getattr(item, "action", None) == "research_cycle_disabled"
+        for item in db.added
+    )
 
 
 @pytest.mark.asyncio

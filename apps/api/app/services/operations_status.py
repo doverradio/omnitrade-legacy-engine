@@ -7,6 +7,7 @@ import uuid
 from sqlalchemy import select, text
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.config import get_settings
 from app.models.paper_account import PaperAccount
 from app.schemas.operations import (
     OperationalAlertResponse,
@@ -44,6 +45,7 @@ def compute_uptime(*, started_at: datetime, now: datetime | None = None) -> str:
 
 
 async def build_operations_status(*, db: AsyncSession) -> OperationalStatusResponse:
+    settings = get_settings()
     now = datetime.now(timezone.utc)
     run_uptime = compute_uptime(started_at=_STARTED_AT, now=now)
 
@@ -136,6 +138,9 @@ async def build_operations_status(*, db: AsyncSession) -> OperationalStatusRespo
     current_champion_record = current_champion_row.mappings().first()
     current_champion = None if current_champion_record is None else current_champion_record.get("current_champion")
 
+    latest_research_cycle = await _load_latest_research_cycle_status(db=db)
+    recent_research_failures = await _count_recent_research_failures(db=db, now=now)
+
     paper_equity = await _get_paper_equity(db=db)
 
     last_candle_at = await _max_timestamp(db=db, sql="SELECT MAX(close_time) FROM candles")
@@ -214,6 +219,15 @@ async def build_operations_status(*, db: AsyncSession) -> OperationalStatusRespo
             )
         )
 
+    if recent_research_failures > 0:
+        alerts.append(
+            OperationalAlertResponse(
+                code="research_cycle_failures",
+                severity="yellow",
+                message=f"Research cycle failures detected ({recent_research_failures} recent)",
+            )
+        )
+
     overall_health = _resolve_health(alerts=alerts)
     current_phase = _resolve_phase(
         candles_processed=candles_processed,
@@ -249,6 +263,11 @@ async def build_operations_status(*, db: AsyncSession) -> OperationalStatusRespo
             "current_campaign": None if current_campaign is None else str(current_campaign.get("name")),
             "current_champion": current_champion,
             "campaign_status": "IDLE" if current_campaign is None else str(current_campaign.get("status")),
+            "feature_state": "enabled" if settings.research_evolution_enabled else "disabled",
+            "last_cycle_status": None if latest_research_cycle is None else str(latest_research_cycle.get("status")),
+            "last_cycle_reason": None if latest_research_cycle is None else str(latest_research_cycle.get("reason")),
+            "last_cycle_at": None if latest_research_cycle is None else str(latest_research_cycle.get("recorded_at")),
+            "recent_failure_count": recent_research_failures,
         },
         monitoring=OperationalMonitoringResponse(
             candles_processed=candles_processed,
@@ -338,6 +357,44 @@ def _resolve_orchestrator_state(*, now: datetime, last_ingestion_at: datetime | 
     if (now - last_seen) > timedelta(minutes=20):
         return "red", "Heartbeat stale"
     return "green", "Heartbeat active"
+
+
+async def _load_latest_research_cycle_status(*, db: AsyncSession) -> dict[str, object] | None:
+    row = await db.execute(
+        text(
+            "SELECT after_state, created_at "
+            "FROM audit_log "
+            "WHERE entity_type = 'research_cycle' "
+            "ORDER BY created_at DESC, id DESC "
+            "LIMIT 1"
+        )
+    )
+    latest = row.mappings().first()
+    if latest is None:
+        return None
+
+    after_state = latest.get("after_state")
+    if not isinstance(after_state, dict):
+        return None
+    return after_state
+
+
+async def _count_recent_research_failures(*, db: AsyncSession, now: datetime) -> int:
+    since = now - timedelta(hours=6)
+    row = await db.execute(
+        text(
+            "SELECT COUNT(*) AS failure_count "
+            "FROM audit_log "
+            "WHERE entity_type = 'research_cycle' "
+            "AND action = 'research_cycle_failed' "
+            "AND created_at >= :since"
+        ),
+        {"since": since},
+    )
+    record = row.mappings().first()
+    if record is None:
+        return 0
+    return int(record.get("failure_count") or 0)
 
 
 def _append_staleness_alert(
