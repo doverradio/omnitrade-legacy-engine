@@ -502,6 +502,116 @@ def _age_seconds(earlier: datetime | None, later: datetime | None = None) -> int
     return int((reference - earlier).total_seconds())
 
 
+async def _evaluate_live_preflight_guards(
+    *,
+    db: AsyncSession,
+    live_trading_profile_id: uuid.UUID,
+    crypto_order_preview_id: uuid.UUID,
+    operator_identity: str,
+    require_submission_enabled: bool,
+) -> dict[str, Any]:
+    settings = get_settings()
+    if not settings.live_crypto_preparation_enabled:
+        raise PermissionError("live crypto order preparation is disabled")
+    if require_submission_enabled and not settings.live_crypto_order_submission_enabled:
+        raise PermissionError("live crypto order submission is disabled")
+
+    profile = await db.scalar(select(LiveTradingProfile).where(LiveTradingProfile.id == live_trading_profile_id).limit(1))
+    if profile is None:
+        raise LookupError("live trading profile not found")
+
+    preview = await db.scalar(
+        select(CryptoOrderPreview).where(
+            CryptoOrderPreview.crypto_order_preview_id == crypto_order_preview_id
+        ).limit(1)
+    )
+    if preview is None:
+        raise LookupError("crypto order preview not found")
+    if preview.live_trading_profile_id != profile.id:
+        raise ValueError("preview does not belong to the requested live trading profile")
+    if preview.side != "BUY" or preview.product_id != "BTC-USD" or preview.order_type != "MARKET":
+        raise ValueError("preview is not eligible for live BTC-USD market buy submission")
+
+    requested_quote_size = _validate_quote_size(
+        requested_quote_size=_decimal(preview.requested_amount),
+        max_order_usd=settings.live_crypto_max_order_usd,
+    )
+
+    connection = await _load_exchange_connection(db=db, exchange_connection_id=preview.exchange_connection_id)
+    now = _utcnow()
+    preview_age_seconds = _require_fresh_timestamp(
+        label="preview",
+        observed_at=preview.created_at,
+        now=now,
+        max_age_seconds=settings.live_crypto_preview_max_age_seconds,
+    )
+    readiness_age_seconds = _require_fresh_timestamp(
+        label="readiness",
+        observed_at=connection.last_verified_at,
+        now=now,
+        max_age_seconds=settings.live_crypto_readiness_max_age_seconds,
+    )
+    balance_age_seconds = _require_fresh_timestamp(
+        label="balance",
+        observed_at=connection.last_successful_sync_at,
+        now=now,
+        max_age_seconds=settings.live_crypto_balance_max_age_seconds,
+    )
+    price_age_seconds = _require_fresh_timestamp(
+        label="price",
+        observed_at=preview.created_at,
+        now=now,
+        max_age_seconds=settings.live_crypto_price_max_age_seconds,
+    )
+
+    approval_gate = await evaluate_live_approval_gate(
+        db=db,
+        live_trading_profile_id=profile.id,
+        checkpoint_type="first_live_enablement",
+    )
+    if not approval_gate.allowed:
+        raise PermissionError(approval_gate.reason or "approval gate rejected")
+    if approval_gate.matched_approval_event_id is None:
+        raise PermissionError("approval evidence missing")
+
+    guard_result = await evaluate_live_submission_guard(
+        db=db,
+        live_trading_profile_id=profile.id,
+    )
+    if not guard_result.allowed:
+        raise PermissionError(guard_result.reason or "submission guard rejected")
+
+    _risk_event, risk_action, approved_quote_size, risk_event_id = await _build_real_risk_context(
+        db=db,
+        profile=profile,
+        preview=preview,
+        connection=connection,
+        operator_identity=operator_identity,
+    )
+
+    return {
+        "profile": profile,
+        "preview": preview,
+        "connection": connection,
+        "requested_quote_size": requested_quote_size,
+        "approved_quote_size": approved_quote_size,
+        "risk_action": risk_action,
+        "risk_event_id": risk_event_id,
+        "approval_event_id": approval_gate.matched_approval_event_id,
+        "preview_age_seconds": preview_age_seconds,
+        "readiness_age_seconds": readiness_age_seconds,
+        "balance_age_seconds": balance_age_seconds,
+        "price_age_seconds": price_age_seconds,
+        "approved_intent_fingerprint": _build_intent_fingerprint(
+            preview=preview,
+            operator_identity=operator_identity,
+            requested_quote_size=approved_quote_size,
+            approval_event_id=approval_gate.matched_approval_event_id,
+        ),
+        "evidence_fingerprint": _build_evidence_fingerprint(preview=preview, connection=connection),
+    }
+
+
 async def _record_audit(
     *,
     db: AsyncSession,
@@ -812,79 +922,20 @@ class LiveCryptoOrderService:
             )
             raise PermissionError("live crypto order submission is disabled")
 
-        profile = await db.scalar(
-            select(LiveTradingProfile).where(LiveTradingProfile.id == request.live_trading_profile_id).limit(1)
-        )
-        if profile is None:
-            raise LookupError("live trading profile not found")
-
-        preview = await db.scalar(
-            select(CryptoOrderPreview).where(
-                CryptoOrderPreview.crypto_order_preview_id == request.crypto_order_preview_id
-            ).limit(1)
-        )
-        if preview is None:
-            raise LookupError("crypto order preview not found")
-        if preview.live_trading_profile_id != profile.id:
-            raise ValueError("preview does not belong to the requested live trading profile")
-        if preview.side != "BUY" or preview.product_id != "BTC-USD" or preview.order_type != "MARKET":
-            raise ValueError("preview is not eligible for live BTC-USD market buy submission")
-        requested_quote_size = _validate_quote_size(
-            requested_quote_size=_decimal(preview.requested_amount),
-            max_order_usd=settings.live_crypto_max_order_usd,
-        )
-
-        connection = await _load_exchange_connection(db=db, exchange_connection_id=preview.exchange_connection_id)
-        now = _utcnow()
-        preview_age_seconds = _require_fresh_timestamp(
-            label="preview",
-            observed_at=preview.created_at,
-            now=now,
-            max_age_seconds=settings.live_crypto_preview_max_age_seconds,
-        )
-        _require_fresh_timestamp(
-            label="readiness",
-            observed_at=connection.last_verified_at,
-            now=now,
-            max_age_seconds=settings.live_crypto_readiness_max_age_seconds,
-        )
-        _require_fresh_timestamp(
-            label="balance",
-            observed_at=connection.last_successful_sync_at,
-            now=now,
-            max_age_seconds=settings.live_crypto_balance_max_age_seconds,
-        )
-        _require_fresh_timestamp(
-            label="price",
-            observed_at=preview.created_at,
-            now=now,
-            max_age_seconds=settings.live_crypto_price_max_age_seconds,
-        )
-
-        approval_gate = await evaluate_live_approval_gate(
+        preflight = await _evaluate_live_preflight_guards(
             db=db,
-            live_trading_profile_id=profile.id,
-            checkpoint_type="first_live_enablement",
-        )
-        if not approval_gate.allowed:
-            raise PermissionError(approval_gate.reason or "approval gate rejected")
-        if approval_gate.matched_approval_event_id is None:
-            raise PermissionError("approval evidence missing")
-
-        guard_result = await evaluate_live_submission_guard(
-            db=db,
-            live_trading_profile_id=profile.id,
-        )
-        if not guard_result.allowed:
-            raise PermissionError(guard_result.reason or "submission guard rejected")
-
-        _risk_event, risk_action, approved_quote_size, risk_event_id = await _build_real_risk_context(
-            db=db,
-            profile=profile,
-            preview=preview,
-            connection=connection,
+            live_trading_profile_id=request.live_trading_profile_id,
+            crypto_order_preview_id=request.crypto_order_preview_id,
             operator_identity=request.operator_identity,
+            require_submission_enabled=True,
         )
+        profile = preflight["profile"]
+        preview = preflight["preview"]
+        approved_quote_size = preflight["approved_quote_size"]
+        risk_action = preflight["risk_action"]
+        risk_event_id = preflight["risk_event_id"]
+        approval_event_id = preflight["approval_event_id"]
+        preview_age_seconds = int(preflight["preview_age_seconds"])
 
         confirmation_challenge_id = uuid.uuid4()
         confirmation_expires_at = _utcnow() + timedelta(minutes=settings.live_crypto_confirmation_challenge_minutes)
@@ -900,15 +951,10 @@ class LiveCryptoOrderService:
         live_crypto_order.safe_provider_response = {
             **live_crypto_order.safe_provider_response,
             "prepared_by": request.operator_identity,
-            "approval_event_id": str(approval_gate.matched_approval_event_id),
+            "approval_event_id": str(approval_event_id),
             "confirmation_expires_at": confirmation_expires_at.isoformat(),
-            "approved_intent_fingerprint": _build_intent_fingerprint(
-                preview=preview,
-                operator_identity=request.operator_identity,
-                requested_quote_size=approved_quote_size,
-                approval_event_id=approval_gate.matched_approval_event_id,
-            ),
-            "evidence_fingerprint": _build_evidence_fingerprint(preview=preview, connection=connection),
+            "approved_intent_fingerprint": str(preflight["approved_intent_fingerprint"]),
+            "evidence_fingerprint": str(preflight["evidence_fingerprint"]),
             "execution_risk_verdict": risk_action.value,
         }
         await _record_audit(
@@ -921,7 +967,7 @@ class LiveCryptoOrderService:
                 "status": live_crypto_order.status,
                 "risk_event_id": str(risk_event_id),
                 "requested_quote_size": format(approved_quote_size, "f"),
-                "approval_event_id": str(approval_gate.matched_approval_event_id),
+                "approval_event_id": str(approval_event_id),
             },
         )
         await _commit_if_supported(db=db)
@@ -950,84 +996,59 @@ class LiveCryptoOrderService:
         if not (request.idempotency_token or "").strip():
             raise PermissionError("idempotency token required for dry run")
 
-        profile = await db.scalar(
-            select(LiveTradingProfile).where(LiveTradingProfile.id == request.live_trading_profile_id).limit(1)
-        )
-        if profile is None:
-            raise LookupError("live trading profile not found")
-
-        preview = await db.scalar(
-            select(CryptoOrderPreview).where(
-                CryptoOrderPreview.crypto_order_preview_id == request.crypto_order_preview_id
-            ).limit(1)
-        )
-        if preview is None:
-            raise LookupError("crypto order preview not found")
-        connection = await _load_exchange_connection(db=db, exchange_connection_id=preview.exchange_connection_id)
-
         preflight_errors: list[str] = []
-        if preview.live_trading_profile_id != profile.id:
-            preflight_errors.append("preview does not belong to the requested live trading profile")
-        if preview.side != "BUY" or preview.product_id != "BTC-USD" or preview.order_type != "MARKET":
-            preflight_errors.append("preview is not eligible for live BTC-USD market buy submission")
-
+        preflight: dict[str, Any] | None = None
         try:
-            _validate_quote_size(
-                requested_quote_size=_decimal(preview.requested_amount),
-                max_order_usd=settings.live_crypto_max_order_usd,
-            )
-        except Exception as exc:
-            preflight_errors.append(str(exc))
-
-        try:
-            preview_age_seconds = _require_fresh_timestamp(
-                label="preview",
-                observed_at=preview.created_at,
-                now=_utcnow(),
-                max_age_seconds=settings.live_crypto_preview_max_age_seconds,
-            )
-            _require_fresh_timestamp(
-                label="readiness",
-                observed_at=connection.last_verified_at,
-                now=_utcnow(),
-                max_age_seconds=settings.live_crypto_readiness_max_age_seconds,
-            )
-            _require_fresh_timestamp(
-                label="balance",
-                observed_at=connection.last_successful_sync_at,
-                now=_utcnow(),
-                max_age_seconds=settings.live_crypto_balance_max_age_seconds,
-            )
-            _require_fresh_timestamp(
-                label="price",
-                observed_at=preview.created_at,
-                now=_utcnow(),
-                max_age_seconds=settings.live_crypto_price_max_age_seconds,
-            )
-        except Exception as exc:
-            preflight_errors.append(str(exc))
-            preview_age_seconds = 0
-
-        approval_gate = await evaluate_live_approval_gate(db=db, live_trading_profile_id=profile.id, checkpoint_type="first_live_enablement")
-        if not approval_gate.allowed:
-            preflight_errors.append("approval gate rejected")
-
-        if not (await evaluate_live_submission_guard(db=db, live_trading_profile_id=profile.id)).allowed:
-            preflight_errors.append("submission guard rejected")
-
-        risk_event_id = None
-        try:
-            _risk_event, risk_action, approved_quote_size, risk_event_id = await _build_real_risk_context(
+            preflight = await _evaluate_live_preflight_guards(
                 db=db,
-                profile=profile,
-                preview=preview,
-                connection=connection,
+                live_trading_profile_id=request.live_trading_profile_id,
+                crypto_order_preview_id=request.crypto_order_preview_id,
                 operator_identity=request.operator_identity,
+                require_submission_enabled=False,
             )
+            profile = preflight["profile"]
+            preview = preflight["preview"]
+            risk_action = preflight["risk_action"]
+            approved_quote_size = preflight["approved_quote_size"]
+            risk_event_id = preflight["risk_event_id"]
+            preview_age_seconds = int(preflight["preview_age_seconds"])
+            readiness_age_seconds = int(preflight["readiness_age_seconds"])
+            balance_age_seconds = int(preflight["balance_age_seconds"])
+            price_age_seconds = int(preflight["price_age_seconds"])
+            approval_event_id = preflight["approval_event_id"]
+            approved_intent_fingerprint = str(preflight["approved_intent_fingerprint"])
+            evidence_fingerprint = str(preflight["evidence_fingerprint"])
         except Exception as exc:
             preflight_errors.append(str(exc))
             risk_action = RiskDecisionAction.REJECT
-            approved_quote_size = _decimal(preview.requested_amount)
+            risk_event_id = None
+            profile = await db.scalar(
+                select(LiveTradingProfile).where(LiveTradingProfile.id == request.live_trading_profile_id).limit(1)
+            )
+            if profile is None:
+                raise LookupError("live trading profile not found")
+            preview = await db.scalar(
+                select(CryptoOrderPreview).where(
+                    CryptoOrderPreview.crypto_order_preview_id == request.crypto_order_preview_id
+                ).limit(1)
+            )
+            if preview is None:
+                raise LookupError("crypto order preview not found")
+            approved_quote_size = _quantize_usd(_decimal(preview.requested_amount))
+            preview_age_seconds = _age_seconds(preview.created_at)
+            readiness_age_seconds = None
+            balance_age_seconds = None
+            price_age_seconds = _age_seconds(preview.created_at)
+            approval_event_id = None
+            approved_intent_fingerprint = None
+            evidence_fingerprint = None
+
+        submission_skipped = True
+        submission_skip_reason = (
+            "Coinbase order submission intentionally skipped "
+            f"(LIVE_CRYPTO_ORDER_SUBMISSION_ENABLED={str(settings.live_crypto_order_submission_enabled).lower()}, "
+            f"LIVE_CRYPTO_DRY_RUN_ENABLED={str(settings.live_crypto_dry_run_enabled).lower()})"
+        )
 
         live_crypto_order = await self._get_or_create_live_order(
             db=db,
@@ -1059,13 +1080,25 @@ class LiveCryptoOrderService:
             "dry_run": True,
             "dry_run_status": live_crypto_order.status,
             "safe_request_summary": _safe_request_summary(request_payload=_build_live_create_order_payload(live_order=live_crypto_order)),
+            "submission_skipped": submission_skipped,
+            "submission_skip_reason": submission_skip_reason,
             "operator_identity": request.operator_identity,
             "preview_id": str(preview.crypto_order_preview_id),
             "preview_age_seconds": preview_age_seconds,
+            "readiness_age_seconds": readiness_age_seconds,
+            "balance_age_seconds": balance_age_seconds,
+            "price_age_seconds": price_age_seconds,
             "dry_run_errors": preflight_errors,
-            "approval_event_id": None
-            if getattr(approval_gate, "matched_approval_event_id", None) is None
-            else str(approval_gate.matched_approval_event_id),
+            "approval_event_id": None if approval_event_id is None else str(approval_event_id),
+            "risk_event_id": None if risk_event_id is None else str(risk_event_id),
+            "approved_intent_fingerprint": approved_intent_fingerprint,
+            "evidence_fingerprint": evidence_fingerprint,
+            "client_order_id": live_crypto_order.client_order_id,
+            "audit_correlation_id": str(live_crypto_order.audit_correlation_id),
+            "dry_run_recorded_at": _utcnow().isoformat(),
+            "requested_quote_size": format(_quantize_usd(_decimal(preview.requested_amount)), "f"),
+            "approved_quote_size": format(_quantize_usd(approved_quote_size), "f"),
+            "max_order_usd": format(settings.live_crypto_max_order_usd, "f"),
             "execution_risk_verdict": risk_action.value,
         }
         live_crypto_order.updated_at = _utcnow()
@@ -1079,6 +1112,19 @@ class LiveCryptoOrderService:
                 "status": live_crypto_order.status,
                 "preview_id": str(preview.crypto_order_preview_id),
                 "provider_create_order_called": False,
+                "submission_skipped": submission_skipped,
+                "submission_skip_reason": submission_skip_reason,
+                "operator_identity": request.operator_identity,
+                "approval_event_id": None if approval_event_id is None else str(approval_event_id),
+                "risk_event_id": None if risk_event_id is None else str(risk_event_id),
+                "approved_intent_fingerprint": approved_intent_fingerprint,
+                "evidence_fingerprint": evidence_fingerprint,
+                "readiness_age_seconds": readiness_age_seconds,
+                "balance_age_seconds": balance_age_seconds,
+                "price_age_seconds": price_age_seconds,
+                "requested_quote_size": format(_quantize_usd(_decimal(preview.requested_amount)), "f"),
+                "approved_quote_size": format(_quantize_usd(approved_quote_size), "f"),
+                "max_order_usd": format(settings.live_crypto_max_order_usd, "f"),
                 "replay_key": replay_key,
             },
         )
@@ -1096,6 +1142,8 @@ class LiveCryptoOrderService:
             safe_request_summary=live_crypto_order.safe_provider_response["safe_request_summary"],
             provider_create_order_called=False,
             order_submitted=False,
+            submission_skipped=submission_skipped,
+            submission_skip_reason=submission_skip_reason,
         )
 
     async def submit(

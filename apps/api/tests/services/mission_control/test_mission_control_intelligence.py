@@ -456,3 +456,64 @@ def test_managed_capital_calculation_avoids_duplicate_paper_account_reference() 
         ),
     ]
     assert service._calculate_total_managed_capital(campaigns) == Decimal("25")
+
+
+@pytest.mark.asyncio
+async def test_live_operation_annotations_include_dry_run_evidence_metadata() -> None:
+    class _ScalarResult:
+        def __init__(self, rows):
+            self._rows = rows
+
+        def all(self):
+            return self._rows
+
+    class _ExecuteResult:
+        def __init__(self, rows):
+            self._rows = rows
+
+        def scalars(self):
+            return _ScalarResult(self._rows)
+
+    class _AnnotatedDb:
+        async def execute(self, *_args, **_kwargs):
+            row = SimpleNamespace(
+                id=uuid.UUID("aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa"),
+                action="DRY_RUN_READY",
+                created_at=datetime(2026, 7, 9, 12, 0, tzinfo=timezone.utc),
+                entity_type="live_crypto_order",
+                entity_id=uuid.UUID("bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb"),
+                after_state={
+                    "submission_skipped": True,
+                    "submission_skip_reason": "LIVE_CRYPTO_ORDER_SUBMISSION_ENABLED=false",
+                    "approval_event_id": "11111111-1111-1111-1111-111111111111",
+                    "risk_event_id": "22222222-2222-2222-2222-222222222222",
+                    "approved_intent_fingerprint": "intent-fingerprint",
+                    "evidence_fingerprint": "evidence-fingerprint",
+                    "readiness_age_seconds": 2,
+                    "balance_age_seconds": 3,
+                    "price_age_seconds": 1,
+                    "requested_quote_size": "5.00",
+                    "approved_quote_size": "5.00",
+                    "max_order_usd": "5.00",
+                },
+            )
+            return _ExecuteResult([row])
+
+    timeline = await service._load_live_operation_annotations(
+        db=_AnnotatedDb(),
+        generated_at=datetime(2026, 7, 9, 12, 5, tzinfo=timezone.utc),
+        current_score=80,
+        operations=_operations_status(),
+        anchor_equity="25.00",
+        anchor_pnl="0.00",
+        paper_pnl_metadata={"paper_pnl_source": "bound_paper_account"},
+    )
+
+    assert len(timeline) == 1
+    metadata = timeline[0].metadata
+    assert metadata["submission_skipped"] is True
+    assert metadata["submission_skip_reason"] == "LIVE_CRYPTO_ORDER_SUBMISSION_ENABLED=false"
+    assert metadata["approved_intent_fingerprint"] == "intent-fingerprint"
+    assert metadata["evidence_fingerprint"] == "evidence-fingerprint"
+    assert metadata["requested_quote_size"] == "5.00"
+    assert metadata["approved_quote_size"] == "5.00"

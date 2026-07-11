@@ -619,6 +619,23 @@ async def _load_live_operation_annotations(
             severity = "yellow"
         if action == "CONNECTION_DISCONNECTED":
             severity = "red"
+        after_state = row.after_state if isinstance(row.after_state, dict) else {}
+        dry_run_metadata: dict[str, object] = {}
+        if action in {"DRY_RUN_READY", "DRY_RUN_BLOCKED"}:
+            dry_run_metadata = {
+                "submission_skipped": bool(after_state.get("submission_skipped", True)),
+                "submission_skip_reason": str(after_state.get("submission_skip_reason", "dry_run_submission_skipped")),
+                "approval_event_id": after_state.get("approval_event_id"),
+                "risk_event_id": after_state.get("risk_event_id"),
+                "approved_intent_fingerprint": after_state.get("approved_intent_fingerprint"),
+                "evidence_fingerprint": after_state.get("evidence_fingerprint"),
+                "readiness_age_seconds": after_state.get("readiness_age_seconds"),
+                "balance_age_seconds": after_state.get("balance_age_seconds"),
+                "price_age_seconds": after_state.get("price_age_seconds"),
+                "requested_quote_size": after_state.get("requested_quote_size"),
+                "approved_quote_size": after_state.get("approved_quote_size"),
+                "max_order_usd": after_state.get("max_order_usd"),
+            }
         events.append(
             MissionControlIntelligenceTimelineEventResponse(
                 event_id=f"live-ops-{row.id}",
@@ -633,7 +650,7 @@ async def _load_live_operation_annotations(
                 trades=operations.monitoring.paper_trades_executed,
                 decision_count=operations.monitoring.decision_records_created,
                 severity=severity,
-                category="live_operations",
+                category="system",
                 event_type=action,
                 metadata={
                     "entity_type": row.entity_type,
@@ -641,6 +658,7 @@ async def _load_live_operation_annotations(
                     "submission_implied": False,
                     "order_submitted": False,
                     "index": index,
+                    **dry_run_metadata,
                     **paper_pnl_metadata,
                 },
             )

@@ -136,3 +136,40 @@ def test_reconciliation_module_has_no_profit_policy_service_imports() -> None:
                     disallowed_imports.append(alias.name)
 
     assert not disallowed_imports, "Reconciliation must not depend on profit-policy services: " + ", ".join(disallowed_imports)
+
+
+def test_dry_run_path_does_not_call_submission_or_capital_movement_symbols() -> None:
+    live_order_file = _APP_ROOT / "services" / "live_crypto_orders.py"
+    tree = ast.parse(live_order_file.read_text(), filename=str(live_order_file))
+
+    dry_run_node: ast.AsyncFunctionDef | None = None
+    for node in ast.walk(tree):
+        if isinstance(node, ast.AsyncFunctionDef) and node.name == "dry_run":
+            dry_run_node = node
+            break
+
+    assert dry_run_node is not None, "live crypto dry_run function must exist"
+
+    called_names = {
+        name
+        for name in (_called_symbol_name(node) for node in ast.walk(dry_run_node) if isinstance(node, ast.Call))
+        if name is not None
+    }
+
+    forbidden = {
+        "create_order",
+        "reconcile",
+        "reconcile_live_order_and_fills",
+        "approve_profit_cycle",
+        "reject_profit_cycle",
+        "evaluate_profit_cycle",
+        "upsert_profit_policy",
+        "withdraw",
+        "transfer",
+        "compound",
+        "execute_policy",
+    }
+    exact_hits = called_names.intersection(forbidden)
+    prefix_hits = {name for name in called_names if name.startswith(("withdraw", "transfer", "compound"))}
+    violations = sorted(exact_hits.union(prefix_hits))
+    assert not violations, "Dry-run autonomy boundary violation(s): " + ", ".join(violations)

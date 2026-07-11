@@ -344,6 +344,9 @@ async def test_dry_run_never_calls_coinbase_create_order(monkeypatch: pytest.Mon
 
     assert response.order_submitted is False
     assert response.provider_create_order_called is False
+    assert response.submission_skipped is True
+    assert "LIVE_CRYPTO_ORDER_SUBMISSION_ENABLED=false" in response.submission_skip_reason
+    assert "LIVE_CRYPTO_DRY_RUN_ENABLED=true" in response.submission_skip_reason
     assert response.dry_run_status in {"DRY_RUN_READY", "DRY_RUN_BLOCKED"}
     assert response.dry_run_message in {
         "Dry run completed. No Coinbase order was submitted.",
@@ -380,6 +383,221 @@ async def test_dry_run_requires_idempotency_token(monkeypatch: pytest.MonkeyPatc
                 idempotency_token="   ",
             ),
         )
+
+
+@pytest.mark.asyncio
+async def test_dry_run_blocks_when_preparation_disabled(monkeypatch: pytest.MonkeyPatch) -> None:
+    profile = SimpleNamespace(id=uuid.uuid4())
+    preview = SimpleNamespace(
+        crypto_order_preview_id=uuid.uuid4(),
+        live_trading_profile_id=profile.id,
+        exchange_connection_id=uuid.uuid4(),
+        provider="coinbase_advanced",
+        environment="production",
+        product_id="BTC-USD",
+        side="BUY",
+        order_type="MARKET",
+        requested_amount=service.Decimal("5.00"),
+        created_at=service.datetime.now(service.timezone.utc),
+    )
+    connection = SimpleNamespace(
+        exchange_connection_id=preview.exchange_connection_id,
+        provider="coinbase_advanced",
+        environment="production",
+        credentials_encrypted="{}",
+        api_key_masked="********1234",
+        api_secret_masked="********",
+        passphrase_configured=True,
+        credentials_valid=True,
+        api_permissions=["view", "trade"],
+        balances=[{"currency": "USD", "available": "10.00", "reserved": "0.00", "total": "10.00"}],
+        last_successful_sync_at=service.datetime.now(service.timezone.utc),
+        last_heartbeat_at=service.datetime.now(service.timezone.utc),
+        last_verified_at=service.datetime.now(service.timezone.utc),
+    )
+    fake_db = _DryRunFakeDb(profile=profile, preview=preview, connection=connection)
+
+    monkeypatch.setattr(
+        service,
+        "get_settings",
+        lambda: SimpleNamespace(
+            live_crypto_order_submission_enabled=False,
+            live_crypto_dry_run_enabled=True,
+            live_crypto_preparation_enabled=False,
+            live_crypto_max_order_usd=service.Decimal("5"),
+            live_crypto_preview_max_age_seconds=30,
+            live_crypto_balance_max_age_seconds=30,
+            live_crypto_readiness_max_age_seconds=60,
+            live_crypto_price_max_age_seconds=30,
+            live_crypto_confirmation_challenge_minutes=1,
+        ),
+    )
+
+    async def _get_or_create_live_order(*_args, **_kwargs):
+        return SimpleNamespace(
+            live_crypto_order_id=uuid.uuid4(),
+            crypto_order_preview_id=preview.crypto_order_preview_id,
+            exchange_connection_id=preview.exchange_connection_id,
+            provider=preview.provider,
+            environment=preview.environment,
+            product_id=preview.product_id,
+            side=preview.side,
+            order_type=preview.order_type,
+            requested_quote_size=service.Decimal("5.00"),
+            client_order_id="client-order-id",
+            status="PENDING_CONFIRMATION",
+            risk_event_id=None,
+            decision_record_id=None,
+            validation_run_id=None,
+            provider_order_id=None,
+            provider_status=None,
+            submitted_at=None,
+            acknowledged_at=None,
+            filled_at=None,
+            cancelled_at=None,
+            failure_code=None,
+            failure_reason=None,
+            safe_provider_response={"dry_run": True},
+            audit_correlation_id=uuid.uuid4(),
+            operator_confirmation_id=None,
+            created_at=service.datetime.now(service.timezone.utc),
+            updated_at=service.datetime.now(service.timezone.utc),
+        )
+
+    monkeypatch.setattr(service.LiveCryptoOrderService, "_get_or_create_live_order", _get_or_create_live_order)
+
+    response = await service.service.dry_run(
+        db=fake_db,
+        request=service.LiveCryptoOrderDryRunRequest(
+            live_trading_profile_id=profile.id,
+            crypto_order_preview_id=preview.crypto_order_preview_id,
+            operator_identity="operator:human",
+            idempotency_token="dry-run-disabled-prep",
+        ),
+    )
+
+    assert response.dry_run_status == "DRY_RUN_BLOCKED"
+    assert response.order_submitted is False
+    assert response.provider_create_order_called is False
+    assert response.live_crypto_order.safe_provider_response["dry_run_errors"] == [
+        "live crypto order preparation is disabled"
+    ]
+
+
+@pytest.mark.asyncio
+async def test_prepare_and_dry_run_use_same_preflight_guard_path(monkeypatch: pytest.MonkeyPatch) -> None:
+    now = datetime(2026, 7, 9, 12, 0, tzinfo=timezone.utc)
+    profile = SimpleNamespace(id=uuid.uuid4())
+    preview = SimpleNamespace(
+        crypto_order_preview_id=uuid.uuid4(),
+        live_trading_profile_id=profile.id,
+        exchange_connection_id=uuid.uuid4(),
+        provider="coinbase_advanced",
+        environment="production",
+        product_id="BTC-USD",
+        side="BUY",
+        order_type="MARKET",
+        requested_amount=service.Decimal("5.00"),
+        created_at=now - timedelta(seconds=1),
+    )
+    connection = SimpleNamespace(
+        exchange_connection_id=preview.exchange_connection_id,
+        last_verified_at=now - timedelta(seconds=1),
+        last_successful_sync_at=now - timedelta(seconds=1),
+        last_heartbeat_at=now - timedelta(seconds=1),
+        balances=[{"currency": "USD", "available": "10.00"}],
+    )
+    live_order = SimpleNamespace(
+        live_crypto_order_id=uuid.uuid4(),
+        crypto_order_preview_id=preview.crypto_order_preview_id,
+        exchange_connection_id=preview.exchange_connection_id,
+        provider=preview.provider,
+        environment=preview.environment,
+        product_id=preview.product_id,
+        side=preview.side,
+        order_type=preview.order_type,
+        requested_quote_size=service.Decimal("5.00"),
+        client_order_id="client-order-id",
+        status="PENDING_CONFIRMATION",
+        risk_event_id=uuid.uuid4(),
+        decision_record_id=None,
+        validation_run_id=None,
+        provider_order_id=None,
+        provider_status=None,
+        submitted_at=None,
+        acknowledged_at=None,
+        filled_at=None,
+        cancelled_at=None,
+        failure_code=None,
+        failure_reason=None,
+        safe_provider_response={"prepared_by": "operator:human"},
+        audit_correlation_id=uuid.uuid4(),
+        operator_confirmation_id=None,
+        created_at=now,
+        updated_at=now,
+    )
+    db = _LiveOrderFakeDb(profile=profile, preview=preview, live_order=live_order, connection=connection)
+
+    monkeypatch.setattr(
+        service,
+        "get_settings",
+        lambda: SimpleNamespace(
+            live_crypto_order_submission_enabled=True,
+            live_crypto_dry_run_enabled=True,
+            live_crypto_preparation_enabled=True,
+            live_crypto_max_order_usd=service.Decimal("5"),
+            live_crypto_preview_max_age_seconds=30,
+            live_crypto_balance_max_age_seconds=30,
+            live_crypto_readiness_max_age_seconds=60,
+            live_crypto_price_max_age_seconds=30,
+            live_crypto_confirmation_challenge_minutes=1,
+        ),
+    )
+
+    calls: list[bool] = []
+
+    async def _shared_preflight(**kwargs):
+        calls.append(bool(kwargs["require_submission_enabled"]))
+        return {
+            "profile": profile,
+            "preview": preview,
+            "connection": connection,
+            "requested_quote_size": service.Decimal("5.00"),
+            "approved_quote_size": service.Decimal("5.00"),
+            "risk_action": service.RiskDecisionAction.APPROVE,
+            "risk_event_id": uuid.uuid4(),
+            "approval_event_id": uuid.uuid4(),
+            "preview_age_seconds": 1,
+            "readiness_age_seconds": 1,
+            "balance_age_seconds": 1,
+            "price_age_seconds": 1,
+            "approved_intent_fingerprint": "intent-fingerprint",
+            "evidence_fingerprint": "evidence-fingerprint",
+        }
+
+    monkeypatch.setattr(service, "_evaluate_live_preflight_guards", _shared_preflight)
+
+    await service.service.prepare_confirmation(
+        db=db,
+        request=LiveCryptoOrderPrepareRequest(
+            live_trading_profile_id=profile.id,
+            crypto_order_preview_id=preview.crypto_order_preview_id,
+            operator_identity="operator:human",
+            idempotency_token="prepare-token",
+        ),
+    )
+
+    await service.service.dry_run(
+        db=db,
+        request=service.LiveCryptoOrderDryRunRequest(
+            live_trading_profile_id=profile.id,
+            crypto_order_preview_id=preview.crypto_order_preview_id,
+            operator_identity="operator:human",
+            idempotency_token="dry-run-token",
+        ),
+    )
+
+    assert calls == [True, False]
 
 
 @pytest.mark.asyncio

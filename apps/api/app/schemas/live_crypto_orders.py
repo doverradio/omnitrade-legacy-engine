@@ -165,6 +165,8 @@ class LiveCryptoOrderDryRunResponse(BaseModel):
     safe_request_summary: dict[str, Any]
     provider_create_order_called: bool
     order_submitted: bool
+    submission_skipped: bool
+    submission_skip_reason: str
 
 
 class LiveCryptoOrderSubmitResponse(BaseModel):
