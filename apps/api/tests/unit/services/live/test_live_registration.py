@@ -30,9 +30,15 @@ class _FakeSession:
         self.paper_accounts = paper_accounts
         self.live_profiles: list[LiveTradingProfile] = []
         self.live_events: list[LiveTradingEvent] = []
+        self._in_transaction = False
+        self.begin_calls = 0
 
     def begin(self) -> _BeginContext:
+        self.begin_calls += 1
         return _BeginContext()
+
+    def in_transaction(self) -> bool:
+        return self._in_transaction
 
     async def scalar(self, statement: Any) -> Any:
         sql = str(statement)
@@ -210,3 +216,20 @@ async def test_register_live_account_is_idempotent() -> None:
     assert first.created_event_id == second.created_event_id
     assert len(session.live_profiles) == 1
     assert len(session.live_events) == 1
+
+
+@pytest.mark.asyncio
+async def test_register_live_account_reuses_active_caller_transaction() -> None:
+    paper = _paper_account(is_active=True)
+    session = _FakeSession(paper_accounts=[paper])
+    session._in_transaction = True
+
+    result = await register_live_account(
+        db=session,
+        request=_request(paper_account_id=paper.id, idempotency_key="active-tx-key"),
+    )
+
+    assert result.accepted is True
+    assert len(session.live_profiles) == 1
+    assert len(session.live_events) == 1
+    assert session.begin_calls == 0

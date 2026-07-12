@@ -190,7 +190,10 @@ async def register_live_account(
         },
     )
 
-    async with db.begin():
+    registration_event: LiveTradingEvent | None = None
+
+    async def _persist_registration() -> None:
+        nonlocal registration_event
         db.add(profile)
         await db.flush()
 
@@ -248,12 +251,20 @@ async def register_live_account(
         db.add(registration_event)
         await db.flush()
 
+    # Reuse caller-owned transaction when one is already active.
+    # This prevents nested transaction ownership conflicts during initialization.
+    if db.in_transaction():
+        await _persist_registration()
+    else:
+        async with db.begin():
+            await _persist_registration()
+
     return LiveAccountRegistrationResult(
         live_trading_profile_id=profile.id,
         readiness_state=profile.lifecycle_state,
         operating_mode=profile.operating_mode,
         accepted=eligibility.eligible,
         rejection_reason=eligibility.rejection_reason,
-        created_event_id=registration_event.id,
+        created_event_id=registration_event.id if registration_event is not None else None,
         idempotency_key=idempotency_key,
     )
