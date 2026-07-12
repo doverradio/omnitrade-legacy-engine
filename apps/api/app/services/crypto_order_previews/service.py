@@ -16,6 +16,8 @@ from app.core.errors import ConflictError, InvalidRequestError, NotFoundError, S
 from app.models.audit_log import AuditLog
 from app.models.asset import Asset
 from app.models.crypto_order_preview import CryptoOrderPreview
+from app.models.decision_record import DecisionRecord
+from app.models.decision_snapshot import DecisionSnapshot
 from app.models.exchange_connection import ExchangeConnection
 from app.models.risk_kill_switch import RiskKillSwitch
 from app.schemas.crypto_order_previews import (
@@ -35,6 +37,7 @@ from app.services.execution_price_evidence import load_current_execution_price_e
 from app.services.risk.risk_context import RISK_POLICY_DEFAULTS
 from app.services.risk.risk_engine import RiskDecisionAction, RiskEvaluationContext, RiskEvaluationRequest, evaluate_signal_risk
 from app.services.risk.risk_monitor import get_risk_rules
+from app.services.risk.risk_persistence import RiskDecisionPersistenceRequest, persist_risk_decision
 
 
 SUPPORTED_SIDE = {"BUY", "SELL"}
@@ -257,6 +260,242 @@ def _price_evidence_summary(*, evidence: ExchangePriceEvidence, market_age_minut
     if evidence.audit_metadata:
         summary["audit_metadata"] = _redact_sensitive(dict(evidence.audit_metadata))
     return summary
+
+
+def _preview_decision_idempotency_key(*, preview_id: uuid.UUID, preview_version: int) -> str:
+    return _stable_hash(
+        {
+            "scope": "crypto_preview_decision",
+            "preview_id": str(preview_id),
+            "preview_version": preview_version,
+        }
+    )
+
+
+def _serialize_risk_steps(*, risk_eval: Any) -> list[dict[str, object]]:
+    steps = getattr(risk_eval, "steps", []) or []
+    serialized: list[dict[str, object]] = []
+    for step in steps:
+        serialized.append(
+            {
+                "step": str(getattr(step, "step", "unknown")),
+                "status": str(getattr(step, "status", "unknown")),
+                "reason_code": getattr(step, "reason_code", None),
+            }
+        )
+    return serialized
+
+
+def _find_first_failing_step(*, risk_eval: Any) -> dict[str, object] | None:
+    for item in _serialize_risk_steps(risk_eval=risk_eval):
+        if item.get("status") == "reject":
+            return item
+    return None
+
+
+async def _create_preview_decision_record(
+    *,
+    db: AsyncSession,
+    preview: CryptoOrderPreview,
+    request: CryptoOrderPreviewCreateRequest,
+    connection: ExchangeConnection,
+    asset: Asset,
+    reference_price: Decimal,
+    quote_size: Decimal,
+    available_quote_balance: Decimal,
+    risk_eval: Any,
+    risk_event_id: uuid.UUID,
+    price_evidence: ExchangePriceEvidence,
+    market_age_minutes: int,
+) -> uuid.UUID:
+    now = datetime.now(timezone.utc)
+    risk_steps = _serialize_risk_steps(risk_eval=risk_eval)
+    first_failing_step = _find_first_failing_step(risk_eval=risk_eval)
+    trade_accepted = getattr(risk_eval, "action", None) != RiskDecisionAction.REJECT
+    approved_quantity = getattr(risk_eval, "approved_quantity", Decimal("0"))
+
+    source_lineage = {
+        "crypto_order_previews": [str(preview.crypto_order_preview_id)],
+        "risk_events": [str(risk_event_id)],
+        "exchange_connections": [str(connection.exchange_connection_id)],
+    }
+    field_provenance = {
+        "generated_signals": [
+            {
+                "source": "crypto_order_previews",
+                "reference": str(preview.crypto_order_preview_id),
+            }
+        ],
+        "risk_adjustments": [
+            {
+                "source": "risk_events",
+                "reference": str(risk_event_id),
+            }
+        ],
+        "market_regime": [
+            {
+                "source": "execution_price_evidence",
+                "reference": str(price_evidence.evidence_id),
+            }
+        ],
+    }
+
+    decision_record = DecisionRecord(
+        idempotency_key=_preview_decision_idempotency_key(
+            preview_id=preview.crypto_order_preview_id,
+            preview_version=preview.preview_version,
+        ),
+        source_lineage=source_lineage,
+        field_provenance=field_provenance,
+        version="preview_v1",
+        timestamp=now,
+        asset={
+            "asset_id": str(asset.id),
+            "symbol": asset.symbol,
+            "provider": connection.provider,
+            "product_id": request.product_id.upper(),
+            "base_currency": price_evidence.base_currency,
+            "quote_currency": price_evidence.quote_currency,
+        },
+        timeframe="execution_preview",
+        market_regime={
+            "execution_price_evidence_id": str(price_evidence.evidence_id),
+            "provider": price_evidence.provider,
+            "venue": price_evidence.venue,
+            "source_endpoint": price_evidence.source_endpoint,
+            "observed_at": price_evidence.observed_at.astimezone(timezone.utc).isoformat() if price_evidence.observed_at else None,
+            "retrieved_at": price_evidence.retrieved_at.astimezone(timezone.utc).isoformat(),
+            "market_age_minutes": market_age_minutes,
+            "reference_price": format(reference_price, "f"),
+        },
+        indicators={
+            "bid": None if price_evidence.bid is None else format(price_evidence.bid, "f"),
+            "ask": None if price_evidence.ask is None else format(price_evidence.ask, "f"),
+            "midpoint": None if price_evidence.midpoint is None else format(price_evidence.midpoint, "f"),
+            "last_trade": None if price_evidence.last_trade is None else format(price_evidence.last_trade, "f"),
+            "latency_ms": price_evidence.latency_ms,
+            "freshness_seconds": price_evidence.freshness_seconds,
+        },
+        generated_signals=[
+            {
+                "preview_id": str(preview.crypto_order_preview_id),
+                "product_id": request.product_id.upper(),
+                "side": request.side,
+                "order_type": request.order_type,
+                "quote_size": format(quote_size, "f"),
+                "requested_amount_currency": request.requested_amount_currency,
+            }
+        ],
+        signal_strength=None,
+        confidence=price_evidence.confidence,
+        supporting_strategies=[],
+        opposing_strategies=[],
+        risk_adjustments=risk_steps,
+        expected_risk={
+            "risk_event_id": str(risk_event_id),
+            "risk_reason_code": getattr(risk_eval, "reason_code", None),
+            "first_failing_rule": first_failing_step,
+        },
+        expected_reward=None,
+        position_size=approved_quantity,
+        trade_accepted=trade_accepted,
+        trade_rejected_reason=getattr(risk_eval, "reason_code", None),
+        execution_details={
+            "preview_id": str(preview.crypto_order_preview_id),
+            "preview_version": preview.preview_version,
+            "status": preview.status,
+            "audit_correlation_id": str(preview.audit_correlation_id) if preview.audit_correlation_id else None,
+            "exchange_connection_id": str(connection.exchange_connection_id),
+            "provider": connection.provider,
+            "environment": connection.environment,
+            "requested_quote_size": format(quote_size, "f"),
+            "approved_quantity": format(approved_quantity, "f"),
+            "available_quote_balance": format(available_quote_balance, "f"),
+            "risk_engine_version": "risk_v1",
+            "rule_order": [item.get("step") for item in risk_steps],
+        },
+        exit_details=None,
+        pnl=None,
+        duration=None,
+        outcome="risk_rejected" if not trade_accepted else "risk_approved_preview",
+        post_trade_notes={
+            "human_explanation": (
+                f"Preview rejected by Risk Engine with reason_code={getattr(risk_eval, 'reason_code', None)}"
+                if not trade_accepted
+                else "Preview approved by Risk Engine for provider preview generation"
+            )
+        },
+        lessons_learned=None,
+        ai_reflection=None,
+        future_tags=None,
+        confidence_calibration=None,
+        review_status="unreviewed",
+        human_notes=None,
+    )
+    db.add(decision_record)
+    await db.flush()
+
+    decision_snapshot = DecisionSnapshot(
+        decision_id=decision_record.decision_id,
+        timestamp=now,
+        asset={
+            "asset_id": str(asset.id),
+            "symbol": asset.symbol,
+            "product_id": request.product_id.upper(),
+        },
+        exchange=connection.provider,
+        timeframe="execution_preview",
+        ohlcv_context=[],
+        indicators={
+            "reference_price": format(reference_price, "f"),
+            "market_age_minutes": market_age_minutes,
+        },
+        generated_features={
+            "execution_price_evidence_id": str(price_evidence.evidence_id),
+            "provider": price_evidence.provider,
+            "source_endpoint": price_evidence.source_endpoint,
+        },
+        market_regime={
+            "mode": "execution_preview",
+            "risk_reason_code": getattr(risk_eval, "reason_code", None),
+        },
+        volatility={},
+        spread_liquidity_context={
+            "bid": None if price_evidence.bid is None else format(price_evidence.bid, "f"),
+            "ask": None if price_evidence.ask is None else format(price_evidence.ask, "f"),
+            "last_trade": None if price_evidence.last_trade is None else format(price_evidence.last_trade, "f"),
+        },
+        strategy_inputs={
+            "strategy_id": str(request.strategy_id) if request.strategy_id else None,
+            "strategy_name": request.strategy_name,
+            "decision_record_id_request": str(request.decision_record_id) if request.decision_record_id else None,
+            "validation_run_id": str(request.validation_run_id) if request.validation_run_id else None,
+        },
+        risk_inputs={
+            "risk_event_id": str(risk_event_id),
+            "risk_engine_version": "risk_v1",
+            "rule_order": [item.get("step") for item in risk_steps],
+            "first_failing_rule": first_failing_step,
+            "reason_code": getattr(risk_eval, "reason_code", None),
+            "requested_quote_size": format(quote_size, "f"),
+            "approved_quantity": format(approved_quantity, "f"),
+            "reference_price": format(reference_price, "f"),
+        },
+        current_position_state=None,
+        open_trades=[],
+        portfolio_exposure={
+            "paper_account_id": None,
+            "available_quote_balance": format(available_quote_balance, "f"),
+        },
+        parameter_set_version="unknown",
+        strategy_version="unknown",
+        ai_model_version="none",
+        decision_engine_version="preview_v1",
+        configuration_version="risk_v1",
+    )
+    db.add(decision_snapshot)
+    await db.flush()
+    return decision_record.decision_id
 
 
 async def _load_ready_preview(db: AsyncSession, preview_id: uuid.UUID) -> CryptoOrderPreview:
@@ -527,6 +766,32 @@ async def create_crypto_order_preview(
     )
 
     if risk_eval.action == RiskDecisionAction.REJECT:
+        risk_result = await persist_risk_decision(
+            db=db,
+            request=RiskDecisionPersistenceRequest(
+                paper_account_id=None,
+                signal_id=None,
+                actor=actor,
+                evaluation_result=risk_eval,
+            ),
+        )
+        record.risk_event_id = risk_result.risk_event_id
+        if record.decision_record_id is None:
+            record.decision_record_id = await _create_preview_decision_record(
+                db=db,
+                preview=record,
+                request=request,
+                connection=connection,
+                asset=asset,
+                reference_price=reference_price,
+                quote_size=quote_size,
+                available_quote_balance=available_quote_balance,
+                risk_eval=risk_eval,
+                risk_event_id=risk_result.risk_event_id,
+                price_evidence=price_evidence,
+                market_age_minutes=market_age_minutes,
+            )
+
         record.status = "RISK_REJECTED"
         record.risk_verdict = "rejected"
         record.risk_explanation = risk_eval.reason_code or "Risk engine rejected the preview"
@@ -551,6 +816,32 @@ async def create_crypto_order_preview(
         before_state={"status": "PREVIEW_REQUESTED"},
         after_state={"status": "PREVIEW_REQUESTED"},
     )
+
+    risk_result = await persist_risk_decision(
+        db=db,
+        request=RiskDecisionPersistenceRequest(
+            paper_account_id=None,
+            signal_id=None,
+            actor=actor,
+            evaluation_result=risk_eval,
+        ),
+    )
+    record.risk_event_id = risk_result.risk_event_id
+    if record.decision_record_id is None:
+        record.decision_record_id = await _create_preview_decision_record(
+            db=db,
+            preview=record,
+            request=request,
+            connection=connection,
+            asset=asset,
+            reference_price=reference_price,
+            quote_size=quote_size,
+            available_quote_balance=available_quote_balance,
+            risk_eval=risk_eval,
+            risk_event_id=risk_result.risk_event_id,
+            price_evidence=price_evidence,
+            market_age_minutes=market_age_minutes,
+        )
 
     preview: ExchangePreviewResult = await provider.preview_market_order(
         credentials=credentials,
