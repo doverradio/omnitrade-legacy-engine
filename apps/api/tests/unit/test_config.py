@@ -1,8 +1,9 @@
 from __future__ import annotations
 
 from decimal import Decimal
+from pathlib import Path
 
-from app.config import Settings, get_settings
+from app.config import DEFAULT_ENV_FILE, Settings, get_settings
 
 
 def test_settings_allow_missing_future_phase_integration_credentials(monkeypatch) -> None:
@@ -23,9 +24,7 @@ def test_settings_allow_missing_future_phase_integration_credentials(monkeypatch
     assert settings.alpaca_base_url == "https://paper-api.alpaca.markets"
 
 
-def test_get_settings_still_loads_phase_1_defaults_without_optional_credentials(
-    monkeypatch, tmp_path
-) -> None:
+def test_get_settings_uses_cached_shared_bootstrap(monkeypatch) -> None:
     for key in [
         "SUPABASE_SERVICE_ROLE_KEY",
         "SUPABASE_JWT_SECRET",
@@ -34,17 +33,23 @@ def test_get_settings_still_loads_phase_1_defaults_without_optional_credentials(
     ]:
         monkeypatch.delenv(key, raising=False)
 
+    get_settings.cache_clear()
+
+    first = get_settings()
+    second = get_settings()
+
+    assert first is second
+    assert first.database_url.startswith("postgresql+asyncpg://")
+
+    get_settings.cache_clear()
+
+
+def test_settings_env_file_is_backend_relative_and_not_cwd_relative(tmp_path, monkeypatch) -> None:
     monkeypatch.chdir(tmp_path)
-    get_settings.cache_clear()
 
-    settings = get_settings()
-
-    assert settings.database_url.startswith("postgresql+asyncpg://")
-    assert settings.binance_us_api_base == "https://api.binance.us"
-    assert settings.supabase_jwt_secret is None
-    assert settings.alpaca_api_key_id is None
-
-    get_settings.cache_clear()
+    assert DEFAULT_ENV_FILE == Path(__file__).resolve().parents[2] / ".env"
+    assert DEFAULT_ENV_FILE.is_absolute()
+    assert Settings.model_config.get("env_file") == DEFAULT_ENV_FILE
 
 
 def test_live_crypto_settings_load_from_explicit_environment_variables(monkeypatch) -> None:
