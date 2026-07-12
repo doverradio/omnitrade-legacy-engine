@@ -13,7 +13,7 @@ from app.models.candle import Candle
 from app.models.crypto_order_preview import CryptoOrderPreview
 from app.models.exchange_connection import ExchangeConnection
 from app.services.crypto_order_previews import service
-from app.services.exchange_connections.providers.base import ExchangePreviewResult
+from app.services.exchange_connections.providers.base import ExchangePreviewResult, ExchangePriceEvidence
 
 
 class _FakeDb:
@@ -113,8 +113,34 @@ async def test_create_buy_preview_success(monkeypatch: pytest.MonkeyPatch) -> No
     async def _load_exchange_connection(*_args, **_kwargs):
         return connection
 
+    evidence = ExchangePriceEvidence(
+        evidence_id=uuid.uuid4(),
+        provider="coinbase_advanced",
+        venue="coinbase_advanced",
+        product_id="BTC-USD",
+        symbol="BTC",
+        quote_currency="USD",
+        base_currency="BTC",
+        bid=Decimal("9995.00"),
+        ask=Decimal("10005.00"),
+        midpoint=Decimal("10000.00"),
+        last_trade=Decimal("10000.00"),
+        reference_price=Decimal("10005.00"),
+        observed_at=now - timedelta(minutes=1),
+        retrieved_at=now,
+        latency_ms=10,
+        freshness_seconds=60,
+        source_endpoint="/api/v3/brokerage/products/BTC-USD",
+        retrieval_method="provider_authenticated_rest",
+        confidence=None,
+        audit_metadata={"source": "coinbase_brokerage_product"},
+    )
+
     async def _load_asset_and_price(*_args, **_kwargs):
-        return asset, Decimal("10000.00"), now - timedelta(minutes=2)
+        return asset
+
+    async def _load_execution_price_evidence(**_kwargs):
+        return evidence, Decimal("10005.00"), 1
 
     async def _global_kill_switch(*_args, **_kwargs):
         return False
@@ -122,11 +148,15 @@ async def test_create_buy_preview_success(monkeypatch: pytest.MonkeyPatch) -> No
     async def _risk_rules(**_kwargs):
         return SimpleNamespace(rules={"max_daily_loss_pct": Decimal("0.05"), "max_drawdown_pct": Decimal("0.10")})
 
+    captured: dict[str, object] = {}
+
     def _evaluate_signal_risk(*_args, **_kwargs):
+        captured["reference_price"] = _kwargs.get("reference_price")
         return SimpleNamespace(action=service.RiskDecisionAction.APPROVE, reason_code=None)
 
     monkeypatch.setattr(service, "_load_exchange_connection", _load_exchange_connection)
     monkeypatch.setattr(service, "_load_asset_and_price", _load_asset_and_price)
+    monkeypatch.setattr(service, "_load_execution_price_evidence", _load_execution_price_evidence)
     monkeypatch.setattr(service, "_get_global_kill_switch", _global_kill_switch)
     monkeypatch.setattr(service, "get_risk_rules", _risk_rules)
     monkeypatch.setattr(service, "evaluate_signal_risk", _evaluate_signal_risk)
@@ -155,6 +185,9 @@ async def test_create_buy_preview_success(monkeypatch: pytest.MonkeyPatch) -> No
     assert response.warning_messages == ["Estimated fee subject to change"]
     assert response.estimated_balance_after == Decimal("94.90")
     stored = next(item for item in db.added if isinstance(item, CryptoOrderPreview))
+    assert captured["reference_price"] == Decimal("10005.00")
+    assert stored.exchange_response_summary["price_evidence"]["evidence_id"] == str(evidence.evidence_id)
+    assert stored.exchange_response_summary["price_evidence"]["quote_currency"] == "USD"
     assert stored.failure_reason is None
     assert stored.exchange_response_summary["preview_id"] == "preview-123"
 
@@ -343,8 +376,34 @@ async def test_preview_redacts_sensitive_exchange_response_summary(monkeypatch: 
     async def _load_exchange_connection(*_args, **_kwargs):
         return connection
 
+    evidence = ExchangePriceEvidence(
+        evidence_id=uuid.uuid4(),
+        provider="coinbase_advanced",
+        venue="coinbase_advanced",
+        product_id="BTC-USD",
+        symbol="BTC",
+        quote_currency="USD",
+        base_currency="BTC",
+        bid=Decimal("9995.00"),
+        ask=Decimal("10005.00"),
+        midpoint=Decimal("10000.00"),
+        last_trade=Decimal("10000.00"),
+        reference_price=Decimal("10005.00"),
+        observed_at=now - timedelta(minutes=1),
+        retrieved_at=now,
+        latency_ms=8,
+        freshness_seconds=60,
+        source_endpoint="/api/v3/brokerage/products/BTC-USD",
+        retrieval_method="provider_authenticated_rest",
+        confidence=None,
+        audit_metadata={"source": "coinbase_brokerage_product"},
+    )
+
     async def _load_asset_and_price(*_args, **_kwargs):
-        return asset, Decimal("10000.00"), now - timedelta(minutes=2)
+        return asset
+
+    async def _load_execution_price_evidence(**_kwargs):
+        return evidence, Decimal("10005.00"), 1
 
     async def _global_kill_switch(*_args, **_kwargs):
         return False
@@ -357,6 +416,7 @@ async def test_preview_redacts_sensitive_exchange_response_summary(monkeypatch: 
 
     monkeypatch.setattr(service, "_load_exchange_connection", _load_exchange_connection)
     monkeypatch.setattr(service, "_load_asset_and_price", _load_asset_and_price)
+    monkeypatch.setattr(service, "_load_execution_price_evidence", _load_execution_price_evidence)
     monkeypatch.setattr(service, "_get_global_kill_switch", _global_kill_switch)
     monkeypatch.setattr(service, "get_risk_rules", _risk_rules)
     monkeypatch.setattr(service, "evaluate_signal_risk", _evaluate_signal_risk)
@@ -382,4 +442,5 @@ async def test_preview_redacts_sensitive_exchange_response_summary(monkeypatch: 
     assert stored.exchange_response_summary["token"] == "[REDACTED]"
     assert stored.exchange_response_summary["nested"]["authorization"] == "[REDACTED]"
     assert stored.exchange_response_summary["nested"]["safe"] == "ok"
+    assert stored.exchange_response_summary["price_evidence"]["evidence_id"] == str(evidence.evidence_id)
     assert response.exchange_response_summary["api_key"] == "[REDACTED]"

@@ -122,6 +122,37 @@ async def test_conformance_08_09_price_preview_normalization_decimal(monkeypatch
 
 
 @pytest.mark.asyncio
+async def test_conformance_fetch_price_evidence_normalization(monkeypatch: pytest.MonkeyPatch) -> None:
+    client = CoinbaseAdvancedClient()
+
+    async def _request_json(**_kwargs):
+        return (
+            {
+                "product_id": "BTC-USD",
+                "base_currency_id": "BTC",
+                "quote_currency_id": "USD",
+                "best_bid": "49990",
+                "best_ask": "50000",
+                "price": "49995",
+            },
+            {"Date": "Thu, 09 Jul 2026 10:00:00 GMT"},
+        )
+
+    monkeypatch.setattr(client, "_request_json", _request_json)
+    evidence = await client.fetch_price_evidence(
+        credentials={"api_key": "k", "api_secret": "s"},
+        environment="production",
+        product_id="BTC-USD",
+    )
+
+    assert evidence.product_id == "BTC-USD"
+    assert evidence.base_currency == "BTC"
+    assert evidence.quote_currency == "USD"
+    assert evidence.reference_price == Decimal("50000")
+    assert evidence.source_endpoint == "/api/v3/brokerage/products/BTC-USD"
+
+
+@pytest.mark.asyncio
 async def test_conformance_10_timestamp_awareness(monkeypatch: pytest.MonkeyPatch) -> None:
     client = CoinbaseAdvancedClient()
 

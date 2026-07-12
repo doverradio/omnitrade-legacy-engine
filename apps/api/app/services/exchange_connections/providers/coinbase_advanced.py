@@ -7,6 +7,7 @@ import email.utils
 import os
 import secrets
 from typing import Any
+import uuid
 
 import httpx
 import jwt
@@ -27,6 +28,7 @@ from app.services.exchange_connections.providers.base import (
     ExchangeProviderMetadata,
     ExchangeProviderOrder,
     ExchangeProviderRejection,
+    ExchangePriceEvidence,
     ExchangeProductSnapshot,
     ExchangePreviewResult,
     ExchangePermissionSnapshot,
@@ -408,6 +410,91 @@ class CoinbaseAdvancedClient:
             product_id=product_id,
             available=available,
             trading_enabled=trading_enabled,
+        )
+
+    async def fetch_price_evidence(
+        self,
+        *,
+        credentials: dict[str, str],
+        environment: str,
+        product_id: str,
+    ) -> ExchangePriceEvidence:
+        path = f"/api/v3/brokerage/products/{product_id}"
+        payload, headers = await self._request_json(
+            method="GET",
+            path=path,
+            credentials=credentials,
+            environment=environment,
+            swallow_404=False,
+        )
+
+        resolved_product = str(payload.get("product_id") or product_id).upper()
+        if resolved_product != product_id.upper():
+            raise InvalidRequestError(
+                message="Coinbase product mismatch in price evidence",
+                details={"requested_product_id": product_id, "resolved_product_id": resolved_product},
+            )
+
+        base_currency = str(payload.get("base_currency_id") or "").upper()
+        quote_currency = str(payload.get("quote_currency_id") or "").upper()
+        if not base_currency or not quote_currency:
+            parts = resolved_product.split("-", 1)
+            if len(parts) == 2:
+                base_currency, quote_currency = parts[0], parts[1]
+
+        bid = _decimal_field(payload, "best_bid", "best_bid_price")
+        ask = _decimal_field(payload, "best_ask", "best_ask_price")
+        last_trade = _decimal_field(payload, "price", "last_trade_price")
+        midpoint: Decimal | None = None
+        if bid is not None and ask is not None and bid > Decimal("0") and ask > Decimal("0"):
+            midpoint = (bid + ask) / Decimal("2")
+
+        reference_price: Decimal | None = None
+        if ask is not None and ask > Decimal("0"):
+            reference_price = ask
+        elif last_trade is not None and last_trade > Decimal("0"):
+            reference_price = last_trade
+        elif midpoint is not None and midpoint > Decimal("0"):
+            reference_price = midpoint
+
+        if reference_price is None or reference_price <= Decimal("0"):
+            raise InvalidRequestError(
+                message="Coinbase executable quote unavailable",
+                details={"product_id": resolved_product},
+            )
+
+        observed_at: datetime | None = None
+        date_header = headers.get("Date") if isinstance(headers, dict) else None
+        if isinstance(date_header, str) and date_header.strip():
+            try:
+                parsed = email.utils.parsedate_to_datetime(date_header)
+                observed_at = parsed if parsed.tzinfo is not None else parsed.replace(tzinfo=timezone.utc)
+                observed_at = observed_at.astimezone(timezone.utc)
+            except Exception:
+                observed_at = None
+
+        retrieved_at = datetime.now(timezone.utc)
+        return ExchangePriceEvidence(
+            evidence_id=uuid.uuid4(),
+            provider=self.provider,
+            venue=self.provider,
+            product_id=resolved_product,
+            symbol=base_currency,
+            quote_currency=quote_currency,
+            base_currency=base_currency,
+            bid=bid,
+            ask=ask,
+            midpoint=midpoint,
+            last_trade=last_trade,
+            reference_price=reference_price,
+            observed_at=observed_at or retrieved_at,
+            retrieved_at=retrieved_at,
+            latency_ms=None,
+            freshness_seconds=0,
+            source_endpoint=path,
+            retrieval_method="provider_authenticated_rest",
+            confidence=None,
+            audit_metadata={"source": "coinbase_brokerage_product"},
         )
 
     async def preview_market_order(

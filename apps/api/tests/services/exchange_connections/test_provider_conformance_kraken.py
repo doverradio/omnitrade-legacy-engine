@@ -222,6 +222,44 @@ async def test_conformance_08_btc_usd_mapping(monkeypatch: pytest.MonkeyPatch) -
 
 
 @pytest.mark.asyncio
+async def test_conformance_fetch_price_evidence_uses_ticker(monkeypatch: pytest.MonkeyPatch) -> None:
+    client = KrakenSpotClient()
+
+    async def _public(*, path, **_kwargs):
+        if path == "/public/AssetPairs":
+            return {
+                "error": [],
+                "result": {
+                    "XXBTZUSD": {
+                        "altname": "XBTUSD",
+                        "wsname": "XBT/USD",
+                        "base": "XXBT",
+                        "quote": "ZUSD",
+                        "status": "online",
+                        "pair_decimals": 1,
+                        "lot_decimals": 8,
+                        "ordermin": "0.0001",
+                        "costmin": "0.5",
+                    }
+                },
+            }
+        return {"error": [], "result": {"XXBTZUSD": {"a": ["50000", "1", "1"], "b": ["49990", "1", "1"], "c": ["49995", "0.1"]}}}
+
+    monkeypatch.setattr(client, "_public_request", _public)
+    evidence = await client.fetch_price_evidence(
+        credentials={"api_key": "k", "api_secret": "s"},
+        environment="production",
+        product_id="BTC-USD",
+    )
+
+    assert evidence.product_id == "BTC-USD"
+    assert evidence.base_currency == "BTC"
+    assert evidence.quote_currency == "USD"
+    assert evidence.reference_price == Decimal("50000")
+    assert evidence.source_endpoint == "/public/Ticker"
+
+
+@pytest.mark.asyncio
 async def test_conformance_09_10_minimum_and_precision_handling(monkeypatch: pytest.MonkeyPatch) -> None:
     client = KrakenSpotClient()
 

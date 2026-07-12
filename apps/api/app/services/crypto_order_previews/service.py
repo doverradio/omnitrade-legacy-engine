@@ -15,7 +15,6 @@ from app.config import get_settings
 from app.core.errors import ConflictError, InvalidRequestError, NotFoundError, ServiceUnavailableError
 from app.models.audit_log import AuditLog
 from app.models.asset import Asset
-from app.models.candle import Candle
 from app.models.crypto_order_preview import CryptoOrderPreview
 from app.models.exchange_connection import ExchangeConnection
 from app.models.risk_kill_switch import RiskKillSwitch
@@ -30,8 +29,9 @@ from app.schemas.crypto_order_previews import (
     CryptoOrderPreviewStatus,
 )
 from app.services.exchange_connections.service import get_decrypted_credentials_for_connection
-from app.services.exchange_connections.providers.base import ExchangeAuthResult, ExchangePreviewResult
+from app.services.exchange_connections.providers.base import ExchangeAuthResult, ExchangePreviewResult, ExchangePriceEvidence
 from app.services.exchange_connections.providers.registry import get_exchange_provider, require_provider_capabilities
+from app.services.execution_price_evidence import load_current_execution_price_evidence
 from app.services.risk.risk_context import RISK_POLICY_DEFAULTS
 from app.services.risk.risk_engine import RiskDecisionAction, RiskEvaluationContext, RiskEvaluationRequest, evaluate_signal_risk
 from app.services.risk.risk_monitor import get_risk_rules
@@ -40,7 +40,6 @@ from app.services.risk.risk_monitor import get_risk_rules
 SUPPORTED_SIDE = {"BUY", "SELL"}
 SUPPORTED_ORDER_TYPE = {"MARKET"}
 SUPPORTED_AMOUNT_CURRENCY = {"USD", "BTC"}
-REFERENCE_INTERVALS = ("1m", "5m", "15m", "1h", "1d")
 _PREVIEW_READY_CONNECTION_VERDICTS = {
     "READY_FOR_PREVIEW",
     "READY_FOR_DRY_RUN",
@@ -183,7 +182,7 @@ async def _load_exchange_connection(db: AsyncSession, exchange_connection_id: uu
     return connection
 
 
-async def _load_asset_and_price(db: AsyncSession, product_id: str) -> tuple[Asset, Decimal, datetime]:
+async def _load_asset_and_price(db: AsyncSession, product_id: str) -> Asset:
     normalized_product = product_id.strip().upper()
     if "-" not in normalized_product:
         raise InvalidRequestError(message="product_id must be a normalized spot pair like BTC-USD", details={"product_id": product_id})
@@ -201,16 +200,63 @@ async def _load_asset_and_price(db: AsyncSession, product_id: str) -> tuple[Asse
     if asset is None:
         raise InvalidRequestError(message="Unsupported product", details={"product_id": product_id})
 
-    candle = await db.scalar(
-        select(Candle)
-        .where(Candle.asset_id == asset.id)
-        .where(Candle.interval.in_(REFERENCE_INTERVALS))
-        .order_by(Candle.open_time.desc())
-    )
-    if candle is None:
-        raise ServiceUnavailableError(message="No market data available for preview", details={"product_id": product_id})
+    return asset
 
-    return asset, Decimal(candle.close), candle.close_time
+
+async def _load_execution_price_evidence(
+    *,
+    provider,
+    credentials: dict[str, str],
+    environment: str,
+    expected_provider: str,
+    product_id: str,
+    max_age_minutes: int,
+) -> tuple[ExchangePriceEvidence, Decimal, int]:
+    return await load_current_execution_price_evidence(
+        provider_client=provider,
+        credentials=credentials,
+        environment=environment,
+        expected_provider=expected_provider,
+        product_id=product_id,
+        max_age_minutes=max_age_minutes,
+    )
+
+
+def _price_evidence_summary(*, evidence: ExchangePriceEvidence, market_age_minutes: int) -> dict[str, object]:
+    summary: dict[str, object] = {
+        "evidence_id": str(evidence.evidence_id),
+        "provider": evidence.provider,
+        "venue": evidence.venue,
+        "product_id": evidence.product_id,
+        "symbol": evidence.symbol,
+        "quote_currency": evidence.quote_currency,
+        "base_currency": evidence.base_currency,
+        "observed_at": evidence.observed_at.astimezone(timezone.utc).isoformat() if evidence.observed_at else None,
+        "retrieved_at": evidence.retrieved_at.astimezone(timezone.utc).isoformat(),
+        "source_endpoint": evidence.source_endpoint,
+        "retrieval_method": evidence.retrieval_method,
+        "market_age_minutes": market_age_minutes,
+    }
+
+    if evidence.bid is not None:
+        summary["bid"] = format(evidence.bid, "f")
+    if evidence.ask is not None:
+        summary["ask"] = format(evidence.ask, "f")
+    if evidence.midpoint is not None:
+        summary["midpoint"] = format(evidence.midpoint, "f")
+    if evidence.last_trade is not None:
+        summary["last_trade"] = format(evidence.last_trade, "f")
+    if evidence.reference_price is not None:
+        summary["reference_price"] = format(evidence.reference_price, "f")
+    if evidence.latency_ms is not None:
+        summary["latency_ms"] = evidence.latency_ms
+    if evidence.freshness_seconds is not None:
+        summary["freshness_seconds"] = evidence.freshness_seconds
+    if evidence.confidence is not None:
+        summary["confidence"] = format(evidence.confidence, "f")
+    if evidence.audit_metadata:
+        summary["audit_metadata"] = _redact_sensitive(dict(evidence.audit_metadata))
+    return summary
 
 
 async def _load_ready_preview(db: AsyncSession, preview_id: uuid.UUID) -> CryptoOrderPreview:
@@ -364,16 +410,18 @@ async def create_crypto_order_preview(
     if request.base_size is not None:
         raise InvalidRequestError(message="base_size is not supported for BUY previews in v1", details={"field": "base_size"})
 
-    asset, reference_price, candle_close_time = await _load_asset_and_price(db=db, product_id=normalized_product)
-    market_age_minutes = int((datetime.now(timezone.utc) - candle_close_time.astimezone(timezone.utc)).total_seconds() / 60)
-    if market_age_minutes > settings.crypto_preview_market_data_max_age_minutes:
-        raise InvalidRequestError(
-            message="Market data is stale",
-            details={"market_age_minutes": market_age_minutes, "max_age_minutes": settings.crypto_preview_market_data_max_age_minutes},
-        )
-
+    asset = await _load_asset_and_price(db=db, product_id=normalized_product)
     credentials = get_decrypted_credentials_for_connection(connection)
     provider = get_exchange_provider(connection.provider)
+    price_evidence, reference_price, market_age_minutes = await _load_execution_price_evidence(
+        provider=provider,
+        credentials=credentials,
+        environment=connection.environment,
+        expected_provider=connection.provider,
+        product_id=normalized_product,
+        max_age_minutes=settings.crypto_preview_market_data_max_age_minutes,
+    )
+
     balances_snapshot = await provider.fetch_balances(credentials=credentials, environment=connection.environment)
     available_quote_balance = next((item.available for item in balances_snapshot.balances if item.currency == "USD"), Decimal("0"))
     available_base_balance = next((item.available for item in balances_snapshot.balances if item.currency == "BTC"), Decimal("0"))
@@ -474,6 +522,7 @@ async def create_crypto_order_preview(
             "quote_size": format(quote_size, "f"),
             "readiness_verdict": record.readiness_verdict,
             "risk_reason_code": risk_eval.reason_code,
+            "price_evidence_id": str(price_evidence.evidence_id),
         },
     )
 
@@ -515,7 +564,9 @@ async def create_crypto_order_preview(
 
     record.preview_id = preview.preview_id
     record.warning_messages = list(preview.warning_messages)
-    record.exchange_response_summary = _redact_sensitive(dict(preview.exchange_response_summary))
+    preview_summary = _redact_sensitive(dict(preview.exchange_response_summary))
+    preview_summary["price_evidence"] = _price_evidence_summary(evidence=price_evidence, market_age_minutes=market_age_minutes)
+    record.exchange_response_summary = preview_summary
     record.best_bid = preview.best_bid
     record.best_ask = preview.best_ask
     record.estimated_average_price = preview.estimated_average_price or reference_price

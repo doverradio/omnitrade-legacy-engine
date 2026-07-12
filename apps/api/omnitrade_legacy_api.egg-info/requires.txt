@@ -3,6 +3,8 @@ uvicorn[standard]
 sqlalchemy[asyncio]
 asyncpg
 alembic
+cryptography
+PyJWT
 pydantic-settings
 httpx
 pytest

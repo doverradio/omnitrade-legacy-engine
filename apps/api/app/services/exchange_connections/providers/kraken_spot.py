@@ -11,6 +11,7 @@ from decimal import Decimal, ROUND_DOWN
 import os
 import urllib.parse
 from typing import Any
+import uuid
 
 import httpx
 
@@ -23,6 +24,7 @@ from app.services.exchange_connections.providers.base import (
     ExchangeOrderSubmissionRequest,
     ExchangeOrderSubmissionResult,
     ExchangePermissionSnapshot,
+    ExchangePriceEvidence,
     ExchangePreviewResult,
     ExchangeProductSnapshot,
     ExchangeProviderAmbiguousResponse,
@@ -657,6 +659,87 @@ class KrakenSpotClient:
             product_id=normalized_product,
             available=available,
             trading_enabled=trading_enabled,
+        )
+
+    async def fetch_price_evidence(
+        self,
+        *,
+        credentials: dict[str, str],
+        environment: str,
+        product_id: str,
+    ) -> ExchangePriceEvidence:
+        _ = credentials
+        retrieved_at = datetime.now(timezone.utc)
+        normalized_product, target_pair = _normalize_intent_product(product_id)
+        pair_info = await self._load_pair_info(environment=environment, normalized_pair=target_pair)
+        if pair_info is None:
+            raise InvalidRequestError(
+                message="Kraken product unavailable for price evidence",
+                details={"product_id": normalized_product},
+            )
+
+        altname = str(pair_info.get("altname") or "XBTUSD")
+        ticker_payload = await self._public_request(path="/public/Ticker", environment=environment, params={"pair": altname})
+        ticker_result = ticker_payload.get("result") if isinstance(ticker_payload.get("result"), dict) else {}
+        ticker_row = next(iter(ticker_result.values())) if isinstance(ticker_result, dict) and ticker_result else None
+        if not isinstance(ticker_row, dict):
+            raise InvalidRequestError(
+                message="Kraken ticker payload unavailable",
+                details={"product_id": normalized_product, "pair": altname},
+            )
+
+        ask_arr = ticker_row.get("a") if isinstance(ticker_row.get("a"), list) else []
+        bid_arr = ticker_row.get("b") if isinstance(ticker_row.get("b"), list) else []
+        last_arr = ticker_row.get("c") if isinstance(ticker_row.get("c"), list) else []
+        ask = _to_decimal(ask_arr[0] if len(ask_arr) > 0 else None)
+        bid = _to_decimal(bid_arr[0] if len(bid_arr) > 0 else None)
+        last_trade = _to_decimal(last_arr[0] if len(last_arr) > 0 else None)
+
+        midpoint: Decimal | None = None
+        if ask > Decimal("0") and bid > Decimal("0"):
+            midpoint = (ask + bid) / Decimal("2")
+
+        reference_price: Decimal | None = None
+        if ask > Decimal("0"):
+            reference_price = ask
+        elif last_trade > Decimal("0"):
+            reference_price = last_trade
+        elif midpoint is not None and midpoint > Decimal("0"):
+            reference_price = midpoint
+
+        if reference_price is None or reference_price <= Decimal("0"):
+            raise InvalidRequestError(
+                message="Kraken executable quote unavailable",
+                details={"product_id": normalized_product, "pair": altname},
+            )
+
+        base_currency = _canonical_asset(str(pair_info.get("base") or "BTC"))
+        quote_currency = _canonical_asset(str(pair_info.get("quote") or "USD"))
+
+        return ExchangePriceEvidence(
+            evidence_id=uuid.uuid4(),
+            provider=self.provider,
+            venue=self.provider,
+            product_id=normalized_product,
+            symbol=base_currency,
+            quote_currency=quote_currency,
+            base_currency=base_currency,
+            bid=bid if bid > Decimal("0") else None,
+            ask=ask if ask > Decimal("0") else None,
+            midpoint=midpoint,
+            last_trade=last_trade if last_trade > Decimal("0") else None,
+            reference_price=reference_price,
+            observed_at=retrieved_at,
+            retrieved_at=retrieved_at,
+            latency_ms=None,
+            freshness_seconds=0,
+            source_endpoint="/public/Ticker",
+            retrieval_method="provider_public_rest",
+            confidence=None,
+            audit_metadata={
+                "pair": altname,
+                "source": "kraken_public_assetpairs_ticker",
+            },
         )
 
     async def preview_market_order(

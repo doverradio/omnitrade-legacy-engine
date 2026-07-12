@@ -8,6 +8,8 @@ Requires-Dist: uvicorn[standard]
 Requires-Dist: sqlalchemy[asyncio]
 Requires-Dist: asyncpg
 Requires-Dist: alembic
+Requires-Dist: cryptography
+Requires-Dist: PyJWT
 Requires-Dist: pydantic-settings
 Requires-Dist: httpx
 Requires-Dist: pytest

@@ -4,6 +4,7 @@ from dataclasses import dataclass, field
 from datetime import datetime
 from decimal import Decimal
 from typing import Any, Literal, Protocol
+import uuid
 
 
 ProviderEnvironment = Literal["production", "sandbox"]
@@ -80,6 +81,30 @@ class ExchangeProductSnapshot:
     product_id: str
     available: bool
     trading_enabled: bool
+
+
+@dataclass(frozen=True, slots=True)
+class ExchangePriceEvidence:
+    evidence_id: uuid.UUID
+    provider: str
+    venue: str
+    product_id: str
+    symbol: str
+    quote_currency: str
+    base_currency: str
+    bid: Decimal | None
+    ask: Decimal | None
+    midpoint: Decimal | None
+    last_trade: Decimal | None
+    reference_price: Decimal | None
+    observed_at: datetime | None
+    retrieved_at: datetime
+    latency_ms: int | None
+    freshness_seconds: int | None
+    source_endpoint: str
+    retrieval_method: str
+    confidence: Decimal | None
+    audit_metadata: dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass(frozen=True, slots=True)
@@ -213,6 +238,15 @@ class ExchangeProviderClient(Protocol):
         ...
 
     async def fetch_product(self, *, credentials: dict[str, str], environment: str, product_id: str) -> ExchangeProductSnapshot:
+        ...
+
+    async def fetch_price_evidence(
+        self,
+        *,
+        credentials: dict[str, str],
+        environment: str,
+        product_id: str,
+    ) -> ExchangePriceEvidence:
         ...
 
     async def preview_market_order(
