@@ -18,6 +18,8 @@ class _FakeDb:
         self.cycles_by_key: dict[str, AutonomousCycleRun] = {}
         self.connection = None
         self.added: list[object] = []
+        self.authorizations: list[dict[str, object]] = []
+        self.enforce_authorization_rows = False
 
     def add(self, item: object) -> None:
         if isinstance(item, AutonomousCycleRun):
@@ -44,6 +46,33 @@ class _FakeDb:
             return next(iter(self.cycles_by_key.values()), None)
         if "count(*)" in sql and "FROM live_crypto_orders" in sql:
             return 0
+        if "FROM autonomous_capital_mandate_authorizations" in sql:
+            if not self.enforce_authorization_rows:
+                return uuid.uuid4()
+
+            compiled = statement.compile()
+            params = compiled.params
+            uuid_values = [value for value in params.values() if isinstance(value, uuid.UUID)]
+            datetime_values = [value for value in params.values() if isinstance(value, datetime)]
+            mandate_id = uuid_values[0] if uuid_values else None
+            mandate_version_id = uuid_values[1] if len(uuid_values) > 1 else None
+            observed_at = datetime_values[0] if datetime_values else None
+
+            for item in self.authorizations:
+                if mandate_id is not None and item.get("mandate_id") != mandate_id:
+                    continue
+                if mandate_version_id is not None and item.get("mandate_version_id") != mandate_version_id:
+                    continue
+                if item.get("authorization_state") != "AUTHORIZED":
+                    continue
+                if item.get("revoked_at") is not None:
+                    continue
+                expires_at = item.get("expires_at")
+                if observed_at is not None and isinstance(expires_at, datetime) and expires_at <= observed_at:
+                    continue
+                return item.get("mandate_authorization_id", uuid.uuid4())
+
+            return None
         if "FROM assets" in sql:
             return None
         return None
@@ -134,6 +163,17 @@ def _patch_happy_path(monkeypatch: pytest.MonkeyPatch, mandate, version, *, acti
     monkeypatch.setattr("app.services.autonomous_cycle.orchestrator.get_decrypted_credentials_for_connection", lambda _c: {"x": "y"})
 
 
+def _authorized_row(*, mandate_id: uuid.UUID, mandate_version_id: uuid.UUID, revoked_at: datetime | None = None, expires_at: datetime | None = None) -> dict[str, object]:
+    return {
+        "mandate_authorization_id": uuid.uuid4(),
+        "mandate_id": mandate_id,
+        "mandate_version_id": mandate_version_id,
+        "authorization_state": "AUTHORIZED",
+        "revoked_at": revoked_at,
+        "expires_at": expires_at,
+    }
+
+
 @pytest.mark.asyncio
 async def test_cycle_buy_generates_preview(monkeypatch: pytest.MonkeyPatch) -> None:
     db = _FakeDb()
@@ -168,6 +208,145 @@ async def test_cycle_buy_generates_preview_for_operator_review_verdict(monkeypat
     assert result.state == "COMPLETE"
     assert result.proposed_action == "BUY"
     assert result.preview_id is not None
+
+
+@pytest.mark.asyncio
+async def test_cycle_accepts_authorized_exact_version_even_when_version_flag_false(monkeypatch: pytest.MonkeyPatch) -> None:
+    db = _FakeDb()
+    db.enforce_authorization_rows = True
+    mandate = _mandate(status="ACTIVE")
+    version = _version()
+    version.is_authorized = False
+    db.authorizations = [
+        _authorized_row(
+            mandate_id=mandate.mandate_id,
+            mandate_version_id=version.mandate_version_id,
+            expires_at=datetime.now(timezone.utc).replace(year=2099),
+        )
+    ]
+    db.connection = SimpleNamespace(last_readiness_verdict="READY_FOR_PREVIEW", provider="kraken_spot", environment="production")
+    _patch_happy_path(monkeypatch, mandate, version, action="BUY")
+
+    result = await run_autonomous_preview_cycle(
+        db=db,
+        request=AutonomousCycleRequest(mandate_id=mandate.mandate_id, actor="operator:owner", forced_action="BUY", idempotency_seed="auth-row-canonical"),
+    )
+
+    assert result.state == "COMPLETE"
+    assert result.proposed_action == "BUY"
+    assert result.preview_id is not None
+    assert result.diagnostics.failure_reason is None
+
+
+@pytest.mark.asyncio
+async def test_cycle_holds_when_exact_version_authorization_missing(monkeypatch: pytest.MonkeyPatch) -> None:
+    db = _FakeDb()
+    db.enforce_authorization_rows = True
+    mandate = _mandate(status="ACTIVE")
+    version = _version()
+    version.is_authorized = False
+    db.authorizations = []
+    db.connection = SimpleNamespace(last_readiness_verdict="READY_FOR_PREVIEW", provider="kraken_spot", environment="production")
+
+    monkeypatch.setattr("app.services.autonomous_cycle.orchestrator.get_mandate", _async_return(mandate))
+    monkeypatch.setattr("app.services.autonomous_cycle.orchestrator.list_mandate_versions", _async_return([version]))
+
+    result = await run_autonomous_preview_cycle(
+        db=db,
+        request=AutonomousCycleRequest(mandate_id=mandate.mandate_id, actor="operator:owner", idempotency_seed="missing-auth"),
+    )
+
+    assert result.state == "COMPLETE"
+    assert result.preview_id is None
+    assert result.diagnostics.failure_reason == "active_mandate_policy_requires_authorized_version"
+
+
+@pytest.mark.asyncio
+async def test_cycle_holds_when_authorization_is_for_another_version(monkeypatch: pytest.MonkeyPatch) -> None:
+    db = _FakeDb()
+    db.enforce_authorization_rows = True
+    mandate = _mandate(status="ACTIVE")
+    version = _version()
+    version.is_authorized = False
+    db.authorizations = [
+        _authorized_row(
+            mandate_id=mandate.mandate_id,
+            mandate_version_id=uuid.uuid4(),
+            expires_at=datetime.now(timezone.utc).replace(year=2099),
+        )
+    ]
+    db.connection = SimpleNamespace(last_readiness_verdict="READY_FOR_PREVIEW", provider="kraken_spot", environment="production")
+
+    monkeypatch.setattr("app.services.autonomous_cycle.orchestrator.get_mandate", _async_return(mandate))
+    monkeypatch.setattr("app.services.autonomous_cycle.orchestrator.list_mandate_versions", _async_return([version]))
+
+    result = await run_autonomous_preview_cycle(
+        db=db,
+        request=AutonomousCycleRequest(mandate_id=mandate.mandate_id, actor="operator:owner", idempotency_seed="other-version-auth"),
+    )
+
+    assert result.state == "COMPLETE"
+    assert result.preview_id is None
+    assert result.diagnostics.failure_reason == "active_mandate_policy_requires_authorized_version"
+
+
+@pytest.mark.asyncio
+async def test_cycle_holds_when_exact_version_authorization_is_revoked(monkeypatch: pytest.MonkeyPatch) -> None:
+    db = _FakeDb()
+    db.enforce_authorization_rows = True
+    mandate = _mandate(status="ACTIVE")
+    version = _version()
+    version.is_authorized = False
+    db.authorizations = [
+        _authorized_row(
+            mandate_id=mandate.mandate_id,
+            mandate_version_id=version.mandate_version_id,
+            revoked_at=datetime.now(timezone.utc),
+            expires_at=datetime.now(timezone.utc).replace(year=2099),
+        )
+    ]
+    db.connection = SimpleNamespace(last_readiness_verdict="READY_FOR_PREVIEW", provider="kraken_spot", environment="production")
+
+    monkeypatch.setattr("app.services.autonomous_cycle.orchestrator.get_mandate", _async_return(mandate))
+    monkeypatch.setattr("app.services.autonomous_cycle.orchestrator.list_mandate_versions", _async_return([version]))
+
+    result = await run_autonomous_preview_cycle(
+        db=db,
+        request=AutonomousCycleRequest(mandate_id=mandate.mandate_id, actor="operator:owner", idempotency_seed="revoked-auth"),
+    )
+
+    assert result.state == "COMPLETE"
+    assert result.preview_id is None
+    assert result.diagnostics.failure_reason == "active_mandate_policy_requires_authorized_version"
+
+
+@pytest.mark.asyncio
+async def test_cycle_holds_when_exact_version_authorization_is_expired(monkeypatch: pytest.MonkeyPatch) -> None:
+    db = _FakeDb()
+    db.enforce_authorization_rows = True
+    mandate = _mandate(status="ACTIVE")
+    version = _version()
+    version.is_authorized = False
+    db.authorizations = [
+        _authorized_row(
+            mandate_id=mandate.mandate_id,
+            mandate_version_id=version.mandate_version_id,
+            expires_at=datetime.now(timezone.utc).replace(year=2000),
+        )
+    ]
+    db.connection = SimpleNamespace(last_readiness_verdict="READY_FOR_PREVIEW", provider="kraken_spot", environment="production")
+
+    monkeypatch.setattr("app.services.autonomous_cycle.orchestrator.get_mandate", _async_return(mandate))
+    monkeypatch.setattr("app.services.autonomous_cycle.orchestrator.list_mandate_versions", _async_return([version]))
+
+    result = await run_autonomous_preview_cycle(
+        db=db,
+        request=AutonomousCycleRequest(mandate_id=mandate.mandate_id, actor="operator:owner", idempotency_seed="expired-auth"),
+    )
+
+    assert result.state == "COMPLETE"
+    assert result.preview_id is None
+    assert result.diagnostics.failure_reason == "active_mandate_policy_requires_authorized_version"
 
 
 @pytest.mark.asyncio

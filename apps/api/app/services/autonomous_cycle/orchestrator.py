@@ -9,13 +9,14 @@ from datetime import datetime, timezone
 from decimal import Decimal
 from typing import Any
 
-from sqlalchemy import desc, func, select
+from sqlalchemy import desc, func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.errors import InvalidRequestError
 from app.models.asset import Asset
 from app.models.audit_log import AuditLog
 from app.models.autonomous_capital_mandate import AutonomousCapitalMandate
+from app.models.autonomous_capital_mandate_authorization import AutonomousCapitalMandateAuthorization
 from app.models.autonomous_capital_mandate_version import AutonomousCapitalMandateVersion
 from app.models.autonomous_cycle_run import AutonomousCycleRun
 from app.models.candle import Candle
@@ -176,7 +177,19 @@ async def run_autonomous_preview_cycle(
                 started_monotonic=started_monotonic,
             )
 
-        version_validation = validate_mandate_version(_to_version_model(version=version, mandate=mandate, is_authorized=bool(version.is_authorized)))
+        version_is_authorized = await _has_valid_exact_version_authorization(
+            db=db,
+            mandate_id=mandate.mandate_id,
+            mandate_version_id=version.mandate_version_id,
+            observed_at=datetime.now(timezone.utc),
+        )
+        version_validation = validate_mandate_version(
+            _to_version_model(
+                version=version,
+                mandate=mandate,
+                is_authorized=version_is_authorized,
+            )
+        )
         if not version_validation.valid:
             return await _finish_hold(
                 db=db,
@@ -1013,6 +1026,30 @@ def _to_cycle_result(cycle: AutonomousCycleRun, *, replayed: bool) -> Autonomous
         started_at=cycle.started_at,
         completed_at=cycle.completed_at,
     )
+
+
+async def _has_valid_exact_version_authorization(
+    *,
+    db: AsyncSession,
+    mandate_id: uuid.UUID,
+    mandate_version_id: uuid.UUID,
+    observed_at: datetime,
+) -> bool:
+    authorization_id = await db.scalar(
+        select(AutonomousCapitalMandateAuthorization.mandate_authorization_id)
+        .where(
+            AutonomousCapitalMandateAuthorization.mandate_id == mandate_id,
+            AutonomousCapitalMandateAuthorization.mandate_version_id == mandate_version_id,
+            AutonomousCapitalMandateAuthorization.authorization_state == "AUTHORIZED",
+            AutonomousCapitalMandateAuthorization.revoked_at.is_(None),
+            or_(
+                AutonomousCapitalMandateAuthorization.expires_at.is_(None),
+                AutonomousCapitalMandateAuthorization.expires_at > observed_at,
+            ),
+        )
+        .limit(1)
+    )
+    return authorization_id is not None
 
 
 def normalize_product_id(product_id: str) -> str:

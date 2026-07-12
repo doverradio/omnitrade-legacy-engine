@@ -26,6 +26,7 @@ class _FakeDb:
         self.flushes = 0
         self.refreshed: list[object] = []
         self._objects: dict[tuple[type, object], object] = {}
+        self.authorizations_by_idempotency: dict[str, object] = {}
 
     def register_get(self, cls: type, key: object, value: object) -> None:
         self._objects[(cls, key)] = value
@@ -49,6 +50,11 @@ class _FakeDb:
         sql = str(statement)
         if "max(autonomous_capital_mandate_versions.version_number)" in sql:
             return None
+        if "FROM autonomous_capital_mandate_authorizations" in sql:
+            params = statement.compile().params
+            idempotency_key = next((value for value in params.values() if isinstance(value, str)), None)
+            if idempotency_key is not None:
+                return self.authorizations_by_idempotency.get(idempotency_key)
         return None
 
     async def scalars(self, _statement):
@@ -215,6 +221,111 @@ async def test_authorization_write_persists_correlation_and_is_atomic(monkeypatc
     audit_entries = [item for item in db.added if isinstance(item, AuditLog)]
     assert len(audit_entries) == 1
     assert audit_entries[0].after_state["audit_correlation_id"] == str(correlation_id)
+
+
+@pytest.mark.asyncio
+async def test_authorization_idempotent_duplicate_returns_existing(monkeypatch: pytest.MonkeyPatch) -> None:
+    db = _FakeDb()
+    mandate = _mandate(status="PENDING_AUTHORIZATION")
+    version = _version(mandate_id=mandate.mandate_id)
+
+    existing_authorization = SimpleNamespace(
+        mandate_authorization_id=uuid.uuid4(),
+        mandate_id=mandate.mandate_id,
+        mandate_version_id=version.mandate_version_id,
+        authorization_state="AUTHORIZED",
+        approval_result="APPROVAL_SATISFIED_BY_ACTIVE_MANDATE",
+        authorized_by_actor_id="operator:owner",
+        audit_correlation_id=uuid.uuid4(),
+        recorded_at=datetime.now(timezone.utc),
+        expires_at=None,
+        revoked_at=None,
+    )
+    db.authorizations_by_idempotency["auth-idempotent-1"] = existing_authorization
+
+    async def _get_mandate(*, db, mandate_id):
+        _ = db
+        _ = mandate_id
+        return mandate
+
+    async def _hydrate(*, db, authorization):
+        _ = db
+        return SimpleNamespace(
+            mandate_authorization_id=authorization.mandate_authorization_id,
+            mandate_id=authorization.mandate_id,
+            mandate_version_id=authorization.mandate_version_id,
+            mandate_version_number=1,
+            autonomy_level="LEVEL_2",
+            authorization_state=authorization.authorization_state,
+            approval_result=authorization.approval_result,
+            authorized_by_actor_id=authorization.authorized_by_actor_id,
+            audit_correlation_id=authorization.audit_correlation_id,
+            recorded_at=authorization.recorded_at,
+            expires_at=authorization.expires_at,
+            revoked_at=authorization.revoked_at,
+        )
+
+    monkeypatch.setattr(lifecycle, "get_mandate", _get_mandate)
+    monkeypatch.setattr(lifecycle, "_hydrate_authorization_model", _hydrate)
+
+    from app.models.autonomous_capital_mandate_version import AutonomousCapitalMandateVersion
+
+    db.register_get(AutonomousCapitalMandateVersion, version.mandate_version_id, version)
+
+    request = MandateAuthorizationRequest(
+        mandate_id=mandate.mandate_id,
+        mandate_version_id=version.mandate_version_id,
+        actor="operator:owner",
+        authorization_method="owner_signature",
+        owner_acknowledgements={"accepted": True},
+        authorization_evidence={"signature": "hash"},
+        deterministic_explanation={"reason": "explicit_owner_authorization"},
+        expires_at=None,
+        idempotency_key="auth-idempotent-1",
+        audit_correlation_id=uuid.uuid4(),
+    )
+
+    result = await lifecycle.authorize_mandate_version(db=db, request=request)
+
+    assert result.mandate_authorization_id == existing_authorization.mandate_authorization_id
+    assert db.commits == 0
+    assert len([item for item in db.added if isinstance(item, AuditLog)]) == 0
+
+
+@pytest.mark.asyncio
+async def test_authorization_audit_failure_prevents_commit(monkeypatch: pytest.MonkeyPatch) -> None:
+    db = _FakeDb(fail_on_add_number=2)
+    mandate = _mandate(status="PENDING_AUTHORIZATION")
+    version = _version(mandate_id=mandate.mandate_id)
+
+    async def _get_mandate(*, db, mandate_id):
+        _ = db
+        _ = mandate_id
+        return mandate
+
+    monkeypatch.setattr(lifecycle, "get_mandate", _get_mandate)
+
+    from app.models.autonomous_capital_mandate_version import AutonomousCapitalMandateVersion
+
+    db.register_get(AutonomousCapitalMandateVersion, version.mandate_version_id, version)
+
+    request = MandateAuthorizationRequest(
+        mandate_id=mandate.mandate_id,
+        mandate_version_id=version.mandate_version_id,
+        actor="operator:owner",
+        authorization_method="owner_signature",
+        owner_acknowledgements={"accepted": True},
+        authorization_evidence={"signature": "hash"},
+        deterministic_explanation={"reason": "explicit_owner_authorization"},
+        expires_at=None,
+        idempotency_key="auth-atomic-fail-1",
+        audit_correlation_id=uuid.uuid4(),
+    )
+
+    with pytest.raises(RuntimeError, match="audit write failed"):
+        await lifecycle.authorize_mandate_version(db=db, request=request)
+
+    assert db.commits == 0
 
 
 @pytest.mark.asyncio
