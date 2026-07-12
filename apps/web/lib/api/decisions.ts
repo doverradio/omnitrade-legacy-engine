@@ -310,6 +310,7 @@ export type DecisionInspectorResponse = {
     entity_type: string;
     correlation_id: string | null;
   }>;
+  integrity_warnings: string[];
   counterfactual: {
     availability: string;
     state_reason: string | null;

@@ -34,6 +34,7 @@ from app.services.exchange_connections.service import get_decrypted_credentials_
 from app.services.exchange_connections.providers.base import ExchangeAuthResult, ExchangePreviewResult, ExchangePriceEvidence
 from app.services.exchange_connections.providers.registry import get_exchange_provider, require_provider_capabilities
 from app.services.execution_price_evidence import load_current_execution_price_evidence
+from app.services.decisions.linkage_integrity import guard_preview_linkage_integrity
 from app.services.risk.risk_context import RISK_POLICY_DEFAULTS
 from app.services.risk.risk_engine import RiskDecisionAction, RiskEvaluationContext, RiskEvaluationRequest, evaluate_signal_risk
 from app.services.risk.risk_monitor import get_risk_rules
@@ -804,6 +805,12 @@ async def create_crypto_order_preview(
             before_state={"status": "PREVIEW_REQUESTED"},
             after_state={"status": record.status, "reason_code": record.failure_reason},
         )
+        await guard_preview_linkage_integrity(
+            db=db,
+            actor=actor,
+            preview=record,
+            stage="risk_rejected",
+        )
         await db.commit()
         await db.refresh(record)
         return _to_response(record)
@@ -883,6 +890,12 @@ async def create_crypto_order_preview(
             before_state={"status": "PREVIEW_REQUESTED"},
             after_state={"status": record.status, "failure_reason": record.failure_reason},
         )
+        await guard_preview_linkage_integrity(
+            db=db,
+            actor=actor,
+            preview=record,
+            stage="provider_preview_failed",
+        )
         await db.commit()
         await db.refresh(record)
         return _to_response(record)
@@ -902,6 +915,13 @@ async def create_crypto_order_preview(
             "preview_id": record.preview_id,
             "estimated_total_value": format(record.estimated_total_value or Decimal("0"), "f"),
         },
+    )
+
+    await guard_preview_linkage_integrity(
+        db=db,
+        actor=actor,
+        preview=record,
+        stage="preview_ready",
     )
 
     await db.commit()

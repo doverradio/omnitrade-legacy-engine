@@ -673,6 +673,7 @@ async def get_decision_inspector(
         live_order=live_order,
         linkage_health=linkage_health,
     )
+    integrity_warnings = _integrity_warnings_payload(audit_events=audit_events)
 
     return {
         "decision_id": str(decision.decision_id),
@@ -706,6 +707,7 @@ async def get_decision_inspector(
         },
         "preview": _preview_panel_payload(preview=preview, live_order=live_order, approval_event=approval_event),
         "audit_timeline": audit_events,
+        "integrity_warnings": integrity_warnings,
         "counterfactual": _counterfactual_panel_payload(counterfactual_rows),
         "linkage_health": linkage_health,
     }
@@ -1697,6 +1699,20 @@ async def _load_inspector_audit_events(
                 ).scalars().all()
             )
         )
+        rows.extend(
+            list(
+                (
+                    await db.execute(
+                        select(AuditLog)
+                        .where(
+                            AuditLog.entity_type == "decision_linkage_integrity",
+                            AuditLog.entity_id == preview.crypto_order_preview_id,
+                        )
+                        .order_by(AuditLog.created_at.asc(), AuditLog.id.asc())
+                    )
+                ).scalars().all()
+            )
+        )
     if live_order is not None:
         rows.extend(
             list(
@@ -1727,6 +1743,28 @@ async def _load_inspector_audit_events(
             }
         )
     return events
+
+
+def _integrity_warnings_payload(*, audit_events: list[dict[str, Any]]) -> list[str]:
+    warnings: list[str] = []
+    for event in audit_events:
+        if event.get("entity_type") != "decision_linkage_integrity":
+            continue
+        action = str(event.get("action") or "")
+        if action == "decision_linkage_integrity_violation":
+            warnings.append("Decision linkage integrity guard detected a persistence invariant violation for this workflow.")
+        elif action == "decision_linkage_integrity_guard_error":
+            warnings.append("Decision linkage integrity guard encountered an internal error during persistence checks.")
+
+    # Preserve insertion order while removing duplicates.
+    deduped: list[str] = []
+    seen: set[str] = set()
+    for item in warnings:
+        if item in seen:
+            continue
+        seen.add(item)
+        deduped.append(item)
+    return deduped
 
 
 def _audit_correlation_id_from_states(before_state: Any, after_state: Any) -> str | None:

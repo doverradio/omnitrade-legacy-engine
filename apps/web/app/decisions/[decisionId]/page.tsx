@@ -146,6 +146,16 @@ export default function DecisionInspectorPage({ params }: DecisionInspectorProps
           <section className="rounded-xl border border-border bg-muted/30 p-4 sm:p-5" aria-label="Decision narrative">
             <h2 className="text-lg font-semibold">Why</h2>
             <p className="mt-2 text-sm text-foreground/90">{data.narrative.explanation}</p>
+            {data.integrity_warnings.length > 0 ? (
+              <div className="mt-3 rounded-md border border-amber-500/40 bg-amber-500/10 p-3">
+                <p className="text-xs font-semibold uppercase tracking-wide text-amber-100">Integrity Warnings</p>
+                <ul className="mt-2 space-y-1 text-xs text-amber-50">
+                  {data.integrity_warnings.map((warning) => (
+                    <li key={warning}>{warning}</li>
+                  ))}
+                </ul>
+              </div>
+            ) : null}
             {evidenceGaps.length > 0 ? (
               <div className="mt-3 rounded-md border border-amber-500/40 bg-amber-500/10 p-3">
                 <p className="text-xs font-semibold uppercase tracking-wide text-amber-100">Evidence Gaps</p>

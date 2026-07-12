@@ -121,6 +121,7 @@ describe("DecisionInspectorPage", () => {
               correlation_id: "cccccccc-cccc-cccc-cccc-cccccccccccc",
             },
           ],
+          integrity_warnings: [],
           counterfactual: {
             availability: "unavailable",
             state_reason: "counterfactual_outcomes_unavailable",

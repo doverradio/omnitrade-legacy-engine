@@ -613,6 +613,32 @@ def test_decision_inspector_returns_narrative_timeline_and_linkage_health() -> N
     assert payload["execution_price_evidence"]["validation_status"] in {"valid", "missing"}
 
 
+def test_decision_inspector_surfaces_integrity_warning_from_audit_events() -> None:
+    fake = _seed_data()
+    decision = fake.decision_rows[0][0]
+    preview = fake.previews[0]
+    fake.audit_rows.append(
+        AuditLog(
+            id=999,
+            actor="integrity_guard",
+            action="decision_linkage_integrity_violation",
+            entity_type="decision_linkage_integrity",
+            entity_id=preview.crypto_order_preview_id,
+            before_state=None,
+            after_state={"decision_id": str(decision.decision_id)},
+            created_at=decision.timestamp,
+        )
+    )
+
+    with _create_test_client(fake) as client:
+        response = client.get(f"/decisions/{decision.decision_id}/inspector")
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["integrity_warnings"]
+    assert "integrity guard detected" in payload["integrity_warnings"][0].lower()
+
+
 def test_decision_inspector_returns_404_for_unknown_decision() -> None:
     fake = _seed_data()
     unknown = str(uuid.uuid4())
