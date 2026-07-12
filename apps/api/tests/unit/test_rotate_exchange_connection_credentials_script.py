@@ -237,3 +237,25 @@ def test_parse_args_requires_confirmation_flag() -> None:
         "--confirm-replace",
     ])
     assert args.confirm_replace is True
+
+
+def test_main_invokes_asyncio_run(monkeypatch: pytest.MonkeyPatch) -> None:
+    captured = {}
+    real_asyncio_run = __import__("asyncio").run
+
+    def _parse_args(_argv=None):
+        return SimpleNamespace(provider="kraken_spot", environment="production", actor="operator:human", confirm_replace=True)
+
+    async def _run(args):
+        captured["args"] = args
+        return 0
+
+    monkeypatch.setattr(script, "parse_args", _parse_args)
+    monkeypatch.setattr(script, "_run", _run)
+    monkeypatch.setattr(script.asyncio, "run", lambda value: real_asyncio_run(value))
+
+    result = script.main([])
+
+    assert result == 0
+    assert captured["args"].provider == "kraken_spot"
+    assert captured["args"].confirm_replace is True
