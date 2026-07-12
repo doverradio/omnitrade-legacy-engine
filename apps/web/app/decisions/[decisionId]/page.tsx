@@ -30,20 +30,20 @@ function stageTone(status: DecisionInspectorStage["status"]): string {
   if (status === "rejected" || status === "missing") {
     return "border-rose-500/50 bg-rose-500/15 text-rose-100";
   }
-  if (status === "pending") {
+  if (status === "pending" || status === "unavailable") {
     return "border-amber-500/50 bg-amber-500/15 text-amber-100";
   }
   return "border-slate-500/50 bg-slate-500/15 text-slate-100";
 }
 
 function linkageTone(status: string): string {
-  if (status === "linked") {
+  if (status === "completed") {
     return "border-emerald-500/50 bg-emerald-500/15 text-emerald-100";
   }
   if (status === "missing") {
     return "border-rose-500/50 bg-rose-500/15 text-rose-100";
   }
-  if (status === "unavailable") {
+  if (status === "unavailable" || status === "pending") {
     return "border-amber-500/50 bg-amber-500/15 text-amber-100";
   }
   return "border-slate-500/50 bg-slate-500/15 text-slate-100";

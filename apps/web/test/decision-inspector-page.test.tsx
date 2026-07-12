@@ -49,7 +49,7 @@ describe("DecisionInspectorPage", () => {
           ],
           narrative: {
             title: "Why",
-            explanation: "The strategy recommended HOLD but risk controls rejected execution.",
+            explanation: "The decision record indicates an action of HOLD, but direct signal linkage is unavailable.",
             evidence_gaps: ["Preview linkage missing"],
           },
           execution_price_evidence: {
@@ -95,9 +95,9 @@ describe("DecisionInspectorPage", () => {
             ],
           },
           decision_intelligence: {
-            decision_record: "linked",
-            decision_snapshot: "linked",
-            execution_evidence: "linked",
+            decision_record: "completed",
+            decision_snapshot: "completed",
+            execution_evidence: "completed",
           },
           preview: {
             availability: "unavailable",
@@ -128,7 +128,7 @@ describe("DecisionInspectorPage", () => {
             summary: "Counterfactual package unavailable because no horizon evaluations are linked yet.",
           },
           linkage_health: [
-            { component: "Decision Record", status: "linked", reason: "decision_record_present" },
+            { component: "Decision Record", status: "completed", reason: "Decision Record is present." },
             { component: "Preview", status: "missing", reason: "preview_missing" },
           ],
         });

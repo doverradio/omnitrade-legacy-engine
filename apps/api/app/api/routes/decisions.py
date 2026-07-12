@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import uuid
 from dataclasses import asdict
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Any
 
 from fastapi import APIRouter, Depends, Query
@@ -38,6 +38,14 @@ from app.services.decisions.timeline import TimelineReadFilters, read_decision_t
 router = APIRouter(prefix="/decisions", tags=["decisions"])
 
 MAX_PAGE_SIZE = 200
+
+_FEATURE_INTRODUCED_AT: dict[str, datetime] = {
+    "decision_snapshot": datetime(2026, 7, 6, 0, 0, tzinfo=timezone.utc),
+    "counterfactual": datetime(2026, 7, 6, 0, 0, tzinfo=timezone.utc),
+    "decision_quality": datetime(2026, 7, 6, 0, 0, tzinfo=timezone.utc),
+    "preview_linkage": datetime(2026, 7, 9, 22, 30, tzinfo=timezone.utc),
+    "live_submission": datetime(2026, 7, 9, 22, 50, tzinfo=timezone.utc),
+}
 
 
 @router.get("/arena-comparisons/latest")
@@ -1856,6 +1864,8 @@ def _risk_panel_payload(*, decision: DecisionRecord, risk_event: RiskEvent | Non
         "first_failing_rule": first_fail,
         "stopped_after_first_fail": first_fail is not None,
         "risk_adjusted_sizing": _approved_notional(decision),
+        "can_attribute_risk_engine": risk_event is not None,
+        "evidence_source": "risk_event" if risk_event is not None else "decision_record" if checks else "unavailable",
         "checks": checks,
     }
 
@@ -1878,46 +1888,29 @@ def _timeline_payload(
             "pending": "○ Pending",
             "not_applicable": "— Not Applicable",
             "missing": "? Missing Evidence",
+            "unavailable": "∅ Unavailable",
         }
         return {"status": code, "label": symbols[code], "detail": detail}
 
+    linkage_by_component = {item["component"]: item for item in linkage_health}
+
+    def linkage_stage(component: str, fallback_status: str, fallback_detail: str) -> dict[str, Any]:
+        item = linkage_by_component.get(component)
+        if item is None:
+            return stage_status(fallback_status, fallback_detail)
+        return stage_status(str(item["status"]), str(item["reason"]))
+
     signal_status = stage_status("completed", "Signal linkage resolved") if linked_signal is not None else stage_status("missing", "Signal linkage missing")
     strategy_status = stage_status("completed", "Strategy identified") if linked_signal is not None else stage_status("missing", "Strategy linkage missing")
-    evidence_status = stage_status("completed", "Provider-native evidence linked") if execution_evidence.get("availability") == "linked" else stage_status("missing", "Execution price evidence linkage missing")
-    risk_status = stage_status("completed", "Risk evaluation recorded") if risk_panel.get("checks") else stage_status("missing", "Risk rule steps unavailable")
+    evidence_status = linkage_stage("Execution Evidence", "missing", "Execution price evidence linkage missing")
+    risk_status = linkage_stage("Risk Event", "missing", "Risk event linkage missing")
     persisted_status = stage_status("completed", "Decision record persisted")
 
-    if preview is None:
-        preview_status = stage_status("not_applicable", "No preview linked")
-    elif preview.status in {"RISK_REJECTED", "PREVIEW_FAILED"}:
-        preview_status = stage_status("rejected", f"Preview status: {preview.status}")
-    else:
-        preview_status = stage_status("completed", f"Preview status: {preview.status}")
-
-    approval_status = stage_status("completed", "Approval event linked") if approval_event is not None else stage_status("not_applicable", "No approval linked")
-
-    rehearsal_link = next((item for item in linkage_health if item["component"] == "Rehearsal"), None)
-    rehearsal_status = stage_status("pending", "Rehearsal pending")
-    if rehearsal_link is not None and rehearsal_link["status"] == "missing":
-        rehearsal_status = stage_status("not_applicable", "No rehearsal evidence linked")
-
-    if live_order is None:
-        submission_status = stage_status("not_applicable", "No submission linked")
-        execution_status = stage_status("not_applicable", "No execution linked")
-    else:
-        if live_order.status in {"SUBMITTED", "ACKNOWLEDGED", "FILLED"}:
-            submission_status = stage_status("completed", f"Order status: {live_order.status}")
-        elif live_order.status in {"FAILED", "CANCELLED"}:
-            submission_status = stage_status("rejected", f"Order status: {live_order.status}")
-        else:
-            submission_status = stage_status("pending", f"Order status: {live_order.status}")
-
-        if live_order.status in {"FILLED", "EXECUTED"}:
-            execution_status = stage_status("completed", "Execution filled")
-        elif live_order.status in {"FAILED", "CANCELLED"}:
-            execution_status = stage_status("rejected", f"Execution ended with {live_order.status}")
-        else:
-            execution_status = stage_status("pending", "Execution pending")
+    preview_status = linkage_stage("Preview", "not_applicable", "Preview not applicable")
+    approval_status = linkage_stage("Approval", "not_applicable", "Approval not applicable")
+    rehearsal_status = linkage_stage("Rehearsal", "unavailable", "Rehearsal linkage capability unavailable")
+    submission_status = linkage_stage("Submission", "not_applicable", "Submission not applicable")
+    execution_status = linkage_stage("Execution", "not_applicable", "Execution not applicable")
 
     outcome_status = stage_status("completed", f"Outcome: {decision.outcome}") if decision.outcome else stage_status("pending", "Outcome not yet known")
 
@@ -1950,15 +1943,33 @@ def _deterministic_narrative_payload(
     reason = decision.trade_rejected_reason or "no_rejection_reason_recorded"
 
     lines: list[str] = []
-    if decision.trade_accepted:
-        lines.append(f"The strategy recommended {action} and the decision was accepted by risk controls.")
+    if linked_signal is not None:
+        lines.append(f"Signal evidence shows a strategy action of {action}.")
     else:
-        lines.append(f"The strategy recommended {action} but risk controls rejected execution with reason {reason}.")
+        lines.append(f"The decision record indicates an action of {action}, but direct signal linkage is unavailable.")
+
+    if decision.trade_accepted:
+        lines.append("The decision record marks this opportunity as trade_accepted=true.")
+    else:
+        lines.append(f"The decision record marks this opportunity as trade_accepted=false with reason {reason}.")
+
+    if risk_panel.get("can_attribute_risk_engine"):
+        if decision.trade_accepted:
+            lines.append("A linked Risk Event is present and indicates a governed approval path.")
+        else:
+            lines.append("A linked Risk Event is present and indicates a governed rejection path.")
+    elif risk_panel.get("checks"):
+        lines.append(
+            "Risk step data exists in the decision record, but no linked Risk Event is available; "
+            "the Inspector cannot determine final Risk Engine causality from persisted linkage alone."
+        )
+    else:
+        lines.append("The Inspector cannot determine whether a Risk Engine evaluation was persisted for this decision.")
 
     if execution_evidence.get("availability") == "linked":
         lines.append("Provider-native execution price evidence was linked and used for decision-time context.")
     else:
-        lines.append("Execution price evidence linkage is missing, so price validation details are unavailable.")
+        lines.append("Execution price evidence linkage is not available, so price validation details cannot be confirmed.")
 
     if risk_panel.get("first_failing_rule"):
         first = risk_panel["first_failing_rule"]
@@ -1967,19 +1978,23 @@ def _deterministic_narrative_payload(
             f"{first.get('rule_name')} ({first.get('reason') or 'no_reason_code_recorded'})."
         )
     elif risk_panel.get("checks"):
-        lines.append("Risk evaluation completed without a failing rule in the recorded step sequence.")
+        lines.append("Recorded risk steps do not show a failing rule.")
     else:
-        lines.append("Risk rule-by-rule evidence is unavailable.")
+        lines.append("Rule-by-rule risk evidence is unavailable.")
 
     if preview is not None:
-        lines.append(f"Preview state is {preview.status}; preview linkage is available.")
+        lines.append(f"A linked preview record exists with status {preview.status}.")
+    elif _decision_predates_feature(decision=decision, feature_key="preview_linkage"):
+        lines.append("This decision predates preview linkage persistence in this repository.")
     else:
-        lines.append("No preview linkage exists for this decision.")
+        lines.append("The Inspector cannot determine whether a preview record should exist for this decision.")
 
     if live_order is not None:
-        lines.append(f"Submission path reached live order state {live_order.status}.")
+        lines.append(f"A linked live-order record exists with status {live_order.status}.")
+    elif _decision_predates_feature(decision=decision, feature_key="live_submission"):
+        lines.append("This decision predates live submission persistence in this repository.")
     else:
-        lines.append("No live submission record is linked to this decision.")
+        lines.append("No linked live-order submission record is available.")
 
     lines.append(f"Recorded confidence at decision time was {confidence}.")
 
@@ -1987,9 +2002,9 @@ def _deterministic_narrative_payload(
         "title": "Why",
         "explanation": " ".join(lines),
         "evidence_gaps": [
-            "Execution price evidence metadata incomplete" if execution_evidence.get("availability") != "linked" else None,
-            "Risk Event linkage missing" if not risk_panel.get("checks") else None,
-            "Preview linkage missing" if preview is None else None,
+            "Execution price evidence linkage unavailable" if execution_evidence.get("availability") != "linked" else None,
+            "Risk Event linkage unavailable for causality attribution" if not risk_panel.get("can_attribute_risk_engine") else None,
+            "Preview linkage unavailable" if (preview is None and not _decision_predates_feature(decision=decision, feature_key="preview_linkage")) else None,
         ],
     }
 
@@ -2079,17 +2094,167 @@ def _linkage_health_payload(
     quality: DecisionQualityScore | None,
     audit_events: list[dict[str, Any]],
 ) -> list[dict[str, str]]:
+    action = (_record_action(decision) or "hold").lower()
+    hold_like = action in {"hold", "wait"}
+
+    preview_refs = _lineage_refs(decision=decision, key="crypto_order_previews")
+    preview_status = "unavailable"
+    preview_reason = "Inspector cannot determine whether preview linkage should exist."
+    if hold_like:
+        preview_status = "not_applicable"
+        preview_reason = "HOLD/WAIT workflows do not require preview/approval/submission/execution stages."
+    elif preview is not None:
+        preview_status = "rejected" if preview.status in {"RISK_REJECTED", "PREVIEW_FAILED", "CANCELLED"} else "completed"
+        preview_reason = f"Preview record linked with status {preview.status}."
+    elif preview_refs:
+        preview_status = "missing"
+        preview_reason = "Source lineage references a preview, but the preview record is unavailable."
+    elif approval_event is not None or live_order is not None:
+        preview_status = "missing"
+        preview_reason = "Downstream records exist, so preview linkage should exist but is missing."
+    elif _decision_predates_feature(decision=decision, feature_key="preview_linkage"):
+        preview_status = "unavailable"
+        preview_reason = "This decision predates preview linkage persistence in this repository."
+    elif decision.trade_accepted:
+        preview_status = "pending"
+        preview_reason = "Preview linkage is expected later for an accepted non-HOLD decision."
+
+    approval_status = "unavailable"
+    approval_reason = "Inspector cannot determine approval applicability from persisted linkage."
+    if hold_like:
+        approval_status = "not_applicable"
+        approval_reason = "HOLD/WAIT workflows do not require approval."
+    elif approval_event is not None:
+        approval_status = "completed"
+        approval_reason = f"Approval event linked with state {approval_event.approval_state}."
+    elif live_order is not None:
+        approval_status = "missing"
+        approval_reason = "Live submission exists but approval linkage is missing."
+    elif preview is not None and preview.status in {"RISK_REJECTED", "PREVIEW_FAILED", "CANCELLED"}:
+        approval_status = "not_applicable"
+        approval_reason = f"Preview ended at {preview.status}; approval stage did not apply."
+    elif preview is not None:
+        approval_status = "pending"
+        approval_reason = "Preview exists; approval is expected next."
+    elif preview_status == "unavailable":
+        approval_status = "unavailable"
+        approval_reason = "Preview linkage generation is unavailable for this historical decision."
+
+    submission_status = "unavailable"
+    submission_reason = "Inspector cannot determine submission applicability from persisted linkage."
+    if hold_like:
+        submission_status = "not_applicable"
+        submission_reason = "HOLD/WAIT workflows do not require submission."
+    elif live_order is not None:
+        if live_order.status in {"FAILED", "CANCELLED", "REJECTED"}:
+            submission_status = "rejected"
+        elif live_order.status in {"SUBMITTED", "ACKNOWLEDGED", "FILLED", "EXECUTED"}:
+            submission_status = "completed"
+        else:
+            submission_status = "pending"
+        submission_reason = f"Live-order record linked with status {live_order.status}."
+    elif approval_event is not None:
+        submission_status = "pending"
+        submission_reason = "Approval exists; submission is expected later."
+    elif preview is not None and preview.status in {"RISK_REJECTED", "PREVIEW_FAILED", "CANCELLED"}:
+        submission_status = "not_applicable"
+        submission_reason = f"Preview ended at {preview.status}; submission stage did not apply."
+    elif preview is not None:
+        submission_status = "pending"
+        submission_reason = "Preview exists; submission is pending approval/operator action."
+    elif _decision_predates_feature(decision=decision, feature_key="live_submission"):
+        submission_status = "unavailable"
+        submission_reason = "This decision predates live submission persistence in this repository."
+
+    execution_status = "unavailable"
+    execution_reason = "Inspector cannot determine execution applicability from persisted linkage."
+    if hold_like:
+        execution_status = "not_applicable"
+        execution_reason = "HOLD/WAIT workflows do not require execution."
+    elif live_order is not None:
+        if live_order.status in {"FILLED", "EXECUTED"}:
+            execution_status = "completed"
+            execution_reason = f"Execution reached terminal state {live_order.status}."
+        elif live_order.status in {"FAILED", "CANCELLED", "REJECTED"}:
+            execution_status = "rejected"
+            execution_reason = f"Execution ended in governed non-fill state {live_order.status}."
+        else:
+            execution_status = "pending"
+            execution_reason = f"Execution is pending with live-order status {live_order.status}."
+    elif submission_status == "pending":
+        execution_status = "pending"
+        execution_reason = "Submission has not completed yet."
+    elif submission_status in {"not_applicable", "unavailable"}:
+        execution_status = submission_status
+        execution_reason = submission_reason
+
+    snapshot_status = "completed" if snapshot is not None else "missing"
+    snapshot_reason = "Decision Snapshot linked."
+    if snapshot is None and _decision_predates_feature(decision=decision, feature_key="decision_snapshot"):
+        snapshot_status = "unavailable"
+        snapshot_reason = "This decision predates Decision Snapshot persistence in this repository."
+    elif snapshot is None:
+        snapshot_reason = "Decision Snapshot linkage should exist but is missing."
+
+    counterfactual_status = "completed" if counterfactual_rows else "unavailable"
+    counterfactual_reason = "Counterfactual package linked."
+    if not counterfactual_rows and _decision_predates_feature(decision=decision, feature_key="counterfactual"):
+        counterfactual_reason = "This decision predates counterfactual persistence in this repository."
+    elif not counterfactual_rows:
+        counterfactual_reason = "Counterfactual package is not available for this decision yet."
+
+    quality_status = "completed" if quality is not None else "unavailable"
+    quality_reason = "Decision Quality score linked."
+    if quality is None and _decision_predates_feature(decision=decision, feature_key="decision_quality"):
+        quality_reason = "This decision predates Decision Quality persistence in this repository."
+    elif quality is None:
+        quality_reason = "Decision Quality score is not available for this decision yet."
+
+    risk_status = "completed" if risk_event is not None else "missing"
+    risk_reason = "Linked Risk Event is present."
+    if risk_event is None and hold_like:
+        risk_status = "not_applicable"
+        risk_reason = "HOLD/WAIT decision has no linked Risk Event and no required risk-execution path."
+    elif risk_event is None and decision.risk_adjustments:
+        risk_status = "unavailable"
+        risk_reason = "Risk steps are present in the decision record, but linked Risk Event causality is unavailable."
+    elif risk_event is None:
+        risk_reason = "Risk Event linkage should exist for causal attribution but is missing."
+
+    execution_evidence_status = "completed" if execution_evidence.get("availability") == "linked" else "missing"
+    execution_evidence_reason = "Execution price evidence linked."
+    if execution_evidence_status == "missing":
+        execution_evidence_reason = "Execution price evidence linkage is missing."
+
     return [
-        {"component": "Decision Record", "status": "linked", "reason": "decision_record_present"},
-        {"component": "Execution Evidence", "status": "linked" if execution_evidence.get("availability") == "linked" else "missing", "reason": execution_evidence.get("availability")},
-        {"component": "Risk Event", "status": "linked" if risk_event is not None else "missing", "reason": "risk_event_linked" if risk_event is not None else "risk_event_missing"},
-        {"component": "Preview", "status": "linked" if preview is not None else "missing", "reason": "preview_linked" if preview is not None else "preview_missing"},
-        {"component": "Audit", "status": "linked" if audit_events else "missing", "reason": "audit_events_present" if audit_events else "audit_events_missing"},
-        {"component": "Approval", "status": "linked" if approval_event is not None else "missing", "reason": "approval_linked" if approval_event is not None else "approval_missing"},
-        {"component": "Submission", "status": "linked" if live_order is not None else "missing", "reason": "live_order_linked" if live_order is not None else "submission_missing"},
-        {"component": "Execution", "status": "linked" if live_order is not None and live_order.status in {"FILLED", "EXECUTED"} else "not_applicable" if live_order is None else "missing", "reason": live_order.status if live_order is not None else "execution_not_attempted"},
-        {"component": "Counterfactual", "status": "linked" if counterfactual_rows else "unavailable", "reason": "counterfactual_present" if counterfactual_rows else "counterfactual_unavailable"},
-        {"component": "Decision Quality", "status": "linked" if quality is not None else "unavailable", "reason": "quality_present" if quality is not None else "quality_unavailable"},
-        {"component": "Decision Snapshot", "status": "linked" if snapshot is not None else "missing", "reason": "snapshot_present" if snapshot is not None else "snapshot_missing"},
-        {"component": "Rehearsal", "status": "missing", "reason": "rehearsal_linkage_not_available_in_current_model"},
+        {"component": "Decision Record", "status": "completed", "reason": "Decision Record is present."},
+        {"component": "Execution Evidence", "status": execution_evidence_status, "reason": execution_evidence_reason},
+        {"component": "Risk Event", "status": risk_status, "reason": risk_reason},
+        {"component": "Preview", "status": preview_status, "reason": preview_reason},
+        {"component": "Audit", "status": "completed" if audit_events else "missing", "reason": "Audit events are linked." if audit_events else "No linked audit events were found."},
+        {"component": "Approval", "status": approval_status, "reason": approval_reason},
+        {"component": "Submission", "status": submission_status, "reason": submission_reason},
+        {"component": "Execution", "status": execution_status, "reason": execution_reason},
+        {"component": "Counterfactual", "status": counterfactual_status, "reason": counterfactual_reason},
+        {"component": "Decision Quality", "status": quality_status, "reason": quality_reason},
+        {"component": "Decision Snapshot", "status": snapshot_status, "reason": snapshot_reason},
+        {"component": "Rehearsal", "status": "unavailable", "reason": "Rehearsal linkage capability is not available in the current repository model."},
     ]
+
+
+def _decision_predates_feature(*, decision: DecisionRecord, feature_key: str) -> bool:
+    cutoff = _FEATURE_INTRODUCED_AT.get(feature_key)
+    if cutoff is None:
+        return False
+    ts = decision.timestamp
+    if ts.tzinfo is None:
+        ts = ts.replace(tzinfo=timezone.utc)
+    return ts < cutoff
+
+
+def _lineage_refs(*, decision: DecisionRecord, key: str) -> list[str]:
+    lineage = decision.source_lineage if isinstance(decision.source_lineage, dict) else {}
+    value = lineage.get(key)
+    if not isinstance(value, list):
+        return []
+    return [item for item in value if isinstance(item, str)]

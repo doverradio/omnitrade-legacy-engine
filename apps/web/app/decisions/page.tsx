@@ -1,7 +1,7 @@
 "use client";
 
 import Link from "next/link";
-import { useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useState } from "react";
 
 import {
   ApiRequestError,
@@ -119,7 +119,7 @@ export default function DecisionExplorerPage() {
     return Math.max(1, Math.ceil(records.total / records.page_size));
   }, [records]);
 
-  async function loadData(nextPage: number): Promise<void> {
+  const loadData = useCallback(async (nextPage: number): Promise<void> => {
     setLoading(true);
     setError(null);
     try {
@@ -138,11 +138,11 @@ export default function DecisionExplorerPage() {
     } finally {
       setLoading(false);
     }
-  }
+  }, [filters]);
 
   useEffect(() => {
     void loadData(1);
-  }, []);
+  }, [loadData]);
 
   return (
     <div className="space-y-6">

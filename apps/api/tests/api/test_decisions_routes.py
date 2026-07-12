@@ -621,3 +621,236 @@ def test_decision_inspector_returns_404_for_unknown_decision() -> None:
         response = client.get(f"/decisions/{unknown}/inspector")
 
     assert response.status_code == 404
+
+
+def test_decision_inspector_hold_without_risk_event_is_conservative_and_not_applicable() -> None:
+    fake = _seed_data()
+    hold_decision = fake.decision_rows[1][0]
+
+    with _create_test_client(fake) as client:
+        response = client.get(f"/decisions/{hold_decision.decision_id}/inspector")
+
+    assert response.status_code == 200
+    payload = response.json()
+
+    assert "cannot determine whether a Risk Engine evaluation was persisted" in payload["narrative"]["explanation"]
+
+    timeline_by_stage = {item["stage"]: item for item in payload["timeline"]}
+    assert timeline_by_stage["Preview"]["status"] == "not_applicable"
+    assert timeline_by_stage["Approval"]["status"] == "not_applicable"
+    assert timeline_by_stage["Submission"]["status"] == "not_applicable"
+    assert timeline_by_stage["Execution"]["status"] == "not_applicable"
+
+    linkage_by_component = {item["component"]: item for item in payload["linkage_health"]}
+    assert linkage_by_component["Risk Event"]["status"] == "not_applicable"
+    assert linkage_by_component["Preview"]["status"] == "not_applicable"
+
+
+def test_decision_inspector_hold_with_linked_risk_event_can_attribute_risk() -> None:
+    fake = _seed_data()
+    hold_decision = fake.decision_rows[1][0]
+    risk_event = RiskEvent(
+        id=uuid.uuid4(),
+        paper_account_id=uuid.uuid4(),
+        related_signal_id=uuid.uuid4(),
+        event_type="risk_decision",
+        action_taken="blocked",
+        detail={"steps": [{"step": "wait_signal", "status": "reject", "reason_code": "wait_signal"}]},
+        created_at=hold_decision.timestamp,
+    )
+    hold_decision.expected_risk = {"risk_event_id": str(risk_event.id)}
+    fake.risk_events.append(risk_event)
+
+    with _create_test_client(fake) as client:
+        response = client.get(f"/decisions/{hold_decision.decision_id}/inspector")
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert "A linked Risk Event is present" in payload["narrative"]["explanation"]
+
+    linkage_by_component = {item["component"]: item for item in payload["linkage_health"]}
+    assert linkage_by_component["Risk Event"]["status"] == "completed"
+
+
+def test_decision_inspector_historical_preview_linkage_is_marked_unavailable() -> None:
+    fake = _seed_data()
+    historical = fake.decision_rows[1][0]
+    historical.timestamp = datetime(2026, 7, 8, tzinfo=timezone.utc)
+    historical.generated_signals = [{"action": "buy", "status": "generated"}]
+    historical.trade_accepted = True
+    historical.trade_rejected_reason = None
+
+    with _create_test_client(fake) as client:
+        response = client.get(f"/decisions/{historical.decision_id}/inspector")
+
+    assert response.status_code == 200
+    payload = response.json()
+
+    timeline_by_stage = {item["stage"]: item for item in payload["timeline"]}
+    assert timeline_by_stage["Preview"]["status"] == "unavailable"
+    assert "predates preview linkage persistence" in timeline_by_stage["Preview"]["detail"].lower()
+
+    linkage_by_component = {item["component"]: item for item in payload["linkage_health"]}
+    assert linkage_by_component["Preview"]["status"] == "unavailable"
+
+
+def test_decision_inspector_preview_missing_when_downstream_records_exist() -> None:
+    fake = _seed_data()
+    decision = fake.decision_rows[0][0]
+    fake.previews = []
+    fake.live_orders = [
+        LiveCryptoOrder(
+            live_crypto_order_id=uuid.uuid4(),
+            crypto_order_preview_id=uuid.uuid4(),
+            exchange_connection_id=uuid.uuid4(),
+            provider="kraken_spot",
+            environment="production",
+            product_id="BTC-USD",
+            side="BUY",
+            order_type="MARKET",
+            requested_quote_size=Decimal("5.00"),
+            client_order_id="client-order-1",
+            status="SUBMITTED",
+            risk_event_id=None,
+            decision_record_id=decision.decision_id,
+            validation_run_id=None,
+            provider_order_id=None,
+            provider_status=None,
+            submitted_at=decision.timestamp,
+            acknowledged_at=None,
+            filled_at=None,
+            cancelled_at=None,
+            failure_code=None,
+            failure_reason=None,
+            safe_provider_response={},
+            audit_correlation_id=uuid.uuid4(),
+            operator_confirmation_id=None,
+            created_at=decision.timestamp,
+            updated_at=decision.timestamp,
+        )
+    ]
+
+    with _create_test_client(fake) as client:
+        response = client.get(f"/decisions/{decision.decision_id}/inspector")
+
+    assert response.status_code == 200
+    payload = response.json()
+    linkage_by_component = {item["component"]: item for item in payload["linkage_health"]}
+    timeline_by_stage = {item["stage"]: item for item in payload["timeline"]}
+
+    assert linkage_by_component["Preview"]["status"] == "missing"
+    assert timeline_by_stage["Preview"]["status"] == "missing"
+
+
+def test_decision_inspector_accepted_and_executed_flow_is_internally_consistent() -> None:
+    fake = _seed_data()
+    decision = fake.decision_rows[0][0]
+    decision.trade_accepted = True
+    decision.outcome = "filled"
+    fake.live_orders = [
+        LiveCryptoOrder(
+            live_crypto_order_id=uuid.uuid4(),
+            crypto_order_preview_id=fake.previews[0].crypto_order_preview_id,
+            exchange_connection_id=uuid.uuid4(),
+            provider="kraken_spot",
+            environment="production",
+            product_id="BTC-USD",
+            side="BUY",
+            order_type="MARKET",
+            requested_quote_size=Decimal("5.00"),
+            client_order_id="client-order-filled",
+            status="FILLED",
+            risk_event_id=fake.risk_events[0].id,
+            decision_record_id=decision.decision_id,
+            validation_run_id=None,
+            provider_order_id="provider-123",
+            provider_status="filled",
+            submitted_at=decision.timestamp,
+            acknowledged_at=decision.timestamp,
+            filled_at=decision.timestamp,
+            cancelled_at=None,
+            failure_code=None,
+            failure_reason=None,
+            safe_provider_response={},
+            audit_correlation_id=uuid.uuid4(),
+            operator_confirmation_id=None,
+            created_at=decision.timestamp,
+            updated_at=decision.timestamp,
+        )
+    ]
+
+    with _create_test_client(fake) as client:
+        response = client.get(f"/decisions/{decision.decision_id}/inspector")
+
+    assert response.status_code == 200
+    payload = response.json()
+
+    timeline_by_stage = {item["stage"]: item for item in payload["timeline"]}
+    assert timeline_by_stage["Submission"]["status"] == "completed"
+    assert timeline_by_stage["Execution"]["status"] == "completed"
+    assert timeline_by_stage["Outcome"]["status"] == "completed"
+
+    linkage_by_component = {item["component"]: item for item in payload["linkage_health"]}
+    assert linkage_by_component["Submission"]["status"] == "completed"
+    assert linkage_by_component["Execution"]["status"] == "completed"
+
+
+def test_decision_inspector_kraken_preview_traceability_for_linked_and_unlinked_records() -> None:
+    fake = _seed_data()
+    decision = fake.decision_rows[0][0]
+
+    unlinked_preview = CryptoOrderPreview(
+        crypto_order_preview_id=uuid.uuid4(),
+        idempotency_key="preview-unlinked",
+        preview_version=1,
+        refreshed_from_preview_id=None,
+        exchange_connection_id=uuid.uuid4(),
+        provider="kraken_spot",
+        environment="production",
+        product_id="BTC-USD",
+        side="BUY",
+        order_type="MARKET",
+        quote_size=Decimal("5.00"),
+        base_size=None,
+        requested_amount=Decimal("5.00"),
+        requested_amount_currency="USD",
+        status="RISK_REJECTED",
+        readiness_verdict="READY_FOR_PREVIEW",
+        risk_event_id=fake.risk_events[0].id,
+        decision_record_id=None,
+        validation_run_id=None,
+        strategy_id=None,
+        strategy_name=None,
+        preview_id="orphan-preview",
+        estimated_average_price=Decimal("10000"),
+        estimated_total_value=Decimal("5.00"),
+        estimated_base_size=Decimal("0.0005"),
+        estimated_quote_size=Decimal("5.00"),
+        estimated_fee=Decimal("0.01"),
+        estimated_fee_currency="USD",
+        estimated_slippage=Decimal("0.001"),
+        estimated_commission_total=Decimal("0.01"),
+        best_bid=Decimal("9999"),
+        best_ask=Decimal("10001"),
+        available_balance_before=Decimal("100"),
+        estimated_balance_after=Decimal("94.99"),
+        risk_verdict="rejected",
+        risk_explanation="position_below_minimum_order_size",
+        failure_reason="position_below_minimum_order_size",
+        warning_messages=[],
+        exchange_response_summary={},
+        expires_at=decision.timestamp,
+        generated_by="operator",
+        audit_correlation_id=uuid.uuid4(),
+        created_at=decision.timestamp,
+        updated_at=decision.timestamp,
+    )
+    fake.previews.append(unlinked_preview)
+
+    with _create_test_client(fake) as client:
+        response = client.get(f"/decisions/{decision.decision_id}/inspector")
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["preview"]["availability"] == "linked"
+    assert payload["preview"]["preview_id"] == fake.previews[0].preview_id

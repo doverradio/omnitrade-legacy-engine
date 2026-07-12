@@ -235,7 +235,7 @@ export type DecisionExplorerSummary = {
 
 export type DecisionInspectorStage = {
   stage: string;
-  status: "completed" | "rejected" | "pending" | "not_applicable" | "missing";
+  status: "completed" | "rejected" | "pending" | "not_applicable" | "missing" | "unavailable";
   label: string;
   detail: string;
 };
