@@ -12,9 +12,12 @@ from urllib.parse import parse_qsl, urlencode
 from uuid import UUID
 
 import httpx
+from sqlalchemy import select
 
 from app.db.session import AsyncSessionLocal
+from app.models.capital_campaign import CapitalCampaign
 from app.models.exchange_connection import ExchangeConnection
+from app.models.live_trading_profile import LiveTradingProfile
 from app.services.exchange_connections.crypto import decrypt_credential_payload
 from app.services.exchange_connections.providers.kraken_spot import KrakenSpotClient
 from scripts import verify_kraken_balance_auth as verifier
@@ -24,6 +27,7 @@ SAFE_HASH_LEN = 16
 DEFAULT_SECRET_B64 = "c2VjcmV0LWtleS1mb3ItdGVzdHM="
 DEFAULT_API_KEY = "API_KEY_PLACEHOLDER"
 DEFAULT_NONCE = "1700000000000"
+DEFAULT_PAPER_ACCOUNT_ID = "905a408c-7d8e-4fc7-ad3b-9ff637005d73"
 
 
 @dataclass(frozen=True)
@@ -46,6 +50,7 @@ class CredentialMeta:
 @dataclass(frozen=True)
 class RequestMeta:
     prepared_method: str
+    prepared_scheme: str
     prepared_url_path: str
     prepared_query: str
     prepared_content_type: str
@@ -130,6 +135,7 @@ def _request_meta_from_request(request: httpx.Request, *, http_client_kind: str)
     body = bytes(request.content)
     return RequestMeta(
         prepared_method=str(request.method),
+        prepared_scheme=str(request.url.scheme),
         prepared_url_path=str(request.url.path),
         prepared_query=query_text,
         prepared_content_type=str(request.headers.get("Content-Type") or ""),
@@ -190,6 +196,7 @@ def _first_differing_stage(stage_matches: dict[str, bool]) -> str | None:
         "payload_key_order",
         "otp_field_presence",
         "prepared_method",
+        "prepared_scheme",
         "prepared_url_path",
         "prepared_query",
         "prepared_content_type",
@@ -207,6 +214,84 @@ def _to_dict(obj: Any) -> dict[str, Any]:
     if hasattr(obj, "__dict__"):
         return {k: v for k, v in obj.__dict__.items()}
     return dict(obj)
+
+
+def _iso_or_none(value: Any) -> str | None:
+    if value is None:
+        return None
+    if hasattr(value, "isoformat"):
+        return value.isoformat()
+    return str(value)
+
+
+async def _discover_kraken_production_connection(*, paper_account_id: UUID) -> dict[str, Any]:
+    async with AsyncSessionLocal() as db:
+        rows = (
+            (
+                await db.execute(
+                    select(ExchangeConnection)
+                    .where(ExchangeConnection.provider == "kraken_spot")
+                    .where(ExchangeConnection.environment == "production")
+                    .order_by(ExchangeConnection.created_at.desc(), ExchangeConnection.exchange_connection_id.desc())
+                )
+            )
+            .scalars()
+            .all()
+        )
+
+        candidates: list[dict[str, Any]] = []
+        for row in rows:
+            candidates.append(
+                {
+                    "exchange_connection_id": str(row.exchange_connection_id),
+                    "provider": str(row.provider),
+                    "environment": str(row.environment),
+                    "connection_name": str(row.connection_name),
+                    "status": str(row.status),
+                    "credentials_valid": bool(row.credentials_valid),
+                    "passphrase_configured": bool(row.passphrase_configured),
+                    "created_at": _iso_or_none(row.created_at),
+                    "updated_at": _iso_or_none(row.updated_at),
+                }
+            )
+
+        profile = await db.scalar(
+            select(LiveTradingProfile)
+            .where(LiveTradingProfile.paper_account_id == paper_account_id)
+            .order_by(LiveTradingProfile.created_at.desc())
+            .limit(1)
+        )
+        campaign = await db.scalar(
+            select(CapitalCampaign)
+            .where(CapitalCampaign.paper_account_id == paper_account_id)
+            .where(CapitalCampaign.exchange == "kraken_spot")
+            .order_by(CapitalCampaign.created_at.desc(), CapitalCampaign.id.desc())
+            .limit(1)
+        )
+
+    selected_id = candidates[0]["exchange_connection_id"] if candidates else None
+    result: dict[str, Any] = {
+        "selection_source": "exchange_connections(provider=kraken_spot, environment=production)",
+        "initializer_selection_rule": "latest_created_at_desc",
+        "paper_account_id": str(paper_account_id),
+        "candidate_count": len(candidates),
+        "candidates": candidates,
+        "selected_exchange_connection_id": selected_id,
+        "selection_ambiguous": len(candidates) > 1,
+        "paper_account_association": {
+            "direct_exchange_connection_link_exists": False,
+            "live_trading_profile_id": None if profile is None else str(profile.id),
+            "capital_campaign_id": None if campaign is None else int(campaign.id),
+            "capital_campaign_uuid": None if campaign is None else str(campaign.uuid),
+        },
+    }
+    if not candidates:
+        result["status"] = "no_match"
+    elif len(candidates) > 1:
+        result["status"] = "ambiguous_multiple_matches"
+    else:
+        result["status"] = "selected_unique"
+    return result
 
 
 async def _capture_provider_request(
@@ -386,6 +471,7 @@ async def _run(args: argparse.Namespace) -> int:
 
     verifier_credentials: dict[str, str]
     provider_credentials: dict[str, str]
+    connection_discovery: dict[str, Any] | None = None
 
     if args.mode == "runtime":
         loaded_credentials, diagnostics, error = await verifier._load_production_credentials()
@@ -393,16 +479,58 @@ async def _run(args: argparse.Namespace) -> int:
             print(json.dumps({"error": "verifier_credentials_unavailable", "diagnostics": diagnostics}, sort_keys=True))
             return 2
         verifier_credentials = loaded_credentials
-        if args.exchange_connection_id:
-            provider_credentials = await _load_connection_credentials(UUID(args.exchange_connection_id))
-            provider_source = "exchange_connection_decrypted"
-        else:
-            provider_credentials = {
-                "api_key": verifier_credentials["api_key"],
-                "api_secret": verifier_credentials["api_secret"],
-                "passphrase": verifier_credentials.get("passphrase", ""),
-            }
-            provider_source = "runtime_verifier_credentials"
+        try:
+            if args.exchange_connection_id:
+                provider_credentials = await _load_connection_credentials(UUID(args.exchange_connection_id))
+                provider_source = "exchange_connection_decrypted"
+            elif args.discover_kraken_production_connection:
+                if args.provider != "kraken_spot" or args.environment != "production":
+                    print(
+                        json.dumps(
+                            {
+                                "error": "discover_mode_requires_kraken_spot_production",
+                                "provider": args.provider,
+                                "environment": args.environment,
+                            },
+                            sort_keys=True,
+                        )
+                    )
+                    return 2
+                connection_discovery = await _discover_kraken_production_connection(
+                    paper_account_id=UUID(args.paper_account_id),
+                )
+                if connection_discovery.get("status") != "selected_unique":
+                    print(
+                        json.dumps(
+                            {
+                                "error": "unable_to_select_unique_exchange_connection",
+                                "connection_discovery": connection_discovery,
+                            },
+                            sort_keys=True,
+                        )
+                    )
+                    return 2
+                provider_credentials = await _load_connection_credentials(UUID(str(connection_discovery["selected_exchange_connection_id"])))
+                provider_source = "exchange_connection_decrypted_discovered"
+            else:
+                provider_credentials = {
+                    "api_key": verifier_credentials["api_key"],
+                    "api_secret": verifier_credentials["api_secret"],
+                    "passphrase": verifier_credentials.get("passphrase", ""),
+                }
+                provider_source = "runtime_verifier_credentials"
+        except Exception as exc:
+            print(
+                json.dumps(
+                    {
+                        "error": "runtime_connection_lookup_failed",
+                        "exception_type": type(exc).__name__,
+                        "connection_discovery": connection_discovery,
+                    },
+                    sort_keys=True,
+                )
+            )
+            return 2
         verifier_source = "runtime_verifier_loader"
     else:
         verifier_credentials = {
@@ -443,6 +571,7 @@ async def _run(args: argparse.Namespace) -> int:
         "payload_key_order": verifier_capture.payload_key_order == provider_capture.payload_key_order,
         "otp_field_presence": verifier_capture.otp_field_present == provider_capture.otp_field_present,
         "prepared_method": verifier_capture.request_meta.prepared_method == provider_capture.request_meta.prepared_method,
+        "prepared_scheme": verifier_capture.request_meta.prepared_scheme == provider_capture.request_meta.prepared_scheme,
         "prepared_url_path": verifier_capture.request_meta.prepared_url_path == provider_capture.request_meta.prepared_url_path,
         "prepared_query": verifier_capture.request_meta.prepared_query == provider_capture.request_meta.prepared_query,
         "prepared_content_type": verifier_capture.request_meta.prepared_content_type == provider_capture.request_meta.prepared_content_type,
@@ -484,6 +613,12 @@ async def _run(args: argparse.Namespace) -> int:
         },
         "stage_equality": stage_matches,
         "first_differing_stage": _first_differing_stage(stage_matches),
+        "request_count": {
+            "verifier_prepared_request_count": 1,
+            "provider_prepared_request_count": 1,
+            "provider_private_request_count_in_test_authentication": provider_auth_sequence.get("private_request_count_in_test_authentication"),
+        },
+        "connection_discovery": connection_discovery,
         "transport_context": {
             "env_proxy_keys_present": {
                 "HTTP_PROXY": bool(os.getenv("HTTP_PROXY") or os.getenv("http_proxy")),
@@ -511,12 +646,15 @@ async def _run(args: argparse.Namespace) -> int:
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Compare Kraken verifier/provider request lifecycle with safe diagnostics")
     parser.add_argument("--mode", choices=["fixed", "runtime"], default="fixed")
+    parser.add_argument("--provider", choices=["kraken_spot"], default="kraken_spot")
     parser.add_argument("--api-key", default=DEFAULT_API_KEY)
     parser.add_argument("--api-secret-b64", default=DEFAULT_SECRET_B64)
     parser.add_argument("--nonce", default=DEFAULT_NONCE)
     parser.add_argument("--provider-passphrase", default="")
     parser.add_argument("--exchange-connection-id", default="")
     parser.add_argument("--environment", default="production", choices=["production", "sandbox"])
+    parser.add_argument("--paper-account-id", default=DEFAULT_PAPER_ACCOUNT_ID)
+    parser.add_argument("--discover-kraken-production-connection", action="store_true")
     return parser.parse_args(argv)
 
 
