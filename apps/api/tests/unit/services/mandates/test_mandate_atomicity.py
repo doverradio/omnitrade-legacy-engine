@@ -8,6 +8,7 @@ import uuid
 import pytest
 
 from app.models.audit_log import AuditLog
+from app.models.autonomous_capital_mandate_authorization import AutonomousCapitalMandateAuthorization
 from app.services.mandates.contracts import (
     MandateAuthorizationRequest,
     MandateLifecycleActionRequest,
@@ -40,11 +41,18 @@ class _FakeDb:
 
     async def flush(self) -> None:
         self.flushes += 1
+        for item in self.added:
+            if isinstance(item, AutonomousCapitalMandateAuthorization) and getattr(item, "mandate_authorization_id", None) is None:
+                item.mandate_authorization_id = uuid.uuid4()
+            if isinstance(item, AutonomousCapitalMandateAuthorization) and getattr(item, "recorded_at", None) is None:
+                item.recorded_at = datetime.now(timezone.utc)
 
     async def commit(self) -> None:
         self.commits += 1
 
     async def refresh(self, item: object) -> None:
+        if isinstance(item, AutonomousCapitalMandateAuthorization) and getattr(item, "mandate_authorization_id", None) is None:
+            raise RuntimeError("authorization refresh requires a flushed identity")
         self.refreshed.append(item)
 
     async def scalar(self, statement):
@@ -222,6 +230,121 @@ async def test_authorization_write_persists_correlation_and_is_atomic(monkeypatc
     audit_entries = [item for item in db.added if isinstance(item, AuditLog)]
     assert len(audit_entries) == 1
     assert audit_entries[0].after_state["audit_correlation_id"] == str(correlation_id)
+    assert db.flushes == 1
+
+
+@pytest.mark.asyncio
+async def test_authorization_commit_false_flushes_before_refresh_and_returns_hydrated_model(monkeypatch: pytest.MonkeyPatch) -> None:
+    db = _FakeDb()
+    mandate = _mandate(status="ACTIVE")
+    version = _version(mandate_id=mandate.mandate_id)
+
+    async def _get_mandate(*, db, mandate_id):
+        _ = db
+        _ = mandate_id
+        return mandate
+
+    async def _hydrate(*, db, authorization):
+        _ = db
+        return SimpleNamespace(
+            mandate_authorization_id=authorization.mandate_authorization_id,
+            mandate_id=authorization.mandate_id,
+            mandate_version_id=authorization.mandate_version_id,
+            mandate_version_number=1,
+            autonomy_level="LEVEL_2",
+            authorization_state=authorization.authorization_state,
+            approval_result=authorization.approval_result,
+            authorized_by_actor_id=authorization.authorized_by_actor_id,
+            audit_correlation_id=authorization.audit_correlation_id,
+            recorded_at=authorization.recorded_at,
+            expires_at=authorization.expires_at,
+            revoked_at=authorization.revoked_at,
+        )
+
+    monkeypatch.setattr(lifecycle, "get_mandate", _get_mandate)
+    monkeypatch.setattr(lifecycle, "_hydrate_authorization_model", _hydrate)
+
+    from app.models.autonomous_capital_mandate_version import AutonomousCapitalMandateVersion
+
+    db.register_get(AutonomousCapitalMandateVersion, version.mandate_version_id, version)
+
+    request = MandateAuthorizationRequest(
+        mandate_id=mandate.mandate_id,
+        mandate_version_id=version.mandate_version_id,
+        actor="operator:owner",
+        authorization_method="owner_signature",
+        owner_acknowledgements={"accepted": True},
+        authorization_evidence={"signature": "hash"},
+        deterministic_explanation={"reason": "explicit_owner_authorization"},
+        expires_at=None,
+        idempotency_key="auth-commit-false-1",
+        audit_correlation_id=uuid.uuid4(),
+    )
+
+    result = await lifecycle.authorize_mandate_version(db=db, request=request, commit=False)
+
+    assert result.mandate_authorization_id is not None
+    assert result.authorization_state == "AUTHORIZED"
+    assert db.flushes == 1
+    assert db.commits == 0
+    assert len(db.refreshed) == 1
+
+
+@pytest.mark.asyncio
+async def test_authorization_commit_true_flushes_before_commit_and_returns_hydrated_model(monkeypatch: pytest.MonkeyPatch) -> None:
+    db = _FakeDb()
+    mandate = _mandate(status="ACTIVE")
+    version = _version(mandate_id=mandate.mandate_id)
+
+    async def _get_mandate(*, db, mandate_id):
+        _ = db
+        _ = mandate_id
+        return mandate
+
+    async def _hydrate(*, db, authorization):
+        _ = db
+        return SimpleNamespace(
+            mandate_authorization_id=authorization.mandate_authorization_id,
+            mandate_id=authorization.mandate_id,
+            mandate_version_id=authorization.mandate_version_id,
+            mandate_version_number=1,
+            autonomy_level="LEVEL_2",
+            authorization_state=authorization.authorization_state,
+            approval_result=authorization.approval_result,
+            authorized_by_actor_id=authorization.authorized_by_actor_id,
+            audit_correlation_id=authorization.audit_correlation_id,
+            recorded_at=authorization.recorded_at,
+            expires_at=authorization.expires_at,
+            revoked_at=authorization.revoked_at,
+        )
+
+    monkeypatch.setattr(lifecycle, "get_mandate", _get_mandate)
+    monkeypatch.setattr(lifecycle, "_hydrate_authorization_model", _hydrate)
+
+    from app.models.autonomous_capital_mandate_version import AutonomousCapitalMandateVersion
+
+    db.register_get(AutonomousCapitalMandateVersion, version.mandate_version_id, version)
+
+    request = MandateAuthorizationRequest(
+        mandate_id=mandate.mandate_id,
+        mandate_version_id=version.mandate_version_id,
+        actor="operator:owner",
+        authorization_method="owner_signature",
+        owner_acknowledgements={"accepted": True},
+        authorization_evidence={"signature": "hash"},
+        deterministic_explanation={"reason": "explicit_owner_authorization"},
+        expires_at=None,
+        idempotency_key="auth-commit-true-1",
+        audit_correlation_id=uuid.uuid4(),
+    )
+
+    result = await lifecycle.authorize_mandate_version(db=db, request=request, commit=True)
+
+    assert result.mandate_authorization_id is not None
+    assert result.authorization_state == "AUTHORIZED"
+    assert db.flushes == 1
+    assert db.commits == 1
+    assert len(db.refreshed) == 1
 
 
 @pytest.mark.asyncio

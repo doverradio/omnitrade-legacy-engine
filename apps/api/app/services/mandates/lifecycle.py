@@ -319,6 +319,7 @@ async def authorize_mandate_version(
         )
     )
 
+    await db.flush()
     if commit:
         await db.commit()
     await db.refresh(authorization)
