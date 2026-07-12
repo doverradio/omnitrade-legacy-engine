@@ -63,10 +63,11 @@ async def test_fixed_mode_with_passphrase_detects_first_divergence(capsys: pytes
     payload = json.loads(out)
 
     assert result == 0
-    assert payload["first_differing_stage"] in {"passphrase_presence", "encoded_body_hash", "payload_key_order", "otp_field_presence"}
+    assert payload["first_differing_stage"] == "passphrase_presence"
     assert payload["stage_equality"]["passphrase_presence"] is False
-    assert payload["provider"]["lifecycle"]["otp_field_present"] is True
+    assert payload["provider"]["lifecycle"]["otp_field_present"] is False
     assert payload["verifier"]["lifecycle"]["otp_field_present"] is False
+    assert payload["provider"]["lifecycle"]["encoded_body_hash"] == payload["verifier"]["lifecycle"]["encoded_body_hash"]
 
 
 @pytest.mark.asyncio

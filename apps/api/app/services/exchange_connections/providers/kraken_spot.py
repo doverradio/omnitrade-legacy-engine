@@ -1327,9 +1327,6 @@ class KrakenSpotClient:
         prior_nonce = self._last_nonce_ms
         nonce = await self._next_nonce()
         body_payload = {"nonce": nonce, **payload}
-        otp = str(credentials.get("passphrase") or "").strip()
-        if otp:
-            body_payload["otp"] = otp
 
         request_path = f"/0{path}"
         encoded_body = _encode_form_payload(body_payload)

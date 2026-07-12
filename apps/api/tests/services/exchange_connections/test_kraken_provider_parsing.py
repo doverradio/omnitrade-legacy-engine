@@ -234,6 +234,60 @@ async def test_kraken_private_request_signs_exact_transmitted_path_and_body(monk
 
 
 @pytest.mark.asyncio
+async def test_kraken_private_request_ignores_static_generic_passphrase_for_payload(monkeypatch: pytest.MonkeyPatch) -> None:
+    client = KrakenSpotClient()
+    captured: dict[str, str] = {}
+
+    class _FakeResponse:
+        status_code = 200
+        text = '{"error":[],"result":{"ZUSD":"1.00"}}'
+
+        def json(self):
+            return {"error": [], "result": {"ZUSD": "1.00"}}
+
+    class _FakeAsyncClient:
+        def __init__(self, *, base_url, timeout):
+            _ = base_url, timeout
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exc_type, exc, tb):
+            return False
+
+        async def post(self, path, content, headers):
+            captured["path"] = str(path)
+            captured["content"] = str(content)
+            captured["api_sign"] = str(headers.get("API-Sign"))
+            return _FakeResponse()
+
+    monkeypatch.setattr("app.services.exchange_connections.providers.kraken_spot.httpx.AsyncClient", _FakeAsyncClient)
+
+    await client._private_request(
+        path="/private/Balance",
+        environment="production",
+        credentials={
+            "api_key": "public-key",
+            "api_secret": "kQH5HW/8p1uGOVjbgWA7FunAmGO8lsSUXNsu3eow76sz84Q18fWxnyRzBHCd3pd5nE9qa99HAZtuZuj6F1huXg==",
+            "passphrase": "STATIC-PASSPHRASE-NOT-OTP",
+        },
+        payload={},
+    )
+
+    assert captured["path"] == "/0/private/Balance"
+    assert captured["content"].startswith("nonce=")
+    assert "&otp=" not in captured["content"]
+    nonce = captured["content"].split("=", 1)[1]
+    expected_signature = build_kraken_signature_from_encoded_payload(
+        url_path="/0/private/Balance",
+        nonce=nonce,
+        encoded_payload=captured["content"],
+        secret_b64="kQH5HW/8p1uGOVjbgWA7FunAmGO8lsSUXNsu3eow76sz84Q18fWxnyRzBHCd3pd5nE9qa99HAZtuZuj6F1huXg==",
+    )
+    assert captured["api_sign"] == expected_signature
+
+
+@pytest.mark.asyncio
 async def test_kraken_public_request_uses_versioned_uri_path(monkeypatch: pytest.MonkeyPatch) -> None:
     client = KrakenSpotClient()
     captured: dict[str, str] = {}
