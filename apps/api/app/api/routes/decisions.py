@@ -412,179 +412,118 @@ async def get_decision_timeline(
 
 @router.get("/records")
 async def list_decision_records(
+    decision_id: uuid.UUID | None = Query(default=None),
     asset_id: uuid.UUID | None = Query(default=None),
     strategy_id: uuid.UUID | None = Query(default=None),
     action: str | None = Query(default=None),
     trade_accepted: bool | None = Query(default=None),
     review_status: str | None = Query(default=None),
+    environment: str | None = Query(default=None),
+    provider: str | None = Query(default=None),
+    product_id: str | None = Query(default=None),
+    q: str | None = Query(default=None),
+    sort: str = Query(default="newest", pattern="^(newest|oldest|highest_confidence|lowest_confidence|highest_quality|lowest_quality|largest_requested_notional|largest_approved_notional|most_recently_reviewed)$"),
+    has_decision_snapshot: bool | None = Query(default=None),
+    has_price_evidence: bool | None = Query(default=None),
+    has_risk_event: bool | None = Query(default=None),
     start_time: datetime | None = Query(default=None),
     end_time: datetime | None = Query(default=None),
     page: int = Query(default=1, ge=1),
     page_size: int = Query(default=50, ge=1, le=MAX_PAGE_SIZE),
     db: AsyncSession = Depends(get_db),
 ) -> dict[str, Any]:
-    _validate_time_range(start_time=start_time, end_time=end_time)
-
-    statement = select(DecisionRecord).order_by(DecisionRecord.timestamp.desc(), DecisionRecord.decision_id.desc())
-    if trade_accepted is not None:
-        statement = statement.where(DecisionRecord.trade_accepted.is_(trade_accepted))
-    if review_status is not None:
-        statement = statement.where(DecisionRecord.review_status == review_status)
-    if start_time is not None:
-        statement = statement.where(DecisionRecord.timestamp >= start_time)
-    if end_time is not None:
-        statement = statement.where(DecisionRecord.timestamp <= end_time)
-
-    decision_rows = list((await db.execute(statement)).scalars().all())
-
-    signal_ids: list[uuid.UUID] = []
-    for row in decision_rows:
-        signal_id = _extract_primary_signal_id(row)
-        if signal_id is not None:
-            signal_ids.append(signal_id)
-
-    signal_map: dict[uuid.UUID, Signal] = {}
-    if signal_ids:
-        signal_rows = list(
-            (
-                await db.execute(
-                    select(Signal).where(Signal.id.in_(sorted(set(signal_ids))))
-                )
-            ).scalars().all()
-        )
-        signal_map = {item.id: item for item in signal_rows}
-
-    filtered_rows: list[DecisionRecord] = []
-    for row in decision_rows:
-        linked_signal = _linked_signal(row=row, signal_map=signal_map)
-        record_asset_id = _coerce_uuid_from_asset(row.asset.get("asset_id") if isinstance(row.asset, dict) else None)
-        resolved_asset_id = linked_signal.asset_id if linked_signal is not None else record_asset_id
-
-        if asset_id is not None and resolved_asset_id != asset_id:
-            continue
-        if strategy_id is not None:
-            if linked_signal is None or linked_signal.strategy_id != strategy_id:
-                continue
-        if action is not None:
-            resolved_action = linked_signal.action if linked_signal is not None else _record_action(row)
-            if resolved_action != action:
-                continue
-
-        filtered_rows.append(row)
-
-    filtered_decision_ids = [row.decision_id for row in filtered_rows]
-    filtered_decision_id_set = set(filtered_decision_ids)
-
-    latest_quality_by_decision: dict[uuid.UUID, DecisionQualityScore] = {}
-    counterfactuals_by_decision: dict[uuid.UUID, list[DecisionCounterfactualResult]] = {}
-    recommendation_history_by_decision: dict[uuid.UUID, dict[str, Any]] = {}
-
-    if filtered_decision_ids:
-        quality_rows = list(
-            (
-                await db.execute(
-                    select(DecisionQualityScore)
-                    .where(DecisionQualityScore.decision_id.in_(filtered_decision_ids))
-                    .order_by(
-                        DecisionQualityScore.decision_id.asc(),
-                        DecisionQualityScore.created_at.desc(),
-                        DecisionQualityScore.id.desc(),
-                    )
-                )
-            ).scalars().all()
-        )
-        for quality_row in quality_rows:
-            if quality_row.decision_id not in latest_quality_by_decision:
-                latest_quality_by_decision[quality_row.decision_id] = quality_row
-
-        counterfactual_rows = list(
-            (
-                await db.execute(
-                    select(DecisionCounterfactualResult)
-                    .where(DecisionCounterfactualResult.decision_id.in_(filtered_decision_ids))
-                    .order_by(
-                        DecisionCounterfactualResult.decision_id.asc(),
-                        DecisionCounterfactualResult.evaluated_at.desc(),
-                        DecisionCounterfactualResult.horizon_minutes.asc(),
-                        DecisionCounterfactualResult.id.asc(),
-                    )
-                )
-            ).scalars().all()
-        )
-        for counterfactual in counterfactual_rows:
-            counterfactuals_by_decision.setdefault(counterfactual.decision_id, []).append(counterfactual)
-
-        recommendation_rows = await read_experiment_recommendations(db=db)
-        for recommendation_row in recommendation_rows:
-            recommendation_created_at = _coerce_datetime(recommendation_row.created_at)
-
-            for decision_id_value in recommendation_row.originating_decision_ids:
-                decision_id = _coerce_uuid_string(decision_id_value)
-                if decision_id is None or decision_id not in filtered_decision_id_set:
-                    continue
-
-                summary = recommendation_history_by_decision.get(decision_id)
-                if summary is None:
-                    summary = {
-                        "count": 0,
-                        "latest_recommendation_at": recommendation_created_at.isoformat(),
-                        "latest_recommendation_type": recommendation_row.recommendation_type,
-                        "latest_recommendation_state": recommendation_row.evidence_state,
-                        "recommendation_ids": [],
-                    }
-                    recommendation_history_by_decision[decision_id] = summary
-
-                summary["count"] += 1
-                summary["recommendation_ids"].append(str(recommendation_row.recommendation_id))
-                latest_at = summary.get("latest_recommendation_at")
-                if not isinstance(latest_at, str) or recommendation_created_at.isoformat() > latest_at:
-                    summary["latest_recommendation_at"] = recommendation_created_at.isoformat()
-                    summary["latest_recommendation_type"] = recommendation_row.recommendation_type
-                    summary["latest_recommendation_state"] = recommendation_row.evidence_state
-
-    items: list[dict[str, Any]] = []
-    for row in filtered_rows:
-        linked_signal = _linked_signal(row=row, signal_map=signal_map)
-        items.append(
-            {
-                "decision_id": str(row.decision_id),
-                "timestamp": row.timestamp.isoformat(),
-                "asset_id": row.asset.get("asset_id") if isinstance(row.asset, dict) else None,
-                "trade_accepted": row.trade_accepted,
-                "review_status": row.review_status,
-                "outcome": row.outcome,
-                "action": _record_action(row),
-                "decision_explanation": {
-                    "trade_rejected_reason": row.trade_rejected_reason,
-                    "ai_reflection": row.ai_reflection,
-                    "post_trade_notes": row.post_trade_notes,
-                    "human_notes": row.human_notes,
-                    "lessons_learned": row.lessons_learned,
-                },
-                "linked_signal": {
-                    "signal_id": str(linked_signal.id) if linked_signal is not None else _record_signal_id_string(row),
-                    "strategy_id": str(linked_signal.strategy_id) if linked_signal is not None else None,
-                    "asset_id": str(linked_signal.asset_id) if linked_signal is not None else None,
-                    "action": linked_signal.action if linked_signal is not None else _record_action(row),
-                    "status": linked_signal.status if linked_signal is not None else _record_signal_status(row),
-                    "signal_time": linked_signal.signal_time.isoformat() if linked_signal is not None else None,
-                },
-                "quality_score": _quality_score_summary(latest_quality_by_decision.get(row.decision_id)),
-                "future_outcome_tracking": _future_outcome_summary(counterfactuals_by_decision.get(row.decision_id, [])),
-                "recommendation_history": recommendation_history_by_decision.get(
-                    row.decision_id,
-                    {
-                        "count": 0,
-                        "latest_recommendation_at": None,
-                        "latest_recommendation_type": None,
-                        "latest_recommendation_state": "unavailable",
-                        "recommendation_ids": [],
-                    },
-                ),
-            }
-        )
-
+    items = await _read_decision_record_items(
+        db=db,
+        decision_id=decision_id,
+        asset_id=asset_id,
+        strategy_id=strategy_id,
+        action=action,
+        trade_accepted=trade_accepted,
+        review_status=review_status,
+        environment=environment,
+        provider=provider,
+        product_id=product_id,
+        q=q,
+        sort=sort,
+        has_decision_snapshot=has_decision_snapshot,
+        has_price_evidence=has_price_evidence,
+        has_risk_event=has_risk_event,
+        start_time=start_time,
+        end_time=end_time,
+    )
     return _paginate(items=items, page=page, page_size=page_size)
+
+
+@router.get("/explorer/summary")
+async def get_decision_explorer_summary(
+    decision_id: uuid.UUID | None = Query(default=None),
+    asset_id: uuid.UUID | None = Query(default=None),
+    strategy_id: uuid.UUID | None = Query(default=None),
+    action: str | None = Query(default=None),
+    trade_accepted: bool | None = Query(default=None),
+    review_status: str | None = Query(default=None),
+    environment: str | None = Query(default=None),
+    provider: str | None = Query(default=None),
+    product_id: str | None = Query(default=None),
+    q: str | None = Query(default=None),
+    has_decision_snapshot: bool | None = Query(default=None),
+    has_price_evidence: bool | None = Query(default=None),
+    has_risk_event: bool | None = Query(default=None),
+    start_time: datetime | None = Query(default=None),
+    end_time: datetime | None = Query(default=None),
+    db: AsyncSession = Depends(get_db),
+) -> dict[str, Any]:
+    items = await _read_decision_record_items(
+        db=db,
+        decision_id=decision_id,
+        asset_id=asset_id,
+        strategy_id=strategy_id,
+        action=action,
+        trade_accepted=trade_accepted,
+        review_status=review_status,
+        environment=environment,
+        provider=provider,
+        product_id=product_id,
+        q=q,
+        sort="newest",
+        has_decision_snapshot=has_decision_snapshot,
+        has_price_evidence=has_price_evidence,
+        has_risk_event=has_risk_event,
+        start_time=start_time,
+        end_time=end_time,
+    )
+
+    summary = {
+        "total_decisions": len(items),
+        "accepted": 0,
+        "risk_rejected": 0,
+        "hold_wait": 0,
+        "preview_ready": 0,
+        "submitted": 0,
+        "executed": 0,
+        "needs_review": 0,
+        "missing_linkage": 0,
+    }
+
+    for item in items:
+        if item.get("trade_accepted") is True:
+            summary["accepted"] += 1
+        if item.get("risk_verdict") == "rejected":
+            summary["risk_rejected"] += 1
+        if item.get("action") in {"hold", "wait"}:
+            summary["hold_wait"] += 1
+        if item.get("preview_status") == "ready":
+            summary["preview_ready"] += 1
+        if item.get("execution_status") in {"submitted", "filled"}:
+            summary["submitted"] += 1
+        if item.get("execution_status") == "filled":
+            summary["executed"] += 1
+        if item.get("review_status") in {"unreviewed", "flagged"}:
+            summary["needs_review"] += 1
+        if item.get("evidence_completeness") != "complete":
+            summary["missing_linkage"] += 1
+
+    return summary
 
 
 @router.post("/coach/reviews/generate")
@@ -951,6 +890,276 @@ async def _filtered_decision_ids(
     return {str(item.decision_id) for item in entries}
 
 
+async def _read_decision_record_items(
+    *,
+    db: AsyncSession,
+    decision_id: uuid.UUID | None,
+    asset_id: uuid.UUID | None,
+    strategy_id: uuid.UUID | None,
+    action: str | None,
+    trade_accepted: bool | None,
+    review_status: str | None,
+    environment: str | None,
+    provider: str | None,
+    product_id: str | None,
+    q: str | None,
+    sort: str,
+    has_decision_snapshot: bool | None,
+    has_price_evidence: bool | None,
+    has_risk_event: bool | None,
+    start_time: datetime | None,
+    end_time: datetime | None,
+) -> list[dict[str, Any]]:
+    _validate_time_range(start_time=start_time, end_time=end_time)
+
+    statement = select(DecisionRecord).order_by(DecisionRecord.timestamp.desc(), DecisionRecord.decision_id.desc())
+    if decision_id is not None:
+        statement = statement.where(DecisionRecord.decision_id == decision_id)
+    if trade_accepted is not None:
+        statement = statement.where(DecisionRecord.trade_accepted.is_(trade_accepted))
+    if review_status is not None:
+        statement = statement.where(DecisionRecord.review_status == review_status)
+    if start_time is not None:
+        statement = statement.where(DecisionRecord.timestamp >= start_time)
+    if end_time is not None:
+        statement = statement.where(DecisionRecord.timestamp <= end_time)
+
+    decision_rows = list((await db.execute(statement)).scalars().all())
+
+    signal_ids: list[uuid.UUID] = []
+    for row in decision_rows:
+        signal_id = _extract_primary_signal_id(row)
+        if signal_id is not None:
+            signal_ids.append(signal_id)
+
+    signal_map: dict[uuid.UUID, Signal] = {}
+    if signal_ids:
+        signal_rows = list((await db.execute(select(Signal).where(Signal.id.in_(sorted(set(signal_ids)))))).scalars().all())
+        signal_map = {item.id: item for item in signal_rows}
+
+    filtered_rows: list[DecisionRecord] = []
+    for row in decision_rows:
+        linked_signal = _linked_signal(row=row, signal_map=signal_map)
+        record_asset_id = _coerce_uuid_from_asset(row.asset.get("asset_id") if isinstance(row.asset, dict) else None)
+        resolved_asset_id = linked_signal.asset_id if linked_signal is not None else record_asset_id
+
+        if asset_id is not None and resolved_asset_id != asset_id:
+            continue
+        if strategy_id is not None and (linked_signal is None or linked_signal.strategy_id != strategy_id):
+            continue
+        if action is not None:
+            resolved_action = (linked_signal.action if linked_signal is not None else _record_action(row)) or ""
+            if resolved_action.lower() != action.lower():
+                continue
+
+        if provider is not None:
+            provider_value = _record_provider(row)
+            if provider_value is None or provider_value.lower() != provider.lower():
+                continue
+        if environment is not None:
+            env_value = _record_environment(row)
+            if env_value is None or env_value.lower() != environment.lower():
+                continue
+        if product_id is not None:
+            product_value = _record_product_id(row)
+            if product_value is None or product_value.upper() != product_id.upper():
+                continue
+
+        filtered_rows.append(row)
+
+    filtered_decision_ids = [row.decision_id for row in filtered_rows]
+    filtered_decision_id_set = set(filtered_decision_ids)
+
+    latest_quality_by_decision: dict[uuid.UUID, DecisionQualityScore] = {}
+    counterfactuals_by_decision: dict[uuid.UUID, list[DecisionCounterfactualResult]] = {}
+    recommendation_history_by_decision: dict[uuid.UUID, dict[str, Any]] = {}
+
+    if filtered_decision_ids:
+        quality_rows = list(
+            (
+                await db.execute(
+                    select(DecisionQualityScore)
+                    .where(DecisionQualityScore.decision_id.in_(filtered_decision_ids))
+                    .order_by(
+                        DecisionQualityScore.decision_id.asc(),
+                        DecisionQualityScore.created_at.desc(),
+                        DecisionQualityScore.id.desc(),
+                    )
+                )
+            ).scalars().all()
+        )
+        for quality_row in quality_rows:
+            if quality_row.decision_id not in latest_quality_by_decision:
+                latest_quality_by_decision[quality_row.decision_id] = quality_row
+
+        counterfactual_rows = list(
+            (
+                await db.execute(
+                    select(DecisionCounterfactualResult)
+                    .where(DecisionCounterfactualResult.decision_id.in_(filtered_decision_ids))
+                    .order_by(
+                        DecisionCounterfactualResult.decision_id.asc(),
+                        DecisionCounterfactualResult.evaluated_at.desc(),
+                        DecisionCounterfactualResult.horizon_minutes.asc(),
+                        DecisionCounterfactualResult.id.asc(),
+                    )
+                )
+            ).scalars().all()
+        )
+        for counterfactual in counterfactual_rows:
+            counterfactuals_by_decision.setdefault(counterfactual.decision_id, []).append(counterfactual)
+
+        recommendation_rows = await read_experiment_recommendations(db=db)
+        for recommendation_row in recommendation_rows:
+            recommendation_created_at = _coerce_datetime(recommendation_row.created_at)
+            for decision_id_value in recommendation_row.originating_decision_ids:
+                linked_decision_id = _coerce_uuid_string(decision_id_value)
+                if linked_decision_id is None or linked_decision_id not in filtered_decision_id_set:
+                    continue
+
+                summary = recommendation_history_by_decision.get(linked_decision_id)
+                if summary is None:
+                    summary = {
+                        "count": 0,
+                        "latest_recommendation_at": recommendation_created_at.isoformat(),
+                        "latest_recommendation_type": recommendation_row.recommendation_type,
+                        "latest_recommendation_state": recommendation_row.evidence_state,
+                        "recommendation_ids": [],
+                    }
+                    recommendation_history_by_decision[linked_decision_id] = summary
+
+                summary["count"] += 1
+                summary["recommendation_ids"].append(str(recommendation_row.recommendation_id))
+                latest_at = summary.get("latest_recommendation_at")
+                if not isinstance(latest_at, str) or recommendation_created_at.isoformat() > latest_at:
+                    summary["latest_recommendation_at"] = recommendation_created_at.isoformat()
+                    summary["latest_recommendation_type"] = recommendation_row.recommendation_type
+                    summary["latest_recommendation_state"] = recommendation_row.evidence_state
+
+    items: list[dict[str, Any]] = []
+    q_norm = q.lower().strip() if isinstance(q, str) and q.strip() else None
+    for row in filtered_rows:
+        linked_signal = _linked_signal(row=row, signal_map=signal_map)
+        quality_score = latest_quality_by_decision.get(row.decision_id)
+        confidence_value = _decimal_to_str(row.confidence)
+        quality_value = _decimal_to_str(quality_score.composite_score) if quality_score is not None else None
+        requested_notional = _requested_notional(row)
+        approved_notional = _approved_notional(row)
+        risk_verdict = _risk_verdict(row)
+        first_failing_rule = _first_failing_rule(row)
+        preview_status = _preview_status(row)
+        approval_status = _approval_status(row)
+        rehearsal_status = _rehearsal_status(row)
+        execution_status = _execution_status(row)
+        has_snapshot_value = _has_decision_snapshot(row)
+        has_price_evidence_value = _has_price_evidence(row)
+        has_risk_event_value = _has_risk_event(row)
+
+        item = {
+            "decision_id": str(row.decision_id),
+            "timestamp": row.timestamp.isoformat(),
+            "asset_id": row.asset.get("asset_id") if isinstance(row.asset, dict) else None,
+            "trade_accepted": row.trade_accepted,
+            "review_status": row.review_status,
+            "outcome": row.outcome,
+            "action": _record_action(row),
+            "provider": _record_provider(row),
+            "environment": _record_environment(row),
+            "product_id": _record_product_id(row),
+            "confidence": confidence_value,
+            "risk_verdict": risk_verdict,
+            "first_failing_risk_rule": first_failing_rule,
+            "requested_notional": requested_notional,
+            "approved_notional": approved_notional,
+            "preview_status": preview_status,
+            "approval_status": approval_status,
+            "rehearsal_status": rehearsal_status,
+            "execution_status": execution_status,
+            "has_decision_snapshot": has_snapshot_value,
+            "has_price_evidence": has_price_evidence_value,
+            "has_risk_event": has_risk_event_value,
+            "evidence_completeness": "complete" if (has_snapshot_value and has_price_evidence_value and has_risk_event_value) else "missing_linkage",
+            "decision_explanation": {
+                "trade_rejected_reason": row.trade_rejected_reason,
+                "ai_reflection": row.ai_reflection,
+                "post_trade_notes": row.post_trade_notes,
+                "human_notes": row.human_notes,
+                "lessons_learned": row.lessons_learned,
+            },
+            "linked_signal": {
+                "signal_id": str(linked_signal.id) if linked_signal is not None else _record_signal_id_string(row),
+                "strategy_id": str(linked_signal.strategy_id) if linked_signal is not None else None,
+                "asset_id": str(linked_signal.asset_id) if linked_signal is not None else None,
+                "action": linked_signal.action if linked_signal is not None else _record_action(row),
+                "status": linked_signal.status if linked_signal is not None else _record_signal_status(row),
+                "signal_time": linked_signal.signal_time.isoformat() if linked_signal is not None else None,
+            },
+            "quality_score": _quality_score_summary(quality_score),
+            "future_outcome_tracking": _future_outcome_summary(counterfactuals_by_decision.get(row.decision_id, [])),
+            "recommendation_history": recommendation_history_by_decision.get(
+                row.decision_id,
+                {
+                    "count": 0,
+                    "latest_recommendation_at": None,
+                    "latest_recommendation_type": None,
+                    "latest_recommendation_state": "unavailable",
+                    "recommendation_ids": [],
+                },
+            ),
+        }
+
+        if has_decision_snapshot is not None and item["has_decision_snapshot"] != has_decision_snapshot:
+            continue
+        if has_price_evidence is not None and item["has_price_evidence"] != has_price_evidence:
+            continue
+        if has_risk_event is not None and item["has_risk_event"] != has_risk_event:
+            continue
+
+        if q_norm is not None:
+            haystack = [
+                item["decision_id"],
+                item.get("product_id") or "",
+                item.get("provider") or "",
+                (row.asset.get("symbol") if isinstance(row.asset, dict) else "") or "",
+                item.get("action") or "",
+                item.get("outcome") or "",
+                row.trade_rejected_reason or "",
+                row.human_notes or "",
+                _record_audit_correlation_id(row) or "",
+            ]
+            if not any(q_norm in str(value).lower() for value in haystack):
+                continue
+
+        items.append(item)
+
+    if sort == "oldest":
+        items.sort(key=lambda value: (value.get("timestamp") or "", value.get("decision_id") or ""))
+    elif sort == "highest_confidence":
+        items.sort(key=lambda value: _float_or_min(value.get("confidence")), reverse=True)
+    elif sort == "lowest_confidence":
+        items.sort(key=lambda value: _float_or_max(value.get("confidence")))
+    elif sort == "highest_quality":
+        items.sort(key=lambda value: _float_or_min(value.get("quality_score", {}).get("composite_score")), reverse=True)
+    elif sort == "lowest_quality":
+        items.sort(key=lambda value: _float_or_max(value.get("quality_score", {}).get("composite_score")))
+    elif sort == "largest_requested_notional":
+        items.sort(key=lambda value: _float_or_min(value.get("requested_notional")), reverse=True)
+    elif sort == "largest_approved_notional":
+        items.sort(key=lambda value: _float_or_min(value.get("approved_notional")), reverse=True)
+    elif sort == "most_recently_reviewed":
+        items.sort(
+            key=lambda value: (
+                1 if value.get("review_status") not in {None, "unreviewed"} else 0,
+                value.get("timestamp") or "",
+            ),
+            reverse=True,
+        )
+    else:
+        items.sort(key=lambda value: (value.get("timestamp") or "", value.get("decision_id") or ""), reverse=True)
+
+    return items
+
+
 def _validate_time_range(*, start_time: datetime | None, end_time: datetime | None) -> None:
     if start_time is not None and end_time is not None and start_time > end_time:
         raise InvalidRequestError(
@@ -1119,3 +1328,165 @@ def _future_outcome_summary(counterfactual_rows: list[DecisionCounterfactualResu
         "latest_best_action": latest.best_action,
         "latest_actual_action_correct": latest.actual_action_correct,
     }
+
+
+def _record_provider(row: DecisionRecord) -> str | None:
+    if isinstance(row.asset, dict):
+        value = row.asset.get("provider") or row.asset.get("exchange")
+        if isinstance(value, str) and value.strip():
+            return value
+
+    if isinstance(row.execution_details, dict):
+        value = row.execution_details.get("provider")
+        if isinstance(value, str) and value.strip():
+            return value
+    return None
+
+
+def _record_environment(row: DecisionRecord) -> str | None:
+    if isinstance(row.execution_details, dict):
+        value = row.execution_details.get("environment")
+        if isinstance(value, str) and value.strip():
+            return value
+    return None
+
+
+def _record_product_id(row: DecisionRecord) -> str | None:
+    if isinstance(row.asset, dict):
+        value = row.asset.get("product_id")
+        if isinstance(value, str) and value.strip():
+            return value
+        symbol = row.asset.get("symbol")
+        quote = row.asset.get("quote_currency")
+        if isinstance(symbol, str) and isinstance(quote, str):
+            return f"{symbol}-{quote}"
+    return None
+
+
+def _requested_notional(row: DecisionRecord) -> str | None:
+    if row.generated_signals and isinstance(row.generated_signals[0], dict):
+        value = row.generated_signals[0].get("quote_size") or row.generated_signals[0].get("requested_amount")
+        if value is not None:
+            return str(value)
+
+    if isinstance(row.execution_details, dict):
+        value = row.execution_details.get("requested_quote_size")
+        if value is not None:
+            return str(value)
+    return None
+
+
+def _approved_notional(row: DecisionRecord) -> str | None:
+    if isinstance(row.execution_details, dict):
+        value = row.execution_details.get("approved_quantity")
+        if value is not None:
+            return str(value)
+
+    if row.position_size is not None:
+        return _decimal_to_str(row.position_size)
+    return None
+
+
+def _risk_verdict(row: DecisionRecord) -> str:
+    if row.trade_accepted:
+        return "approved"
+    return "rejected"
+
+
+def _first_failing_rule(row: DecisionRecord) -> str | None:
+    if row.risk_adjustments:
+        for adjustment in row.risk_adjustments:
+            if not isinstance(adjustment, dict):
+                continue
+            status = adjustment.get("status")
+            if status == "reject":
+                reason_code = adjustment.get("reason_code")
+                if isinstance(reason_code, str):
+                    return reason_code
+    return row.trade_rejected_reason
+
+
+def _preview_status(row: DecisionRecord) -> str:
+    lineage = row.source_lineage if isinstance(row.source_lineage, dict) else {}
+    previews = lineage.get("crypto_order_previews")
+    if isinstance(previews, list) and previews:
+        return "ready"
+
+    if isinstance(row.execution_details, dict):
+        if row.execution_details.get("preview_id") is not None:
+            return "ready"
+    return "none"
+
+
+def _approval_status(row: DecisionRecord) -> str:
+    lineage = row.source_lineage if isinstance(row.source_lineage, dict) else {}
+    approvals = lineage.get("live_crypto_order_approvals")
+    if isinstance(approvals, list) and approvals:
+        return "created"
+    return "none"
+
+
+def _rehearsal_status(row: DecisionRecord) -> str:
+    lineage = row.source_lineage if isinstance(row.source_lineage, dict) else {}
+    rehearsals = lineage.get("live_crypto_order_rehearsals")
+    if isinstance(rehearsals, list) and rehearsals:
+        return "created"
+    return "none"
+
+
+def _execution_status(row: DecisionRecord) -> str:
+    lineage = row.source_lineage if isinstance(row.source_lineage, dict) else {}
+    trades = lineage.get("trades")
+    if isinstance(trades, list) and trades:
+        return "filled"
+
+    if isinstance(row.execution_details, dict):
+        status = row.execution_details.get("status")
+        if isinstance(status, str):
+            lower = status.lower()
+            if lower in {"submitted", "filled", "executed"}:
+                return "filled" if lower in {"filled", "executed"} else "submitted"
+    return "not_submitted"
+
+
+def _has_decision_snapshot(row: DecisionRecord) -> bool:
+    return bool(row.market_regime)
+
+
+def _has_price_evidence(row: DecisionRecord) -> bool:
+    if isinstance(row.market_regime, dict) and row.market_regime.get("execution_price_evidence_id"):
+        return True
+    if isinstance(row.execution_details, dict):
+        value = row.execution_details.get("execution_price_evidence_id")
+        return bool(value)
+    return False
+
+
+def _has_risk_event(row: DecisionRecord) -> bool:
+    if isinstance(row.expected_risk, dict) and row.expected_risk.get("risk_event_id"):
+        return True
+    lineage = row.source_lineage if isinstance(row.source_lineage, dict) else {}
+    risk_events = lineage.get("risk_events")
+    return isinstance(risk_events, list) and len(risk_events) > 0
+
+
+def _record_audit_correlation_id(row: DecisionRecord) -> str | None:
+    if isinstance(row.execution_details, dict):
+        value = row.execution_details.get("audit_correlation_id")
+        if isinstance(value, str):
+            return value
+    return None
+
+
+def _float_or_min(value: Any) -> float:
+    try:
+        return float(value)
+    except Exception:
+        return -1.0
+
+
+def _float_or_max(value: Any) -> float:
+    try:
+        return float(value)
+    except Exception:
+        return 1e12

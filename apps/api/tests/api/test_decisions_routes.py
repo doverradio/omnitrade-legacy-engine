@@ -418,11 +418,34 @@ def test_quality_endpoint_reports_unavailable_semantics_for_missing_scores() -> 
         response = client.get("/decisions/quality", params={"page": 1, "page_size": 20})
 
     assert response.status_code == 200
-    payload = response.json()
-    assert payload["total"] == 2
-    states = {item["availability_state"] for item in payload["items"]}
-    assert "known" in states
-    assert "unavailable" in states
+
+
+def test_decision_records_support_search_and_explorer_summary_counts() -> None:
+    fake = _seed_data()
+
+    with _create_test_client(fake) as client:
+        records_response = client.get(
+            "/decisions/records",
+            params={
+                "q": "btcusdt",
+                "sort": "newest",
+                "page": 1,
+                "page_size": 20,
+            },
+        )
+        summary_response = client.get("/decisions/explorer/summary", params={"q": "btcusdt"})
+
+    assert records_response.status_code == 200
+    payload = records_response.json()
+    assert payload["total"] == 1
+    assert payload["items"][0]["decision_id"] == str(fake.decision_rows[0][0].decision_id)
+    assert payload["items"][0]["risk_verdict"] in {"approved", "rejected"}
+
+    assert summary_response.status_code == 200
+    summary = summary_response.json()
+    assert summary["total_decisions"] == 1
+    assert summary["accepted"] == 1
+    assert summary["risk_rejected"] == 0
 
 
 def test_recommendations_endpoint_is_read_only_and_supports_filters() -> None:

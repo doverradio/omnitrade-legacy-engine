@@ -132,6 +132,22 @@ export type DecisionRecordItem = {
   review_status: string | null;
   outcome: string | null;
   action: string | null;
+  provider: string | null;
+  environment: string | null;
+  product_id: string | null;
+  confidence: string | null;
+  risk_verdict: string;
+  first_failing_risk_rule: string | null;
+  requested_notional: string | null;
+  approved_notional: string | null;
+  preview_status: string;
+  approval_status: string;
+  rehearsal_status: string;
+  execution_status: string;
+  has_decision_snapshot: boolean;
+  has_price_evidence: boolean;
+  has_risk_event: boolean;
+  evidence_completeness: string;
   decision_explanation: {
     trade_rejected_reason: string | null;
     ai_reflection: Record<string, unknown> | null;
@@ -176,15 +192,45 @@ export type DecisionRecordItem = {
 };
 
 export type DecisionRecordFilters = {
+  decision_id?: string;
   asset_id?: string;
   strategy_id?: string;
   action?: string;
   trade_accepted?: boolean;
   review_status?: string;
+  environment?: string;
+  provider?: string;
+  product_id?: string;
+  q?: string;
+  sort?:
+    | "newest"
+    | "oldest"
+    | "highest_confidence"
+    | "lowest_confidence"
+    | "highest_quality"
+    | "lowest_quality"
+    | "largest_requested_notional"
+    | "largest_approved_notional"
+    | "most_recently_reviewed";
+  has_decision_snapshot?: boolean;
+  has_price_evidence?: boolean;
+  has_risk_event?: boolean;
   start_time?: string;
   end_time?: string;
   page?: number;
   page_size?: number;
+};
+
+export type DecisionExplorerSummary = {
+  total_decisions: number;
+  accepted: number;
+  risk_rejected: number;
+  hold_wait: number;
+  preview_ready: number;
+  submitted: number;
+  executed: number;
+  needs_review: number;
+  missing_linkage: number;
 };
 
 export type CoachReviewGenerationResponse = {
@@ -308,6 +354,9 @@ export async function getDecisionRecommendations(filters: DecisionReadFilters): 
 
 export async function getDecisionRecords(filters: DecisionRecordFilters): Promise<PaginatedResponse<DecisionRecordItem>> {
   const query = new URLSearchParams();
+  if (filters.decision_id) {
+    query.set("decision_id", filters.decision_id);
+  }
   if (filters.asset_id) {
     query.set("asset_id", filters.asset_id);
   }
@@ -323,6 +372,30 @@ export async function getDecisionRecords(filters: DecisionRecordFilters): Promis
   if (filters.review_status) {
     query.set("review_status", filters.review_status);
   }
+  if (filters.environment) {
+    query.set("environment", filters.environment);
+  }
+  if (filters.provider) {
+    query.set("provider", filters.provider);
+  }
+  if (filters.product_id) {
+    query.set("product_id", filters.product_id);
+  }
+  if (filters.q) {
+    query.set("q", filters.q);
+  }
+  if (filters.sort) {
+    query.set("sort", filters.sort);
+  }
+  if (typeof filters.has_decision_snapshot === "boolean") {
+    query.set("has_decision_snapshot", String(filters.has_decision_snapshot));
+  }
+  if (typeof filters.has_price_evidence === "boolean") {
+    query.set("has_price_evidence", String(filters.has_price_evidence));
+  }
+  if (typeof filters.has_risk_event === "boolean") {
+    query.set("has_risk_event", String(filters.has_risk_event));
+  }
   if (filters.start_time) {
     query.set("start_time", filters.start_time);
   }
@@ -333,6 +406,56 @@ export async function getDecisionRecords(filters: DecisionRecordFilters): Promis
   query.set("page_size", String(filters.page_size ?? 50));
 
   return requestJson<PaginatedResponse<DecisionRecordItem>>(`/decisions/records?${query.toString()}`);
+}
+
+export async function getDecisionExplorerSummary(filters: DecisionRecordFilters): Promise<DecisionExplorerSummary> {
+  const query = new URLSearchParams();
+  if (filters.decision_id) {
+    query.set("decision_id", filters.decision_id);
+  }
+  if (filters.asset_id) {
+    query.set("asset_id", filters.asset_id);
+  }
+  if (filters.strategy_id) {
+    query.set("strategy_id", filters.strategy_id);
+  }
+  if (filters.action) {
+    query.set("action", filters.action);
+  }
+  if (typeof filters.trade_accepted === "boolean") {
+    query.set("trade_accepted", String(filters.trade_accepted));
+  }
+  if (filters.review_status) {
+    query.set("review_status", filters.review_status);
+  }
+  if (filters.environment) {
+    query.set("environment", filters.environment);
+  }
+  if (filters.provider) {
+    query.set("provider", filters.provider);
+  }
+  if (filters.product_id) {
+    query.set("product_id", filters.product_id);
+  }
+  if (filters.q) {
+    query.set("q", filters.q);
+  }
+  if (typeof filters.has_decision_snapshot === "boolean") {
+    query.set("has_decision_snapshot", String(filters.has_decision_snapshot));
+  }
+  if (typeof filters.has_price_evidence === "boolean") {
+    query.set("has_price_evidence", String(filters.has_price_evidence));
+  }
+  if (typeof filters.has_risk_event === "boolean") {
+    query.set("has_risk_event", String(filters.has_risk_event));
+  }
+  if (filters.start_time) {
+    query.set("start_time", filters.start_time);
+  }
+  if (filters.end_time) {
+    query.set("end_time", filters.end_time);
+  }
+  return requestJson<DecisionExplorerSummary>(`/decisions/explorer/summary?${query.toString()}`);
 }
 
 export async function generateCoachReviews(params?: {
