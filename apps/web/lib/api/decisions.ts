@@ -233,6 +233,96 @@ export type DecisionExplorerSummary = {
   missing_linkage: number;
 };
 
+export type DecisionInspectorStage = {
+  stage: string;
+  status: "completed" | "rejected" | "pending" | "not_applicable" | "missing";
+  label: string;
+  detail: string;
+};
+
+export type DecisionInspectorResponse = {
+  decision_id: string;
+  header: {
+    title: string;
+    decision_id: string;
+    current_status: string;
+    timestamp: string;
+    strategy: string | null;
+    campaign: string | null;
+    provider: string | null;
+    environment: string;
+    market: string;
+    confidence: string | null;
+    decision_quality: string | null;
+    review_status: string;
+    environment_badge: string;
+    paper_live_badge: string;
+  };
+  timeline: DecisionInspectorStage[];
+  narrative: {
+    title: string;
+    explanation: string;
+    evidence_gaps: Array<string | null>;
+  };
+  execution_price_evidence: {
+    availability: string;
+    provider: string | null;
+    venue: string | null;
+    product: string | null;
+    base_currency: string | null;
+    quote_currency: string | null;
+    observed_price: string | null;
+    bid: string | null;
+    ask: string | null;
+    reference_price: string | null;
+    observed_timestamp: string | null;
+    retrieved_timestamp: string | null;
+    evidence_age_seconds: number | null;
+    freshness_seconds: number | null;
+    validation_status: string;
+    evidence_id: string | null;
+  };
+  risk_evaluation: {
+    verdict: string;
+    first_failing_rule: Record<string, unknown> | null;
+    stopped_after_first_fail: boolean;
+    risk_adjusted_sizing: string | null;
+    checks: Array<Record<string, unknown>>;
+  };
+  decision_intelligence: Record<string, string>;
+  preview: {
+    availability: string;
+    state_reason: string | null;
+    preview_id: string | null;
+    requested_amount: string | null;
+    approved_amount: string | null;
+    estimated_quantity: string | null;
+    estimated_fees: string | null;
+    expiration: string | null;
+    submission_state: string;
+    execution_state: string;
+    human_approval_state: string;
+  };
+  audit_timeline: Array<{
+    actor: string;
+    timestamp: string;
+    action: string;
+    entity_type: string;
+    correlation_id: string | null;
+  }>;
+  counterfactual: {
+    availability: string;
+    state_reason: string | null;
+    items: Array<Record<string, unknown>>;
+    summary: string;
+  };
+  linkage_health: Array<{
+    component: string;
+    status: string;
+    reason: string;
+  }>;
+};
+
 export type CoachReviewGenerationResponse = {
   status: string;
   advisory_only: boolean;
@@ -456,6 +546,10 @@ export async function getDecisionExplorerSummary(filters: DecisionRecordFilters)
     query.set("end_time", filters.end_time);
   }
   return requestJson<DecisionExplorerSummary>(`/decisions/explorer/summary?${query.toString()}`);
+}
+
+export async function getDecisionInspector(decisionId: string): Promise<DecisionInspectorResponse> {
+  return requestJson<DecisionInspectorResponse>(`/decisions/${decisionId}/inspector`);
 }
 
 export async function generateCoachReviews(params?: {

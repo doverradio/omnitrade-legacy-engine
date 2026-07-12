@@ -16,6 +16,9 @@ from app.models.decision_quality_score import DecisionQualityScore
 from app.models.decision_record import DecisionRecord
 from app.models.decision_snapshot import DecisionSnapshot
 from app.models.risk_event import RiskEvent
+from app.models.crypto_order_preview import CryptoOrderPreview
+from app.models.live_crypto_order import LiveCryptoOrder
+from app.models.audit_log import AuditLog
 
 
 class _ScalarResult:
@@ -55,6 +58,9 @@ class _FakeSession:
         self.counterfactual_results = counterfactual_results
         self.quality_scores = quality_scores
         self.recommendations = recommendations
+        self.previews: list[CryptoOrderPreview] = []
+        self.live_orders: list[LiveCryptoOrder] = []
+        self.audit_rows: list[AuditLog] = []
         self.add_calls = 0
         self.begin_calls = 0
 
@@ -75,6 +81,34 @@ class _FakeSession:
             for decision_record, _ in self.decision_rows:
                 if decision_record.decision_id == decision_id:
                     return decision_record
+            return None
+
+        if "FROM decision_snapshots" in sql and "decision_id_1" in params:
+            decision_id = params.get("decision_id_1")
+            for _decision_record, snapshot in self.decision_rows:
+                if snapshot is not None and snapshot.decision_id == decision_id:
+                    return snapshot
+            return None
+
+        if "FROM crypto_order_previews" in sql and "decision_record_id_1" in params:
+            decision_id = params.get("decision_record_id_1")
+            for item in self.previews:
+                if item.decision_record_id == decision_id:
+                    return item
+            return None
+
+        if "FROM live_crypto_orders" in sql and "decision_record_id_1" in params:
+            decision_id = params.get("decision_record_id_1")
+            for item in self.live_orders:
+                if item.decision_record_id == decision_id:
+                    return item
+            return None
+
+        if "FROM risk_events" in sql and "id_1" in params:
+            risk_id = params.get("id_1")
+            for item in self.risk_events:
+                if item.id == risk_id:
+                    return item
             return None
 
         if "FROM decision_quality_scores" in sql and "decision_id_1" in params:
@@ -103,6 +137,17 @@ class _FakeSession:
         if "FROM risk_events" in sql:
             requested = {str(value) for value in params.values() if isinstance(value, uuid.UUID)}
             rows = [item for item in self.risk_events if str(item.id) in requested]
+            return _ExecuteResult(rows, scalar_items=rows)
+
+        if "FROM audit_log" in sql:
+            entity_type = params.get("entity_type_1")
+            entity_id = params.get("entity_id_1")
+            rows = [
+                item
+                for item in self.audit_rows
+                if item.entity_type == entity_type and item.entity_id == entity_id
+            ]
+            rows.sort(key=lambda item: (item.created_at, item.id))
             return _ExecuteResult(rows, scalar_items=rows)
 
         if "FROM decision_explainability_records" in sql:
@@ -360,7 +405,65 @@ def _seed_data() -> _FakeSession:
         )
     ]
 
-    return _FakeSession(
+    preview = CryptoOrderPreview(
+        crypto_order_preview_id=uuid.uuid4(),
+        idempotency_key="preview-1",
+        preview_version=1,
+        refreshed_from_preview_id=None,
+        exchange_connection_id=uuid.uuid4(),
+        provider="kraken_spot",
+        environment="production",
+        product_id="BTC-USD",
+        side="BUY",
+        order_type="MARKET",
+        quote_size=Decimal("5.00"),
+        base_size=None,
+        requested_amount=Decimal("5.00"),
+        requested_amount_currency="USD",
+        status="RISK_REJECTED",
+        readiness_verdict="READY_FOR_PREVIEW",
+        risk_event_id=risk_event.id,
+        decision_record_id=decision_a.decision_id,
+        validation_run_id=None,
+        strategy_id=None,
+        strategy_name=None,
+        preview_id="preview-id",
+        estimated_average_price=Decimal("10000"),
+        estimated_total_value=Decimal("5.00"),
+        estimated_base_size=Decimal("0.0005"),
+        estimated_quote_size=Decimal("5.00"),
+        estimated_fee=Decimal("0.01"),
+        estimated_fee_currency="USD",
+        estimated_slippage=Decimal("0.001"),
+        estimated_commission_total=Decimal("0.01"),
+        best_bid=Decimal("9999"),
+        best_ask=Decimal("10001"),
+        available_balance_before=Decimal("100"),
+        estimated_balance_after=Decimal("94.99"),
+        risk_verdict="rejected",
+        risk_explanation="position_below_minimum_order_size",
+        failure_reason="position_below_minimum_order_size",
+        warning_messages=[],
+        exchange_response_summary={},
+        expires_at=now,
+        generated_by="operator",
+        audit_correlation_id=uuid.uuid4(),
+        created_at=now,
+        updated_at=now,
+    )
+
+    audit = AuditLog(
+        id=1,
+        actor="operator",
+        action="crypto_order_preview_initiated",
+        entity_type="crypto_order_preview",
+        entity_id=preview.crypto_order_preview_id,
+        before_state={"status": "PREVIEW_REQUESTED"},
+        after_state={"status": "RISK_REJECTED", "audit_correlation_id": str(preview.audit_correlation_id)},
+        created_at=now,
+    )
+
+    fake = _FakeSession(
         decision_rows=[(decision_a, snapshot_a), (decision_b, snapshot_b)],
         risk_events=[risk_event],
         explainability_records=explainability,
@@ -368,6 +471,10 @@ def _seed_data() -> _FakeSession:
         quality_scores=quality,
         recommendations=recommendation,
     )
+    fake.previews = [preview]
+    fake.live_orders = []
+    fake.audit_rows = [audit]
+    return fake
 
 
 def test_decision_timeline_supports_pagination_and_filtering_and_read_only_behavior() -> None:
@@ -487,3 +594,30 @@ def test_decision_records_endpoint_includes_learn_layer_enrichments() -> None:
     assert second_item["quality_score"]["availability_state"] == "unavailable"
     assert second_item["future_outcome_tracking"]["availability_state"] == "unavailable"
     assert second_item["recommendation_history"]["count"] == 0
+
+
+def test_decision_inspector_returns_narrative_timeline_and_linkage_health() -> None:
+    fake = _seed_data()
+    decision_id = str(fake.decision_rows[0][0].decision_id)
+
+    with _create_test_client(fake) as client:
+        response = client.get(f"/decisions/{decision_id}/inspector")
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["header"]["decision_id"] == decision_id
+    assert payload["narrative"]["title"] == "Why"
+    assert any(item["stage"] == "Risk Evaluation" for item in payload["timeline"])
+    assert any(item["component"] == "Preview" for item in payload["linkage_health"])
+    assert payload["risk_evaluation"]["verdict"] in {"approved", "rejected"}
+    assert payload["execution_price_evidence"]["validation_status"] in {"valid", "missing"}
+
+
+def test_decision_inspector_returns_404_for_unknown_decision() -> None:
+    fake = _seed_data()
+    unknown = str(uuid.uuid4())
+
+    with _create_test_client(fake) as client:
+        response = client.get(f"/decisions/{unknown}/inspector")
+
+    assert response.status_code == 404

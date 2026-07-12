@@ -14,6 +14,12 @@ from app.db.session import get_db
 from app.models.decision_counterfactual_result import DecisionCounterfactualResult
 from app.models.decision_quality_score import DecisionQualityScore
 from app.models.decision_record import DecisionRecord
+from app.models.decision_snapshot import DecisionSnapshot
+from app.models.crypto_order_preview import CryptoOrderPreview
+from app.models.live_crypto_order import LiveCryptoOrder
+from app.models.live_approval_event import LiveApprovalEvent
+from app.models.audit_log import AuditLog
+from app.models.risk_event import RiskEvent
 from app.models.signal import Signal
 from app.services.arena.comparison import read_latest_arena_comparison_record
 from app.services.arena.contracts import ArenaLeaderboardFilterContract
@@ -568,6 +574,132 @@ async def get_decision_explainability(
         "opposing_evidence": read_model.opposing_evidence,
         "confidence_factors": read_model.confidence_factors,
         "risk_adjustments": read_model.risk_adjustments,
+    }
+
+
+@router.get("/{decision_id}/inspector")
+async def get_decision_inspector(
+    decision_id: uuid.UUID,
+    db: AsyncSession = Depends(get_db),
+) -> dict[str, Any]:
+    decision = await db.scalar(select(DecisionRecord).where(DecisionRecord.decision_id == decision_id).limit(1))
+    if decision is None:
+        raise NotFoundError(message="Decision not found", details={"decision_id": str(decision_id)})
+
+    snapshot = await db.scalar(select(DecisionSnapshot).where(DecisionSnapshot.decision_id == decision_id).limit(1))
+    preview = await db.scalar(
+        select(CryptoOrderPreview)
+        .where(CryptoOrderPreview.decision_record_id == decision_id)
+        .order_by(CryptoOrderPreview.created_at.desc(), CryptoOrderPreview.preview_version.desc())
+        .limit(1)
+    )
+    live_order = await db.scalar(
+        select(LiveCryptoOrder)
+        .where(LiveCryptoOrder.decision_record_id == decision_id)
+        .order_by(LiveCryptoOrder.created_at.desc())
+        .limit(1)
+    )
+
+    risk_event_id = _decision_risk_event_id(decision)
+    risk_event = None
+    if risk_event_id is not None:
+        risk_event = await db.scalar(select(RiskEvent).where(RiskEvent.id == risk_event_id).limit(1))
+
+    quality = await db.scalar(
+        select(DecisionQualityScore)
+        .where(DecisionQualityScore.decision_id == decision_id)
+        .order_by(DecisionQualityScore.created_at.desc(), DecisionQualityScore.id.desc())
+        .limit(1)
+    )
+    counterfactual_rows = list(
+        (
+            await db.execute(
+                select(DecisionCounterfactualResult)
+                .where(DecisionCounterfactualResult.decision_id == decision_id)
+                .order_by(
+                    DecisionCounterfactualResult.horizon_minutes.asc(),
+                    DecisionCounterfactualResult.evaluated_at.desc(),
+                )
+            )
+        ).scalars().all()
+    )
+
+    linked_signal = None
+    signal_id = _extract_primary_signal_id(decision)
+    if signal_id is not None:
+        linked_signal = await db.scalar(select(Signal).where(Signal.id == signal_id).limit(1))
+
+    approval_event = None
+    approval_event_id = _decision_live_approval_event_id(decision)
+    if approval_event_id is not None:
+        approval_event = await db.scalar(select(LiveApprovalEvent).where(LiveApprovalEvent.id == approval_event_id).limit(1))
+
+    audit_events = await _load_inspector_audit_events(
+        db=db,
+        decision_id=decision_id,
+        preview=preview,
+        live_order=live_order,
+    )
+
+    execution_evidence = _execution_price_evidence_payload(decision=decision)
+    risk_panel = _risk_panel_payload(decision=decision, risk_event=risk_event)
+    linkage_health = _linkage_health_payload(
+        decision=decision,
+        snapshot=snapshot,
+        execution_evidence=execution_evidence,
+        risk_event=risk_event,
+        preview=preview,
+        approval_event=approval_event,
+        live_order=live_order,
+        counterfactual_rows=counterfactual_rows,
+        quality=quality,
+        audit_events=audit_events,
+    )
+    timeline = _timeline_payload(
+        decision=decision,
+        linked_signal=linked_signal,
+        execution_evidence=execution_evidence,
+        risk_panel=risk_panel,
+        preview=preview,
+        approval_event=approval_event,
+        live_order=live_order,
+        linkage_health=linkage_health,
+    )
+
+    return {
+        "decision_id": str(decision.decision_id),
+        "header": _inspector_header_payload(
+            decision=decision,
+            linked_signal=linked_signal,
+            quality=quality,
+            preview=preview,
+            live_order=live_order,
+        ),
+        "timeline": timeline,
+        "narrative": _deterministic_narrative_payload(
+            decision=decision,
+            linked_signal=linked_signal,
+            execution_evidence=execution_evidence,
+            risk_panel=risk_panel,
+            preview=preview,
+            live_order=live_order,
+        ),
+        "execution_price_evidence": execution_evidence,
+        "risk_evaluation": risk_panel,
+        "decision_intelligence": {
+            "decision_record": "linked",
+            "decision_snapshot": "linked" if snapshot is not None else "missing",
+            "decision_version": decision.version,
+            "risk_event": "linked" if risk_event is not None else "missing",
+            "execution_evidence": "linked" if execution_evidence["availability"] == "linked" else "missing",
+            "counterfactual_package": "linked" if counterfactual_rows else "unavailable",
+            "decision_quality": "linked" if quality is not None else "unavailable",
+            "review_status": decision.review_status or "unreviewed",
+        },
+        "preview": _preview_panel_payload(preview=preview, live_order=live_order, approval_event=approval_event),
+        "audit_timeline": audit_events,
+        "counterfactual": _counterfactual_panel_payload(counterfactual_rows),
+        "linkage_health": linkage_health,
     }
 
 
@@ -1490,3 +1622,474 @@ def _float_or_max(value: Any) -> float:
         return float(value)
     except Exception:
         return 1e12
+
+
+def _decision_risk_event_id(decision: DecisionRecord) -> uuid.UUID | None:
+    if isinstance(decision.expected_risk, dict):
+        value = decision.expected_risk.get("risk_event_id")
+        if isinstance(value, str):
+            try:
+                return uuid.UUID(value)
+            except ValueError:
+                return None
+    lineage = decision.source_lineage if isinstance(decision.source_lineage, dict) else {}
+    refs = lineage.get("risk_events")
+    if isinstance(refs, list) and refs:
+        first = refs[0]
+        if isinstance(first, str):
+            try:
+                return uuid.UUID(first)
+            except ValueError:
+                return None
+    return None
+
+
+def _decision_live_approval_event_id(decision: DecisionRecord) -> uuid.UUID | None:
+    lineage = decision.source_lineage if isinstance(decision.source_lineage, dict) else {}
+    refs = lineage.get("live_approval_events")
+    if isinstance(refs, list) and refs:
+        first = refs[0]
+        if isinstance(first, str):
+            try:
+                return uuid.UUID(first)
+            except ValueError:
+                return None
+    return None
+
+
+async def _load_inspector_audit_events(
+    *,
+    db: AsyncSession,
+    decision_id: uuid.UUID,
+    preview: CryptoOrderPreview | None,
+    live_order: LiveCryptoOrder | None,
+) -> list[dict[str, Any]]:
+    rows: list[AuditLog] = []
+    rows.extend(
+        list(
+            (
+                await db.execute(
+                    select(AuditLog)
+                    .where(AuditLog.entity_type == "decision_record", AuditLog.entity_id == decision_id)
+                    .order_by(AuditLog.created_at.asc(), AuditLog.id.asc())
+                )
+            ).scalars().all()
+        )
+    )
+
+    if preview is not None:
+        rows.extend(
+            list(
+                (
+                    await db.execute(
+                        select(AuditLog)
+                        .where(AuditLog.entity_type == "crypto_order_preview", AuditLog.entity_id == preview.crypto_order_preview_id)
+                        .order_by(AuditLog.created_at.asc(), AuditLog.id.asc())
+                    )
+                ).scalars().all()
+            )
+        )
+    if live_order is not None:
+        rows.extend(
+            list(
+                (
+                    await db.execute(
+                        select(AuditLog)
+                        .where(AuditLog.entity_type == "live_crypto_order", AuditLog.entity_id == live_order.live_crypto_order_id)
+                        .order_by(AuditLog.created_at.asc(), AuditLog.id.asc())
+                    )
+                ).scalars().all()
+            )
+        )
+
+    unique_rows: dict[tuple[str, int], AuditLog] = {}
+    for row in rows:
+        unique_rows[(row.entity_type, row.id)] = row
+
+    ordered = sorted(unique_rows.values(), key=lambda item: (item.created_at, item.id))
+    events: list[dict[str, Any]] = []
+    for row in ordered:
+        events.append(
+            {
+                "actor": row.actor,
+                "timestamp": row.created_at.isoformat(),
+                "action": row.action,
+                "entity_type": row.entity_type,
+                "correlation_id": _audit_correlation_id_from_states(row.before_state, row.after_state),
+            }
+        )
+    return events
+
+
+def _audit_correlation_id_from_states(before_state: Any, after_state: Any) -> str | None:
+    for state in (after_state, before_state):
+        if isinstance(state, dict):
+            value = state.get("audit_correlation_id")
+            if isinstance(value, str):
+                return value
+    return None
+
+
+def _inspector_header_payload(
+    *,
+    decision: DecisionRecord,
+    linked_signal: Signal | None,
+    quality: DecisionQualityScore | None,
+    preview: CryptoOrderPreview | None,
+    live_order: LiveCryptoOrder | None,
+) -> dict[str, Any]:
+    action_value = (linked_signal.action if linked_signal is not None else _record_action(decision)) or "hold"
+    product_id = _record_product_id(decision) or (preview.product_id if preview is not None else None) or (live_order.product_id if live_order is not None else None) or "Unknown"
+    readable_action = action_value.upper()
+    environment_value = _record_environment(decision) or (preview.environment if preview is not None else None) or (live_order.environment if live_order is not None else None) or "unknown"
+    market_label = f"{_record_provider(decision) or (preview.provider if preview is not None else None) or (live_order.provider if live_order is not None else None) or 'unknown'} / {product_id}"
+
+    return {
+        "title": f"{product_id} {readable_action} Recommendation",
+        "decision_id": str(decision.decision_id),
+        "current_status": decision.outcome or ("accepted" if decision.trade_accepted else "rejected"),
+        "timestamp": decision.timestamp.isoformat(),
+        "strategy": str(linked_signal.strategy_id) if linked_signal is not None else None,
+        "campaign": _campaign_id(decision),
+        "provider": _record_provider(decision) or (preview.provider if preview is not None else None) or (live_order.provider if live_order is not None else None),
+        "environment": environment_value,
+        "market": market_label,
+        "confidence": _decimal_to_str(decision.confidence),
+        "decision_quality": _decimal_to_str(quality.composite_score) if quality is not None else None,
+        "review_status": decision.review_status or "unreviewed",
+        "environment_badge": environment_value.upper(),
+        "paper_live_badge": "PAPER" if environment_value != "live" else "LIVE",
+    }
+
+
+def _campaign_id(decision: DecisionRecord) -> str | None:
+    lineage = decision.source_lineage if isinstance(decision.source_lineage, dict) else {}
+    refs = lineage.get("capital_campaigns")
+    if isinstance(refs, list) and refs:
+        first = refs[0]
+        if isinstance(first, str):
+            return first
+    return None
+
+
+def _execution_price_evidence_payload(*, decision: DecisionRecord) -> dict[str, Any]:
+    regime = decision.market_regime if isinstance(decision.market_regime, dict) else {}
+    indicators = decision.indicators if isinstance(decision.indicators, dict) else {}
+
+    observed_ts = regime.get("observed_at")
+    retrieved_ts = regime.get("retrieved_at")
+    freshness_seconds = indicators.get("freshness_seconds")
+    age_seconds = None
+    if isinstance(observed_ts, str) and isinstance(retrieved_ts, str):
+        try:
+            observed_dt = _coerce_datetime(observed_ts)
+            retrieved_dt = _coerce_datetime(retrieved_ts)
+            age_seconds = int((retrieved_dt - observed_dt).total_seconds())
+        except Exception:
+            age_seconds = None
+
+    linked = bool(regime.get("execution_price_evidence_id"))
+    return {
+        "availability": "linked" if linked else "missing",
+        "provider": regime.get("provider"),
+        "venue": regime.get("venue"),
+        "product": decision.asset.get("product_id") if isinstance(decision.asset, dict) else None,
+        "base_currency": decision.asset.get("base_currency") if isinstance(decision.asset, dict) else None,
+        "quote_currency": decision.asset.get("quote_currency") if isinstance(decision.asset, dict) else None,
+        "observed_price": regime.get("reference_price"),
+        "bid": indicators.get("bid"),
+        "ask": indicators.get("ask"),
+        "reference_price": regime.get("reference_price"),
+        "observed_timestamp": observed_ts,
+        "retrieved_timestamp": retrieved_ts,
+        "evidence_age_seconds": age_seconds,
+        "freshness_seconds": freshness_seconds,
+        "validation_status": "valid" if linked else "missing",
+        "evidence_id": regime.get("execution_price_evidence_id"),
+    }
+
+
+def _risk_panel_payload(*, decision: DecisionRecord, risk_event: RiskEvent | None) -> dict[str, Any]:
+    checks: list[dict[str, Any]] = []
+
+    if risk_event is not None and isinstance(risk_event.detail, dict):
+        for step in risk_event.detail.get("steps", []):
+            if not isinstance(step, dict):
+                continue
+            status = str(step.get("status", "unknown"))
+            checks.append(
+                {
+                    "rule_name": step.get("step"),
+                    "policy": "risk_engine_final",
+                    "observed_value": None,
+                    "threshold": None,
+                    "result": "PASS" if status == "approve" else "FAIL" if status == "reject" else "UNKNOWN",
+                    "reason": step.get("reason_code"),
+                    "status": status,
+                }
+            )
+    elif decision.risk_adjustments:
+        for step in decision.risk_adjustments:
+            if not isinstance(step, dict):
+                continue
+            status = str(step.get("status", "unknown"))
+            checks.append(
+                {
+                    "rule_name": step.get("step"),
+                    "policy": "risk_engine_final",
+                    "observed_value": step.get("observed_value"),
+                    "threshold": step.get("threshold"),
+                    "result": "PASS" if status == "approve" else "FAIL" if status == "reject" else "UNKNOWN",
+                    "reason": step.get("reason_code"),
+                    "status": status,
+                }
+            )
+
+    first_fail = None
+    for check in checks:
+        if check["result"] == "FAIL":
+            first_fail = check
+            break
+
+    return {
+        "verdict": "approved" if decision.trade_accepted else "rejected",
+        "first_failing_rule": first_fail,
+        "stopped_after_first_fail": first_fail is not None,
+        "risk_adjusted_sizing": _approved_notional(decision),
+        "checks": checks,
+    }
+
+
+def _timeline_payload(
+    *,
+    decision: DecisionRecord,
+    linked_signal: Signal | None,
+    execution_evidence: dict[str, Any],
+    risk_panel: dict[str, Any],
+    preview: CryptoOrderPreview | None,
+    approval_event: LiveApprovalEvent | None,
+    live_order: LiveCryptoOrder | None,
+    linkage_health: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    def stage_status(code: str, detail: str) -> dict[str, Any]:
+        symbols = {
+            "completed": "✓ Completed",
+            "rejected": "✕ Rejected",
+            "pending": "○ Pending",
+            "not_applicable": "— Not Applicable",
+            "missing": "? Missing Evidence",
+        }
+        return {"status": code, "label": symbols[code], "detail": detail}
+
+    signal_status = stage_status("completed", "Signal linkage resolved") if linked_signal is not None else stage_status("missing", "Signal linkage missing")
+    strategy_status = stage_status("completed", "Strategy identified") if linked_signal is not None else stage_status("missing", "Strategy linkage missing")
+    evidence_status = stage_status("completed", "Provider-native evidence linked") if execution_evidence.get("availability") == "linked" else stage_status("missing", "Execution price evidence linkage missing")
+    risk_status = stage_status("completed", "Risk evaluation recorded") if risk_panel.get("checks") else stage_status("missing", "Risk rule steps unavailable")
+    persisted_status = stage_status("completed", "Decision record persisted")
+
+    if preview is None:
+        preview_status = stage_status("not_applicable", "No preview linked")
+    elif preview.status in {"RISK_REJECTED", "PREVIEW_FAILED"}:
+        preview_status = stage_status("rejected", f"Preview status: {preview.status}")
+    else:
+        preview_status = stage_status("completed", f"Preview status: {preview.status}")
+
+    approval_status = stage_status("completed", "Approval event linked") if approval_event is not None else stage_status("not_applicable", "No approval linked")
+
+    rehearsal_link = next((item for item in linkage_health if item["component"] == "Rehearsal"), None)
+    rehearsal_status = stage_status("pending", "Rehearsal pending")
+    if rehearsal_link is not None and rehearsal_link["status"] == "missing":
+        rehearsal_status = stage_status("not_applicable", "No rehearsal evidence linked")
+
+    if live_order is None:
+        submission_status = stage_status("not_applicable", "No submission linked")
+        execution_status = stage_status("not_applicable", "No execution linked")
+    else:
+        if live_order.status in {"SUBMITTED", "ACKNOWLEDGED", "FILLED"}:
+            submission_status = stage_status("completed", f"Order status: {live_order.status}")
+        elif live_order.status in {"FAILED", "CANCELLED"}:
+            submission_status = stage_status("rejected", f"Order status: {live_order.status}")
+        else:
+            submission_status = stage_status("pending", f"Order status: {live_order.status}")
+
+        if live_order.status in {"FILLED", "EXECUTED"}:
+            execution_status = stage_status("completed", "Execution filled")
+        elif live_order.status in {"FAILED", "CANCELLED"}:
+            execution_status = stage_status("rejected", f"Execution ended with {live_order.status}")
+        else:
+            execution_status = stage_status("pending", "Execution pending")
+
+    outcome_status = stage_status("completed", f"Outcome: {decision.outcome}") if decision.outcome else stage_status("pending", "Outcome not yet known")
+
+    return [
+        {"stage": "Signal Generated", **signal_status},
+        {"stage": "Strategy Selected", **strategy_status},
+        {"stage": "Execution Price Evidence", **evidence_status},
+        {"stage": "Risk Evaluation", **risk_status},
+        {"stage": "Decision Record Persisted", **persisted_status},
+        {"stage": "Preview", **preview_status},
+        {"stage": "Approval", **approval_status},
+        {"stage": "Rehearsal", **rehearsal_status},
+        {"stage": "Submission", **submission_status},
+        {"stage": "Execution", **execution_status},
+        {"stage": "Outcome", **outcome_status},
+    ]
+
+
+def _deterministic_narrative_payload(
+    *,
+    decision: DecisionRecord,
+    linked_signal: Signal | None,
+    execution_evidence: dict[str, Any],
+    risk_panel: dict[str, Any],
+    preview: CryptoOrderPreview | None,
+    live_order: LiveCryptoOrder | None,
+) -> dict[str, Any]:
+    action = (linked_signal.action if linked_signal is not None else _record_action(decision) or "hold").upper()
+    confidence = _decimal_to_str(decision.confidence) or "unknown"
+    reason = decision.trade_rejected_reason or "no_rejection_reason_recorded"
+
+    lines: list[str] = []
+    if decision.trade_accepted:
+        lines.append(f"The strategy recommended {action} and the decision was accepted by risk controls.")
+    else:
+        lines.append(f"The strategy recommended {action} but risk controls rejected execution with reason {reason}.")
+
+    if execution_evidence.get("availability") == "linked":
+        lines.append("Provider-native execution price evidence was linked and used for decision-time context.")
+    else:
+        lines.append("Execution price evidence linkage is missing, so price validation details are unavailable.")
+
+    if risk_panel.get("first_failing_rule"):
+        first = risk_panel["first_failing_rule"]
+        lines.append(
+            "Risk evaluation stopped at the first failing rule: "
+            f"{first.get('rule_name')} ({first.get('reason') or 'no_reason_code_recorded'})."
+        )
+    elif risk_panel.get("checks"):
+        lines.append("Risk evaluation completed without a failing rule in the recorded step sequence.")
+    else:
+        lines.append("Risk rule-by-rule evidence is unavailable.")
+
+    if preview is not None:
+        lines.append(f"Preview state is {preview.status}; preview linkage is available.")
+    else:
+        lines.append("No preview linkage exists for this decision.")
+
+    if live_order is not None:
+        lines.append(f"Submission path reached live order state {live_order.status}.")
+    else:
+        lines.append("No live submission record is linked to this decision.")
+
+    lines.append(f"Recorded confidence at decision time was {confidence}.")
+
+    return {
+        "title": "Why",
+        "explanation": " ".join(lines),
+        "evidence_gaps": [
+            "Execution price evidence metadata incomplete" if execution_evidence.get("availability") != "linked" else None,
+            "Risk Event linkage missing" if not risk_panel.get("checks") else None,
+            "Preview linkage missing" if preview is None else None,
+        ],
+    }
+
+
+def _preview_panel_payload(
+    *,
+    preview: CryptoOrderPreview | None,
+    live_order: LiveCryptoOrder | None,
+    approval_event: LiveApprovalEvent | None,
+) -> dict[str, Any]:
+    if preview is None:
+        return {
+            "availability": "unavailable",
+            "state_reason": "no_preview_linked",
+            "preview_id": None,
+            "requested_amount": None,
+            "approved_amount": None,
+            "estimated_quantity": None,
+            "estimated_fees": None,
+            "expiration": None,
+            "submission_state": "not_applicable",
+            "execution_state": "not_applicable",
+            "human_approval_state": "not_applicable",
+        }
+
+    return {
+        "availability": "linked",
+        "state_reason": None,
+        "preview_id": preview.preview_id,
+        "requested_amount": _decimal_to_str(preview.requested_amount),
+        "approved_amount": _decimal_to_str(preview.estimated_quote_size),
+        "estimated_quantity": _decimal_to_str(preview.estimated_base_size),
+        "estimated_fees": _decimal_to_str(preview.estimated_fee),
+        "expiration": preview.expires_at.isoformat(),
+        "submission_state": live_order.status if live_order is not None else "not_submitted",
+        "execution_state": live_order.status if live_order is not None else "not_executed",
+        "human_approval_state": approval_event.approval_state if approval_event is not None else "not_applicable",
+    }
+
+
+def _counterfactual_panel_payload(rows: list[DecisionCounterfactualResult]) -> dict[str, Any]:
+    if not rows:
+        return {
+            "availability": "unavailable",
+            "state_reason": "counterfactual_outcomes_unavailable",
+            "items": [],
+            "summary": "Counterfactual package unavailable because no horizon evaluations are linked yet.",
+        }
+
+    items = []
+    for row in rows:
+        items.append(
+            {
+                "horizon": row.horizon_label,
+                "evaluation_horizon_minutes": row.horizon_minutes,
+                "alternative_actions": {
+                    "buy_return_pct": _decimal_to_str(row.shadow_buy_return_pct),
+                    "sell_return_pct": _decimal_to_str(row.shadow_sell_return_pct),
+                    "wait_return_pct": _decimal_to_str(row.shadow_wait_return_pct),
+                },
+                "expected_return_pct": _decimal_to_str(row.shadow_buy_return_pct),
+                "expected_downside_pct": _decimal_to_str(row.shadow_sell_return_pct),
+                "confidence": row.evaluation_state,
+                "expected_value": _decimal_to_str(row.shadow_wait_return_pct),
+                "best_action": row.best_action,
+            }
+        )
+
+    return {
+        "availability": "linked",
+        "state_reason": None,
+        "items": items,
+        "summary": "Counterfactual package linked; horizons can be compared without mutating decision history.",
+    }
+
+
+def _linkage_health_payload(
+    *,
+    decision: DecisionRecord,
+    snapshot: DecisionSnapshot | None,
+    execution_evidence: dict[str, Any],
+    risk_event: RiskEvent | None,
+    preview: CryptoOrderPreview | None,
+    approval_event: LiveApprovalEvent | None,
+    live_order: LiveCryptoOrder | None,
+    counterfactual_rows: list[DecisionCounterfactualResult],
+    quality: DecisionQualityScore | None,
+    audit_events: list[dict[str, Any]],
+) -> list[dict[str, str]]:
+    return [
+        {"component": "Decision Record", "status": "linked", "reason": "decision_record_present"},
+        {"component": "Execution Evidence", "status": "linked" if execution_evidence.get("availability") == "linked" else "missing", "reason": execution_evidence.get("availability")},
+        {"component": "Risk Event", "status": "linked" if risk_event is not None else "missing", "reason": "risk_event_linked" if risk_event is not None else "risk_event_missing"},
+        {"component": "Preview", "status": "linked" if preview is not None else "missing", "reason": "preview_linked" if preview is not None else "preview_missing"},
+        {"component": "Audit", "status": "linked" if audit_events else "missing", "reason": "audit_events_present" if audit_events else "audit_events_missing"},
+        {"component": "Approval", "status": "linked" if approval_event is not None else "missing", "reason": "approval_linked" if approval_event is not None else "approval_missing"},
+        {"component": "Submission", "status": "linked" if live_order is not None else "missing", "reason": "live_order_linked" if live_order is not None else "submission_missing"},
+        {"component": "Execution", "status": "linked" if live_order is not None and live_order.status in {"FILLED", "EXECUTED"} else "not_applicable" if live_order is None else "missing", "reason": live_order.status if live_order is not None else "execution_not_attempted"},
+        {"component": "Counterfactual", "status": "linked" if counterfactual_rows else "unavailable", "reason": "counterfactual_present" if counterfactual_rows else "counterfactual_unavailable"},
+        {"component": "Decision Quality", "status": "linked" if quality is not None else "unavailable", "reason": "quality_present" if quality is not None else "quality_unavailable"},
+        {"component": "Decision Snapshot", "status": "linked" if snapshot is not None else "missing", "reason": "snapshot_present" if snapshot is not None else "snapshot_missing"},
+        {"component": "Rehearsal", "status": "missing", "reason": "rehearsal_linkage_not_available_in_current_model"},
+    ]
