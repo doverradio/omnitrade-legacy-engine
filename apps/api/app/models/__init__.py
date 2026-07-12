@@ -17,6 +17,7 @@ from app.models.autonomous_capital_mandate import AutonomousCapitalMandate
 from app.models.autonomous_capital_mandate_authorization import AutonomousCapitalMandateAuthorization
 from app.models.autonomous_capital_mandate_evaluation import AutonomousCapitalMandateEvaluation
 from app.models.autonomous_capital_mandate_version import AutonomousCapitalMandateVersion
+from app.models.autonomous_cycle_run import AutonomousCycleRun
 from app.models.backtest import Backtest
 from app.models.backtest_trade import BacktestTrade
 from app.models.capital_campaign import CapitalCampaign
@@ -84,6 +85,7 @@ __all__ = [
 	"AutonomousCapitalMandateAuthorization",
 	"AutonomousCapitalMandateEvaluation",
 	"AutonomousCapitalMandateVersion",
+	"AutonomousCycleRun",
 	"Backtest",
 	"BacktestTrade",
 	"CapitalCampaign",
