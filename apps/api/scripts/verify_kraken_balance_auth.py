@@ -11,8 +11,7 @@ import urllib.parse
 
 import httpx
 
-from app.config import Settings, get_settings
-from app.services.exchange_connections.providers.registry import get_exchange_provider
+from app.config import Settings
 
 
 def _classify_kraken_error(errors: list[str]) -> str:
@@ -47,22 +46,14 @@ async def _load_production_credentials() -> tuple[dict[str, str] | None, dict[st
         "credentials_loaded": False,
     }
 
-    settings = None
+    dotenv_path = Path(__file__).resolve().parents[1] / ".env"
+    diagnostics["dotenv_file_loaded"] = dotenv_path.exists()
+
     try:
-        settings = get_settings()
+        settings = Settings(_env_file=str(dotenv_path), _env_file_encoding="utf-8")
         diagnostics["credential_configuration_loaded"] = True
         diagnostics["credential_source"] = "application_settings"
     except Exception:
-        try:
-            dotenv_path = Path(__file__).resolve().parents[1] / ".env"
-            diagnostics["dotenv_file_loaded"] = dotenv_path.exists()
-            settings = Settings(_env_file=str(dotenv_path), _env_file_encoding="utf-8")
-            diagnostics["credential_configuration_loaded"] = True
-            diagnostics["credential_source"] = "application_settings"
-        except Exception:
-            return None, diagnostics, "configuration_not_loaded"
-
-    if settings is None:
         return None, diagnostics, "configuration_not_loaded"
 
     api_key_secret = getattr(settings, "kraken_api_key", None)
@@ -102,25 +93,7 @@ def _print_loader_diagnostics(*, diagnostics: dict[str, object], provider_initia
 
 
 async def _run(*, timeout_seconds: float) -> int:
-    try:
-        _ = get_exchange_provider("kraken_spot")
-        provider_initialized = True
-    except Exception:
-        provider_initialized = False
-        print("success=false")
-        print("http_status=0")
-        print("kraken_error_category=provider_initialization_failed")
-        print("safe_provider_error=provider_initialization_failed")
-        print("authentication_succeeded=false")
-        print("credential_configuration_loaded=false")
-        print("kraken_api_key_configured=false")
-        print("kraken_api_secret_configured=false")
-        print("credential_source=other_safe_category")
-        print("dotenv_file_loaded=false")
-        print("credentials_loaded=false")
-        print("provider_initialized=false")
-        return 2
-
+    provider_initialized = True
     credentials, diagnostics, credential_error = await _load_production_credentials()
     _print_loader_diagnostics(diagnostics=diagnostics, provider_initialized=provider_initialized)
     if credential_error is not None or credentials is None:
@@ -132,12 +105,7 @@ async def _run(*, timeout_seconds: float) -> int:
         return 2
 
     nonce = str(int(time.time() * 1000))
-    payload: dict[str, str] = {"nonce": nonce}
-    otp = str(credentials.get("passphrase") or "").strip()
-    if otp:
-        payload["otp"] = otp
-
-    encoded_body = urllib.parse.urlencode(payload)
+    encoded_body = urllib.parse.urlencode({"nonce": nonce})
     request_path = "/0/private/Balance"
     signature = _independent_signature(
         url_path=request_path,

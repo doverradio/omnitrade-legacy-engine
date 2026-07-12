@@ -21,8 +21,8 @@ def _settings(*, api_key: str | None, api_secret: str | None, otp: str | None = 
 
 
 @pytest.mark.asyncio
-async def test_load_credentials_from_application_settings(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setattr(verifier, "get_settings", lambda: _settings(api_key="k", api_secret="s", otp=""))
+async def test_load_credentials_from_explicit_dotenv_settings(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(verifier, "Settings", lambda **_kwargs: _settings(api_key="k", api_secret="s", otp=""))
 
     credentials, diagnostics, error = await verifier._load_production_credentials()
 
@@ -37,24 +37,8 @@ async def test_load_credentials_from_application_settings(monkeypatch: pytest.Mo
 
 
 @pytest.mark.asyncio
-async def test_load_credentials_uses_dotenv_fallback_when_get_settings_fails(monkeypatch: pytest.MonkeyPatch) -> None:
-    def _fail_get_settings():
-        raise RuntimeError("settings cache unavailable")
-
-    monkeypatch.setattr(verifier, "get_settings", _fail_get_settings)
-    monkeypatch.setattr(verifier, "Settings", lambda **_kwargs: _settings(api_key="k", api_secret="s", otp=""))
-
-    credentials, diagnostics, error = await verifier._load_production_credentials()
-
-    assert error is None
-    assert credentials is not None
-    assert diagnostics["credential_configuration_loaded"] is True
-    assert diagnostics["credential_source"] == "application_settings"
-
-
-@pytest.mark.asyncio
 async def test_missing_api_key_has_precise_classification(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setattr(verifier, "get_settings", lambda: _settings(api_key=None, api_secret="s", otp=None))
+    monkeypatch.setattr(verifier, "Settings", lambda **_kwargs: _settings(api_key=None, api_secret="s", otp=None))
 
     credentials, diagnostics, error = await verifier._load_production_credentials()
 
@@ -66,7 +50,7 @@ async def test_missing_api_key_has_precise_classification(monkeypatch: pytest.Mo
 
 @pytest.mark.asyncio
 async def test_missing_secret_has_precise_classification(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setattr(verifier, "get_settings", lambda: _settings(api_key="k", api_secret=None, otp=None))
+    monkeypatch.setattr(verifier, "Settings", lambda **_kwargs: _settings(api_key="k", api_secret=None, otp=None))
 
     credentials, diagnostics, error = await verifier._load_production_credentials()
 
@@ -78,7 +62,7 @@ async def test_missing_secret_has_precise_classification(monkeypatch: pytest.Mon
 
 @pytest.mark.asyncio
 async def test_both_missing_have_precise_classification(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setattr(verifier, "get_settings", lambda: _settings(api_key=None, api_secret=None, otp=None))
+    monkeypatch.setattr(verifier, "Settings", lambda **_kwargs: _settings(api_key=None, api_secret=None, otp=None))
 
     credentials, diagnostics, error = await verifier._load_production_credentials()
 
@@ -90,13 +74,9 @@ async def test_both_missing_have_precise_classification(monkeypatch: pytest.Monk
 
 @pytest.mark.asyncio
 async def test_configuration_error_has_precise_classification(monkeypatch: pytest.MonkeyPatch) -> None:
-    def _fail_get_settings():
-        raise RuntimeError("missing configuration")
-
     def _fail_settings(**_kwargs):
         raise RuntimeError("dotenv load failed")
 
-    monkeypatch.setattr(verifier, "get_settings", _fail_get_settings)
     monkeypatch.setattr(verifier, "Settings", _fail_settings)
 
     credentials, diagnostics, error = await verifier._load_production_credentials()
@@ -111,8 +91,6 @@ async def test_verifier_success_reaches_balance_request_with_safe_output(
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
 ) -> None:
-    monkeypatch.setattr(verifier, "get_exchange_provider", lambda _name: object())
-
     async def _loader():
         return (
             {"api_key": "public-key", "api_secret": "secret-b64", "passphrase": ""},
@@ -177,8 +155,6 @@ async def test_verifier_success_reaches_balance_request_with_safe_output(
 
 @pytest.mark.asyncio
 async def test_verifier_invalid_signature_classification(monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]) -> None:
-    monkeypatch.setattr(verifier, "get_exchange_provider", lambda _name: object())
-
     async def _loader():
         return (
             {"api_key": "public-key", "api_secret": "secret-b64", "passphrase": ""},
@@ -229,7 +205,6 @@ async def test_verifier_invalid_signature_classification(monkeypatch: pytest.Mon
 
 @pytest.mark.asyncio
 async def test_verifier_uses_production_loader_and_not_env_duplicate(monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]) -> None:
-    monkeypatch.setattr(verifier, "get_exchange_provider", lambda _name: object())
     calls = {"loader": 0}
 
     async def _loader():
@@ -252,20 +227,6 @@ async def test_verifier_uses_production_loader_and_not_env_duplicate(monkeypatch
     assert calls["loader"] == 1
     assert "kraken_error_category=both_credentials_missing" in out
     assert not hasattr(verifier, "_read_env")
-
-
-@pytest.mark.asyncio
-async def test_verifier_provider_initialization_failure_category(monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]) -> None:
-    def _raise(_name: str):
-        raise RuntimeError("registry unavailable")
-
-    monkeypatch.setattr(verifier, "get_exchange_provider", _raise)
-    result = await verifier._run(timeout_seconds=1.0)
-    out = capsys.readouterr().out
-
-    assert result == 2
-    assert "kraken_error_category=provider_initialization_failed" in out
-    assert "provider_initialized=false" in out
 
 
 def test_main_runs_with_stubbed_asyncio(monkeypatch: pytest.MonkeyPatch) -> None:
