@@ -73,5 +73,6 @@ ADRs are numbered sequentially (`ADR-0001`, `ADR-0002`, ...) in the order they w
 | [ADR-0008](./ADR-0008-capital-allocation-engine.md) | Capital Allocation Engine | Accepted |
 | [ADR-0009](./ADR-0009-execution-price-evidence-boundary.md) | Execution Price Evidence Boundary | Accepted |
 | [ADR-0010](./ADR-0010-decision-linkage-integrity-guard.md) | Decision Linkage Integrity Guard | Accepted |
+| [ADR-0011](./ADR-0011-autonomous-capital-mandate-engine.md) | Autonomous Capital Mandate Engine | Accepted |
 
 This index must be updated whenever a new ADR is added or an existing one's status changes.

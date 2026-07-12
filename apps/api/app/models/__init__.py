@@ -13,6 +13,9 @@ from app.models.arena_tournament import ArenaTournament
 from app.models.arena_tournament_history_record import ArenaTournamentHistoryRecord
 from app.models.arena_competition_budget_allocation import ArenaCompetitionBudgetAllocation
 from app.models.audit_log import AuditLog
+from app.models.autonomous_capital_mandate import AutonomousCapitalMandate
+from app.models.autonomous_capital_mandate_authorization import AutonomousCapitalMandateAuthorization
+from app.models.autonomous_capital_mandate_version import AutonomousCapitalMandateVersion
 from app.models.backtest import Backtest
 from app.models.backtest_trade import BacktestTrade
 from app.models.capital_campaign import CapitalCampaign
@@ -76,6 +79,9 @@ __all__ = [
 	"ArenaTournament",
 	"ArenaTournamentHistoryRecord",
 	"AuditLog",
+	"AutonomousCapitalMandate",
+	"AutonomousCapitalMandateAuthorization",
+	"AutonomousCapitalMandateVersion",
 	"Backtest",
 	"BacktestTrade",
 	"CapitalCampaign",
