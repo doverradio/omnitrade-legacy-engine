@@ -130,6 +130,16 @@ def _version(*, allowed_order_sides: list[str] | None = None):
     )
 
 
+def _version_with_identity(*, mandate_id: uuid.UUID, version_number: int, identity: str, is_authorized: bool = True, is_active: bool = True):
+    version = _version(allowed_order_sides=["BUY", "SELL", "HOLD"])
+    version.mandate_id = mandate_id
+    version.version_number = version_number
+    version.allowed_strategy_versions = [identity]
+    version.is_authorized = is_authorized
+    version.is_active = is_active
+    return version
+
+
 def _market_tuple():
     return (
         SimpleNamespace(
@@ -237,6 +247,42 @@ async def test_cycle_accepts_authorized_exact_version_even_when_version_flag_fal
     assert result.proposed_action == "BUY"
     assert result.preview_id is not None
     assert result.diagnostics.failure_reason is None
+
+
+@pytest.mark.asyncio
+async def test_cycle_selects_latest_canonical_governing_version_and_keeps_legacy_version_historical(monkeypatch: pytest.MonkeyPatch) -> None:
+    db = _FakeDb()
+    db.enforce_authorization_rows = True
+    mandate = _mandate(status="ACTIVE")
+    legacy_identity = build_strategy_identity(slug="ma_crossover", module_version="1.0.0")
+    canonical_identity = build_strategy_identity(slug="ma_crossover", module_version="1.0.1")
+    version_1 = _version_with_identity(mandate_id=mandate.mandate_id, version_number=1, identity=legacy_identity, is_authorized=False, is_active=False)
+    version_2 = _version_with_identity(mandate_id=mandate.mandate_id, version_number=2, identity=canonical_identity, is_authorized=False, is_active=False)
+    db.authorizations = [
+        _authorized_row(mandate_id=mandate.mandate_id, mandate_version_id=version_1.mandate_version_id, expires_at=datetime.now(timezone.utc).replace(year=2099)),
+        _authorized_row(mandate_id=mandate.mandate_id, mandate_version_id=version_2.mandate_version_id, expires_at=datetime.now(timezone.utc).replace(year=2099)),
+    ]
+    db.connection = SimpleNamespace(last_readiness_verdict="READY_FOR_PREVIEW", provider="kraken_spot", environment="production")
+
+    monkeypatch.setattr("app.services.autonomous_cycle.orchestrator.get_mandate", _async_return(mandate))
+    monkeypatch.setattr("app.services.autonomous_cycle.orchestrator.list_mandate_versions", _async_return([version_2, version_1]))
+    monkeypatch.setattr("app.services.autonomous_cycle.orchestrator._reconcile_state", _async_return(ReconciliationStatus(True, True, 0, 0, False, ())))
+    monkeypatch.setattr("app.services.autonomous_cycle.orchestrator.load_current_execution_price_evidence", _async_return(_market_tuple()))
+    monkeypatch.setattr("app.services.autonomous_cycle.orchestrator._evaluate_risk", _async_return(RiskEvaluationSummary(risk_verdict="ACCEPTED", risk_event_id=uuid.uuid4(), reason_code=None)))
+    monkeypatch.setattr("app.services.autonomous_cycle.orchestrator._persist_decision_intelligence", _async_return(uuid.uuid4()))
+    monkeypatch.setattr("app.services.autonomous_cycle.orchestrator.evaluate_and_record_mandate", _async_return(SimpleNamespace(evaluation_id=uuid.uuid4())))
+    monkeypatch.setattr("app.services.autonomous_cycle.orchestrator.create_crypto_order_preview", _async_return(SimpleNamespace(crypto_order_preview_id=uuid.uuid4())))
+    monkeypatch.setattr("app.services.autonomous_cycle.orchestrator.get_exchange_provider", lambda _provider: object())
+    monkeypatch.setattr("app.services.autonomous_cycle.orchestrator.get_decrypted_credentials_for_connection", lambda _c: {"x": "y"})
+
+    result = await run_autonomous_preview_cycle(
+        db=db,
+        request=AutonomousCycleRequest(mandate_id=mandate.mandate_id, actor="operator:owner", forced_action="BUY", idempotency_seed="governing-version-selection"),
+    )
+
+    assert result.state == "COMPLETE"
+    assert result.preview_id is not None
+    assert result.mandate_version_id == version_2.mandate_version_id
 
 
 @pytest.mark.asyncio

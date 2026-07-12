@@ -186,6 +186,24 @@ class MandateVersionCreateRequest:
 
 
 @dataclass(frozen=True)
+class MandateVersionReplacementRequest:
+    mandate_id: uuid.UUID
+    source_mandate_version_id: uuid.UUID
+    source_mandate_authorization_id: uuid.UUID
+    replacement_allowed_strategy_versions: tuple[str, ...]
+    actor: str
+    authorization_method: str
+    owner_acknowledgements: dict[str, Any]
+    authorization_evidence: dict[str, Any]
+    deterministic_explanation: dict[str, Any]
+    deployed_git_sha: str
+    expires_at: datetime | None = None
+    idempotency_key: str | None = None
+    audit_correlation_id: uuid.UUID | None = None
+    software_build_version: str | None = None
+
+
+@dataclass(frozen=True)
 class MandateAuthorizationRequest:
     mandate_id: uuid.UUID
     mandate_version_id: uuid.UUID
@@ -223,3 +241,15 @@ class MandateEvaluationRecord:
     software_build_version: str | None
     idempotency_key: str
     created_at: datetime
+
+
+@dataclass(frozen=True)
+class MandateVersionReplacementResult:
+    mandate_id: uuid.UUID
+    source_mandate_version_id: uuid.UUID
+    replacement_mandate_version_id: uuid.UUID
+    authorization_id: uuid.UUID
+    mandate_status: str
+    selected_mandate_version_id: uuid.UUID
+    selected_strategy_identity: str
+    created_replacement: bool

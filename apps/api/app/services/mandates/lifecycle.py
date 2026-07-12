@@ -154,6 +154,7 @@ async def create_mandate_version(
     *,
     db: AsyncSession,
     request: MandateVersionCreateRequest,
+    commit: bool = True,
 ) -> AutonomousCapitalMandateVersion:
     mandate = await get_mandate(db=db, mandate_id=request.mandate_id)
 
@@ -239,7 +240,8 @@ async def create_mandate_version(
         )
     )
 
-    await db.commit()
+    if commit:
+        await db.commit()
     await db.refresh(version)
     return version
 
@@ -248,6 +250,7 @@ async def authorize_mandate_version(
     *,
     db: AsyncSession,
     request: MandateAuthorizationRequest,
+    commit: bool = True,
 ) -> MandateAuthorizationModel:
     mandate = await get_mandate(db=db, mandate_id=request.mandate_id)
     version = await db.get(AutonomousCapitalMandateVersion, request.mandate_version_id)
@@ -316,7 +319,8 @@ async def authorize_mandate_version(
         )
     )
 
-    await db.commit()
+    if commit:
+        await db.commit()
     await db.refresh(authorization)
     return await _hydrate_authorization_model(db=db, authorization=authorization)
 
