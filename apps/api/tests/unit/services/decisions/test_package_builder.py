@@ -14,6 +14,7 @@ from app.models.decision_quality_score import DecisionQualityScore
 from app.models.decision_record import DecisionRecord
 from app.models.decision_snapshot import DecisionSnapshot
 from app.services.decisions.package import DECISION_PACKAGE_SCHEMA_VERSION, DecisionPackageBuilder
+from app.services.strategies.identity import build_strategy_identity
 
 
 class _ScalarResult:
@@ -159,13 +160,13 @@ def _decision_snapshot(decision_id: uuid.UUID) -> DecisionSnapshot:
         market_regime={"regime_tag": "trend_up"},
         volatility={"atr": "12.5"},
         spread_liquidity_context=None,
-        strategy_inputs={"strategy_id": str(uuid.uuid4())},
+        strategy_inputs={"strategy_id": str(uuid.uuid4()), "selected_strategy_identity": build_strategy_identity(slug="ma_crossover", module_version="1.0.0")},
         risk_inputs={"max_position": "0.02"},
         current_position_state=None,
         open_trades=[],
         portfolio_exposure={"equity": "10000"},
         parameter_set_version="ps_v1",
-        strategy_version="strategy_v1",
+        strategy_version=build_strategy_identity(slug="ma_crossover", module_version="1.0.0"),
         ai_model_version="ai_v1",
         decision_engine_version="v1",
         configuration_version="risk_v1",

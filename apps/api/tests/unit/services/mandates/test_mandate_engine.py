@@ -21,9 +21,11 @@ from app.services.mandates.validation import (
     validate_mandate_version,
     validate_version_immutability,
 )
+from app.services.strategies.identity import build_strategy_identity
 
 
 _NOW = datetime(2026, 7, 12, 12, 0, tzinfo=timezone.utc)
+_STRATEGY_IDENTITY = build_strategy_identity(slug="ma_crossover", module_version="1.0.0")
 
 
 def _mandate(*, status: str = "ACTIVE", autonomy_level: str = AUTONOMY_LEVEL_2) -> MandateDomainModel:
@@ -62,7 +64,7 @@ def _version(*, is_authorized: bool = True, is_active: bool = True) -> MandateVe
         max_fee_bps=Decimal("50"),
         allowed_products=("BTC-USD",),
         allowed_order_sides=("BUY", "SELL", "HOLD"),
-        allowed_strategy_versions=("strategy.v1",),
+        allowed_strategy_versions=(_STRATEGY_IDENTITY,),
         approval_policy=MANDATE_APPROVAL_POLICY_MANDATE_ALLOWED,
         is_authorized=is_authorized,
         is_active=is_active,
@@ -78,7 +80,7 @@ def _request(mandate: MandateDomainModel) -> MandateEligibilityInput:
         live_trading_profile_id=mandate.live_trading_profile_id,
         paper_account_id=mandate.paper_account_id,
         capital_campaign_id=mandate.capital_campaign_id,
-        strategy_version="strategy.v1",
+        strategy_version=_STRATEGY_IDENTITY,
         product="BTC-USD",
         side="BUY",
         proposed_notional_usd=Decimal("5.00"),
@@ -223,6 +225,27 @@ def test_authorization_result_is_deterministic_for_same_input() -> None:
     assert first == second
 
 
+def test_canonical_strategy_identity_is_deterministic() -> None:
+    identity_a = build_strategy_identity(slug="ma_crossover", module_version="1.0.0")
+    identity_b = build_strategy_identity(slug="ma_crossover", module_version="1.0.0")
+
+    assert identity_a == identity_b == _STRATEGY_IDENTITY
+
+
+def test_same_module_version_does_not_collide_across_slugs() -> None:
+    identity_a = build_strategy_identity(slug="ma_crossover", module_version="1.0.0")
+    identity_b = build_strategy_identity(slug="rsi_mean_reversion", module_version="1.0.0")
+
+    assert identity_a != identity_b
+
+
+def test_same_slug_with_different_versions_remains_distinguishable() -> None:
+    identity_a = build_strategy_identity(slug="ma_crossover", module_version="1.0.0")
+    identity_b = build_strategy_identity(slug="ma_crossover", module_version="1.0.1")
+
+    assert identity_a != identity_b
+
+
 def test_authorized_version_is_immutable() -> None:
     current = _version(is_authorized=True)
     proposed = MandateVersionModel(**{**current.__dict__, "max_fee_bps": Decimal("10")})
@@ -265,6 +288,43 @@ def test_mandate_allowed_policy_cannot_be_active_without_authorization() -> None
     result = validate_mandate_version(active_unauthorized)
     assert result.valid is False
     assert result.reason == "active_mandate_policy_requires_authorized_version"
+
+
+def test_mandate_allowed_policy_rejects_malformed_strategy_identity() -> None:
+    invalid = _version()
+    invalid = MandateVersionModel(**{**invalid.__dict__, "allowed_strategy_versions": ("1.0.0",)})
+
+    result = validate_mandate_version(invalid)
+    assert result.valid is False
+    assert result.reason == "invalid_allowed_strategy_identity"
+
+
+def test_mandate_allowed_policy_accepts_canonical_identity() -> None:
+    valid = _version()
+
+    result = validate_mandate_version(valid)
+    assert result.valid is True
+
+
+def test_allowed_canonical_strategy_passes_and_other_same_version_fails() -> None:
+    mandate = _mandate()
+    allowed_version = _version()
+    request = _request(mandate)
+
+    allowed_decision = evaluate_mandate_eligibility(mandate=mandate, version=allowed_version, request=request)
+
+    other_version = MandateVersionModel(
+        **{
+            **allowed_version.__dict__,
+            "mandate_version_id": uuid.uuid4(),
+            "allowed_strategy_versions": (build_strategy_identity(slug="other_strategy", module_version="1.0.0"),),
+        }
+    )
+    disallowed_decision = evaluate_mandate_eligibility(mandate=mandate, version=other_version, request=request)
+
+    assert allowed_decision.result == "AUTHORIZED"
+    assert disallowed_decision.result == "REJECTED"
+    assert disallowed_decision.reason_code == "strategy_not_allowed_by_mandate"
 
 
 def test_state_transition_rules_are_enforced() -> None:

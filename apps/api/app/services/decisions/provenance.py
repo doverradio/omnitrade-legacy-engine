@@ -58,7 +58,7 @@ DECISION_SNAPSHOT_PROVENANCE_MAPPING: dict[str, tuple[str, ...]] = {
     "open_trades": ("trades",),
     "portfolio_exposure": ("paper_accounts", "trades"),
     "parameter_set_version": ("parameter_sets",),
-    "strategy_version": ("strategies.module_version",),
+    "strategy_version": ("strategies.slug", "strategies.module_version"),
     "ai_model_version": ("model_outputs.model_version",),
     "decision_engine_version": ("decision_engine",),
     "configuration_version": ("risk_rule_configs",),

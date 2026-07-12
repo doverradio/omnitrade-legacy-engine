@@ -15,6 +15,7 @@ from app.services.mandates.contracts import (
 )
 from app.services.mandates import lifecycle
 from app.services.mandates import evidence
+from app.services.strategies.identity import build_strategy_identity
 
 
 class _FakeDb:
@@ -105,7 +106,7 @@ def _version(*, mandate_id: uuid.UUID, version_id: uuid.UUID | None = None) -> S
         max_fee_bps=Decimal("10"),
         allowed_products=["BTC-USD"],
         allowed_order_sides=["BUY", "SELL", "HOLD"],
-        allowed_strategy_versions=["strategy.v1"],
+        allowed_strategy_versions=[build_strategy_identity(slug="ma_crossover", module_version="1.0.0")],
         approval_policy="MANDATE_ALLOWED",
         is_authorized=False,
         is_active=False,
@@ -143,7 +144,7 @@ async def test_create_version_audit_failure_prevents_commit(monkeypatch: pytest.
         max_fee_bps=Decimal("10"),
         allowed_products=("BTC-USD",),
         allowed_order_sides=("BUY", "SELL", "HOLD"),
-        allowed_strategy_versions=("strategy.v1",),
+        allowed_strategy_versions=(build_strategy_identity(slug="ma_crossover", module_version="1.0.0"),),
         entry_policy={},
         exit_policy={},
         cooldown_policy={},
@@ -393,7 +394,7 @@ async def test_evaluation_write_persists_correlation_and_is_atomic(monkeypatch: 
     request = evidence.MandateEvaluationWriteRequest(
         mandate_id=mandate.mandate_id,
         actor="operator:owner",
-        strategy_version="strategy.v1",
+        strategy_version=build_strategy_identity(slug="ma_crossover", module_version="1.0.0"),
         product="BTC-USD",
         side="BUY",
         proposed_notional_usd=Decimal("5"),
@@ -459,7 +460,7 @@ async def test_evaluation_audit_failure_prevents_commit(monkeypatch: pytest.Monk
     request = evidence.MandateEvaluationWriteRequest(
         mandate_id=mandate.mandate_id,
         actor="operator:owner",
-        strategy_version="strategy.v1",
+        strategy_version=build_strategy_identity(slug="ma_crossover", module_version="1.0.0"),
         product="BTC-USD",
         side="BUY",
         proposed_notional_usd=Decimal("5"),

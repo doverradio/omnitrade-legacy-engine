@@ -10,6 +10,7 @@ from app.services.mandates.contracts import (
     MANDATE_APPROVAL_POLICY_MANDATE_ALLOWED,
     MandateVersionModel,
 )
+from app.services.strategies.identity import is_strategy_identity
 from app.services.mandates.state import is_valid_state, validate_transition
 
 
@@ -54,6 +55,10 @@ def validate_mandate_version(version: MandateVersionModel) -> ValidationResult:
         return ValidationResult(valid=False, reason="empty_allowed_products")
     if not version.allowed_order_sides:
         return ValidationResult(valid=False, reason="empty_allowed_order_sides")
+    if not version.allowed_strategy_versions:
+        return ValidationResult(valid=False, reason="empty_allowed_strategy_versions")
+    if any(not is_strategy_identity(item) for item in version.allowed_strategy_versions):
+        return ValidationResult(valid=False, reason="invalid_allowed_strategy_identity")
     if version.approval_policy not in {
         MANDATE_APPROVAL_POLICY_HUMAN_REQUIRED,
         MANDATE_APPROVAL_POLICY_MANDATE_ALLOWED,

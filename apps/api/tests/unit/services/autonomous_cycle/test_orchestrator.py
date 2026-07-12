@@ -11,6 +11,7 @@ from app.models.audit_log import AuditLog
 from app.models.autonomous_cycle_run import AutonomousCycleRun
 from app.services.autonomous_cycle.contracts import AutonomousCycleRequest, ReconciliationStatus, RiskEvaluationSummary
 from app.services.autonomous_cycle.orchestrator import run_autonomous_preview_cycle
+from app.services.strategies.identity import build_strategy_identity
 
 
 class _FakeDb:
@@ -122,7 +123,7 @@ def _version(*, allowed_order_sides: list[str] | None = None):
         max_fee_bps=Decimal("10"),
         allowed_products=["BTC-USD"],
         allowed_order_sides=allowed_order_sides or ["BUY", "SELL", "HOLD"],
-        allowed_strategy_versions=["forced"],
+        allowed_strategy_versions=[build_strategy_identity(slug="ma_crossover", module_version="1.0.0")],
         approval_policy="MANDATE_ALLOWED",
         is_authorized=True,
         is_active=True,

@@ -11,6 +11,7 @@ import pytest
 from app.core.errors import ConflictError, InvalidRequestError, NotFoundError
 from app.db.session import get_db
 from app.main import create_app
+from app.services.strategies.identity import build_strategy_identity
 
 
 class _FakeSession:
@@ -71,7 +72,7 @@ def _version_obj(*, mandate_id: uuid.UUID, version_id: uuid.UUID | None = None, 
         max_fee_bps=Decimal("10"),
         allowed_products=["BTC-USD"],
         allowed_order_sides=["BUY", "SELL", "HOLD"],
-        allowed_strategy_versions=["strategy.v1"],
+        allowed_strategy_versions=[build_strategy_identity(slug="ma_crossover", module_version="1.0.0")],
         approval_policy=approval_policy,
         is_authorized=False,
         is_active=False,
@@ -115,7 +116,7 @@ def _version_payload(*, approval_policy: str = "MANDATE_ALLOWED", idempotency_ke
         "max_fee_bps": "10",
         "allowed_products": ["BTC-USD"],
         "allowed_order_sides": ["BUY", "SELL", "HOLD"],
-        "allowed_strategy_versions": ["strategy.v1"],
+        "allowed_strategy_versions": [build_strategy_identity(slug="ma_crossover", module_version="1.0.0")],
         "entry_policy": {},
         "exit_policy": {},
         "cooldown_policy": {},
@@ -509,7 +510,7 @@ def test_evaluation_evidence_persisted_for_all_actions(monkeypatch: pytest.Monke
         response = client.post(
             f"/autonomous-capital/mandates/{mandate_id}/evaluations",
             json={
-                "strategy_version": "strategy.v1",
+                "strategy_version": build_strategy_identity(slug="ma_crossover", module_version="1.0.0"),
                 "product": "BTC-USD",
                 "side": side,
                 "proposed_notional_usd": "5",
@@ -572,7 +573,7 @@ def test_evaluation_links_decision_and_supports_replay_idempotency(monkeypatch: 
     monkeypatch.setattr("app.api.routes.autonomous_capital_mandates.evaluate_and_record_mandate", _evaluate_stub)
 
     request_json = {
-        "strategy_version": "strategy.v1",
+        "strategy_version": build_strategy_identity(slug="ma_crossover", module_version="1.0.0"),
         "product": "BTC-USD",
         "side": "BUY",
         "proposed_notional_usd": "5",
@@ -610,7 +611,7 @@ def test_evaluation_rejects_invented_risk_result(monkeypatch: pytest.MonkeyPatch
         response = client.post(
             f"/autonomous-capital/mandates/{uuid.uuid4()}/evaluations",
             json={
-                "strategy_version": "strategy.v1",
+                "strategy_version": build_strategy_identity(slug="ma_crossover", module_version="1.0.0"),
                 "product": "BTC-USD",
                 "side": "BUY",
                 "proposed_notional_usd": "5",

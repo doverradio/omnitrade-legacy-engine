@@ -47,6 +47,7 @@ from app.services.mandates.validation import validate_mandate_version
 from app.services.risk.risk_context import resolve_execution_risk_context
 from app.services.risk.risk_engine import RiskDecisionAction, RiskEvaluationRequest, evaluate_signal_risk
 from app.services.risk.risk_persistence import RiskDecisionPersistenceRequest, persist_risk_decision
+from app.services.strategies.identity import build_strategy_identity
 from app.services.strategies import strategy_registry
 from app.services.strategies.base import StrategyContext
 from app.schemas.crypto_order_previews import CryptoOrderPreviewCreateRequest
@@ -548,7 +549,7 @@ async def _run_approved_strategy(
         (
             item
             for item in strategies
-            if item.slug in approved_versions or item.module_version in approved_versions
+            if build_strategy_identity(slug=item.slug, module_version=item.module_version) in approved_versions
         ),
         None,
     )
@@ -560,11 +561,13 @@ async def _run_approved_strategy(
             deterministic_explanation=("CHECK_FAILED:no_approved_strategy_active",),
         )
 
+    strategy_identity = build_strategy_identity(slug=selected.slug, module_version=selected.module_version)
+
     if not strategy_registry.has(selected.slug):
         return StrategyProposal(
             action="HOLD",
             strategy_name=selected.slug,
-            strategy_version=selected.module_version,
+            strategy_version=strategy_identity,
             deterministic_explanation=("CHECK_FAILED:strategy_factory_not_registered",),
         )
 
@@ -582,7 +585,7 @@ async def _run_approved_strategy(
         return StrategyProposal(
             action="HOLD",
             strategy_name=selected.slug,
-            strategy_version=selected.module_version,
+            strategy_version=strategy_identity,
             deterministic_explanation=("CHECK_FAILED:insufficient_candle_context",),
         )
 
@@ -620,10 +623,11 @@ async def _run_approved_strategy(
     return StrategyProposal(
         action=action,
         strategy_name=selected.slug,
-        strategy_version=selected.module_version,
+        strategy_version=strategy_identity,
         deterministic_explanation=(
             "CHECK_PASSED:strategy_evaluated",
             f"CHECK_INFO:strategy={selected.slug}",
+            f"CHECK_INFO:strategy_identity={strategy_identity}",
             f"CHECK_INFO:signal_action={signal.action}",
         ),
     )
@@ -857,6 +861,7 @@ async def _persist_decision_intelligence(
         strategy_inputs={
             "allowed_strategy_versions": list(version.allowed_strategy_versions),
             "selected_strategy": proposal.strategy_name,
+            "selected_strategy_identity": proposal.strategy_version,
         },
         risk_inputs={
             "risk_verdict": risk_summary.risk_verdict,
