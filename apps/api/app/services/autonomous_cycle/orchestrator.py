@@ -29,6 +29,7 @@ from app.models.strategy import Strategy
 from app.services.crypto_order_previews.service import create_crypto_order_preview
 from app.services.decisions.ingestion import DECISION_ENGINE_VERSION
 from app.services.execution_price_evidence import load_current_execution_price_evidence
+from app.services.exchange_connections.readiness import supports_autonomous_preview
 from app.services.exchange_connections.providers.registry import get_exchange_provider
 from app.services.exchange_connections.service import get_decrypted_credentials_for_connection
 from app.services.mandates.contracts import (
@@ -61,11 +62,6 @@ from .contracts import (
 )
 
 _TERMINAL_CYCLE_STATES = {"HOLD", "PREVIEW_READY", "FAILED", "COMPLETE"}
-_READY_CONNECTION_VERDICTS = {
-    "READY_FOR_PREVIEW",
-    "READY_FOR_ORDER_SUBMISSION",
-    "NOT_READY_SUBMISSION_DISABLED",
-}
 _RESOLVED_ORDER_STATUSES = {"filled", "cancelled", "failed", "rejected", "expired", "settled"}
 
 _ALLOWED_TRANSITIONS: dict[str, set[str]] = {
@@ -204,7 +200,7 @@ async def run_autonomous_preview_cycle(
                 started_monotonic=started_monotonic,
             )
 
-        if connection.last_readiness_verdict not in _READY_CONNECTION_VERDICTS:
+        if not supports_autonomous_preview(connection.last_readiness_verdict):
             return await _finish_hold(
                 db=db,
                 cycle=cycle,

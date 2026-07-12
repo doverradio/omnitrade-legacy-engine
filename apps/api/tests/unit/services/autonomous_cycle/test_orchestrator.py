@@ -153,6 +153,24 @@ async def test_cycle_buy_generates_preview(monkeypatch: pytest.MonkeyPatch) -> N
 
 
 @pytest.mark.asyncio
+async def test_cycle_buy_generates_preview_for_operator_review_verdict(monkeypatch: pytest.MonkeyPatch) -> None:
+    db = _FakeDb()
+    mandate = _mandate(status="ACTIVE")
+    version = _version()
+    db.connection = SimpleNamespace(last_readiness_verdict="READY_FOR_OPERATOR_REVIEW", provider="kraken_spot", environment="production")
+    _patch_happy_path(monkeypatch, mandate, version, action="BUY")
+
+    result = await run_autonomous_preview_cycle(
+        db=db,
+        request=AutonomousCycleRequest(mandate_id=mandate.mandate_id, actor="operator:owner", forced_action="BUY", idempotency_seed="buy-cycle-operator-review"),
+    )
+
+    assert result.state == "COMPLETE"
+    assert result.proposed_action == "BUY"
+    assert result.preview_id is not None
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("status", ["PAUSED", "REVOKED", "EXPIRED", "DRAFT"])
 async def test_cycle_non_active_mandate_finishes_hold(monkeypatch: pytest.MonkeyPatch, status: str) -> None:
     db = _FakeDb()

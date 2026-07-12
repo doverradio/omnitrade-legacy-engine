@@ -12,6 +12,25 @@ from app.schemas.exchange_connections import (
 CheckStatus = Literal["pass", "warn", "fail"]
 
 
+# Centralized readiness contract for preview-only autonomous cycles.
+# Keep legacy verdicts for compatibility while explicitly accepting
+# READY_FOR_OPERATOR_REVIEW emitted by compute_verdict.
+AUTONOMOUS_PREVIEW_READY_VERDICTS = frozenset(
+    {
+        "READY_FOR_PREVIEW",
+        "READY_FOR_OPERATOR_REVIEW",
+        "READY_FOR_ORDER_SUBMISSION",
+        "NOT_READY_SUBMISSION_DISABLED",
+    }
+)
+
+
+def supports_autonomous_preview(verdict: str | None) -> bool:
+    if verdict is None:
+        return False
+    return verdict in AUTONOMOUS_PREVIEW_READY_VERDICTS
+
+
 def readiness_check(*, code: str, label: str, status: CheckStatus, explanation: str, remediation: str) -> ExchangeReadinessCheckResponse:
     return ExchangeReadinessCheckResponse(
         code=code,
