@@ -112,7 +112,7 @@ def evaluate_mandate_eligibility(
         ),
         (
             "risk_engine_allows_action",
-            request.risk_verdict == "ALLOW",
+            request.risk_verdict in {"ACCEPTED", "RESIZED"},
             "risk_engine_rejected_action",
         ),
         (
@@ -127,14 +127,19 @@ def evaluate_mandate_eligibility(
         ),
     ]
 
-    failures = [failure_reason for _name, passed, failure_reason in checks if not passed]
+    passed_checks = tuple(name for name, passed, _failure_reason in checks if passed)
+    failed_pairs = [(name, failure_reason) for name, passed, failure_reason in checks if not passed]
+    failures = [failure_reason for _name, failure_reason in failed_pairs]
+    failed_checks = tuple(name for name, _failure_reason in failed_pairs)
 
     if failures:
-        explanation = tuple(f"CHECK_FAILED:{code}" for code in failures)
+        explanation = tuple([*(f"CHECK_PASSED:{code}" for code in passed_checks), *(f"CHECK_FAILED:{code}" for code in failures)])
         return MandateAuthorizationDecision(
             result=MANDATE_AUTHORIZATION_REJECTED,
             approval_result=MANDATE_APPROVAL_RESULT_REQUIRED_HUMAN,
             reason_code=failures[0],
+            passed_checks=passed_checks,
+            failed_checks=failed_checks,
             deterministic_explanation=explanation,
         )
 
@@ -143,12 +148,23 @@ def evaluate_mandate_eligibility(
             result=MANDATE_AUTHORIZATION_REJECTED,
             approval_result=MANDATE_APPROVAL_RESULT_REQUIRED_HUMAN,
             reason_code="autonomy_level_does_not_allow_autonomous_execution",
-            deterministic_explanation=("CHECK_FAILED:autonomy_level_does_not_allow_autonomous_execution",),
+            passed_checks=passed_checks,
+            failed_checks=("autonomy_level_supports_autonomous_execution",),
+            deterministic_explanation=(
+                *(f"CHECK_PASSED:{code}" for code in passed_checks),
+                "CHECK_FAILED:autonomy_level_does_not_allow_autonomous_execution",
+            ),
         )
 
     return MandateAuthorizationDecision(
         result=MANDATE_AUTHORIZATION_ALLOWED,
         approval_result=MANDATE_APPROVAL_RESULT_ACTIVE_MANDATE,
         reason_code="authorized_under_active_mandate",
-        deterministic_explanation=("CHECK_PASSED:authorized_under_active_mandate",),
+        passed_checks=(*passed_checks, "autonomy_level_supports_autonomous_execution"),
+        failed_checks=(),
+        deterministic_explanation=(
+            *(f"CHECK_PASSED:{code}" for code in passed_checks),
+            "CHECK_PASSED:autonomy_level_supports_autonomous_execution",
+            "CHECK_PASSED:authorized_under_active_mandate",
+        ),
     )

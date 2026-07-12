@@ -59,7 +59,7 @@ def validate_mandate_version(version: MandateVersionModel) -> ValidationResult:
         MANDATE_APPROVAL_POLICY_MANDATE_ALLOWED,
     }:
         return ValidationResult(valid=False, reason="invalid_approval_policy")
-    if version.approval_policy == MANDATE_APPROVAL_POLICY_MANDATE_ALLOWED and not version.is_authorized:
+    if version.approval_policy == MANDATE_APPROVAL_POLICY_MANDATE_ALLOWED and version.is_active and not version.is_authorized:
         return ValidationResult(valid=False, reason="active_mandate_policy_requires_authorized_version")
     return ValidationResult(valid=True, reason=None)
 

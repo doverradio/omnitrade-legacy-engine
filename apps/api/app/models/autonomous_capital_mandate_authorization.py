@@ -38,6 +38,7 @@ class AutonomousCapitalMandateAuthorization(Base):
     authorization_evidence: Mapped[dict[str, Any]] = mapped_column(JSONB, nullable=False)
     deterministic_explanation: Mapped[dict[str, Any]] = mapped_column(JSONB, nullable=False)
     idempotency_key: Mapped[str] = mapped_column(Text, nullable=False)
+    audit_correlation_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), nullable=True)
     recorded_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, server_default=text("now()"))
     expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     revoked_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)

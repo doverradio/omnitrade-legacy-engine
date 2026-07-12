@@ -15,6 +15,7 @@ from app.models.arena_competition_budget_allocation import ArenaCompetitionBudge
 from app.models.audit_log import AuditLog
 from app.models.autonomous_capital_mandate import AutonomousCapitalMandate
 from app.models.autonomous_capital_mandate_authorization import AutonomousCapitalMandateAuthorization
+from app.models.autonomous_capital_mandate_evaluation import AutonomousCapitalMandateEvaluation
 from app.models.autonomous_capital_mandate_version import AutonomousCapitalMandateVersion
 from app.models.backtest import Backtest
 from app.models.backtest_trade import BacktestTrade
@@ -81,6 +82,7 @@ __all__ = [
 	"AuditLog",
 	"AutonomousCapitalMandate",
 	"AutonomousCapitalMandateAuthorization",
+	"AutonomousCapitalMandateEvaluation",
 	"AutonomousCapitalMandateVersion",
 	"Backtest",
 	"BacktestTrade",

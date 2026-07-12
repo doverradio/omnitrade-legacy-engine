@@ -4,6 +4,7 @@ from dataclasses import dataclass
 from datetime import datetime
 from decimal import Decimal
 import uuid
+from typing import Any
 
 
 AUTONOMY_LEVEL_0 = "LEVEL_0"
@@ -87,9 +88,12 @@ class MandateAuthorizationModel:
     mandate_authorization_id: uuid.UUID
     mandate_id: uuid.UUID
     mandate_version_id: uuid.UUID
+    mandate_version_number: int | None
+    autonomy_level: str | None
     authorization_state: str
     approval_result: str
     authorized_by_actor_id: str | None
+    audit_correlation_id: uuid.UUID | None
     recorded_at: datetime
     expires_at: datetime | None
     revoked_at: datetime | None
@@ -125,6 +129,8 @@ class MandateAuthorizationDecision:
     result: str
     approval_result: str
     reason_code: str
+    passed_checks: tuple[str, ...]
+    failed_checks: tuple[str, ...]
     deterministic_explanation: tuple[str, ...]
 
 
@@ -134,3 +140,86 @@ class DecisionMandateReferenceContract:
     mandate_version_id: uuid.UUID | None
     autonomy_level: str
     authorization_result: str
+
+
+@dataclass(frozen=True)
+class MandateLifecycleActionRequest:
+    mandate_id: uuid.UUID
+    actor: str
+    action: str
+    reason: str
+    idempotency_key: str | None = None
+    audit_correlation_id: uuid.UUID | None = None
+    software_build_version: str | None = None
+
+
+@dataclass(frozen=True)
+class MandateVersionCreateRequest:
+    mandate_id: uuid.UUID
+    actor: str
+    base_currency: str
+    authorized_capital_usd: Decimal
+    max_order_notional_usd: Decimal
+    max_open_exposure_usd: Decimal
+    max_daily_deployed_usd: Decimal
+    max_daily_realized_loss_usd: Decimal
+    max_campaign_drawdown_usd: Decimal
+    max_consecutive_losses: int
+    position_limit: int
+    price_evidence_max_age_seconds: int
+    max_slippage_bps: Decimal
+    max_fee_bps: Decimal
+    allowed_products: tuple[str, ...]
+    allowed_order_sides: tuple[str, ...]
+    allowed_strategy_versions: tuple[str, ...]
+    entry_policy: dict[str, Any]
+    exit_policy: dict[str, Any]
+    cooldown_policy: dict[str, Any]
+    operating_schedule: dict[str, Any]
+    approval_policy: str
+    reconciliation_policy: dict[str, Any]
+    kill_switch_policy: dict[str, Any]
+    owner_acknowledgements: dict[str, Any]
+    authorization_evidence_summary: dict[str, Any]
+    idempotency_key: str | None = None
+    audit_correlation_id: uuid.UUID | None = None
+
+
+@dataclass(frozen=True)
+class MandateAuthorizationRequest:
+    mandate_id: uuid.UUID
+    mandate_version_id: uuid.UUID
+    actor: str
+    authorization_method: str
+    owner_acknowledgements: dict[str, Any]
+    authorization_evidence: dict[str, Any]
+    deterministic_explanation: dict[str, Any]
+    expires_at: datetime | None
+    idempotency_key: str | None = None
+    audit_correlation_id: uuid.UUID | None = None
+
+
+@dataclass(frozen=True)
+class MandateEvaluationRecord:
+    evaluation_id: uuid.UUID
+    mandate_id: uuid.UUID
+    mandate_version_id: uuid.UUID
+    mandate_version_number: int
+    autonomy_level: str
+    proposed_action: str
+    authorization_result: str
+    approval_result: str
+    risk_verdict: str
+    risk_evaluated: bool
+    checks_passed: tuple[str, ...]
+    checks_failed: tuple[str, ...]
+    deterministic_explanation: tuple[str, ...]
+    reason_code: str
+    human_approval_required: bool
+    active_mandate_exemption_eligible: bool
+    decision_id: uuid.UUID | None
+    actor: str
+    audit_correlation_id: uuid.UUID
+    software_build_version: str | None
+    idempotency_key: str
+    created_at: datetime

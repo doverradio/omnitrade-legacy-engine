@@ -88,7 +88,7 @@ def _request(mandate: MandateDomainModel) -> MandateEligibilityInput:
         campaign_drawdown_usd=Decimal("0"),
         consecutive_losses=0,
         current_position_count=0,
-        risk_verdict="ALLOW",
+        risk_verdict="ACCEPTED",
         evidence_age_seconds=10,
         kill_switch_engaged=False,
         observed_at=_NOW,
@@ -102,6 +102,8 @@ def test_valid_mandate_authorizes_action() -> None:
 
     assert decision.result == "AUTHORIZED"
     assert decision.approval_result == MANDATE_APPROVAL_RESULT_ACTIVE_MANDATE
+    assert "autonomy_level_supports_autonomous_execution" in decision.passed_checks
+    assert decision.failed_checks == ()
 
 
 def test_invalid_mandate_version_rejected_by_validation_service() -> None:
@@ -147,6 +149,7 @@ def test_kill_switch_rejects_even_when_other_checks_pass() -> None:
     decision = evaluate_mandate_eligibility(mandate=mandate, version=_version(), request=request)
     assert decision.result == "REJECTED"
     assert decision.reason_code == "kill_switch_engaged"
+    assert "kill_switch_clear" in decision.failed_checks
 
 
 def test_capital_limit_rejects_when_order_notional_exceeds_limit() -> None:
@@ -247,6 +250,21 @@ def test_autonomy_level_behavior_requires_level_2_for_exemption() -> None:
     )
     assert decision_level_2.result == "AUTHORIZED"
     assert mandate_supports_autonomous_actions(AUTONOMY_LEVEL_2) is True
+
+
+def test_mandate_allowed_policy_can_exist_before_authorization_when_inactive() -> None:
+    inactive_unauthorized = _version(is_authorized=False, is_active=False)
+
+    result = validate_mandate_version(inactive_unauthorized)
+    assert result.valid is True
+
+
+def test_mandate_allowed_policy_cannot_be_active_without_authorization() -> None:
+    active_unauthorized = _version(is_authorized=False, is_active=True)
+
+    result = validate_mandate_version(active_unauthorized)
+    assert result.valid is False
+    assert result.reason == "active_mandate_policy_requires_authorized_version"
 
 
 def test_state_transition_rules_are_enforced() -> None:
