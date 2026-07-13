@@ -688,6 +688,144 @@ async def test_worker_continues_after_structured_execution_rejection(monkeypatch
 
 
 @pytest.mark.asyncio
+async def test_worker_triggers_one_autonomous_cycle_for_latest_kraken_btc_candle(monkeypatch: pytest.MonkeyPatch) -> None:
+    db = _FakeDB()
+    mandate_id = uuid.uuid4()
+    candle_close = datetime(2026, 7, 9, 12, 15, tzinfo=timezone.utc)
+    captured: dict[str, object] = {}
+
+    async def _capture_cycle(*, db, request):
+        captured["request"] = request
+        return SimpleNamespace(
+            cycle_id=uuid.uuid4(),
+            state="COMPLETE",
+            replayed=False,
+            idempotency_key="cycle-idem",
+        )
+
+    import app.services.orchestration.continuous_pipeline_worker as worker_module
+
+    monkeypatch.setattr(worker_module, "run_ingestion_cycle", _fake_ingestion_cycle)
+    monkeypatch.setattr(worker_module, "_load_active_assets", _async_return([]))
+    monkeypatch.setattr(worker_module, "_load_active_strategies", _async_return([]))
+    monkeypatch.setattr(
+        worker_module,
+        "run_deterministic_research_cycle_if_due",
+        _async_return(
+            SimpleNamespace(
+                started=False,
+                reason="not_due",
+                campaign_id=None,
+                candidates_generated=0,
+                candidates_evaluated=0,
+                descendants_generated=0,
+                champion=None,
+            )
+        ),
+    )
+    monkeypatch.setattr(worker_module, "capture_system_intelligence_snapshot_if_due", _async_return(None))
+    monkeypatch.setattr(worker_module, "_load_single_active_kraken_mandate", _async_return(SimpleNamespace(mandate_id=mandate_id)))
+    monkeypatch.setattr(
+        worker_module,
+        "_load_latest_kraken_btc_15m_candle",
+        _async_return(SimpleNamespace(close_time=candle_close)),
+    )
+    monkeypatch.setattr(worker_module, "run_autonomous_preview_cycle", _capture_cycle)
+
+    stats = await run_orchestration_cycle(db=db, client=object(), config=_config())
+
+    assert stats.ingestion_assets_ok == 1
+    request = captured["request"]
+    assert request.mandate_id == mandate_id
+    assert request.actor == "orchestration_worker"
+    assert request.product_id == "BTC-USD"
+    assert request.strategy_interval == "15m"
+    assert request.trigger == "kraken_btc_15m_candle_close"
+    assert request.idempotency_seed == "kraken-btc-15m-close:2026-07-09T12:15:00+00:00"
+
+
+@pytest.mark.asyncio
+async def test_worker_skips_autonomous_cycle_when_no_active_kraken_mandate(monkeypatch: pytest.MonkeyPatch) -> None:
+    db = _FakeDB()
+    called = {"count": 0}
+
+    async def _capture_cycle(*, db, request):
+        called["count"] += 1
+        return SimpleNamespace(cycle_id=uuid.uuid4(), state="COMPLETE", replayed=False, idempotency_key="cycle-idem")
+
+    import app.services.orchestration.continuous_pipeline_worker as worker_module
+
+    monkeypatch.setattr(worker_module, "run_ingestion_cycle", _fake_ingestion_cycle)
+    monkeypatch.setattr(worker_module, "_load_active_assets", _async_return([]))
+    monkeypatch.setattr(worker_module, "_load_active_strategies", _async_return([]))
+    monkeypatch.setattr(
+        worker_module,
+        "run_deterministic_research_cycle_if_due",
+        _async_return(
+            SimpleNamespace(
+                started=False,
+                reason="not_due",
+                campaign_id=None,
+                candidates_generated=0,
+                candidates_evaluated=0,
+                descendants_generated=0,
+                champion=None,
+            )
+        ),
+    )
+    monkeypatch.setattr(worker_module, "capture_system_intelligence_snapshot_if_due", _async_return(None))
+    monkeypatch.setattr(worker_module, "_load_single_active_kraken_mandate", _async_return(None))
+    monkeypatch.setattr(worker_module, "run_autonomous_preview_cycle", _capture_cycle)
+
+    stats = await run_orchestration_cycle(db=db, client=object(), config=_config())
+
+    assert stats.ingestion_assets_ok == 1
+    assert called["count"] == 0
+
+
+@pytest.mark.asyncio
+async def test_worker_rolls_back_and_continues_when_autonomous_cycle_raises(monkeypatch: pytest.MonkeyPatch) -> None:
+    db = _FakeDB()
+
+    async def _raise_cycle(*, db, request):
+        raise RuntimeError("autonomous cycle failure")
+
+    import app.services.orchestration.continuous_pipeline_worker as worker_module
+
+    monkeypatch.setattr(worker_module, "run_ingestion_cycle", _fake_ingestion_cycle)
+    monkeypatch.setattr(worker_module, "_load_active_assets", _async_return([]))
+    monkeypatch.setattr(worker_module, "_load_active_strategies", _async_return([]))
+    monkeypatch.setattr(
+        worker_module,
+        "run_deterministic_research_cycle_if_due",
+        _async_return(
+            SimpleNamespace(
+                started=False,
+                reason="not_due",
+                campaign_id=None,
+                candidates_generated=0,
+                candidates_evaluated=0,
+                descendants_generated=0,
+                champion=None,
+            )
+        ),
+    )
+    monkeypatch.setattr(worker_module, "capture_system_intelligence_snapshot_if_due", _async_return(None))
+    monkeypatch.setattr(worker_module, "_load_single_active_kraken_mandate", _async_return(SimpleNamespace(mandate_id=uuid.uuid4())))
+    monkeypatch.setattr(
+        worker_module,
+        "_load_latest_kraken_btc_15m_candle",
+        _async_return(SimpleNamespace(close_time=datetime(2026, 7, 9, 12, 15, tzinfo=timezone.utc))),
+    )
+    monkeypatch.setattr(worker_module, "run_autonomous_preview_cycle", _raise_cycle)
+
+    stats = await run_orchestration_cycle(db=db, client=object(), config=_config())
+
+    assert stats.ingestion_assets_ok == 1
+    assert db.rollbacks == 1
+
+
+@pytest.mark.asyncio
 async def test_run_orchestration_cycle_passes_kraken_client_to_ingestion(monkeypatch: pytest.MonkeyPatch) -> None:
     db = _FakeDB()
     captured: dict[str, object] = {}

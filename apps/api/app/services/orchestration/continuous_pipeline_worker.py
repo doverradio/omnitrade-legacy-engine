@@ -5,13 +5,14 @@ import logging
 import os
 import uuid
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timezone
 from decimal import Decimal
 
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.models.audit_log import AuditLog
+from app.models.autonomous_capital_mandate import AutonomousCapitalMandate
 from app.core.logging import setup_logging
 from app.db.session import AsyncSessionLocal, dispose_database_engine, is_retryable_db_connection_error
 from app.models.asset import Asset
@@ -39,8 +40,15 @@ from app.services.signals.execution_orchestrator import SignalExecutionRequest, 
 from app.services.system_intelligence_snapshots import capture_system_intelligence_snapshot_if_due
 from app.services.strategies import StrategyContext, strategy_registry
 from app.services.strategies.registry import StrategyLookupError
+from app.services.autonomous_cycle import AutonomousCycleRequest, run_autonomous_preview_cycle
 
 logger = logging.getLogger(__name__)
+
+_AUTONOMOUS_CYCLE_TRIGGER = "kraken_btc_15m_candle_close"
+_AUTONOMOUS_CYCLE_PRODUCT_ID = "BTC-USD"
+_AUTONOMOUS_CYCLE_INTERVAL = "15m"
+_AUTONOMOUS_CYCLE_PROVIDER = "kraken_spot"
+_AUTONOMOUS_CYCLE_ASSET_SYMBOLS = ("BTC", "XBT", "XXBT")
 
 _RESEARCH_STATUS_EVENT_TYPES = {
     "disabled": "RESEARCH_CYCLE_DISABLED",
@@ -189,6 +197,98 @@ async def _load_decision_record_for_signal(
         .limit(1)
     )
     return result.scalars().first()
+
+
+async def _load_single_active_kraken_mandate(db: AsyncSession) -> AutonomousCapitalMandate | None:
+    if not hasattr(db, "execute"):
+        return None
+
+    result = await db.execute(
+        select(AutonomousCapitalMandate)
+        .where(AutonomousCapitalMandate.status == "ACTIVE")
+        .where(AutonomousCapitalMandate.provider == _AUTONOMOUS_CYCLE_PROVIDER)
+        .order_by(AutonomousCapitalMandate.updated_at.desc())
+        .limit(2)
+    )
+    mandates = list(result.scalars().all())
+    if not mandates:
+        logger.info("autonomous_cycle_skip reason=no_active_kraken_mandate")
+        return None
+    if len(mandates) > 1:
+        logger.warning("autonomous_cycle_skip reason=ambiguous_active_kraken_mandates mandate_count=%s", len(mandates))
+        return None
+    return mandates[0]
+
+
+async def _load_latest_kraken_btc_15m_candle(db: AsyncSession) -> Candle | None:
+    if not hasattr(db, "execute"):
+        return None
+
+    asset_result = await db.execute(
+        select(Asset)
+        .where(Asset.is_active.is_(True))
+        .where(Asset.asset_class == "crypto")
+        .where(Asset.exchange == _AUTONOMOUS_CYCLE_PROVIDER)
+        .where(Asset.symbol.in_(_AUTONOMOUS_CYCLE_ASSET_SYMBOLS))
+        .order_by(Asset.created_at.desc())
+        .limit(2)
+    )
+    assets = list(asset_result.scalars().all())
+    if not assets:
+        logger.info("autonomous_cycle_skip reason=kraken_btc_asset_missing")
+        return None
+    if len(assets) > 1:
+        logger.warning("autonomous_cycle_skip reason=ambiguous_kraken_btc_assets asset_count=%s", len(assets))
+        return None
+
+    candle_result = await db.execute(
+        select(Candle)
+        .where(Candle.asset_id == assets[0].id)
+        .where(Candle.interval == _AUTONOMOUS_CYCLE_INTERVAL)
+        .order_by(Candle.open_time.desc())
+        .limit(1)
+    )
+    candle = candle_result.scalars().first()
+    if candle is None:
+        logger.info("autonomous_cycle_skip reason=kraken_btc_15m_candle_missing")
+    return candle
+
+
+def _build_kraken_btc_candle_idempotency_seed(*, candle: Candle) -> str:
+    close_time = candle.close_time
+    close_time_utc = close_time if close_time.tzinfo is not None else close_time.replace(tzinfo=timezone.utc)
+    return f"kraken-btc-15m-close:{close_time_utc.astimezone(timezone.utc).isoformat()}"
+
+
+async def _run_kraken_btc_autonomous_cycle_if_due(*, db: AsyncSession) -> None:
+    mandate = await _load_single_active_kraken_mandate(db)
+    if mandate is None:
+        return
+
+    latest_candle = await _load_latest_kraken_btc_15m_candle(db)
+    if latest_candle is None:
+        return
+
+    result = await run_autonomous_preview_cycle(
+        db=db,
+        request=AutonomousCycleRequest(
+            mandate_id=mandate.mandate_id,
+            actor="orchestration_worker",
+            product_id=_AUTONOMOUS_CYCLE_PRODUCT_ID,
+            strategy_interval=_AUTONOMOUS_CYCLE_INTERVAL,
+            trigger=_AUTONOMOUS_CYCLE_TRIGGER,
+            idempotency_seed=_build_kraken_btc_candle_idempotency_seed(candle=latest_candle),
+        ),
+    )
+    logger.info(
+        "autonomous_cycle_triggered trigger=%s mandate_id=%s cycle_id=%s state=%s replayed=%s idempotency_key=%s",
+        _AUTONOMOUS_CYCLE_TRIGGER,
+        mandate.mandate_id,
+        result.cycle_id,
+        result.state,
+        result.replayed,
+        result.idempotency_key,
+    )
 
 
 async def _load_active_validation_run_ids(*, db: AsyncSession) -> list[uuid.UUID]:
@@ -398,6 +498,12 @@ async def run_orchestration_cycle(
         kraken_client,
         interval=config.candle_interval,
     )
+
+    try:
+        await _run_kraken_btc_autonomous_cycle_if_due(db=db)
+    except Exception:
+        await _rollback_active_session(db=db)
+        logger.exception("autonomous_cycle_failed trigger=%s", _AUTONOMOUS_CYCLE_TRIGGER)
 
     assets = await _load_active_assets(db)
     strategies = await _load_active_strategies(db)
