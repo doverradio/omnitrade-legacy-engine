@@ -113,16 +113,71 @@ python -m app.services.data.worker_entrypoint
 Use the root operator entrypoint to run autonomous preview and read-only operator diagnostics from the repository root.
 
 ```bash
+./operator preview
 ./operator preview --mandate-id <mandate_uuid> --actor operator:human --product-id BTC-USD --strategy-interval 15m
 ./operator preview-show --preview-id <preview_uuid>
 ./operator candles --symbol BTC --interval 15m --exchange kraken_spot --max-age-minutes 30
 ./operator status --mandate-id <mandate_uuid> --symbol BTC --interval 15m --exchange kraken_spot
+./operator watch --symbol BTC --interval 15m --refresh-seconds 5
 ```
 
-Notes:
-- The `preview` command runs only the preview path and never submits live orders.
-- `preview-show`, `candles`, and `status` are read-only evidence and diagnostics views.
-- Add `--json` to any command to output machine-readable JSON.
+### Commands
+
+- `preview`: runs one autonomous cycle in preview-only mode.
+- `status`: Mission Control-style operational summary (DB, worker heartbeat, Kraken readiness, mandate, safety boundary, latest cycle, counts).
+- `watch`: live-refresh read-only console for latest decision, heartbeat, counts, candles, and system health.
+- `candles`: candle freshness/readiness for one symbol/interval.
+- `preview-show`: full evidence view for one persisted preview.
+
+### Output Modes
+
+- Default mode is operator-oriented, grouped, and human-readable.
+- `--json` keeps machine-readable output for automation.
+- `--verbose` includes raw deterministic codes and expanded diagnostics.
+- `--no-color` disables ANSI colors.
+- `NO_COLOR=1` also disables ANSI colors.
+
+### Example Output (preview)
+
+```text
+=======================================
+ AUTONOMOUS PREVIEW
+=======================================
+
+Overall
+----------------------------
+State              COMPLETE
+Decision           [HOLD]
+Type               Strategy-derived
+
+Safety
+----------------------------
+Live Order         NOT SUBMITTED
+Boundary           Preview-only path
+```
+
+### Example Output (status)
+
+```text
+=======================================
+ MISSION CONTROL STATUS
+=======================================
+
+Overall
+----------------------------
+Environment        production
+Git SHA            7f3a1a2b4cde
+API                responsive
+Worker             heartbeat 2m ago
+Database           connected
+System health      healthy
+```
+
+### Safety Guarantees
+
+- `preview` never submits live orders.
+- `status`, `watch`, `candles`, and `preview-show` are read-only diagnostics.
+- Submission boundary is printed in status output and remains explicit.
 
 ### 6) Phase 0 Validation
 

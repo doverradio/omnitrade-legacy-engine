@@ -3,11 +3,17 @@ from __future__ import annotations
 from datetime import datetime, timezone
 
 from app.operator_cli.formatting import (
+    RenderOptions,
     render_candles_text,
     render_preview_show_text,
     render_preview_text,
     render_status_text,
+    render_watch_text,
 )
+
+
+def _opts() -> RenderOptions:
+    return RenderOptions(color_enabled=False, unicode_enabled=False, verbose=True)
 
 
 def test_render_preview_text_includes_safety_line() -> None:
@@ -28,10 +34,10 @@ def test_render_preview_text_includes_safety_line() -> None:
                 "deterministic_explanation": ["CHECK_OK:risk"],
             },
         }
-    )
+    , _opts())
 
-    assert "Autonomous Preview" in text
-    assert "Safety: preview-only path" in text
+    assert "AUTONOMOUS PREVIEW" in text
+    assert "Preview-only path" in text
     assert "CHECK_OK:risk" in text
 
 
@@ -67,12 +73,13 @@ def test_render_preview_show_text_includes_decision_metadata() -> None:
                 "state": "COMPLETE",
             },
         }
-    )
+    , _opts())
 
-    assert "Preview Evidence" in text
-    assert "Decision ID: did" in text
+    assert "PREVIEW EVIDENCE" in text
+    assert "Decision ID" in text
+    assert "did" in text
     assert "Signal reason: cross_up" in text
-    assert "Warnings:" in text
+    assert "Warnings" in text
 
 
 def test_render_candles_text_includes_readiness() -> None:
@@ -89,10 +96,10 @@ def test_render_candles_text_includes_readiness() -> None:
             "ready": True,
             "reason": "ok",
         }
-    )
+    , _opts())
 
-    assert "Candle Readiness" in text
-    assert "Ready: True" in text
+    assert "CANDLE READINESS" in text
+    assert "READY" in text
 
 
 def test_render_status_text_includes_connection_summary() -> None:
@@ -129,8 +136,26 @@ def test_render_status_text_includes_connection_summary() -> None:
                 "age_minutes": 1,
             },
         }
+    , _opts())
+
+    assert "MISSION CONTROL STATUS" in text
+    assert "Git SHA" in text
+    assert "Operator" in text
+
+
+def test_render_watch_text_contains_expected_fields() -> None:
+    text = render_watch_text(
+        {
+            "latest_cycle": {"proposed_action": "HOLD"},
+            "worker_heartbeat": datetime(2026, 1, 1, tzinfo=timezone.utc),
+            "campaign_count": 2,
+            "decision_count": 5,
+            "candle_summary": {"reason": "ok"},
+            "system_health": "healthy",
+        },
+        _opts(),
     )
 
-    assert "Operator Status" in text
-    assert "Exchange connections:" in text
-    assert "kraken_spot production status=connected readiness=READY" in text
+    assert "OPERATOR WATCH" in text
+    assert "Latest decision" in text
+    assert "Press Ctrl+C" in text

@@ -8,8 +8,7 @@ from app.operator_cli.main import parse_args
 def test_parse_preview_command() -> None:
     args = parse_args([
         "preview",
-        "--mandate-id",
-        "11111111-1111-1111-1111-111111111111",
+        "--verbose",
         "--actor",
         "operator:test",
         "--product-id",
@@ -17,15 +16,17 @@ def test_parse_preview_command() -> None:
     ])
 
     assert args.command == "preview"
-    assert args.mandate_id == UUID("11111111-1111-1111-1111-111111111111")
+    assert args.mandate_id is None
     assert args.actor == "operator:test"
     assert args.product_id == "BTC-USD"
     assert args.strategy_interval == "15m"
+    assert args.verbose is True
 
 
 def test_parse_preview_show_command() -> None:
     args = parse_args([
         "preview-show",
+        "--no-color",
         "--preview-id",
         "22222222-2222-2222-2222-222222222222",
         "--json",
@@ -34,6 +35,7 @@ def test_parse_preview_show_command() -> None:
     assert args.command == "preview-show"
     assert args.preview_id == UUID("22222222-2222-2222-2222-222222222222")
     assert args.json_output is True
+    assert args.no_color is True
 
 
 def test_parse_candles_command() -> None:
@@ -69,3 +71,17 @@ def test_parse_status_command() -> None:
     assert args.mandate_id == UUID("33333333-3333-3333-3333-333333333333")
     assert args.symbol == "BTC"
     assert args.interval == "15m"
+
+
+def test_parse_watch_command() -> None:
+    args = parse_args([
+        "watch",
+        "--symbol",
+        "BTC",
+        "--refresh-seconds",
+        "2",
+    ])
+
+    assert args.command == "watch"
+    assert args.symbol == "BTC"
+    assert args.refresh_seconds == 2

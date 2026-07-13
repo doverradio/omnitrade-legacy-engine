@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from datetime import datetime, timezone
 from decimal import Decimal
+from pathlib import Path
 from typing import Any
 from uuid import UUID
 
@@ -13,10 +14,12 @@ from app.models.asset import Asset
 from app.models.autonomous_capital_mandate import AutonomousCapitalMandate
 from app.models.autonomous_cycle_run import AutonomousCycleRun
 from app.models.candle import Candle
+from app.models.capital_campaign import CapitalCampaign
 from app.models.crypto_order_preview import CryptoOrderPreview
 from app.models.decision_record import DecisionRecord
 from app.models.decision_snapshot import DecisionSnapshot
 from app.models.exchange_connection import ExchangeConnection
+from app.models.live_crypto_order import LiveCryptoOrder
 from app.services.autonomous_cycle import AutonomousCycleRequest, run_autonomous_preview_cycle
 
 
@@ -30,7 +33,7 @@ def _coerce_decimal(value: Any) -> str | None:
 
 async def execute_preview_cycle(
     *,
-    mandate_id: UUID,
+    mandate_id: UUID | None,
     actor: str,
     product_id: str,
     strategy_interval: str,
@@ -40,10 +43,27 @@ async def execute_preview_cycle(
     forced_action: str | None,
 ) -> dict[str, Any]:
     async with AsyncSessionLocal() as db:
+        resolved_mandate_id = mandate_id
+        if resolved_mandate_id is None:
+            resolved_mandate_id = await db.scalar(
+                select(AutonomousCapitalMandate.mandate_id)
+                .where(AutonomousCapitalMandate.status == "ACTIVE")
+                .order_by(desc(AutonomousCapitalMandate.updated_at))
+                .limit(1)
+            )
+            if resolved_mandate_id is None:
+                resolved_mandate_id = await db.scalar(
+                    select(AutonomousCapitalMandate.mandate_id)
+                    .order_by(desc(AutonomousCapitalMandate.updated_at))
+                    .limit(1)
+                )
+        if resolved_mandate_id is None:
+            raise ValueError("No mandate found. Seed or create a mandate before running preview.")
+
         result = await run_autonomous_preview_cycle(
             db=db,
             request=AutonomousCycleRequest(
-                mandate_id=mandate_id,
+                mandate_id=resolved_mandate_id,
                 actor=actor,
                 product_id=product_id,
                 strategy_interval=strategy_interval,
@@ -80,6 +100,25 @@ async def execute_preview_cycle(
             "deterministic_explanation": list(result.diagnostics.deterministic_explanation),
         },
     }
+
+
+def _resolve_git_sha() -> str | None:
+    configured_sha = (
+        Path(__file__).resolve().parents[4] / ".git" / "HEAD"
+    )
+    if configured_sha.exists():
+        try:
+            head_value = configured_sha.read_text(encoding="utf-8").strip()
+            if head_value.startswith("ref:"):
+                ref_path = head_value.split(":", 1)[1].strip()
+                ref_file = configured_sha.parent / ref_path
+                if ref_file.exists():
+                    return ref_file.read_text(encoding="utf-8").strip()[:12]
+            if head_value:
+                return head_value[:12]
+        except OSError:
+            return None
+    return None
 
 
 async def fetch_preview_evidence(*, preview_id: UUID) -> dict[str, Any]:
@@ -282,8 +321,11 @@ async def fetch_operator_status(
     candle_max_age_minutes: int,
 ) -> dict[str, Any]:
     settings = get_settings()
+    now = datetime.now(timezone.utc)
 
     async with AsyncSessionLocal() as db:
+        await db.execute(select(1))
+
         if mandate_id is not None:
             mandate: AutonomousCapitalMandate | None = await db.get(AutonomousCapitalMandate, mandate_id)
             if mandate is None:
@@ -307,6 +349,41 @@ async def fetch_operator_status(
         connections = (
             await db.execute(select(ExchangeConnection).order_by(ExchangeConnection.provider.asc(), ExchangeConnection.environment.asc()))
         ).scalars().all()
+        campaign_count = int((await db.scalar(select(func.count()).select_from(CapitalCampaign))) or 0)
+        decision_count = int((await db.scalar(select(func.count()).select_from(DecisionRecord))) or 0)
+        open_preview_count = int(
+            (
+                await db.scalar(
+                    select(func.count())
+                    .select_from(CryptoOrderPreview)
+                    .where(CryptoOrderPreview.expires_at > now)
+                )
+            )
+            or 0
+        )
+
+        open_live_orders = int(
+            (
+                await db.scalar(
+                    select(func.count())
+                    .select_from(LiveCryptoOrder)
+                    .where(
+                        func.lower(LiveCryptoOrder.status).notin_(
+                            [
+                                "filled",
+                                "cancelled",
+                                "failed",
+                                "rejected",
+                                "expired",
+                                "settled",
+                                "completed",
+                            ]
+                        )
+                    )
+                )
+            )
+            or 0
+        )
 
     candle_summary: dict[str, Any] | None = None
     if candle_symbol:
@@ -318,11 +395,87 @@ async def fetch_operator_status(
             lookback_limit=200,
         )
 
+    kraken_production = None
+    for item in connections:
+        if item.provider == "kraken_spot" and item.environment == "production":
+            kraken_production = item
+            break
+
+    latest_strategy: dict[str, Any] = {"name": None, "version": None}
+    open_positions: int | None = None
+    if latest_cycle is not None:
+        context = latest_cycle.cycle_context or {}
+        strategy = context.get("strategy") if isinstance(context, dict) else None
+        reconciliation = context.get("reconciliation_status") if isinstance(context, dict) else None
+        if isinstance(strategy, dict):
+            latest_strategy = {
+                "name": strategy.get("name"),
+                "version": strategy.get("version"),
+            }
+        if isinstance(reconciliation, dict) and isinstance(reconciliation.get("open_position_count"), int):
+            open_positions = reconciliation.get("open_position_count")
+
+    latest_signal = latest_cycle.proposed_action if latest_cycle else None
+    worker_heartbeat = latest_cycle.completed_at if latest_cycle and latest_cycle.completed_at else None
+    if worker_heartbeat is None and latest_cycle is not None:
+        worker_heartbeat = latest_cycle.started_at
+
+    system_health = "healthy"
+    if kraken_production is not None and kraken_production.status not in {"connected"}:
+        system_health = "degraded"
+    if candle_summary and not candle_summary.get("ready"):
+        system_health = "degraded"
+
+    preview_operator_recommendation = "No action required."
+    if latest_cycle is not None:
+        action = str(latest_cycle.proposed_action or "").upper()
+        state = str(latest_cycle.state or "").upper()
+        risk_verdict = str(latest_cycle.risk_verdict or "").upper()
+        if state == "FAILED":
+            preview_operator_recommendation = "Inspect latest cycle failure before proceeding."
+        elif action == "HOLD":
+            preview_operator_recommendation = "Waiting for next qualifying BUY."
+        elif action in {"BUY", "SELL"} and risk_verdict == "REJECTED":
+            preview_operator_recommendation = "Inspect Risk rejection."
+        elif action in {"BUY", "SELL"}:
+            preview_operator_recommendation = "Review latest preview evidence and approval readiness."
+
+    api_status = "responsive"
+    database_status = "connected"
+    kraken_status = "Unavailable"
+    if kraken_production is not None:
+        readiness = kraken_production.last_readiness_verdict or "Unknown"
+        kraken_status = f"{kraken_production.status} ({readiness})"
+
+    worker_status = "Unavailable"
+    if worker_heartbeat is not None:
+        heartbeat_value = worker_heartbeat if worker_heartbeat.tzinfo is not None else worker_heartbeat.replace(tzinfo=timezone.utc)
+        age_minutes = int(max(0, (now - heartbeat_value).total_seconds() // 60))
+        worker_status = f"heartbeat {age_minutes}m ago"
+
+    git_sha = _resolve_git_sha()
+
     return {
         "environment": settings.environment,
+        "git_sha": git_sha,
+        "api_status": api_status,
+        "database_status": database_status,
+        "worker_status": worker_status,
+        "worker_heartbeat": worker_heartbeat,
+        "kraken_status": kraken_status,
+        "system_health": system_health,
         "database_url_configured": bool(settings.database_url),
         "mandate_id": mandate.mandate_id if mandate else None,
         "mandate_status": mandate.status if mandate else None,
+        "latest_strategy": latest_strategy,
+        "latest_signal": latest_signal,
+        "campaign_count": campaign_count,
+        "decision_count": decision_count,
+        "open_positions": open_positions,
+        "open_previews": open_preview_count,
+        "open_live_orders": open_live_orders,
+        "research_status": "available" if settings.research_evolution_enabled else "disabled",
+        "operator_recommendation": preview_operator_recommendation,
         "safety_flags": {
             "live_crypto_order_submission_enabled": settings.live_crypto_order_submission_enabled,
             "live_crypto_dry_run_enabled": settings.live_crypto_dry_run_enabled,
@@ -362,3 +515,20 @@ async def fetch_operator_status(
         ],
         "candle_summary": candle_summary,
     }
+
+
+async def fetch_watch_status(
+    *,
+    mandate_id: UUID | None,
+    candle_symbol: str | None,
+    candle_interval: str,
+    candle_exchange: str | None,
+    candle_max_age_minutes: int,
+) -> dict[str, Any]:
+    return await fetch_operator_status(
+        mandate_id=mandate_id,
+        candle_symbol=candle_symbol,
+        candle_interval=candle_interval,
+        candle_exchange=candle_exchange,
+        candle_max_age_minutes=candle_max_age_minutes,
+    )
