@@ -47,7 +47,7 @@ from app.services.mandates.validation import validate_mandate_version
 from app.services.risk.risk_context import resolve_execution_risk_context
 from app.services.risk.risk_engine import RiskDecisionAction, RiskEvaluationRequest, evaluate_signal_risk
 from app.services.risk.risk_persistence import RiskDecisionPersistenceRequest, persist_risk_decision
-from app.services.strategies.identity import build_strategy_identity
+from app.services.strategies.identity import build_strategy_identity, parse_strategy_identity
 from app.services.strategies import strategy_registry
 from app.services.strategies.base import StrategyContext
 from app.schemas.crypto_order_previews import CryptoOrderPreviewCreateRequest
@@ -297,12 +297,13 @@ async def run_autonomous_preview_cycle(
             version=version,
             request=request,
         )
+        runtime_strategy_identity = _resolve_runtime_strategy_identity(proposal=proposal, version=version)
         cycle.proposed_action = proposal.action
         cycle.cycle_context = {
             **cycle.cycle_context,
             "strategy": {
                 "name": proposal.strategy_name,
-                "version": proposal.strategy_version,
+                "version": runtime_strategy_identity,
                 "deterministic_explanation": list(proposal.deterministic_explanation),
             },
             "proposed_action": proposal.action,
@@ -313,7 +314,7 @@ async def run_autonomous_preview_cycle(
             version=version,
             product_id=request.product_id,
             action=proposal.action,
-            strategy_version=proposal.strategy_version,
+            strategy_version=runtime_strategy_identity,
         )
         cycle.mandate_verdict = mandate_verdict
         if mandate_verdict == MANDATE_AUTHORIZATION_REJECTED:
@@ -359,7 +360,7 @@ async def run_autonomous_preview_cycle(
             request=MandateEvaluationWriteRequest(
                 mandate_id=mandate.mandate_id,
                 actor=request.actor,
-                strategy_version=proposal.strategy_version,
+                strategy_version=runtime_strategy_identity,
                 product=normalize_product_id(request.product_id),
                 side=proposal.action,
                 proposed_notional_usd=version.max_order_notional_usd,
@@ -631,6 +632,34 @@ async def _run_approved_strategy(
             f"CHECK_INFO:signal_action={signal.action}",
         ),
     )
+
+
+def _resolve_runtime_strategy_identity(
+    *,
+    proposal: StrategyProposal,
+    version: AutonomousCapitalMandateVersion,
+) -> str:
+    if proposal.strategy_version != "none":
+        return proposal.strategy_version
+
+    if proposal.strategy_name != "none":
+        for item in version.allowed_strategy_versions:
+            parsed = parse_strategy_identity(item)
+            if parsed is None:
+                continue
+            slug, module_version = parsed
+            if slug == proposal.strategy_name:
+                return build_strategy_identity(slug=slug, module_version=module_version)
+
+    if len(version.allowed_strategy_versions) == 1:
+        candidate = version.allowed_strategy_versions[0]
+        parsed = parse_strategy_identity(candidate)
+        if parsed is None:
+            return candidate
+        slug, module_version = parsed
+        return build_strategy_identity(slug=slug, module_version=module_version)
+
+    return proposal.strategy_version
 
 
 def _evaluate_mandate_scope(

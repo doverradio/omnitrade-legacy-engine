@@ -9,8 +9,12 @@ import pytest
 
 from app.models.audit_log import AuditLog
 from app.models.autonomous_cycle_run import AutonomousCycleRun
-from app.services.autonomous_cycle.contracts import AutonomousCycleRequest, ReconciliationStatus, RiskEvaluationSummary
-from app.services.autonomous_cycle.orchestrator import run_autonomous_preview_cycle
+from app.services.autonomous_cycle.contracts import AutonomousCycleRequest, ReconciliationStatus, RiskEvaluationSummary, StrategyProposal
+from app.services.autonomous_cycle.orchestrator import (
+    _evaluate_mandate_scope,
+    _resolve_runtime_strategy_identity,
+    run_autonomous_preview_cycle,
+)
 from app.services.strategies.identity import build_strategy_identity
 
 
@@ -629,3 +633,73 @@ async def test_no_submission_side_effects(monkeypatch: pytest.MonkeyPatch) -> No
     )
 
     assert called["submit"] == 0
+
+
+def test_resolve_runtime_strategy_identity_never_returns_none_for_selected_strategy() -> None:
+    version = _version()
+    proposal = StrategyProposal(
+        action="HOLD",
+        strategy_name="ma_crossover",
+        strategy_version="none",
+        deterministic_explanation=("CHECK_FAILED:insufficient_candle_context",),
+    )
+
+    resolved = _resolve_runtime_strategy_identity(proposal=proposal, version=version)
+
+    assert resolved == build_strategy_identity(slug="ma_crossover", module_version="1.0.0")
+    assert resolved != "none"
+
+
+def test_mandate_scope_accepts_exact_canonical_identity_membership() -> None:
+    version = _version(allowed_order_sides=["BUY", "SELL", "HOLD"])
+    runtime_identity = build_strategy_identity(slug="ma_crossover", module_version="1.0.0")
+
+    assert runtime_identity == version.allowed_strategy_versions[0]
+
+    verdict, reason = _evaluate_mandate_scope(
+        version=version,
+        product_id="BTC-USD",
+        action="HOLD",
+        strategy_version=runtime_identity,
+    )
+
+    assert verdict == "AUTHORIZED"
+    assert reason == "authorized_under_active_mandate"
+
+
+@pytest.mark.asyncio
+async def test_cycle_propagates_canonical_strategy_identity_into_mandate_evaluation(monkeypatch: pytest.MonkeyPatch) -> None:
+    db = _FakeDb()
+    mandate = _mandate(status="ACTIVE")
+    version = _version(allowed_order_sides=["BUY", "SELL", "HOLD"])
+    db.connection = SimpleNamespace(last_readiness_verdict="READY_FOR_PREVIEW", provider="kraken_spot", environment="production")
+
+    _patch_happy_path(monkeypatch, mandate, version, action="HOLD", risk_verdict="NOT_EVALUATED")
+
+    monkeypatch.setattr(
+        "app.services.autonomous_cycle.orchestrator._run_approved_strategy",
+        _async_return(
+            StrategyProposal(
+                action="HOLD",
+                strategy_name="ma_crossover",
+                strategy_version="none",
+                deterministic_explanation=("CHECK_FAILED:insufficient_candle_context",),
+            )
+        ),
+    )
+
+    captured: dict[str, object] = {}
+
+    async def _capture_mandate_eval(*, db, request):
+        captured["strategy_version"] = request.strategy_version
+        return SimpleNamespace(evaluation_id=uuid.uuid4())
+
+    monkeypatch.setattr("app.services.autonomous_cycle.orchestrator.evaluate_and_record_mandate", _capture_mandate_eval)
+
+    result = await run_autonomous_preview_cycle(
+        db=db,
+        request=AutonomousCycleRequest(mandate_id=mandate.mandate_id, actor="operator:owner", idempotency_seed="identity-propagation"),
+    )
+
+    assert result.state == "COMPLETE"
+    assert captured["strategy_version"] == build_strategy_identity(slug="ma_crossover", module_version="1.0.0")
