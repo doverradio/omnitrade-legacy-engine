@@ -685,3 +685,108 @@ async def test_worker_continues_after_structured_execution_rejection(monkeypatch
     assert stats.executions_attempted == 2
     assert stats.executions_rejected == 1
     assert stats.executions_failed == 0
+
+
+@pytest.mark.asyncio
+async def test_run_orchestration_cycle_passes_kraken_client_to_ingestion(monkeypatch: pytest.MonkeyPatch) -> None:
+    db = _FakeDB()
+    captured: dict[str, object] = {}
+
+    async def _fake_ingestion_cycle(db_arg, client_arg, kraken_client_arg, **kwargs):
+        captured["db"] = db_arg
+        captured["client"] = client_arg
+        captured["kraken_client"] = kraken_client_arg
+        captured["interval"] = kwargs.get("interval")
+        return SimpleNamespace(successful_assets=0)
+
+    import app.services.orchestration.continuous_pipeline_worker as worker_module
+
+    monkeypatch.setattr(worker_module, "run_ingestion_cycle", _fake_ingestion_cycle)
+    monkeypatch.setattr(worker_module, "ingest_decision_records", _fake_decision_ingestion)
+    monkeypatch.setattr(worker_module, "_load_active_assets", _async_return([]))
+    monkeypatch.setattr(worker_module, "_load_active_strategies", _async_return([]))
+    monkeypatch.setattr(
+        worker_module,
+        "run_deterministic_research_cycle_if_due",
+        _async_return(
+            SimpleNamespace(
+                started=False,
+                reason="research_disabled",
+                campaign_id=None,
+                candidates_generated=0,
+                candidates_evaluated=0,
+                descendants_generated=0,
+                champion=None,
+            )
+        ),
+    )
+    monkeypatch.setattr(worker_module, "capture_system_intelligence_snapshot_if_due", _async_return(None))
+
+    kraken_client = object()
+    client = object()
+
+    await run_orchestration_cycle(db=db, client=client, kraken_client=kraken_client, config=_config())
+
+    assert captured["db"] is db
+    assert captured["client"] is client
+    assert captured["kraken_client"] is kraken_client
+    assert captured["interval"] == "1m"
+
+
+@pytest.mark.asyncio
+async def test_run_forever_initializes_kraken_client_and_passes_it_to_cycle(monkeypatch: pytest.MonkeyPatch) -> None:
+    import app.services.orchestration.continuous_pipeline_worker as worker_module
+
+    captured: dict[str, object] = {}
+
+    class _FakeHTTPClient:
+        async def __aenter__(self):
+            captured["http_client"] = self
+            return self
+
+        async def __aexit__(self, exc_type, exc, tb):
+            return None
+
+    class _FakeSessionContext:
+        async def __aenter__(self):
+            return object()
+
+        async def __aexit__(self, exc_type, exc, tb):
+            return None
+
+    async def _fake_run_orchestration_cycle(db, **kwargs):
+        captured["db"] = db
+        captured["cycle_kwargs"] = kwargs
+        return SimpleNamespace(
+            ingestion_assets_ok=1,
+            signals_created=0,
+            execution_candidates=0,
+            executions_attempted=0,
+            executions_rejected=0,
+            executions_failed=0,
+            executions_skipped=0,
+            decisions_inserted=0,
+            research_cycles_started=0,
+            intelligence_snapshots_captured=0,
+        )
+
+    async def _fake_sleep(_seconds: float) -> None:
+        raise RuntimeError("stop-loop")
+
+    monkeypatch.setattr(worker_module, "setup_logging", lambda: None)
+    monkeypatch.setattr(worker_module.WorkerConfig, "from_env", staticmethod(_config))
+    monkeypatch.setattr(worker_module, "AsyncHTTPClient", _FakeHTTPClient)
+    monkeypatch.setattr(worker_module, "AsyncSessionLocal", _FakeSessionContext)
+    monkeypatch.setattr(worker_module, "BinanceUSClient", lambda http_client: (captured.update({"binance_http": http_client}) or "binance-client"))
+    monkeypatch.setattr(worker_module, "KrakenSpotClient", lambda http_client: (captured.update({"kraken_http": http_client}) or "kraken-client"))
+    monkeypatch.setattr(worker_module, "run_orchestration_cycle", _fake_run_orchestration_cycle)
+    monkeypatch.setattr(worker_module.asyncio, "sleep", _fake_sleep)
+
+    with pytest.raises(RuntimeError, match="stop-loop"):
+        await worker_module.run_forever()
+
+    assert captured["binance_http"] is captured["http_client"]
+    assert captured["kraken_http"] is captured["http_client"]
+    cycle_kwargs = captured["cycle_kwargs"]
+    assert cycle_kwargs["client"] == "binance-client"
+    assert cycle_kwargs["kraken_client"] == "kraken-client"

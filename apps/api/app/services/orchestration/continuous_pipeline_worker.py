@@ -26,6 +26,7 @@ from app.models.validation_run_event import ValidationRunEvent
 from app.services.ai_coach.deterministic import evaluate_decision_quality_v0
 from app.services.data.binance_client import BinanceUSClient
 from app.services.data.http_client import AsyncHTTPClient
+from app.services.data.kraken_client import KrakenSpotClient
 from app.services.decision_quality.deterministic import evaluate_replay_result_v0
 from app.services.decisions.ingestion import build_signal_idempotency_key
 from app.services.decisions.package import DecisionPackageBuilder
@@ -388,11 +389,13 @@ async def run_orchestration_cycle(
     db: AsyncSession,
     *,
     client: BinanceUSClient,
+    kraken_client: KrakenSpotClient | None = None,
     config: WorkerConfig,
 ) -> CycleStats:
     ingestion_result = await run_ingestion_cycle(
         db,
         client,
+        kraken_client,
         interval=config.candle_interval,
     )
 
@@ -706,12 +709,19 @@ async def run_forever() -> None:
 
     async with AsyncHTTPClient() as http_client:
         client = BinanceUSClient(http_client)
+        kraken_client = KrakenSpotClient(http_client)
+        logger.info("kraken_ingestion_client_initialized provider=%s", "kraken_spot")
 
         while True:
             sleep_seconds = config.poll_interval_seconds
             try:
                 async with AsyncSessionLocal() as db:
-                    stats = await run_orchestration_cycle(db, client=client, config=config)
+                    stats = await run_orchestration_cycle(
+                        db,
+                        client=client,
+                        kraken_client=kraken_client,
+                        config=config,
+                    )
 
                 logger.info(
                     "Pipeline cycle completed ingestion_assets_ok=%s signals_created=%s execution_candidates=%s executions_attempted=%s executions_rejected=%s executions_failed=%s executions_skipped=%s decisions_inserted=%s research_cycles_started=%s intelligence_snapshots_captured=%s",

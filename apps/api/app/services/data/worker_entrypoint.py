@@ -67,9 +67,15 @@ async def run_ingestion_cycle(
             source_interval = interval
             source_lookback = lookback
             source_symbol = asset.symbol
+            provider = "binance_us"
         elif asset.exchange == "kraken_spot":
             if kraken_client is None:
-                logger.warning("Skipping active crypto asset %s because Kraken ingestion is unavailable", asset.symbol)
+                logger.warning(
+                    "Skipping active crypto asset because Kraken ingestion is unavailable asset_id=%s symbol=%s exchange=%s",
+                    asset.id,
+                    asset.symbol,
+                    asset.exchange,
+                )
                 failed_assets += 1
                 continue
 
@@ -77,6 +83,7 @@ async def run_ingestion_cycle(
             source_interval = "15m"
             source_lookback = timedelta(hours=24)
             source_symbol = _kraken_product_symbol(asset)
+            provider = "kraken_spot"
         else:
             logger.warning(
                 "Skipping active crypto asset %s on unsupported exchange %s for candle ingestion",
@@ -89,17 +96,54 @@ async def run_ingestion_cycle(
         try:
             end_time = cycle_completed_at
             start_time = end_time - source_lookback
+            logger.info(
+                "candle_ingestion_fetch_started provider=%s asset_id=%s symbol=%s product=%s interval=%s start_time=%s end_time=%s",
+                provider,
+                asset.id,
+                asset.symbol,
+                source_symbol,
+                source_interval,
+                start_time.isoformat(),
+                end_time.isoformat(),
+            )
             candles = await source_client.fetch_klines(
                 symbol=source_symbol,
                 interval=source_interval,
                 start_time=start_time,
                 end_time=end_time,
             )
+            fetched_count = len(candles)
             written = await upsert_candles(db_session, asset.id, source_interval, candles)
             await db_session.commit()
 
+            newest_close_time = candles[-1].close_time if candles else None
+            ingestion_lag_seconds = None
+            if newest_close_time is not None:
+                ingestion_lag_seconds = int((cycle_completed_at - newest_close_time).total_seconds())
+
             rows_written += written
             successful_assets += 1
+            if fetched_count == 0:
+                logger.info(
+                    "candle_ingestion_no_new_closed_candles provider=%s asset_id=%s symbol=%s product=%s interval=%s",
+                    provider,
+                    asset.id,
+                    asset.symbol,
+                    source_symbol,
+                    source_interval,
+                )
+            logger.info(
+                "candle_ingestion_persisted provider=%s asset_id=%s symbol=%s product=%s interval=%s fetched_count=%s rows_written=%s newest_close_time=%s ingestion_lag_seconds=%s",
+                provider,
+                asset.id,
+                asset.symbol,
+                source_symbol,
+                source_interval,
+                fetched_count,
+                written,
+                newest_close_time.isoformat() if newest_close_time else None,
+                ingestion_lag_seconds,
+            )
         except (BinanceClientError, KrakenClientError):
             logger.exception("Recent-candle ingestion failed for symbol=%s exchange=%s", asset.symbol, asset.exchange)
             failed_assets += 1
