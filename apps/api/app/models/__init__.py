@@ -50,6 +50,8 @@ from app.models.risk_kill_switch import RiskKillSwitch
 from app.models.risk_rule_config import RiskRuleConfig
 from app.models.signal import Signal
 from app.models.strategy import Strategy
+from app.models.strategy_roster_proposal import StrategyRosterProposal
+from app.models.strategy_roster_run import StrategyRosterRun
 from app.models.trade import Trade
 from app.models.research_laboratory_run import ResearchLaboratoryRun
 from app.models.research_campaign import ResearchCampaign
@@ -118,6 +120,8 @@ __all__ = [
 	"RiskRuleConfig",
 	"Signal",
 	"Strategy",
+	"StrategyRosterProposal",
+	"StrategyRosterRun",
 	"Trade",
 	"ResearchLaboratoryRun",
 	"ResearchCampaign",

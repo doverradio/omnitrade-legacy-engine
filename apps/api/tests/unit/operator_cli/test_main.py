@@ -109,3 +109,20 @@ def test_parse_watch_command() -> None:
     assert args.command == "watch"
     assert args.symbol == "BTC"
     assert args.refresh_seconds == 2
+
+
+def test_parse_roster_command() -> None:
+    args = parse_args([
+        "roster",
+        "--provider",
+        "kraken_spot",
+        "--product-id",
+        "BTC-USD",
+        "--interval",
+        "15m",
+    ])
+
+    assert args.command == "roster"
+    assert args.provider == "kraken_spot"
+    assert args.product_id == "BTC-USD"
+    assert args.interval == "15m"

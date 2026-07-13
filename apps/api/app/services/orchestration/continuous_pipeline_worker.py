@@ -41,6 +41,7 @@ from app.services.system_intelligence_snapshots import capture_system_intelligen
 from app.services.strategies import StrategyContext, strategy_registry
 from app.services.strategies.registry import StrategyLookupError
 from app.services.autonomous_cycle import AutonomousCycleRequest, run_autonomous_preview_cycle
+from app.services.strategy_roster import StrategyRosterRequest, run_strategy_roster_for_candle
 
 logger = logging.getLogger(__name__)
 
@@ -260,14 +261,14 @@ def _build_kraken_btc_candle_idempotency_seed(*, candle: Candle) -> str:
     return f"kraken-btc-15m-close:{close_time_utc.astimezone(timezone.utc).isoformat()}"
 
 
-async def _run_kraken_btc_autonomous_cycle_if_due(*, db: AsyncSession) -> None:
+async def _run_kraken_btc_autonomous_cycle_if_due(*, db: AsyncSession) -> tuple[uuid.UUID | None, Candle | None]:
     mandate = await _load_single_active_kraken_mandate(db)
     if mandate is None:
-        return
+        return None, None
 
     latest_candle = await _load_latest_kraken_btc_15m_candle(db)
     if latest_candle is None:
-        return
+        return None, None
 
     result = await run_autonomous_preview_cycle(
         db=db,
@@ -289,6 +290,7 @@ async def _run_kraken_btc_autonomous_cycle_if_due(*, db: AsyncSession) -> None:
         result.replayed,
         result.idempotency_key,
     )
+    return result.cycle_id, latest_candle
 
 
 async def _load_active_validation_run_ids(*, db: AsyncSession) -> list[uuid.UUID]:
@@ -499,11 +501,40 @@ async def run_orchestration_cycle(
         interval=config.candle_interval,
     )
 
+    autonomous_cycle_id: uuid.UUID | None = None
+    kraken_btc_candle: Candle | None = None
     try:
-        await _run_kraken_btc_autonomous_cycle_if_due(db=db)
+        autonomous_cycle_id, kraken_btc_candle = await _run_kraken_btc_autonomous_cycle_if_due(db=db)
     except Exception:
         await _rollback_active_session(db=db)
         logger.exception("autonomous_cycle_failed trigger=%s", _AUTONOMOUS_CYCLE_TRIGGER)
+
+    try:
+        if kraken_btc_candle is None:
+            kraken_btc_candle = await _load_latest_kraken_btc_15m_candle(db)
+        if kraken_btc_candle is not None:
+            await run_strategy_roster_for_candle(
+                db=db,
+                request=StrategyRosterRequest(
+                    asset_id=kraken_btc_candle.asset_id,
+                    provider=_AUTONOMOUS_CYCLE_PROVIDER,
+                    product_id=_AUTONOMOUS_CYCLE_PRODUCT_ID,
+                    interval=_AUTONOMOUS_CYCLE_INTERVAL,
+                    candle_open_time=kraken_btc_candle.open_time,
+                    candle_close_time=kraken_btc_candle.close_time,
+                    trigger=_AUTONOMOUS_CYCLE_TRIGGER,
+                    scheduled_cycle_id=autonomous_cycle_id,
+                ),
+            )
+    except Exception:
+        await _rollback_active_session(db=db)
+        logger.exception(
+            "strategy_roster_failed trigger=%s provider=%s product_id=%s interval=%s",
+            _AUTONOMOUS_CYCLE_TRIGGER,
+            _AUTONOMOUS_CYCLE_PROVIDER,
+            _AUTONOMOUS_CYCLE_PRODUCT_ID,
+            _AUTONOMOUS_CYCLE_INTERVAL,
+        )
 
     assets = await _load_active_assets(db)
     strategies = await _load_active_strategies(db)

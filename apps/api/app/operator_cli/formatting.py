@@ -595,3 +595,57 @@ def render_watch_text(payload: dict[str, Any], options: RenderOptions) -> str:
     )
     lines.append(_style("Press Ctrl+C to exit watch mode.", "muted", options))
     return "\n".join(lines)
+
+
+def render_roster_text(payload: dict[str, Any], options: RenderOptions) -> str:
+    run = payload.get("roster_run") or {}
+    proposals = payload.get("proposals") or []
+    lines = _frame_header("STRATEGY ROSTER", options)
+
+    if not run:
+        lines.append("No roster run found for this market.")
+        return "\n".join(lines)
+
+    lines.extend(
+        _section(
+            "Market",
+            [
+                ("Asset", _fmt(payload.get("product_id"), default="Unavailable")),
+                ("Interval", _fmt(payload.get("interval"), default="Unavailable")),
+                ("Candle close", _fmt(run.get("candle_close_time"), default="Unavailable")),
+                ("Trigger", _fmt(run.get("trigger"), default="Unavailable")),
+            ],
+            options,
+        )
+    )
+
+    for item in proposals:
+        lines.append(f"{_fmt(item.get('strategy_slug')):<20} {_badge(_fmt(item.get('action')), replayed=False, options=options)}")
+    if proposals:
+        lines.append("")
+
+    lines.extend(
+        _section(
+            "Summary",
+            [
+                ("BUY", _fmt(run.get("buy_count"), default="0")),
+                ("SELL", _fmt(run.get("sell_count"), default="0")),
+                ("HOLD", _fmt(run.get("hold_count"), default="0")),
+                ("Failed", _fmt(len(run.get("strategies_failed") or []), default="0")),
+            ],
+            options,
+        )
+    )
+    lines.extend(
+        _section(
+            "Execution",
+            [
+                ("Mode", _fmt(run.get("execution_mode"), default="SHADOW")),
+                ("Capital moved", "No"),
+                ("Live submission", "Disabled" if not run.get("live_submission_allowed") else "Enabled"),
+            ],
+            options,
+        )
+    )
+
+    return "\n".join(lines)

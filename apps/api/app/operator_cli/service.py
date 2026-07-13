@@ -20,6 +20,8 @@ from app.models.decision_record import DecisionRecord
 from app.models.decision_snapshot import DecisionSnapshot
 from app.models.exchange_connection import ExchangeConnection
 from app.models.live_crypto_order import LiveCryptoOrder
+from app.models.strategy_roster_proposal import StrategyRosterProposal
+from app.models.strategy_roster_run import StrategyRosterRun
 from app.services.autonomous_cycle import AutonomousCycleRequest, run_autonomous_preview_cycle
 
 
@@ -751,3 +753,82 @@ async def fetch_watch_status(
         candle_exchange=candle_exchange,
         candle_max_age_minutes=candle_max_age_minutes,
     )
+
+
+async def fetch_strategy_roster_summary(
+    *,
+    provider: str,
+    product_id: str,
+    interval: str,
+) -> dict[str, Any]:
+    async with AsyncSessionLocal() as db:
+        latest_run = await db.scalar(
+            select(StrategyRosterRun)
+            .where(StrategyRosterRun.provider == provider)
+            .where(StrategyRosterRun.product_id == product_id)
+            .where(StrategyRosterRun.interval == interval)
+            .order_by(desc(StrategyRosterRun.candle_close_time), desc(StrategyRosterRun.created_at))
+            .limit(1)
+        )
+
+        if latest_run is None:
+            return {
+                "provider": provider,
+                "product_id": product_id,
+                "interval": interval,
+                "roster_run": None,
+                "proposals": [],
+            }
+
+        proposals = list(
+            (
+                await db.execute(
+                    select(StrategyRosterProposal)
+                    .where(StrategyRosterProposal.roster_run_id == latest_run.roster_run_id)
+                    .order_by(StrategyRosterProposal.strategy_slug.asc())
+                )
+            ).scalars().all()
+        )
+
+    return {
+        "provider": provider,
+        "product_id": product_id,
+        "interval": interval,
+        "roster_run": {
+            "roster_run_id": latest_run.roster_run_id,
+            "asset_id": latest_run.asset_id,
+            "candle_open_time": latest_run.candle_open_time,
+            "candle_close_time": latest_run.candle_close_time,
+            "trigger": latest_run.trigger,
+            "started_at": latest_run.started_at,
+            "completed_at": latest_run.completed_at,
+            "strategies_requested": list(latest_run.strategies_requested or []),
+            "strategies_completed": list(latest_run.strategies_completed or []),
+            "strategies_failed": list(latest_run.strategies_failed or []),
+            "buy_count": latest_run.buy_count,
+            "sell_count": latest_run.sell_count,
+            "hold_count": latest_run.hold_count,
+            "execution_mode": latest_run.execution_mode,
+            "live_submission_allowed": latest_run.live_submission_allowed,
+            "scheduled_cycle_id": latest_run.scheduled_cycle_id,
+        },
+        "proposals": [
+            {
+                "proposal_id": item.proposal_id,
+                "strategy_slug": item.strategy_slug,
+                "strategy_version": item.strategy_version,
+                "strategy_identity": item.strategy_identity,
+                "parameter_set_identity": item.parameter_set_identity,
+                "action": item.action,
+                "evaluation_status": item.evaluation_status,
+                "strength": item.strength,
+                "confidence": item.confidence,
+                "reason": item.reason,
+                "deterministic_explanation": list(item.deterministic_explanation or []),
+                "indicator_values": item.indicator_values,
+                "market_window_evidence": item.market_window_evidence,
+                "evaluated_at": item.evaluated_at,
+            }
+            for item in proposals
+        ],
+    }

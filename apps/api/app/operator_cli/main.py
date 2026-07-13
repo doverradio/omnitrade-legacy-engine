@@ -10,6 +10,7 @@ from uuid import UUID, uuid4
 from app.operator_cli.formatting import (
     render_candles_text,
     render_json,
+    render_roster_text,
     render_watch_text,
     render_preview_show_text,
     render_preview_text,
@@ -21,6 +22,7 @@ from app.operator_cli.service import (
     fetch_candle_readiness,
     fetch_operator_status,
     fetch_preview_evidence,
+    fetch_strategy_roster_summary,
     fetch_watch_status,
 )
 
@@ -41,6 +43,7 @@ def _build_parser() -> argparse.ArgumentParser:
             "  ./operator candles --symbol BTC --exchange kraken_spot\n"
             "  ./operator preview-show --preview-id <preview_uuid>\n"
             "  ./operator watch --symbol BTC --interval 15m\n"
+            "  ./operator roster\n"
             "  ./operator status --json\n"
             "  ./operator status --no-color --verbose"
         ),
@@ -114,6 +117,17 @@ def _build_parser() -> argparse.ArgumentParser:
     watch.add_argument("--refresh-seconds", type=int, default=5)
     watch.add_argument("--json", action="store_true", dest="json_output")
 
+    roster = subparsers.add_parser(
+        "roster",
+        parents=[common],
+        help="Show latest shadow strategy roster run and proposals",
+        description="Read-only Strategy Roster summary for the latest completed candle.",
+    )
+    roster.add_argument("--provider", type=str, default="kraken_spot")
+    roster.add_argument("--product-id", type=str, default="BTC-USD")
+    roster.add_argument("--interval", type=str, default="15m")
+    roster.add_argument("--json", action="store_true", dest="json_output")
+
     return parser
 
 
@@ -174,6 +188,15 @@ async def _run_async(args: argparse.Namespace) -> tuple[int, dict[str, Any], str
             "watch_refreshed_at": datetime.now(timezone.utc),
         }
         text = render_json(payload) if args.json_output else render_watch_text(payload, options)
+        return 0, payload, text
+
+    if args.command == "roster":
+        payload = await fetch_strategy_roster_summary(
+            provider=args.provider,
+            product_id=args.product_id,
+            interval=args.interval,
+        )
+        text = render_json(payload) if args.json_output else render_roster_text(payload, options)
         return 0, payload, text
 
     payload = await fetch_operator_status(

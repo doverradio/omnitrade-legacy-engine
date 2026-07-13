@@ -28,9 +28,13 @@ def test_registry_registers_all_documented_placeholder_strategies() -> None:
     register_builtin_strategies(registry)
 
     assert registry.registered_slugs() == (
+        "bollinger_reversion",
         "breakout",
+        "donchian_breakout",
         "ensemble_scorer",
         "ma_crossover",
+        "mean_reversion",
+        "momentum",
         "rsi_mean_reversion",
         "trend_regime_filter",
         "volatility_filter",

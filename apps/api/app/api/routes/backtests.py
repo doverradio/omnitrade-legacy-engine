@@ -202,9 +202,17 @@ async def get_backtest_trades(backtest_id: uuid.UUID, db: AsyncSession = Depends
 def _minimum_history_required(strategy_slug: str, params: dict[str, object]) -> int:
     if strategy_slug == "ma_crossover":
         return int(params.get("slow_period", 50)) + 1
+    if strategy_slug == "momentum":
+        return int(params.get("lookback", 6)) + 1
     if strategy_slug == "rsi_mean_reversion":
         return int(params.get("rsi_period", 14)) + 1
     if strategy_slug == "breakout":
+        return int(params.get("lookback", 20)) + 1
+    if strategy_slug == "mean_reversion":
+        return int(params.get("window", 20)) + 1
+    if strategy_slug == "bollinger_reversion":
+        return int(params.get("window", 20)) + 1
+    if strategy_slug == "donchian_breakout":
         return int(params.get("lookback", 20)) + 1
     if strategy_slug == "volatility_filter":
         return int(params.get("atr_period", 14)) + 1

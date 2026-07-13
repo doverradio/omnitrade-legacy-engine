@@ -815,9 +815,155 @@ async def test_worker_rolls_back_and_continues_when_autonomous_cycle_raises(monk
     monkeypatch.setattr(
         worker_module,
         "_load_latest_kraken_btc_15m_candle",
-        _async_return(SimpleNamespace(close_time=datetime(2026, 7, 9, 12, 15, tzinfo=timezone.utc))),
+        _async_return(
+            SimpleNamespace(
+                asset_id=uuid.uuid4(),
+                open_time=datetime(2026, 7, 9, 12, 0, tzinfo=timezone.utc),
+                close_time=datetime(2026, 7, 9, 12, 15, tzinfo=timezone.utc),
+            )
+        ),
     )
     monkeypatch.setattr(worker_module, "run_autonomous_preview_cycle", _raise_cycle)
+    monkeypatch.setattr(
+        worker_module,
+        "run_strategy_roster_for_candle",
+        _async_return(SimpleNamespace(roster_run_id=uuid.uuid4(), replayed=False)),
+    )
+
+    stats = await run_orchestration_cycle(db=db, client=object(), config=_config())
+
+    assert stats.ingestion_assets_ok == 1
+    assert db.rollbacks == 1
+
+
+@pytest.mark.asyncio
+async def test_worker_triggers_strategy_roster_with_autonomous_cycle_link(monkeypatch: pytest.MonkeyPatch) -> None:
+    db = _FakeDB()
+    captured: dict[str, object] = {}
+    cycle_id = uuid.uuid4()
+    candle = SimpleNamespace(
+        asset_id=uuid.uuid4(),
+        open_time=datetime(2026, 7, 10, 12, 0, tzinfo=timezone.utc),
+        close_time=datetime(2026, 7, 10, 12, 15, tzinfo=timezone.utc),
+    )
+
+    async def _capture_roster(*, db, request):
+        captured["request"] = request
+        return SimpleNamespace(roster_run_id=uuid.uuid4(), replayed=False)
+
+    import app.services.orchestration.continuous_pipeline_worker as worker_module
+
+    monkeypatch.setattr(worker_module, "run_ingestion_cycle", _fake_ingestion_cycle)
+    monkeypatch.setattr(worker_module, "_run_kraken_btc_autonomous_cycle_if_due", _async_return((cycle_id, candle)))
+    monkeypatch.setattr(worker_module, "run_strategy_roster_for_candle", _capture_roster)
+    monkeypatch.setattr(worker_module, "_load_active_assets", _async_return([]))
+    monkeypatch.setattr(worker_module, "_load_active_strategies", _async_return([]))
+    monkeypatch.setattr(
+        worker_module,
+        "run_deterministic_research_cycle_if_due",
+        _async_return(
+            SimpleNamespace(
+                started=False,
+                reason="not_due",
+                campaign_id=None,
+                candidates_generated=0,
+                candidates_evaluated=0,
+                descendants_generated=0,
+                champion=None,
+            )
+        ),
+    )
+    monkeypatch.setattr(worker_module, "capture_system_intelligence_snapshot_if_due", _async_return(None))
+
+    stats = await run_orchestration_cycle(db=db, client=object(), config=_config())
+
+    assert stats.ingestion_assets_ok == 1
+    request = captured["request"]
+    assert request.asset_id == candle.asset_id
+    assert request.candle_close_time == candle.close_time
+    assert request.scheduled_cycle_id == cycle_id
+
+
+@pytest.mark.asyncio
+async def test_worker_still_runs_roster_when_autonomous_cycle_skips(monkeypatch: pytest.MonkeyPatch) -> None:
+    db = _FakeDB()
+    captured = {"count": 0}
+    candle = SimpleNamespace(
+        asset_id=uuid.uuid4(),
+        open_time=datetime(2026, 7, 10, 12, 0, tzinfo=timezone.utc),
+        close_time=datetime(2026, 7, 10, 12, 15, tzinfo=timezone.utc),
+    )
+
+    async def _capture_roster(*, db, request):
+        captured["count"] += 1
+        return SimpleNamespace(roster_run_id=uuid.uuid4(), replayed=False)
+
+    import app.services.orchestration.continuous_pipeline_worker as worker_module
+
+    monkeypatch.setattr(worker_module, "run_ingestion_cycle", _fake_ingestion_cycle)
+    monkeypatch.setattr(worker_module, "_run_kraken_btc_autonomous_cycle_if_due", _async_return((None, None)))
+    monkeypatch.setattr(worker_module, "_load_latest_kraken_btc_15m_candle", _async_return(candle))
+    monkeypatch.setattr(worker_module, "run_strategy_roster_for_candle", _capture_roster)
+    monkeypatch.setattr(worker_module, "_load_active_assets", _async_return([]))
+    monkeypatch.setattr(worker_module, "_load_active_strategies", _async_return([]))
+    monkeypatch.setattr(
+        worker_module,
+        "run_deterministic_research_cycle_if_due",
+        _async_return(
+            SimpleNamespace(
+                started=False,
+                reason="not_due",
+                campaign_id=None,
+                candidates_generated=0,
+                candidates_evaluated=0,
+                descendants_generated=0,
+                champion=None,
+            )
+        ),
+    )
+    monkeypatch.setattr(worker_module, "capture_system_intelligence_snapshot_if_due", _async_return(None))
+
+    stats = await run_orchestration_cycle(db=db, client=object(), config=_config())
+
+    assert stats.ingestion_assets_ok == 1
+    assert captured["count"] == 1
+
+
+@pytest.mark.asyncio
+async def test_worker_rolls_back_and_continues_when_roster_raises(monkeypatch: pytest.MonkeyPatch) -> None:
+    db = _FakeDB()
+    candle = SimpleNamespace(
+        asset_id=uuid.uuid4(),
+        open_time=datetime(2026, 7, 10, 12, 0, tzinfo=timezone.utc),
+        close_time=datetime(2026, 7, 10, 12, 15, tzinfo=timezone.utc),
+    )
+
+    async def _raise_roster(*, db, request):
+        raise RuntimeError("roster failed")
+
+    import app.services.orchestration.continuous_pipeline_worker as worker_module
+
+    monkeypatch.setattr(worker_module, "run_ingestion_cycle", _fake_ingestion_cycle)
+    monkeypatch.setattr(worker_module, "_run_kraken_btc_autonomous_cycle_if_due", _async_return((uuid.uuid4(), candle)))
+    monkeypatch.setattr(worker_module, "run_strategy_roster_for_candle", _raise_roster)
+    monkeypatch.setattr(worker_module, "_load_active_assets", _async_return([]))
+    monkeypatch.setattr(worker_module, "_load_active_strategies", _async_return([]))
+    monkeypatch.setattr(
+        worker_module,
+        "run_deterministic_research_cycle_if_due",
+        _async_return(
+            SimpleNamespace(
+                started=False,
+                reason="not_due",
+                campaign_id=None,
+                candidates_generated=0,
+                candidates_evaluated=0,
+                descendants_generated=0,
+                champion=None,
+            )
+        ),
+    )
+    monkeypatch.setattr(worker_module, "capture_system_intelligence_snapshot_if_due", _async_return(None))
 
     stats = await run_orchestration_cycle(db=db, client=object(), config=_config())
 
