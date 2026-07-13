@@ -108,6 +108,22 @@ source .venv/bin/activate
 python -m app.services.data.worker_entrypoint
 ```
 
+## Operator CLI (repo root)
+
+Use the root operator entrypoint to run autonomous preview and read-only operator diagnostics from the repository root.
+
+```bash
+./operator preview --mandate-id <mandate_uuid> --actor operator:human --product-id BTC-USD --strategy-interval 15m
+./operator preview-show --preview-id <preview_uuid>
+./operator candles --symbol BTC --interval 15m --exchange kraken_spot --max-age-minutes 30
+./operator status --mandate-id <mandate_uuid> --symbol BTC --interval 15m --exchange kraken_spot
+```
+
+Notes:
+- The `preview` command runs only the preview path and never submits live orders.
+- `preview-show`, `candles`, and `status` are read-only evidence and diagnostics views.
+- Add `--json` to any command to output machine-readable JSON.
+
 ### 6) Phase 0 Validation
 
 Run the Phase 0 checklist in [docs/VALIDATION_CHECKLIST.md](docs/VALIDATION_CHECKLIST.md).

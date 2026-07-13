@@ -1,0 +1,71 @@
+from __future__ import annotations
+
+from uuid import UUID
+
+from app.operator_cli.main import parse_args
+
+
+def test_parse_preview_command() -> None:
+    args = parse_args([
+        "preview",
+        "--mandate-id",
+        "11111111-1111-1111-1111-111111111111",
+        "--actor",
+        "operator:test",
+        "--product-id",
+        "BTC-USD",
+    ])
+
+    assert args.command == "preview"
+    assert args.mandate_id == UUID("11111111-1111-1111-1111-111111111111")
+    assert args.actor == "operator:test"
+    assert args.product_id == "BTC-USD"
+    assert args.strategy_interval == "15m"
+
+
+def test_parse_preview_show_command() -> None:
+    args = parse_args([
+        "preview-show",
+        "--preview-id",
+        "22222222-2222-2222-2222-222222222222",
+        "--json",
+    ])
+
+    assert args.command == "preview-show"
+    assert args.preview_id == UUID("22222222-2222-2222-2222-222222222222")
+    assert args.json_output is True
+
+
+def test_parse_candles_command() -> None:
+    args = parse_args([
+        "candles",
+        "--symbol",
+        "BTC",
+        "--interval",
+        "15m",
+        "--exchange",
+        "kraken_spot",
+        "--max-age-minutes",
+        "12",
+    ])
+
+    assert args.command == "candles"
+    assert args.symbol == "BTC"
+    assert args.interval == "15m"
+    assert args.exchange == "kraken_spot"
+    assert args.max_age_minutes == 12
+
+
+def test_parse_status_command() -> None:
+    args = parse_args([
+        "status",
+        "--mandate-id",
+        "33333333-3333-3333-3333-333333333333",
+        "--symbol",
+        "BTC",
+    ])
+
+    assert args.command == "status"
+    assert args.mandate_id == UUID("33333333-3333-3333-3333-333333333333")
+    assert args.symbol == "BTC"
+    assert args.interval == "15m"
