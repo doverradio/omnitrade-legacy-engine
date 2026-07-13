@@ -520,19 +520,18 @@ async def _run_approved_strategy(
             deterministic_explanation=(f"CHECK_INFO:forced_action={request.forced_action}",),
         )
 
-    symbol = product_to_asset_symbol(request.product_id)
-    asset = await db.scalar(
-        select(Asset)
-        .where(Asset.symbol == symbol)
-        .order_by(desc(Asset.created_at))
-        .limit(1)
+    asset, asset_resolution_reason = await _resolve_asset_for_cycle(
+        db=db,
+        product_id=request.product_id,
+        provider=mandate.provider,
+        exchange_environment=mandate.exchange_environment,
     )
     if asset is None:
         return StrategyProposal(
             action="HOLD",
             strategy_name="none",
             strategy_version="none",
-            deterministic_explanation=("CHECK_FAILED:asset_not_found_for_strategy",),
+            deterministic_explanation=(f"CHECK_FAILED:{asset_resolution_reason or 'asset_not_found_for_strategy'}",),
         )
 
     strategies = list(
@@ -703,8 +702,12 @@ async def _evaluate_risk(
             reason_code="paper_account_required_for_risk_context",
         )
 
-    symbol = product_to_asset_symbol(product_id)
-    asset = await db.scalar(select(Asset).where(Asset.symbol == symbol).limit(1))
+    asset, _asset_resolution_reason = await _resolve_asset_for_cycle(
+        db=db,
+        product_id=product_id,
+        provider=mandate.provider,
+        exchange_environment=mandate.exchange_environment,
+    )
     if asset is None:
         return RiskEvaluationSummary(
             risk_verdict="REJECTED",
@@ -1096,6 +1099,60 @@ def product_to_asset_symbol(product_id: str) -> str:
     if len(parts) == 2:
         return f"{parts[0]}{parts[1]}"
     return normalized.replace("-", "")
+
+
+def _canonicalize_asset_symbol(symbol: str) -> str:
+    normalized = symbol.strip().upper()
+    return {
+        "XXBT": "BTC",
+        "XBT": "BTC",
+    }.get(normalized, normalized)
+
+
+def _candidate_asset_symbols_for_product(product_id: str) -> tuple[str, ...]:
+    normalized_product = normalize_product_id(product_id)
+    base_symbol = normalized_product.split("-", 1)[0] if "-" in normalized_product else normalized_product
+    canonical_base_symbol = _canonicalize_asset_symbol(base_symbol)
+    candidates = {canonical_base_symbol}
+    if canonical_base_symbol == "BTC":
+        candidates.update({"XBT", "XXBT"})
+    return tuple(sorted(candidates))
+
+
+def _provider_exchange_label(*, provider: str, exchange_environment: str) -> str:
+    normalized_environment = exchange_environment.strip().lower()
+    if normalized_environment == "sandbox":
+        return f"{provider}_sandbox"
+    return provider
+
+
+async def _resolve_asset_for_cycle(
+    *,
+    db: AsyncSession,
+    product_id: str,
+    provider: str,
+    exchange_environment: str,
+) -> tuple[Asset | None, str | None]:
+    candidate_symbols = _candidate_asset_symbols_for_product(product_id)
+    exchange_label = _provider_exchange_label(provider=provider, exchange_environment=exchange_environment)
+    rows = list(
+        (
+            await db.execute(
+                select(Asset)
+                .where(func.upper(Asset.symbol).in_(candidate_symbols))
+                .where(Asset.asset_class == "crypto")
+                .where(Asset.exchange == exchange_label)
+                .where(Asset.is_active.is_(True))
+                .order_by(desc(Asset.created_at))
+                .limit(2)
+            )
+        ).scalars().all()
+    )
+    if not rows:
+        return None, "asset_not_found_for_strategy"
+    if len(rows) > 1:
+        return None, "ambiguous_asset_resolution_for_strategy"
+    return rows[0], None
 
 
 def _to_version_model(

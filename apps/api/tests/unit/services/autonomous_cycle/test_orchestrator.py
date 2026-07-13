@@ -8,11 +8,16 @@ import uuid
 import pytest
 
 from app.models.audit_log import AuditLog
+from app.models.decision_record import DecisionRecord
 from app.models.autonomous_cycle_run import AutonomousCycleRun
 from app.services.autonomous_cycle.contracts import AutonomousCycleRequest, ReconciliationStatus, RiskEvaluationSummary, StrategyProposal
 from app.services.autonomous_cycle.orchestrator import (
+    _candidate_asset_symbols_for_product,
     _evaluate_mandate_scope,
+    _persist_decision_intelligence,
+    _resolve_asset_for_cycle,
     _resolve_runtime_strategy_identity,
+    _run_approved_strategy,
     run_autonomous_preview_cycle,
 )
 from app.services.strategies.identity import build_strategy_identity
@@ -703,3 +708,204 @@ async def test_cycle_propagates_canonical_strategy_identity_into_mandate_evaluat
 
     assert result.state == "COMPLETE"
     assert captured["strategy_version"] == build_strategy_identity(slug="ma_crossover", module_version="1.0.0")
+
+
+def test_candidate_asset_symbols_for_product_normalizes_btc_and_xbt_aliases() -> None:
+    assert _candidate_asset_symbols_for_product("BTC-USD") == ("BTC", "XBT", "XXBT")
+    assert _candidate_asset_symbols_for_product("BTC/USD") == ("BTC", "XBT", "XXBT")
+    assert _candidate_asset_symbols_for_product("XBT/USD") == ("BTC", "XBT", "XXBT")
+
+
+@pytest.mark.asyncio
+async def test_resolve_asset_for_cycle_scopes_to_provider_exchange() -> None:
+    class _Result:
+        def __init__(self, rows):
+            self._rows = rows
+
+        def scalars(self):
+            return self
+
+        def all(self):
+            return list(self._rows)
+
+    class _Db:
+        async def execute(self, _statement):
+            return _Result(
+                [
+                    SimpleNamespace(id=uuid.uuid4(), symbol="BTC", exchange="coinbase_advanced", asset_class="crypto", is_active=True),
+                ]
+            )
+
+    asset, reason = await _resolve_asset_for_cycle(
+        db=_Db(),
+        product_id="BTC-USD",
+        provider="coinbase_advanced",
+        exchange_environment="production",
+    )
+
+    assert reason is None
+    assert asset is not None
+    assert asset.symbol == "BTC"
+    assert asset.exchange == "coinbase_advanced"
+
+
+@pytest.mark.asyncio
+async def test_resolve_asset_for_cycle_fails_closed_when_ambiguous() -> None:
+    class _Result:
+        def __init__(self, rows):
+            self._rows = rows
+
+        def scalars(self):
+            return self
+
+        def all(self):
+            return list(self._rows)
+
+    class _Db:
+        async def execute(self, _statement):
+            return _Result(
+                [
+                    SimpleNamespace(id=uuid.uuid4(), symbol="BTC", exchange="kraken_spot", asset_class="crypto", is_active=True),
+                    SimpleNamespace(id=uuid.uuid4(), symbol="XBT", exchange="kraken_spot", asset_class="crypto", is_active=True),
+                ]
+            )
+
+    asset, reason = await _resolve_asset_for_cycle(
+        db=_Db(),
+        product_id="BTC-USD",
+        provider="kraken_spot",
+        exchange_environment="production",
+    )
+
+    assert asset is None
+    assert reason == "ambiguous_asset_resolution_for_strategy"
+
+
+@pytest.mark.asyncio
+async def test_resolve_asset_for_cycle_missing_asset_returns_not_found() -> None:
+    class _Result:
+        def scalars(self):
+            return self
+
+        def all(self):
+            return []
+
+    class _Db:
+        async def execute(self, _statement):
+            return _Result()
+
+    asset, reason = await _resolve_asset_for_cycle(
+        db=_Db(),
+        product_id="BTC-USD",
+        provider="kraken_spot",
+        exchange_environment="production",
+    )
+
+    assert asset is None
+    assert reason == "asset_not_found_for_strategy"
+
+
+@pytest.mark.asyncio
+async def test_run_approved_strategy_executes_with_resolved_asset_and_candles(monkeypatch: pytest.MonkeyPatch) -> None:
+    asset = SimpleNamespace(id=uuid.uuid4(), symbol="BTC", asset_class="crypto", exchange="kraken_spot", is_active=True)
+    strategy = SimpleNamespace(
+        id=uuid.uuid4(),
+        slug="ma_crossover",
+        module_version="1.0.0",
+        created_at=datetime.now(timezone.utc),
+    )
+    candles = [
+        SimpleNamespace(
+            open_time=datetime.now(timezone.utc),
+            close_time=datetime.now(timezone.utc),
+            open=Decimal("1"),
+            high=Decimal("2"),
+            low=Decimal("1"),
+            close=Decimal("2"),
+            volume=Decimal("10"),
+        )
+        for _ in range(3)
+    ]
+
+    class _Result:
+        def __init__(self, rows):
+            self._rows = rows
+
+        def scalars(self):
+            return self
+
+        def all(self):
+            return list(self._rows)
+
+    class _Db:
+        async def execute(self, statement):
+            sql = str(statement)
+            if "FROM assets" in sql:
+                return _Result([asset])
+            if "FROM strategies" in sql:
+                return _Result([strategy])
+            if "FROM candles" in sql:
+                return _Result(candles)
+            return _Result([])
+
+        async def scalar(self, statement):
+            sql = str(statement)
+            if "FROM parameter_sets" in sql:
+                return None
+            return None
+
+    captured: dict[str, object] = {}
+
+    class _Generator:
+        def generate_signal(self, context):
+            captured["candles"] = context.candles
+            captured["asset_metadata"] = context.asset_metadata
+            return SimpleNamespace(action="BUY")
+
+    monkeypatch.setattr("app.services.autonomous_cycle.orchestrator.strategy_registry.has", lambda _slug: True)
+    monkeypatch.setattr("app.services.autonomous_cycle.orchestrator.strategy_registry.get", lambda _slug: _Generator())
+
+    proposal = await _run_approved_strategy(
+        db=_Db(),
+        mandate=SimpleNamespace(provider="kraken_spot", exchange_environment="production"),
+        version=SimpleNamespace(allowed_strategy_versions=[build_strategy_identity(slug="ma_crossover", module_version="1.0.0")]),
+        request=AutonomousCycleRequest(mandate_id=uuid.uuid4(), actor="operator:owner", product_id="BTC-USD", strategy_interval="15m"),
+    )
+
+    assert proposal.action == "BUY"
+    assert proposal.strategy_name == "ma_crossover"
+    assert proposal.strategy_version == build_strategy_identity(slug="ma_crossover", module_version="1.0.0")
+    assert captured.get("candles") is not None
+    assert len(captured["candles"]) == 3
+    assert captured["asset_metadata"] == {"symbol": "BTC", "asset_class": "crypto"}
+
+
+@pytest.mark.asyncio
+async def test_decision_record_persists_canonical_product_identity() -> None:
+    db = _FakeDb()
+    cycle_id = uuid.uuid4()
+    await _persist_decision_intelligence(
+        db=db,
+        cycle=SimpleNamespace(cycle_id=cycle_id, risk_event_id=None, audit_correlation_id=uuid.uuid4()),
+        mandate=SimpleNamespace(provider="kraken_spot", mandate_id=uuid.uuid4()),
+        version=SimpleNamespace(
+            mandate_version_id=uuid.uuid4(),
+            allowed_strategy_versions=[build_strategy_identity(slug="ma_crossover", module_version="1.0.0")],
+            max_order_notional_usd=Decimal("5"),
+            max_open_exposure_usd=Decimal("10"),
+        ),
+        proposal=StrategyProposal(
+            action="BUY",
+            strategy_name="ma_crossover",
+            strategy_version=build_strategy_identity(slug="ma_crossover", module_version="1.0.0"),
+            deterministic_explanation=("CHECK_PASSED:strategy_evaluated",),
+        ),
+        risk_summary=RiskEvaluationSummary(risk_verdict="ACCEPTED", risk_event_id=None, reason_code=None),
+        product_id="BTC-USD",
+        reference_price=Decimal("50000"),
+        evidence_age_minutes=0,
+        strategy_interval="15m",
+    )
+
+    record = next(item for item in db.added if isinstance(item, DecisionRecord))
+    assert record.asset["product_id"] == "BTC-USD"
