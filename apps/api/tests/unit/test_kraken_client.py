@@ -83,3 +83,50 @@ async def test_fetch_klines_excludes_current_incomplete_candle_using_end_time() 
 
     assert len(candles) == 2
     assert candles[-1].close_time == datetime(2024, 1, 1, 0, 30, tzinfo=timezone.utc)
+
+
+@pytest.mark.asyncio
+async def test_fetch_klines_can_include_duplicate_open_times_across_pages() -> None:
+    calls = {"count": 0}
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        calls["count"] += 1
+        if calls["count"] == 1:
+            payload = {
+                "error": [],
+                "result": {
+                    "XXBTZUSD": [
+                        [1704067200, "42000", "42100", "41900", "42050", "0", "10", 1],
+                        [1704068100, "42050", "42200", "42000", "42190", "0", "11", 1],
+                    ],
+                    "last": 1704068100,
+                },
+            }
+        else:
+            payload = {
+                "error": [],
+                "result": {
+                    "XXBTZUSD": [
+                        [1704068100, "42055", "42210", "42010", "42195", "0", "12", 1],
+                        [1704069000, "42195", "42300", "42150", "42240", "0", "13", 1],
+                    ],
+                    "last": 1704069000,
+                },
+            }
+        return httpx.Response(status_code=200, request=request, json=payload)
+
+    transport = httpx.MockTransport(handler)
+
+    async with httpx.AsyncClient(transport=transport) as raw_client:
+        http_client = AsyncHTTPClient(raw_client)
+        client = KrakenSpotClient(http_client)
+        candles = await client.fetch_klines(
+            symbol="BTC-USD",
+            interval="15m",
+            start_time=datetime(2024, 1, 1, 0, 0, tzinfo=timezone.utc),
+            end_time=datetime(2024, 1, 1, 0, 45, tzinfo=timezone.utc),
+        )
+
+    open_times = [item.open_time for item in candles]
+    assert len(open_times) >= 4
+    assert open_times.count(datetime(2024, 1, 1, 0, 15, tzinfo=timezone.utc)) >= 2

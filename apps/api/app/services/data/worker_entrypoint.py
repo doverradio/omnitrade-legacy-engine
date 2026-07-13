@@ -144,12 +144,52 @@ async def run_ingestion_cycle(
                 newest_close_time.isoformat() if newest_close_time else None,
                 ingestion_lag_seconds,
             )
-        except (BinanceClientError, KrakenClientError):
-            logger.exception("Recent-candle ingestion failed for symbol=%s exchange=%s", asset.symbol, asset.exchange)
+        except (BinanceClientError, KrakenClientError) as exc:
+            rolled_back = False
+            try:
+                await db_session.rollback()
+                rolled_back = True
+            except Exception:
+                logger.exception(
+                    "candle_ingestion_rollback_failed provider=%s asset_id=%s symbol=%s interval=%s",
+                    provider,
+                    asset.id,
+                    asset.symbol,
+                    source_interval,
+                )
+            logger.exception(
+                "candle_ingestion_asset_failed provider=%s asset_id=%s symbol=%s interval=%s rolled_back=%s error_type=%s",
+                provider,
+                asset.id,
+                asset.symbol,
+                source_interval,
+                rolled_back,
+                exc.__class__.__name__,
+            )
             failed_assets += 1
             continue
-        except Exception:
-            logger.exception("Unexpected ingestion failure for symbol=%s exchange=%s", asset.symbol, asset.exchange)
+        except Exception as exc:
+            rolled_back = False
+            try:
+                await db_session.rollback()
+                rolled_back = True
+            except Exception:
+                logger.exception(
+                    "candle_ingestion_rollback_failed provider=%s asset_id=%s symbol=%s interval=%s",
+                    provider,
+                    asset.id,
+                    asset.symbol,
+                    source_interval,
+                )
+            logger.exception(
+                "candle_ingestion_asset_failed provider=%s asset_id=%s symbol=%s interval=%s rolled_back=%s error_type=%s",
+                provider,
+                asset.id,
+                asset.symbol,
+                source_interval,
+                rolled_back,
+                exc.__class__.__name__,
+            )
             failed_assets += 1
             continue
 

@@ -36,6 +36,7 @@ class _FakeDBSession:
     def __init__(self, assets):
         self.assets = assets
         self.commits = 0
+        self.rollbacks = 0
         self.last_statement = None
 
     async def execute(self, statement):
@@ -44,6 +45,9 @@ class _FakeDBSession:
 
     async def commit(self):
         self.commits += 1
+
+    async def rollback(self):
+        self.rollbacks += 1
 
 
 @pytest.mark.asyncio
@@ -213,6 +217,7 @@ async def test_worker_continues_when_one_asset_fails(monkeypatch: pytest.MonkeyP
     assert result.failed_assets == 1
     assert result.successful_assets == 1
     assert upserted_symbols == ["BTCUSDT"]
+    assert db_session.rollbacks == 1
 
 
 @pytest.mark.asyncio
@@ -235,3 +240,166 @@ async def test_ingestion_status_updates_after_successful_cycle(monkeypatch: pyte
     await run_ingestion_cycle(db_session, _FakeClient(), now_fn=lambda: cycle_time)
 
     assert get_last_successful_ingestion_at() == cycle_time
+
+
+@pytest.mark.asyncio
+async def test_worker_rolls_back_and_continues_after_kraken_persistence_failure(monkeypatch: pytest.MonkeyPatch) -> None:
+    reset_last_successful_ingestion_at()
+
+    kraken_asset = SimpleNamespace(id=uuid4(), symbol="BTC", base_currency="USD", exchange="kraken_spot")
+    binance_asset = SimpleNamespace(id=uuid4(), symbol="ETHUSDT", exchange="binance_us")
+    db_session = _FakeDBSession([kraken_asset, binance_asset])
+
+    kraken_candles = [
+        NormalizedCandle(
+            open_time=datetime(2026, 7, 5, 0, 0, tzinfo=timezone.utc),
+            close_time=datetime(2026, 7, 5, 0, 15, tzinfo=timezone.utc),
+            open=Decimal("1"),
+            high=Decimal("2"),
+            low=Decimal("0.5"),
+            close=Decimal("1.5"),
+            volume=Decimal("10"),
+            source="kraken_spot",
+        )
+    ]
+    binance_candles = [
+        NormalizedCandle(
+            open_time=datetime(2026, 7, 5, 0, 0, tzinfo=timezone.utc),
+            close_time=datetime(2026, 7, 5, 0, 1, tzinfo=timezone.utc),
+            open=Decimal("10"),
+            high=Decimal("11"),
+            low=Decimal("9.5"),
+            close=Decimal("10.5"),
+            volume=Decimal("5"),
+            source="binance_us",
+        )
+    ]
+
+    class _FakeKrakenClient:
+        async def fetch_klines(self, **kwargs: object):
+            assert kwargs["symbol"] == "BTC-USD"
+            assert kwargs["interval"] == "15m"
+            return kraken_candles
+
+    class _FakeBinanceClient:
+        async def fetch_klines(self, **kwargs: object):
+            assert kwargs["symbol"] == "ETHUSDT"
+            assert kwargs["interval"] == "1m"
+            return binance_candles
+
+    upsert_calls = {"kraken": 0, "binance": 0}
+
+    async def _fake_upsert(_db, asset_id, _interval, incoming_candles):
+        if asset_id == kraken_asset.id:
+            upsert_calls["kraken"] += 1
+            raise RuntimeError("cardinality_violation")
+        assert asset_id == binance_asset.id
+        assert db_session.rollbacks == 1
+        assert incoming_candles == binance_candles
+        upsert_calls["binance"] += 1
+        return len(incoming_candles)
+
+    monkeypatch.setattr("app.services.data.worker_entrypoint.upsert_candles", _fake_upsert)
+
+    cycle_time = datetime(2026, 7, 5, 2, 0, tzinfo=timezone.utc)
+    result = await run_ingestion_cycle(
+        db_session,
+        _FakeBinanceClient(),
+        _FakeKrakenClient(),
+        now_fn=lambda: cycle_time,
+    )
+
+    assert upsert_calls == {"kraken": 1, "binance": 1}
+    assert db_session.rollbacks == 1
+    assert db_session.commits == 1
+    assert result.failed_assets == 1
+    assert result.successful_assets == 1
+    assert get_last_successful_ingestion_at() == cycle_time
+
+
+@pytest.mark.asyncio
+async def test_worker_rolls_back_and_continues_after_binance_failure_then_kraken_succeeds(monkeypatch: pytest.MonkeyPatch) -> None:
+    reset_last_successful_ingestion_at()
+
+    binance_asset = SimpleNamespace(id=uuid4(), symbol="BTCUSDT", exchange="binance_us")
+    kraken_asset = SimpleNamespace(id=uuid4(), symbol="XBT", base_currency="USD", exchange="kraken_spot")
+    db_session = _FakeDBSession([binance_asset, kraken_asset])
+
+    kraken_candles = [
+        NormalizedCandle(
+            open_time=datetime(2026, 7, 5, 0, 0, tzinfo=timezone.utc),
+            close_time=datetime(2026, 7, 5, 0, 15, tzinfo=timezone.utc),
+            open=Decimal("1"),
+            high=Decimal("2"),
+            low=Decimal("0.5"),
+            close=Decimal("1.5"),
+            volume=Decimal("10"),
+            source="kraken_spot",
+        )
+    ]
+
+    class _FakeBinanceClient:
+        async def fetch_klines(self, **kwargs: object):
+            assert kwargs["symbol"] == "BTCUSDT"
+            raise BinanceClientError(
+                message="boom",
+                symbol="BTCUSDT",
+                interval="1m",
+                start_time=datetime(2026, 7, 5, 0, 0, tzinfo=timezone.utc),
+                end_time=datetime(2026, 7, 5, 2, 0, tzinfo=timezone.utc),
+            )
+
+    class _FakeKrakenClient:
+        async def fetch_klines(self, **kwargs: object):
+            assert kwargs["symbol"] == "XBT-USD"
+            assert kwargs["interval"] == "15m"
+            return kraken_candles
+
+    async def _fake_upsert(_db, asset_id, _interval, incoming_candles):
+        assert asset_id == kraken_asset.id
+        assert db_session.rollbacks == 1
+        assert incoming_candles == kraken_candles
+        return len(incoming_candles)
+
+    monkeypatch.setattr("app.services.data.worker_entrypoint.upsert_candles", _fake_upsert)
+
+    cycle_time = datetime(2026, 7, 5, 2, 0, tzinfo=timezone.utc)
+    result = await run_ingestion_cycle(
+        db_session,
+        _FakeBinanceClient(),
+        _FakeKrakenClient(),
+        now_fn=lambda: cycle_time,
+    )
+
+    assert db_session.rollbacks == 1
+    assert db_session.commits == 1
+    assert result.failed_assets == 1
+    assert result.successful_assets == 1
+    assert get_last_successful_ingestion_at() == cycle_time
+
+
+@pytest.mark.asyncio
+async def test_ingestion_status_does_not_update_when_no_asset_succeeds(monkeypatch: pytest.MonkeyPatch) -> None:
+    reset_last_successful_ingestion_at()
+
+    asset = SimpleNamespace(id=uuid4(), symbol="BTCUSDT", exchange="binance_us")
+    db_session = _FakeDBSession([asset])
+
+    class _FailingClient:
+        async def fetch_klines(self, **_: object):
+            raise BinanceClientError(
+                message="boom",
+                symbol="BTCUSDT",
+                interval="1m",
+                start_time=datetime(2026, 7, 5, 0, 0, tzinfo=timezone.utc),
+                end_time=datetime(2026, 7, 5, 2, 0, tzinfo=timezone.utc),
+            )
+
+    await run_ingestion_cycle(
+        db_session,
+        _FailingClient(),
+        now_fn=lambda: datetime(2026, 7, 5, 2, 0, tzinfo=timezone.utc),
+    )
+
+    assert db_session.rollbacks == 1
+    assert get_last_successful_ingestion_at() is None
