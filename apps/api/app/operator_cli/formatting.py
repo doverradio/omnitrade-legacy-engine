@@ -597,6 +597,45 @@ def render_watch_text(payload: dict[str, Any], options: RenderOptions) -> str:
     return "\n".join(lines)
 
 
+def _strategy_label(slug: str | None) -> str:
+    value = (slug or "unknown").replace("_", " ").strip()
+    if not value:
+        return "Unknown"
+    return " ".join(part.capitalize() for part in value.split())
+
+
+def _roster_failure_reason(item: dict[str, Any]) -> str:
+    codes = [str(code).strip().lower() for code in (item.get("deterministic_explanation") or [])]
+    reason_text = str(item.get("reason") or "").strip().lower()
+
+    if any("insufficient_candle_history" in code for code in codes) or "insufficient candle history" in reason_text:
+        return "insufficient_history"
+    if any("strategy_row_missing" in code for code in codes):
+        return "strategy_row_missing"
+    if any("strategy_not_registered" in code for code in codes):
+        return "strategy_not_registered"
+    if any("incomplete_candle" in code for code in codes):
+        return "incomplete_candle"
+    if any("stale_candle" in code for code in codes):
+        return "stale_candle"
+    if any("strategy_evaluation_exception" in code for code in codes):
+        return "strategy_evaluation_exception"
+    return reason_text.replace(" ", "_") if reason_text else "evaluation_failed"
+
+
+def _roster_display_status(item: dict[str, Any]) -> tuple[str, str | None]:
+    evaluation_status = str(item.get("evaluation_status") or "").upper()
+    action = str(item.get("action") or "").upper()
+
+    if evaluation_status == "FAILED":
+        return "FAILED", _roster_failure_reason(item)
+    if evaluation_status == "INSUFFICIENT_CONTEXT":
+        return "FAILED", _roster_failure_reason(item)
+    if action in {"BUY", "SELL", "HOLD"}:
+        return action, None
+    return "FAILED", "evaluation_failed"
+
+
 def render_roster_text(payload: dict[str, Any], options: RenderOptions) -> str:
     run = payload.get("roster_run") or {}
     proposals = payload.get("proposals") or []
@@ -619,8 +658,26 @@ def render_roster_text(payload: dict[str, Any], options: RenderOptions) -> str:
         )
     )
 
+    buy_count = 0
+    sell_count = 0
+    hold_count = 0
+    failed_count = 0
+
     for item in proposals:
-        lines.append(f"{_fmt(item.get('strategy_slug')):<20} {_badge(_fmt(item.get('action')), replayed=False, options=options)}")
+        strategy_name = _strategy_label(item.get("strategy_slug"))
+        status, reason = _roster_display_status(item)
+        if status == "BUY":
+            buy_count += 1
+        elif status == "SELL":
+            sell_count += 1
+        elif status == "HOLD":
+            hold_count += 1
+        else:
+            failed_count += 1
+        lines.append(f"{strategy_name:<20} {_badge(status, replayed=False, options=options)}")
+        if reason is not None:
+            lines.append(f"  reason: {reason}")
+
     if proposals:
         lines.append("")
 
@@ -628,10 +685,10 @@ def render_roster_text(payload: dict[str, Any], options: RenderOptions) -> str:
         _section(
             "Summary",
             [
-                ("BUY", _fmt(run.get("buy_count"), default="0")),
-                ("SELL", _fmt(run.get("sell_count"), default="0")),
-                ("HOLD", _fmt(run.get("hold_count"), default="0")),
-                ("Failed", _fmt(len(run.get("strategies_failed") or []), default="0")),
+                ("BUY", _fmt(buy_count, default="0")),
+                ("SELL", _fmt(sell_count, default="0")),
+                ("HOLD", _fmt(hold_count, default="0")),
+                ("Failed", _fmt(failed_count, default="0")),
             ],
             options,
         )

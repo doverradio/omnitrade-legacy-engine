@@ -7,6 +7,7 @@ from app.operator_cli.formatting import (
     render_candles_text,
     render_preview_show_text,
     render_preview_text,
+    render_roster_text,
     render_status_text,
     render_watch_text,
 )
@@ -198,3 +199,94 @@ def test_render_watch_text_contains_expected_fields() -> None:
     assert "OPERATOR WATCH" in text
     assert "Latest decision" in text
     assert "Press Ctrl+C" in text
+
+
+def test_render_roster_text_statuses_and_summary_reconcile() -> None:
+    text = render_roster_text(
+        {
+            "provider": "kraken_spot",
+            "product_id": "BTC-USD",
+            "interval": "15m",
+            "roster_run": {
+                "candle_close_time": "2026-07-13T23:00:00Z",
+                "trigger": "kraken_btc_15m_candle_close",
+                "execution_mode": "SHADOW",
+                "live_submission_allowed": False,
+            },
+            "proposals": [
+                {"strategy_slug": "ma_crossover", "action": "HOLD", "evaluation_status": "EVALUATED"},
+                {"strategy_slug": "momentum", "action": "BUY", "evaluation_status": "EVALUATED"},
+                {"strategy_slug": "breakout", "action": "SELL", "evaluation_status": "EVALUATED"},
+                {
+                    "strategy_slug": "mean_reversion",
+                    "action": "HOLD",
+                    "evaluation_status": "FAILED",
+                    "deterministic_explanation": ["CHECK_FAILED:strategy_row_missing"],
+                    "reason": "Strategy row not found.",
+                },
+                {
+                    "strategy_slug": "bollinger_reversion",
+                    "action": "HOLD",
+                    "evaluation_status": "INSUFFICIENT_CONTEXT",
+                    "deterministic_explanation": ["CHECK_FAILED:insufficient_candle_history"],
+                    "reason": "Insufficient candle history.",
+                },
+                {
+                    "strategy_slug": "donchian_breakout",
+                    "action": "HOLD",
+                    "evaluation_status": "FAILED",
+                    "deterministic_explanation": ["CHECK_FAILED:stale_candle"],
+                    "reason": "Candle is stale for roster evaluation.",
+                },
+                {
+                    "strategy_slug": "rsi_mean_reversion",
+                    "action": "HOLD",
+                    "evaluation_status": "FAILED",
+                    "deterministic_explanation": ["CHECK_FAILED:strategy_evaluation_exception"],
+                    "reason": "Strategy evaluation failed: RuntimeError",
+                },
+            ],
+        },
+        _opts(),
+    )
+
+    assert "Ma Crossover" in text
+    assert "Momentum" in text
+    assert "BUY                1" in text
+    assert "SELL               1" in text
+    assert "HOLD               1" in text
+    assert "Failed             4" in text
+    assert "reason: strategy_row_missing" in text
+    assert "reason: insufficient_history" in text
+    assert "reason: stale_candle" in text
+
+
+def test_render_roster_text_failed_not_rendered_as_hold() -> None:
+    text = render_roster_text(
+        {
+            "provider": "kraken_spot",
+            "product_id": "BTC-USD",
+            "interval": "15m",
+            "roster_run": {
+                "candle_close_time": "2026-07-13T23:00:00Z",
+                "trigger": "kraken_btc_15m_candle_close",
+                "execution_mode": "SHADOW",
+                "live_submission_allowed": False,
+            },
+            "proposals": [
+                {
+                    "strategy_slug": "momentum",
+                    "action": "HOLD",
+                    "evaluation_status": "FAILED",
+                    "deterministic_explanation": ["CHECK_FAILED:strategy_row_missing"],
+                    "reason": "Strategy row not found.",
+                }
+            ],
+        },
+        _opts(),
+    )
+
+    assert "Momentum" in text
+    assert "[FAILED]" in text
+    assert "reason: strategy_row_missing" in text
+    assert "HOLD               0" in text
