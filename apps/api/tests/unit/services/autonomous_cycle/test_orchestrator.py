@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from datetime import datetime, timezone
+from datetime import timedelta
 from decimal import Decimal
 from types import SimpleNamespace
 import uuid
@@ -9,6 +10,7 @@ import pytest
 
 from app.models.audit_log import AuditLog
 from app.models.decision_record import DecisionRecord
+from app.models.decision_snapshot import DecisionSnapshot
 from app.models.autonomous_cycle_run import AutonomousCycleRun
 from app.services.autonomous_cycle.contracts import AutonomousCycleRequest, ReconciliationStatus, RiskEvaluationSummary, StrategyProposal
 from app.services.autonomous_cycle.orchestrator import (
@@ -20,6 +22,7 @@ from app.services.autonomous_cycle.orchestrator import (
     _run_approved_strategy,
     run_autonomous_preview_cycle,
 )
+from app.services.strategies.base import Signal
 from app.services.strategies.identity import build_strategy_identity
 
 
@@ -210,6 +213,8 @@ async def test_cycle_buy_generates_preview(monkeypatch: pytest.MonkeyPatch) -> N
     assert result.state == "COMPLETE"
     assert result.proposed_action == "BUY"
     assert result.preview_id is not None
+    cycle_rows = [item for item in db.added if isinstance(item, AutonomousCycleRun)]
+    assert len(cycle_rows) == 1
 
 
 @pytest.mark.asyncio
@@ -562,14 +567,19 @@ async def test_idempotent_repeated_cycle_replays(monkeypatch: pytest.MonkeyPatch
     version = _version()
     db.connection = SimpleNamespace(last_readiness_verdict="READY_FOR_PREVIEW", provider="kraken_spot", environment="production")
 
-    calls = {"preview": 0}
+    calls = {"preview": 0, "persist": 0}
 
     async def _preview(**_kwargs):
         calls["preview"] += 1
         return SimpleNamespace(crypto_order_preview_id=uuid.uuid4())
 
+    async def _persist(**_kwargs):
+        calls["persist"] += 1
+        return uuid.uuid4()
+
     _patch_happy_path(monkeypatch, mandate, version, action="BUY")
     monkeypatch.setattr("app.services.autonomous_cycle.orchestrator.create_crypto_order_preview", _preview)
+    monkeypatch.setattr("app.services.autonomous_cycle.orchestrator._persist_decision_intelligence", _persist)
 
     req = AutonomousCycleRequest(mandate_id=mandate.mandate_id, actor="operator:owner", forced_action="BUY", idempotency_seed="idem-1")
     first = await run_autonomous_preview_cycle(db=db, request=req)
@@ -578,6 +588,132 @@ async def test_idempotent_repeated_cycle_replays(monkeypatch: pytest.MonkeyPatch
     assert first.replayed is False
     assert second.replayed is True
     assert calls["preview"] == 1
+    assert calls["persist"] == 1
+    cycle_rows = [item for item in db.added if isinstance(item, AutonomousCycleRun)]
+    assert len(cycle_rows) == 1
+
+
+@pytest.mark.asyncio
+async def test_non_terminal_loading_cycle_resumes_without_new_cycle_row(monkeypatch: pytest.MonkeyPatch) -> None:
+    db = _FakeDb()
+    mandate = _mandate()
+    version = _version()
+    db.connection = SimpleNamespace(last_readiness_verdict="READY_FOR_PREVIEW", provider="kraken_spot", environment="production")
+
+    existing_cycle = AutonomousCycleRun(
+        idempotency_key="resume-loading",
+        mandate_id=mandate.mandate_id,
+        state="LOADING",
+        evaluation_stage="load_mandate",
+        cycle_context={},
+        diagnostics={},
+        deterministic_explanation=[],
+        audit_correlation_id=uuid.uuid4(),
+        started_at=datetime.now(timezone.utc),
+    )
+    existing_cycle.cycle_id = uuid.uuid4()
+    db.cycles_by_key[existing_cycle.idempotency_key] = existing_cycle
+
+    _patch_happy_path(monkeypatch, mandate, version, action="BUY")
+
+    result = await run_autonomous_preview_cycle(
+        db=db,
+        request=AutonomousCycleRequest(mandate_id=mandate.mandate_id, actor="operator:owner", forced_action="BUY", idempotency_seed="resume-loading"),
+    )
+
+    assert result.state == "COMPLETE"
+    assert result.cycle_id == existing_cycle.cycle_id
+    cycle_rows = [item for item in db.added if isinstance(item, AutonomousCycleRun)]
+    assert cycle_rows == []
+
+
+@pytest.mark.asyncio
+async def test_non_terminal_ready_cycle_fails_closed_as_not_resumable(monkeypatch: pytest.MonkeyPatch) -> None:
+    db = _FakeDb()
+    mandate = _mandate()
+    db.connection = SimpleNamespace(last_readiness_verdict="READY_FOR_PREVIEW", provider="kraken_spot", environment="production")
+
+    existing_cycle = AutonomousCycleRun(
+        idempotency_key="resume-ready",
+        mandate_id=mandate.mandate_id,
+        state="READY",
+        evaluation_stage="provider_readiness",
+        cycle_context={},
+        diagnostics={},
+        deterministic_explanation=[],
+        audit_correlation_id=uuid.uuid4(),
+        started_at=datetime.now(timezone.utc),
+    )
+    existing_cycle.cycle_id = uuid.uuid4()
+    db.cycles_by_key[existing_cycle.idempotency_key] = existing_cycle
+
+    calls = {"preview": 0, "persist": 0}
+
+    async def _preview(**_kwargs):
+        calls["preview"] += 1
+        return SimpleNamespace(crypto_order_preview_id=uuid.uuid4())
+
+    async def _persist(**_kwargs):
+        calls["persist"] += 1
+        return uuid.uuid4()
+
+    monkeypatch.setattr("app.services.autonomous_cycle.orchestrator.create_crypto_order_preview", _preview)
+    monkeypatch.setattr("app.services.autonomous_cycle.orchestrator._persist_decision_intelligence", _persist)
+
+    result = await run_autonomous_preview_cycle(
+        db=db,
+        request=AutonomousCycleRequest(mandate_id=mandate.mandate_id, actor="operator:owner", idempotency_seed="resume-ready"),
+    )
+
+    assert result.state == "FAILED"
+    assert result.diagnostics.failure_reason == "existing_non_terminal_cycle_not_resumable"
+    assert calls["persist"] == 0
+    assert calls["preview"] == 0
+
+
+@pytest.mark.asyncio
+async def test_stale_non_terminal_cycle_fails_closed(monkeypatch: pytest.MonkeyPatch) -> None:
+    db = _FakeDb()
+    mandate = _mandate()
+    db.connection = SimpleNamespace(last_readiness_verdict="READY_FOR_PREVIEW", provider="kraken_spot", environment="production")
+
+    existing_cycle = AutonomousCycleRun(
+        idempotency_key="resume-stale",
+        mandate_id=mandate.mandate_id,
+        state="LOADING",
+        evaluation_stage="load_mandate",
+        cycle_context={},
+        diagnostics={},
+        deterministic_explanation=[],
+        audit_correlation_id=uuid.uuid4(),
+        started_at=datetime.now(timezone.utc) - timedelta(hours=2),
+    )
+    existing_cycle.updated_at = datetime.now(timezone.utc) - timedelta(hours=2)
+    existing_cycle.cycle_id = uuid.uuid4()
+    db.cycles_by_key[existing_cycle.idempotency_key] = existing_cycle
+
+    calls = {"preview": 0, "persist": 0}
+
+    async def _preview(**_kwargs):
+        calls["preview"] += 1
+        return SimpleNamespace(crypto_order_preview_id=uuid.uuid4())
+
+    async def _persist(**_kwargs):
+        calls["persist"] += 1
+        return uuid.uuid4()
+
+    monkeypatch.setattr("app.services.autonomous_cycle.orchestrator.create_crypto_order_preview", _preview)
+    monkeypatch.setattr("app.services.autonomous_cycle.orchestrator._persist_decision_intelligence", _persist)
+
+    result = await run_autonomous_preview_cycle(
+        db=db,
+        request=AutonomousCycleRequest(mandate_id=mandate.mandate_id, actor="operator:owner", idempotency_seed="resume-stale"),
+    )
+
+    assert result.state == "FAILED"
+    assert result.diagnostics.failure_reason == "stale_non_terminal_cycle"
+    assert calls["persist"] == 0
+    assert calls["preview"] == 0
 
 
 @pytest.mark.asyncio
@@ -860,7 +996,35 @@ async def test_run_approved_strategy_executes_with_resolved_asset_and_candles(mo
         def generate_signal(self, context):
             captured["candles"] = context.candles
             captured["asset_metadata"] = context.asset_metadata
-            return SimpleNamespace(action="BUY")
+            return Signal(
+                action="buy",
+                strength=Decimal("1.0"),
+                reason="Fast SMA crossed above Slow SMA.",
+                indicators={
+                    "fast_ma": "3.0",
+                    "slow_ma": "2.5",
+                    "previous_fast_ma": "2.0",
+                    "previous_slow_ma": "2.4",
+                    "crossover_state": "bullish_cross",
+                    "signal_generated": "buy",
+                    "evaluated_conditions": {
+                        "buy": {
+                            "previous_fast_ma_lte_previous_slow_ma": True,
+                            "fast_ma_gt_slow_ma": True,
+                        },
+                        "sell": {
+                            "previous_fast_ma_gte_previous_slow_ma": False,
+                            "fast_ma_lt_slow_ma": False,
+                        },
+                    },
+                    "selection_explanations": {
+                        "buy": "BUY selected because previous_fast_ma <= previous_slow_ma and fast_ma > slow_ma evaluated to true.",
+                        "sell": "SELL not selected because previous_fast_ma >= previous_slow_ma and fast_ma < slow_ma evaluated to false.",
+                        "hold": "HOLD not selected because the bullish crossover conditions were satisfied.",
+                    },
+                },
+                timestamp=datetime.now(timezone.utc),
+            )
 
     monkeypatch.setattr("app.services.autonomous_cycle.orchestrator.strategy_registry.has", lambda _slug: True)
     monkeypatch.setattr("app.services.autonomous_cycle.orchestrator.strategy_registry.get", lambda _slug: _Generator())
@@ -875,9 +1039,160 @@ async def test_run_approved_strategy_executes_with_resolved_asset_and_candles(mo
     assert proposal.action == "BUY"
     assert proposal.strategy_name == "ma_crossover"
     assert proposal.strategy_version == build_strategy_identity(slug="ma_crossover", module_version="1.0.0")
+    assert proposal.signal_payload is not None
+    assert proposal.signal_payload["indicators"]["signal_generated"] == "buy"
     assert captured.get("candles") is not None
     assert len(captured["candles"]) == 3
     assert captured["asset_metadata"] == {"symbol": "BTC", "asset_class": "crypto"}
+
+
+@pytest.mark.asyncio
+async def test_run_approved_strategy_supports_lightweight_signal_objects(monkeypatch: pytest.MonkeyPatch) -> None:
+    asset = SimpleNamespace(id=uuid.uuid4(), symbol="BTC", asset_class="crypto", exchange="kraken_spot", is_active=True)
+    strategy = SimpleNamespace(
+        id=uuid.uuid4(),
+        slug="ma_crossover",
+        module_version="1.0.0",
+        created_at=datetime.now(timezone.utc),
+    )
+    candles = [
+        SimpleNamespace(
+            open_time=datetime.now(timezone.utc),
+            close_time=datetime.now(timezone.utc),
+            open=Decimal("1"),
+            high=Decimal("2"),
+            low=Decimal("1"),
+            close=Decimal("2"),
+            volume=Decimal("10"),
+        )
+        for _ in range(3)
+    ]
+
+    class _Result:
+        def __init__(self, rows):
+            self._rows = rows
+
+        def scalars(self):
+            return self
+
+        def all(self):
+            return list(self._rows)
+
+    class _Db:
+        async def execute(self, statement):
+            sql = str(statement)
+            if "FROM assets" in sql:
+                return _Result([asset])
+            if "FROM strategies" in sql:
+                return _Result([strategy])
+            if "FROM candles" in sql:
+                return _Result(candles)
+            return _Result([])
+
+        async def scalar(self, statement):
+            sql = str(statement)
+            if "FROM parameter_sets" in sql:
+                return None
+            return None
+
+    class _Generator:
+        def generate_signal(self, _context):
+            return SimpleNamespace(
+                action="buy",
+                strength=Decimal("1.0"),
+                reason="Fast SMA crossed above Slow SMA.",
+                indicators={"signal_generated": "buy", "crossover_state": "bullish_cross"},
+                timestamp=datetime.now(timezone.utc),
+            )
+
+    monkeypatch.setattr("app.services.autonomous_cycle.orchestrator.strategy_registry.has", lambda _slug: True)
+    monkeypatch.setattr("app.services.autonomous_cycle.orchestrator.strategy_registry.get", lambda _slug: _Generator())
+
+    proposal = await _run_approved_strategy(
+        db=_Db(),
+        mandate=SimpleNamespace(provider="kraken_spot", exchange_environment="production"),
+        version=SimpleNamespace(allowed_strategy_versions=[build_strategy_identity(slug="ma_crossover", module_version="1.0.0")]),
+        request=AutonomousCycleRequest(mandate_id=uuid.uuid4(), actor="operator:owner", product_id="BTC-USD", strategy_interval="15m"),
+    )
+
+    assert proposal.action == "BUY"
+    assert proposal.signal_payload is not None
+    assert proposal.signal_payload["action"] == "buy"
+    assert proposal.signal_payload["indicators"]["signal_generated"] == "buy"
+    assert "timeline" in proposal.signal_payload
+
+
+@pytest.mark.asyncio
+async def test_run_approved_strategy_malformed_signal_fails_closed_to_hold(monkeypatch: pytest.MonkeyPatch) -> None:
+    asset = SimpleNamespace(id=uuid.uuid4(), symbol="BTC", asset_class="crypto", exchange="kraken_spot", is_active=True)
+    strategy = SimpleNamespace(
+        id=uuid.uuid4(),
+        slug="ma_crossover",
+        module_version="1.0.0",
+        created_at=datetime.now(timezone.utc),
+    )
+    candles = [
+        SimpleNamespace(
+            open_time=datetime.now(timezone.utc),
+            close_time=datetime.now(timezone.utc),
+            open=Decimal("1"),
+            high=Decimal("2"),
+            low=Decimal("1"),
+            close=Decimal("2"),
+            volume=Decimal("10"),
+        )
+        for _ in range(3)
+    ]
+
+    class _Result:
+        def __init__(self, rows):
+            self._rows = rows
+
+        def scalars(self):
+            return self
+
+        def all(self):
+            return list(self._rows)
+
+    class _Db:
+        async def execute(self, statement):
+            sql = str(statement)
+            if "FROM assets" in sql:
+                return _Result([asset])
+            if "FROM strategies" in sql:
+                return _Result([strategy])
+            if "FROM candles" in sql:
+                return _Result(candles)
+            return _Result([])
+
+        async def scalar(self, statement):
+            sql = str(statement)
+            if "FROM parameter_sets" in sql:
+                return None
+            return None
+
+    class _Generator:
+        def generate_signal(self, _context):
+            return SimpleNamespace(
+                action="invalid",
+                reason="Malformed signal action",
+                indicators={"unsafe": object()},
+                timestamp=datetime.now(timezone.utc),
+            )
+
+    monkeypatch.setattr("app.services.autonomous_cycle.orchestrator.strategy_registry.has", lambda _slug: True)
+    monkeypatch.setattr("app.services.autonomous_cycle.orchestrator.strategy_registry.get", lambda _slug: _Generator())
+
+    proposal = await _run_approved_strategy(
+        db=_Db(),
+        mandate=SimpleNamespace(provider="kraken_spot", exchange_environment="production"),
+        version=SimpleNamespace(allowed_strategy_versions=[build_strategy_identity(slug="ma_crossover", module_version="1.0.0")]),
+        request=AutonomousCycleRequest(mandate_id=uuid.uuid4(), actor="operator:owner", product_id="BTC-USD", strategy_interval="15m"),
+    )
+
+    assert proposal.action == "HOLD"
+    assert proposal.signal_payload is not None
+    assert proposal.signal_payload.get("indicators", {}).get("unsafe") is None
 
 
 @pytest.mark.asyncio
@@ -899,6 +1214,35 @@ async def test_decision_record_persists_canonical_product_identity() -> None:
             strategy_name="ma_crossover",
             strategy_version=build_strategy_identity(slug="ma_crossover", module_version="1.0.0"),
             deterministic_explanation=("CHECK_PASSED:strategy_evaluated",),
+            signal_payload={
+                "action": "buy",
+                "reason": "Fast SMA crossed above Slow SMA.",
+                "indicators": {
+                    "fast_ma": "3.0",
+                    "slow_ma": "2.5",
+                    "previous_fast_ma": "2.0",
+                    "previous_slow_ma": "2.4",
+                    "crossover_state": "bullish_cross",
+                    "signal_generated": "buy",
+                    "evaluated_conditions": {
+                        "buy": {
+                            "previous_fast_ma_lte_previous_slow_ma": True,
+                            "fast_ma_gt_slow_ma": True,
+                        },
+                        "sell": {
+                            "previous_fast_ma_gte_previous_slow_ma": False,
+                            "fast_ma_lt_slow_ma": False,
+                        },
+                    },
+                    "selection_explanations": {
+                        "buy": "BUY selected because previous_fast_ma <= previous_slow_ma and fast_ma > slow_ma evaluated to true.",
+                        "sell": "SELL not selected because previous_fast_ma >= previous_slow_ma and fast_ma < slow_ma evaluated to false.",
+                        "hold": "HOLD not selected because the bullish crossover conditions were satisfied.",
+                    },
+                },
+                "strength": "1.0",
+                "timestamp": "2026-07-01T00:00:00Z",
+            },
         ),
         risk_summary=RiskEvaluationSummary(risk_verdict="ACCEPTED", risk_event_id=None, reason_code=None),
         product_id="BTC-USD",
@@ -908,4 +1252,10 @@ async def test_decision_record_persists_canonical_product_identity() -> None:
     )
 
     record = next(item for item in db.added if isinstance(item, DecisionRecord))
+    snapshot = next(item for item in db.added if isinstance(item, DecisionSnapshot))
     assert record.asset["product_id"] == "BTC-USD"
+    assert record.indicators["signal_generated"] == "buy"
+    assert record.indicators["selection_explanations"]["hold"].startswith("HOLD not selected because")
+    assert record.generated_signals[0]["strategy_evidence"]["crossover_state"] == "bullish_cross"
+    assert snapshot.strategy_inputs["strategy_evidence"]["fast_ma"] == "3.0"
+    assert snapshot.strategy_inputs["signal_reason"] == "Fast SMA crossed above Slow SMA."

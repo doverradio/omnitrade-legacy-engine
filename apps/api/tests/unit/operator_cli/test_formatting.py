@@ -21,29 +21,53 @@ def test_render_preview_text_includes_safety_line() -> None:
         {
             "cycle_id": "cid",
             "state": "COMPLETE",
+            "command_mode": "NEW_PREVIEW",
+            "evaluation_mode": "NEW_PREVIEW",
             "proposed_action": "BUY",
+            "outcome": "BUY",
+            "decision_classification": "strategy-derived",
+            "capital_state": "PREVIEW_ONLY",
             "mandate_verdict": "allowed",
             "risk_verdict": "ACCEPTED",
             "preview_id": "pid",
             "decision_record_id": "did",
+            "decision_snapshot": {"decision_id": "sid"},
+            "timeline": {
+                "evaluated_at": "2024-05-01T10:00:00Z",
+                "cycle_age_seconds": 120,
+                "decision_age_seconds": 90,
+                "market_data_age_seconds": 30,
+                "latest_completed_candle_open": "2024-05-01T09:45:00Z",
+                "latest_completed_candle_close": "2024-05-01T10:00:00Z",
+                "oldest_candle_used_open": "2024-04-30T15:00:00Z",
+                "history_candle_count": 50,
+                "decision_applies_to": "2024-05-01T10:00:00Z",
+                "current_incomplete_candle_excluded": True,
+            },
             "replayed": False,
             "diagnostics": {
-                "evaluation_stage": "risk",
                 "termination_stage": "complete",
                 "failure_reason": None,
                 "deterministic_explanation": ["CHECK_OK:risk"],
             },
-        }
-    , _opts())
+        },
+        _opts(),
+    )
 
     assert "AUTONOMOUS PREVIEW" in text
     assert "Preview-only path" in text
     assert "CHECK_OK:risk" in text
+    assert "NEW PREVIEW" in text
+    assert "Cycle age" in text
+    assert "Decision age" in text
+    assert "Candle age" in text
+    assert "Latest candle open" in text
 
 
 def test_render_preview_show_text_includes_decision_metadata() -> None:
     text = render_preview_show_text(
         {
+            "command_mode": "VIEW_EXISTING",
             "preview": {
                 "crypto_order_preview_id": "pid",
                 "status": "PREVIEW_READY",
@@ -62,6 +86,7 @@ def test_render_preview_show_text_includes_decision_metadata() -> None:
                 "timeframe": "15m",
             },
             "decision_snapshot": {
+                "decision_id": "sid",
                 "strategy_version": "ma_crossover@1.0.0",
                 "configuration_version": "autonomous_cycle_preview_v1",
                 "strategy_inputs": {
@@ -71,15 +96,29 @@ def test_render_preview_show_text_includes_decision_metadata() -> None:
             "cycle": {
                 "cycle_id": "cid",
                 "state": "COMPLETE",
+                "deterministic_explanation": ["CHECK_OK:signal"],
             },
+            "timeline": {
+                "record_created_at": "2024-05-01T10:00:00Z",
+                "decision_age_seconds": 3600,
+                "latest_completed_candle_close": "2024-05-01T10:00:00Z",
+                "history_candle_count": 48,
+                "decision_applies_to": "2024-05-01T10:00:00Z",
+            },
+            "capital_state": "PREVIEW_ONLY",
         }
-    , _opts())
+        , _opts()
+    )
 
     assert "PREVIEW EVIDENCE" in text
-    assert "Decision ID" in text
+    assert "Decision Record ID" in text
     assert "did" in text
-    assert "Signal reason: cross_up" in text
+    assert "VIEW EXISTING" in text
+    assert "Signal" in text
+    assert "cross_up" in text
     assert "Warnings" in text
+    assert "History loaded" in text
+    assert "Verbose deterministic codes" in text
 
 
 def test_render_candles_text_includes_readiness() -> None:

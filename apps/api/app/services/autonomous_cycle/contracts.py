@@ -3,6 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from datetime import datetime
 from decimal import Decimal
+from typing import Any, TypedDict
 import uuid
 
 
@@ -42,12 +43,23 @@ class ReconciliationStatus:
     explanation: tuple[str, ...] = ()
 
 
+class StrategySignalPayload(TypedDict, total=False):
+    action: str
+    strength: str | float | Decimal
+    reason: str
+    indicators: dict[str, Any]
+    timestamp: str
+    timeline: dict[str, Any]
+    market_window: dict[str, Any]
+
+
 @dataclass(frozen=True)
 class StrategyProposal:
     action: str
     strategy_name: str
     strategy_version: str
     deterministic_explanation: tuple[str, ...]
+    signal_payload: StrategySignalPayload | None = None
 
 
 @dataclass(frozen=True)

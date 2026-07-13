@@ -66,7 +66,7 @@ class MovingAverageCrossoverStrategy(Strategy):
         fast_ma = _simple_moving_average(numeric_closes, fast_period)
         slow_ma = _simple_moving_average(numeric_closes, slow_period)
 
-        indicators = build_indicator_snapshot(
+        indicators = _build_strategy_evidence(
             fast_ma=fast_ma,
             slow_ma=slow_ma,
             previous_fast_ma=previous_fast_ma,
@@ -92,7 +92,7 @@ class MovingAverageCrossoverStrategy(Strategy):
                 action="buy",
                 strength=Decimal("1.0"),
                 reason="Fast SMA crossed above Slow SMA.",
-                indicators=indicators,
+                indicators={**indicators, **_selection_evidence(action="buy", buy_selected=True, sell_selected=False)},
                 timestamp=timestamp,
             )
 
@@ -101,7 +101,7 @@ class MovingAverageCrossoverStrategy(Strategy):
                 action="sell",
                 strength=Decimal("1.0"),
                 reason="Fast SMA crossed below Slow SMA.",
-                indicators=indicators,
+                indicators={**indicators, **_selection_evidence(action="sell", buy_selected=False, sell_selected=True)},
                 timestamp=timestamp,
             )
 
@@ -109,7 +109,7 @@ class MovingAverageCrossoverStrategy(Strategy):
             action="hold",
             strength=Decimal("0.0"),
             reason="No crossover detected.",
-            indicators=indicators,
+            indicators={**indicators, **_selection_evidence(action="hold", buy_selected=False, sell_selected=False)},
             timestamp=timestamp,
         )
 
@@ -168,6 +168,88 @@ def _hold_signal(*, reason: str, timestamp: datetime) -> Signal:
         ),
         timestamp=timestamp,
     )
+
+
+def _build_strategy_evidence(
+    *,
+    fast_ma: Decimal | None,
+    slow_ma: Decimal | None,
+    previous_fast_ma: Decimal | None,
+    previous_slow_ma: Decimal | None,
+) -> dict[str, Any]:
+    indicators = build_indicator_snapshot(
+        fast_ma=fast_ma,
+        slow_ma=slow_ma,
+        previous_fast_ma=previous_fast_ma,
+        previous_slow_ma=previous_slow_ma,
+    )
+
+    buy_previous_fast_ma_lte_previous_slow_ma = previous_fast_ma is not None and previous_slow_ma is not None and previous_fast_ma <= previous_slow_ma
+    buy_fast_ma_gt_slow_ma = fast_ma is not None and slow_ma is not None and fast_ma > slow_ma
+    sell_previous_fast_ma_gte_previous_slow_ma = previous_fast_ma is not None and previous_slow_ma is not None and previous_fast_ma >= previous_slow_ma
+    sell_fast_ma_lt_slow_ma = fast_ma is not None and slow_ma is not None and fast_ma < slow_ma
+
+    buy_selected = buy_previous_fast_ma_lte_previous_slow_ma and buy_fast_ma_gt_slow_ma
+    sell_selected = sell_previous_fast_ma_gte_previous_slow_ma and sell_fast_ma_lt_slow_ma
+
+    if buy_selected:
+        crossover_state = "bullish_cross"
+    elif sell_selected:
+        crossover_state = "bearish_cross"
+    else:
+        crossover_state = "no_crossover"
+
+    indicators.update(
+        {
+            "crossover_state": crossover_state,
+            "signal_generated": "unknown",
+            "evaluated_conditions": {
+                "buy": {
+                    "previous_fast_ma_lte_previous_slow_ma": buy_previous_fast_ma_lte_previous_slow_ma,
+                    "fast_ma_gt_slow_ma": buy_fast_ma_gt_slow_ma,
+                },
+                "sell": {
+                    "previous_fast_ma_gte_previous_slow_ma": sell_previous_fast_ma_gte_previous_slow_ma,
+                    "fast_ma_lt_slow_ma": sell_fast_ma_lt_slow_ma,
+                },
+            },
+            "selection_explanations": {
+                "buy": None,
+                "sell": None,
+                "hold": None,
+            },
+        }
+    )
+    return indicators
+
+
+def _selection_evidence(*, action: str, buy_selected: bool, sell_selected: bool) -> dict[str, Any]:
+    if action == "buy":
+        return {
+            "signal_generated": "buy",
+            "selection_explanations": {
+                "buy": "BUY selected because previous_fast_ma <= previous_slow_ma and fast_ma > slow_ma evaluated to true.",
+                "sell": "SELL not selected because previous_fast_ma >= previous_slow_ma and fast_ma < slow_ma evaluated to false.",
+                "hold": "HOLD not selected because the bullish crossover conditions were satisfied.",
+            },
+        }
+    if action == "sell":
+        return {
+            "signal_generated": "sell",
+            "selection_explanations": {
+                "buy": "BUY not selected because previous_fast_ma <= previous_slow_ma and fast_ma > slow_ma evaluated to false.",
+                "sell": "SELL selected because previous_fast_ma >= previous_slow_ma and fast_ma < slow_ma evaluated to true.",
+                "hold": "HOLD not selected because the bearish crossover conditions were satisfied.",
+            },
+        }
+    return {
+        "signal_generated": "hold",
+        "selection_explanations": {
+            "buy": "BUY not selected because bullish crossover conditions were not satisfied.",
+            "sell": "SELL not selected because bearish crossover conditions were not satisfied.",
+            "hold": "HOLD selected because neither bullish nor bearish crossover conditions were satisfied.",
+        },
+    }
 
 
 def register_ma_crossover_strategy(registry: StrategyRegistry = strategy_registry) -> StrategyRegistry:

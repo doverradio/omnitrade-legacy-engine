@@ -64,6 +64,8 @@ from .contracts import (
 )
 
 _TERMINAL_CYCLE_STATES = {"HOLD", "PREVIEW_READY", "FAILED", "COMPLETE"}
+_RESUMABLE_NON_TERMINAL_STATES = {"NOT_STARTED", "LOADING"}
+_MAX_RESUME_AGE_SECONDS = 30 * 60
 _RESOLVED_ORDER_STATUSES = {"filled", "cancelled", "failed", "rejected", "expired", "settled"}
 
 _ALLOWED_TRANSITIONS: dict[str, set[str]] = {
@@ -90,6 +92,53 @@ def build_cycle_idempotency_key(*, request: AutonomousCycleRequest) -> str:
     return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
 
 
+def _serialize_strategy_signal(*, signal: Any) -> dict[str, Any]:
+    def _to_json_safe(value: Any) -> Any:
+        if value is None or isinstance(value, (str, int, float, bool)):
+            return value
+        if isinstance(value, Decimal):
+            return format(value, "f")
+        if isinstance(value, datetime):
+            return value.astimezone(timezone.utc).isoformat() if value.tzinfo else value.replace(tzinfo=timezone.utc).isoformat()
+        if isinstance(value, (list, tuple)):
+            return [_to_json_safe(item) for item in value]
+        if isinstance(value, dict):
+            return {str(key): _to_json_safe(item) for key, item in value.items()}
+        return None
+
+    if signal is None:
+        return {}
+
+    model_dump = getattr(signal, "model_dump", None)
+    if callable(model_dump):
+        dumped = model_dump(mode="json")
+        return _to_json_safe(dumped) if isinstance(dumped, dict) else {}
+
+    payload: dict[str, Any] = {}
+    for field in ("action", "strength", "reason", "indicators", "timestamp"):
+        if hasattr(signal, field):
+            payload[field] = _to_json_safe(getattr(signal, field))
+
+    timestamp = payload.get("timestamp")
+    if isinstance(timestamp, str):
+        payload["timestamp"] = timestamp
+
+    indicators = payload.get("indicators")
+    if indicators is not None and not isinstance(indicators, dict):
+        payload["indicators"] = {}
+
+    return payload
+
+
+def _is_stale_non_terminal_cycle(cycle: AutonomousCycleRun) -> bool:
+    reference = cycle.updated_at or cycle.started_at
+    if reference is None:
+        return True
+    observed = reference if reference.tzinfo is not None else reference.replace(tzinfo=timezone.utc)
+    age_seconds = int((datetime.now(timezone.utc) - observed.astimezone(timezone.utc)).total_seconds())
+    return age_seconds > _MAX_RESUME_AGE_SECONDS
+
+
 async def run_autonomous_preview_cycle(
     *,
     db: AsyncSession,
@@ -111,7 +160,34 @@ async def run_autonomous_preview_cycle(
     )
     if existing is not None and existing.state in _TERMINAL_CYCLE_STATES | {"COMPLETE"}:
         return _to_cycle_result(existing, replayed=True)
-    cycle: AutonomousCycleRun | None = None
+
+    if existing is not None and existing.state not in _RESUMABLE_NON_TERMINAL_STATES:
+        return await _finish_failed(
+            db=db,
+            cycle=existing,
+            stage="resume_existing_cycle",
+            reason="existing_non_terminal_cycle_not_resumable",
+            explanation=(
+                "CHECK_FAILED:existing_non_terminal_cycle_not_resumable",
+                f"CHECK_INFO:existing_cycle_state={existing.state}",
+            ),
+            started_monotonic=started_monotonic,
+        )
+
+    if existing is not None and _is_stale_non_terminal_cycle(existing):
+        return await _finish_failed(
+            db=db,
+            cycle=existing,
+            stage="resume_existing_cycle",
+            reason="stale_non_terminal_cycle",
+            explanation=(
+                "CHECK_FAILED:stale_non_terminal_cycle",
+                f"CHECK_INFO:existing_cycle_state={existing.state}",
+            ),
+            started_monotonic=started_monotonic,
+        )
+
+    cycle = existing
     if cycle is None:
         cycle = AutonomousCycleRun(
             idempotency_key=idempotency_key,
@@ -639,8 +715,10 @@ async def _run_approved_strategy(
         strategy_parameters=params.params if params is not None else {},
     )
     signal = strategy_registry.get(selected.slug).generate_signal(context)
+    signal_payload = _serialize_strategy_signal(signal=signal)
+    signal_action = str(signal_payload.get("action") or getattr(signal, "action", "hold"))
 
-    action = signal.action.upper()
+    action = signal_action.upper()
     if action not in ACTIONS:
         action = "HOLD"
 
@@ -652,10 +730,10 @@ async def _run_approved_strategy(
             "CHECK_PASSED:strategy_evaluated",
             f"CHECK_INFO:strategy={selected.slug}",
             f"CHECK_INFO:strategy_identity={strategy_identity}",
-            f"CHECK_INFO:signal_action={signal.action}",
+            f"CHECK_INFO:signal_action={signal_action}",
         ),
         signal_payload={
-            **signal.model_dump(mode="json"),
+            **signal_payload,
             "timeline": timeline,
             "market_window": {
                 "asset_symbol": asset.symbol,

@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+from types import SimpleNamespace
 from uuid import UUID
 
+import app.operator_cli.main as operator_main
 from app.operator_cli.main import parse_args
 
 
@@ -21,6 +23,28 @@ def test_parse_preview_command() -> None:
     assert args.product_id == "BTC-USD"
     assert args.strategy_interval == "15m"
     assert args.verbose is True
+
+
+def test_resolve_preview_idempotency_seed_defaults_to_fresh_value(monkeypatch) -> None:
+    monkeypatch.setattr(operator_main, "uuid4", lambda: SimpleNamespace(hex="fresh-seed"))
+    args = parse_args([
+        "preview",
+        "--actor",
+        "operator:test",
+    ])
+
+    assert operator_main._resolve_preview_idempotency_seed(args) == "fresh-seed"
+
+
+def test_resolve_preview_idempotency_seed_can_reuse_existing_key() -> None:
+    args = parse_args([
+        "preview",
+        "--reuse-idempotency-key",
+        "--actor",
+        "operator:test",
+    ])
+
+    assert operator_main._resolve_preview_idempotency_seed(args) is None
 
 
 def test_parse_preview_show_command() -> None:

@@ -34,7 +34,15 @@ def test_ma_crossover_buy_signal() -> None:
 
     assert signal.action == "buy"
     assert signal.reason == "Fast SMA crossed above Slow SMA."
-    assert set(signal.indicators) == {"fast_ma", "slow_ma", "previous_fast_ma", "previous_slow_ma"}
+    assert signal.indicators["signal_generated"] == "buy"
+    assert signal.indicators["crossover_state"] == "bullish_cross"
+    assert signal.indicators["evaluated_conditions"]["buy"] == {
+        "previous_fast_ma_lte_previous_slow_ma": True,
+        "fast_ma_gt_slow_ma": True,
+    }
+    assert signal.indicators["selection_explanations"]["buy"].startswith("BUY selected because")
+    assert signal.indicators["selection_explanations"]["sell"].startswith("SELL not selected because")
+    assert signal.indicators["selection_explanations"]["hold"].startswith("HOLD not selected because")
 
 
 def test_ma_crossover_sell_signal() -> None:
