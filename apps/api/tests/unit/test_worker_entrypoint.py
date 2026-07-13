@@ -8,6 +8,7 @@ from uuid import uuid4
 import pytest
 
 from app.services.data.binance_client import BinanceClientError, NormalizedCandle
+from app.services.data.kraken_client import KrakenClientError
 from app.services.data.ingestion_status import (
     get_last_successful_ingestion_at,
     reset_last_successful_ingestion_at,
@@ -106,6 +107,57 @@ async def test_worker_writes_fetched_candles(monkeypatch: pytest.MonkeyPatch) ->
     assert writes["count"] == 1
     assert db_session.commits == 1
     assert result.rows_written == 1
+
+
+@pytest.mark.asyncio
+async def test_worker_ingests_kraken_assets_with_15m_candles(monkeypatch: pytest.MonkeyPatch) -> None:
+    reset_last_successful_ingestion_at()
+
+    asset = SimpleNamespace(id=uuid4(), symbol="BTC", base_currency="USD", exchange="kraken_spot")
+    db_session = _FakeDBSession([asset])
+
+    candles = [
+        NormalizedCandle(
+            open_time=datetime(2026, 7, 5, 0, 0, tzinfo=timezone.utc),
+            close_time=datetime(2026, 7, 5, 0, 15, tzinfo=timezone.utc),
+            open=Decimal("1"),
+            high=Decimal("2"),
+            low=Decimal("0.5"),
+            close=Decimal("1.5"),
+            volume=Decimal("10"),
+            source="kraken_spot",
+        )
+    ]
+
+    class _FakeKrakenClient:
+        async def fetch_klines(self, **kwargs: object):
+            assert kwargs["symbol"] == "BTC-USD"
+            assert kwargs["interval"] == "15m"
+            return candles
+
+    class _FakeBinanceClient:
+        async def fetch_klines(self, **kwargs: object):
+            raise AssertionError(f"Binance client should not be used: {kwargs}")
+
+    async def _fake_upsert(db, asset_id, interval, incoming_candles):
+        assert db is db_session
+        assert asset_id == asset.id
+        assert interval == "15m"
+        assert incoming_candles == candles
+        return len(incoming_candles)
+
+    monkeypatch.setattr("app.services.data.worker_entrypoint.upsert_candles", _fake_upsert)
+
+    result = await run_ingestion_cycle(
+        db_session,
+        _FakeBinanceClient(),
+        _FakeKrakenClient(),
+        now_fn=lambda: datetime(2026, 7, 5, 2, 0, tzinfo=timezone.utc),
+    )
+
+    assert result.successful_assets == 1
+    assert result.failed_assets == 0
+    assert db_session.commits == 1
 
 
 @pytest.mark.asyncio

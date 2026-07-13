@@ -16,6 +16,7 @@ from app.models.asset import Asset
 from app.services.data.binance_client import BinanceClientError, BinanceUSClient
 from app.services.data.candle_writer import upsert_candles
 from app.services.data.http_client import AsyncHTTPClient
+from app.services.data.kraken_client import KrakenClientError, KrakenSpotClient
 
 
 logger = logging.getLogger(__name__)
@@ -96,14 +97,23 @@ async def backfill_symbol(
     db_session: AsyncSession,
     client: BinanceUSClient,
     args: BackfillArgs,
+    kraken_client: KrakenSpotClient | None = None,
 ) -> BackfillReport:
     asset = await get_asset_by_symbol(db_session, args.symbol)
     if asset is None:
         raise ValueError(f"Asset '{args.symbol}' not found. Run scripts/seed_assets.py first.")
 
-    if asset.exchange != "binance_us":
+    if asset.exchange == "binance_us":
+        source_client = client
+        source_symbol = args.symbol
+    elif asset.exchange == "kraken_spot":
+        if kraken_client is None:
+            raise ValueError("Kraken backfill requires a Kraken client")
+        source_client = kraken_client
+        source_symbol = _kraken_product_symbol(asset)
+    else:
         raise ValueError(
-            f"Asset '{args.symbol}' is on exchange '{asset.exchange}', but this backfill script currently targets binance_us assets only."
+            f"Asset '{args.symbol}' is on exchange '{asset.exchange}', but this backfill script only supports binance_us and kraken_spot assets."
         )
 
     interval_delta = INTERVAL_TO_DELTA[args.interval]
@@ -116,13 +126,13 @@ async def backfill_symbol(
         page_end = min(cursor + interval_delta * 1000, args.end_date)
 
         try:
-            candles = await client.fetch_klines(
-                symbol=args.symbol,
+            candles = await source_client.fetch_klines(
+                symbol=source_symbol,
                 interval=args.interval,
                 start_time=cursor,
                 end_time=page_end,
             )
-        except BinanceClientError as exc:
+        except (BinanceClientError, KrakenClientError) as exc:
             failure_message = (
                 f"Backfill stopped after partial success: succeeded_window={succeeded_start.isoformat() if succeeded_start else None}"
                 f"..{succeeded_end.isoformat() if succeeded_end else None}, failed_window={cursor.isoformat()}..{page_end.isoformat()},"
@@ -140,6 +150,11 @@ async def backfill_symbol(
             )
 
         if candles:
+            if candles[-1].open_time < cursor:
+                raise ValueError(
+                    "Kraken backfill pagination did not advance; latest candle open_time is older than the current cursor"
+                )
+
             written = await upsert_candles(db_session, asset.id, args.interval, candles)
             await db_session.commit()
 
@@ -190,7 +205,8 @@ async def _async_main(argv: Sequence[str] | None = None) -> int:
     async with AsyncSessionLocal() as db_session:
         async with AsyncHTTPClient() as http_client:
             client = BinanceUSClient(http_client)
-            report = await backfill_symbol(db_session, client, args)
+            kraken_client = KrakenSpotClient(http_client)
+            report = await backfill_symbol(db_session, client, args, kraken_client)
 
     print_report(report)
     return 1 if report.failure_message else 0
@@ -198,6 +214,15 @@ async def _async_main(argv: Sequence[str] | None = None) -> int:
 
 def main(argv: Sequence[str] | None = None) -> int:
     return asyncio.run(_async_main(argv))
+
+
+def _kraken_product_symbol(asset: Asset) -> str:
+    symbol = asset.symbol.strip().upper()
+    if "-" in symbol or "/" in symbol:
+        return symbol
+    if asset.base_currency:
+        return f"{symbol}-{asset.base_currency.strip().upper()}"
+    return symbol
 
 
 if __name__ == "__main__":
