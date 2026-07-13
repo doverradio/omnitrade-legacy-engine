@@ -5,7 +5,7 @@ import asyncio
 import sys
 from datetime import datetime, timezone
 from typing import Any
-from uuid import UUID
+from uuid import UUID, uuid4
 
 from app.operator_cli.formatting import (
     render_candles_text,
@@ -60,6 +60,7 @@ def _build_parser() -> argparse.ArgumentParser:
     preview.add_argument("--strategy-interval", type=str, default="15m")
     preview.add_argument("--trigger", type=str, default="operator_cli")
     preview.add_argument("--idempotency-seed", type=str, default=None)
+    preview.add_argument("--reuse-idempotency-key", action="store_true", help="Reuse the orchestrator-derived idempotency key instead of minting a fresh preview seed.")
     preview.add_argument("--software-build-version", type=str, default=None)
     preview.add_argument("--forced-action", choices=["BUY", "SELL", "HOLD"], default=None)
     preview.add_argument("--json", action="store_true", dest="json_output")
@@ -116,6 +117,15 @@ def _build_parser() -> argparse.ArgumentParser:
     return parser
 
 
+def _resolve_preview_idempotency_seed(args: argparse.Namespace) -> str | None:
+    if getattr(args, "reuse_idempotency_key", False):
+        return None
+    explicit_seed = getattr(args, "idempotency_seed", None)
+    if explicit_seed:
+        return explicit_seed
+    return uuid4().hex
+
+
 async def _run_async(args: argparse.Namespace) -> tuple[int, dict[str, Any], str]:
     options = resolve_render_options(no_color=bool(args.no_color), verbose=bool(args.verbose))
 
@@ -126,7 +136,7 @@ async def _run_async(args: argparse.Namespace) -> tuple[int, dict[str, Any], str
             product_id=args.product_id,
             strategy_interval=args.strategy_interval,
             trigger=args.trigger,
-            idempotency_seed=args.idempotency_seed,
+            idempotency_seed=_resolve_preview_idempotency_seed(args),
             software_build_version=args.software_build_version,
             forced_action=args.forced_action,
         )

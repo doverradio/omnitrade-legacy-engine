@@ -31,6 +31,194 @@ def _coerce_decimal(value: Any) -> str | None:
     return str(value)
 
 
+def _parse_datetime(value: Any) -> datetime | None:
+    if value is None:
+        return None
+    if isinstance(value, datetime):
+        return value if value.tzinfo is not None else value.replace(tzinfo=timezone.utc)
+    if isinstance(value, str):
+        normalized = value.strip()
+        if normalized.endswith("Z"):
+            normalized = f"{normalized[:-1]}+00:00"
+        parsed = datetime.fromisoformat(normalized)
+        return parsed if parsed.tzinfo is not None else parsed.replace(tzinfo=timezone.utc)
+    return None
+
+
+def _seconds_between(later: datetime | None, earlier: datetime | None) -> int | None:
+    if later is None or earlier is None:
+        return None
+    delta = later.astimezone(timezone.utc) - earlier.astimezone(timezone.utc)
+    return max(0, int(delta.total_seconds()))
+
+
+def _preview_command_mode(*, replayed: bool, command_name: str) -> str:
+    if command_name == "preview-show":
+        return "VIEW_EXISTING"
+    return "IDEMPOTENT_REPLAY" if replayed else "NEW_PREVIEW"
+
+
+def _decision_classification(*, proposed_action: str | None, risk_verdict: str | None, deterministic_explanation: list[str], failure_reason: str | None) -> str:
+    action = (proposed_action or "").upper()
+    risk = (risk_verdict or "").upper()
+    explanation_blob = " ".join(deterministic_explanation).lower()
+    reason = (failure_reason or "").lower()
+
+    if reason.startswith("mandate_status_") or "mandate_not_active" in explanation_blob or "mandate_version_invalid" in reason:
+        return "MANDATE_REJECTED"
+    if "reconciliation_not_ready" in reason or "provider_not_ready" in reason or "insufficient_candle_context" in explanation_blob or "exchange_connection_not_found" in reason:
+        return "INFRASTRUCTURE_BLOCKED"
+    if risk == "REJECTED":
+        return "RISK_REJECTED"
+    if action == "HOLD":
+        if "strategy_evaluated" in explanation_blob or "signal_action=hold" in explanation_blob:
+            return "STRATEGY_DERIVED"
+        return "SAFETY_HOLD" if explanation_blob else "INFRASTRUCTURE_BLOCKED"
+    if action in {"BUY", "SELL"}:
+        return "STRATEGY_DERIVED"
+    return "INFRASTRUCTURE_BLOCKED"
+
+
+def _capital_state(*, preview: CryptoOrderPreview | None, proposed_action: str | None) -> str:
+    if preview is not None:
+        return "PREVIEW_ONLY"
+    if (proposed_action or "").upper() == "HOLD":
+        return "NONE"
+    return "UNKNOWN"
+
+
+def _build_timeline_payload(
+    *,
+    command_mode: str,
+    cycle: AutonomousCycleRun | None,
+    decision: DecisionRecord | None,
+    snapshot: DecisionSnapshot | None,
+    preview: CryptoOrderPreview | None,
+) -> dict[str, Any]:
+    now = datetime.now(timezone.utc)
+    cycle_created_at = _parse_datetime(getattr(cycle, "created_at", None)) or _parse_datetime(getattr(cycle, "started_at", None))
+    decision_created_at = _parse_datetime(getattr(decision, "timestamp", None))
+    snapshot_created_at = _parse_datetime(getattr(snapshot, "timestamp", None))
+    preview_created_at = _parse_datetime(getattr(preview, "created_at", None))
+
+    cycle_context = getattr(cycle, "cycle_context", None) or {}
+    timeline_context = {}
+    if isinstance(cycle_context, dict):
+        strategy_context = cycle_context.get("strategy") if isinstance(cycle_context.get("strategy"), dict) else {}
+        signal_payload = strategy_context.get("signal_payload") if isinstance(strategy_context, dict) else {}
+        if isinstance(signal_payload, dict):
+            timeline_context = signal_payload.get("timeline") if isinstance(signal_payload.get("timeline"), dict) else {}
+        if not timeline_context and isinstance(cycle_context.get("timeline"), dict):
+            timeline_context = cycle_context.get("timeline")
+
+    latest_completed_candle_open = _parse_datetime(timeline_context.get("latest_completed_candle_open")) if isinstance(timeline_context, dict) else None
+    latest_completed_candle_close = _parse_datetime(timeline_context.get("latest_completed_candle_close")) if isinstance(timeline_context, dict) else None
+    oldest_candle_used_open = _parse_datetime(timeline_context.get("oldest_candle_used_open")) if isinstance(timeline_context, dict) else None
+    oldest_candle_used_close = _parse_datetime(timeline_context.get("oldest_candle_used_close")) if isinstance(timeline_context, dict) else None
+    evaluated_at = _parse_datetime(timeline_context.get("evaluated_at")) or decision_created_at or cycle_created_at or now
+
+    cycle_age_seconds = _seconds_between(now, cycle_created_at)
+    decision_age_seconds = _seconds_between(now, decision_created_at)
+    snapshot_age_seconds = _seconds_between(now, snapshot_created_at)
+    market_data_age_seconds = _seconds_between(now, latest_completed_candle_close)
+
+    history_candle_count = timeline_context.get("history_candle_count") if isinstance(timeline_context, dict) else None
+    current_candle_excluded = bool(timeline_context.get("current_incomplete_candle_excluded")) if isinstance(timeline_context, dict) else None
+    decision_applies_to = timeline_context.get("decision_applies_to") if isinstance(timeline_context, dict) else None
+
+    mismatch_warning = False
+    if cycle_age_seconds is not None and decision_age_seconds is not None:
+        if abs(cycle_age_seconds - decision_age_seconds) > 120:
+            mismatch_warning = True
+
+    return {
+        "evaluated_at": evaluated_at,
+        "cycle_created_at": cycle_created_at,
+        "decision_created_at": decision_created_at,
+        "snapshot_created_at": snapshot_created_at,
+        "preview_created_at": preview_created_at,
+        "latest_completed_candle_open": latest_completed_candle_open,
+        "latest_completed_candle_close": latest_completed_candle_close,
+        "oldest_candle_used_open": oldest_candle_used_open,
+        "oldest_candle_used_close": oldest_candle_used_close,
+        "history_candle_count": history_candle_count,
+        "cycle_age_seconds": cycle_age_seconds,
+        "decision_age_seconds": decision_age_seconds,
+        "snapshot_age_seconds": snapshot_age_seconds,
+        "market_data_age_seconds": market_data_age_seconds,
+        "current_incomplete_candle_excluded": current_candle_excluded,
+        "decision_applies_to": decision_applies_to,
+        "age_sources": {
+            "cycle_age_seconds": "autonomous_cycle_runs.created_at",
+            "decision_age_seconds": "decision_records.timestamp",
+            "snapshot_age_seconds": "decision_snapshots.timestamp",
+            "market_data_age_seconds": "candles.close_time",
+        },
+        "timestamp_mismatch_warning": mismatch_warning,
+    }
+
+
+def _build_preview_evidence_payload(
+    *,
+    command_name: str,
+    result: Any,
+    cycle: AutonomousCycleRun | None,
+    decision: DecisionRecord | None,
+    snapshot: DecisionSnapshot | None,
+    preview: CryptoOrderPreview | None,
+) -> dict[str, Any]:
+    evaluation_mode = _preview_command_mode(replayed=bool(getattr(result, "replayed", False)), command_name=command_name)
+    command_mode = evaluation_mode
+    if command_name == "preview-show":
+        command_mode = "VIEW_EXISTING"
+
+    proposed_action = getattr(result, "proposed_action", None) or getattr(cycle, "proposed_action", None) or "HOLD"
+    risk_verdict = getattr(result, "risk_verdict", None) or getattr(cycle, "risk_verdict", None)
+    deterministic_explanation = list(getattr(result.diagnostics, "deterministic_explanation", []) if getattr(result, "diagnostics", None) else [])
+    if not deterministic_explanation and cycle is not None:
+        deterministic_explanation = list(getattr(cycle, "deterministic_explanation", []) or [])
+
+    timeline = _build_timeline_payload(
+        command_mode=command_mode,
+        cycle=cycle,
+        decision=decision,
+        snapshot=snapshot,
+        preview=preview,
+    )
+
+    decision_classification = _decision_classification(
+        proposed_action=proposed_action,
+        risk_verdict=risk_verdict,
+        deterministic_explanation=deterministic_explanation,
+        failure_reason=getattr(result.diagnostics, "failure_reason", None) if getattr(result, "diagnostics", None) else getattr(cycle, "failure_reason", None),
+    )
+
+    capital_state = _capital_state(preview=preview, proposed_action=proposed_action)
+    new_evaluation = command_mode == "NEW_PREVIEW"
+    outcome = (proposed_action or "FAILED").upper() if command_mode != "VIEW_EXISTING" else (getattr(decision, "outcome", None) or (proposed_action or "FAILED")).upper()
+
+    if command_mode == "VIEW_EXISTING":
+        record_created = timeline.get("decision_created_at") or timeline.get("cycle_created_at")
+    elif command_mode == "IDEMPOTENT_REPLAY":
+        record_created = timeline.get("cycle_created_at")
+    else:
+        record_created = timeline.get("cycle_created_at") or timeline.get("decision_created_at")
+
+    timeline_warning = bool(timeline.get("timestamp_mismatch_warning"))
+
+    return {
+        "command_mode": command_mode,
+        "evaluation_mode": evaluation_mode,
+        "outcome": outcome,
+        "decision_classification": decision_classification,
+        "capital_state": capital_state,
+        "new_evaluation": new_evaluation,
+        "record_created_at": record_created,
+        "timeline": timeline,
+        "timeline_warning": timeline_warning,
+    }
+
+
 async def execute_preview_cycle(
     *,
     mandate_id: UUID | None,
@@ -74,7 +262,12 @@ async def execute_preview_cycle(
             ),
         )
 
-    return {
+        cycle = await db.get(AutonomousCycleRun, result.cycle_id)
+        decision = await db.get(DecisionRecord, result.decision_record_id) if result.decision_record_id else None
+        snapshot = await db.get(DecisionSnapshot, result.decision_record_id) if result.decision_record_id else None
+        preview = await db.get(CryptoOrderPreview, result.preview_id) if result.preview_id else None
+
+    payload = {
         "cycle_id": result.cycle_id,
         "state": result.state,
         "idempotency_key": result.idempotency_key,
@@ -100,6 +293,18 @@ async def execute_preview_cycle(
             "deterministic_explanation": list(result.diagnostics.deterministic_explanation),
         },
     }
+
+    payload.update(
+        _build_preview_evidence_payload(
+            command_name="preview",
+            result=result,
+            cycle=cycle,
+            decision=decision,
+            snapshot=snapshot,
+            preview=preview,
+        )
+    )
+    return payload
 
 
 def _resolve_git_sha() -> str | None:
@@ -140,7 +345,7 @@ async def fetch_preview_evidence(*, preview_id: UUID) -> dict[str, Any]:
             .limit(1)
         )
 
-    return {
+    payload = {
         "preview": {
             "crypto_order_preview_id": preview.crypto_order_preview_id,
             "status": preview.status,
@@ -209,9 +414,23 @@ async def fetch_preview_evidence(*, preview_id: UUID) -> dict[str, Any]:
             "risk_verdict": cycle.risk_verdict if cycle else None,
             "started_at": cycle.started_at if cycle else None,
             "completed_at": cycle.completed_at if cycle else None,
+            "created_at": cycle.created_at if cycle else None,
             "deterministic_explanation": cycle.deterministic_explanation if cycle else None,
+            "cycle_context": cycle.cycle_context if cycle else None,
         },
     }
+
+    payload.update(
+        _build_preview_evidence_payload(
+            command_name="preview-show",
+            result=type("_PreviewResult", (), {"replayed": False, "proposed_action": preview.side, "risk_verdict": preview.risk_verdict, "diagnostics": type("_Diag", (), {"deterministic_explanation": cycle.deterministic_explanation if cycle else [], "failure_reason": cycle.failure_reason if cycle else None})()})(),
+            cycle=cycle,
+            decision=decision,
+            snapshot=snapshot,
+            preview=preview,
+        )
+    )
+    return payload
 
 
 async def fetch_candle_readiness(

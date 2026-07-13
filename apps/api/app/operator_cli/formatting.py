@@ -218,20 +218,24 @@ def _next_evaluation(payload: dict[str, Any]) -> str:
 
 def render_preview_text(payload: dict[str, Any], options: RenderOptions) -> str:
     diagnostics = payload.get("diagnostics") or {}
-    cycle_context = payload.get("cycle_context") or {}
-    strategy = cycle_context.get("strategy") or {}
-    market = cycle_context.get("market_evidence") or {}
-    mandate_status = payload.get("mandate_verdict")
-    action = str(payload.get("proposed_action") or "HOLD")
+    timeline = payload.get("timeline") or {}
+    command_mode = _fmt(payload.get("command_mode") or payload.get("evaluation_mode") or ("IDEMPOTENT_REPLAY" if payload.get("replayed") else "NEW_PREVIEW"))
+    outcome = _fmt(payload.get("outcome") or payload.get("proposed_action") or "HOLD").upper()
+    classification = _fmt(payload.get("decision_classification") or _classify_hold(payload)).replace("_", " ").title().replace(" ", "-")
+    capital_state = _fmt(payload.get("capital_state") or ("PREVIEW_ONLY" if payload.get("preview_id") else "NONE"))
+    raw_explanations = [str(item) for item in (diagnostics.get("deterministic_explanation") or [])]
+    humanized = [_humanize_reason(item) for item in raw_explanations]
+    signal_reason = "\n".join(entry for entry in humanized if entry)
 
     lines = _frame_header("AUTONOMOUS PREVIEW", options)
     lines.extend(
         _section(
-            "Overall",
+            "Evaluation",
             [
-                ("State", _style(_fmt(payload.get("state")).upper(), _state_tone(_fmt(payload.get("state"))), options)),
-                ("Decision", _badge(action, replayed=bool(payload.get("replayed")), options=options)),
-                ("Type", _classify_hold(payload) if action.upper() == "HOLD" else "Capital movement candidate"),
+                ("Mode", _style(command_mode.replace("_", " "), _state_tone(command_mode), options)),
+                ("Generated at", _fmt(timeline.get("evaluated_at") or payload.get("started_at") or payload.get("completed_at"), default="Unavailable")),
+                ("Cycle age", f"{timeline.get('cycle_age_seconds')} seconds" if timeline.get("cycle_age_seconds") is not None else "Unavailable"),
+                ("Decision record", "CREATED NOW" if command_mode == "NEW_PREVIEW" else ("No" if command_mode != "VIEW_EXISTING" else "No new evaluation")),
             ],
             options,
         )
@@ -239,84 +243,57 @@ def render_preview_text(payload: dict[str, Any], options: RenderOptions) -> str:
 
     lines.extend(
         _section(
-            "Market",
+            "Identifiers",
             [
-                ("Asset", _fmt((cycle_context.get("product_id") or payload.get("product_id") or "BTC-USD"))),
-                ("Exchange", _fmt((cycle_context.get("provider") or cycle_context.get("exchange_environment") or market.get("provider") or "Unavailable"))),
-                ("Interval", _fmt(cycle_context.get("strategy_interval") or cycle_context.get("interval") or "15m")),
-                ("Candle age", f"{_fmt(market.get('age_minutes'), default='Unavailable')} minutes" if market.get("age_minutes") is not None else "Unavailable"),
-                ("Readiness", "READY" if market.get("reference_price") else "Unavailable"),
-            ],
-            options,
-        )
-    )
-
-    lines.extend(
-        _section(
-            "Mandate",
-            [("Verdict", _style(_fmt(mandate_status).upper(), _state_tone(_fmt(mandate_status)), options))],
-            options,
-        )
-    )
-
-    lines.extend(
-        _section(
-            "Strategy",
-            [
-                ("Name", _fmt(strategy.get("name"), default="Unavailable")),
-                ("Version", _fmt(strategy.get("version"), default="Unavailable")),
-            ],
-            options,
-        )
-    )
-
-    raw_explanations = [str(item) for item in (diagnostics.get("deterministic_explanation") or [])]
-    humanized = [_humanize_reason(item) for item in raw_explanations]
-    signal_reason = " ".join(entry for entry in humanized if entry)
-    lines.extend(
-        _section(
-            "Signal",
-            [
-                ("Action", _badge(action, replayed=False, options=options)),
-                ("Reason", signal_reason or "Unavailable"),
-            ],
-            options,
-        )
-    )
-
-    risk_expected = action.upper() in {"BUY", "SELL"}
-    preview_expected = risk_expected and str(payload.get("risk_verdict") or "").upper() in {"ACCEPTED", "RESIZED"}
-    lines.extend(
-        _section(
-            "Risk",
-            [
-                ("Verdict", _style(_fmt(payload.get("risk_verdict")), _state_tone(_fmt(payload.get("risk_verdict"))), options)),
-                ("Expected", "Yes" if risk_expected else "No"),
-                ("Preview expected", "Yes" if preview_expected else "No"),
-            ],
-            options,
-        )
-    )
-
-    lines.extend(
-        _section(
-            "Decision Record",
-            [
-                ("Decision ID", _fmt(payload.get("decision_record_id"), default="Unavailable")),
+                ("Cycle ID", _fmt(payload.get("cycle_id"), default="Unavailable")),
+                ("Decision Record ID", _fmt(payload.get("decision_record_id"), default="Unavailable")),
+                ("Decision Snapshot ID", _fmt((payload.get("decision_snapshot") or {}).get("decision_id") or payload.get("decision_record_id"), default="Unavailable")),
                 ("Preview ID", _fmt(payload.get("preview_id"), default="Unavailable")),
             ],
             options,
         )
     )
 
-    completed_age = _minutes_age(payload.get("completed_at"))
+    lines.extend(
+        _section(
+            "Market Window",
+            [
+                ("Asset", _fmt((timeline.get("asset") or (payload.get("cycle_context") or {}).get("product_id") or "BTC-USD"))),
+                ("Interval", _fmt((payload.get("cycle_context") or {}).get("strategy_interval") or (payload.get("decision_record") or {}).get("timeframe") or "15m")),
+                ("Latest candle open", _fmt(timeline.get("latest_completed_candle_open"), default="Unavailable")),
+                ("Latest candle close", _fmt(timeline.get("latest_completed_candle_close"), default="Unavailable")),
+                ("History loaded", _fmt(timeline.get("history_candle_count"), default="Unavailable") + " candles" if timeline.get("history_candle_count") is not None else "Unavailable"),
+                ("Oldest candle used", _fmt(timeline.get("oldest_candle_used_open"), default="Unavailable")),
+                ("Newest candle used", _fmt(timeline.get("latest_completed_candle_close"), default="Unavailable")),
+                ("Decision applies to", _fmt(timeline.get("decision_applies_to"), default="Unavailable")),
+                ("Current candle excluded", _fmt(timeline.get("current_incomplete_candle_excluded"), default="Unavailable")),
+            ],
+            options,
+        )
+    )
+
+    lines.extend(
+        _section(
+            "Outcome",
+            [
+                ("Action", _badge(outcome, replayed=command_mode == "IDEMPOTENT_REPLAY", options=options)),
+                ("Classification", classification),
+                ("Capital state", capital_state),
+                ("Risk expected", "Yes" if outcome in {"BUY", "SELL"} else "No"),
+                ("Preview expected", "Yes" if outcome in {"BUY", "SELL"} and _fmt(payload.get("risk_verdict")).upper() in {"ACCEPTED", "RESIZED"} else "No"),
+            ],
+            options,
+        )
+    )
+
     lines.extend(
         _section(
             "Timing",
             [
+                ("Evaluation timestamp", _fmt(timeline.get("evaluated_at") or payload.get("started_at") or payload.get("completed_at"), default="Unavailable")),
+                ("Decision age", f"{timeline.get('decision_age_seconds')} seconds" if timeline.get("decision_age_seconds") is not None else "Unavailable"),
+                ("Candle age", f"{timeline.get('market_data_age_seconds')} seconds" if timeline.get("market_data_age_seconds") is not None else "Unavailable"),
                 ("Duration", _duration_seconds(payload)),
-                ("Decision age", f"{completed_age} minutes" if completed_age is not None else "Unavailable"),
-                ("Next evaluation", _next_evaluation(payload)),
             ],
             options,
         )
@@ -333,15 +310,22 @@ def render_preview_text(payload: dict[str, Any], options: RenderOptions) -> str:
         )
     )
 
-    lines.extend(_section("Recommendation", [("Action", _operator_recommendation(payload))], options))
+    lines.extend(_section("Recommendation", [("Operator", _operator_recommendation(payload))], options))
 
-    explanation = diagnostics.get("deterministic_explanation") or []
-    if explanation and options.verbose:
-        lines.append("Verbose deterministic codes")
-        lines.append("--------------------------" if not options.unicode_enabled else "──────────────────────────")
-        for item in explanation:
-            lines.append(f"- {item}")
+    if payload.get("timeline_warning"):
+        lines.extend(_section("Warning", [("EVIDENCE TIMESTAMP MISMATCH", "Fresh cycle and decision timestamps disagree unexpectedly")], options))
+
+    if signal_reason and options.verbose:
+        lines.extend(_section("Verbose", [("Deterministic codes", "\n".join(f"- {item}" for item in raw_explanations))], options))
         lines.append("")
+        lines.append(_style("Source fields", "muted", options))
+        lines.append("- command_mode -> explicit command/evaluation mode")
+        lines.append("- timeline.cycle_age_seconds -> autonomous_cycle_runs.created_at")
+        lines.append("- timeline.decision_age_seconds -> decision_records.timestamp")
+        lines.append("- timeline.market_data_age_seconds -> candles.close_time")
+        lines.append("- timeline.latest_completed_candle_open/close -> strategy market window")
+        lines.append(f"- outcome -> {_fmt(outcome)}")
+        lines.append(f"- classification -> {_fmt(payload.get('decision_classification') or _classify_hold(payload))}")
     return "\n".join(lines)
 
 
@@ -350,49 +334,55 @@ def render_preview_show_text(payload: dict[str, Any], options: RenderOptions) ->
     decision = payload.get("decision_record") or {}
     snapshot = payload.get("decision_snapshot") or {}
     cycle = payload.get("cycle") or {}
+    timeline = payload.get("timeline") or {}
+    command_mode = _fmt(payload.get("command_mode") or payload.get("evaluation_mode") or "VIEW_EXISTING")
+    outcome = _fmt(payload.get("outcome") or decision.get("outcome") or preview.get("side") or "HOLD").upper()
+    classification = _fmt(payload.get("decision_classification") or ("Strategy-derived" if outcome in {"BUY", "SELL"} else _classify_hold({"proposed_action": outcome, "diagnostics": {"deterministic_explanation": list(cycle.get("deterministic_explanation") or [])}})))
     lines = _frame_header("PREVIEW EVIDENCE", options)
     lines.extend(
         _section(
-            "Overall",
+            "Evaluation",
             [
-                ("Preview", _fmt(preview.get("crypto_order_preview_id"), default="Unavailable")),
-                ("Status", _style(_fmt(preview.get("status")), _state_tone(_fmt(preview.get("status"))), options)),
-                ("Decision", _badge(preview.get("side"), replayed=False, options=options)),
+                ("Mode", _style(command_mode.replace("_", " "), _state_tone(command_mode), options)),
+                ("Record created", _fmt(timeline.get("record_created_at") or decision.get("timeframe") or preview.get("created_at"), default="Unavailable")),
+                ("Age", f"{timeline.get('decision_age_seconds')} seconds" if timeline.get("decision_age_seconds") is not None else "Unavailable"),
+                ("New evaluation", "No"),
             ],
             options,
         )
     )
     lines.extend(
         _section(
-            "Market",
+            "Identifiers",
             [
-                ("Provider", _fmt(preview.get("provider"), default="Unavailable")),
-                ("Environment", _fmt(preview.get("environment"), default="Unavailable")),
-                ("Product", _fmt(preview.get("product_id"), default="Unavailable")),
+                ("Preview ID", _fmt(preview.get("crypto_order_preview_id"), default="Unavailable")),
+                ("Decision Record ID", _fmt(decision.get("decision_id"), default="Unavailable")),
+                ("Decision Snapshot ID", _fmt(snapshot.get("decision_id") or decision.get("decision_id"), default="Unavailable")),
+                ("Cycle ID", _fmt(cycle.get("cycle_id"), default="Unavailable")),
             ],
             options,
         )
     )
     lines.extend(
         _section(
-            "Risk",
+            "Market Window",
             [
-                ("Readiness", _fmt(preview.get("readiness_verdict"), default="Unavailable")),
-                ("Risk verdict", _fmt(preview.get("risk_verdict"), default="Unavailable")),
-                ("Trade accepted", _fmt(decision.get("trade_accepted"), default="Unavailable")),
+                ("Asset", _fmt(preview.get("product_id"), default="Unavailable")),
+                ("Interval", _fmt(decision.get("timeframe"), default="Unavailable")),
+                ("Latest candle", _fmt(timeline.get("latest_completed_candle_close"), default="Unavailable")),
+                ("History loaded", _fmt(timeline.get("history_candle_count"), default="Unavailable") + " candles" if timeline.get("history_candle_count") is not None else "Unavailable"),
+                ("Decision applies to", _fmt(timeline.get("decision_applies_to"), default="Unavailable")),
             ],
             options,
         )
     )
     lines.extend(
         _section(
-            "Decision Record",
+            "Outcome",
             [
-                ("Decision ID", _fmt(decision.get("decision_id"), default="Unavailable")),
-                ("Timeframe", _fmt(decision.get("timeframe"), default="Unavailable")),
-                ("Strategy", _fmt(snapshot.get("strategy_version"), default="Unavailable")),
-                ("Config", _fmt(snapshot.get("configuration_version"), default="Unavailable")),
-                ("Cycle", _fmt(cycle.get("cycle_id"), default="Unavailable")),
+                ("Action", _badge(outcome, replayed=False, options=options)),
+                ("Classification", classification.replace("_", " ").title()),
+                ("Capital state", _fmt(payload.get("capital_state") or ("PREVIEW_ONLY" if preview else "NONE"))),
             ],
             options,
         )
@@ -407,20 +397,26 @@ def render_preview_show_text(payload: dict[str, Any], options: RenderOptions) ->
             options,
         )
     )
-
     warning_messages = preview.get("warning_messages") or []
     if warning_messages:
-        lines.append(_style("Warnings", "warn", options))
+        lines.extend(_section("Warnings", [("Count", str(len(warning_messages)))], options))
         for message in warning_messages:
             lines.append(f"- {message}")
         lines.append("")
-
     strategy_inputs = snapshot.get("strategy_inputs") or {}
     signal_reason = strategy_inputs.get("signal_reason")
     if signal_reason:
-        lines.append(f"Signal reason: {_fmt(signal_reason)}")
+        lines.extend(_section("Signal", [("Reason", _fmt(signal_reason))], options))
+    if options.verbose:
+        lines.append(_style("Verbose deterministic codes", "muted", options))
+        for item in cycle.get("deterministic_explanation") or []:
+            lines.append(f"- {item}")
         lines.append("")
-
+        lines.append(_style("Source fields", "muted", options))
+        lines.append("- command_mode -> explicit preview-show mode")
+        lines.append("- decision_age_seconds -> decision_records.timestamp")
+        lines.append("- record_created_at -> decision_records.timestamp")
+        lines.append("- history_candle_count -> cycle timeline slice")
     return "\n".join(lines)
 
 

@@ -111,8 +111,7 @@ async def run_autonomous_preview_cycle(
     )
     if existing is not None and existing.state in _TERMINAL_CYCLE_STATES | {"COMPLETE"}:
         return _to_cycle_result(existing, replayed=True)
-
-    cycle = existing
+    cycle: AutonomousCycleRun | None = None
     if cycle is None:
         cycle = AutonomousCycleRun(
             idempotency_key=idempotency_key,
@@ -305,6 +304,7 @@ async def run_autonomous_preview_cycle(
                 "name": proposal.strategy_name,
                 "version": runtime_strategy_identity,
                 "deterministic_explanation": list(proposal.deterministic_explanation),
+                "signal_payload": proposal.signal_payload,
             },
             "proposed_action": proposal.action,
         }
@@ -518,6 +518,13 @@ async def _run_approved_strategy(
             strategy_name="forced_preview_action",
             strategy_version="forced",
             deterministic_explanation=(f"CHECK_INFO:forced_action={request.forced_action}",),
+            signal_payload=None,
+        )
+
+    if request.forced_action is not None and request.forced_action not in ACTIONS:
+        raise InvalidRequestError(
+            message="forced_action must be BUY, SELL, or HOLD",
+            details={"forced_action": request.forced_action},
         )
 
     asset, asset_resolution_reason = await _resolve_asset_for_cycle(
@@ -532,6 +539,7 @@ async def _run_approved_strategy(
             strategy_name="none",
             strategy_version="none",
             deterministic_explanation=(f"CHECK_FAILED:{asset_resolution_reason or 'asset_not_found_for_strategy'}",),
+            signal_payload=None,
         )
 
     strategies = list(
@@ -559,6 +567,7 @@ async def _run_approved_strategy(
             strategy_name="none",
             strategy_version="none",
             deterministic_explanation=("CHECK_FAILED:no_approved_strategy_active",),
+            signal_payload=None,
         )
 
     strategy_identity = build_strategy_identity(slug=selected.slug, module_version=selected.module_version)
@@ -569,6 +578,7 @@ async def _run_approved_strategy(
             strategy_name=selected.slug,
             strategy_version=strategy_identity,
             deterministic_explanation=("CHECK_FAILED:strategy_factory_not_registered",),
+            signal_payload=None,
         )
 
     candles = list(
@@ -587,7 +597,21 @@ async def _run_approved_strategy(
             strategy_name=selected.slug,
             strategy_version=strategy_identity,
             deterministic_explanation=("CHECK_FAILED:insufficient_candle_context",),
+            signal_payload=None,
         )
+
+    latest_candle = candles[0]
+    oldest_candle = candles[-1]
+    timeline = {
+        "evaluated_at": datetime.now(timezone.utc).isoformat(),
+        "history_candle_count": len(candles),
+        "latest_completed_candle_open": latest_candle.open_time.isoformat(),
+        "latest_completed_candle_close": latest_candle.close_time.isoformat(),
+        "oldest_candle_used_open": oldest_candle.open_time.isoformat(),
+        "oldest_candle_used_close": oldest_candle.close_time.isoformat(),
+        "current_incomplete_candle_excluded": True,
+        "decision_applies_to": f"Latest completed {request.strategy_interval} candle",
+    }
 
     params = await db.scalar(
         select(ParameterSet)
@@ -630,6 +654,20 @@ async def _run_approved_strategy(
             f"CHECK_INFO:strategy_identity={strategy_identity}",
             f"CHECK_INFO:signal_action={signal.action}",
         ),
+        signal_payload={
+            **signal.model_dump(mode="json"),
+            "timeline": timeline,
+            "market_window": {
+                "asset_symbol": asset.symbol,
+                "interval": request.strategy_interval,
+                "history_candle_count": len(candles),
+                "latest_completed_candle_open": latest_candle.open_time.isoformat(),
+                "latest_completed_candle_close": latest_candle.close_time.isoformat(),
+                "oldest_candle_used_open": oldest_candle.open_time.isoformat(),
+                "oldest_candle_used_close": oldest_candle.close_time.isoformat(),
+                "current_incomplete_candle_excluded": True,
+            },
+        },
     )
 
 
@@ -810,6 +848,8 @@ async def _persist_decision_intelligence(
         return existing.decision_id
 
     trade_accepted = risk_summary.risk_verdict in {"ACCEPTED", "RESIZED"}
+    signal_payload = proposal.signal_payload or {}
+    signal_indicators = signal_payload.get("indicators") if isinstance(signal_payload, dict) else {}
     record = DecisionRecord(
         idempotency_key=idempotency_key,
         source_lineage={
@@ -824,6 +864,7 @@ async def _persist_decision_intelligence(
         },
         field_provenance={
             "generated_signals": [{"entity_type": "autonomous_cycle_runs", "entity_id": str(cycle.cycle_id)}],
+            "indicators": [{"entity_type": "strategy_signal", "entity_id": str(cycle.cycle_id)}] if signal_payload else [],
             "risk_adjustments": [{"entity_type": "risk_events", "entity_id": str(cycle.risk_event_id)}] if cycle.risk_event_id else [],
         },
         version=DECISION_ENGINE_VERSION,
@@ -831,12 +872,16 @@ async def _persist_decision_intelligence(
         asset={"product_id": normalize_product_id(product_id), "provider": mandate.provider},
         timeframe=strategy_interval,
         market_regime={"state": "unknown", "source": "autonomous_cycle_preview"},
-        indicators={},
+        indicators=signal_indicators if isinstance(signal_indicators, dict) else {},
         generated_signals=[
             {
                 "action": proposal.action,
                 "strategy": proposal.strategy_name,
                 "strategy_version": proposal.strategy_version,
+                "signal_reason": signal_payload.get("reason") if isinstance(signal_payload, dict) else None,
+                "signal_generated": signal_payload.get("action") if isinstance(signal_payload, dict) else None,
+                "strategy_evidence": signal_indicators if isinstance(signal_indicators, dict) else {},
+                "timeline": signal_payload.get("timeline") if isinstance(signal_payload, dict) else None,
             }
         ],
         signal_strength=None,
@@ -894,6 +939,10 @@ async def _persist_decision_intelligence(
             "allowed_strategy_versions": list(version.allowed_strategy_versions),
             "selected_strategy": proposal.strategy_name,
             "selected_strategy_identity": proposal.strategy_version,
+            "strategy_evidence": signal_indicators if isinstance(signal_indicators, dict) else {},
+            "signal_reason": signal_payload.get("reason") if isinstance(signal_payload, dict) else None,
+            "signal_generated": signal_payload.get("action") if isinstance(signal_payload, dict) else None,
+            "timeline": signal_payload.get("timeline") if isinstance(signal_payload, dict) else None,
         },
         risk_inputs={
             "risk_verdict": risk_summary.risk_verdict,
