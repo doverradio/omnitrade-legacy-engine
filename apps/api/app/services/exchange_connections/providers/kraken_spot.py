@@ -1130,7 +1130,6 @@ class KrakenSpotClient:
             "type": side.lower(),
             "pair": altname,
             "volume": format(quote_size, "f") if side == "BUY" else format(base_size, "f"),
-            "timeinforce": "IOC",
             "cl_ord_id": request.client_order_id,
         }
         if side == "BUY":
@@ -1147,6 +1146,8 @@ class KrakenSpotClient:
             details = exc.details if isinstance(exc.details, dict) else {}
             errors = details.get("errors") if isinstance(details.get("errors"), list) else []
             status_code = details.get("status_code")
+            provider_path = details.get("path")
+            forensics = details.get("forensics") if isinstance(details.get("forensics"), dict) else None
             if isinstance(status_code, int) and status_code >= 500:
                 return ExchangeOrderSubmissionResult(
                     classification="ambiguous",
@@ -1154,9 +1155,14 @@ class KrakenSpotClient:
                     rejection=None,
                     ambiguous=ExchangeProviderAmbiguousResponse(
                         reason="provider_http_5xx",
-                        safe_details={"status_code": status_code, "path": details.get("path")},
+                        safe_details={"status_code": status_code, "path": provider_path},
                     ),
-                    raw_response={},
+                    raw_response={
+                        "provider_path": provider_path,
+                        "http_status": status_code,
+                        "provider_errors": [str(item) for item in errors[:10]],
+                        "forensics": forensics,
+                    },
                     safe_headers={},
                 )
             rejection_code = "provider_rejected"
@@ -1166,18 +1172,31 @@ class KrakenSpotClient:
                 rejection_code = "invalid_nonce"
             elif any("invalid arguments" in str(item).lower() for item in errors):
                 rejection_code = "invalid_arguments"
+            rejection_message = str(errors[0]) if errors else "Kraken order rejected"
+            raw_provider_response = {
+                "provider_path": provider_path,
+                "http_status": status_code,
+                "provider_errors": [str(item) for item in errors[:10]],
+                "forensics": forensics,
+            }
             return ExchangeOrderSubmissionResult(
                 classification="rejected",
                 order=None,
                 rejection=ExchangeProviderRejection(
                     code=rejection_code,
-                    message="Kraken order rejected",
+                    message=rejection_message,
                     retryable=False,
                     provider_status=None,
-                    safe_details={"errors": [str(item) for item in errors[:5]], "path": details.get("path")},
+                    safe_details={
+                        "classification": rejection_code,
+                        "provider_errors": [str(item) for item in errors[:10]],
+                        "http_status": status_code,
+                        "provider_path": provider_path,
+                        "raw_provider_response": raw_provider_response,
+                    },
                 ),
                 ambiguous=None,
-                raw_response={},
+                raw_response=raw_provider_response,
                 safe_headers={},
             )
         except ServiceUnavailableError as exc:

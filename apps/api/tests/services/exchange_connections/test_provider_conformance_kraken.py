@@ -453,6 +453,7 @@ async def test_conformance_18_19_create_order_capability_enabled_and_submit_succ
     assert result.order.provider_order_id == "O-1"
     assert captured_payload["cl_ord_id"] == "cid"
     assert captured_payload["oflags"] == "fciq,viqc"
+    assert "timeinforce" not in captured_payload
     assert Decimal(captured_payload["volume"]) <= Decimal("5")
 
 
@@ -503,6 +504,8 @@ async def test_conformance_20_submission_explicit_rejection_classification(monke
     assert result.classification == "rejected"
     assert result.rejection is not None
     assert result.rejection.code == "insufficient_funds"
+    assert "EOrder:Insufficient funds" in (result.rejection.safe_details or {}).get("provider_errors", [])
+    assert result.raw_response.get("provider_errors") == ["EOrder:Insufficient funds"]
 
 
 @pytest.mark.asyncio

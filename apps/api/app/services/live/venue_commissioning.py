@@ -604,7 +604,19 @@ async def start_run(*, db: AsyncSession, actor: str, run_id: uuid.UUID, confirm:
             _mark_manual_review(run=run)
             run.state_payload = {
                 **(run.state_payload or {}),
-                "buy_rejection": None if rejection is None else {"code": rejection.code, "message": rejection.message},
+                "buy_rejection": None
+                if rejection is None
+                else {
+                    "classification": rejection.code,
+                    "provider_errors": (rejection.safe_details or {}).get("provider_errors")
+                    or ([rejection.message] if rejection.message else []),
+                    "http_status": (rejection.safe_details or {}).get("http_status"),
+                    "provider_path": (rejection.safe_details or {}).get("provider_path"),
+                    "message": rejection.message,
+                    "raw_provider_response": (rejection.safe_details or {}).get("raw_provider_response")
+                    or (raw.get("raw") if isinstance(raw, dict) else None),
+                    "safe_details": rejection.safe_details,
+                },
             }
 
     if run.status in {"BUY_SUBMISSION_PENDING", "BUY_RECONCILIATION_REQUIRED"}:
@@ -694,7 +706,19 @@ async def start_run(*, db: AsyncSession, actor: str, run_id: uuid.UUID, confirm:
                     _mark_manual_review(run=run)
                     run.state_payload = {
                         **(run.state_payload or {}),
-                        "sell_rejection": None if rejection is None else {"code": rejection.code, "message": rejection.message},
+                        "sell_rejection": None
+                        if rejection is None
+                        else {
+                            "classification": rejection.code,
+                            "provider_errors": (rejection.safe_details or {}).get("provider_errors")
+                            or ([rejection.message] if rejection.message else []),
+                            "http_status": (rejection.safe_details or {}).get("http_status"),
+                            "provider_path": (rejection.safe_details or {}).get("provider_path"),
+                            "message": rejection.message,
+                            "raw_provider_response": (rejection.safe_details or {}).get("raw_provider_response")
+                            or (raw.get("raw") if isinstance(raw, dict) else None),
+                            "safe_details": rejection.safe_details,
+                        },
                     }
         else:
             run.duplicate_orders_detected = True
