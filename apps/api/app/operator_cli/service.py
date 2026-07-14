@@ -1,15 +1,19 @@
 from __future__ import annotations
 
+import re
 from datetime import datetime, timezone
+from datetime import timedelta
 from decimal import Decimal
 from pathlib import Path
 from typing import Any
 from uuid import UUID
+import uuid
 
 from sqlalchemy import desc, func, select
 
 from app.config import get_settings
 from app.db.session import AsyncSessionLocal
+from app.models.audit_log import AuditLog
 from app.models.asset import Asset
 from app.models.autonomous_capital_mandate import AutonomousCapitalMandate
 from app.models.autonomous_cycle_run import AutonomousCycleRun
@@ -20,11 +24,19 @@ from app.models.decision_record import DecisionRecord
 from app.models.decision_snapshot import DecisionSnapshot
 from app.models.exchange_connection import ExchangeConnection
 from app.models.live_crypto_order import LiveCryptoOrder
+from app.models.risk_event import RiskEvent
+from app.models.signal import Signal
+from app.models.strategy import Strategy
+from app.models.trade import Trade
+from app.models.validation_run_event import ValidationRunEvent
 from app.models.strategy_roster_proposal import StrategyRosterProposal
 from app.models.strategy_roster_proposal_outcome import StrategyRosterProposalOutcome
 from app.models.strategy_roster_run import StrategyRosterRun
 from app.services.autonomous_cycle import AutonomousCycleRequest, run_autonomous_preview_cycle
 from app.services.strategy_outcomes import fetch_strategy_scorecards
+
+
+_EXECUTION_FORENSICS_MAX_SINCE_CYCLES = 200
 
 
 def _coerce_decimal(value: Any) -> str | None:
@@ -47,6 +59,556 @@ def _parse_datetime(value: Any) -> datetime | None:
         parsed = datetime.fromisoformat(normalized)
         return parsed if parsed.tzinfo is not None else parsed.replace(tzinfo=timezone.utc)
     return None
+
+
+def _resolve_since_datetime(value: str) -> datetime:
+    raw = value.strip()
+    lowered = raw.lower()
+    if lowered in {"now", "0", "0m", "0h", "0d"}:
+        return datetime.now(timezone.utc)
+
+    relative = re.fullmatch(r"(\d+)\s+(minute|minutes|hour|hours|day|days)\s+ago", lowered)
+    if relative:
+        amount = int(relative.group(1))
+        unit = relative.group(2)
+        if "minute" in unit:
+            return datetime.now(timezone.utc) - timedelta(minutes=amount)
+        if "hour" in unit:
+            return datetime.now(timezone.utc) - timedelta(hours=amount)
+        return datetime.now(timezone.utc) - timedelta(days=amount)
+
+    candidate = raw.replace("Z", "+00:00")
+    parsed = datetime.fromisoformat(candidate)
+    if parsed.tzinfo is None:
+        return parsed.replace(tzinfo=timezone.utc)
+    return parsed.astimezone(timezone.utc)
+
+
+def _safe_uuid_list(values: Any) -> list[uuid.UUID]:
+    if not isinstance(values, list):
+        return []
+    out: list[uuid.UUID] = []
+    for value in values:
+        try:
+            out.append(uuid.UUID(str(value)))
+        except (ValueError, TypeError, AttributeError):
+            continue
+    return out
+
+
+def _decimal_str(value: Any) -> str | None:
+    if value is None:
+        return None
+    if isinstance(value, Decimal):
+        return format(value, "f")
+    return str(value)
+
+
+def _sum_trade_quantity(trades: list[Trade], *, side: str) -> Decimal:
+    total = Decimal("0")
+    for trade in trades:
+        if trade.side == side:
+            total += Decimal(str(trade.quantity))
+    return total
+
+
+def _infer_non_candidate_reason(signals: list[Signal]) -> str:
+    if not signals:
+        return "UNPROVEN"
+    actionable = [item for item in signals if item.action in {"buy", "sell"}]
+    if not actionable:
+        return "HOLD"
+    return "UNPROVEN"
+
+
+def _event_payload_campaign_id(payload: Any) -> str | None:
+    if not isinstance(payload, dict):
+        return None
+    metadata = payload.get("metadata")
+    if isinstance(metadata, dict):
+        campaign_id = metadata.get("campaign_id")
+        if campaign_id is not None:
+            return str(campaign_id)
+    return None
+
+
+async def _compute_position_quantity(
+    *,
+    db: Any,
+    paper_account_id: uuid.UUID,
+    asset_id: uuid.UUID,
+    executed_at: datetime,
+    include_trade_at_timestamp: bool,
+) -> Decimal:
+    trades = list(
+        (
+            await db.execute(
+                select(Trade)
+                .where(Trade.paper_account_id == paper_account_id)
+                .where(Trade.asset_id == asset_id)
+                .where(Trade.executed_at <= executed_at)
+                .order_by(Trade.executed_at.asc(), Trade.id.asc())
+            )
+        ).scalars().all()
+    )
+    total = Decimal("0")
+    for trade in trades:
+        if not include_trade_at_timestamp and trade.executed_at == executed_at:
+            continue
+        qty = Decimal(str(trade.quantity))
+        if trade.side == "buy":
+            total += qty
+        elif trade.side == "sell":
+            total -= qty
+    return max(Decimal("0"), total)
+
+
+def _execution_summary_from_audits(audit_rows: list[dict[str, Any]], trades: list[Trade]) -> dict[str, Any]:
+    actions = {str(item.get("action") or "") for item in audit_rows}
+    service_called = any(action.startswith("signal_execution") for action in actions) or bool(trades)
+    rejected = any("rejected" in action for action in actions)
+    skipped = any("duplicate" in action for action in actions)
+    errored = any("failed" in action for action in actions)
+    return {
+        "execution_service_called": service_called,
+        "order_creation_reason": "paper_internal_sim_creates_trade_directly" if trades else "paper_order_model_absent",
+        "trade_created": bool(trades),
+        "rejected": rejected,
+        "skipped": skipped,
+        "error": errored,
+    }
+
+
+async def _build_cycle_forensics(*, db: Any, cycle: AutonomousCycleRun) -> dict[str, Any]:
+    decision: DecisionRecord | None = None
+    if cycle.decision_record_id is not None:
+        decision = await db.get(DecisionRecord, cycle.decision_record_id)
+
+    signal_ids: list[uuid.UUID] = []
+    if decision is not None:
+        source_lineage = decision.source_lineage or {}
+        signal_ids = _safe_uuid_list(source_lineage.get("signals"))
+
+    signals: list[Signal] = []
+    if signal_ids:
+        signals = list(
+            (
+                await db.execute(
+                    select(Signal)
+                    .where(Signal.id.in_(signal_ids))
+                    .order_by(Signal.created_at.asc(), Signal.id.asc())
+                )
+            ).scalars().all()
+        )
+
+    strategy_map: dict[uuid.UUID, Strategy] = {}
+    if signals:
+        strategy_ids = sorted({item.strategy_id for item in signals}, key=str)
+        if strategy_ids:
+            strategies = list((await db.execute(select(Strategy).where(Strategy.id.in_(strategy_ids)))).scalars().all())
+            strategy_map = {item.id: item for item in strategies}
+
+    asset_map: dict[uuid.UUID, Asset] = {}
+    if signals:
+        asset_ids = sorted({item.asset_id for item in signals}, key=str)
+        if asset_ids:
+            assets = list((await db.execute(select(Asset).where(Asset.id.in_(asset_ids)))).scalars().all())
+            asset_map = {item.id: item for item in assets}
+
+    risk_events: list[RiskEvent] = []
+    if signal_ids:
+        risk_events = list(
+            (
+                await db.execute(
+                    select(RiskEvent)
+                    .where(RiskEvent.related_signal_id.in_(signal_ids))
+                    .order_by(RiskEvent.created_at.asc(), RiskEvent.id.asc())
+                )
+            ).scalars().all()
+        )
+    if cycle.risk_event_id is not None and all(item.id != cycle.risk_event_id for item in risk_events):
+        extra_event = await db.get(RiskEvent, cycle.risk_event_id)
+        if extra_event is not None:
+            risk_events.append(extra_event)
+
+    trades: list[Trade] = []
+    if signal_ids:
+        trades = list(
+            (
+                await db.execute(
+                    select(Trade)
+                    .where(Trade.signal_id.in_(signal_ids))
+                    .order_by(Trade.executed_at.asc(), Trade.id.asc())
+                )
+            ).scalars().all()
+        )
+
+    audit_rows: list[dict[str, Any]] = []
+    if signal_ids:
+        audit_rows = [
+            {
+                "id": item.id,
+                "created_at": item.created_at,
+                "action": item.action,
+                "entity_type": item.entity_type,
+                "entity_id": item.entity_id,
+                "before_state": item.before_state,
+                "after_state": item.after_state,
+            }
+            for item in (
+                (
+                    await db.execute(
+                        select(AuditLog)
+                        .where(AuditLog.entity_type == "signal")
+                        .where(AuditLog.entity_id.in_(signal_ids))
+                        .order_by(AuditLog.created_at.asc(), AuditLog.id.asc())
+                    )
+                ).scalars().all()
+            )
+        ]
+
+    execution_summary = _execution_summary_from_audits(audit_rows, trades)
+
+    interval = decision.timeframe if decision is not None else None
+    provider = None
+    latest_candle_time = None
+    primary_asset_id = signals[0].asset_id if signals else None
+    primary_asset = asset_map.get(primary_asset_id) if primary_asset_id is not None else None
+    if primary_asset is not None:
+        provider = primary_asset.exchange
+        if interval is None:
+            interval = (cycle.cycle_context or {}).get("strategy_interval") if isinstance(cycle.cycle_context, dict) else None
+        if interval is not None:
+            latest_candle_time = await db.scalar(
+                select(Candle.close_time)
+                .where(Candle.asset_id == primary_asset.id)
+                .where(Candle.interval == interval)
+                .order_by(Candle.open_time.desc())
+                .limit(1)
+            )
+
+    candidate = any(item.action in {"buy", "sell"} for item in signals)
+    candidate_reason = None
+    if not candidate:
+        candidate_reason = _infer_non_candidate_reason(signals)
+
+    accounting_entries: list[dict[str, Any]] = []
+    total_fees = Decimal("0")
+    trade_fill_evidence = 0
+    balance_change_observed = 0
+    position_change_observed = 0
+    position_change_unproven = 0
+    balance_change_unproven = 0
+    for trade in trades:
+        total_fees += Decimal(str(trade.fee))
+        before_position = await _compute_position_quantity(
+            db=db,
+            paper_account_id=trade.paper_account_id,
+            asset_id=trade.asset_id,
+            executed_at=trade.executed_at,
+            include_trade_at_timestamp=False,
+        )
+        after_position = await _compute_position_quantity(
+            db=db,
+            paper_account_id=trade.paper_account_id,
+            asset_id=trade.asset_id,
+            executed_at=trade.executed_at,
+            include_trade_at_timestamp=True,
+        )
+
+        trade_audit = await db.scalar(
+            select(AuditLog)
+            .where(AuditLog.entity_type == "trade")
+            .where(AuditLog.entity_id == trade.id)
+            .where(AuditLog.action == "paper_trade_simulated")
+            .order_by(AuditLog.created_at.desc(), AuditLog.id.desc())
+            .limit(1)
+        )
+        before_balance = None
+        after_balance = None
+        if trade_audit is not None:
+            before_state = trade_audit.before_state if isinstance(trade_audit.before_state, dict) else {}
+            after_state = trade_audit.after_state if isinstance(trade_audit.after_state, dict) else {}
+            before_balance = before_state.get("cash_balance")
+            after_balance = after_state.get("cash_balance")
+            trade_fill_evidence += 1
+        if before_balance is not None and after_balance is not None and str(before_balance) != str(after_balance):
+            balance_change_observed += 1
+        elif before_balance is None or after_balance is None:
+            balance_change_unproven += 1
+
+        if before_position != after_position:
+            position_change_observed += 1
+        elif before_position is None or after_position is None:
+            position_change_unproven += 1
+
+        accounting_entries.append(
+            {
+                "trade_id": trade.id,
+                "paper_account_id": trade.paper_account_id,
+                "asset_id": trade.asset_id,
+                "balance_before": before_balance,
+                "balance_after": after_balance,
+                "position_before": _decimal_str(before_position),
+                "position_after": _decimal_str(after_position),
+                "fee": _decimal_str(trade.fee),
+                "executed_at": trade.executed_at,
+            }
+        )
+
+    roster_runs = list(
+        (
+            await db.execute(
+                select(StrategyRosterRun)
+                .where(StrategyRosterRun.scheduled_cycle_id == cycle.cycle_id)
+                .order_by(StrategyRosterRun.started_at.asc(), StrategyRosterRun.roster_run_id.asc())
+            )
+        ).scalars().all()
+    )
+
+    outcome_score_rows = list(
+        (
+            await db.execute(
+                select(StrategyRosterProposalOutcome)
+                .join(
+                    StrategyRosterProposal,
+                    StrategyRosterProposalOutcome.proposal_id == StrategyRosterProposal.proposal_id,
+                )
+                .where(StrategyRosterProposal.scheduled_cycle_id == cycle.cycle_id)
+                .order_by(StrategyRosterProposalOutcome.evaluated_at.asc(), StrategyRosterProposalOutcome.outcome_id.asc())
+            )
+        ).scalars().all()
+    )
+
+    event_start = cycle.started_at - timedelta(minutes=5)
+    event_end = (cycle.completed_at or cycle.started_at) + timedelta(minutes=30)
+    research_events = list(
+        (
+            await db.execute(
+                select(ValidationRunEvent)
+                .where(ValidationRunEvent.created_at >= event_start)
+                .where(ValidationRunEvent.created_at <= event_end)
+                .where(ValidationRunEvent.event_type.like("RESEARCH_CYCLE_%"))
+                .order_by(ValidationRunEvent.created_at.asc(), ValidationRunEvent.id.asc())
+            )
+        ).scalars().all()
+    )
+
+    signal_rows = []
+    for signal in signals:
+        strategy = strategy_map.get(signal.strategy_id)
+        signal_rows.append(
+            {
+                "signal_id": signal.id,
+                "strategy_id": signal.strategy_id,
+                "strategy": None if strategy is None else strategy.slug,
+                "action": signal.action.upper(),
+                "confidence": _decimal_str(signal.ai_confidence),
+                "reason": None,
+                "status": signal.status,
+                "asset_id": signal.asset_id,
+            }
+        )
+
+    summary = "No actionable signal found"
+    if candidate and execution_summary.get("trade_created"):
+        summary = "Actionable signal became paper trade"
+    elif candidate and execution_summary.get("rejected"):
+        summary = "Actionable signal rejected before trade"
+    elif candidate and execution_summary.get("skipped"):
+        summary = "Actionable signal skipped"
+    elif candidate and not execution_summary.get("execution_service_called"):
+        summary = "Actionable signal not executed"
+
+    candidate_status = "UNPROVEN" if not signal_rows else ("YES" if candidate else "NO")
+    risk_evaluated_status = "YES" if risk_events else ("UNPROVEN" if candidate else "NOT APPLICABLE")
+    risk_decision = risk_events[-1].action_taken if risk_events else ("UNPROVEN" if candidate else "NOT APPLICABLE")
+    risk_reason = risk_events[-1].detail if risk_events else ("UNPROVEN" if candidate else "NOT APPLICABLE")
+
+    execution_attempted_status = "YES" if candidate else "NO"
+    execution_service_called_status = (
+        "YES"
+        if execution_summary.get("execution_service_called")
+        else "UNPROVEN"
+        if candidate
+        else "NOT APPLICABLE"
+    )
+    order_created_status = "NOT APPLICABLE"
+    trade_created_status = "YES" if execution_summary.get("trade_created") else "NO"
+    if trades:
+        filled_status = "YES" if trade_fill_evidence == len(trades) else "UNPROVEN"
+    elif candidate:
+        filled_status = "NO"
+    else:
+        filled_status = "NOT APPLICABLE"
+
+    rejected_status = "YES" if execution_summary.get("rejected") else ("NO" if candidate else "NOT APPLICABLE")
+    skipped_status = "YES" if execution_summary.get("skipped") else ("NO" if candidate else "NOT APPLICABLE")
+    error_status = "YES" if execution_summary.get("error") else ("NO" if candidate else "NOT APPLICABLE")
+
+    decision_record_linkage_status = "YES" if cycle.decision_record_id is not None else ("UNPROVEN" if signal_rows else "NOT APPLICABLE")
+    outcome_linkage_status = (
+        "YES"
+        if outcome_score_rows
+        else "NO"
+        if cycle.decision_record_id is not None
+        else "UNPROVEN"
+    )
+    research_linkage_status = "YES" if research_events else "NO"
+
+    account_balance_changed_status = (
+        "YES"
+        if balance_change_observed > 0
+        else "UNPROVEN"
+        if trades and balance_change_unproven > 0
+        else "NO"
+        if trades
+        else "NOT APPLICABLE"
+    )
+    position_changed_status = (
+        "YES"
+        if position_change_observed > 0
+        else "UNPROVEN"
+        if trades and position_change_unproven > 0
+        else "NO"
+        if trades
+        else "NOT APPLICABLE"
+    )
+    accounting_entry_status = "YES" if trade_fill_evidence > 0 else ("UNPROVEN" if trades else "NOT APPLICABLE")
+
+    return {
+        "cycle_id": cycle.cycle_id,
+        "timestamp": cycle.started_at,
+        "asset": None if primary_asset is None else primary_asset.symbol,
+        "asset_id": primary_asset_id,
+        "provider": provider,
+        "interval": interval,
+        "latest_candle_time": latest_candle_time,
+        "signal_section": {
+            "signals_generated": len(signal_rows),
+            "signals": signal_rows,
+        },
+        "execution_candidate": {
+            "is_candidate": candidate,
+            "status": candidate_status,
+            "reason_if_no": candidate_reason if candidate_status == "NO" else "NOT APPLICABLE",
+        },
+        "risk": {
+            "evaluated_status": risk_evaluated_status,
+            "decision": risk_decision,
+            "reason": risk_reason,
+            "risk_event_ids": [item.id for item in risk_events],
+        },
+        "execution": {
+            "execution_attempted_status": execution_attempted_status,
+            "execution_service_called_status": execution_service_called_status,
+            "order_created_status": order_created_status,
+            "order_creation_reason": execution_summary.get("order_creation_reason"),
+            "trade_created_status": trade_created_status,
+            "filled_status": filled_status,
+            "rejected_status": rejected_status,
+            "skipped_status": skipped_status,
+            "error_status": error_status,
+            "trade_ids": [item.id for item in trades],
+            "signal_ids": signal_ids,
+        },
+        "accounting": {
+            "paper_account_ids": sorted({item.paper_account_id for item in trades}, key=str),
+            "entries": accounting_entries,
+            "fees_total": _decimal_str(total_fees),
+            "pnl": decision.pnl if decision is not None else None,
+            "buy_quantity_total": _decimal_str(_sum_trade_quantity(trades, side="buy")),
+            "sell_quantity_total": _decimal_str(_sum_trade_quantity(trades, side="sell")),
+            "account_balance_changed_status": account_balance_changed_status,
+            "position_changed_status": position_changed_status,
+            "accounting_entry_persisted_status": accounting_entry_status,
+        },
+        "decision_records": {
+            "decision_record_id": cycle.decision_record_id,
+            "outcome_score_linkage_count": len(outcome_score_rows),
+            "outcome_score_ids": [item.outcome_id for item in outcome_score_rows],
+            "decision_record_linkage_status": decision_record_linkage_status,
+            "outcome_linkage_status": outcome_linkage_status,
+            "research_linkage_status": research_linkage_status,
+            "research_linkage": [
+                {
+                    "event_id": item.id,
+                    "event_type": item.event_type,
+                    "campaign_id": _event_payload_campaign_id(item.payload),
+                    "created_at": item.created_at,
+                }
+                for item in research_events
+            ],
+            "autonomous_cycle_linkage": {
+                "cycle_id": cycle.cycle_id,
+                "scheduled_roster_run_ids": [item.roster_run_id for item in roster_runs],
+            },
+        },
+        "summary": summary,
+    }
+
+
+async def fetch_execution_forensics(
+    *,
+    since: str | None,
+    cycle_id: UUID | None,
+    latest: bool,
+) -> dict[str, Any]:
+    selectors = int(bool(since)) + int(cycle_id is not None) + int(latest)
+    if selectors != 1:
+        raise ValueError("Choose exactly one selector: --since, --cycle, or --latest")
+
+    async with AsyncSessionLocal() as db:
+        cycles: list[AutonomousCycleRun]
+        criteria: dict[str, Any] = {
+            "selector": "latest" if latest else "cycle" if cycle_id is not None else "since",
+            "since": since,
+            "cycle_id": cycle_id,
+        }
+
+        if latest:
+            item = await db.scalar(select(AutonomousCycleRun).order_by(desc(AutonomousCycleRun.started_at)).limit(1))
+            cycles = [] if item is None else [item]
+        elif cycle_id is not None:
+            item = await db.get(AutonomousCycleRun, cycle_id)
+            if item is None:
+                raise ValueError(f"Cycle {cycle_id} not found")
+            cycles = [item]
+        else:
+            assert since is not None
+            threshold = _resolve_since_datetime(since)
+            criteria["resolved_since"] = threshold
+            cycles = list(
+                (
+                    await db.execute(
+                        select(AutonomousCycleRun)
+                        .where(AutonomousCycleRun.started_at >= threshold)
+                        .order_by(desc(AutonomousCycleRun.started_at), desc(AutonomousCycleRun.cycle_id))
+                        .limit(_EXECUTION_FORENSICS_MAX_SINCE_CYCLES)
+                    )
+                ).scalars().all()
+            )
+            criteria["max_cycles"] = _EXECUTION_FORENSICS_MAX_SINCE_CYCLES
+
+        deduped_cycles: list[AutonomousCycleRun] = []
+        seen_cycle_ids: set[uuid.UUID] = set()
+        for item in cycles:
+            cycle_key = item.cycle_id
+            if cycle_key in seen_cycle_ids:
+                continue
+            seen_cycle_ids.add(cycle_key)
+            deduped_cycles.append(item)
+        cycles = deduped_cycles
+
+        reports = [await _build_cycle_forensics(db=db, cycle=item) for item in cycles]
+
+    return {
+        "mode": "read_only_forensics",
+        "criteria": criteria,
+        "cycle_count": len(reports),
+        "truncated": bool(since) and len(reports) >= _EXECUTION_FORENSICS_MAX_SINCE_CYCLES,
+        "cycles": reports,
+    }
 
 
 def _seconds_between(later: datetime | None, earlier: datetime | None) -> int | None:
@@ -834,8 +1396,6 @@ async def fetch_strategy_roster_summary(
             for item in proposals
         ],
     }
-
-
 async def fetch_strategy_scorecards_summary(
     *,
     provider: str,

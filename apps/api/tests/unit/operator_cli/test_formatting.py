@@ -5,6 +5,7 @@ from datetime import datetime, timezone
 from app.operator_cli.formatting import (
     RenderOptions,
     render_candles_text,
+    render_execution_forensics_text,
     render_preview_show_text,
     render_preview_text,
     render_roster_text,
@@ -384,3 +385,95 @@ def test_render_scorecards_text_empty_state() -> None:
     )
 
     assert "No scorecards found for this market." in text
+
+
+def test_render_execution_forensics_text_contains_trace_sections() -> None:
+    text = render_execution_forensics_text(
+        {
+            "mode": "read_only_forensics",
+            "criteria": {"selector": "latest", "since": None, "cycle_id": None},
+            "cycle_count": 1,
+            "cycles": [
+                {
+                    "cycle_id": "cid",
+                    "timestamp": "2026-07-14T09:49:40Z",
+                    "asset": "BTC",
+                    "provider": "kraken_spot",
+                    "interval": "15m",
+                    "latest_candle_time": "2026-07-14T09:45:00Z",
+                    "signal_section": {
+                        "signals_generated": 1,
+                        "signals": [
+                            {
+                                "signal_id": "sid",
+                                "strategy": "momentum",
+                                "action": "BUY",
+                                "confidence": "0.78",
+                                "reason": "breakout",
+                            }
+                        ],
+                    },
+                    "execution_candidate": {"is_candidate": True, "reason_if_no": None},
+                    "risk": {
+                        "evaluated": True,
+                        "decision": "accepted",
+                        "reason": {"decision": "accept"},
+                        "risk_event_ids": ["rid"],
+                    },
+                    "execution": {
+                        "execution_attempted": True,
+                        "execution_service_called": True,
+                        "order_created": False,
+                        "trade_created": True,
+                        "filled": True,
+                        "rejected": False,
+                        "skipped": False,
+                        "error": False,
+                        "trade_ids": ["tid"],
+                    },
+                    "accounting": {
+                        "paper_account_ids": ["aid"],
+                        "fees_total": "0.01",
+                        "pnl": {"net": "0.02"},
+                        "buy_quantity_total": "1",
+                        "sell_quantity_total": "0",
+                        "entries": [
+                            {
+                                "trade_id": "tid",
+                                "paper_account_id": "aid",
+                                "balance_before": "100.0",
+                                "balance_after": "95.0",
+                                "position_before": "0",
+                                "position_after": "1",
+                                "fee": "0.01",
+                            }
+                        ],
+                    },
+                    "decision_records": {
+                        "decision_record_id": "did",
+                        "outcome_score_linkage_count": 1,
+                        "outcome_score_ids": ["oid"],
+                        "autonomous_cycle_linkage": {"cycle_id": "cid", "scheduled_roster_run_ids": ["rrid"]},
+                        "research_linkage": [
+                            {
+                                "event_id": 1,
+                                "event_type": "RESEARCH_CYCLE_STARTED",
+                                "campaign_id": "campid",
+                                "created_at": "2026-07-14T09:50:00Z",
+                            }
+                        ],
+                    },
+                    "summary": "Actionable signal became paper trade",
+                }
+            ],
+        },
+        _opts(),
+    )
+
+    assert "PRODUCTION EXECUTION FORENSICS" in text
+    assert "Cycle ID" in text
+    assert "Signals" in text
+    assert "Execution" in text
+    assert "Accounting" in text
+    assert "Decision Linkage" in text
+    assert "Actionable signal became paper trade" in text

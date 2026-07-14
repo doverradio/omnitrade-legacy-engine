@@ -9,6 +9,7 @@ from uuid import UUID, uuid4
 
 from app.operator_cli.formatting import (
     render_candles_text,
+    render_execution_forensics_text,
     render_json,
     render_roster_text,
     render_scorecards_text,
@@ -23,6 +24,7 @@ from app.operator_cli.service import (
     fetch_candle_readiness,
     fetch_operator_status,
     fetch_preview_evidence,
+    fetch_execution_forensics,
     fetch_strategy_scorecards_summary,
     fetch_strategy_roster_summary,
     fetch_watch_status,
@@ -47,6 +49,9 @@ def _build_parser() -> argparse.ArgumentParser:
             "  ./operator watch --symbol BTC --interval 15m\n"
             "  ./operator roster\n"
             "  ./operator scorecards\n"
+            "  ./operator execution-forensics --latest\n"
+            "  ./operator execution-forensics --since '2 hours ago'\n"
+            "  ./operator execution-forensics --cycle <cycle_uuid>\n"
             "  ./operator status --json\n"
             "  ./operator status --no-color --verbose"
         ),
@@ -142,6 +147,18 @@ def _build_parser() -> argparse.ArgumentParser:
     scorecards.add_argument("--interval", type=str, default="15m")
     scorecards.add_argument("--json", action="store_true", dest="json_output")
 
+    execution_forensics = subparsers.add_parser(
+        "execution-forensics",
+        parents=[common],
+        help="Trace why capital did or did not move for autonomous cycles",
+        description="Read-only autonomous-cycle signal-to-execution-to-accounting forensics.",
+    )
+    selector = execution_forensics.add_mutually_exclusive_group(required=True)
+    selector.add_argument("--since", type=str, default=None)
+    selector.add_argument("--cycle", type=UUID, default=None)
+    selector.add_argument("--latest", action="store_true")
+    execution_forensics.add_argument("--json", action="store_true", dest="json_output")
+
     return parser
 
 
@@ -220,6 +237,15 @@ async def _run_async(args: argparse.Namespace) -> tuple[int, dict[str, Any], str
             interval=args.interval,
         )
         text = render_json(payload) if args.json_output else render_scorecards_text(payload, options)
+        return 0, payload, text
+
+    if args.command == "execution-forensics":
+        payload = await fetch_execution_forensics(
+            since=args.since,
+            cycle_id=args.cycle,
+            latest=bool(args.latest),
+        )
+        text = render_json(payload) if args.json_output else render_execution_forensics_text(payload, options)
         return 0, payload, text
 
     payload = await fetch_operator_status(

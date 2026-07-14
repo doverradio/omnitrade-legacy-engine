@@ -786,3 +786,183 @@ def render_scorecards_text(payload: dict[str, Any], options: RenderOptions) -> s
         lines.append("")
 
     return "\n".join(lines)
+
+
+def _forensics_bool(value: Any) -> str:
+    if isinstance(value, str) and value.upper() in {"YES", "NO", "UNPROVEN", "NOT APPLICABLE"}:
+        return value.upper()
+    return "YES" if bool(value) else "NO"
+
+
+def render_execution_forensics_text(payload: dict[str, Any], options: RenderOptions) -> str:
+    lines = _frame_header("PRODUCTION EXECUTION FORENSICS", options)
+    criteria = payload.get("criteria") or {}
+    lines.extend(
+        _section(
+            "Scope",
+            [
+                ("Mode", _fmt(payload.get("mode"), default="Unavailable")),
+                ("Selector", _fmt(criteria.get("selector"), default="Unavailable")),
+                ("Since", _fmt(criteria.get("resolved_since") or criteria.get("since"), default="N/A")),
+                ("Cycle ID", _fmt(criteria.get("cycle_id"), default="N/A")),
+                ("Cycles", _fmt(payload.get("cycle_count"), default="0")),
+            ],
+            options,
+        )
+    )
+
+    cycles = payload.get("cycles") or []
+    if not cycles:
+        lines.append("No autonomous cycles matched this selector.")
+        return "\n".join(lines)
+
+    for idx, cycle in enumerate(cycles, start=1):
+        lines.append(f"Cycle {idx}")
+        lines.append("--------------------" if not options.unicode_enabled else "────────────────────")
+        lines.extend(
+            _section(
+                "Cycle",
+                [
+                    ("Cycle ID", _fmt(cycle.get("cycle_id"), default="Unavailable")),
+                    ("Timestamp", _fmt(cycle.get("timestamp"), default="Unavailable")),
+                    ("Asset", _fmt(cycle.get("asset"), default="Unavailable")),
+                    ("Provider", _fmt(cycle.get("provider"), default="Unavailable")),
+                    ("Interval", _fmt(cycle.get("interval"), default="Unavailable")),
+                    ("Latest candle", _fmt(cycle.get("latest_candle_time"), default="Unavailable")),
+                ],
+                options,
+            )
+        )
+
+        signal_section = cycle.get("signal_section") or {}
+        signal_rows = signal_section.get("signals") or []
+        lines.extend(
+            _section(
+                "Signals",
+                [
+                    ("Generated", _fmt(signal_section.get("signals_generated"), default="0")),
+                ],
+                options,
+            )
+        )
+        for signal in signal_rows:
+            lines.append(
+                f"- signal_id={_fmt(signal.get('signal_id'))} strategy={_fmt(signal.get('strategy'))} action={_fmt(signal.get('action'))} confidence={_fmt(signal.get('confidence'), default='N/A')} reason={_fmt(signal.get('reason'), default='N/A')}"
+            )
+        if signal_rows:
+            lines.append("")
+
+        candidate = cycle.get("execution_candidate") or {}
+        lines.extend(
+            _section(
+                "Candidate",
+                [
+                    ("Execution candidate", _forensics_bool(candidate.get("status", candidate.get("is_candidate")))),
+                    ("If NO, why", _fmt(candidate.get("reason_if_no"), default="N/A")),
+                ],
+                options,
+            )
+        )
+
+        risk = cycle.get("risk") or {}
+        lines.extend(
+            _section(
+                "Risk",
+                [
+                    ("Evaluated", _forensics_bool(risk.get("evaluated_status", risk.get("evaluated")))),
+                    ("Decision", _fmt(risk.get("decision"), default="N/A")),
+                    ("Reason", _fmt(risk.get("reason"), default="N/A")),
+                    ("Risk Event IDs", ", ".join(str(item) for item in (risk.get("risk_event_ids") or [])) or "N/A"),
+                ],
+                options,
+            )
+        )
+
+        execution = cycle.get("execution") or {}
+        lines.extend(
+            _section(
+                "Execution",
+                [
+                    ("Attempted", _forensics_bool(execution.get("execution_attempted_status", execution.get("execution_attempted")))),
+                    ("Service called", _forensics_bool(execution.get("execution_service_called_status", execution.get("execution_service_called")))),
+                    ("Order created", _forensics_bool(execution.get("order_created_status", execution.get("order_created")))),
+                    ("Trade created", _forensics_bool(execution.get("trade_created_status", execution.get("trade_created")))),
+                    ("Filled", _forensics_bool(execution.get("filled_status", execution.get("filled")))),
+                    ("Rejected", _forensics_bool(execution.get("rejected_status", execution.get("rejected")))),
+                    ("Skipped", _forensics_bool(execution.get("skipped_status", execution.get("skipped")))),
+                    ("Error", _forensics_bool(execution.get("error_status", execution.get("error")))),
+                    ("Trade IDs", ", ".join(str(item) for item in (execution.get("trade_ids") or [])) or "N/A"),
+                ],
+                options,
+            )
+        )
+
+        accounting = cycle.get("accounting") or {}
+        lines.extend(
+            _section(
+                "Accounting",
+                [
+                    ("Paper accounts", ", ".join(str(item) for item in (accounting.get("paper_account_ids") or [])) or "N/A"),
+                    ("Balance changed", _forensics_bool(accounting.get("account_balance_changed_status"))),
+                    ("Position changed", _forensics_bool(accounting.get("position_changed_status"))),
+                    ("Accounting entry", _forensics_bool(accounting.get("accounting_entry_persisted_status"))),
+                    ("Fees", _fmt(accounting.get("fees_total"), default="N/A")),
+                    ("PnL", _fmt(accounting.get("pnl"), default="N/A")),
+                    ("BUY qty", _fmt(accounting.get("buy_quantity_total"), default="N/A")),
+                    ("SELL qty", _fmt(accounting.get("sell_quantity_total"), default="N/A")),
+                ],
+                options,
+            )
+        )
+        for entry in accounting.get("entries") or []:
+            lines.append(
+                "- trade_id={} account={} balance_before={} balance_after={} position_before={} position_after={} fee={}".format(
+                    _fmt(entry.get("trade_id")),
+                    _fmt(entry.get("paper_account_id")),
+                    _fmt(entry.get("balance_before"), default="N/A"),
+                    _fmt(entry.get("balance_after"), default="N/A"),
+                    _fmt(entry.get("position_before"), default="N/A"),
+                    _fmt(entry.get("position_after"), default="N/A"),
+                    _fmt(entry.get("fee"), default="N/A"),
+                )
+            )
+        if accounting.get("entries"):
+            lines.append("")
+
+        decision = cycle.get("decision_records") or {}
+        auto_link = decision.get("autonomous_cycle_linkage") or {}
+        lines.extend(
+            _section(
+                "Decision Linkage",
+                [
+                    ("Decision Record ID", _fmt(decision.get("decision_record_id"), default="N/A")),
+                    ("Decision linked", _forensics_bool(decision.get("decision_record_linkage_status"))),
+                    ("Outcome linkage", _fmt(decision.get("outcome_score_linkage_count"), default="0")),
+                    ("Outcome linked", _forensics_bool(decision.get("outcome_linkage_status"))),
+                    ("Research linked", _forensics_bool(decision.get("research_linkage_status"))),
+                    ("Outcome IDs", ", ".join(str(item) for item in (decision.get("outcome_score_ids") or [])) or "N/A"),
+                    ("Autonomous Cycle", _fmt(auto_link.get("cycle_id"), default="N/A")),
+                    ("Roster Runs", ", ".join(str(item) for item in (auto_link.get("scheduled_roster_run_ids") or [])) or "N/A"),
+                ],
+                options,
+            )
+        )
+        research = decision.get("research_linkage") or []
+        if research:
+            lines.append("Research linkage")
+            lines.append("----------------" if not options.unicode_enabled else "────────────────")
+            for item in research:
+                lines.append(
+                    f"- event_id={_fmt(item.get('event_id'))} type={_fmt(item.get('event_type'))} campaign_id={_fmt(item.get('campaign_id'), default='N/A')} created_at={_fmt(item.get('created_at'))}"
+                )
+            lines.append("")
+
+        lines.extend(
+            _section(
+                "Summary",
+                [("Conclusion", _fmt(cycle.get("summary"), default="Unavailable"))],
+                options,
+            )
+        )
+
+    return "\n".join(lines)

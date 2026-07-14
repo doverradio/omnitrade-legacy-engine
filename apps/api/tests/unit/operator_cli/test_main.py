@@ -145,3 +145,36 @@ def test_parse_scorecards_command() -> None:
     assert args.product_id == "BTC-USD"
     assert args.interval == "15m"
     assert args.json_output is True
+
+
+def test_parse_execution_forensics_command_selectors() -> None:
+    latest = parse_args([
+        "execution-forensics",
+        "--latest",
+    ])
+    assert latest.command == "execution-forensics"
+    assert latest.latest is True
+    assert latest.since is None
+    assert latest.cycle is None
+
+    since = parse_args([
+        "execution-forensics",
+        "--since",
+        "2 hours ago",
+    ])
+    assert since.command == "execution-forensics"
+    assert since.latest is False
+    assert since.since == "2 hours ago"
+    assert since.cycle is None
+
+    cycle = parse_args([
+        "execution-forensics",
+        "--cycle",
+        "44444444-4444-4444-4444-444444444444",
+        "--json",
+    ])
+    assert cycle.command == "execution-forensics"
+    assert cycle.latest is False
+    assert cycle.since is None
+    assert cycle.cycle == UUID("44444444-4444-4444-4444-444444444444")
+    assert cycle.json_output is True
