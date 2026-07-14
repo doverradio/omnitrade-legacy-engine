@@ -41,6 +41,7 @@ from app.services.system_intelligence_snapshots import capture_system_intelligen
 from app.services.strategies import StrategyContext, strategy_registry
 from app.services.strategies.registry import StrategyLookupError
 from app.services.autonomous_cycle import AutonomousCycleRequest, run_autonomous_preview_cycle
+from app.services.strategy_outcomes import score_due_strategy_roster_proposal_outcomes
 from app.services.strategy_roster import StrategyRosterRequest, run_strategy_roster_for_candle
 
 logger = logging.getLogger(__name__)
@@ -535,6 +536,21 @@ async def run_orchestration_cycle(
             _AUTONOMOUS_CYCLE_PRODUCT_ID,
             _AUTONOMOUS_CYCLE_INTERVAL,
         )
+
+    if all(hasattr(db, attr) for attr in ("execute", "scalar", "commit")):
+        try:
+            outcome_result = await score_due_strategy_roster_proposal_outcomes(db=db)
+            logger.info(
+                "strategy_outcome_scoring_completed scanned=%s inserted=%s skipped_not_due=%s skipped_existing=%s skipped_missing_prices=%s execution_mode=shadow live_submission=false",
+                outcome_result.scanned_proposals,
+                outcome_result.inserted_outcomes,
+                outcome_result.skipped_not_due,
+                outcome_result.skipped_existing,
+                outcome_result.skipped_missing_prices,
+            )
+        except Exception:
+            await _rollback_active_session(db=db)
+            logger.exception("strategy_outcome_scoring_failed trigger=%s", _AUTONOMOUS_CYCLE_TRIGGER)
 
     assets = await _load_active_assets(db)
     strategies = await _load_active_strategies(db)

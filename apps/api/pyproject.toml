@@ -23,3 +23,6 @@ dependencies = [
 
 [tool.setuptools.packages.find]
 include = ["app*"]
+
+[tool.pytest.ini_options]
+addopts = "--import-mode=importlib"

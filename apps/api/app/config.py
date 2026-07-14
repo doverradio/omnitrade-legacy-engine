@@ -96,6 +96,23 @@ class Settings(BaseSettings):
     research_min_decisions: int = Field(default=50, validation_alias="RESEARCH_MIN_DECISIONS")
     research_min_actionable_signals: int = Field(default=5, validation_alias="RESEARCH_MIN_ACTIONABLE_SIGNALS")
     research_min_trades: int = Field(default=3, validation_alias="RESEARCH_MIN_TRADES")
+    outcome_scoring_fee_bps: Decimal = Field(default=Decimal("10"), validation_alias="OUTCOME_SCORING_FEE_BPS")
+    outcome_scoring_hold_buy_threshold_pct: Decimal = Field(
+        default=Decimal("0"),
+        validation_alias="OUTCOME_SCORING_HOLD_BUY_THRESHOLD_PCT",
+    )
+    outcome_scoring_hold_sell_threshold_pct: Decimal = Field(
+        default=Decimal("0"),
+        validation_alias="OUTCOME_SCORING_HOLD_SELL_THRESHOLD_PCT",
+    )
+    outcome_scoring_sideways_threshold_pct: Decimal = Field(
+        default=Decimal("0.10"),
+        validation_alias="OUTCOME_SCORING_SIDEWAYS_THRESHOLD_PCT",
+    )
+    outcome_scorecards_regime_min_evaluations: int = Field(
+        default=50,
+        validation_alias="OUTCOME_SCORECARDS_REGIME_MIN_EVALUATIONS",
+    )
 
     environment: str = "local"
     log_level: str = "INFO"

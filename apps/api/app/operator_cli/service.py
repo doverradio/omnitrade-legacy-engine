@@ -21,8 +21,10 @@ from app.models.decision_snapshot import DecisionSnapshot
 from app.models.exchange_connection import ExchangeConnection
 from app.models.live_crypto_order import LiveCryptoOrder
 from app.models.strategy_roster_proposal import StrategyRosterProposal
+from app.models.strategy_roster_proposal_outcome import StrategyRosterProposalOutcome
 from app.models.strategy_roster_run import StrategyRosterRun
 from app.services.autonomous_cycle import AutonomousCycleRequest, run_autonomous_preview_cycle
+from app.services.strategy_outcomes import fetch_strategy_scorecards
 
 
 def _coerce_decimal(value: Any) -> str | None:
@@ -830,5 +832,78 @@ async def fetch_strategy_roster_summary(
                 "evaluated_at": item.evaluated_at,
             }
             for item in proposals
+        ],
+    }
+
+
+async def fetch_strategy_scorecards_summary(
+    *,
+    provider: str,
+    product_id: str,
+    interval: str,
+) -> dict[str, Any]:
+    async with AsyncSessionLocal() as db:
+        latest_outcome_at = await db.scalar(
+            select(StrategyRosterProposalOutcome.evaluated_at)
+            .where(StrategyRosterProposalOutcome.provider == provider)
+            .where(StrategyRosterProposalOutcome.product_id == product_id)
+            .where(StrategyRosterProposalOutcome.interval == interval)
+            .order_by(desc(StrategyRosterProposalOutcome.evaluated_at))
+            .limit(1)
+        )
+        scorecards = await fetch_strategy_scorecards(
+            db=db,
+            provider=provider,
+            product_id=product_id,
+            interval=interval,
+        )
+
+    return {
+        "provider": provider,
+        "product_id": product_id,
+        "interval": interval,
+        "latest_outcome_evaluated_at": latest_outcome_at,
+        "scorecards": [
+            {
+                "strategy_slug": item.strategy_slug,
+                "per_horizon": [
+                    {
+                        "horizon": bucket.horizon_label,
+                        "total_evaluated": bucket.total_evaluated,
+                        "buy_evaluations": bucket.buy_evaluations,
+                        "buy_correct": bucket.buy_correct,
+                        "sell_evaluations": bucket.sell_evaluations,
+                        "sell_correct": bucket.sell_correct,
+                        "hold_evaluations": bucket.hold_evaluations,
+                        "hold_correct": bucket.hold_correct,
+                        "overall_correct_pct": bucket.overall_correct_pct,
+                        "average_raw_return_pct": bucket.average_raw_return_pct,
+                        "average_fee_adjusted_return_pct": bucket.average_fee_adjusted_return_pct,
+                        "average_mfe_pct": bucket.average_mfe_pct,
+                        "average_mae_pct": bucket.average_mae_pct,
+                    }
+                    for bucket in item.per_horizon
+                ],
+                "aggregate": {
+                    "horizon": item.aggregate.horizon_label,
+                    "total_evaluated": item.aggregate.total_evaluated,
+                    "buy_evaluations": item.aggregate.buy_evaluations,
+                    "buy_correct": item.aggregate.buy_correct,
+                    "sell_evaluations": item.aggregate.sell_evaluations,
+                    "sell_correct": item.aggregate.sell_correct,
+                    "hold_evaluations": item.aggregate.hold_evaluations,
+                    "hold_correct": item.aggregate.hold_correct,
+                    "overall_correct_pct": item.aggregate.overall_correct_pct,
+                    "average_raw_return_pct": item.aggregate.average_raw_return_pct,
+                    "average_fee_adjusted_return_pct": item.aggregate.average_fee_adjusted_return_pct,
+                    "average_mfe_pct": item.aggregate.average_mfe_pct,
+                    "average_mae_pct": item.aggregate.average_mae_pct,
+                },
+                "best_regime": item.best_regime,
+                "worst_regime": item.worst_regime,
+                "regime_evidence_count": item.regime_evidence_count,
+                "regime_min_evidence_required": item.regime_min_evidence_required,
+            }
+            for item in scorecards
         ],
     }

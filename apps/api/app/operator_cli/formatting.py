@@ -706,3 +706,83 @@ def render_roster_text(payload: dict[str, Any], options: RenderOptions) -> str:
     )
 
     return "\n".join(lines)
+
+
+def render_scorecards_text(payload: dict[str, Any], options: RenderOptions) -> str:
+    lines = _frame_header("STRATEGY SCORECARDS", options)
+    lines.extend(
+        _section(
+            "Market",
+            [
+                ("Provider", _fmt(payload.get("provider"), default="Unavailable")),
+                ("Product", _fmt(payload.get("product_id"), default="Unavailable")),
+                ("Interval", _fmt(payload.get("interval"), default="Unavailable")),
+                ("Latest scored", _fmt(payload.get("latest_outcome_evaluated_at"), default="Unavailable")),
+            ],
+            options,
+        )
+    )
+
+    scorecards = payload.get("scorecards") or []
+    if not scorecards:
+        lines.append("No scorecards found for this market.")
+        return "\n".join(lines)
+
+    lines.append("All metrics show explicit population sizes per horizon and aggregate.")
+    lines.append("")
+
+    def _pct(value: Any) -> str:
+        if value is None:
+            return "-"
+        return f"{Decimal(str(value)):.4f}"
+
+    def _bucket_lines(bucket: dict[str, Any], *, title: str) -> list[str]:
+        total = int(bucket.get("total_evaluated") or 0)
+        buy_eval = int(bucket.get("buy_evaluations") or 0)
+        buy_correct = int(bucket.get("buy_correct") or 0)
+        sell_eval = int(bucket.get("sell_evaluations") or 0)
+        sell_correct = int(bucket.get("sell_correct") or 0)
+        hold_eval = int(bucket.get("hold_evaluations") or 0)
+        hold_correct = int(bucket.get("hold_correct") or 0)
+        reconciliation_total = buy_eval + sell_eval + hold_eval
+
+        return [
+            f"  {title}",
+            f"    population(total_evaluated): {total}",
+            f"    BUY evaluations/correct: {buy_eval}/{buy_correct}",
+            f"    SELL evaluations/correct: {sell_eval}/{sell_correct}",
+            f"    HOLD evaluations/correct: {hold_eval}/{hold_correct}",
+            f"    reconciliation(BUY+SELL+HOLD==total): {reconciliation_total}=={total}",
+            f"    overall_correct_pct: {_pct(bucket.get('overall_correct_pct'))}",
+            f"    average_raw_return_pct: {_pct(bucket.get('average_raw_return_pct'))}",
+            f"    average_fee_adjusted_return_pct: {_pct(bucket.get('average_fee_adjusted_return_pct'))}",
+            f"    average_mfe_pct: {_pct(bucket.get('average_mfe_pct'))}",
+            f"    average_mae_pct: {_pct(bucket.get('average_mae_pct'))}",
+        ]
+
+    for card in scorecards:
+        strategy = str(card.get("strategy_slug") or "unknown")
+        lines.append(f"Strategy: {strategy}")
+
+        for bucket in card.get("per_horizon") or []:
+            horizon = str(bucket.get("horizon") or "unknown")
+            lines.extend(_bucket_lines(bucket, title=f"Per Horizon [{horizon}]"))
+
+        aggregate = card.get("aggregate") or {}
+        lines.extend(_bucket_lines(aggregate, title="Aggregate [all horizons combined]"))
+
+        evidence_count = int(card.get("regime_evidence_count") or 0)
+        min_required = int(card.get("regime_min_evidence_required") or 0)
+        best_regime = card.get("best_regime")
+        worst_regime = card.get("worst_regime")
+
+        if evidence_count < min_required:
+            lines.append(f"  Best Regime: Insufficient evidence ({evidence_count}/{min_required})")
+            lines.append(f"  Worst Regime: Insufficient evidence ({evidence_count}/{min_required})")
+        else:
+            lines.append(f"  Best Regime: {best_regime or '-'}")
+            lines.append(f"  Worst Regime: {worst_regime or '-'}")
+
+        lines.append("")
+
+    return "\n".join(lines)

@@ -126,3 +126,22 @@ def test_parse_roster_command() -> None:
     assert args.provider == "kraken_spot"
     assert args.product_id == "BTC-USD"
     assert args.interval == "15m"
+
+
+def test_parse_scorecards_command() -> None:
+    args = parse_args([
+        "scorecards",
+        "--provider",
+        "kraken_spot",
+        "--product-id",
+        "BTC-USD",
+        "--interval",
+        "15m",
+        "--json",
+    ])
+
+    assert args.command == "scorecards"
+    assert args.provider == "kraken_spot"
+    assert args.product_id == "BTC-USD"
+    assert args.interval == "15m"
+    assert args.json_output is True

@@ -11,6 +11,7 @@ from app.operator_cli.formatting import (
     render_candles_text,
     render_json,
     render_roster_text,
+    render_scorecards_text,
     render_watch_text,
     render_preview_show_text,
     render_preview_text,
@@ -22,6 +23,7 @@ from app.operator_cli.service import (
     fetch_candle_readiness,
     fetch_operator_status,
     fetch_preview_evidence,
+    fetch_strategy_scorecards_summary,
     fetch_strategy_roster_summary,
     fetch_watch_status,
 )
@@ -44,6 +46,7 @@ def _build_parser() -> argparse.ArgumentParser:
             "  ./operator preview-show --preview-id <preview_uuid>\n"
             "  ./operator watch --symbol BTC --interval 15m\n"
             "  ./operator roster\n"
+            "  ./operator scorecards\n"
             "  ./operator status --json\n"
             "  ./operator status --no-color --verbose"
         ),
@@ -128,6 +131,17 @@ def _build_parser() -> argparse.ArgumentParser:
     roster.add_argument("--interval", type=str, default="15m")
     roster.add_argument("--json", action="store_true", dest="json_output")
 
+    scorecards = subparsers.add_parser(
+        "scorecards",
+        parents=[common],
+        help="Show deterministic strategy outcome scorecards",
+        description="Read-only Strategy Outcome scorecards across evaluated horizons.",
+    )
+    scorecards.add_argument("--provider", type=str, default="kraken_spot")
+    scorecards.add_argument("--product-id", type=str, default="BTC-USD")
+    scorecards.add_argument("--interval", type=str, default="15m")
+    scorecards.add_argument("--json", action="store_true", dest="json_output")
+
     return parser
 
 
@@ -197,6 +211,15 @@ async def _run_async(args: argparse.Namespace) -> tuple[int, dict[str, Any], str
             interval=args.interval,
         )
         text = render_json(payload) if args.json_output else render_roster_text(payload, options)
+        return 0, payload, text
+
+    if args.command == "scorecards":
+        payload = await fetch_strategy_scorecards_summary(
+            provider=args.provider,
+            product_id=args.product_id,
+            interval=args.interval,
+        )
+        text = render_json(payload) if args.json_output else render_scorecards_text(payload, options)
         return 0, payload, text
 
     payload = await fetch_operator_status(

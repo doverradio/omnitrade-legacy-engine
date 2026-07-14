@@ -8,6 +8,7 @@ from app.operator_cli.formatting import (
     render_preview_show_text,
     render_preview_text,
     render_roster_text,
+    render_scorecards_text,
     render_status_text,
     render_watch_text,
 )
@@ -290,3 +291,96 @@ def test_render_roster_text_failed_not_rendered_as_hold() -> None:
     assert "[FAILED]" in text
     assert "reason: strategy_row_missing" in text
     assert "HOLD               0" in text
+
+
+def test_render_scorecards_text_contains_summary_rows() -> None:
+    text = render_scorecards_text(
+        {
+            "provider": "kraken_spot",
+            "product_id": "BTC-USD",
+            "interval": "15m",
+            "latest_outcome_evaluated_at": "2026-07-14T10:00:00Z",
+            "scorecards": [
+                {
+                    "strategy_slug": "momentum",
+                    "per_horizon": [
+                        {
+                            "horizon": "15m",
+                            "total_evaluated": 3,
+                            "buy_evaluations": 1,
+                            "buy_correct": 1,
+                            "sell_evaluations": 1,
+                            "sell_correct": 0,
+                            "hold_evaluations": 1,
+                            "hold_correct": 1,
+                            "overall_correct_pct": "66.6667",
+                            "average_raw_return_pct": "0.3012",
+                            "average_fee_adjusted_return_pct": "0.1012",
+                            "average_mfe_pct": "0.8100",
+                            "average_mae_pct": "-0.4200",
+                        },
+                        {
+                            "horizon": "1h",
+                            "total_evaluated": 1,
+                            "buy_evaluations": 0,
+                            "buy_correct": 0,
+                            "sell_evaluations": 1,
+                            "sell_correct": 1,
+                            "hold_evaluations": 0,
+                            "hold_correct": 0,
+                            "overall_correct_pct": "100.0000",
+                            "average_raw_return_pct": "0.5000",
+                            "average_fee_adjusted_return_pct": "0.3000",
+                            "average_mfe_pct": "1.0000",
+                            "average_mae_pct": "-0.2000",
+                        },
+                    ],
+                    "aggregate": {
+                        "horizon": "aggregate",
+                        "total_evaluated": 4,
+                        "buy_evaluations": 1,
+                        "buy_correct": 1,
+                        "sell_evaluations": 2,
+                        "sell_correct": 1,
+                        "hold_evaluations": 1,
+                        "hold_correct": 1,
+                        "overall_correct_pct": "75.0000",
+                        "average_raw_return_pct": "0.3500",
+                        "average_fee_adjusted_return_pct": "0.1500",
+                        "average_mfe_pct": "0.9000",
+                        "average_mae_pct": "-0.3500",
+                    },
+                    "best_regime": None,
+                    "worst_regime": None,
+                    "regime_evidence_count": 4,
+                    "regime_min_evidence_required": 50,
+                }
+            ],
+        },
+        _opts(),
+    )
+
+    assert "STRATEGY SCORECARDS" in text
+    assert "Per Horizon [15m]" in text
+    assert "Per Horizon [1h]" in text
+    assert "Aggregate [all horizons combined]" in text
+    assert "BUY evaluations/correct: 1/1" in text
+    assert "SELL evaluations/correct: 2/1" in text
+    assert "HOLD evaluations/correct: 1/1" in text
+    assert "reconciliation(BUY+SELL+HOLD==total): 4==4" in text
+    assert "Insufficient evidence (4/50)" in text
+
+
+def test_render_scorecards_text_empty_state() -> None:
+    text = render_scorecards_text(
+        {
+            "provider": "kraken_spot",
+            "product_id": "BTC-USD",
+            "interval": "15m",
+            "latest_outcome_evaluated_at": None,
+            "scorecards": [],
+        },
+        _opts(),
+    )
+
+    assert "No scorecards found for this market." in text
