@@ -4,6 +4,7 @@ import argparse
 import asyncio
 import sys
 from datetime import datetime, timezone
+from decimal import Decimal
 from typing import Any
 from uuid import UUID, uuid4
 
@@ -18,9 +19,13 @@ from app.operator_cli.formatting import (
     render_preview_text,
     resolve_render_options,
     render_status_text,
+    render_venue_commission_text,
 )
 from app.operator_cli.service import (
+    activate_venue_commission_run,
     execute_preview_cycle,
+    fetch_venue_commission_readiness,
+    fetch_venue_commission_status,
     fetch_candle_readiness,
     fetch_operator_status,
     fetch_preview_evidence,
@@ -28,6 +33,8 @@ from app.operator_cli.service import (
     fetch_strategy_scorecards_summary,
     fetch_strategy_roster_summary,
     fetch_watch_status,
+    revoke_venue_commission_run,
+    start_venue_commission_run,
 )
 
 
@@ -52,6 +59,11 @@ def _build_parser() -> argparse.ArgumentParser:
             "  ./operator execution-forensics --latest\n"
             "  ./operator execution-forensics --since '2 hours ago'\n"
             "  ./operator execution-forensics --cycle <cycle_uuid>\n"
+            "  ./operator venue-commission-readiness --provider kraken_spot --product BTC-USD --environment production --amount-usd 5 --hold-minutes 30 --json\n"
+            "  ./operator venue-commission-activate --provider kraken_spot --product BTC-USD --environment production --amount-usd 5 --hold-minutes 30 --confirm --json\n"
+            "  ./operator venue-commission-start --commissioning-run-id <run_uuid> --confirm --json\n"
+            "  ./operator venue-commission-status --commissioning-run-id <run_uuid> --json\n"
+            "  ./operator venue-commission-revoke --commissioning-run-id <run_uuid> --confirm --json\n"
             "  ./operator status --json\n"
             "  ./operator status --no-color --verbose"
         ),
@@ -159,6 +171,65 @@ def _build_parser() -> argparse.ArgumentParser:
     selector.add_argument("--latest", action="store_true")
     execution_forensics.add_argument("--json", action="store_true", dest="json_output")
 
+    venue_readiness = subparsers.add_parser(
+        "venue-commission-readiness",
+        parents=[common],
+        help="Evaluate whether Kraken First Flight commissioning can be activated safely",
+        description="Read-only readiness checks for a bounded Kraken First Flight commissioning run.",
+    )
+    venue_readiness.add_argument("--provider", type=str, required=True)
+    venue_readiness.add_argument("--product", type=str, required=True)
+    venue_readiness.add_argument("--environment", type=str, required=True)
+    venue_readiness.add_argument("--amount-usd", type=Decimal, required=True)
+    venue_readiness.add_argument("--hold-minutes", type=int, required=True)
+    venue_readiness.add_argument("--json", action="store_true", dest="json_output")
+
+    venue_activate = subparsers.add_parser(
+        "venue-commission-activate",
+        parents=[common],
+        help="Create one bounded Kraken First Flight commissioning run in ACTIVE state",
+        description="Operator-confirmed activation for one bounded Kraken First Flight commissioning run.",
+    )
+    venue_activate.add_argument("--provider", type=str, required=True)
+    venue_activate.add_argument("--product", type=str, required=True)
+    venue_activate.add_argument("--environment", type=str, required=True)
+    venue_activate.add_argument("--amount-usd", type=Decimal, required=True)
+    venue_activate.add_argument("--hold-minutes", type=int, required=True)
+    venue_activate.add_argument("--actor", type=str, default="operator:human")
+    venue_activate.add_argument("--confirm", action="store_true")
+    venue_activate.add_argument("--json", action="store_true", dest="json_output")
+
+    venue_start = subparsers.add_parser(
+        "venue-commission-start",
+        parents=[common],
+        help="Explicitly authorize the forced Kraken commissioning BUY",
+        description="Starts a previously activated commissioning run and advances its state machine.",
+    )
+    venue_start.add_argument("--commissioning-run-id", type=UUID, required=True)
+    venue_start.add_argument("--actor", type=str, default="operator:human")
+    venue_start.add_argument("--confirm", action="store_true")
+    venue_start.add_argument("--json", action="store_true", dest="json_output")
+
+    venue_status = subparsers.add_parser(
+        "venue-commission-status",
+        parents=[common],
+        help="Show bounded Kraken First Flight commissioning status",
+        description="Read the current persisted state for one commissioning run.",
+    )
+    venue_status.add_argument("--commissioning-run-id", type=UUID, required=True)
+    venue_status.add_argument("--json", action="store_true", dest="json_output")
+
+    venue_revoke = subparsers.add_parser(
+        "venue-commission-revoke",
+        parents=[common],
+        help="Emergency revoke for bounded Kraken First Flight commissioning",
+        description="Revokes an active commissioning run or fail-closes it to manual review when unsafe.",
+    )
+    venue_revoke.add_argument("--commissioning-run-id", type=UUID, required=True)
+    venue_revoke.add_argument("--actor", type=str, default="operator:human")
+    venue_revoke.add_argument("--confirm", action="store_true")
+    venue_revoke.add_argument("--json", action="store_true", dest="json_output")
+
     return parser
 
 
@@ -246,6 +317,53 @@ async def _run_async(args: argparse.Namespace) -> tuple[int, dict[str, Any], str
             latest=bool(args.latest),
         )
         text = render_json(payload) if args.json_output else render_execution_forensics_text(payload, options)
+        return 0, payload, text
+
+    if args.command == "venue-commission-readiness":
+        payload = await fetch_venue_commission_readiness(
+            provider=args.provider,
+            product_id=args.product,
+            environment=args.environment,
+            amount_usd=args.amount_usd,
+            hold_minutes=args.hold_minutes,
+        )
+        text = render_json(payload) if args.json_output else render_venue_commission_text(payload, options)
+        return (0 if payload.get("would_activate_safely") else 1), payload, text
+
+    if args.command == "venue-commission-activate":
+        payload = await activate_venue_commission_run(
+            actor=args.actor,
+            provider=args.provider,
+            product_id=args.product,
+            environment=args.environment,
+            amount_usd=args.amount_usd,
+            hold_minutes=args.hold_minutes,
+            confirm=bool(args.confirm),
+        )
+        text = render_json(payload) if args.json_output else render_venue_commission_text(payload, options)
+        return 0, payload, text
+
+    if args.command == "venue-commission-start":
+        payload = await start_venue_commission_run(
+            actor=args.actor,
+            commissioning_run_id=args.commissioning_run_id,
+            confirm=bool(args.confirm),
+        )
+        text = render_json(payload) if args.json_output else render_venue_commission_text(payload, options)
+        return 0, payload, text
+
+    if args.command == "venue-commission-status":
+        payload = await fetch_venue_commission_status(commissioning_run_id=args.commissioning_run_id)
+        text = render_json(payload) if args.json_output else render_venue_commission_text(payload, options)
+        return 0, payload, text
+
+    if args.command == "venue-commission-revoke":
+        payload = await revoke_venue_commission_run(
+            actor=args.actor,
+            commissioning_run_id=args.commissioning_run_id,
+            confirm=bool(args.confirm),
+        )
+        text = render_json(payload) if args.json_output else render_venue_commission_text(payload, options)
         return 0, payload, text
 
     payload = await fetch_operator_status(

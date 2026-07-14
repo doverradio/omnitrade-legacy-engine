@@ -43,6 +43,7 @@ from app.models.live_reconciliation_event import LiveReconciliationEvent
 from app.models.live_resilience_event import LiveResilienceEvent
 from app.models.live_trading_event import LiveTradingEvent
 from app.models.live_trading_profile import LiveTradingProfile
+from app.models.venue_commissioning_run import VenueCommissioningRun
 from app.models.parameter_set import ParameterSet
 from app.models.paper_account import PaperAccount
 from app.models.risk_event import RiskEvent
@@ -114,6 +115,7 @@ __all__ = [
 	"LiveResilienceEvent",
 	"LiveTradingEvent",
 	"LiveTradingProfile",
+	"VenueCommissioningRun",
 	"PaperAccount",
 	"ParameterSet",
 	"RiskEvent",

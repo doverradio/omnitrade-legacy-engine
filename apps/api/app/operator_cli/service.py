@@ -26,6 +26,7 @@ from app.models.exchange_connection import ExchangeConnection
 from app.models.live_crypto_order import LiveCryptoOrder
 from app.models.risk_event import RiskEvent
 from app.models.signal import Signal
+from app.models.venue_commissioning_run import VenueCommissioningRun
 from app.models.strategy import Strategy
 from app.models.trade import Trade
 from app.models.validation_run_event import ValidationRunEvent
@@ -1538,4 +1539,171 @@ async def fetch_strategy_scorecards_summary(
             }
             for item in scorecards
         ],
+    }
+
+
+def _serialize_commissioning_run(run: VenueCommissioningRun) -> dict[str, Any]:
+    return {
+        "commissioning_run_id": run.commissioning_run_id,
+        "status": run.status,
+        "execution_purpose": run.execution_purpose,
+        "commissioning_type": run.commissioning_type,
+        "provider": run.provider,
+        "environment": run.environment,
+        "product_id": run.product_id,
+        "max_quote_notional": run.max_quote_notional,
+        "max_buys": run.max_buys,
+        "max_sells": run.max_sells,
+        "hold_minutes": run.hold_minutes,
+        "buy_requested_quote_usd": run.buy_requested_quote_usd,
+        "buy_client_order_id": run.buy_client_order_id,
+        "buy_provider_order_id": run.buy_provider_order_id,
+        "buy_submitted_at": run.buy_submitted_at,
+        "buy_filled_at": run.buy_filled_at,
+        "buy_filled_quote_usd": run.buy_filled_quote_usd,
+        "buy_filled_base_btc": run.buy_filled_base_btc,
+        "buy_avg_price_usd": run.buy_avg_price_usd,
+        "buy_fee_usd": run.buy_fee_usd,
+        "hold_started_at": run.hold_started_at,
+        "hold_due_at": run.hold_due_at,
+        "sell_client_order_id": run.sell_client_order_id,
+        "sell_provider_order_id": run.sell_provider_order_id,
+        "sell_submitted_at": run.sell_submitted_at,
+        "sell_filled_at": run.sell_filled_at,
+        "sell_requested_base_btc": run.sell_requested_base_btc,
+        "sell_filled_base_btc": run.sell_filled_base_btc,
+        "sell_filled_quote_usd": run.sell_filled_quote_usd,
+        "sell_avg_price_usd": run.sell_avg_price_usd,
+        "sell_fee_usd": run.sell_fee_usd,
+        "gross_pnl_usd": run.gross_pnl_usd,
+        "total_fees_usd": run.total_fees_usd,
+        "net_realized_pnl_usd": run.net_realized_pnl_usd,
+        "dust_base_btc": run.dust_base_btc,
+        "duplicate_orders_detected": run.duplicate_orders_detected,
+        "manual_intervention_required": run.manual_intervention_required,
+        "ledger_matches_kraken": run.ledger_matches_kraken,
+        "activated_by": run.activated_by,
+        "activated_at": run.activated_at,
+        "started_by": run.started_by,
+        "started_at": run.started_at,
+        "completed_at": run.completed_at,
+        "revoked_by": run.revoked_by,
+        "revoked_reason": run.revoked_reason,
+        "updated_at": run.updated_at,
+    }
+
+
+async def fetch_venue_commission_readiness(
+    *,
+    provider: str,
+    product_id: str,
+    environment: str,
+    amount_usd: Decimal,
+    hold_minutes: int,
+) -> dict[str, Any]:
+    from app.services.live.venue_commissioning import service as venue_commissioning_service
+    from app.services.live.venue_commissioning import CommissioningConfig
+
+    config = CommissioningConfig(
+        provider=provider,
+        product_id=product_id,
+        environment=environment,
+        amount=amount_usd,
+        hold_minutes=hold_minutes,
+    )
+    async with AsyncSessionLocal() as db:
+        readiness = await venue_commissioning_service["evaluate_readiness"](db=db, config=config)
+
+    return {
+        "provider": provider,
+        "product_id": product_id,
+        "environment": environment,
+        "amount_usd": amount_usd,
+        "hold_minutes": hold_minutes,
+        "would_activate_safely": readiness.would_activate_safely,
+        "exact_blocker": readiness.exact_blocker,
+        "existing_active_run": readiness.existing_active_run,
+        "checks": [
+            {"label": item.label, "status": item.status, "reason": item.reason}
+            for item in readiness.checks
+        ],
+    }
+
+
+async def activate_venue_commission_run(
+    *,
+    actor: str,
+    provider: str,
+    product_id: str,
+    environment: str,
+    amount_usd: Decimal,
+    hold_minutes: int,
+    confirm: bool,
+) -> dict[str, Any]:
+    from app.services.live.venue_commissioning import service as venue_commissioning_service
+    from app.services.live.venue_commissioning import CommissioningConfig
+
+    config = CommissioningConfig(
+        provider=provider,
+        product_id=product_id,
+        environment=environment,
+        amount=amount_usd,
+        hold_minutes=hold_minutes,
+    )
+    async with AsyncSessionLocal() as db:
+        run = await venue_commissioning_service["activate_run"](
+            db=db,
+            actor=actor,
+            config=config,
+            confirm=confirm,
+        )
+
+    return {
+        "activation": "accepted",
+        "run": _serialize_commissioning_run(run),
+    }
+
+
+async def start_venue_commission_run(*, actor: str, commissioning_run_id: UUID, confirm: bool) -> dict[str, Any]:
+    from app.services.live.venue_commissioning import service as venue_commissioning_service
+
+    async with AsyncSessionLocal() as db:
+        run = await venue_commissioning_service["start_run"](
+            db=db,
+            actor=actor,
+            run_id=commissioning_run_id,
+            confirm=confirm,
+        )
+
+    return {
+        "start": "processed",
+        "run": _serialize_commissioning_run(run),
+    }
+
+
+async def fetch_venue_commission_status(*, commissioning_run_id: UUID) -> dict[str, Any]:
+    from app.services.live.venue_commissioning import service as venue_commissioning_service
+
+    async with AsyncSessionLocal() as db:
+        run = await venue_commissioning_service["get_run"](db=db, run_id=commissioning_run_id)
+
+    return {
+        "run": _serialize_commissioning_run(run),
+    }
+
+
+async def revoke_venue_commission_run(*, actor: str, commissioning_run_id: UUID, confirm: bool) -> dict[str, Any]:
+    from app.services.live.venue_commissioning import service as venue_commissioning_service
+
+    async with AsyncSessionLocal() as db:
+        run = await venue_commissioning_service["revoke_run"](
+            db=db,
+            actor=actor,
+            run_id=commissioning_run_id,
+            confirm=confirm,
+        )
+
+    return {
+        "revoke": "processed",
+        "run": _serialize_commissioning_run(run),
     }

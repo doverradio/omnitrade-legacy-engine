@@ -41,6 +41,7 @@ from app.services.system_intelligence_snapshots import capture_system_intelligen
 from app.services.strategies import StrategyContext, strategy_registry
 from app.services.strategies.registry import StrategyLookupError
 from app.services.autonomous_cycle import AutonomousCycleRequest, run_autonomous_preview_cycle
+from app.services.orchestration.venue_commissioning_bridge import service as venue_commissioning_service
 from app.services.strategy_outcomes import score_due_strategy_roster_proposal_outcomes
 from app.services.strategy_roster import StrategyRosterRequest, run_strategy_roster_for_candle
 
@@ -384,6 +385,10 @@ async def _rollback_active_session(*, db: AsyncSession) -> None:
     if not hasattr(db, "rollback"):
         return
     await db.rollback()
+    if hasattr(db, "failed_transaction"):
+        setattr(db, "failed_transaction", False)
+    if hasattr(db, "pending"):
+        db.pending.clear()
 
 
 async def _record_research_cycle_status(
@@ -501,6 +506,19 @@ async def run_orchestration_cycle(
         kraken_client,
         interval=config.candle_interval,
     )
+
+    if hasattr(db, "scalars") and hasattr(db, "scalar"):
+        try:
+            resumed_runs = await venue_commissioning_service["resume_runs"](
+                db=db,
+                actor="orchestration_worker",
+                limit=10,
+            )
+            if resumed_runs > 0:
+                logger.info("venue_commission_resume_completed resumed_runs=%s", resumed_runs)
+        except Exception:
+            await _rollback_active_session(db=db)
+            logger.exception("venue_commission_resume_failed")
 
     autonomous_cycle_id: uuid.UUID | None = None
     kraken_btc_candle: Candle | None = None
@@ -782,19 +800,33 @@ async def run_orchestration_cycle(
     try:
         research_cycle_result = await run_deterministic_research_cycle_if_due(db=db)
     except Exception as exc:
-        await _rollback_active_session(db=db)
         failure_reason = _safe_research_failure_reason(exc)
-        await _record_research_cycle_status(
-            db=db,
-            status="failed",
-            reason=failure_reason,
-            campaign_id=None,
-            candidates_generated=0,
-            candidates_evaluated=0,
-            descendants_generated=0,
-            champion=None,
-            error_type=exc.__class__.__name__,
-        )
+        await _rollback_active_session(db=db)
+        try:
+            await _record_research_cycle_status(
+                db=db,
+                status="failed",
+                reason=failure_reason,
+                campaign_id=None,
+                candidates_generated=0,
+                candidates_evaluated=0,
+                descendants_generated=0,
+                champion=None,
+                error_type=exc.__class__.__name__,
+            )
+        except Exception:
+            await _rollback_active_session(db=db)
+            await _record_research_cycle_status(
+                db=db,
+                status="failed",
+                reason=failure_reason,
+                campaign_id=None,
+                candidates_generated=0,
+                candidates_evaluated=0,
+                descendants_generated=0,
+                champion=None,
+                error_type=exc.__class__.__name__,
+            )
         await db.commit()
         logger.exception("Deterministic research cycle failed; continuing orchestration cycle without research outputs")
         research_cycle_result = None

@@ -1014,3 +1014,64 @@ def render_execution_forensics_text(payload: dict[str, Any], options: RenderOpti
         )
 
     return "\n".join(lines)
+
+
+def render_venue_commission_text(payload: dict[str, Any], options: RenderOptions) -> str:
+    lines = _frame_header("VENUE COMMISSIONING", options)
+
+    if "checks" in payload:
+        lines.extend(
+            _section(
+                "Readiness",
+                [
+                    ("Provider", _fmt(payload.get("provider"), default="N/A")),
+                    ("Environment", _fmt(payload.get("environment"), default="N/A")),
+                    ("Product", _fmt(payload.get("product_id"), default="N/A")),
+                    ("Amount USD", _fmt(payload.get("amount_usd"), default="N/A")),
+                    ("Hold minutes", _fmt(payload.get("hold_minutes"), default="N/A")),
+                    ("Would activate", _forensics_bool(payload.get("would_activate_safely"))),
+                    ("Exact blocker", _fmt(payload.get("exact_blocker"), default="NONE")),
+                    ("Existing active run", _fmt(payload.get("existing_active_run"), default="NONE")),
+                ],
+                options,
+            )
+        )
+        checks = payload.get("checks") or []
+        if checks:
+            lines.append("Checks")
+            lines.append("------" if not options.unicode_enabled else "──────")
+            for item in checks:
+                lines.append(
+                    "- {}: {}{}".format(
+                        _fmt(item.get("label"), default="Unnamed"),
+                        _fmt(item.get("status"), default="UNKNOWN"),
+                        "" if not item.get("reason") else f" ({_fmt(item.get('reason'))})",
+                    )
+                )
+            lines.append("")
+
+    run = payload.get("run") if isinstance(payload.get("run"), dict) else None
+    if run is not None:
+        lines.extend(
+            _section(
+                "Run",
+                [
+                    ("Run ID", _fmt(run.get("commissioning_run_id"), default="N/A")),
+                    ("Status", _fmt(run.get("status"), default="N/A")),
+                    ("Purpose", _fmt(run.get("execution_purpose"), default="N/A")),
+                    ("Type", _fmt(run.get("commissioning_type"), default="N/A")),
+                    ("Provider", _fmt(run.get("provider"), default="N/A")),
+                    ("Environment", _fmt(run.get("environment"), default="N/A")),
+                    ("Product", _fmt(run.get("product_id"), default="N/A")),
+                    ("Buy client order", _fmt(run.get("buy_client_order_id"), default="N/A")),
+                    ("Sell client order", _fmt(run.get("sell_client_order_id"), default="N/A")),
+                    ("Hold due", _fmt(run.get("hold_due_at"), default="N/A")),
+                    ("Net realized PnL", _fmt(run.get("net_realized_pnl_usd"), default="N/A")),
+                    ("Dust BTC", _fmt(run.get("dust_base_btc"), default="N/A")),
+                    ("Manual review", _forensics_bool(run.get("manual_intervention_required"))),
+                ],
+                options,
+            )
+        )
+
+    return "\n".join(lines)

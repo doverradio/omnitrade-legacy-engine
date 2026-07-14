@@ -61,6 +61,14 @@ class _RecoveryAwareDB(_FakeDB):
         self.committed.extend(self.pending)
         self.pending.clear()
 
+
+class _ResumeCapableDB(_FakeDB):
+    async def scalar(self, *_args, **_kwargs):
+        return None
+
+    async def scalars(self, *_args, **_kwargs):
+        return []
+
     async def rollback(self) -> None:
         self.rollbacks += 1
         self.failed_transaction = False
@@ -435,6 +443,7 @@ async def test_worker_records_research_cycle_started_in_stats(monkeypatch: pytes
     import app.services.orchestration.continuous_pipeline_worker as worker_module
 
     monkeypatch.setattr(worker_module, "run_ingestion_cycle", _fake_ingestion_cycle)
+    monkeypatch.setitem(worker_module.venue_commissioning_service, "resume_runs", _async_return(0))
     monkeypatch.setattr(worker_module, "_load_active_assets", _async_return([]))
     monkeypatch.setattr(worker_module, "_load_active_strategies", _async_return([]))
     monkeypatch.setattr(
@@ -458,6 +467,81 @@ async def test_worker_records_research_cycle_started_in_stats(monkeypatch: pytes
 
     assert stats.research_cycles_started == 1
     assert db.commits >= 1
+
+
+@pytest.mark.asyncio
+async def test_worker_invokes_commissioning_resume_hook(monkeypatch: pytest.MonkeyPatch) -> None:
+    db = _ResumeCapableDB()
+    resume_calls = {"count": 0}
+
+    async def _resume_runs(*, db, actor, limit):
+        assert actor == "orchestration_worker"
+        assert limit == 10
+        assert db is not None
+        resume_calls["count"] += 1
+        return 1
+
+    import app.services.orchestration.continuous_pipeline_worker as worker_module
+
+    monkeypatch.setattr(worker_module, "run_ingestion_cycle", _fake_ingestion_cycle)
+    monkeypatch.setitem(worker_module.venue_commissioning_service, "resume_runs", _resume_runs)
+    monkeypatch.setattr(worker_module, "_load_active_assets", _async_return([]))
+    monkeypatch.setattr(worker_module, "_load_active_strategies", _async_return([]))
+    monkeypatch.setattr(
+        worker_module,
+        "run_deterministic_research_cycle_if_due",
+        _async_return(
+            SimpleNamespace(
+                started=False,
+                reason="not_due",
+                campaign_id=None,
+                candidates_generated=0,
+                candidates_evaluated=0,
+                descendants_generated=0,
+                champion=None,
+            )
+        ),
+    )
+    monkeypatch.setattr(worker_module, "capture_system_intelligence_snapshot_if_due", _async_return(None))
+
+    await run_orchestration_cycle(db=db, client=object(), config=_config())
+
+    assert resume_calls["count"] == 1
+
+
+@pytest.mark.asyncio
+async def test_worker_isolates_commissioning_resume_failure(monkeypatch: pytest.MonkeyPatch) -> None:
+    db = _FakeDB()
+
+    async def _resume_fail(*_args, **_kwargs):
+        raise RuntimeError("resume failed")
+
+    import app.services.orchestration.continuous_pipeline_worker as worker_module
+
+    monkeypatch.setattr(worker_module, "run_ingestion_cycle", _fake_ingestion_cycle)
+    monkeypatch.setitem(worker_module.venue_commissioning_service, "resume_runs", _resume_fail)
+    monkeypatch.setattr(worker_module, "_load_active_assets", _async_return([]))
+    monkeypatch.setattr(worker_module, "_load_active_strategies", _async_return([]))
+    monkeypatch.setattr(
+        worker_module,
+        "run_deterministic_research_cycle_if_due",
+        _async_return(
+            SimpleNamespace(
+                started=False,
+                reason="not_due",
+                campaign_id=None,
+                candidates_generated=0,
+                candidates_evaluated=0,
+                descendants_generated=0,
+                champion=None,
+            )
+        ),
+    )
+    monkeypatch.setattr(worker_module, "capture_system_intelligence_snapshot_if_due", _async_return(None))
+
+    stats = await run_orchestration_cycle(db=db, client=object(), config=_config())
+
+    assert stats.ingestion_assets_ok == 1
 
 
 @pytest.mark.asyncio

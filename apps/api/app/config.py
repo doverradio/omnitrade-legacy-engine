@@ -64,6 +64,10 @@ class Settings(BaseSettings):
         default=False,
         validation_alias="LIVE_CRYPTO_PREPARATION_ENABLED",
     )
+    venue_commissioning_enabled: bool = Field(
+        default=False,
+        validation_alias="VENUE_COMMISSIONING_ENABLED",
+    )
     live_crypto_confirmation_challenge_minutes: int = Field(
         default=1,
         validation_alias="LIVE_CRYPTO_CONFIRMATION_CHALLENGE_MINUTES",

@@ -913,13 +913,14 @@ class KrakenSpotClient:
         environment: str,
         request: ExchangeOrderSubmissionRequest,
     ) -> ExchangeOrderSubmissionResult:
-        if request.side.upper() != "BUY" or request.order_type.upper() != "MARKET":
+        side = request.side.upper()
+        if side not in {"BUY", "SELL"} or request.order_type.upper() != "MARKET":
             return ExchangeOrderSubmissionResult(
                 classification="rejected",
                 order=None,
                 rejection=ExchangeProviderRejection(
                     code="unsupported_order_shape",
-                    message="Kraken submission supports only MARKET BUY in this execution profile",
+                    message="Kraken submission supports only MARKET BUY/SELL in this execution profile",
                     retryable=False,
                     provider_status=None,
                     safe_details={"side": request.side, "order_type": request.order_type},
@@ -928,7 +929,7 @@ class KrakenSpotClient:
                 raw_response={},
                 safe_headers={},
             )
-        if request.quote_size is None or request.quote_size <= Decimal("0"):
+        if side == "BUY" and (request.quote_size is None or request.quote_size <= Decimal("0")):
             return ExchangeOrderSubmissionResult(
                 classification="rejected",
                 order=None,
@@ -938,6 +939,21 @@ class KrakenSpotClient:
                     retryable=False,
                     provider_status=None,
                     safe_details={"quote_size": None if request.quote_size is None else format(request.quote_size, "f")},
+                ),
+                ambiguous=None,
+                raw_response={},
+                safe_headers={},
+            )
+        if side == "SELL" and (request.base_size is None or request.base_size <= Decimal("0")):
+            return ExchangeOrderSubmissionResult(
+                classification="rejected",
+                order=None,
+                rejection=ExchangeProviderRejection(
+                    code="invalid_base_size",
+                    message="Kraken market sell submission requires base_size > 0",
+                    retryable=False,
+                    provider_status=None,
+                    safe_details={"base_size": None if request.base_size is None else format(request.base_size, "f")},
                 ),
                 ambiguous=None,
                 raw_response={},
@@ -968,41 +984,80 @@ class KrakenSpotClient:
         ordermin = _to_decimal(pair_info.get("ordermin"))
         costmin = _to_decimal(pair_info.get("costmin"))
 
-        quote_size = _quantize(request.quote_size, pair_decimals)
-        if quote_size <= Decimal("0"):
-            return ExchangeOrderSubmissionResult(
-                classification="rejected",
-                order=None,
-                rejection=ExchangeProviderRejection(
-                    code="quote_size_quantized_to_zero",
-                    message="Kraken quote_size underflows provider precision",
-                    retryable=False,
-                    provider_status=None,
-                    safe_details={"requested_quote_size": format(request.quote_size, "f"), "pair_decimals": pair_decimals},
-                ),
-                ambiguous=None,
-                raw_response={},
-                safe_headers={},
-            )
-        if quote_size > request.quote_size:
-            return ExchangeOrderSubmissionResult(
-                classification="rejected",
-                order=None,
-                rejection=ExchangeProviderRejection(
-                    code="quote_size_precision_conflict",
-                    message="Kraken quote_size precision would increase requested amount",
-                    retryable=False,
-                    provider_status=None,
-                    safe_details={
-                        "requested_quote_size": format(request.quote_size, "f"),
-                        "quantized_quote_size": format(quote_size, "f"),
-                        "pair_decimals": pair_decimals,
-                    },
-                ),
-                ambiguous=None,
-                raw_response={},
-                safe_headers={},
-            )
+        quote_size: Decimal | None = None
+        base_size: Decimal | None = None
+        if side == "BUY":
+            quote_size = _quantize(request.quote_size, pair_decimals)
+            if quote_size <= Decimal("0"):
+                return ExchangeOrderSubmissionResult(
+                    classification="rejected",
+                    order=None,
+                    rejection=ExchangeProviderRejection(
+                        code="quote_size_quantized_to_zero",
+                        message="Kraken quote_size underflows provider precision",
+                        retryable=False,
+                        provider_status=None,
+                        safe_details={"requested_quote_size": format(request.quote_size, "f"), "pair_decimals": pair_decimals},
+                    ),
+                    ambiguous=None,
+                    raw_response={},
+                    safe_headers={},
+                )
+            if quote_size > request.quote_size:
+                return ExchangeOrderSubmissionResult(
+                    classification="rejected",
+                    order=None,
+                    rejection=ExchangeProviderRejection(
+                        code="quote_size_precision_conflict",
+                        message="Kraken quote_size precision would increase requested amount",
+                        retryable=False,
+                        provider_status=None,
+                        safe_details={
+                            "requested_quote_size": format(request.quote_size, "f"),
+                            "quantized_quote_size": format(quote_size, "f"),
+                            "pair_decimals": pair_decimals,
+                        },
+                    ),
+                    ambiguous=None,
+                    raw_response={},
+                    safe_headers={},
+                )
+        else:
+            base_size = _quantize(request.base_size, lot_decimals)
+            if base_size <= Decimal("0"):
+                return ExchangeOrderSubmissionResult(
+                    classification="rejected",
+                    order=None,
+                    rejection=ExchangeProviderRejection(
+                        code="base_size_quantized_to_zero",
+                        message="Kraken base_size underflows provider precision",
+                        retryable=False,
+                        provider_status=None,
+                        safe_details={"requested_base_size": format(request.base_size, "f"), "lot_decimals": lot_decimals},
+                    ),
+                    ambiguous=None,
+                    raw_response={},
+                    safe_headers={},
+                )
+            if base_size > request.base_size:
+                return ExchangeOrderSubmissionResult(
+                    classification="rejected",
+                    order=None,
+                    rejection=ExchangeProviderRejection(
+                        code="base_size_precision_conflict",
+                        message="Kraken base_size precision would increase requested amount",
+                        retryable=False,
+                        provider_status=None,
+                        safe_details={
+                            "requested_base_size": format(request.base_size, "f"),
+                            "quantized_base_size": format(base_size, "f"),
+                            "lot_decimals": lot_decimals,
+                        },
+                    ),
+                    ambiguous=None,
+                    raw_response={},
+                    safe_headers={},
+                )
 
         ticker_payload = await self._public_request(path="/public/Ticker", environment=environment, params={"pair": altname})
         ticker_result = ticker_payload.get("result") if isinstance(ticker_payload.get("result"), dict) else {}
@@ -1034,7 +1089,7 @@ class KrakenSpotClient:
                 safe_headers={},
             )
 
-        estimated_base_size = _quantize(quote_size / best_ask, lot_decimals)
+        estimated_base_size = _quantize(quote_size / best_ask, lot_decimals) if side == "BUY" else base_size
         if ordermin > Decimal("0") and estimated_base_size < ordermin:
             return ExchangeOrderSubmissionResult(
                 classification="rejected",
@@ -1054,7 +1109,7 @@ class KrakenSpotClient:
                 raw_response={},
                 safe_headers={},
             )
-        if costmin > Decimal("0") and quote_size < costmin:
+        if side == "BUY" and costmin > Decimal("0") and quote_size < costmin:
             return ExchangeOrderSubmissionResult(
                 classification="rejected",
                 order=None,
@@ -1072,13 +1127,14 @@ class KrakenSpotClient:
 
         payload = {
             "ordertype": "market",
-            "type": "buy",
+            "type": side.lower(),
             "pair": altname,
-            "volume": format(quote_size, "f"),
-            "oflags": "fciq,viqc",
+            "volume": format(quote_size, "f") if side == "BUY" else format(base_size, "f"),
             "timeinforce": "IOC",
             "cl_ord_id": request.client_order_id,
         }
+        if side == "BUY":
+            payload["oflags"] = "fciq,viqc"
 
         try:
             provider_response = await self._private_request(
@@ -1159,7 +1215,7 @@ class KrakenSpotClient:
                     provider_order_id=None,
                     client_order_id=request.client_order_id,
                     product_id=normalized_product,
-                    side="BUY",
+                    side=side,
                     status="UNKNOWN",
                     submitted_at=datetime.now(timezone.utc),
                     acknowledged_at=None,
@@ -1180,7 +1236,7 @@ class KrakenSpotClient:
                 provider_order_id=provider_order_id,
                 client_order_id=request.client_order_id,
                 product_id=normalized_product,
-                side="BUY",
+                side=side,
                 status="OPEN",
                 submitted_at=datetime.now(timezone.utc),
                 acknowledged_at=datetime.now(timezone.utc),
