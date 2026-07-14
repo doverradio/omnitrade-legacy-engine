@@ -838,9 +838,10 @@ def render_execution_forensics_text(payload: dict[str, Any], options: RenderOpti
         signal_rows = signal_section.get("signals") or []
         lines.extend(
             _section(
-                "Signals",
+                "Legacy Signals",
                 [
-                    ("Generated", _fmt(signal_section.get("signals_generated"), default="0")),
+                    ("Executable signals", _fmt(signal_section.get("signals_generated"), default="0")),
+                    ("Source", _fmt(signal_section.get("source"), default="signals_table_via_decision_lineage")),
                 ],
                 options,
             )
@@ -851,6 +852,38 @@ def render_execution_forensics_text(payload: dict[str, Any], options: RenderOpti
             )
         if signal_rows:
             lines.append("")
+
+        roster = cycle.get("strategy_roster") or {}
+        lines.extend(
+            _section(
+                "Strategy Roster",
+                [
+                    ("Proposals", _fmt(roster.get("proposal_count"), default="0")),
+                    ("BUY", _fmt(roster.get("buy_count"), default="0")),
+                    ("SELL", _fmt(roster.get("sell_count"), default="0")),
+                    ("HOLD", _fmt(roster.get("hold_count"), default="0")),
+                    ("Mode", _fmt(roster.get("mode"), default="SHADOW")),
+                    ("Executable", _forensics_bool(roster.get("executable"))),
+                    ("Reason", _fmt(roster.get("reason"), default="N/A")),
+                ],
+                options,
+            )
+        )
+
+        autonomous = cycle.get("autonomous_decision") or {}
+        lines.extend(
+            _section(
+                "Autonomous Decision",
+                [
+                    ("Proposed action", _fmt(autonomous.get("proposed_action"), default="UNPROVEN")),
+                    ("Mandate verdict", _fmt(autonomous.get("mandate_verdict"), default="UNPROVEN")),
+                    ("Risk verdict", _fmt(autonomous.get("risk_verdict"), default="UNPROVEN")),
+                    ("Execution handoff", _fmt(autonomous.get("execution_handoff"), default="UNPROVEN")),
+                    ("Exact blocker", _fmt(autonomous.get("exact_blocker"), default="UNPROVEN")),
+                ],
+                options,
+            )
+        )
 
         candidate = cycle.get("execution_candidate") or {}
         lines.extend(

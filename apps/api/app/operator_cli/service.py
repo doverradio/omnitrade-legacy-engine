@@ -366,6 +366,16 @@ async def _build_cycle_forensics(*, db: Any, cycle: AutonomousCycleRun) -> dict[
         ).scalars().all()
     )
 
+    roster_proposals = list(
+        (
+            await db.execute(
+                select(StrategyRosterProposal)
+                .where(StrategyRosterProposal.scheduled_cycle_id == cycle.cycle_id)
+                .order_by(StrategyRosterProposal.evaluated_at.asc(), StrategyRosterProposal.proposal_id.asc())
+            )
+        ).scalars().all()
+    )
+
     outcome_score_rows = list(
         (
             await db.execute(
@@ -410,7 +420,31 @@ async def _build_cycle_forensics(*, db: Any, cycle: AutonomousCycleRun) -> dict[
             }
         )
 
-    summary = "No actionable signal found"
+    cycle_context = cycle.cycle_context if isinstance(cycle.cycle_context, dict) else {}
+    strategy_context = cycle_context.get("strategy") if isinstance(cycle_context.get("strategy"), dict) else {}
+    strategy_signal_payload = strategy_context.get("signal_payload") if isinstance(strategy_context.get("signal_payload"), dict) else {}
+    autonomous_proposed_action = (getattr(cycle, "proposed_action", None) or strategy_signal_payload.get("action") or "HOLD").upper()
+    if autonomous_proposed_action not in {"BUY", "SELL", "HOLD"}:
+        autonomous_proposed_action = "HOLD"
+
+    roster_buy = sum(1 for item in roster_proposals if str(item.action).upper() == "BUY")
+    roster_sell = sum(1 for item in roster_proposals if str(item.action).upper() == "SELL")
+    roster_hold = sum(1 for item in roster_proposals if str(item.action).upper() == "HOLD")
+    roster_mode = "SHADOW"
+    roster_executable = "NO"
+    roster_reason = "Strategy Roster proposals are shadow research observations and never executable orders"
+
+    if signal_rows:
+        execution_handoff_status = "LEGACY_SIGNAL_PIPELINE"
+        execution_handoff_blocker = "NOT APPLICABLE"
+    elif autonomous_proposed_action in {"BUY", "SELL"}:
+        execution_handoff_status = "NOT IMPLEMENTED"
+        execution_handoff_blocker = "AUTONOMOUS_CANONICAL_SIGNAL_HANDOFF_NOT_IMPLEMENTED"
+    else:
+        execution_handoff_status = "NOT APPLICABLE"
+        execution_handoff_blocker = "HOLD_ACTION"
+
+    summary = "No legacy executable signals linked to this autonomous cycle"
     if candidate and execution_summary.get("trade_created"):
         summary = "Actionable signal became paper trade"
     elif candidate and execution_summary.get("rejected"):
@@ -487,6 +521,23 @@ async def _build_cycle_forensics(*, db: Any, cycle: AutonomousCycleRun) -> dict[
         "signal_section": {
             "signals_generated": len(signal_rows),
             "signals": signal_rows,
+            "source": "signals_table_via_decision_lineage",
+        },
+        "strategy_roster": {
+            "proposal_count": len(roster_proposals),
+            "buy_count": roster_buy,
+            "sell_count": roster_sell,
+            "hold_count": roster_hold,
+            "mode": roster_mode,
+            "executable": roster_executable,
+            "reason": roster_reason,
+        },
+        "autonomous_decision": {
+            "proposed_action": autonomous_proposed_action,
+            "mandate_verdict": getattr(cycle, "mandate_verdict", None) or "UNPROVEN",
+            "risk_verdict": getattr(cycle, "risk_verdict", None) or "UNPROVEN",
+            "execution_handoff": execution_handoff_status,
+            "exact_blocker": execution_handoff_blocker,
         },
         "execution_candidate": {
             "is_candidate": candidate,

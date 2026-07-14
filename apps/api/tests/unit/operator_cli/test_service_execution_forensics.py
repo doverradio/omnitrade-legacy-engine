@@ -55,13 +55,14 @@ class _FetchDB:
 
 
 class _BuildDB:
-    def __init__(self, *, decision=None, signals=None, risk_events=None, trades=None, signal_audits=None, trade_audit=None):
+    def __init__(self, *, decision=None, signals=None, risk_events=None, trades=None, signal_audits=None, trade_audit=None, roster_proposals=None):
         self.decision = decision
         self.signals = list(signals or [])
         self.risk_events = list(risk_events or [])
         self.trades = list(trades or [])
         self.signal_audits = list(signal_audits or [])
         self.trade_audit = trade_audit
+        self.roster_proposals = list(roster_proposals or [])
 
     async def get(self, model, key):
         if model is service.DecisionRecord:
@@ -104,6 +105,8 @@ class _BuildDB:
             return _ScalarListResult(self.signal_audits)
         if entity is service.StrategyRosterRun:
             return _ScalarListResult([])
+        if entity is service.StrategyRosterProposal:
+            return _ScalarListResult(self.roster_proposals)
         if entity is service.StrategyRosterProposalOutcome:
             return _ScalarListResult([])
         if entity is service.ValidationRunEvent:
@@ -358,6 +361,82 @@ async def test_build_cycle_forensics_candidate_without_execution_call_is_unprove
     assert payload["execution"]["execution_service_called_status"] == "UNPROVEN"
     assert payload["execution"]["trade_created_status"] == "NO"
     assert payload["execution"]["filled_status"] == "NO"
+
+
+@pytest.mark.asyncio
+async def test_build_cycle_forensics_separates_shadow_roster_from_legacy_signals() -> None:
+    decision_id = uuid4()
+    cycle = SimpleNamespace(
+        cycle_id=uuid4(),
+        started_at=datetime.now(timezone.utc),
+        completed_at=None,
+        decision_record_id=decision_id,
+        risk_event_id=None,
+        proposed_action="BUY",
+        mandate_verdict="AUTHORIZED",
+        risk_verdict="ACCEPTED",
+        cycle_context={"strategy_interval": "15m"},
+        preview_id=uuid4(),
+    )
+    decision = SimpleNamespace(id=decision_id, source_lineage={"signals": []}, timeframe="15m", pnl=None)
+    roster_proposals = [
+        SimpleNamespace(action="BUY", evaluated_at=datetime.now(timezone.utc), proposal_id=uuid4()),
+        SimpleNamespace(action="SELL", evaluated_at=datetime.now(timezone.utc), proposal_id=uuid4()),
+        SimpleNamespace(action="HOLD", evaluated_at=datetime.now(timezone.utc), proposal_id=uuid4()),
+    ]
+
+    payload = await service._build_cycle_forensics(
+        db=_BuildDB(decision=decision, roster_proposals=roster_proposals),
+        cycle=cycle,
+    )
+
+    assert payload["signal_section"]["signals_generated"] == 0
+    assert payload["strategy_roster"]["proposal_count"] == 3
+    assert payload["strategy_roster"]["mode"] == "SHADOW"
+    assert payload["strategy_roster"]["executable"] == "NO"
+    assert payload["autonomous_decision"]["proposed_action"] == "BUY"
+    assert payload["autonomous_decision"]["execution_handoff"] == "NOT IMPLEMENTED"
+    assert payload["autonomous_decision"]["exact_blocker"] == "AUTONOMOUS_CANONICAL_SIGNAL_HANDOFF_NOT_IMPLEMENTED"
+    assert payload["summary"] == "No legacy executable signals linked to this autonomous cycle"
+
+
+@pytest.mark.asyncio
+async def test_build_cycle_forensics_legacy_signal_pipeline_handoff_detected() -> None:
+    signal_id = uuid4()
+    decision_id = uuid4()
+    asset_id = uuid4()
+    strategy_id = uuid4()
+    cycle = SimpleNamespace(
+        cycle_id=uuid4(),
+        started_at=datetime.now(timezone.utc),
+        completed_at=None,
+        decision_record_id=decision_id,
+        risk_event_id=None,
+        proposed_action="BUY",
+        mandate_verdict="AUTHORIZED",
+        risk_verdict="ACCEPTED",
+        cycle_context={"strategy_interval": "15m"},
+    )
+    decision = SimpleNamespace(id=decision_id, source_lineage={"signals": [str(signal_id)]}, timeframe="15m", pnl=None)
+    signals = [
+        SimpleNamespace(
+            id=signal_id,
+            strategy_id=strategy_id,
+            action="buy",
+            ai_confidence=0.9,
+            status="generated",
+            asset_id=asset_id,
+        )
+    ]
+
+    payload = await service._build_cycle_forensics(
+        db=_BuildDB(decision=decision, signals=signals),
+        cycle=cycle,
+    )
+
+    assert payload["signal_section"]["signals_generated"] == 1
+    assert payload["autonomous_decision"]["execution_handoff"] == "LEGACY_SIGNAL_PIPELINE"
+    assert payload["autonomous_decision"]["exact_blocker"] == "NOT APPLICABLE"
 
 
 @pytest.mark.asyncio

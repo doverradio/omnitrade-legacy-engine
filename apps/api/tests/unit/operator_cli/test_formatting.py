@@ -403,6 +403,7 @@ def test_render_execution_forensics_text_contains_trace_sections() -> None:
                     "latest_candle_time": "2026-07-14T09:45:00Z",
                     "signal_section": {
                         "signals_generated": 1,
+                        "source": "signals_table_via_decision_lineage",
                         "signals": [
                             {
                                 "signal_id": "sid",
@@ -412,6 +413,22 @@ def test_render_execution_forensics_text_contains_trace_sections() -> None:
                                 "reason": "breakout",
                             }
                         ],
+                    },
+                    "strategy_roster": {
+                        "proposal_count": 7,
+                        "buy_count": 1,
+                        "sell_count": 2,
+                        "hold_count": 4,
+                        "mode": "SHADOW",
+                        "executable": "NO",
+                        "reason": "Strategy Roster proposals are shadow research observations and never executable orders",
+                    },
+                    "autonomous_decision": {
+                        "proposed_action": "BUY",
+                        "mandate_verdict": "AUTHORIZED",
+                        "risk_verdict": "ACCEPTED",
+                        "execution_handoff": "NOT IMPLEMENTED",
+                        "exact_blocker": "AUTONOMOUS_CANONICAL_SIGNAL_HANDOFF_NOT_IMPLEMENTED",
                     },
                     "execution_candidate": {"is_candidate": True, "reason_if_no": None},
                     "risk": {
@@ -472,8 +489,95 @@ def test_render_execution_forensics_text_contains_trace_sections() -> None:
 
     assert "PRODUCTION EXECUTION FORENSICS" in text
     assert "Cycle ID" in text
-    assert "Signals" in text
+    assert "Legacy Signals" in text
+    assert "Strategy Roster" in text
+    assert "Autonomous Decision" in text
     assert "Execution" in text
     assert "Accounting" in text
     assert "Decision Linkage" in text
     assert "Actionable signal became paper trade" in text
+
+
+def test_render_execution_forensics_shadow_roster_is_not_executable() -> None:
+    text = render_execution_forensics_text(
+        {
+            "mode": "read_only_forensics",
+            "criteria": {"selector": "latest", "since": None, "cycle_id": None},
+            "cycle_count": 1,
+            "cycles": [
+                {
+                    "cycle_id": "cid",
+                    "timestamp": "2026-07-14T09:49:40Z",
+                    "asset": "BTC",
+                    "provider": "kraken_spot",
+                    "interval": "15m",
+                    "latest_candle_time": "2026-07-14T09:45:00Z",
+                    "signal_section": {
+                        "signals_generated": 0,
+                        "source": "signals_table_via_decision_lineage",
+                        "signals": [],
+                    },
+                    "strategy_roster": {
+                        "proposal_count": 7,
+                        "buy_count": 1,
+                        "sell_count": 2,
+                        "hold_count": 4,
+                        "mode": "SHADOW",
+                        "executable": "NO",
+                        "reason": "Strategy Roster proposals are shadow research observations and never executable orders",
+                    },
+                    "autonomous_decision": {
+                        "proposed_action": "BUY",
+                        "mandate_verdict": "AUTHORIZED",
+                        "risk_verdict": "ACCEPTED",
+                        "execution_handoff": "NOT IMPLEMENTED",
+                        "exact_blocker": "AUTONOMOUS_CANONICAL_SIGNAL_HANDOFF_NOT_IMPLEMENTED",
+                    },
+                    "execution_candidate": {"status": "UNPROVEN", "reason_if_no": "NOT APPLICABLE"},
+                    "risk": {"evaluated_status": "UNPROVEN", "decision": "UNPROVEN", "reason": "UNPROVEN", "risk_event_ids": []},
+                    "execution": {
+                        "execution_attempted_status": "NO",
+                        "execution_service_called_status": "NOT APPLICABLE",
+                        "order_created_status": "NOT APPLICABLE",
+                        "trade_created_status": "NO",
+                        "filled_status": "NOT APPLICABLE",
+                        "rejected_status": "NOT APPLICABLE",
+                        "skipped_status": "NOT APPLICABLE",
+                        "error_status": "NOT APPLICABLE",
+                        "trade_ids": [],
+                    },
+                    "accounting": {
+                        "paper_account_ids": [],
+                        "entries": [],
+                        "fees_total": "0",
+                        "pnl": None,
+                        "buy_quantity_total": "0",
+                        "sell_quantity_total": "0",
+                        "account_balance_changed_status": "NOT APPLICABLE",
+                        "position_changed_status": "NOT APPLICABLE",
+                        "accounting_entry_persisted_status": "NOT APPLICABLE",
+                    },
+                    "decision_records": {
+                        "decision_record_id": "did",
+                        "outcome_score_linkage_count": 0,
+                        "outcome_score_ids": [],
+                        "decision_record_linkage_status": "YES",
+                        "outcome_linkage_status": "NO",
+                        "research_linkage_status": "NO",
+                        "autonomous_cycle_linkage": {"cycle_id": "cid", "scheduled_roster_run_ids": ["rrid"]},
+                        "research_linkage": [],
+                    },
+                    "summary": "No legacy executable signals linked to this autonomous cycle",
+                }
+            ],
+        },
+        _opts(),
+    )
+
+    assert "Legacy Signals" in text
+    assert "Executable signals" in text
+    assert "Strategy Roster" in text
+    assert "SHADOW" in text
+    assert "Execution handoff" in text
+    assert "NOT IMPLEMENTED" in text
+    assert "No legacy executable signals linked to this autonomous cycle" in text
