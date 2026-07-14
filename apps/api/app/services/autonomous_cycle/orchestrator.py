@@ -25,7 +25,9 @@ from app.models.decision_record import DecisionRecord
 from app.models.decision_snapshot import DecisionSnapshot
 from app.models.exchange_connection import ExchangeConnection
 from app.models.live_crypto_order import LiveCryptoOrder
+from app.models.paper_account import PaperAccount
 from app.models.parameter_set import ParameterSet
+from app.models.signal import Signal
 from app.models.strategy import Strategy
 from app.services.crypto_order_previews.service import create_crypto_order_preview
 from app.services.decisions.ingestion import DECISION_ENGINE_VERSION
@@ -47,6 +49,7 @@ from app.services.mandates.validation import validate_mandate_version
 from app.services.risk.risk_context import resolve_execution_risk_context
 from app.services.risk.risk_engine import RiskDecisionAction, RiskEvaluationRequest, evaluate_signal_risk
 from app.services.risk.risk_persistence import RiskDecisionPersistenceRequest, persist_risk_decision
+from app.services.signals.execution_orchestrator import SignalExecutionRequest, orchestrate_paper_signal_execution
 from app.services.strategies.identity import build_strategy_identity, parse_strategy_identity
 from app.services.strategies import strategy_registry
 from app.services.strategies.base import StrategyContext
@@ -416,6 +419,17 @@ async def run_autonomous_preview_cycle(
         cycle.risk_event_id = risk_summary.risk_event_id
         await db.flush()
 
+        canonical_signal = await _create_canonical_signal_for_cycle(
+            db=db,
+            cycle=cycle,
+            mandate=mandate,
+            version=version,
+            proposal=proposal,
+            strategy_interval=request.strategy_interval,
+            product_id=request.product_id,
+        )
+        signal_id = canonical_signal.id if canonical_signal is not None else None
+
         decision_record_id = await _persist_decision_intelligence(
             db=db,
             cycle=cycle,
@@ -427,6 +441,7 @@ async def run_autonomous_preview_cycle(
             reference_price=reference_price,
             evidence_age_minutes=evidence_age_minutes,
             strategy_interval=request.strategy_interval,
+            canonical_signal_id=signal_id,
         )
         cycle.decision_record_id = decision_record_id
         await db.flush()
@@ -487,6 +502,21 @@ async def run_autonomous_preview_cycle(
             await _transition_cycle(db=db, cycle=cycle, to_state="PREVIEW_READY", stage="preview_generated")
         else:
             await _transition_cycle(db=db, cycle=cycle, to_state="HOLD", stage="hold_terminal")
+
+        handoff_result = await _attempt_autonomous_paper_execution_handoff(
+            db=db,
+            cycle=cycle,
+            mandate=mandate,
+            request=request,
+            proposal=proposal,
+            risk_summary=risk_summary,
+            signal=canonical_signal,
+        )
+        cycle.cycle_context = {
+            **cycle.cycle_context,
+            "execution_handoff": handoff_result,
+        }
+        await db.flush()
 
         await _transition_cycle(db=db, cycle=cycle, to_state="COMPLETE", stage="complete")
         cycle.termination_stage = "preview_generated" if preview_id is not None else "hold_terminal"
@@ -579,6 +609,241 @@ async def _reconcile_state(
         stale_evidence=False,
         explanation=tuple(explanations),
     )
+
+
+async def _create_canonical_signal_for_cycle(
+    *,
+    db: AsyncSession,
+    cycle: AutonomousCycleRun,
+    mandate: AutonomousCapitalMandate,
+    version: AutonomousCapitalMandateVersion,
+    proposal: StrategyProposal,
+    strategy_interval: str,
+    product_id: str,
+) -> Signal | None:
+    if proposal.action not in {"BUY", "SELL"}:
+        return None
+
+    signal_id = uuid.uuid5(uuid.NAMESPACE_URL, f"ac-cycle-signal:{cycle.cycle_id}")
+    existing = await db.scalar(
+        select(Signal)
+        .where(Signal.id == signal_id)
+        .limit(1)
+    )
+    if existing is not None:
+        return existing
+
+    asset, _ = await _resolve_asset_for_cycle(
+        db=db,
+        product_id=product_id,
+        provider=mandate.provider,
+        exchange_environment=mandate.exchange_environment,
+    )
+    if asset is None:
+        return None
+
+    selected_strategy_id: uuid.UUID | None = None
+    strategy_identity = proposal.strategy_version
+    parsed_identity = parse_strategy_identity(strategy_identity)
+    if parsed_identity is not None:
+        slug, module_version = parsed_identity
+        selected_strategy_id = await db.scalar(
+            select(Strategy.id)
+            .where(Strategy.slug == slug)
+            .where(Strategy.module_version == module_version)
+            .where(Strategy.is_active.is_(True))
+            .limit(1)
+        )
+
+    if selected_strategy_id is None:
+        for candidate in version.allowed_strategy_versions:
+            parsed = parse_strategy_identity(candidate)
+            if parsed is None:
+                continue
+            slug, module_version = parsed
+            selected_strategy_id = await db.scalar(
+                select(Strategy.id)
+                .where(Strategy.slug == slug)
+                .where(Strategy.module_version == module_version)
+                .where(Strategy.is_active.is_(True))
+                .limit(1)
+            )
+            if selected_strategy_id is not None:
+                break
+
+    if selected_strategy_id is None:
+        return None
+
+    parameter_set_id = await db.scalar(
+        select(ParameterSet.id)
+        .where(ParameterSet.strategy_id == selected_strategy_id)
+        .order_by(ParameterSet.created_at.desc())
+        .limit(1)
+    )
+    if parameter_set_id is None:
+        return None
+
+    signal = Signal(
+        id=signal_id,
+        strategy_id=selected_strategy_id,
+        parameter_set_id=parameter_set_id,
+        asset_id=asset.id,
+        signal_time=cycle.started_at or datetime.now(timezone.utc),
+        action=proposal.action.lower(),
+        raw_strength=None,
+        ai_confidence=None,
+        regime_tag=f"autonomous_cycle_{strategy_interval}",
+        status="generated",
+    )
+    db.add(signal)
+    await db.flush()
+    return signal
+
+
+async def _attempt_autonomous_paper_execution_handoff(
+    *,
+    db: AsyncSession,
+    cycle: AutonomousCycleRun,
+    mandate: AutonomousCapitalMandate,
+    request: AutonomousCycleRequest,
+    proposal: StrategyProposal,
+    risk_summary: RiskEvaluationSummary,
+    signal: Signal | None,
+) -> dict[str, object]:
+    if proposal.action == "HOLD":
+        return {
+            "execution_handoff": "PAPER_EXECUTION",
+            "attempted": False,
+            "status": "HOLD_NOT_EXECUTABLE",
+            "exact_result": "HOLD_NOT_EXECUTABLE",
+            "canonical_signal": {
+                "signal_id": None,
+                "action": "HOLD",
+                "executable": "NO",
+                "mode": "PAPER",
+            },
+        }
+
+    if proposal.action not in {"BUY", "SELL"}:
+        return {
+            "execution_handoff": "PAPER_EXECUTION",
+            "attempted": False,
+            "status": "PAPER_EXECUTION_FAILED",
+            "exact_result": "UNSUPPORTED_ACTION",
+            "canonical_signal": {
+                "signal_id": None,
+                "action": proposal.action,
+                "executable": "NO",
+                "mode": "PAPER",
+            },
+        }
+
+    if signal is None:
+        return {
+            "execution_handoff": "PAPER_EXECUTION",
+            "attempted": False,
+            "status": "PAPER_EXECUTION_FAILED",
+            "exact_result": "SIGNAL_CREATION_FAILED",
+            "canonical_signal": {
+                "signal_id": None,
+                "action": proposal.action,
+                "executable": "NO",
+                "mode": "PAPER",
+            },
+        }
+
+    signal_payload = {
+        "signal_id": str(signal.id),
+        "action": proposal.action,
+        "executable": "YES",
+        "mode": "PAPER",
+    }
+
+    if risk_summary.risk_verdict not in {"ACCEPTED", "RESIZED"}:
+        return {
+            "execution_handoff": "PAPER_EXECUTION",
+            "attempted": False,
+            "status": "PAPER_EXECUTION_SKIPPED",
+            "exact_result": "RISK_NOT_APPROVED",
+            "canonical_signal": signal_payload,
+        }
+
+    if mandate.paper_account_id is None:
+        return {
+            "execution_handoff": "PAPER_EXECUTION",
+            "attempted": False,
+            "status": "PAPER_EXECUTION_FAILED",
+            "exact_result": "PAPER_ACCOUNT_MISSING",
+            "canonical_signal": signal_payload,
+        }
+
+    paper_account = await db.scalar(
+        select(PaperAccount)
+        .where(PaperAccount.id == mandate.paper_account_id)
+        .where(PaperAccount.is_active.is_(True))
+        .limit(1)
+    )
+    if paper_account is None or paper_account.asset_class != "crypto":
+        return {
+            "execution_handoff": "PAPER_EXECUTION",
+            "attempted": False,
+            "status": "PAPER_EXECUTION_FAILED",
+            "exact_result": "PAPER_ACCOUNT_INCOMPATIBLE",
+            "canonical_signal": signal_payload,
+        }
+
+    if risk_summary.approved_quantity is None or risk_summary.approved_quantity <= 0:
+        return {
+            "execution_handoff": "PAPER_EXECUTION",
+            "attempted": False,
+            "status": "PAPER_EXECUTION_FAILED",
+            "exact_result": "APPROVED_QUANTITY_UNAVAILABLE",
+            "canonical_signal": signal_payload,
+        }
+
+    try:
+        result = await orchestrate_paper_signal_execution(
+            db=db,
+            request=SignalExecutionRequest(
+                signal_id=signal.id,
+                paper_account_id=paper_account.id,
+                asset_id=signal.asset_id,
+                side=proposal.action.lower(),
+                quantity=risk_summary.approved_quantity,
+                actor=request.actor,
+                client_order_id=f"ac-cycle:{cycle.cycle_id}",
+            ),
+        )
+    except Exception as exc:
+        return {
+            "execution_handoff": "PAPER_EXECUTION",
+            "attempted": True,
+            "status": "PAPER_EXECUTION_FAILED",
+            "exact_result": "PAPER_EXECUTION_EXCEPTION",
+            "error_type": exc.__class__.__name__,
+            "reason": str(exc) or exc.__class__.__name__,
+            "canonical_signal": signal_payload,
+        }
+
+    mapped_status = "PAPER_EXECUTION_FAILED"
+    if result.outcome == "EXECUTED":
+        mapped_status = "PAPER_EXECUTION_ACCEPTED"
+    elif result.outcome == "REJECTED":
+        mapped_status = "PAPER_EXECUTION_REJECTED"
+    elif result.outcome == "SKIPPED":
+        mapped_status = "PAPER_EXECUTION_SKIPPED"
+
+    return {
+        "execution_handoff": "PAPER_EXECUTION",
+        "attempted": True,
+        "status": mapped_status,
+        "exact_result": result.execution_status,
+        "trade_id": str(result.trade_id) if result.trade_id is not None else None,
+        "execution_venue": result.execution_venue,
+        "reason_code": result.reason_code,
+        "reason_text": result.reason_text,
+        "canonical_signal": signal_payload,
+    }
 
 
 async def _run_approved_strategy(
@@ -809,6 +1074,7 @@ async def _evaluate_risk(
             risk_verdict="NOT_EVALUATED",
             risk_event_id=None,
             reason_code="hold_action",
+            approved_quantity=None,
         )
 
     if mandate.paper_account_id is None:
@@ -816,6 +1082,7 @@ async def _evaluate_risk(
             risk_verdict="REJECTED",
             risk_event_id=None,
             reason_code="paper_account_required_for_risk_context",
+            approved_quantity=None,
         )
 
     asset, _asset_resolution_reason = await _resolve_asset_for_cycle(
@@ -829,6 +1096,7 @@ async def _evaluate_risk(
             risk_verdict="REJECTED",
             risk_event_id=None,
             reason_code="asset_not_found",
+            approved_quantity=None,
         )
 
     from app.models.paper_account import PaperAccount
@@ -839,6 +1107,7 @@ async def _evaluate_risk(
             risk_verdict="REJECTED",
             risk_event_id=None,
             reason_code="paper_account_not_found",
+            approved_quantity=None,
         )
 
     risk_context = await resolve_execution_risk_context(db=db, paper_account=paper_account, asset=asset)
@@ -900,6 +1169,7 @@ async def _evaluate_risk(
         risk_verdict=verdict,
         risk_event_id=persisted.risk_event_id,
         reason_code=risk_result.reason_code,
+        approved_quantity=risk_result.approved_quantity,
     )
 
 
@@ -915,6 +1185,7 @@ async def _persist_decision_intelligence(
     reference_price: Decimal,
     evidence_age_minutes: int,
     strategy_interval: str,
+    canonical_signal_id: uuid.UUID | None,
 ) -> uuid.UUID:
     idempotency_key = f"ac-cycle-decision:{cycle.cycle_id}"
     existing = await db.scalar(
@@ -936,7 +1207,7 @@ async def _persist_decision_intelligence(
             "mandate_versions": [str(version.mandate_version_id)],
             "risk_events": [str(cycle.risk_event_id)] if cycle.risk_event_id else [],
             "crypto_order_previews": [],
-            "signals": [],
+            "signals": [str(canonical_signal_id)] if canonical_signal_id is not None else [],
             "model_outputs": [],
             "trades": [],
         },

@@ -421,6 +421,7 @@ async def _build_cycle_forensics(*, db: Any, cycle: AutonomousCycleRun) -> dict[
         )
 
     cycle_context = cycle.cycle_context if isinstance(cycle.cycle_context, dict) else {}
+    cycle_handoff = cycle_context.get("execution_handoff") if isinstance(cycle_context.get("execution_handoff"), dict) else {}
     strategy_context = cycle_context.get("strategy") if isinstance(cycle_context.get("strategy"), dict) else {}
     strategy_signal_payload = strategy_context.get("signal_payload") if isinstance(strategy_context.get("signal_payload"), dict) else {}
     autonomous_proposed_action = (getattr(cycle, "proposed_action", None) or strategy_signal_payload.get("action") or "HOLD").upper()
@@ -434,7 +435,16 @@ async def _build_cycle_forensics(*, db: Any, cycle: AutonomousCycleRun) -> dict[
     roster_executable = "NO"
     roster_reason = "Strategy Roster proposals are shadow research observations and never executable orders"
 
-    if signal_rows:
+    canonical_signal = cycle_handoff.get("canonical_signal") if isinstance(cycle_handoff.get("canonical_signal"), dict) else None
+
+    if cycle_handoff:
+        execution_handoff_status = str(cycle_handoff.get("execution_handoff") or "UNPROVEN")
+        cycle_handoff_status = str(cycle_handoff.get("status") or "UNPROVEN")
+        if cycle_handoff_status in {"PAPER_EXECUTION_FAILED", "PAPER_EXECUTION_REJECTED", "PAPER_EXECUTION_SKIPPED"}:
+            execution_handoff_blocker = str(cycle_handoff.get("exact_result") or cycle_handoff_status)
+        else:
+            execution_handoff_blocker = "NOT APPLICABLE"
+    elif signal_rows:
         execution_handoff_status = "LEGACY_SIGNAL_PIPELINE"
         execution_handoff_blocker = "NOT APPLICABLE"
     elif autonomous_proposed_action in {"BUY", "SELL"}:
@@ -445,7 +455,9 @@ async def _build_cycle_forensics(*, db: Any, cycle: AutonomousCycleRun) -> dict[
         execution_handoff_blocker = "HOLD_ACTION"
 
     summary = "No legacy executable signals linked to this autonomous cycle"
-    if candidate and execution_summary.get("trade_created"):
+    if cycle_handoff:
+        summary = str(cycle_handoff.get("status") or "UNPROVEN")
+    elif candidate and execution_summary.get("trade_created"):
         summary = "Actionable signal became paper trade"
     elif candidate and execution_summary.get("rejected"):
         summary = "Actionable signal rejected before trade"
@@ -454,15 +466,17 @@ async def _build_cycle_forensics(*, db: Any, cycle: AutonomousCycleRun) -> dict[
     elif candidate and not execution_summary.get("execution_service_called"):
         summary = "Actionable signal not executed"
 
-    candidate_status = "UNPROVEN" if not signal_rows else ("YES" if candidate else "NO")
+    candidate_status = "UNPROVEN" if not signal_rows and canonical_signal is None else ("YES" if candidate else "NO")
+    if canonical_signal is not None and str(canonical_signal.get("executable") or "NO").upper() == "YES":
+        candidate_status = "YES"
     risk_evaluated_status = "YES" if risk_events else ("UNPROVEN" if candidate else "NOT APPLICABLE")
     risk_decision = risk_events[-1].action_taken if risk_events else ("UNPROVEN" if candidate else "NOT APPLICABLE")
     risk_reason = risk_events[-1].detail if risk_events else ("UNPROVEN" if candidate else "NOT APPLICABLE")
 
-    execution_attempted_status = "YES" if candidate else "NO"
+    execution_attempted_status = "YES" if bool(cycle_handoff.get("attempted")) else ("YES" if candidate else "NO")
     execution_service_called_status = (
         "YES"
-        if execution_summary.get("execution_service_called")
+        if (bool(cycle_handoff.get("attempted")) or execution_summary.get("execution_service_called"))
         else "UNPROVEN"
         if candidate
         else "NOT APPLICABLE"
@@ -532,6 +546,12 @@ async def _build_cycle_forensics(*, db: Any, cycle: AutonomousCycleRun) -> dict[
             "executable": roster_executable,
             "reason": roster_reason,
         },
+        "canonical_signal": {
+            "signal_id": (canonical_signal or {}).get("signal_id"),
+            "action": (canonical_signal or {}).get("action"),
+            "executable": (canonical_signal or {}).get("executable", "NO"),
+            "mode": (canonical_signal or {}).get("mode", "PAPER"),
+        },
         "autonomous_decision": {
             "proposed_action": autonomous_proposed_action,
             "mandate_verdict": getattr(cycle, "mandate_verdict", None) or "UNPROVEN",
@@ -553,6 +573,7 @@ async def _build_cycle_forensics(*, db: Any, cycle: AutonomousCycleRun) -> dict[
         "execution": {
             "execution_attempted_status": execution_attempted_status,
             "execution_service_called_status": execution_service_called_status,
+            "exact_result": cycle_handoff.get("exact_result") if cycle_handoff else None,
             "order_created_status": order_created_status,
             "order_creation_reason": execution_summary.get("order_creation_reason"),
             "trade_created_status": trade_created_status,

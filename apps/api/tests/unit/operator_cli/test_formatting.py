@@ -427,8 +427,14 @@ def test_render_execution_forensics_text_contains_trace_sections() -> None:
                         "proposed_action": "BUY",
                         "mandate_verdict": "AUTHORIZED",
                         "risk_verdict": "ACCEPTED",
-                        "execution_handoff": "NOT IMPLEMENTED",
-                        "exact_blocker": "AUTONOMOUS_CANONICAL_SIGNAL_HANDOFF_NOT_IMPLEMENTED",
+                        "execution_handoff": "PAPER_EXECUTION",
+                        "exact_blocker": "NOT APPLICABLE",
+                    },
+                    "canonical_signal": {
+                        "signal_id": "sid",
+                        "action": "BUY",
+                        "executable": "YES",
+                        "mode": "PAPER",
                     },
                     "execution_candidate": {"is_candidate": True, "reason_if_no": None},
                     "risk": {
@@ -440,6 +446,7 @@ def test_render_execution_forensics_text_contains_trace_sections() -> None:
                     "execution": {
                         "execution_attempted": True,
                         "execution_service_called": True,
+                        "exact_result": "executed",
                         "order_created": False,
                         "trade_created": True,
                         "filled": True,
@@ -492,6 +499,7 @@ def test_render_execution_forensics_text_contains_trace_sections() -> None:
     assert "Legacy Signals" in text
     assert "Strategy Roster" in text
     assert "Autonomous Decision" in text
+    assert "Canonical Signal" in text
     assert "Execution" in text
     assert "Accounting" in text
     assert "Decision Linkage" in text
@@ -530,14 +538,21 @@ def test_render_execution_forensics_shadow_roster_is_not_executable() -> None:
                         "proposed_action": "BUY",
                         "mandate_verdict": "AUTHORIZED",
                         "risk_verdict": "ACCEPTED",
-                        "execution_handoff": "NOT IMPLEMENTED",
-                        "exact_blocker": "AUTONOMOUS_CANONICAL_SIGNAL_HANDOFF_NOT_IMPLEMENTED",
+                        "execution_handoff": "PAPER_EXECUTION",
+                        "exact_blocker": "SIGNAL_CREATION_FAILED",
+                    },
+                    "canonical_signal": {
+                        "signal_id": None,
+                        "action": "BUY",
+                        "executable": "NO",
+                        "mode": "PAPER",
                     },
                     "execution_candidate": {"status": "UNPROVEN", "reason_if_no": "NOT APPLICABLE"},
                     "risk": {"evaluated_status": "UNPROVEN", "decision": "UNPROVEN", "reason": "UNPROVEN", "risk_event_ids": []},
                     "execution": {
                         "execution_attempted_status": "NO",
                         "execution_service_called_status": "NOT APPLICABLE",
+                        "exact_result": "SIGNAL_CREATION_FAILED",
                         "order_created_status": "NOT APPLICABLE",
                         "trade_created_status": "NO",
                         "filled_status": "NOT APPLICABLE",
@@ -579,5 +594,5 @@ def test_render_execution_forensics_shadow_roster_is_not_executable() -> None:
     assert "Strategy Roster" in text
     assert "SHADOW" in text
     assert "Execution handoff" in text
-    assert "NOT IMPLEMENTED" in text
+    assert "PAPER_EXECUTION" in text
     assert "No legacy executable signals linked to this autonomous cycle" in text

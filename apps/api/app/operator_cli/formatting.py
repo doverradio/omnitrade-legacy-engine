@@ -885,6 +885,20 @@ def render_execution_forensics_text(payload: dict[str, Any], options: RenderOpti
             )
         )
 
+        canonical_signal = cycle.get("canonical_signal") or {}
+        lines.extend(
+            _section(
+                "Canonical Signal",
+                [
+                    ("Signal ID", _fmt(canonical_signal.get("signal_id"), default="N/A")),
+                    ("Action", _fmt(canonical_signal.get("action"), default="N/A")),
+                    ("Executable", _forensics_bool(canonical_signal.get("executable"))),
+                    ("Mode", _fmt(canonical_signal.get("mode"), default="PAPER")),
+                ],
+                options,
+            )
+        )
+
         candidate = cycle.get("execution_candidate") or {}
         lines.extend(
             _section(
@@ -918,6 +932,7 @@ def render_execution_forensics_text(payload: dict[str, Any], options: RenderOpti
                 [
                     ("Attempted", _forensics_bool(execution.get("execution_attempted_status", execution.get("execution_attempted")))),
                     ("Service called", _forensics_bool(execution.get("execution_service_called_status", execution.get("execution_service_called")))),
+                    ("Exact result", _fmt(execution.get("exact_result"), default="N/A")),
                     ("Order created", _forensics_bool(execution.get("order_created_status", execution.get("order_created")))),
                     ("Trade created", _forensics_bool(execution.get("trade_created_status", execution.get("trade_created")))),
                     ("Filled", _forensics_bool(execution.get("filled_status", execution.get("filled")))),

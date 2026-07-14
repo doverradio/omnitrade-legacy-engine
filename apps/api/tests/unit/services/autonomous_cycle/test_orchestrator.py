@@ -30,6 +30,7 @@ class _FakeDb:
     def __init__(self) -> None:
         self.cycles_by_key: dict[str, AutonomousCycleRun] = {}
         self.connection = None
+        self.paper_account = SimpleNamespace(id=uuid.uuid4(), is_active=True, asset_class="crypto")
         self.added: list[object] = []
         self.authorizations: list[dict[str, object]] = []
         self.enforce_authorization_rows = False
@@ -88,6 +89,8 @@ class _FakeDb:
             return None
         if "FROM assets" in sql:
             return None
+        if "FROM paper_accounts" in sql:
+            return self.paper_account
         return None
 
     async def get(self, _cls, _key):
@@ -177,7 +180,31 @@ def _patch_happy_path(monkeypatch: pytest.MonkeyPatch, mandate, version, *, acti
     monkeypatch.setattr("app.services.autonomous_cycle.orchestrator.load_current_execution_price_evidence", _async_return(_market_tuple()))
     monkeypatch.setattr(
         "app.services.autonomous_cycle.orchestrator._evaluate_risk",
-        _async_return(RiskEvaluationSummary(risk_verdict=risk_verdict, risk_event_id=uuid.uuid4(), reason_code=None)),
+        _async_return(
+            RiskEvaluationSummary(
+                risk_verdict=risk_verdict,
+                risk_event_id=uuid.uuid4(),
+                reason_code=None,
+                approved_quantity=Decimal("0.001") if risk_verdict in {"ACCEPTED", "RESIZED"} else None,
+            )
+        ),
+    )
+    monkeypatch.setattr(
+        "app.services.autonomous_cycle.orchestrator._create_canonical_signal_for_cycle",
+        _async_return(SimpleNamespace(id=uuid.uuid4(), asset_id=uuid.uuid4()) if action in {"BUY", "SELL"} else None),
+    )
+    monkeypatch.setattr(
+        "app.services.autonomous_cycle.orchestrator.orchestrate_paper_signal_execution",
+        _async_return(
+            SimpleNamespace(
+                outcome="EXECUTED" if action in {"BUY", "SELL"} and risk_verdict in {"ACCEPTED", "RESIZED"} else "SKIPPED",
+                execution_status="executed" if action in {"BUY", "SELL"} and risk_verdict in {"ACCEPTED", "RESIZED"} else "skipped",
+                trade_id=uuid.uuid4() if action in {"BUY", "SELL"} and risk_verdict in {"ACCEPTED", "RESIZED"} else None,
+                execution_venue="internal_sim",
+                reason_code=None,
+                reason_text=None,
+            )
+        ),
     )
     monkeypatch.setattr("app.services.autonomous_cycle.orchestrator._persist_decision_intelligence", _async_return(uuid.uuid4()))
     monkeypatch.setattr("app.services.autonomous_cycle.orchestrator.evaluate_and_record_mandate", _async_return(SimpleNamespace(evaluation_id=uuid.uuid4())))
@@ -282,7 +309,21 @@ async def test_cycle_selects_latest_canonical_governing_version_and_keeps_legacy
     monkeypatch.setattr("app.services.autonomous_cycle.orchestrator.list_mandate_versions", _async_return([version_2, version_1]))
     monkeypatch.setattr("app.services.autonomous_cycle.orchestrator._reconcile_state", _async_return(ReconciliationStatus(True, True, 0, 0, False, ())))
     monkeypatch.setattr("app.services.autonomous_cycle.orchestrator.load_current_execution_price_evidence", _async_return(_market_tuple()))
-    monkeypatch.setattr("app.services.autonomous_cycle.orchestrator._evaluate_risk", _async_return(RiskEvaluationSummary(risk_verdict="ACCEPTED", risk_event_id=uuid.uuid4(), reason_code=None)))
+    monkeypatch.setattr(
+        "app.services.autonomous_cycle.orchestrator._evaluate_risk",
+        _async_return(
+            RiskEvaluationSummary(
+                risk_verdict="ACCEPTED",
+                risk_event_id=uuid.uuid4(),
+                reason_code=None,
+                approved_quantity=Decimal("0.001"),
+            )
+        ),
+    )
+    monkeypatch.setattr(
+        "app.services.autonomous_cycle.orchestrator._create_canonical_signal_for_cycle",
+        _async_return(SimpleNamespace(id=uuid.uuid4(), asset_id=uuid.uuid4())),
+    )
     monkeypatch.setattr("app.services.autonomous_cycle.orchestrator._persist_decision_intelligence", _async_return(uuid.uuid4()))
     monkeypatch.setattr("app.services.autonomous_cycle.orchestrator.evaluate_and_record_mandate", _async_return(SimpleNamespace(evaluation_id=uuid.uuid4())))
     monkeypatch.setattr("app.services.autonomous_cycle.orchestrator.create_crypto_order_preview", _async_return(SimpleNamespace(crypto_order_preview_id=uuid.uuid4())))
@@ -753,19 +794,24 @@ async def test_cycle_diagnostics_include_termination_stage(monkeypatch: pytest.M
 
 
 @pytest.mark.asyncio
-async def test_no_submission_side_effects(monkeypatch: pytest.MonkeyPatch) -> None:
+async def test_no_live_submission_side_effects(monkeypatch: pytest.MonkeyPatch) -> None:
     db = _FakeDb()
     mandate = _mandate()
     version = _version()
     db.connection = SimpleNamespace(last_readiness_verdict="READY_FOR_PREVIEW", provider="kraken_spot", environment="production")
 
-    called = {"submit": 0}
+    called = {"prepare": 0, "submit": 0}
+
+    def _prepare_fail(*_args, **_kwargs):
+        called["prepare"] += 1
+        raise AssertionError("live prepare path must not be called")
 
     def _submit_fail(*_args, **_kwargs):
         called["submit"] += 1
-        raise AssertionError("submission path must not be called")
+        raise AssertionError("live submit path must not be called")
 
     _patch_happy_path(monkeypatch, mandate, version, action="BUY")
+    monkeypatch.setattr("app.services.live_crypto_orders.service.prepare_confirmation", _prepare_fail)
     monkeypatch.setattr("app.services.live_crypto_orders.service.submit", _submit_fail)
 
     await run_autonomous_preview_cycle(
@@ -773,7 +819,192 @@ async def test_no_submission_side_effects(monkeypatch: pytest.MonkeyPatch) -> No
         request=AutonomousCycleRequest(mandate_id=mandate.mandate_id, actor="operator:owner", forced_action="BUY", idempotency_seed="nosubmit-1"),
     )
 
+    assert called["prepare"] == 0
     assert called["submit"] == 0
+
+
+def test_orchestrator_has_no_live_order_service_import() -> None:
+    import app.services.autonomous_cycle.orchestrator as orchestrator_module
+
+    assert not hasattr(orchestrator_module, "live_crypto_orders_service")
+
+
+@pytest.mark.asyncio
+async def test_cycle_buy_handoff_uses_paper_execution_pipeline(monkeypatch: pytest.MonkeyPatch) -> None:
+    db = _FakeDb()
+    mandate = _mandate()
+    version = _version()
+    db.connection = SimpleNamespace(last_readiness_verdict="READY_FOR_PREVIEW", provider="kraken_spot", environment="production")
+
+    _patch_happy_path(monkeypatch, mandate, version, action="BUY")
+    signal_id = uuid.uuid4()
+    calls = {"execute": 0}
+
+    monkeypatch.setattr(
+        "app.services.autonomous_cycle.orchestrator._create_canonical_signal_for_cycle",
+        _async_return(SimpleNamespace(id=signal_id, asset_id=uuid.uuid4())),
+    )
+
+    async def _execute(*, db, request):
+        calls["execute"] += 1
+        assert request.signal_id == signal_id
+        return SimpleNamespace(
+            outcome="EXECUTED",
+            execution_status="executed",
+            trade_id=uuid.uuid4(),
+            execution_venue="internal_sim",
+            reason_code=None,
+            reason_text=None,
+        )
+
+    monkeypatch.setattr("app.services.autonomous_cycle.orchestrator.orchestrate_paper_signal_execution", _execute)
+
+    result = await run_autonomous_preview_cycle(
+        db=db,
+        request=AutonomousCycleRequest(mandate_id=mandate.mandate_id, actor="operator:owner", forced_action="BUY", idempotency_seed="handoff-buy-1"),
+    )
+
+    assert result.state == "COMPLETE"
+    assert calls["execute"] == 1
+    assert result.cycle_context["execution_handoff"]["status"] == "PAPER_EXECUTION_ACCEPTED"
+    assert result.cycle_context["execution_handoff"]["execution_handoff"] == "PAPER_EXECUTION"
+    assert result.cycle_context["execution_handoff"]["canonical_signal"]["signal_id"] == str(signal_id)
+
+
+@pytest.mark.asyncio
+async def test_cycle_sell_handoff_uses_paper_execution_pipeline(monkeypatch: pytest.MonkeyPatch) -> None:
+    db = _FakeDb()
+    mandate = _mandate()
+    version = _version(allowed_order_sides=["BUY", "SELL", "HOLD"])
+    db.connection = SimpleNamespace(last_readiness_verdict="READY_FOR_PREVIEW", provider="kraken_spot", environment="production")
+
+    _patch_happy_path(monkeypatch, mandate, version, action="SELL")
+    signal_id = uuid.uuid4()
+    calls = {"execute": 0}
+
+    monkeypatch.setattr(
+        "app.services.autonomous_cycle.orchestrator._create_canonical_signal_for_cycle",
+        _async_return(SimpleNamespace(id=signal_id, asset_id=uuid.uuid4())),
+    )
+
+    async def _execute(*, db, request):
+        calls["execute"] += 1
+        assert request.side == "sell"
+        return SimpleNamespace(
+            outcome="EXECUTED",
+            execution_status="executed",
+            trade_id=uuid.uuid4(),
+            execution_venue="internal_sim",
+            reason_code=None,
+            reason_text=None,
+        )
+
+    monkeypatch.setattr("app.services.autonomous_cycle.orchestrator.orchestrate_paper_signal_execution", _execute)
+
+    result = await run_autonomous_preview_cycle(
+        db=db,
+        request=AutonomousCycleRequest(mandate_id=mandate.mandate_id, actor="operator:owner", forced_action="SELL", idempotency_seed="handoff-sell-1"),
+    )
+
+    assert result.state == "COMPLETE"
+    assert calls["execute"] == 1
+    assert result.cycle_context["execution_handoff"]["status"] == "PAPER_EXECUTION_ACCEPTED"
+
+
+@pytest.mark.asyncio
+async def test_cycle_risk_rejection_skips_paper_execution(monkeypatch: pytest.MonkeyPatch) -> None:
+    db = _FakeDb()
+    mandate = _mandate()
+    version = _version()
+    db.connection = SimpleNamespace(last_readiness_verdict="READY_FOR_PREVIEW", provider="kraken_spot", environment="production")
+
+    _patch_happy_path(monkeypatch, mandate, version, action="BUY", risk_verdict="REJECTED")
+    calls = {"execute": 0}
+
+    async def _execute_fail(*_args, **_kwargs):
+        calls["execute"] += 1
+        raise AssertionError("risk-rejected cycle must not execute paper signal")
+
+    monkeypatch.setattr("app.services.autonomous_cycle.orchestrator.orchestrate_paper_signal_execution", _execute_fail)
+
+    result = await run_autonomous_preview_cycle(
+        db=db,
+        request=AutonomousCycleRequest(mandate_id=mandate.mandate_id, actor="operator:owner", forced_action="BUY", idempotency_seed="handoff-risk-reject"),
+    )
+
+    assert result.state == "COMPLETE"
+    assert calls["execute"] == 0
+    assert result.cycle_context["execution_handoff"]["status"] == "PAPER_EXECUTION_SKIPPED"
+
+
+@pytest.mark.asyncio
+async def test_cycle_hold_does_not_attempt_paper_execution(monkeypatch: pytest.MonkeyPatch) -> None:
+    db = _FakeDb()
+    mandate = _mandate()
+    version = _version()
+    db.connection = SimpleNamespace(last_readiness_verdict="READY_FOR_PREVIEW", provider="kraken_spot", environment="production")
+
+    _patch_happy_path(monkeypatch, mandate, version, action="HOLD", risk_verdict="NOT_EVALUATED")
+    calls = {"execute": 0}
+
+    async def _execute_fail(*_args, **_kwargs):
+        calls["execute"] += 1
+        raise AssertionError("HOLD action must not execute")
+
+    monkeypatch.setattr("app.services.autonomous_cycle.orchestrator.orchestrate_paper_signal_execution", _execute_fail)
+
+    result = await run_autonomous_preview_cycle(
+        db=db,
+        request=AutonomousCycleRequest(mandate_id=mandate.mandate_id, actor="operator:owner", forced_action="HOLD", idempotency_seed="handoff-hold-1"),
+    )
+
+    assert result.state == "COMPLETE"
+    assert calls["execute"] == 0
+    assert result.cycle_context["execution_handoff"]["status"] == "HOLD_NOT_EXECUTABLE"
+
+
+@pytest.mark.asyncio
+async def test_cycle_paper_handoff_replay_is_idempotent(monkeypatch: pytest.MonkeyPatch) -> None:
+    db = _FakeDb()
+    mandate = _mandate()
+    version = _version()
+    db.connection = SimpleNamespace(last_readiness_verdict="READY_FOR_PREVIEW", provider="kraken_spot", environment="production")
+
+    _patch_happy_path(monkeypatch, mandate, version, action="BUY")
+    signal_id = uuid.uuid4()
+    calls = {"signal": 0, "execute": 0}
+
+    async def _signal(*_args, **_kwargs):
+        calls["signal"] += 1
+        return SimpleNamespace(id=signal_id, asset_id=uuid.uuid4())
+
+    async def _execute(*, db, request):
+        calls["execute"] += 1
+        return SimpleNamespace(
+            outcome="EXECUTED",
+            execution_status="executed",
+            trade_id=uuid.uuid4(),
+            execution_venue="internal_sim",
+            reason_code=None,
+            reason_text=None,
+        )
+
+    monkeypatch.setattr("app.services.autonomous_cycle.orchestrator._create_canonical_signal_for_cycle", _signal)
+    monkeypatch.setattr("app.services.autonomous_cycle.orchestrator.orchestrate_paper_signal_execution", _execute)
+
+    request = AutonomousCycleRequest(
+        mandate_id=mandate.mandate_id,
+        actor="operator:owner",
+        forced_action="BUY",
+        idempotency_seed="handoff-replay-1",
+    )
+    first = await run_autonomous_preview_cycle(db=db, request=request)
+    second = await run_autonomous_preview_cycle(db=db, request=request)
+
+    assert first.replayed is False
+    assert second.replayed is True
+    assert calls["signal"] == 1
+    assert calls["execute"] == 1
 
 
 def test_resolve_runtime_strategy_identity_never_returns_none_for_selected_strategy() -> None:
@@ -1244,11 +1475,17 @@ async def test_decision_record_persists_canonical_product_identity() -> None:
                 "timestamp": "2026-07-01T00:00:00Z",
             },
         ),
-        risk_summary=RiskEvaluationSummary(risk_verdict="ACCEPTED", risk_event_id=None, reason_code=None),
+        risk_summary=RiskEvaluationSummary(
+            risk_verdict="ACCEPTED",
+            risk_event_id=None,
+            reason_code=None,
+            approved_quantity=Decimal("0.001"),
+        ),
         product_id="BTC-USD",
         reference_price=Decimal("50000"),
         evidence_age_minutes=0,
         strategy_interval="15m",
+        canonical_signal_id=uuid.uuid4(),
     )
 
     record = next(item for item in db.added if isinstance(item, DecisionRecord))

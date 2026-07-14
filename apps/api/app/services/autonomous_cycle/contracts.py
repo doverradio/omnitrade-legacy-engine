@@ -67,6 +67,7 @@ class RiskEvaluationSummary:
     risk_verdict: str
     risk_event_id: uuid.UUID | None
     reason_code: str | None
+    approved_quantity: Decimal | None
 
 
 @dataclass(frozen=True)

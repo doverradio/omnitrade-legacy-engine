@@ -440,6 +440,48 @@ async def test_build_cycle_forensics_legacy_signal_pipeline_handoff_detected() -
 
 
 @pytest.mark.asyncio
+async def test_build_cycle_forensics_reads_autonomous_handoff_from_cycle_context() -> None:
+    decision_id = uuid4()
+    cycle = SimpleNamespace(
+        cycle_id=uuid4(),
+        started_at=datetime.now(timezone.utc),
+        completed_at=None,
+        decision_record_id=decision_id,
+        risk_event_id=None,
+        proposed_action="BUY",
+        mandate_verdict="AUTHORIZED",
+        risk_verdict="ACCEPTED",
+        cycle_context={
+            "strategy_interval": "15m",
+            "execution_handoff": {
+                "execution_handoff": "PAPER_EXECUTION",
+                "status": "PAPER_EXECUTION_ACCEPTED",
+                "exact_result": "executed",
+                "canonical_signal": {
+                    "signal_id": str(uuid4()),
+                    "action": "BUY",
+                    "executable": "YES",
+                    "mode": "PAPER",
+                },
+            },
+        },
+        preview_id=uuid4(),
+    )
+    decision = SimpleNamespace(id=decision_id, source_lineage={"signals": []}, timeframe="15m", pnl=None)
+
+    payload = await service._build_cycle_forensics(
+        db=_BuildDB(decision=decision),
+        cycle=cycle,
+    )
+
+    assert payload["autonomous_decision"]["execution_handoff"] == "PAPER_EXECUTION"
+    assert payload["autonomous_decision"]["exact_blocker"] == "NOT APPLICABLE"
+    assert payload["canonical_signal"]["mode"] == "PAPER"
+    assert payload["canonical_signal"]["executable"] == "YES"
+    assert payload["execution"]["exact_result"] == "executed"
+
+
+@pytest.mark.asyncio
 async def test_execution_forensics_payload_is_json_serializable(monkeypatch) -> None:
     cycle = SimpleNamespace(cycle_id=UUID("aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa"), started_at=datetime.now(timezone.utc))
     db = _FetchDB(latest_cycle=cycle)
