@@ -210,3 +210,87 @@ def test_parse_execution_forensics_command_selectors() -> None:
     assert cycle.since is None
     assert cycle.cycle == UUID("44444444-4444-4444-4444-444444444444")
     assert cycle.json_output is True
+
+
+def test_parse_legacy_campaign_transition_commands() -> None:
+    readiness = parse_args([
+        "legacy-campaign-transition-readiness",
+        "--legacy-campaign-id",
+        "11111111-1111-1111-1111-111111111111",
+        "--canonical-campaign-id",
+        "22222222-2222-2222-2222-222222222222",
+        "--canonical-campaign-version",
+        "1",
+        "--paper-account-id",
+        "33333333-3333-3333-3333-333333333333",
+        "--live-trading-profile-id",
+        "44444444-4444-4444-4444-444444444444",
+        "--provider",
+        "kraken_spot",
+        "--environment",
+        "production",
+        "--product",
+        "BTC-USD",
+        "--json",
+    ])
+    assert readiness.command == "legacy-campaign-transition-readiness"
+    assert readiness.legacy_campaign_id == UUID("11111111-1111-1111-1111-111111111111")
+    assert readiness.canonical_campaign_id == UUID("22222222-2222-2222-2222-222222222222")
+    assert readiness.canonical_campaign_version == 1
+    assert readiness.confirm is False
+
+    execute = parse_args([
+        "legacy-campaign-transition-execute",
+        "--legacy-campaign-id",
+        "11111111-1111-1111-1111-111111111111",
+        "--canonical-campaign-id",
+        "22222222-2222-2222-2222-222222222222",
+        "--canonical-campaign-version",
+        "1",
+        "--paper-account-id",
+        "33333333-3333-3333-3333-333333333333",
+        "--live-trading-profile-id",
+        "44444444-4444-4444-4444-444444444444",
+        "--provider",
+        "kraken_spot",
+        "--environment",
+        "production",
+        "--product",
+        "BTC-USD",
+        "--confirm",
+    ])
+    assert execute.command == "legacy-campaign-transition-execute"
+    assert execute.confirm is True
+
+    audit = parse_args([
+        "legacy-campaign-transition-audit",
+        "--legacy-campaign-id",
+        "11111111-1111-1111-1111-111111111111",
+        "--limit",
+        "5",
+    ])
+    assert audit.command == "legacy-campaign-transition-audit"
+    assert audit.limit == 5
+
+    rollback = parse_args([
+        "legacy-campaign-transition-rollback",
+        "--legacy-campaign-id",
+        "11111111-1111-1111-1111-111111111111",
+        "--canonical-campaign-id",
+        "22222222-2222-2222-2222-222222222222",
+        "--canonical-campaign-version",
+        "1",
+        "--paper-account-id",
+        "33333333-3333-3333-3333-333333333333",
+        "--live-trading-profile-id",
+        "44444444-4444-4444-4444-444444444444",
+        "--provider",
+        "kraken_spot",
+        "--environment",
+        "production",
+        "--product",
+        "BTC-USD",
+        "--confirm",
+    ])
+    assert rollback.command == "legacy-campaign-transition-rollback"
+    assert rollback.confirm is True

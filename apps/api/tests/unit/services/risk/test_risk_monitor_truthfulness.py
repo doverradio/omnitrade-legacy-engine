@@ -64,6 +64,7 @@ def _equity_evidence(
             missing_price_assets=[],
             stale_price_assets=[],
             stale_cutoff=now,
+            price_evidence=[],
         ),
         baseline=EquityBaselineSnapshot(
             start_of_day_equity=start_of_day_equity,

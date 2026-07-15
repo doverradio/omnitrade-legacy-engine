@@ -8,6 +8,7 @@ from uuid import UUID
 import pytest
 
 import app.operator_cli.service as service
+from app.services.risk.equity_evidence import EquityBaselineSnapshot, EquityRiskEvidence, EquityValuationSnapshot
 
 
 class _SessionContext:
@@ -71,11 +72,53 @@ async def test_fetch_risk_ledger_diagnosis_reports_formula_trace_and_deltas(monk
 
     async def _status(*_args, **_kwargs):
         return SimpleNamespace(
-            daily_loss=SimpleNamespace(used=Decimal("1.19"), limit=Decimal("0.75"), pct_used=Decimal("1.586666666666666666666666667")),
-            drawdown=SimpleNamespace(used=Decimal("1.19"), limit=Decimal("2.50"), pct_used=Decimal("0.476")),
-            daily_loss_input_source="current_cash_balance",
-            drawdown_input_source="current_cash_balance",
+            daily_loss=SimpleNamespace(used=Decimal("0"), limit=Decimal("0.75"), pct_used=Decimal("0")),
+            drawdown=SimpleNamespace(used=Decimal("0"), limit=Decimal("2.50"), pct_used=Decimal("0")),
+            daily_loss_input_source="current_equity",
+            drawdown_input_source="current_equity",
             policy_source="system_default_config",
+            current_equity=Decimal("25.00"),
+            current_cash_balance=Decimal("23.81"),
+            current_position_value=Decimal("1.19"),
+            start_of_day_equity=Decimal("25.00"),
+            high_water_mark_equity=Decimal("25.00"),
+            valuation_source="provider_quotes",
+            valuation_state="ready",
+            daily_loss_baseline_source="rolled_from_prior_last_equity",
+            drawdown_baseline_source="updated_from_current_equity_observation",
+            baseline_state="ready",
+            generated_at=datetime(2026, 1, 1, 12, 31, tzinfo=timezone.utc),
+        )
+
+    async def _evidence(*_args, **_kwargs):
+        now = datetime(2026, 1, 1, 12, 31, tzinfo=timezone.utc)
+        return EquityRiskEvidence(
+            valuation=EquityValuationSnapshot(
+                generated_at=now,
+                current_equity=Decimal("25.00"),
+                cash_balance=Decimal("23.81"),
+                position_value=Decimal("1.19"),
+                latest_price_timestamp=now,
+                valuation_source="provider_quotes",
+                valuation_state="ready",
+                missing_price_assets=[],
+                stale_price_assets=[],
+                stale_cutoff=now,
+                price_evidence=[],
+            ),
+            baseline=EquityBaselineSnapshot(
+                start_of_day_equity=Decimal("25.00"),
+                high_water_mark_equity=Decimal("25.00"),
+                start_of_day_source="rolled_from_prior_last_equity",
+                high_water_mark_source="updated_from_current_equity_observation",
+                session_date=now.date(),
+                baseline_state="ready",
+                baseline_ready=True,
+            ),
+            unresolved_reconciliation_count=0,
+            unknown_provider_order_count=0,
+            ready=True,
+            fail_closed_reason=None,
         )
 
     async def _snapshot(*_args, **_kwargs):
@@ -91,6 +134,7 @@ async def test_fetch_risk_ledger_diagnosis_reports_formula_trace_and_deltas(monk
     monkeypatch.setattr(service, "AsyncSessionLocal", lambda: _SessionContext(db))
     monkeypatch.setattr(service, "resolve_effective_risk_policy", _policy)
     monkeypatch.setattr(service.risk_monitor, "get_risk_status", _status)
+    monkeypatch.setattr(service, "resolve_equity_risk_evidence", _evidence)
     monkeypatch.setattr(service, "build_account_snapshot", _snapshot)
 
     payload = await service.fetch_risk_ledger_diagnosis(account_id=account_id)
@@ -101,8 +145,10 @@ async def test_fetch_risk_ledger_diagnosis_reports_formula_trace_and_deltas(monk
     assert payload["inputs"]["max_daily_loss_pct"]["value"] == "0.03"
     assert payload["inputs"]["max_drawdown_pct"]["value"] == "0.10"
     assert payload["evaluation"]["latest_trade_executed_at"] == latest_trade_at
-    assert payload["formulas"]["daily_loss.used"] == "max(0, starting_balance - current_cash_balance)"
-    assert payload["status"]["daily_loss"]["used"] == "1.19"
+    assert payload["formulas"]["legacy_cash_only.daily_loss.used"] == "max(0, starting_balance - current_cash_balance)"
+    assert payload["formulas"]["authoritative_equity.daily_loss.used"] == "max(0, start_of_day_equity - current_equity)"
+    assert payload["status"]["daily_loss"]["used"] == "0"
     assert payload["status"]["drawdown"]["limit"] == "2.50"
+    assert payload["equity_evidence"]["ready"] is True
     assert payload["snapshot"]["cash_balance"] == "19.00"
     assert payload["diagnosis"]["ledger_alignment"] == "divergent"

@@ -4,6 +4,7 @@ import uuid
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal
+from typing import Any
 
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -11,17 +12,21 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.models.asset import Asset
 from app.models.audit_log import AuditLog
 from app.models.candle import Candle
+from app.models.exchange_connection import ExchangeConnection
 from app.models.live_crypto_order import LiveCryptoOrder
 from app.models.live_reconciliation_event import LiveReconciliationEvent
 from app.models.live_trading_profile import LiveTradingProfile
 from app.models.paper_account import PaperAccount
 from app.models.risk_equity_baseline import RiskEquityBaseline
+from app.services.exchange_connections.providers.registry import get_exchange_provider
+from app.services.exchange_connections.service import get_decrypted_credentials_for_connection
 from app.services.paper.accounting import build_account_snapshot
 
 
 _UNRESOLVED_RECONCILIATION_STATUSES = {"open", "partially_filled", "reconciliation_required", "unknown", "conflict", "balance_mismatch"}
 _TERMINAL_LIVE_ORDER_STATUSES = {"DRY_RUN_READY", "DRY_RUN_BLOCKED", "FILLED", "CANCELLED", "FAILED", "REJECTED", "EXPIRED", "COMPLETED"}
 _INCONSISTENT_BALANCE_TOLERANCE = Decimal("0.00000001")
+_SUPPORTED_INTERVAL_SUFFIXES = {"s": 1, "m": 60, "h": 3600, "d": 86400}
 
 
 @dataclass(frozen=True, slots=True)
@@ -36,6 +41,22 @@ class EquityValuationSnapshot:
     missing_price_assets: list[str]
     stale_price_assets: list[str]
     stale_cutoff: datetime
+    price_evidence: list[dict[str, Any]]
+
+
+@dataclass(frozen=True, slots=True)
+class PositionPriceEvidence:
+    symbol: str
+    asset_id: uuid.UUID
+    source: str
+    product_id: str | None
+    reference_price: Decimal | None
+    observed_at: datetime | None
+    stale_at: datetime | None
+    state: str
+    detail: str
+    interval: str | None
+    provider: str | None
 
 
 @dataclass(frozen=True, slots=True)
@@ -59,23 +80,129 @@ class EquityRiskEvidence:
     fail_closed_reason: str | None
 
 
-async def _load_open_position_latest_price_points(*, db: AsyncSession, asset_ids: list[uuid.UUID]) -> dict[uuid.UUID, tuple[Decimal | None, datetime | None]]:
-    result: dict[uuid.UUID, tuple[Decimal | None, datetime | None]] = {}
+def _parse_interval_seconds(interval: str | None) -> int | None:
+    if interval is None:
+        return None
+    value = interval.strip().lower()
+    if len(value) < 2:
+        return None
+    unit = value[-1]
+    if unit not in _SUPPORTED_INTERVAL_SUFFIXES:
+        return None
+    amount_raw = value[:-1]
+    if not amount_raw.isdigit():
+        return None
+    amount = int(amount_raw)
+    if amount <= 0:
+        return None
+    return amount * _SUPPORTED_INTERVAL_SUFFIXES[unit]
+
+
+def _normalize_profile_environment(raw: str | None) -> str:
+    value = str(raw or "production").strip().lower()
+    return value if value in {"production", "sandbox"} else "production"
+
+
+def _normalize_product_for_quote(symbol: str) -> str | None:
+    normalized = symbol.strip().upper()
+    if not normalized:
+        return None
+    if "-" in normalized:
+        base, quote = normalized.split("-", 1)
+        quote = quote.strip().upper()
+        if quote in {"USD", "USDT"}:
+            return f"{base.strip().upper()}-USD"
+        return None
+    for suffix in ("USDT", "USD"):
+        if normalized.endswith(suffix) and len(normalized) > len(suffix):
+            return f"{normalized[: -len(suffix)]}-USD"
+    return None
+
+
+async def _resolve_provider_quote_context(*, db: AsyncSession, paper_account_id: uuid.UUID) -> tuple[str, str, dict[str, str]] | None:
+    profile = await db.scalar(
+        select(LiveTradingProfile)
+        .where(LiveTradingProfile.paper_account_id == paper_account_id)
+        .order_by(LiveTradingProfile.created_at.desc(), LiveTradingProfile.id.desc())
+        .limit(1)
+    )
+    if profile is None:
+        return None
+
+    provenance = profile.provenance_metadata if isinstance(profile.provenance_metadata, dict) else {}
+    provider = str(provenance.get("provider") or "").strip().lower()
+    if not provider:
+        return None
+    environment = _normalize_profile_environment(str(provenance.get("exchange_environment") or provenance.get("environment") or "production"))
+    connection = await db.scalar(
+        select(ExchangeConnection)
+        .where(ExchangeConnection.provider == provider)
+        .where(ExchangeConnection.environment == environment)
+        .order_by(ExchangeConnection.created_at.desc(), ExchangeConnection.exchange_connection_id.desc())
+        .limit(1)
+    )
+    if connection is None or not bool(connection.credentials_valid):
+        return None
+
+    credentials = get_decrypted_credentials_for_connection(connection)
+    if not credentials.get("api_key") or not credentials.get("api_secret"):
+        return None
+
+    return (provider, environment, credentials)
+
+
+async def _load_open_position_latest_candle_points(
+    *,
+    db: AsyncSession,
+    asset_ids: list[uuid.UUID],
+) -> dict[uuid.UUID, tuple[Decimal | None, datetime | None, str | None, str | None]]:
+    result: dict[uuid.UUID, tuple[Decimal | None, datetime | None, str | None, str | None]] = {}
     for asset_id in asset_ids:
         row = await db.execute(
-            select(Candle.close, Candle.close_time)
+            select(Candle.close, Candle.close_time, Candle.interval, Candle.source)
             .where(Candle.asset_id == asset_id)
             .order_by(Candle.open_time.desc())
             .limit(1)
         )
         item = row.first()
         if item is None:
-            result[asset_id] = (None, None)
+            result[asset_id] = (None, None, None, None)
             continue
-        close = item[0]
-        close_time = item[1]
-        result[asset_id] = (Decimal(str(close)) if close is not None else None, close_time)
+        close, close_time, interval, source = item
+        result[asset_id] = (Decimal(str(close)) if close is not None else None, close_time, interval, source)
     return result
+
+
+async def _load_open_position_price_evidence_from_provider(
+    *,
+    provider: str,
+    environment: str,
+    credentials: dict[str, str],
+    product_id: str,
+) -> tuple[Decimal | None, datetime | None, str | None]:
+    client = get_exchange_provider(provider, environment=environment)
+    evidence = await client.fetch_price_evidence(
+        credentials=credentials,
+        environment=environment,
+        product_id=product_id,
+    )
+    return evidence.reference_price, evidence.observed_at, evidence.source_endpoint
+
+
+def _serialize_price_evidence(item: PositionPriceEvidence) -> dict[str, Any]:
+    return {
+        "symbol": item.symbol,
+        "asset_id": str(item.asset_id),
+        "source": item.source,
+        "provider": item.provider,
+        "product_id": item.product_id,
+        "reference_price": None if item.reference_price is None else format(item.reference_price, "f"),
+        "observed_at": item.observed_at,
+        "stale_at": item.stale_at,
+        "state": item.state,
+        "detail": item.detail,
+        "interval": item.interval,
+    }
 
 
 async def build_equity_valuation_snapshot(
@@ -106,25 +233,196 @@ async def build_equity_valuation_snapshot(
             missing_price_assets=[],
             stale_price_assets=[],
             stale_cutoff=stale_cutoff,
+            price_evidence=[],
         )
 
-    price_points = await _load_open_position_latest_price_points(db=db, asset_ids=[item.asset_id for item in open_positions])
+    provider_context = await _resolve_provider_quote_context(db=db, paper_account_id=paper_account.id)
+    provider_price_points: dict[uuid.UUID, tuple[Decimal | None, datetime | None, str | None]] = {}
+    provider_failures: dict[uuid.UUID, str] = {}
+    if provider_context is not None:
+        provider, environment, credentials = provider_context
+        for position in open_positions:
+            product_id = _normalize_product_for_quote(position.symbol)
+            if product_id is None:
+                provider_failures[position.asset_id] = "unsupported_symbol_for_provider_quote"
+                continue
+            try:
+                provider_price_points[position.asset_id] = await _load_open_position_price_evidence_from_provider(
+                    provider=provider,
+                    environment=environment,
+                    credentials=credentials,
+                    product_id=product_id,
+                )
+            except Exception as exc:  # pragma: no cover - exercised through monkeypatched provider failure tests
+                provider_failures[position.asset_id] = str(exc)
+
+    candle_points = await _load_open_position_latest_candle_points(db=db, asset_ids=[item.asset_id for item in open_positions])
 
     missing_price_assets: list[str] = []
     stale_price_assets: list[str] = []
     latest_price_timestamp: datetime | None = None
+    evidence_entries: list[PositionPriceEvidence] = []
+    source_kinds: set[str] = set()
 
     for position in open_positions:
-        _close, close_time = price_points.get(position.asset_id, (None, None))
-        if close_time is None:
-            missing_price_assets.append(position.symbol)
+        product_id = _normalize_product_for_quote(position.symbol)
+        provider_quote = provider_price_points.get(position.asset_id)
+        provider_failure = provider_failures.get(position.asset_id)
+
+        if provider_quote is not None:
+            reference_price, observed_at, source_endpoint = provider_quote
+            observed_utc = observed_at if observed_at is None else observed_at.astimezone(timezone.utc)
+            stale_at = None if observed_utc is None else observed_utc + timedelta(seconds=max(1, int(max_price_age_seconds)))
+            if reference_price is None or reference_price <= Decimal("0") or observed_utc is None:
+                missing_price_assets.append(position.symbol)
+                evidence_entries.append(
+                    PositionPriceEvidence(
+                        symbol=position.symbol,
+                        asset_id=position.asset_id,
+                        source="provider_quote",
+                        provider=provider_context[0] if provider_context is not None else None,
+                        product_id=product_id,
+                        reference_price=reference_price,
+                        observed_at=observed_utc,
+                        stale_at=stale_at,
+                        state="missing",
+                        detail="provider_quote_missing_reference_or_timestamp",
+                        interval=None,
+                    )
+                )
+                source_kinds.add("provider_quote")
+                continue
+            if stale_at is not None and now > stale_at:
+                stale_price_assets.append(position.symbol)
+                evidence_entries.append(
+                    PositionPriceEvidence(
+                        symbol=position.symbol,
+                        asset_id=position.asset_id,
+                        source="provider_quote",
+                        provider=provider_context[0] if provider_context is not None else None,
+                        product_id=product_id,
+                        reference_price=reference_price,
+                        observed_at=observed_utc,
+                        stale_at=stale_at,
+                        state="stale",
+                        detail="provider_quote_exceeds_max_age",
+                        interval=None,
+                    )
+                )
+                source_kinds.add("provider_quote")
+                if latest_price_timestamp is None or observed_utc > latest_price_timestamp:
+                    latest_price_timestamp = observed_utc
+                continue
+
+            evidence_entries.append(
+                PositionPriceEvidence(
+                    symbol=position.symbol,
+                    asset_id=position.asset_id,
+                    source="provider_quote",
+                    provider=provider_context[0] if provider_context is not None else None,
+                    product_id=product_id,
+                    reference_price=reference_price,
+                    observed_at=observed_utc,
+                    stale_at=stale_at,
+                    state="ready",
+                    detail="provider_quote_fresh",
+                    interval=None,
+                )
+            )
+            source_kinds.add("provider_quote")
+            if latest_price_timestamp is None or observed_utc > latest_price_timestamp:
+                latest_price_timestamp = observed_utc
             continue
-        if close_time.tzinfo is None:
-            close_time = close_time.replace(tzinfo=timezone.utc)
-        if close_time < stale_cutoff:
+
+        close, close_time, interval, candle_source = candle_points.get(position.asset_id, (None, None, None, None))
+        interval_seconds = _parse_interval_seconds(interval)
+        close_utc = close_time if close_time is None else close_time.astimezone(timezone.utc)
+        cadence_bound_seconds = None if interval_seconds is None else interval_seconds + max(1, int(max_price_age_seconds))
+        stale_at = None if close_utc is None or cadence_bound_seconds is None else close_utc + timedelta(seconds=cadence_bound_seconds)
+        detail = "candle_fallback"
+        if provider_failure is not None:
+            detail = f"provider_quote_failed:{provider_failure}"
+
+        if close is None or close <= Decimal("0") or close_utc is None:
+            missing_price_assets.append(position.symbol)
+            evidence_entries.append(
+                PositionPriceEvidence(
+                    symbol=position.symbol,
+                    asset_id=position.asset_id,
+                    source="candle",
+                    provider=None,
+                    product_id=product_id,
+                    reference_price=close,
+                    observed_at=close_utc,
+                    stale_at=stale_at,
+                    state="missing",
+                    detail=f"{detail}:missing_candle_price_or_timestamp",
+                    interval=interval,
+                )
+            )
+            source_kinds.add("candle")
+            continue
+        if interval_seconds is None:
             stale_price_assets.append(position.symbol)
-        if latest_price_timestamp is None or close_time > latest_price_timestamp:
-            latest_price_timestamp = close_time
+            evidence_entries.append(
+                PositionPriceEvidence(
+                    symbol=position.symbol,
+                    asset_id=position.asset_id,
+                    source="candle",
+                    provider=None,
+                    product_id=product_id,
+                    reference_price=close,
+                    observed_at=close_utc,
+                    stale_at=stale_at,
+                    state="stale",
+                    detail=f"{detail}:unsupported_candle_interval",
+                    interval=interval,
+                )
+            )
+            source_kinds.add("candle")
+            if latest_price_timestamp is None or close_utc > latest_price_timestamp:
+                latest_price_timestamp = close_utc
+            continue
+        if stale_at is not None and now > stale_at:
+            stale_price_assets.append(position.symbol)
+            evidence_entries.append(
+                PositionPriceEvidence(
+                    symbol=position.symbol,
+                    asset_id=position.asset_id,
+                    source="candle",
+                    provider=None,
+                    product_id=product_id,
+                    reference_price=close,
+                    observed_at=close_utc,
+                    stale_at=stale_at,
+                    state="stale",
+                    detail=f"{detail}:candle_exceeds_interval_bound",
+                    interval=interval,
+                )
+            )
+            source_kinds.add("candle")
+            if latest_price_timestamp is None or close_utc > latest_price_timestamp:
+                latest_price_timestamp = close_utc
+            continue
+
+        evidence_entries.append(
+            PositionPriceEvidence(
+                symbol=position.symbol,
+                asset_id=position.asset_id,
+                source="candle",
+                provider=None,
+                product_id=product_id,
+                reference_price=close,
+                observed_at=close_utc,
+                stale_at=stale_at,
+                state="ready",
+                detail=detail,
+                interval=interval,
+            )
+        )
+        source_kinds.add("candle")
+        if latest_price_timestamp is None or close_utc > latest_price_timestamp:
+            latest_price_timestamp = close_utc
 
     valuation_state = "ready"
     if missing_price_assets:
@@ -138,17 +436,26 @@ async def build_equity_valuation_snapshot(
     if abs(persisted_cash - computed_cash) > _INCONSISTENT_BALANCE_TOLERANCE:
         valuation_state = "inconsistent_account_state"
 
+    valuation_source = "paper_account_snapshot_mark_to_market_candles"
+    if source_kinds == {"provider_quote"}:
+        valuation_source = "provider_quotes"
+    elif source_kinds == {"candle"}:
+        valuation_source = "candle_interval_bound"
+    elif source_kinds:
+        valuation_source = "mixed_provider_quote_and_candle"
+
     return EquityValuationSnapshot(
         generated_at=now,
         current_equity=Decimal(snapshot.equity),
         cash_balance=Decimal(snapshot.cash_balance),
         position_value=Decimal(snapshot.position_value),
         latest_price_timestamp=latest_price_timestamp,
-        valuation_source="paper_account_snapshot_mark_to_market_candles",
+        valuation_source=valuation_source,
         valuation_state=valuation_state,
         missing_price_assets=sorted(missing_price_assets),
         stale_price_assets=sorted(stale_price_assets),
         stale_cutoff=stale_cutoff,
+        price_evidence=[_serialize_price_evidence(item) for item in evidence_entries],
     )
 
 

@@ -26,6 +26,7 @@ from app.operator_cli.service import (
     activate_venue_commission_run,
     fetch_canonical_campaign_binding_audit,
     fetch_canonical_campaign_binding_status,
+    fetch_legacy_campaign_transition_audit,
     fetch_campaign_orchestration_history,
     fetch_campaign_orchestration_preview,
     fetch_campaign_orchestration_readiness,
@@ -41,8 +42,11 @@ from app.operator_cli.service import (
     fetch_strategy_roster_summary,
     fetch_risk_ledger_diagnosis,
     fetch_watch_status,
+    inspect_legacy_campaign_transition,
+    rollback_legacy_campaign_transition,
     revoke_venue_commission_run,
     start_venue_commission_run,
+    transition_legacy_campaign_to_canonical_successor,
 )
 
 
@@ -74,6 +78,10 @@ def _build_parser() -> argparse.ArgumentParser:
             "  ./operator venue-commission-revoke --commissioning-run-id <run_uuid> --confirm --json\n"
             "  ./operator canonical-campaign-readiness --campaign-id <campaign_uuid> --campaign-version 1 --paper-account-id <paper_uuid> --live-trading-profile-id <profile_uuid> --provider kraken_spot --environment production --product BTC-USD --json\n"
             "  ./operator canonical-campaign-bind --campaign-id <campaign_uuid> --campaign-version 1 --paper-account-id <paper_uuid> --live-trading-profile-id <profile_uuid> --provider kraken_spot --environment production --product BTC-USD --actor operator:human --confirm --json\n"
+            "  ./operator legacy-campaign-transition-readiness --legacy-campaign-id <legacy_uuid> --canonical-campaign-id <canonical_uuid> --canonical-campaign-version 1 --paper-account-id <paper_uuid> --live-trading-profile-id <profile_uuid> --provider kraken_spot --environment production --product BTC-USD --json\n"
+            "  ./operator legacy-campaign-transition-execute --legacy-campaign-id <legacy_uuid> --canonical-campaign-id <canonical_uuid> --canonical-campaign-version 1 --paper-account-id <paper_uuid> --live-trading-profile-id <profile_uuid> --provider kraken_spot --environment production --product BTC-USD --actor operator:human --confirm --json\n"
+            "  ./operator legacy-campaign-transition-audit --legacy-campaign-id <legacy_uuid> --json\n"
+            "  ./operator legacy-campaign-transition-rollback --legacy-campaign-id <legacy_uuid> --canonical-campaign-id <canonical_uuid> --canonical-campaign-version 1 --paper-account-id <paper_uuid> --live-trading-profile-id <profile_uuid> --provider kraken_spot --environment production --product BTC-USD --actor operator:human --confirm --json\n"
             "  ./operator risk-ledger-diagnosis --account-id <paper_uuid> --json\n"
             "  ./operator status --json\n"
             "  ./operator status --no-color --verbose"
@@ -284,6 +292,70 @@ def _build_parser() -> argparse.ArgumentParser:
     canonical_audit.add_argument("--campaign-id", type=UUID, required=True)
     canonical_audit.add_argument("--limit", type=int, default=20)
     canonical_audit.add_argument("--json", action="store_true", dest="json_output")
+
+    legacy_transition_readiness = subparsers.add_parser(
+        "legacy-campaign-transition-readiness",
+        parents=[common],
+        help="Read-only safety checks before superseding a legacy campaign",
+        description="Read-only legacy-to-canonical campaign transition readiness diagnostics.",
+    )
+    legacy_transition_readiness.add_argument("--legacy-campaign-id", type=UUID, required=True)
+    legacy_transition_readiness.add_argument("--canonical-campaign-id", type=UUID, required=True)
+    legacy_transition_readiness.add_argument("--canonical-campaign-version", type=int, required=True)
+    legacy_transition_readiness.add_argument("--paper-account-id", type=UUID, required=True)
+    legacy_transition_readiness.add_argument("--live-trading-profile-id", type=UUID, required=True)
+    legacy_transition_readiness.add_argument("--provider", type=str, required=True)
+    legacy_transition_readiness.add_argument("--environment", type=str, required=True)
+    legacy_transition_readiness.add_argument("--product", type=str, required=True)
+    legacy_transition_readiness.add_argument("--actor", type=str, default="operator:human")
+    legacy_transition_readiness.add_argument("--confirm", action="store_true")
+    legacy_transition_readiness.add_argument("--json", action="store_true", dest="json_output")
+
+    legacy_transition_execute = subparsers.add_parser(
+        "legacy-campaign-transition-execute",
+        parents=[common],
+        help="Supersede a legacy campaign after strict safety checks",
+        description="Operator-confirmed immutable transition from legacy campaign to canonical successor.",
+    )
+    legacy_transition_execute.add_argument("--legacy-campaign-id", type=UUID, required=True)
+    legacy_transition_execute.add_argument("--canonical-campaign-id", type=UUID, required=True)
+    legacy_transition_execute.add_argument("--canonical-campaign-version", type=int, required=True)
+    legacy_transition_execute.add_argument("--paper-account-id", type=UUID, required=True)
+    legacy_transition_execute.add_argument("--live-trading-profile-id", type=UUID, required=True)
+    legacy_transition_execute.add_argument("--provider", type=str, required=True)
+    legacy_transition_execute.add_argument("--environment", type=str, required=True)
+    legacy_transition_execute.add_argument("--product", type=str, required=True)
+    legacy_transition_execute.add_argument("--actor", type=str, default="operator:human")
+    legacy_transition_execute.add_argument("--confirm", action="store_true")
+    legacy_transition_execute.add_argument("--json", action="store_true", dest="json_output")
+
+    legacy_transition_audit = subparsers.add_parser(
+        "legacy-campaign-transition-audit",
+        parents=[common],
+        help="Show immutable audit evidence for legacy campaign transitions",
+        description="Read-only transition/rollback audit evidence for one legacy campaign.",
+    )
+    legacy_transition_audit.add_argument("--legacy-campaign-id", type=UUID, required=True)
+    legacy_transition_audit.add_argument("--limit", type=int, default=20)
+    legacy_transition_audit.add_argument("--json", action="store_true", dest="json_output")
+
+    legacy_transition_rollback = subparsers.add_parser(
+        "legacy-campaign-transition-rollback",
+        parents=[common],
+        help="Emergency rollback of a prior legacy transition when safety checks pass",
+        description="Operator-confirmed emergency rollback for a specific prior canonical successor transition.",
+    )
+    legacy_transition_rollback.add_argument("--legacy-campaign-id", type=UUID, required=True)
+    legacy_transition_rollback.add_argument("--canonical-campaign-id", type=UUID, required=True)
+    legacy_transition_rollback.add_argument("--canonical-campaign-version", type=int, required=True)
+    legacy_transition_rollback.add_argument("--paper-account-id", type=UUID, required=True)
+    legacy_transition_rollback.add_argument("--live-trading-profile-id", type=UUID, required=True)
+    legacy_transition_rollback.add_argument("--provider", type=str, required=True)
+    legacy_transition_rollback.add_argument("--environment", type=str, required=True)
+    legacy_transition_rollback.add_argument("--product", type=str, required=True)
+    legacy_transition_rollback.add_argument("--actor", type=str, default="operator:human")
+    legacy_transition_rollback.add_argument("--confirm", action="store_true")
+    legacy_transition_rollback.add_argument("--json", action="store_true", dest="json_output")
 
     risk_diagnosis = subparsers.add_parser(
         "risk-ledger-diagnosis",
@@ -517,6 +589,55 @@ async def _run_async(args: argparse.Namespace) -> tuple[int, dict[str, Any], str
 
     if args.command == "canonical-campaign-binding-audit":
         payload = await fetch_canonical_campaign_binding_audit(campaign_id=args.campaign_id, limit=args.limit)
+        return 0, payload, render_json(payload)
+
+    if args.command == "legacy-campaign-transition-readiness":
+        payload = await inspect_legacy_campaign_transition(
+            legacy_campaign_id=args.legacy_campaign_id,
+            canonical_campaign_id=args.canonical_campaign_id,
+            canonical_campaign_version=args.canonical_campaign_version,
+            paper_account_id=args.paper_account_id,
+            live_trading_profile_id=args.live_trading_profile_id,
+            provider=args.provider,
+            environment=args.environment,
+            product_id=args.product,
+            actor=args.actor,
+            confirm=bool(args.confirm),
+        )
+        return 0, payload, render_json(payload)
+
+    if args.command == "legacy-campaign-transition-execute":
+        payload = await transition_legacy_campaign_to_canonical_successor(
+            legacy_campaign_id=args.legacy_campaign_id,
+            canonical_campaign_id=args.canonical_campaign_id,
+            canonical_campaign_version=args.canonical_campaign_version,
+            paper_account_id=args.paper_account_id,
+            live_trading_profile_id=args.live_trading_profile_id,
+            provider=args.provider,
+            environment=args.environment,
+            product_id=args.product,
+            actor=args.actor,
+            confirm=bool(args.confirm),
+        )
+        return 0, payload, render_json(payload)
+
+    if args.command == "legacy-campaign-transition-audit":
+        payload = await fetch_legacy_campaign_transition_audit(legacy_campaign_id=args.legacy_campaign_id, limit=args.limit)
+        return 0, payload, render_json(payload)
+
+    if args.command == "legacy-campaign-transition-rollback":
+        payload = await rollback_legacy_campaign_transition(
+            legacy_campaign_id=args.legacy_campaign_id,
+            canonical_campaign_id=args.canonical_campaign_id,
+            canonical_campaign_version=args.canonical_campaign_version,
+            paper_account_id=args.paper_account_id,
+            live_trading_profile_id=args.live_trading_profile_id,
+            provider=args.provider,
+            environment=args.environment,
+            product_id=args.product,
+            actor=args.actor,
+            confirm=bool(args.confirm),
+        )
         return 0, payload, render_json(payload)
 
     if args.command == "risk-ledger-diagnosis":

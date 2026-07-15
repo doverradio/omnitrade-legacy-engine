@@ -37,9 +37,14 @@ from app.models.strategy_roster_run import StrategyRosterRun
 from app.services.autonomous_cycle import AutonomousCycleRequest, run_autonomous_preview_cycle
 from app.services.canonical_campaign_binding import (
     CanonicalCampaignBindingRequest,
+    LegacyCampaignTransitionRequest,
     bind_canonical_campaign_runtime as _bind_canonical_campaign_runtime,
+    fetch_legacy_campaign_transition_audit as _fetch_legacy_campaign_transition_audit,
     fetch_canonical_campaign_binding_audit as _fetch_canonical_campaign_binding_audit,
     inspect_canonical_campaign_binding as _inspect_canonical_campaign_binding,
+    inspect_legacy_campaign_transition as _inspect_legacy_campaign_transition,
+    rollback_legacy_campaign_transition as _rollback_legacy_campaign_transition,
+    transition_legacy_campaign_to_canonical_successor as _transition_legacy_campaign_to_canonical_successor,
 )
 from app.services.capital_campaign_orchestration import (
     fetch_campaign_orchestration_history as _fetch_campaign_orchestration_history,
@@ -1562,6 +1567,7 @@ async def fetch_risk_ledger_diagnosis(*, account_id: UUID) -> dict[str, Any]:
             "stale_cutoff": equity_evidence.valuation.stale_cutoff,
             "missing_price_assets": equity_evidence.valuation.missing_price_assets,
             "stale_price_assets": equity_evidence.valuation.stale_price_assets,
+            "price_evidence": equity_evidence.valuation.price_evidence,
             "unresolved_reconciliation_count": equity_evidence.unresolved_reconciliation_count,
             "unknown_provider_order_count": equity_evidence.unknown_provider_order_count,
             "start_of_day_source": equity_evidence.baseline.start_of_day_source,
@@ -2036,3 +2042,133 @@ async def fetch_canonical_campaign_binding_status(*, campaign_id: UUID, campaign
 async def fetch_canonical_campaign_binding_audit(*, campaign_id: UUID, limit: int = 20) -> dict[str, Any]:
     async with AsyncSessionLocal() as db:
         return await _fetch_canonical_campaign_binding_audit(db=db, campaign_id=campaign_id, limit=limit)
+
+
+async def inspect_legacy_campaign_transition(
+    *,
+    legacy_campaign_id: UUID,
+    canonical_campaign_id: UUID,
+    canonical_campaign_version: int,
+    paper_account_id: UUID,
+    live_trading_profile_id: UUID,
+    provider: str,
+    environment: str,
+    product_id: str,
+    actor: str,
+    confirm: bool,
+) -> dict[str, Any]:
+    async with AsyncSessionLocal() as db:
+        result = await _inspect_legacy_campaign_transition(
+            db=db,
+            request=LegacyCampaignTransitionRequest(
+                legacy_campaign_id=legacy_campaign_id,
+                canonical_campaign_id=canonical_campaign_id,
+                canonical_campaign_version=canonical_campaign_version,
+                paper_account_id=paper_account_id,
+                live_trading_profile_id=live_trading_profile_id,
+                provider=provider,
+                environment=environment,
+                product_id=product_id,
+                actor=actor,
+                confirm=confirm,
+            ),
+        )
+    return {
+        "ready": result.ready,
+        "blockers": result.blockers,
+        "checks": [{"code": item.code, "passed": item.passed, "detail": item.detail} for item in result.checks],
+        "snapshot": result.snapshot,
+    }
+
+
+async def transition_legacy_campaign_to_canonical_successor(
+    *,
+    legacy_campaign_id: UUID,
+    canonical_campaign_id: UUID,
+    canonical_campaign_version: int,
+    paper_account_id: UUID,
+    live_trading_profile_id: UUID,
+    provider: str,
+    environment: str,
+    product_id: str,
+    actor: str,
+    confirm: bool,
+) -> dict[str, Any]:
+    async with AsyncSessionLocal() as db:
+        result = await _transition_legacy_campaign_to_canonical_successor(
+            db=db,
+            request=LegacyCampaignTransitionRequest(
+                legacy_campaign_id=legacy_campaign_id,
+                canonical_campaign_id=canonical_campaign_id,
+                canonical_campaign_version=canonical_campaign_version,
+                paper_account_id=paper_account_id,
+                live_trading_profile_id=live_trading_profile_id,
+                provider=provider,
+                environment=environment,
+                product_id=product_id,
+                actor=actor,
+                confirm=confirm,
+            ),
+        )
+    return {
+        "changed": result.changed,
+        "idempotent": result.idempotent,
+        "audit_created": result.audit_created,
+        "before": result.before,
+        "after": result.after,
+        "readiness": {
+            "ready": result.readiness.ready,
+            "blockers": result.readiness.blockers,
+            "checks": [{"code": item.code, "passed": item.passed, "detail": item.detail} for item in result.readiness.checks],
+            "snapshot": result.readiness.snapshot,
+        },
+    }
+
+
+async def rollback_legacy_campaign_transition(
+    *,
+    legacy_campaign_id: UUID,
+    canonical_campaign_id: UUID,
+    canonical_campaign_version: int,
+    paper_account_id: UUID,
+    live_trading_profile_id: UUID,
+    provider: str,
+    environment: str,
+    product_id: str,
+    actor: str,
+    confirm: bool,
+) -> dict[str, Any]:
+    async with AsyncSessionLocal() as db:
+        result = await _rollback_legacy_campaign_transition(
+            db=db,
+            request=LegacyCampaignTransitionRequest(
+                legacy_campaign_id=legacy_campaign_id,
+                canonical_campaign_id=canonical_campaign_id,
+                canonical_campaign_version=canonical_campaign_version,
+                paper_account_id=paper_account_id,
+                live_trading_profile_id=live_trading_profile_id,
+                provider=provider,
+                environment=environment,
+                product_id=product_id,
+                actor=actor,
+                confirm=confirm,
+            ),
+        )
+    return {
+        "changed": result.changed,
+        "idempotent": result.idempotent,
+        "audit_created": result.audit_created,
+        "before": result.before,
+        "after": result.after,
+        "readiness": {
+            "ready": result.readiness.ready,
+            "blockers": result.readiness.blockers,
+            "checks": [{"code": item.code, "passed": item.passed, "detail": item.detail} for item in result.readiness.checks],
+            "snapshot": result.readiness.snapshot,
+        },
+    }
+
+
+async def fetch_legacy_campaign_transition_audit(*, legacy_campaign_id: UUID, limit: int = 20) -> dict[str, Any]:
+    async with AsyncSessionLocal() as db:
+        return await _fetch_legacy_campaign_transition_audit(db=db, legacy_campaign_id=legacy_campaign_id, limit=limit)
