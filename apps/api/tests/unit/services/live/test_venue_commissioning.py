@@ -15,6 +15,8 @@ class _FakeDb:
     def __init__(self) -> None:
         self.connection = None
         self.profile = None
+        self.approval_event = None
+        self.preview = None
         self.run = None
         self.open_live_order = None
         self.global_switch = None
@@ -28,6 +30,10 @@ class _FakeDb:
             return self.connection
         if "FROM live_trading_profiles" in sql:
             return self.profile
+        if "FROM live_approval_events" in sql:
+            return self.approval_event
+        if "FROM crypto_order_previews" in sql:
+            return self.preview
         if "FROM risk_kill_switches" in sql and "scope = :scope_1" in sql:
             return self.global_switch
         if "FROM risk_kill_switches" in sql and "scope = :scope_1" not in sql:
@@ -184,6 +190,57 @@ async def test_activation_does_not_submit_order(monkeypatch: pytest.MonkeyPatch)
 
 
 @pytest.mark.asyncio
+async def test_start_rejects_missing_commissioning_authority(monkeypatch: pytest.MonkeyPatch) -> None:
+    db = _FakeDb()
+    run_id = uuid.uuid4()
+    db.connection = SimpleNamespace(provider="kraken_spot", environment="production")
+    db.profile = SimpleNamespace(
+        id=uuid.uuid4(),
+        paper_account_id=uuid.uuid4(),
+        provenance_metadata={"provider": "kraken_spot", "exchange_environment": "production"},
+    )
+    db.approval_event = SimpleNamespace(id=uuid.uuid4(), approval_state="approved", approval_scope={}, expires_at=None)
+    db.preview = SimpleNamespace(
+        crypto_order_preview_id=uuid.uuid4(),
+        requested_amount=Decimal("5.00"),
+        side="buy",
+        product_id="BTC-USD",
+        provider="kraken_spot",
+        environment="production",
+        live_trading_profile_id=db.profile.id,
+        decision_record_id=uuid.uuid4(),
+    )
+    db.run = SimpleNamespace(
+        commissioning_run_id=run_id,
+        status="ACTIVE",
+        provider="kraken_spot",
+        product_id="BTC-USD",
+        environment="production",
+        buy_client_order_id=None,
+        buy_provider_order_id=None,
+        buy_idempotency_key=None,
+        buy_submitted_at=None,
+        buy_requested_quote_usd=Decimal("5.00"),
+        hold_minutes=30,
+        started_by=None,
+        started_at=None,
+        updated_at=None,
+        duplicate_orders_detected=False,
+        manual_intervention_required=False,
+        sell_client_order_id=None,
+        buy_filled_base_btc=None,
+    )
+
+    async def _submit(*_args, **_kwargs):
+        raise AssertionError("provider must not be reached without authority")
+
+    monkeypatch.setattr(vc, "get_exchange_provider", lambda *_args, **_kwargs: SimpleNamespace(submit_order=_submit))
+
+    with pytest.raises(PermissionError, match="commissioning authority missing"):
+        await vc.start_run(db=db, actor="operator:human", run_id=run_id, confirm=True)
+
+
+@pytest.mark.asyncio
 async def test_activation_requires_confirm() -> None:
     db = _FakeDb()
     with pytest.raises(PermissionError):
@@ -331,7 +388,6 @@ async def test_resume_processes_started_run() -> None:
         dust_base_btc=None,
         ledger_matches_kraken=False,
         completed_at=None,
-        execution_purpose="VENUE_COMMISSIONING",
     )
 
     fill = SimpleNamespace(size=Decimal("0.00005"), price=Decimal("100000"), fee=SimpleNamespace(amount=Decimal("0.01")), occurred_at=now)
@@ -386,7 +442,6 @@ async def test_start_ambiguous_buy_enters_reconciliation_required(monkeypatch: p
         buy_submitted_at=None,
         buy_requested_quote_usd=Decimal("5.00"),
         hold_minutes=30,
-        state_payload={},
         started_by=None,
         started_at=None,
         updated_at=None,
@@ -473,6 +528,30 @@ async def test_start_submit_payload_uses_staged_uuid_and_validate_shape(monkeypa
     db = _FakeDb()
     run_id = uuid.uuid4()
     db.connection = SimpleNamespace(provider="kraken_spot", environment="production")
+    profile_id = uuid.uuid4()
+    preview_id = uuid.uuid4()
+    approval_event_id = uuid.uuid4()
+    db.profile = SimpleNamespace(
+        id=profile_id,
+        paper_account_id=uuid.uuid4(),
+        provenance_metadata={"provider": "kraken_spot", "exchange_environment": "production"},
+    )
+    db.approval_event = SimpleNamespace(
+        id=approval_event_id,
+        approval_state="approved",
+        approval_scope={},
+        expires_at=None,
+    )
+    db.preview = SimpleNamespace(
+        crypto_order_preview_id=preview_id,
+        requested_amount=Decimal("5.00"),
+        side="buy",
+        product_id="BTC-USD",
+        provider="kraken_spot",
+        environment="production",
+        live_trading_profile_id=profile_id,
+        decision_record_id=uuid.uuid4(),
+    )
     db.run = SimpleNamespace(
         commissioning_run_id=run_id,
         status="ACTIVE",
@@ -485,7 +564,6 @@ async def test_start_submit_payload_uses_staged_uuid_and_validate_shape(monkeypa
         buy_submitted_at=None,
         buy_requested_quote_usd=Decimal("5.00"),
         hold_minutes=30,
-        state_payload={},
         started_by=None,
         started_at=None,
         updated_at=None,
@@ -503,6 +581,13 @@ async def test_start_submit_payload_uses_staged_uuid_and_validate_shape(monkeypa
         sell_idempotency_key=None,
         sell_submitted_at=None,
         sell_requested_base_btc=None,
+        state_payload={
+            "authority": {
+                "approval_event_id": str(approval_event_id),
+                "crypto_order_preview_id": str(preview_id),
+                "live_trading_profile_id": str(profile_id),
+            }
+        },
     )
 
     client = KrakenSpotClient()
@@ -546,6 +631,11 @@ async def test_start_submit_payload_uses_staged_uuid_and_validate_shape(monkeypa
     monkeypatch.setattr(client, "_private_request", _private)
     monkeypatch.setattr(vc, "get_exchange_provider", lambda *_args, **_kwargs: client)
     monkeypatch.setattr(vc, "_reconcile_order", _reconcile)
+
+    async def _validate_authority(**_kwargs):
+        return None
+
+    monkeypatch.setattr(vc, "_validate_campaign_scoped_submission_authority", _validate_authority)
     monkeypatch.setattr("app.services.live_crypto_orders._load_decrypted_credentials", lambda *_args, **_kwargs: {})
 
     run = await vc.start_run(db=db, actor="operator:human", run_id=run_id, confirm=True)
@@ -567,6 +657,186 @@ async def test_start_submit_payload_uses_staged_uuid_and_validate_shape(monkeypa
     assert captured_add_order_payload == expected_live_payload
     assert "validate" not in captured_add_order_payload
     assert "timeinforce" not in captured_add_order_payload
+
+
+@pytest.mark.asyncio
+async def test_start_sell_due_submits_exactly_one_provider_order(monkeypatch: pytest.MonkeyPatch) -> None:
+    db = _FakeDb()
+    run_id = uuid.uuid4()
+    profile_id = uuid.uuid4()
+    preview_id = uuid.uuid4()
+    approval_event_id = uuid.uuid4()
+    db.connection = SimpleNamespace(provider="kraken_spot", environment="production")
+    db.profile = SimpleNamespace(
+        id=profile_id,
+        paper_account_id=uuid.uuid4(),
+        provenance_metadata={"provider": "kraken_spot", "exchange_environment": "production"},
+    )
+    db.approval_event = SimpleNamespace(
+        id=approval_event_id,
+        approval_state="approved",
+        approval_scope={},
+        expires_at=None,
+    )
+    db.preview = SimpleNamespace(
+        crypto_order_preview_id=preview_id,
+        requested_amount=Decimal("5.00"),
+        side="buy",
+        product_id="BTC-USD",
+        provider="kraken_spot",
+        environment="production",
+        live_trading_profile_id=profile_id,
+        decision_record_id=uuid.uuid4(),
+    )
+    db.run = SimpleNamespace(
+        commissioning_run_id=run_id,
+        status="SELL_DUE",
+        provider="kraken_spot",
+        product_id="BTC-USD",
+        environment="production",
+        buy_client_order_id=vc._build_client_order_id(run_id=run_id, side="BUY"),
+        buy_provider_order_id="buy-provider-order-1",
+        buy_idempotency_key=vc._build_client_order_id(run_id=run_id, side="BUY"),
+        buy_submitted_at=datetime.now(timezone.utc) - timedelta(minutes=31),
+        buy_requested_quote_usd=Decimal("5.00"),
+        buy_filled_base_btc=Decimal("0.00005"),
+        buy_filled_quote_usd=Decimal("5.00"),
+        buy_fee_usd=Decimal("0.01"),
+        buy_avg_price_usd=Decimal("100000"),
+        buy_filled_at=datetime.now(timezone.utc) - timedelta(minutes=31),
+        hold_minutes=30,
+        hold_started_at=datetime.now(timezone.utc) - timedelta(minutes=31),
+        hold_due_at=datetime.now(timezone.utc) - timedelta(minutes=1),
+        sell_client_order_id=None,
+        sell_provider_order_id=None,
+        sell_idempotency_key=None,
+        sell_submitted_at=None,
+        sell_requested_base_btc=None,
+        state_payload={
+            "authority": {
+                "approval_event_id": str(approval_event_id),
+                "crypto_order_preview_id": str(preview_id),
+                "live_trading_profile_id": str(profile_id),
+            }
+        },
+        started_by=None,
+        started_at=datetime.now(timezone.utc) - timedelta(minutes=31),
+        updated_at=None,
+        duplicate_orders_detected=False,
+        manual_intervention_required=False,
+    )
+
+    calls = {"submit_order": 0}
+
+    async def _submit(*_args, **_kwargs):
+        calls["submit_order"] += 1
+        return "SUCCESS", None, "provider-sell-order-1", {"raw": {"ok": True}}
+
+    async def _reconcile(**_kwargs):
+        return "OPEN", None, []
+
+    async def _validate_authority(**_kwargs):
+        return None
+
+    monkeypatch.setattr(vc, "get_exchange_provider", lambda *_args, **_kwargs: SimpleNamespace())
+    monkeypatch.setattr(vc, "_submit_order", _submit)
+    monkeypatch.setattr(vc, "_reconcile_order", _reconcile)
+    monkeypatch.setattr(vc, "_validate_campaign_scoped_submission_authority", _validate_authority)
+
+    run = await vc.start_run(db=db, actor="operator:human", run_id=run_id, confirm=True)
+
+    assert calls["submit_order"] == 1
+    assert run.sell_provider_order_id == "provider-sell-order-1"
+
+
+@pytest.mark.asyncio
+async def test_start_sell_retry_does_not_duplicate_provider_order(monkeypatch: pytest.MonkeyPatch) -> None:
+    db = _FakeDb()
+    run_id = uuid.uuid4()
+    profile_id = uuid.uuid4()
+    preview_id = uuid.uuid4()
+    approval_event_id = uuid.uuid4()
+    db.connection = SimpleNamespace(provider="kraken_spot", environment="production")
+    db.profile = SimpleNamespace(
+        id=profile_id,
+        paper_account_id=uuid.uuid4(),
+        provenance_metadata={"provider": "kraken_spot", "exchange_environment": "production"},
+    )
+    db.approval_event = SimpleNamespace(
+        id=approval_event_id,
+        approval_state="approved",
+        approval_scope={},
+        expires_at=None,
+    )
+    db.preview = SimpleNamespace(
+        crypto_order_preview_id=preview_id,
+        requested_amount=Decimal("5.00"),
+        side="buy",
+        product_id="BTC-USD",
+        provider="kraken_spot",
+        environment="production",
+        live_trading_profile_id=profile_id,
+        decision_record_id=uuid.uuid4(),
+    )
+    db.run = SimpleNamespace(
+        commissioning_run_id=run_id,
+        status="SELL_DUE",
+        provider="kraken_spot",
+        product_id="BTC-USD",
+        environment="production",
+        buy_client_order_id=vc._build_client_order_id(run_id=run_id, side="BUY"),
+        buy_provider_order_id="buy-provider-order-1",
+        buy_idempotency_key=vc._build_client_order_id(run_id=run_id, side="BUY"),
+        buy_submitted_at=datetime.now(timezone.utc) - timedelta(minutes=31),
+        buy_requested_quote_usd=Decimal("5.00"),
+        buy_filled_base_btc=Decimal("0.00005"),
+        buy_filled_quote_usd=Decimal("5.00"),
+        buy_fee_usd=Decimal("0.01"),
+        buy_avg_price_usd=Decimal("100000"),
+        buy_filled_at=datetime.now(timezone.utc) - timedelta(minutes=31),
+        hold_minutes=30,
+        hold_started_at=datetime.now(timezone.utc) - timedelta(minutes=31),
+        hold_due_at=datetime.now(timezone.utc) - timedelta(minutes=1),
+        sell_client_order_id=vc._build_client_order_id(run_id=run_id, side="SELL"),
+        sell_provider_order_id="provider-sell-order-1",
+        sell_idempotency_key=vc._build_client_order_id(run_id=run_id, side="SELL"),
+        sell_submitted_at=datetime.now(timezone.utc) - timedelta(minutes=1),
+        sell_requested_base_btc=Decimal("0.00005"),
+        state_payload={
+            "authority": {
+                "approval_event_id": str(approval_event_id),
+                "crypto_order_preview_id": str(preview_id),
+                "live_trading_profile_id": str(profile_id),
+            }
+        },
+        started_by=None,
+        started_at=datetime.now(timezone.utc) - timedelta(minutes=31),
+        updated_at=None,
+        duplicate_orders_detected=False,
+        manual_intervention_required=False,
+    )
+
+    calls = {"submit_order": 0}
+
+    async def _submit(*_args, **_kwargs):
+        calls["submit_order"] += 1
+        return "SUCCESS", None, "provider-sell-order-2", {"raw": {"ok": True}}
+
+    async def _reconcile(**_kwargs):
+        return "OPEN", None, []
+
+    async def _validate_authority(**_kwargs):
+        return None
+
+    monkeypatch.setattr(vc, "get_exchange_provider", lambda *_args, **_kwargs: SimpleNamespace())
+    monkeypatch.setattr(vc, "_submit_order", _submit)
+    monkeypatch.setattr(vc, "_reconcile_order", _reconcile)
+    monkeypatch.setattr(vc, "_validate_campaign_scoped_submission_authority", _validate_authority)
+
+    run = await vc.start_run(db=db, actor="operator:human", run_id=run_id, confirm=True)
+
+    assert calls["submit_order"] == 0
+    assert run.sell_provider_order_id == "provider-sell-order-1"
 
 
 @pytest.mark.asyncio

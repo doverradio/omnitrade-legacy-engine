@@ -52,22 +52,44 @@ class _DryRunFakeDb:
 
 
 class _LiveOrderFakeDb:
-    def __init__(self, *, profile, preview, live_order=None, connection=None) -> None:
+    def __init__(self, *, profile, preview, live_order=None, connection=None, approval_event=None, campaign=None, decision_snapshot=None) -> None:
         self.profile = profile
         self.preview = preview
         self.live_order = live_order
         self.connection = connection
+        self.approval_event = approval_event
+        self.campaign = campaign
+        self.decision_snapshot = decision_snapshot
 
     async def scalar(self, statement):
         sql = str(statement)
+        params = statement.compile().params
         if "FROM live_trading_profiles" in sql:
             return self.profile
         if "FROM crypto_order_previews" in sql:
-            return self.preview
+            preview_id = params.get("crypto_order_preview_id_1")
+            if preview_id is None:
+                return self.preview
+            return self.preview if getattr(self.preview, "crypto_order_preview_id", None) == preview_id else None
         if "FROM live_crypto_orders" in sql:
             return self.live_order
         if "FROM exchange_connections" in sql:
             return self.connection
+        if "FROM live_approval_events" in sql:
+            approval_id = params.get("id_1")
+            if self.approval_event is None:
+                return None
+            return self.approval_event if getattr(self.approval_event, "id", None) == approval_id else None
+        if "FROM capital_campaigns" in sql:
+            paper_account_id = params.get("paper_account_id_1")
+            if self.campaign is None:
+                return None
+            return self.campaign if getattr(self.campaign, "paper_account_id", None) == paper_account_id else None
+        if "FROM decision_snapshots" in sql:
+            decision_id = params.get("decision_id_1")
+            if self.decision_snapshot is None:
+                return None
+            return self.decision_snapshot if getattr(self.decision_snapshot, "decision_id", None) == decision_id else None
         return None
 
     async def scalars(self, _statement):
@@ -89,8 +111,45 @@ class _ReplayDetectedDb(_FakeDb):
 
 
 class _SubmitStateDb(_LiveOrderFakeDb):
-    def __init__(self, *, profile, preview, live_order, connection) -> None:
-        super().__init__(profile=profile, preview=preview, live_order=live_order, connection=connection)
+    def __init__(self, *, profile, preview, live_order, connection, approval_event=None, campaign=None, decision_snapshot=None) -> None:
+        if not hasattr(profile, "paper_account_id"):
+            profile.paper_account_id = uuid.uuid4()
+        if not hasattr(profile, "provenance_metadata"):
+            profile.provenance_metadata = {"exchange_environment": "production", "provider": "coinbase_advanced"}
+        decision_id = getattr(preview, "decision_record_id", None)
+        if decision_id is not None and getattr(live_order, "decision_record_id", None) is None:
+            live_order.decision_record_id = decision_id
+        prepared_decision = str(live_order.safe_provider_response.get("decision_record_id") or "")
+        if decision_id is not None and not prepared_decision:
+            live_order.safe_provider_response["decision_record_id"] = str(decision_id)
+        if campaign is None:
+            campaign = _submit_campaign(paper_account_id=profile.paper_account_id)
+        if approval_event is None:
+            approval_event = _submit_approval_event(
+                approval_event_id=uuid.UUID(str(live_order.safe_provider_response["approval_event_id"])),
+                profile_id=profile.id,
+                paper_account_id=profile.paper_account_id,
+                campaign_id=campaign.uuid,
+                campaign_version=campaign.definition_version,
+                provider=getattr(preview, "provider", "coinbase_advanced"),
+                environment=getattr(preview, "environment", "production"),
+                product_id=getattr(preview, "product_id", "BTC-USD"),
+                side=getattr(preview, "side", "BUY"),
+                preview_id=preview.crypto_order_preview_id,
+                strategy_version=(decision_snapshot.strategy_version if decision_snapshot is not None else "ma_crossover@1.0.0"),
+                parameter_set_version=(decision_snapshot.parameter_set_version if decision_snapshot is not None else "param-set-v1"),
+            )
+        if decision_snapshot is None and decision_id is not None:
+            decision_snapshot = _submit_decision_snapshot(decision_id=decision_id)
+        super().__init__(
+            profile=profile,
+            preview=preview,
+            live_order=live_order,
+            connection=connection,
+            approval_event=approval_event,
+            campaign=campaign,
+            decision_snapshot=decision_snapshot,
+        )
         self.audit_logs: list[object] = []
         self.commits = 0
 
@@ -103,6 +162,61 @@ class _SubmitStateDb(_LiveOrderFakeDb):
 
 def _provider_stub(**methods):
     return SimpleNamespace(**methods)
+
+
+def _submit_campaign(*, paper_account_id: uuid.UUID) -> SimpleNamespace:
+    return SimpleNamespace(
+        uuid=uuid.uuid4(),
+        definition_version=1,
+        starting_capital=service.Decimal("25.00"),
+        paper_account_id=paper_account_id,
+    )
+
+
+def _submit_decision_snapshot(*, decision_id: uuid.UUID, strategy_version: str = "ma_crossover@1.0.0", parameter_set_version: str = "param-set-v1") -> SimpleNamespace:
+    return SimpleNamespace(
+        decision_id=decision_id,
+        strategy_version=strategy_version,
+        parameter_set_version=parameter_set_version,
+    )
+
+
+def _submit_approval_event(
+    *,
+    approval_event_id: uuid.UUID,
+    profile_id: uuid.UUID,
+    paper_account_id: uuid.UUID,
+    campaign_id: uuid.UUID,
+    campaign_version: int,
+    provider: str,
+    environment: str,
+    product_id: str,
+    side: str,
+    preview_id: uuid.UUID,
+    strategy_version: str,
+    parameter_set_version: str,
+) -> SimpleNamespace:
+    return SimpleNamespace(
+        id=approval_event_id,
+        approval_state="approved",
+        expires_at=datetime(2030, 1, 1, tzinfo=timezone.utc),
+        approval_scope={
+            "product": product_id,
+            "side": side,
+            "max_order_usd": "5",
+            "provider": provider,
+            "environment": environment,
+            "live_trading_profile_id": str(profile_id),
+            "paper_account_id": str(paper_account_id),
+            "capital_campaign_id": str(campaign_id),
+            "capital_campaign_version": campaign_version,
+            "max_total_deployed_campaign_capital_usd": "25.00",
+            "strategy_version": strategy_version,
+            "parameter_set_version": parameter_set_version,
+            "crypto_order_preview_id": str(preview_id),
+            "no_leverage": True,
+        },
+    )
 
 
 @pytest.mark.asyncio
@@ -1048,22 +1162,40 @@ def test_safe_request_summary_redacts_nested_provider_secrets() -> None:
     assert provider_preview["list"][1]["signature"] == "[REDACTED]"
 
 
-def _submit_live_order(*, status: str = "PENDING_CONFIRMATION"):
+def _submit_live_order(
+    *,
+    status: str = "PENDING_CONFIRMATION",
+    preview_id: uuid.UUID | None = None,
+    exchange_connection_id: uuid.UUID | None = None,
+    decision_record_id: uuid.UUID | None = None,
+    risk_event_id: uuid.UUID | None = None,
+    approval_event_id: uuid.UUID | None = None,
+    provider: str = "coinbase_advanced",
+    environment: str = "production",
+    product_id: str = "BTC-USD",
+    side: str = "BUY",
+    requested_quote_size: service.Decimal = service.Decimal("5.00"),
+):
     now = datetime(2026, 7, 9, 12, 0, tzinfo=timezone.utc)
+    resolved_preview_id = preview_id or uuid.uuid4()
+    resolved_connection_id = exchange_connection_id or uuid.uuid4()
+    resolved_decision_id = decision_record_id
+    resolved_risk_event_id = risk_event_id or uuid.uuid4()
+    resolved_approval_event_id = approval_event_id or uuid.uuid4()
     return SimpleNamespace(
         live_crypto_order_id=uuid.uuid4(),
-        crypto_order_preview_id=uuid.uuid4(),
-        exchange_connection_id=uuid.uuid4(),
-        provider="coinbase_advanced",
-        environment="production",
-        product_id="BTC-USD",
-        side="BUY",
+        crypto_order_preview_id=resolved_preview_id,
+        exchange_connection_id=resolved_connection_id,
+        provider=provider,
+        environment=environment,
+        product_id=product_id,
+        side=side,
         order_type="MARKET",
-        requested_quote_size=service.Decimal("5.00"),
+        requested_quote_size=requested_quote_size,
         client_order_id="stable-client-order-id",
         status=status,
-        risk_event_id=uuid.uuid4(),
-        decision_record_id=None,
+        risk_event_id=resolved_risk_event_id,
+        decision_record_id=resolved_decision_id,
         validation_run_id=None,
         provider_order_id=None,
         provider_status=None,
@@ -1075,7 +1207,11 @@ def _submit_live_order(*, status: str = "PENDING_CONFIRMATION"):
         failure_reason=None,
         safe_provider_response={
             "prepared_by": "operator:human",
-            "approval_event_id": str(uuid.uuid4()),
+            "approval_event_id": str(resolved_approval_event_id),
+            "risk_event_id": str(resolved_risk_event_id),
+            "crypto_order_preview_id": str(resolved_preview_id),
+            "decision_record_id": "" if resolved_decision_id is None else str(resolved_decision_id),
+            "approved_quote_size": format(requested_quote_size, "f"),
             "confirmation_expires_at": (now + timedelta(minutes=1)).isoformat(),
             "approved_intent_fingerprint": "intent-fingerprint",
             "evidence_fingerprint": "evidence-fingerprint",
@@ -1088,32 +1224,114 @@ def _submit_live_order(*, status: str = "PENDING_CONFIRMATION"):
     )
 
 
-def _submit_preview(*, live_trading_profile_id: uuid.UUID, crypto_order_preview_id: uuid.UUID, exchange_connection_id: uuid.UUID):
+def _submit_preview(
+    *,
+    live_trading_profile_id: uuid.UUID,
+    crypto_order_preview_id: uuid.UUID,
+    exchange_connection_id: uuid.UUID,
+    decision_record_id: uuid.UUID | None = None,
+    provider: str = "coinbase_advanced",
+    environment: str = "production",
+    product_id: str = "BTC-USD",
+    side: str = "BUY",
+):
     now = datetime(2026, 7, 9, 12, 0, tzinfo=timezone.utc)
+    resolved_decision_id = decision_record_id or uuid.uuid4()
     return SimpleNamespace(
         crypto_order_preview_id=crypto_order_preview_id,
         live_trading_profile_id=live_trading_profile_id,
         exchange_connection_id=exchange_connection_id,
-        provider="coinbase_advanced",
-        environment="production",
-        product_id="BTC-USD",
-        side="BUY",
+        provider=provider,
+        environment=environment,
+        product_id=product_id,
+        side=side,
         order_type="MARKET",
         requested_amount=service.Decimal("5.00"),
+        decision_record_id=resolved_decision_id,
         created_at=now - timedelta(seconds=1),
     )
 
 
-def _submit_connection(*, exchange_connection_id: uuid.UUID):
+def _submit_connection(*, exchange_connection_id: uuid.UUID, provider: str = "coinbase_advanced", environment: str = "production"):
     now = datetime(2026, 7, 9, 12, 0, tzinfo=timezone.utc)
     return SimpleNamespace(
         exchange_connection_id=exchange_connection_id,
+        provider=provider,
+        environment=environment,
+        credentials_valid=True,
+        api_permissions=["view", "trade"],
         last_verified_at=now - timedelta(seconds=1),
         last_successful_sync_at=now - timedelta(seconds=1),
         last_heartbeat_at=now - timedelta(seconds=1),
         balances=[{"currency": "USD", "available": "10.00"}],
         credentials_encrypted="{}",
     )
+
+
+def _submit_settings() -> SimpleNamespace:
+    return SimpleNamespace(
+        live_crypto_order_submission_enabled=True,
+        live_crypto_preview_max_age_seconds=30,
+        live_crypto_readiness_max_age_seconds=60,
+        live_crypto_balance_max_age_seconds=30,
+        live_crypto_price_max_age_seconds=30,
+        live_crypto_max_order_usd=service.Decimal("5"),
+    )
+
+
+def _submit_authority_fixture() -> tuple[SimpleNamespace, SimpleNamespace, SimpleNamespace, SimpleNamespace, SimpleNamespace, SimpleNamespace, _SubmitStateDb]:
+    profile = SimpleNamespace(
+        id=uuid.uuid4(),
+        paper_account_id=uuid.uuid4(),
+        provenance_metadata={"exchange_environment": "production", "provider": "coinbase_advanced"},
+    )
+    decision_id = uuid.uuid4()
+    preview_id = uuid.uuid4()
+    exchange_connection_id = uuid.uuid4()
+    approval_event_id = uuid.uuid4()
+    risk_event_id = uuid.uuid4()
+    live_order = _submit_live_order(
+        status="PENDING_CONFIRMATION",
+        preview_id=preview_id,
+        exchange_connection_id=exchange_connection_id,
+        decision_record_id=decision_id,
+        risk_event_id=risk_event_id,
+        approval_event_id=approval_event_id,
+        requested_quote_size=service.Decimal("5.00"),
+    )
+    preview = _submit_preview(
+        live_trading_profile_id=profile.id,
+        crypto_order_preview_id=preview_id,
+        exchange_connection_id=exchange_connection_id,
+        decision_record_id=decision_id,
+    )
+    connection = _submit_connection(exchange_connection_id=exchange_connection_id)
+    campaign = _submit_campaign(paper_account_id=profile.paper_account_id)
+    decision_snapshot = _submit_decision_snapshot(decision_id=decision_id)
+    approval_event = _submit_approval_event(
+        approval_event_id=approval_event_id,
+        profile_id=profile.id,
+        paper_account_id=profile.paper_account_id,
+        campaign_id=campaign.uuid,
+        campaign_version=campaign.definition_version,
+        provider=preview.provider,
+        environment=preview.environment,
+        product_id=preview.product_id,
+        side=preview.side,
+        preview_id=preview.crypto_order_preview_id,
+        strategy_version=decision_snapshot.strategy_version,
+        parameter_set_version=decision_snapshot.parameter_set_version,
+    )
+    db = _SubmitStateDb(
+        profile=profile,
+        preview=preview,
+        live_order=live_order,
+        connection=connection,
+        approval_event=approval_event,
+        campaign=campaign,
+        decision_snapshot=decision_snapshot,
+    )
+    return profile, live_order, preview, connection, campaign, approval_event, db
 
 
 @pytest.mark.asyncio
@@ -1366,6 +1584,255 @@ async def test_submit_does_not_use_new_client_token_as_provider_identity(monkeyp
 
     assert seen["idempotency_key"] == live_order.client_order_id
     assert response.live_crypto_order.status == "ACKNOWLEDGED"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "case,reason_substring,mutate",
+    [
+        (
+            "campaign_id_mismatch",
+            "campaign identity mismatch",
+            lambda fixture: fixture[5].approval_scope.__setitem__("capital_campaign_id", str(uuid.uuid4())),
+        ),
+        (
+            "campaign_version_mismatch",
+            "campaign version mismatch",
+            lambda fixture: fixture[5].approval_scope.__setitem__("capital_campaign_version", 999),
+        ),
+        (
+            "strategy_version_mismatch",
+            "strategy version mismatch",
+            lambda fixture: fixture[5].approval_scope.__setitem__("strategy_version", "other@9.9.9"),
+        ),
+        (
+            "parameter_set_version_mismatch",
+            "parameter set version mismatch",
+            lambda fixture: fixture[5].approval_scope.__setitem__("parameter_set_version", "other-param"),
+        ),
+        (
+            "preview_identity_mismatch",
+            "preview identity mismatch",
+            lambda fixture: fixture[5].approval_scope.__setitem__("crypto_order_preview_id", str(uuid.uuid4())),
+        ),
+        (
+            "live_profile_mismatch",
+            "live trading profile mismatch",
+            lambda fixture: fixture[5].approval_scope.__setitem__("live_trading_profile_id", str(uuid.uuid4())),
+        ),
+        (
+            "provider_mismatch",
+            "provider",
+            lambda fixture: fixture[5].approval_scope.__setitem__("provider", "kraken_spot"),
+        ),
+        (
+            "environment_mismatch",
+            "environment",
+            lambda fixture: fixture[5].approval_scope.__setitem__("environment", "sandbox"),
+        ),
+        (
+            "product_mismatch",
+            "product mismatch",
+            lambda fixture: fixture[5].approval_scope.__setitem__("product", "ETH-USD"),
+        ),
+        (
+            "max_order_exceeded",
+            "max order amount exceeded",
+            lambda fixture: fixture[5].approval_scope.__setitem__("max_order_usd", "4.99"),
+        ),
+        (
+            "leverage_requested",
+            "leverage boundary violated",
+            lambda fixture: fixture[5].approval_scope.__setitem__("no_leverage", False),
+        ),
+        (
+            "campaign_identity_missing",
+            "lacks campaign identity",
+            lambda fixture: fixture[5].approval_scope.pop("capital_campaign_id"),
+        ),
+        (
+            "strategy_identity_missing",
+            "lacks strategy identity",
+            lambda fixture: fixture[5].approval_scope.pop("strategy_version"),
+        ),
+        (
+            "parameter_identity_missing",
+            "lacks parameter identity",
+            lambda fixture: fixture[5].approval_scope.pop("parameter_set_version"),
+        ),
+    ],
+)
+async def test_submit_blocks_on_campaign_scoped_authority_mismatch_without_provider_call(
+    monkeypatch: pytest.MonkeyPatch,
+    case: str,
+    reason_substring: str,
+    mutate,
+) -> None:
+    fixture = _submit_authority_fixture()
+    _profile, live_order, _preview, _connection, _campaign, _approval_event, db = fixture
+    mutate(fixture)
+
+    calls = {"create_order": 0}
+
+    async def _create_order(*_args, **_kwargs):
+        calls["create_order"] += 1
+        return {"success": True, "success_response": {"order_id": "provider-order-1", "status": "OPEN"}}, {}
+
+    monkeypatch.setattr(service, "get_settings", _submit_settings)
+    monkeypatch.setattr(service, "_utcnow", lambda: datetime(2026, 7, 9, 12, 0, tzinfo=timezone.utc))
+    monkeypatch.setattr(service, "_build_intent_fingerprint", lambda **_kwargs: "intent-fingerprint")
+    monkeypatch.setattr(service, "_build_evidence_fingerprint", lambda **_kwargs: "evidence-fingerprint")
+    monkeypatch.setattr(service, "_load_decrypted_credentials", lambda _connection: {"api_key": "key", "api_secret": "secret"})
+    monkeypatch.setattr(service, "get_exchange_provider", lambda *_args, **_kwargs: _provider_stub(create_order=_create_order))
+
+    with pytest.raises(PermissionError, match=reason_substring):
+        await service.service.submit(
+            db=db,
+            request=service.LiveCryptoOrderSubmitRequest(
+                live_crypto_order_id=live_order.live_crypto_order_id,
+                confirmation_challenge_id=live_order.operator_confirmation_id,
+                confirmation_phrase="BUY BTC",
+                operator_identity="operator:human",
+                idempotency_token=f"token-{case}",
+            ),
+        )
+
+    assert calls["create_order"] == 0
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "case,reason_substring,mutate",
+    [
+        (
+            "risk_event_id_mismatch",
+            "prepared risk event identity mismatch",
+            lambda fixture: fixture[1].safe_provider_response.__setitem__("risk_event_id", str(uuid.uuid4())),
+        ),
+        (
+            "decision_record_id_mismatch",
+            "decision record identity mismatch",
+            lambda fixture: fixture[1].safe_provider_response.__setitem__("decision_record_id", str(uuid.uuid4())),
+        ),
+        (
+            "prepared_preview_id_mismatch",
+            "prepared preview identity mismatch",
+            lambda fixture: fixture[1].safe_provider_response.__setitem__("crypto_order_preview_id", str(uuid.uuid4())),
+        ),
+        (
+            "approved_amount_mismatch",
+            "prepared approved amount mismatch",
+            lambda fixture: fixture[1].safe_provider_response.__setitem__("approved_quote_size", "4.99"),
+        ),
+    ],
+)
+async def test_submit_blocks_on_risk_or_identity_mismatch_without_provider_call(
+    monkeypatch: pytest.MonkeyPatch,
+    case: str,
+    reason_substring: str,
+    mutate,
+) -> None:
+    fixture = _submit_authority_fixture()
+    _profile, live_order, _preview, _connection, _campaign, _approval_event, db = fixture
+    mutate(fixture)
+
+    calls = {"create_order": 0}
+
+    async def _create_order(*_args, **_kwargs):
+        calls["create_order"] += 1
+        return {"success": True, "success_response": {"order_id": "provider-order-1", "status": "OPEN"}}, {}
+
+    monkeypatch.setattr(service, "get_settings", _submit_settings)
+    monkeypatch.setattr(service, "_utcnow", lambda: datetime(2026, 7, 9, 12, 0, tzinfo=timezone.utc))
+    monkeypatch.setattr(service, "_build_intent_fingerprint", lambda **_kwargs: "intent-fingerprint")
+    monkeypatch.setattr(service, "_build_evidence_fingerprint", lambda **_kwargs: "evidence-fingerprint")
+    monkeypatch.setattr(service, "_load_decrypted_credentials", lambda _connection: {"api_key": "key", "api_secret": "secret"})
+    monkeypatch.setattr(service, "get_exchange_provider", lambda *_args, **_kwargs: _provider_stub(create_order=_create_order))
+
+    with pytest.raises(PermissionError, match=reason_substring):
+        await service.service.submit(
+            db=db,
+            request=service.LiveCryptoOrderSubmitRequest(
+                live_crypto_order_id=live_order.live_crypto_order_id,
+                confirmation_challenge_id=live_order.operator_confirmation_id,
+                confirmation_phrase="BUY BTC",
+                operator_identity="operator:human",
+                idempotency_token=f"token-risk-{case}",
+            ),
+        )
+
+    assert calls["create_order"] == 0
+
+
+@pytest.mark.asyncio
+async def test_submit_allows_exact_campaign_scoped_authority_and_calls_provider_once(monkeypatch: pytest.MonkeyPatch) -> None:
+    fixture = _submit_authority_fixture()
+    _profile, live_order, _preview, _connection, _campaign, _approval_event, db = fixture
+    calls = {"create_order": 0, "payload_quote_size": None, "idempotency_key": None}
+
+    async def _create_order(*_args, **kwargs):
+        calls["create_order"] += 1
+        calls["payload_quote_size"] = kwargs["request_payload"]["order_configuration"]["market_market_ioc"]["quote_size"]
+        calls["idempotency_key"] = kwargs["idempotency_key"]
+        return {"success": True, "success_response": {"order_id": "provider-order-1", "status": "OPEN"}}, {"x-request-id": "ok"}
+
+    monkeypatch.setattr(service, "get_settings", _submit_settings)
+    monkeypatch.setattr(service, "_utcnow", lambda: datetime(2026, 7, 9, 12, 0, tzinfo=timezone.utc))
+    monkeypatch.setattr(service, "_build_intent_fingerprint", lambda **_kwargs: "intent-fingerprint")
+    monkeypatch.setattr(service, "_build_evidence_fingerprint", lambda **_kwargs: "evidence-fingerprint")
+    monkeypatch.setattr(service, "_load_decrypted_credentials", lambda _connection: {"api_key": "key", "api_secret": "secret"})
+    monkeypatch.setattr(service, "get_exchange_provider", lambda *_args, **_kwargs: _provider_stub(create_order=_create_order))
+
+    response = await service.service.submit(
+        db=db,
+        request=service.LiveCryptoOrderSubmitRequest(
+            live_crypto_order_id=live_order.live_crypto_order_id,
+            confirmation_challenge_id=live_order.operator_confirmation_id,
+            confirmation_phrase="BUY BTC",
+            operator_identity="operator:human",
+            idempotency_token="token-scope-match",
+        ),
+    )
+
+    assert calls["create_order"] == 1
+    assert calls["idempotency_key"] == live_order.client_order_id
+    assert service.Decimal(str(calls["payload_quote_size"])) == live_order.requested_quote_size
+    assert response.live_crypto_order.status == "ACKNOWLEDGED"
+
+
+@pytest.mark.asyncio
+async def test_submit_blocks_when_requested_amount_precision_could_expand_order(monkeypatch: pytest.MonkeyPatch) -> None:
+    fixture = _submit_authority_fixture()
+    _profile, live_order, _preview, _connection, _campaign, _approval_event, db = fixture
+    live_order.requested_quote_size = service.Decimal("5.001")
+    live_order.safe_provider_response["approved_quote_size"] = "5.001"
+
+    calls = {"create_order": 0}
+
+    async def _create_order(*_args, **_kwargs):
+        calls["create_order"] += 1
+        return {"success": True, "success_response": {"order_id": "provider-order-1", "status": "OPEN"}}, {}
+
+    monkeypatch.setattr(service, "get_settings", _submit_settings)
+    monkeypatch.setattr(service, "_utcnow", lambda: datetime(2026, 7, 9, 12, 0, tzinfo=timezone.utc))
+    monkeypatch.setattr(service, "_build_intent_fingerprint", lambda **_kwargs: "intent-fingerprint")
+    monkeypatch.setattr(service, "_build_evidence_fingerprint", lambda **_kwargs: "evidence-fingerprint")
+    monkeypatch.setattr(service, "_load_decrypted_credentials", lambda _connection: {"api_key": "key", "api_secret": "secret"})
+    monkeypatch.setattr(service, "get_exchange_provider", lambda *_args, **_kwargs: _provider_stub(create_order=_create_order))
+
+    with pytest.raises(ValueError, match="precision"):
+        await service.service.submit(
+            db=db,
+            request=service.LiveCryptoOrderSubmitRequest(
+                live_crypto_order_id=live_order.live_crypto_order_id,
+                confirmation_challenge_id=live_order.operator_confirmation_id,
+                confirmation_phrase="BUY BTC",
+                operator_identity="operator:human",
+                idempotency_token="token-precision",
+            ),
+        )
+
+    assert calls["create_order"] == 0
 
 
 @pytest.mark.asyncio

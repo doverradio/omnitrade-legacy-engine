@@ -20,6 +20,7 @@ from app.models.live_crypto_order import LiveCryptoOrder
 from app.models.live_approval_event import LiveApprovalEvent
 from app.models.live_trading_event import LiveTradingEvent
 from app.models.live_trading_profile import LiveTradingProfile
+from app.models.decision_snapshot import DecisionSnapshot
 from app.models.paper_account import PaperAccount
 from app.models.risk_kill_switch import RiskKillSwitch
 from app.models.risk_event import RiskEvent
@@ -249,6 +250,30 @@ async def _load_active_campaign_for_account(*, db: AsyncSession, paper_account_i
     )
 
 
+async def _load_preview_decision_identity(*, db: AsyncSession, preview_id: uuid.UUID) -> dict[str, str] | None:
+    preview = await db.scalar(
+        select(CryptoOrderPreview)
+        .where(CryptoOrderPreview.crypto_order_preview_id == preview_id)
+        .limit(1)
+    )
+    decision_record_id = getattr(preview, "decision_record_id", None) if preview is not None else None
+    if preview is None or decision_record_id is None:
+        return None
+    decision_snapshot = await db.scalar(
+        select(DecisionSnapshot)
+        .where(DecisionSnapshot.decision_id == decision_record_id)
+        .limit(1)
+    )
+    if decision_snapshot is None:
+        return None
+    return {
+        "crypto_order_preview_id": str(preview.crypto_order_preview_id),
+        "decision_record_id": str(decision_record_id),
+        "strategy_version": str(getattr(decision_snapshot, "strategy_version", "unknown") or "unknown"),
+        "parameter_set_version": str(getattr(decision_snapshot, "parameter_set_version", "unknown") or "unknown"),
+    }
+
+
 async def _load_kill_switch_state(*, db: AsyncSession, scope: str, account_id: uuid.UUID | None) -> RiskKillSwitch:
     switch = await db.scalar(
         select(RiskKillSwitch)
@@ -320,6 +345,166 @@ def _build_evidence_fingerprint(*, preview: CryptoOrderPreview, connection: Exch
             "heartbeat_at": None if connection.last_heartbeat_at is None else connection.last_heartbeat_at.isoformat(),
         }
     )
+
+
+def _approval_scope_required_text(
+    approval_scope: dict[str, Any],
+    *,
+    key: str,
+    reason: str,
+) -> str:
+    value = approval_scope.get(key)
+    normalized = str(value or "").strip()
+    if not normalized:
+        raise PermissionError(reason)
+    return normalized
+
+
+async def _validate_campaign_scoped_submission_authority(
+    *,
+    db: AsyncSession,
+    approval_event_id: uuid.UUID,
+    profile: LiveTradingProfile,
+    preview: CryptoOrderPreview,
+    connection: ExchangeConnection,
+    requested_quote_size: Decimal,
+) -> None:
+    approval_event = await db.scalar(
+        select(LiveApprovalEvent)
+        .where(LiveApprovalEvent.id == approval_event_id)
+        .limit(1)
+    )
+    if approval_event is None:
+        raise PermissionError("approval event evidence missing")
+    if approval_event.approval_state != "approved":
+        raise PermissionError("approval not active")
+    if approval_event.expires_at is not None and approval_event.expires_at <= _utcnow():
+        raise PermissionError("approval expired")
+
+    preview_environment = _normalize_exchange_environment(str(getattr(preview, "environment", "production")))
+    provider = _effective_live_provider(profile=profile, preview=preview, connection=connection)
+    if _approval_environment(approval_event) != preview_environment:
+        raise PermissionError("approval environment does not match preview environment")
+    if _approval_provider(approval_event) != provider:
+        raise PermissionError("approval provider does not match preview provider")
+
+    approval_scope = approval_event.approval_scope if isinstance(approval_event.approval_scope, dict) else {}
+    if not approval_scope:
+        raise PermissionError("approval scope missing")
+
+    live_profile_scope = _approval_scope_required_text(
+        approval_scope,
+        key="live_trading_profile_id",
+        reason="approval scope lacks live trading profile identity",
+    )
+    if live_profile_scope != str(profile.id):
+        raise PermissionError("approval live trading profile mismatch")
+
+    paper_account_scope = _approval_scope_required_text(
+        approval_scope,
+        key="paper_account_id",
+        reason="approval scope lacks paper account identity",
+    )
+    if paper_account_scope != str(profile.paper_account_id):
+        raise PermissionError("approval paper account mismatch")
+
+    product_scope = _approval_scope_required_text(
+        approval_scope,
+        key="product",
+        reason="approval scope lacks product identity",
+    )
+    if product_scope != preview.product_id:
+        raise PermissionError("approval product mismatch")
+
+    side_scope = _approval_scope_required_text(
+        approval_scope,
+        key="side",
+        reason="approval scope lacks side identity",
+    )
+    if side_scope != preview.side:
+        raise PermissionError("approval side mismatch")
+
+    provider_scope = _approval_scope_required_text(
+        approval_scope,
+        key="provider",
+        reason="approval scope lacks provider identity",
+    )
+    if provider_scope != provider:
+        raise PermissionError("approval provider mismatch")
+
+    environment_scope = _approval_scope_required_text(
+        approval_scope,
+        key="environment",
+        reason="approval scope lacks environment identity",
+    )
+    if environment_scope != preview_environment:
+        raise PermissionError("approval environment mismatch")
+
+    campaign = await _load_active_campaign_for_account(db=db, paper_account_id=profile.paper_account_id)
+    if campaign is None:
+        raise PermissionError("capital campaign evidence missing")
+
+    campaign_scope = _approval_scope_required_text(
+        approval_scope,
+        key="capital_campaign_id",
+        reason="approval scope lacks campaign identity",
+    )
+    if campaign_scope != str(campaign.uuid):
+        raise PermissionError("approval campaign identity mismatch")
+
+    campaign_version_scope = _approval_scope_required_text(
+        approval_scope,
+        key="capital_campaign_version",
+        reason="approval scope lacks campaign version",
+    )
+    if campaign_version_scope != str(campaign.definition_version):
+        raise PermissionError("approval campaign version mismatch")
+
+    preview_identity = await _load_preview_decision_identity(db=db, preview_id=preview.crypto_order_preview_id)
+    if preview_identity is None:
+        raise PermissionError("preview decision identity evidence missing")
+
+    strategy_scope = _approval_scope_required_text(
+        approval_scope,
+        key="strategy_version",
+        reason="approval scope lacks strategy identity",
+    )
+    if strategy_scope != preview_identity["strategy_version"]:
+        raise PermissionError("approval strategy version mismatch")
+
+    parameter_scope = _approval_scope_required_text(
+        approval_scope,
+        key="parameter_set_version",
+        reason="approval scope lacks parameter identity",
+    )
+    if parameter_scope != preview_identity["parameter_set_version"]:
+        raise PermissionError("approval parameter set version mismatch")
+
+    preview_scope = _approval_scope_required_text(
+        approval_scope,
+        key="crypto_order_preview_id",
+        reason="approval scope lacks preview identity",
+    )
+    if preview_scope != str(preview.crypto_order_preview_id):
+        raise PermissionError("approval preview identity mismatch")
+
+    if approval_scope.get("no_leverage") is not True:
+        raise PermissionError("approval leverage boundary violated")
+
+    max_order_scope = _approval_scope_required_text(
+        approval_scope,
+        key="max_order_usd",
+        reason="approval scope lacks max order amount",
+    )
+    max_order_usd = Decimal(max_order_scope)
+    if requested_quote_size > max_order_usd:
+        raise PermissionError("approval max order amount exceeded")
+
+    campaign_capital = approval_scope.get("max_total_deployed_campaign_capital_usd")
+    if campaign_capital is not None and str(campaign_capital).strip():
+        campaign_capital_limit = Decimal(str(campaign_capital))
+        if requested_quote_size > campaign_capital_limit:
+            raise PermissionError("approval campaign capital boundary violated")
 
 
 async def _audit_guard_failure(
@@ -675,6 +860,47 @@ async def _evaluate_live_preflight_guards(
         raise PermissionError("approval environment does not match preview environment")
     if approval_event is not None and _approval_provider(approval_event) != _effective_live_provider(profile=profile, preview=preview, connection=connection):
         raise PermissionError("approval provider does not match preview provider")
+
+    if require_submission_enabled and approval_event is not None:
+        approval_scope = approval_event.approval_scope if isinstance(approval_event.approval_scope, dict) else {}
+        paper_account_id = getattr(profile, "paper_account_id", None)
+        preview_campaign = await _load_active_campaign_for_account(db=db, paper_account_id=paper_account_id) if paper_account_id is not None else None
+        preview_identity = await _load_preview_decision_identity(db=db, preview_id=preview.crypto_order_preview_id) if paper_account_id is not None else None
+        if paper_account_id is not None and preview_identity is None:
+            raise PermissionError("preview decision identity evidence missing")
+        if str(approval_scope.get("live_trading_profile_id") or "") != str(profile.id):
+            raise PermissionError("approval live trading profile mismatch")
+        if paper_account_id is not None and str(approval_scope.get("paper_account_id") or "") != str(paper_account_id):
+            raise PermissionError("approval paper account mismatch")
+        if str(approval_scope.get("product") or "") != preview.product_id:
+            raise PermissionError("approval product mismatch")
+        if str(approval_scope.get("side") or "") != preview.side:
+            raise PermissionError("approval side mismatch")
+        if str(approval_scope.get("provider") or "") != _effective_live_provider(profile=profile, preview=preview, connection=connection):
+            raise PermissionError("approval provider does not match preview provider")
+        if str(approval_scope.get("environment") or "") != preview_environment:
+            raise PermissionError("approval environment does not match preview environment")
+        if preview_campaign is not None and paper_account_id is not None:
+            if str(approval_scope.get("capital_campaign_id") or "") != str(preview_campaign.uuid):
+                raise PermissionError("approval campaign identity mismatch")
+            if str(approval_scope.get("capital_campaign_version") or "") != str(preview_campaign.definition_version):
+                raise PermissionError("approval campaign version mismatch")
+            if preview_identity is not None and str(approval_scope.get("strategy_version") or "") != preview_identity["strategy_version"]:
+                raise PermissionError("approval strategy version mismatch")
+            if preview_identity is not None and str(approval_scope.get("parameter_set_version") or "") != preview_identity["parameter_set_version"]:
+                raise PermissionError("approval parameter set version mismatch")
+            if str(approval_scope.get("crypto_order_preview_id") or "") != str(preview.crypto_order_preview_id):
+                raise PermissionError("approval preview identity mismatch")
+            campaign_capital = approval_scope.get("max_total_deployed_campaign_capital_usd")
+            if campaign_capital is not None:
+                campaign_capital_limit = Decimal(str(campaign_capital))
+                if requested_quote_size > campaign_capital_limit:
+                    raise PermissionError("approval campaign capital boundary violated")
+        max_order_usd = Decimal(str(approval_scope.get("max_order_usd") or settings.live_crypto_max_order_usd))
+        if requested_quote_size > max_order_usd:
+            raise PermissionError("approval max order amount exceeded")
+        if approval_scope.get("no_leverage") is not True:
+            raise PermissionError("approval leverage boundary violated")
 
     guard_result = await evaluate_live_submission_guard(
         db=db,
@@ -1107,6 +1333,10 @@ class LiveCryptoOrderService:
             **live_crypto_order.safe_provider_response,
             "prepared_by": request.operator_identity,
             "approval_event_id": str(approval_event_id),
+            "risk_event_id": str(risk_event_id),
+            "crypto_order_preview_id": str(preview.crypto_order_preview_id),
+            "decision_record_id": None if getattr(preview, "decision_record_id", None) is None else str(getattr(preview, "decision_record_id", None)),
+            "approved_quote_size": format(approved_quote_size, "f"),
             "confirmation_expires_at": confirmation_expires_at.isoformat(),
             "approved_intent_fingerprint": str(preflight["approved_intent_fingerprint"]),
             "evidence_fingerprint": str(preflight["evidence_fingerprint"]),
@@ -1481,27 +1711,53 @@ class LiveCryptoOrderService:
         approval_event_id = live_order.safe_provider_response.get("approval_event_id")
         if approval_event_id is None:
             raise PermissionError("approval binding missing")
+        approval_event_uuid = uuid.UUID(str(approval_event_id))
         approved_intent_fingerprint = live_order.safe_provider_response.get("approved_intent_fingerprint")
         expected_intent_fingerprint = _build_intent_fingerprint(
             preview=preview,
             operator_identity=request.operator_identity,
             requested_quote_size=live_order.requested_quote_size,
-            approval_event_id=uuid.UUID(str(approval_event_id)),
+            approval_event_id=approval_event_uuid,
         )
         if approved_intent_fingerprint != expected_intent_fingerprint:
             raise PermissionError("approved intent fingerprint mismatch")
         if live_order.safe_provider_response.get("evidence_fingerprint") != _build_evidence_fingerprint(preview=preview, connection=connection):
             raise PermissionError("approval evidence fingerprint mismatch")
 
-        _risk_event, risk_action, approved_quote_size, risk_event_id = await _build_real_risk_context(
+        await _validate_campaign_scoped_submission_authority(
             db=db,
+            approval_event_id=approval_event_uuid,
             profile=profile,
             preview=preview,
             connection=connection,
-            operator_identity=request.operator_identity,
+            requested_quote_size=live_order.requested_quote_size,
         )
-        if approved_quote_size != live_order.requested_quote_size:
-            raise PermissionError("approved order intent no longer matches current risk-approved sizing")
+
+        prepared_preview_id = str(live_order.safe_provider_response.get("crypto_order_preview_id") or "")
+        if prepared_preview_id != str(live_order.crypto_order_preview_id):
+            raise PermissionError("prepared preview identity mismatch")
+
+        prepared_decision_record_id = str(live_order.safe_provider_response.get("decision_record_id") or "")
+        expected_decision_record_id = "" if getattr(preview, "decision_record_id", None) is None else str(getattr(preview, "decision_record_id", None))
+        if expected_decision_record_id and prepared_decision_record_id != expected_decision_record_id:
+            raise PermissionError("prepared decision record identity mismatch")
+        if live_order.decision_record_id != getattr(preview, "decision_record_id", None):
+            raise PermissionError("live order decision identity mismatch")
+
+        prepared_risk_event_id = str(live_order.safe_provider_response.get("risk_event_id") or "")
+        if not prepared_risk_event_id:
+            raise PermissionError("prepared risk event identity missing")
+        if live_order.risk_event_id is None or prepared_risk_event_id != str(live_order.risk_event_id):
+            raise PermissionError("prepared risk event identity mismatch")
+        risk_event_id = live_order.risk_event_id
+
+        prepared_approved_quote_size = str(live_order.safe_provider_response.get("approved_quote_size") or "")
+        if not prepared_approved_quote_size:
+            raise PermissionError("prepared approved amount missing")
+        if _decimal(prepared_approved_quote_size) != live_order.requested_quote_size:
+            raise PermissionError("prepared approved amount mismatch")
+        approved_quote_size = live_order.requested_quote_size
+        risk_action = RiskDecisionAction.APPROVE
 
         live_order.status = "SUBMISSION_PENDING"
         live_order.submitted_at = _utcnow()
@@ -1551,6 +1807,11 @@ class LiveCryptoOrderService:
                 }
             },
         }
+        payload_quote_size = _decimal(
+            request_payload["order_configuration"]["market_market_ioc"]["quote_size"]
+        )
+        if payload_quote_size != approved_quote_size:
+            raise PermissionError("provider payload amount mismatch with approved amount")
         if hasattr(provider, "submit_order"):
             submission = await provider.submit_order(
                 credentials=connection_credentials,
@@ -1862,7 +2123,7 @@ class LiveCryptoOrderService:
             client_order_id=client_order_id,
             status="PENDING_CONFIRMATION",
             risk_event_id=risk_event_id,
-            decision_record_id=None,
+            decision_record_id=getattr(preview, "decision_record_id", None),
             validation_run_id=None,
             provider_order_id=None,
             provider_status=None,

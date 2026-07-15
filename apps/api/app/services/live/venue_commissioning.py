@@ -6,13 +6,16 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal, ROUND_DOWN
 from typing import Any
+from types import SimpleNamespace
 
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import get_settings
 from app.models.audit_log import AuditLog
+from app.models.crypto_order_preview import CryptoOrderPreview
 from app.models.exchange_connection import ExchangeConnection
+from app.models.live_approval_event import LiveApprovalEvent
 from app.models.live_crypto_order import LiveCryptoOrder
 from app.models.live_trading_profile import LiveTradingProfile
 from app.models.risk_kill_switch import RiskKillSwitch
@@ -27,6 +30,7 @@ from app.services.exchange_connections.providers.registry import (
     get_exchange_provider,
     require_provider_capabilities,
 )
+from app.services.live_crypto_orders import _validate_campaign_scoped_submission_authority
 
 
 logger = logging.getLogger(__name__)
@@ -175,6 +179,35 @@ def _mark_manual_review(*, run: VenueCommissioningRun) -> None:
 
 def _is_explicitly_started(run: VenueCommissioningRun) -> bool:
     return run.activated_at is not None and run.started_at is not None
+
+
+def _authority_state(run: VenueCommissioningRun) -> dict[str, Any]:
+    payload = run.state_payload if isinstance(run.state_payload, dict) else {}
+    authority = payload.get("authority")
+    if not isinstance(authority, dict) or not authority:
+        raise PermissionError("commissioning authority missing")
+    return authority
+
+
+def _authority_required_text(authority: dict[str, Any], *, key: str, reason: str) -> str:
+    value = authority.get(key)
+    normalized = str(value or "").strip()
+    if not normalized:
+        raise PermissionError(reason)
+    return normalized
+
+
+def _authority_required_uuid(authority: dict[str, Any], *, key: str, reason: str) -> uuid.UUID:
+    return uuid.UUID(_authority_required_text(authority, key=key, reason=reason))
+
+
+def _payload_state(run: VenueCommissioningRun) -> dict[str, Any]:
+    payload = getattr(run, "state_payload", None)
+    return payload if isinstance(payload, dict) else {}
+
+
+def _merge_state_payload(run: VenueCommissioningRun, **updates: Any) -> None:
+    run.state_payload = {**_payload_state(run), **updates}
 
 
 async def _record_audit(
@@ -434,6 +467,17 @@ async def _submit_order(
     amount: Decimal,
     base_size: Decimal | None,
 ) -> tuple[str, ExchangeProviderRejection | None, str | None, dict[str, Any]]:
+    authority = _authority_state(run)
+    approval_event_id = _authority_required_uuid(
+        authority,
+        key="approval_event_id",
+        reason="commissioning authority lacks approval identity",
+    )
+    preview_id = _authority_required_uuid(
+        authority,
+        key="crypto_order_preview_id",
+        reason="commissioning authority lacks preview identity",
+    )
     connection = await _load_connection(
         db=db,
         config=CommissioningConfig(
@@ -447,9 +491,44 @@ async def _submit_order(
     if connection is None:
         return "REJECTED", ExchangeProviderRejection(code="connection_missing", message="connection missing"), None, {}
 
+    profile = await _load_profile_for_connection(db=db, connection=connection)
+    if profile is None:
+        return "REJECTED", ExchangeProviderRejection(code="profile_missing", message="profile missing"), None, {}
+
     from app.services.live_crypto_orders import _load_decrypted_credentials
 
     credentials = _load_decrypted_credentials(connection)
+    approval_event = await db.scalar(select(LiveApprovalEvent).where(LiveApprovalEvent.id == approval_event_id).limit(1))
+    if approval_event is None:
+        return "REJECTED", ExchangeProviderRejection(code="approval_missing", message="approval missing"), None, {}
+
+    preview = await db.scalar(select(CryptoOrderPreview).where(CryptoOrderPreview.crypto_order_preview_id == preview_id).limit(1))
+    if preview is None:
+        return "REJECTED", ExchangeProviderRejection(code="preview_missing", message="preview missing"), None, {}
+
+    profile_scope = _authority_required_uuid(
+        authority,
+        key="live_trading_profile_id",
+        reason="commissioning authority lacks live trading profile identity",
+    )
+    if profile_scope != profile.id:
+        return "REJECTED", ExchangeProviderRejection(code="profile_mismatch", message="profile mismatch"), None, {}
+
+    requested_quote_size = _q_usd(Decimal(str(preview.requested_amount)))
+    if side == "BUY" and requested_quote_size != _q_usd(amount):
+        return "REJECTED", ExchangeProviderRejection(code="amount_mismatch", message="buy amount mismatch"), None, {}
+    if side == "SELL" and base_size is None:
+        return "REJECTED", ExchangeProviderRejection(code="amount_missing", message="sell amount missing"), None, {}
+
+    await _validate_campaign_scoped_submission_authority(
+        db=db,
+        approval_event_id=approval_event_id,
+        profile=profile,
+        preview=preview,
+        connection=connection,
+        requested_quote_size=requested_quote_size,
+    )
+
     provider = get_exchange_provider(run.provider, environment=run.environment)
     require_provider_capabilities(
         provider=run.provider,
@@ -582,14 +661,14 @@ async def start_run(*, db: AsyncSession, actor: str, run_id: uuid.UUID, confirm:
         run.buy_idempotency_key = run.buy_idempotency_key or run.buy_client_order_id
         run.buy_submitted_at = run.buy_submitted_at or now
         _transition(run, "BUY_SUBMISSION_PENDING")
-        run.state_payload = {
-            **(run.state_payload or {}),
-            "buy_submit_intent": {
+        _merge_state_payload(
+            run,
+            buy_submit_intent={
                 "client_order_id": run.buy_client_order_id,
                 "idempotency_key": run.buy_idempotency_key,
                 "forced_buy": True,
             },
-        }
+        )
         run.updated_at = now
         await _record_audit(
             db=db,
@@ -610,16 +689,16 @@ async def start_run(*, db: AsyncSession, actor: str, run_id: uuid.UUID, confirm:
         )
         run = await _reload_run_for_update(db=db, run_id=run_id)
         run.buy_provider_order_id = provider_order_id or run.buy_provider_order_id
-        run.state_payload = {**(run.state_payload or {}), "buy_submit": raw}
+        _merge_state_payload(run, buy_submit=raw)
         if outcome == "SUCCESS":
             _transition(run, "BUY_SUBMISSION_PENDING")
         elif outcome == "AMBIGUOUS":
             _transition(run, "BUY_RECONCILIATION_REQUIRED")
         else:
             _mark_manual_review(run=run)
-            run.state_payload = {
-                **(run.state_payload or {}),
-                "buy_rejection": None
+            _merge_state_payload(
+                run,
+                buy_rejection=None
                 if rejection is None
                 else {
                     "classification": rejection.code,
@@ -632,7 +711,7 @@ async def start_run(*, db: AsyncSession, actor: str, run_id: uuid.UUID, confirm:
                     or (raw.get("raw") if isinstance(raw, dict) else None),
                     "safe_details": rejection.safe_details,
                 },
-            }
+            )
 
     if run.status in {"BUY_SUBMISSION_PENDING", "BUY_RECONCILIATION_REQUIRED"}:
         order_status, order, fills = await _reconcile_order(db=db, run=run, side="BUY")
@@ -667,32 +746,32 @@ async def start_run(*, db: AsyncSession, actor: str, run_id: uuid.UUID, confirm:
             sell_qty = _derive_sell_quantity(run=run)
             if sell_qty is None:
                 _mark_manual_review(run=run)
-                run.state_payload = {
-                    **(run.state_payload or {}),
-                    "sell_attribution": {
+                _merge_state_payload(
+                    run,
+                    sell_attribution={
                         "status": "UNPROVEN",
                         "reason": "ATTRIBUTABLE_BUY_QUANTITY_NOT_RECONCILED",
                     },
-                }
+                )
             else:
                 run.sell_requested_base_btc = sell_qty
                 run.sell_client_order_id = run.sell_client_order_id or _build_client_order_id(run_id=run.commissioning_run_id, side="SELL")
                 run.sell_idempotency_key = run.sell_idempotency_key or run.sell_client_order_id
                 run.sell_submitted_at = run.sell_submitted_at or now
                 _transition(run, "SELL_SUBMISSION_PENDING")
-                run.state_payload = {
-                    **(run.state_payload or {}),
-                    "sell_attribution": {
+                _merge_state_payload(
+                    run,
+                    sell_attribution={
                         "status": "PROVEN",
                         "source": "buy_filled_base_btc",
                         "buy_filled_base_btc": format(run.buy_filled_base_btc, "f") if run.buy_filled_base_btc is not None else None,
                         "sell_requested_base_btc": format(sell_qty, "f"),
                     },
-                    "sell_submit_intent": {
+                    sell_submit_intent={
                         "client_order_id": run.sell_client_order_id,
                         "idempotency_key": run.sell_idempotency_key,
                     },
-                }
+                )
                 run.updated_at = now
                 await _record_audit(
                     db=db,
@@ -713,16 +792,16 @@ async def start_run(*, db: AsyncSession, actor: str, run_id: uuid.UUID, confirm:
                 )
                 run = await _reload_run_for_update(db=db, run_id=run_id)
                 run.sell_provider_order_id = provider_order_id or run.sell_provider_order_id
-                run.state_payload = {**(run.state_payload or {}), "sell_submit": raw}
+                _merge_state_payload(run, sell_submit=raw)
                 if outcome == "SUCCESS":
                     _transition(run, "SELL_SUBMISSION_PENDING")
                 elif outcome == "AMBIGUOUS":
                     _transition(run, "SELL_RECONCILIATION_REQUIRED")
                 else:
                     _mark_manual_review(run=run)
-                    run.state_payload = {
-                        **(run.state_payload or {}),
-                        "sell_rejection": None
+                    _merge_state_payload(
+                        run,
+                        sell_rejection=None
                         if rejection is None
                         else {
                             "classification": rejection.code,
@@ -735,7 +814,7 @@ async def start_run(*, db: AsyncSession, actor: str, run_id: uuid.UUID, confirm:
                             or (raw.get("raw") if isinstance(raw, dict) else None),
                             "safe_details": rejection.safe_details,
                         },
-                    }
+                    )
         else:
             run.duplicate_orders_detected = True
             _mark_manual_review(run=run)

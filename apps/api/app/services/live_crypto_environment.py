@@ -12,6 +12,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.config import get_settings
 from app.models.asset import Asset
 from app.models.capital_campaign import CapitalCampaign
+from app.models.decision_snapshot import DecisionSnapshot
 from app.models.crypto_order_preview import CryptoOrderPreview
 from app.models.exchange_connection import ExchangeConnection
 from app.models.live_approval_event import LiveApprovalEvent
@@ -352,6 +353,7 @@ class RecordApprovalHelperRequest:
     live_trading_profile_id: UUID
     provider: str = "coinbase_advanced"
     exchange_environment: str = "production"
+    crypto_order_preview_id: UUID | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -483,6 +485,32 @@ async def _load_latest_preview(*, db: AsyncSession, exchange_connection_id: UUID
         .order_by(CryptoOrderPreview.created_at.desc())
         .limit(1)
     )
+
+
+async def _load_preview_decision_identity(*, db: AsyncSession, preview_id: UUID | None) -> dict[str, str] | None:
+    if preview_id is None:
+        return None
+    preview = await db.scalar(
+        select(CryptoOrderPreview)
+        .where(CryptoOrderPreview.crypto_order_preview_id == preview_id)
+        .limit(1)
+    )
+    decision_record_id = getattr(preview, "decision_record_id", None) if preview is not None else None
+    if preview is None or decision_record_id is None:
+        return None
+    decision_snapshot = await db.scalar(
+        select(DecisionSnapshot)
+        .where(DecisionSnapshot.decision_id == decision_record_id)
+        .limit(1)
+    )
+    if decision_snapshot is None:
+        return None
+    return {
+        "crypto_order_preview_id": str(preview.crypto_order_preview_id),
+        "decision_record_id": str(decision_record_id),
+        "strategy_version": str(getattr(decision_snapshot, "strategy_version", "unknown") or "unknown"),
+        "parameter_set_version": str(getattr(decision_snapshot, "parameter_set_version", "unknown") or "unknown"),
+    }
 
 
 async def _load_latest_approval(*, db: AsyncSession, live_trading_profile_id: UUID | None, provider: str, environment: str) -> LiveApprovalEvent | None:
@@ -1021,6 +1049,34 @@ async def record_first_live_enablement_approval(
             f"live trading profile provider mismatch: profile={_profile_provider(profile) or 'missing'} requested={request.provider}"
         )
 
+    approval_scope: dict[str, object] = {
+        "product": "BTC-USD",
+        "side": "BUY",
+        "max_order_usd": "5",
+        "provider": request.provider,
+        "environment": requested_environment,
+        "live_trading_profile_id": str(request.live_trading_profile_id),
+        "paper_account_id": str(profile.paper_account_id),
+        "authorized_actor": request.actor,
+        "no_leverage": True,
+    }
+    campaign = await _load_campaign_for_account_exchange(
+        db=db,
+        paper_account_id=profile.paper_account_id,
+        exchange=_exchange_label(provider=request.provider, environment=requested_environment),
+    )
+    if campaign is not None:
+        approval_scope.update(
+            {
+                "capital_campaign_id": str(campaign.uuid),
+                "capital_campaign_version": campaign.definition_version,
+                "max_total_deployed_campaign_capital_usd": format(Decimal(str(campaign.starting_capital)), "f"),
+            }
+        )
+    preview_identity = await _load_preview_decision_identity(db=db, preview_id=request.crypto_order_preview_id)
+    if preview_identity is not None:
+        approval_scope.update(preview_identity)
+
     result = await record_live_approval_checkpoint(
         db=db,
         request=LiveApprovalCheckpointRequest(
@@ -1029,13 +1085,7 @@ async def record_first_live_enablement_approval(
             approver_id=request.actor,
             approver_role="operator",
             rationale="Dry-run readiness checkpoint",
-            approval_scope={
-                "product": "BTC-USD",
-                "side": "BUY",
-                "max_order_usd": "5",
-                "provider": request.provider,
-                "environment": requested_environment,
-            },
+            approval_scope=approval_scope,
             expires_at=datetime.now(timezone.utc) + timedelta(minutes=30),
             renewal_condition="operator_reapproval_required",
             requested_by=request.actor,
@@ -1097,6 +1147,7 @@ async def run_live_crypto_rehearsal(
                 live_trading_profile_id=readiness.live_trading_profile_id,
                 provider=request.provider,
                 exchange_environment=exchange_environment,
+                crypto_order_preview_id=preview_id,
             ),
         )
         approval_event_id = approval.approval_event_id

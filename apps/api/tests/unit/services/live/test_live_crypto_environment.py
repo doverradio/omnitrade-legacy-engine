@@ -532,25 +532,51 @@ async def test_approval_helper_uses_first_live_enablement_checkpoint(monkeypatch
     captured: dict[str, object] = {}
     db = _FakeDb()
     db.profile = _profile(uuid4())
+    db.campaign = _campaign(db.profile.paper_account_id)
+    db.campaign.definition_version = 1
+    db.campaign.starting_capital = Decimal("25")
+    preview_id = uuid4()
 
     async def _approval_stub(*, db, request):
         _ = db
         captured["checkpoint_type"] = request.checkpoint_type
         captured["max_order_usd"] = request.approval_scope.get("max_order_usd")
         captured["provider"] = request.approval_scope.get("provider")
+        captured["capital_campaign_id"] = request.approval_scope.get("capital_campaign_id")
+        captured["strategy_version"] = request.approval_scope.get("strategy_version")
+        captured["parameter_set_version"] = request.approval_scope.get("parameter_set_version")
+        captured["crypto_order_preview_id"] = request.approval_scope.get("crypto_order_preview_id")
         return SimpleNamespace(approval_event_id=uuid4(), approval_state="approved")
 
+    async def _preview_identity_stub(*, db, preview_id):
+        _ = db, preview_id
+        return {
+            "crypto_order_preview_id": str(preview_id),
+            "decision_record_id": str(uuid4()),
+            "strategy_version": "ma_crossover@1.0.0",
+            "parameter_set_version": "param-set-v1",
+        }
+
     monkeypatch.setattr(service, "record_live_approval_checkpoint", _approval_stub)
+    monkeypatch.setattr(service, "_load_preview_decision_identity", _preview_identity_stub)
 
     result = await service.record_first_live_enablement_approval(
         db=db,
-        request=service.RecordApprovalHelperRequest(actor="operator:human", live_trading_profile_id=db.profile.id),
+        request=service.RecordApprovalHelperRequest(
+            actor="operator:human",
+            live_trading_profile_id=db.profile.id,
+            crypto_order_preview_id=preview_id,
+        ),
     )
 
     assert result.approval_state == "approved"
     assert captured["checkpoint_type"] == "first_live_enablement"
     assert captured["max_order_usd"] == "5"
     assert captured["provider"] == "coinbase_advanced"
+    assert captured["capital_campaign_id"] == str(db.campaign.uuid)
+    assert captured["strategy_version"] == "ma_crossover@1.0.0"
+    assert captured["parameter_set_version"] == "param-set-v1"
+    assert captured["crypto_order_preview_id"] == str(preview_id)
 
 
 @pytest.mark.asyncio
