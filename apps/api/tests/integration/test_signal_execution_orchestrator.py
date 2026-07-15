@@ -442,6 +442,7 @@ async def test_orchestrator_rejects_before_adapter_when_risk_rejects(monkeypatch
     async def fake_persist_risk_decision(*args, **kwargs):
         persist_calls["count"] += 1
         return RiskDecisionPersistenceResult(
+            risk_event_id=uuid.uuid4(),
             risk_event_action="blocked",
             risk_event_type="daily_loss_limit",
             risk_event_reason_code="max_daily_loss_breached",
@@ -515,6 +516,7 @@ async def test_orchestrator_passes_resized_quantity_to_crypto_adapter(monkeypatc
     async def fake_persist_risk_decision(*args, **kwargs):
         persist_calls["count"] += 1
         return RiskDecisionPersistenceResult(
+            risk_event_id=uuid.uuid4(),
             risk_event_action="resized",
             risk_event_type="position_limit",
             risk_event_reason_code="position_resized_by_risk_engine",

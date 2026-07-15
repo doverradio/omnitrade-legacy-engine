@@ -13,7 +13,15 @@ from app.main import create_app
 from app.models.audit_log import AuditLog
 from app.models.live_crypto_order import LiveCryptoOrder
 from app.schemas.mission_control import MissionControlIntelligenceTimelineEventResponse
-from app.schemas.operations import OperationalAlertResponse, OperationalHealthIndicatorResponse, OperationalMonitoringResponse, OperationalRunStatusResponse, OperationalStatusResponse
+from app.schemas.operations import (
+    LiveCryptoReadinessItemResponse,
+    LiveCryptoReadinessResponse,
+    OperationalAlertResponse,
+    OperationalHealthIndicatorResponse,
+    OperationalMonitoringResponse,
+    OperationalRunStatusResponse,
+    OperationalStatusResponse,
+)
 from app.schemas.dashboard import DashboardIntelligenceScoreResponse, DashboardIntelligenceTimelinePointResponse
 from app.services import mission_control_intelligence as mission_control_service
 from app.services import live_crypto_orders as live_crypto_orders_service
@@ -273,6 +281,17 @@ async def test_authenticated_dry_run_persists_audit_evidence_and_is_visible_in_m
                 trades_today=8,
                 research_memory_growth=350,
             ),
+            live_crypto_readiness=LiveCryptoReadinessResponse(
+                ready=True,
+                items=[
+                    LiveCryptoReadinessItemResponse(
+                        key="coinbase_production_dry_run_executed",
+                        label="coinbase_spot Production Dry Run Executed",
+                        ready=True,
+                        detail="Latest coinbase_spot production dry run result: DRY_RUN_READY",
+                    )
+                ],
+            ),
             alerts=[OperationalAlertResponse(code="worker_restart", severity="yellow", message="Worker restarted")],
         )
 
@@ -352,7 +371,7 @@ async def test_authenticated_dry_run_persists_audit_evidence_and_is_visible_in_m
                 metadata={
                     "mode": "dry_run",
                     "submission_skipped": True,
-                    "submission_skip_reason": "Coinbase order submission intentionally skipped for dry-run verification.",
+                        "submission_skip_reason": "Provider order submission intentionally skipped for dry-run verification.",
                     "approval_event_id": str(uuid4()),
                     "risk_event_id": str(uuid4()),
                     "approved_quote_size": "5.00",
@@ -395,7 +414,7 @@ async def test_authenticated_dry_run_persists_audit_evidence_and_is_visible_in_m
     assert live_order["order_type"] == "MARKET"
     assert live_order["safe_provider_response"]["max_order_usd"] == "5"
     assert dry_run_payload["submission_skipped"] is True
-    assert dry_run_payload["submission_skip_reason"].startswith("Coinbase order submission intentionally skipped")
+    assert dry_run_payload["submission_skip_reason"].startswith("Provider order submission intentionally skipped")
     assert len(db.audit_logs) == 1
 
     assert mc_response.status_code == 200
@@ -405,7 +424,7 @@ async def test_authenticated_dry_run_persists_audit_evidence_and_is_visible_in_m
     annotation = matching_events[0]
     assert annotation["metadata"]["mode"] == "dry_run"
     assert annotation["metadata"]["submission_skipped"] is True
-    assert annotation["metadata"]["submission_skip_reason"].startswith("Coinbase order submission intentionally skipped")
+    assert annotation["metadata"]["submission_skip_reason"].startswith("Provider order submission intentionally skipped")
     assert annotation["metadata"]["failure_reason"] is None
 
 
@@ -473,6 +492,17 @@ async def test_authenticated_dry_run_blocked_result_surfaces_failure_reason_in_r
                 signals_today=42,
                 trades_today=8,
                 research_memory_growth=350,
+            ),
+            live_crypto_readiness=LiveCryptoReadinessResponse(
+                ready=False,
+                items=[
+                    LiveCryptoReadinessItemResponse(
+                        key="coinbase_production_dry_run_executed",
+                        label="coinbase_spot Production Dry Run Executed",
+                        ready=False,
+                        detail="Latest coinbase_spot production dry run result: DRY_RUN_BLOCKED",
+                    )
+                ],
             ),
             alerts=[],
         )
@@ -553,7 +583,7 @@ async def test_authenticated_dry_run_blocked_result_surfaces_failure_reason_in_r
                 metadata={
                     "mode": "dry_run",
                     "submission_skipped": True,
-                    "submission_skip_reason": "Coinbase order submission intentionally skipped for dry-run verification.",
+                    "submission_skip_reason": "Provider order submission intentionally skipped for dry-run verification.",
                     "failure_reason": "approval checkpoint missing",
                 },
             )
@@ -591,4 +621,4 @@ async def test_authenticated_dry_run_blocked_result_surfaces_failure_reason_in_r
     assert annotation["metadata"]["mode"] == "dry_run"
     assert annotation["metadata"]["submission_skipped"] is True
     assert annotation["metadata"]["failure_reason"]
-    assert annotation["metadata"]["submission_skip_reason"].startswith("Coinbase order submission intentionally skipped")
+    assert annotation["metadata"]["submission_skip_reason"].startswith("Provider order submission intentionally skipped")
