@@ -606,6 +606,7 @@ async def test_inspect_legacy_transition_blocks_on_open_orders_positions_and_pen
     monkeypatch.setattr(binding, "_count_unresolved_reconciliation_events_for_campaign", _async_return(2))
     monkeypatch.setattr(binding, "_count_open_positions_for_campaign", _async_return(1))
     monkeypatch.setattr(binding, "_count_pending_accounting_closure_for_campaign", _async_return(1))
+    monkeypatch.setattr(binding, "_load_transition_conflicting_campaigns", _async_return([]))
 
     readiness = await binding.inspect_legacy_campaign_transition(
         db=db,
@@ -628,6 +629,333 @@ async def test_inspect_legacy_transition_blocks_on_open_orders_positions_and_pen
     assert "legacy_clean_reconciliation_state" in readiness.blockers
     assert "legacy_no_open_live_position" in readiness.blockers
     assert "legacy_no_pending_accounting_closure" in readiness.blockers
+
+
+@pytest.mark.asyncio
+async def test_inspect_legacy_transition_allows_unbound_canonical_binding_targets(monkeypatch: pytest.MonkeyPatch) -> None:
+    legacy_id = UUID("f1e8a655-70ee-47f3-8e9e-89c8735b6542")
+    canonical_id = UUID("e9a9e8e9-9574-498d-b49e-f011218c7f2b")
+    paper_account_id = UUID("905a408c-7d8e-4fc7-ad3b-9ff637005d73")
+    profile_id = UUID("9da09ae9-475e-41e8-b2c2-717ba5acfa3d")
+
+    db = _FakeDb()
+    legacy = _legacy_runtime(campaign_id=legacy_id, paper_account_id=paper_account_id, status="READY")
+    canonical = _runtime(campaign_id=canonical_id, paper_account_id=None, exchange=None)
+    canonical.status = "DRAFT"
+
+    async def _load_runtime_router(*, db, campaign_id):
+        if campaign_id == legacy_id:
+            return legacy
+        if campaign_id == canonical_id:
+            return canonical
+        return None
+
+    monkeypatch.setattr(binding, "_load_runtime", _load_runtime_router)
+    monkeypatch.setattr(binding, "_load_definition", _async_return(_definition(campaign_id=canonical_id, version=1)))
+    monkeypatch.setattr(binding, "_load_paper_account", _async_return(_paper_account(paper_account_id)))
+    monkeypatch.setattr(binding, "_load_live_profile", _async_return(_profile(profile_id, paper_account_id)))
+    monkeypatch.setattr(binding, "_load_connection", _async_return(_connection()))
+    monkeypatch.setattr(binding, "_load_asset", _async_return(_asset(exchange="kraken_spot")))
+    monkeypatch.setattr(binding, "_load_transition_conflicting_campaigns", _async_return([]))
+    monkeypatch.setattr(binding, "_count_open_live_orders_for_campaign", _async_return(0))
+    monkeypatch.setattr(binding, "_count_unresolved_reconciliation_events_for_campaign", _async_return(0))
+    monkeypatch.setattr(binding, "_count_open_positions_for_campaign", _async_return(0))
+    monkeypatch.setattr(binding, "_count_pending_accounting_closure_for_campaign", _async_return(0))
+
+    readiness = await binding.inspect_legacy_campaign_transition(
+        db=db,
+        request=binding.LegacyCampaignTransitionRequest(
+            legacy_campaign_id=legacy_id,
+            canonical_campaign_id=canonical_id,
+            canonical_campaign_version=1,
+            paper_account_id=paper_account_id,
+            live_trading_profile_id=profile_id,
+            provider="kraken_spot",
+            environment="production",
+            product_id="BTC-USD",
+            actor="operator:human",
+            confirm=False,
+        ),
+    )
+
+    assert readiness.ready is True
+    assert "canonical_paper_account_unbound_or_matches" not in readiness.blockers
+    assert "canonical_exchange_unbound_or_matches" not in readiness.blockers
+    assert "canonical_successor_eligible_for_binding" not in readiness.blockers
+
+
+@pytest.mark.asyncio
+async def test_inspect_legacy_transition_fails_closed_on_conflicting_canonical_account_or_exchange(monkeypatch: pytest.MonkeyPatch) -> None:
+    legacy_id = UUID("f1e8a655-70ee-47f3-8e9e-89c8735b6542")
+    canonical_id = UUID("e9a9e8e9-9574-498d-b49e-f011218c7f2b")
+    paper_account_id = UUID("905a408c-7d8e-4fc7-ad3b-9ff637005d73")
+    profile_id = UUID("9da09ae9-475e-41e8-b2c2-717ba5acfa3d")
+
+    db = _FakeDb()
+    legacy = _legacy_runtime(campaign_id=legacy_id, paper_account_id=paper_account_id, status="READY")
+    canonical = _runtime(
+        campaign_id=canonical_id,
+        paper_account_id=UUID("aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa"),
+        exchange="coinbase",
+    )
+    canonical.status = "DRAFT"
+
+    async def _load_runtime_router(*, db, campaign_id):
+        if campaign_id == legacy_id:
+            return legacy
+        if campaign_id == canonical_id:
+            return canonical
+        return None
+
+    monkeypatch.setattr(binding, "_load_runtime", _load_runtime_router)
+    monkeypatch.setattr(binding, "_load_definition", _async_return(_definition(campaign_id=canonical_id, version=1)))
+    monkeypatch.setattr(binding, "_load_paper_account", _async_return(_paper_account(paper_account_id)))
+    monkeypatch.setattr(binding, "_load_live_profile", _async_return(_profile(profile_id, paper_account_id)))
+    monkeypatch.setattr(binding, "_load_connection", _async_return(_connection()))
+    monkeypatch.setattr(binding, "_load_asset", _async_return(_asset(exchange="kraken_spot")))
+    monkeypatch.setattr(binding, "_load_transition_conflicting_campaigns", _async_return([]))
+    monkeypatch.setattr(binding, "_count_open_live_orders_for_campaign", _async_return(0))
+    monkeypatch.setattr(binding, "_count_unresolved_reconciliation_events_for_campaign", _async_return(0))
+    monkeypatch.setattr(binding, "_count_open_positions_for_campaign", _async_return(0))
+    monkeypatch.setattr(binding, "_count_pending_accounting_closure_for_campaign", _async_return(0))
+
+    readiness = await binding.inspect_legacy_campaign_transition(
+        db=db,
+        request=binding.LegacyCampaignTransitionRequest(
+            legacy_campaign_id=legacy_id,
+            canonical_campaign_id=canonical_id,
+            canonical_campaign_version=1,
+            paper_account_id=paper_account_id,
+            live_trading_profile_id=profile_id,
+            provider="kraken_spot",
+            environment="production",
+            product_id="BTC-USD",
+            actor="operator:human",
+            confirm=False,
+        ),
+    )
+
+    assert readiness.ready is False
+    assert "canonical_paper_account_unbound_or_matches" in readiness.blockers
+    assert "canonical_exchange_unbound_or_matches" in readiness.blockers
+    assert "canonical_successor_eligible_for_binding" in readiness.blockers
+
+
+@pytest.mark.asyncio
+async def test_readiness_and_execution_share_identical_prerequisite_evaluator(monkeypatch: pytest.MonkeyPatch) -> None:
+    legacy_id = UUID("f1e8a655-70ee-47f3-8e9e-89c8735b6542")
+    canonical_id = UUID("e9a9e8e9-9574-498d-b49e-f011218c7f2b")
+    paper_account_id = UUID("905a408c-7d8e-4fc7-ad3b-9ff637005d73")
+    profile_id = UUID("9da09ae9-475e-41e8-b2c2-717ba5acfa3d")
+
+    db = _FakeDb()
+    legacy = _legacy_runtime(campaign_id=legacy_id, paper_account_id=paper_account_id, status="READY")
+    canonical = _runtime(campaign_id=canonical_id, paper_account_id=None, exchange=None)
+
+    calls: list[str] = []
+
+    async def _load_runtime(*, db, campaign_id):
+        if campaign_id == legacy_id:
+            return legacy
+        if campaign_id == canonical_id:
+            return canonical
+        return None
+
+    async def _eval(*, db, request, legacy, canonical, canonical_definition):
+        calls.append("eval")
+        return binding.LegacyCampaignTransitionReadinessResult(
+            ready=True,
+            blockers=[],
+            checks=[],
+            snapshot={"legacy_campaign": {"status": str(legacy.status if legacy is not None else "UNKNOWN")}},
+        )
+
+    monkeypatch.setattr(binding, "_load_runtime", _load_runtime)
+    monkeypatch.setattr(binding, "_load_runtime_for_update", _load_runtime)
+    monkeypatch.setattr(binding, "_load_definition", _async_return(_definition(campaign_id=canonical_id, version=1)))
+    monkeypatch.setattr(binding, "_load_definition_for_update", _async_return(_definition(campaign_id=canonical_id, version=1)))
+    monkeypatch.setattr(binding, "_inspect_legacy_campaign_transition_locked", _eval)
+
+    readiness = await binding.inspect_legacy_campaign_transition(
+        db=db,
+        request=binding.LegacyCampaignTransitionRequest(
+            legacy_campaign_id=legacy_id,
+            canonical_campaign_id=canonical_id,
+            canonical_campaign_version=1,
+            paper_account_id=paper_account_id,
+            live_trading_profile_id=profile_id,
+            provider="kraken_spot",
+            environment="production",
+            product_id="BTC-USD",
+            actor="operator:human",
+            confirm=False,
+        ),
+    )
+    assert readiness.ready is True
+
+    result = await binding.transition_legacy_campaign_to_canonical_successor(
+        db=db,
+        request=binding.LegacyCampaignTransitionRequest(
+            legacy_campaign_id=legacy_id,
+            canonical_campaign_id=canonical_id,
+            canonical_campaign_version=1,
+            paper_account_id=paper_account_id,
+            live_trading_profile_id=profile_id,
+            provider="kraken_spot",
+            environment="production",
+            product_id="BTC-USD",
+            actor="operator:human",
+            confirm=True,
+        ),
+    )
+
+    assert result.changed is True
+    assert calls == ["eval", "eval"]
+
+
+@pytest.mark.asyncio
+async def test_readiness_true_guarantees_execution_prereqs_on_unchanged_state_and_canonical_unbound(monkeypatch: pytest.MonkeyPatch) -> None:
+    legacy_id = UUID("f1e8a655-70ee-47f3-8e9e-89c8735b6542")
+    canonical_id = UUID("e9a9e8e9-9574-498d-b49e-f011218c7f2b")
+    paper_account_id = UUID("905a408c-7d8e-4fc7-ad3b-9ff637005d73")
+    profile_id = UUID("9da09ae9-475e-41e8-b2c2-717ba5acfa3d")
+
+    db = _FakeDb()
+    legacy = _legacy_runtime(campaign_id=legacy_id, paper_account_id=paper_account_id, status="READY")
+    canonical = _runtime(campaign_id=canonical_id, paper_account_id=None, exchange=None)
+    canonical.status = "DRAFT"
+
+    async def _load_runtime_router(*, db, campaign_id):
+        if campaign_id == legacy_id:
+            return legacy
+        if campaign_id == canonical_id:
+            return canonical
+        return None
+
+    monkeypatch.setattr(binding, "_load_runtime", _load_runtime_router)
+    monkeypatch.setattr(binding, "_load_runtime_for_update", _load_runtime_router)
+    monkeypatch.setattr(binding, "_load_definition", _async_return(_definition(campaign_id=canonical_id, version=1)))
+    monkeypatch.setattr(binding, "_load_definition_for_update", _async_return(_definition(campaign_id=canonical_id, version=1)))
+    monkeypatch.setattr(binding, "_load_paper_account", _async_return(_paper_account(paper_account_id)))
+    monkeypatch.setattr(binding, "_load_live_profile", _async_return(_profile(profile_id, paper_account_id)))
+    monkeypatch.setattr(binding, "_load_connection", _async_return(_connection()))
+    monkeypatch.setattr(binding, "_load_asset", _async_return(_asset(exchange="kraken_spot")))
+    monkeypatch.setattr(binding, "_load_transition_conflicting_campaigns", _async_return([]))
+    monkeypatch.setattr(binding, "_count_open_live_orders_for_campaign", _async_return(0))
+    monkeypatch.setattr(binding, "_count_unresolved_reconciliation_events_for_campaign", _async_return(0))
+    monkeypatch.setattr(binding, "_count_open_positions_for_campaign", _async_return(0))
+    monkeypatch.setattr(binding, "_count_pending_accounting_closure_for_campaign", _async_return(0))
+
+    readiness = await binding.inspect_legacy_campaign_transition(
+        db=db,
+        request=binding.LegacyCampaignTransitionRequest(
+            legacy_campaign_id=legacy_id,
+            canonical_campaign_id=canonical_id,
+            canonical_campaign_version=1,
+            paper_account_id=paper_account_id,
+            live_trading_profile_id=profile_id,
+            provider="kraken_spot",
+            environment="production",
+            product_id="BTC-USD",
+            actor="operator:human",
+            confirm=False,
+        ),
+    )
+    assert readiness.ready is True
+
+    transition = await binding.transition_legacy_campaign_to_canonical_successor(
+        db=db,
+        request=binding.LegacyCampaignTransitionRequest(
+            legacy_campaign_id=legacy_id,
+            canonical_campaign_id=canonical_id,
+            canonical_campaign_version=1,
+            paper_account_id=paper_account_id,
+            live_trading_profile_id=profile_id,
+            provider="kraken_spot",
+            environment="production",
+            product_id="BTC-USD",
+            actor="operator:human",
+            confirm=True,
+        ),
+    )
+
+    assert transition.changed is True
+    assert canonical.paper_account_id is None
+    assert canonical.exchange is None
+
+
+@pytest.mark.asyncio
+async def test_subsequent_canonical_bind_succeeds_after_transition(monkeypatch: pytest.MonkeyPatch) -> None:
+    legacy_id = UUID("f1e8a655-70ee-47f3-8e9e-89c8735b6542")
+    canonical_id = UUID("e9a9e8e9-9574-498d-b49e-f011218c7f2b")
+    paper_account_id = UUID("905a408c-7d8e-4fc7-ad3b-9ff637005d73")
+    profile_id = UUID("9da09ae9-475e-41e8-b2c2-717ba5acfa3d")
+
+    db = _FakeDb()
+    legacy = _legacy_runtime(campaign_id=legacy_id, paper_account_id=paper_account_id, status="READY")
+    canonical = _runtime(campaign_id=canonical_id, paper_account_id=None, exchange=None)
+    canonical.status = "DRAFT"
+
+    async def _load_runtime_router(*, db, campaign_id):
+        if campaign_id == legacy_id:
+            return legacy
+        if campaign_id == canonical_id:
+            return canonical
+        return None
+
+    monkeypatch.setattr(binding, "_load_runtime", _load_runtime_router)
+    monkeypatch.setattr(binding, "_load_runtime_for_update", _load_runtime_router)
+    monkeypatch.setattr(binding, "_load_definition", _async_return(_definition(campaign_id=canonical_id, version=1)))
+    monkeypatch.setattr(binding, "_load_definition_for_update", _async_return(_definition(campaign_id=canonical_id, version=1)))
+    monkeypatch.setattr(binding, "_load_paper_account", _async_return(_paper_account(paper_account_id)))
+    monkeypatch.setattr(binding, "_load_live_profile", _async_return(_profile(profile_id, paper_account_id)))
+    monkeypatch.setattr(binding, "_load_connection", _async_return(_connection()))
+    monkeypatch.setattr(binding, "_load_asset", _async_return(_asset(exchange="kraken_spot")))
+    monkeypatch.setattr(binding, "_load_transition_conflicting_campaigns", _async_return([]))
+    monkeypatch.setattr(binding, "_load_conflicting_campaigns", _async_return([]))
+    monkeypatch.setattr(binding, "_count_open_live_orders_for_campaign", _async_return(0))
+    monkeypatch.setattr(binding, "_count_open_live_orders", _async_return(0))
+    monkeypatch.setattr(binding, "_count_unresolved_reconciliation_events_for_campaign", _async_return(0))
+    monkeypatch.setattr(binding, "_count_unresolved_reconciliation_events", _async_return(0))
+    monkeypatch.setattr(binding, "_count_open_positions_for_campaign", _async_return(0))
+    monkeypatch.setattr(binding, "_count_pending_accounting_closure_for_campaign", _async_return(0))
+
+    transition = await binding.transition_legacy_campaign_to_canonical_successor(
+        db=db,
+        request=binding.LegacyCampaignTransitionRequest(
+            legacy_campaign_id=legacy_id,
+            canonical_campaign_id=canonical_id,
+            canonical_campaign_version=1,
+            paper_account_id=paper_account_id,
+            live_trading_profile_id=profile_id,
+            provider="kraken_spot",
+            environment="production",
+            product_id="BTC-USD",
+            actor="operator:human",
+            confirm=True,
+        ),
+    )
+    assert transition.changed is True
+    assert canonical.paper_account_id is None
+    assert canonical.exchange is None
+
+    bind_result = await binding.bind_canonical_campaign_runtime(
+        db=db,
+        request=binding.CanonicalCampaignBindingRequest(
+            campaign_id=canonical_id,
+            campaign_version=1,
+            paper_account_id=paper_account_id,
+            live_trading_profile_id=profile_id,
+            provider="kraken_spot",
+            environment="production",
+            product_id="BTC-USD",
+            actor="operator:human",
+            confirm=True,
+        ),
+    )
+    assert bind_result.changed is True
+    assert canonical.paper_account_id == paper_account_id
+    assert canonical.exchange == "kraken_spot"
 
 
 @pytest.mark.asyncio
