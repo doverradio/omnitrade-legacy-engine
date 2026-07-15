@@ -48,6 +48,9 @@ class _FakeOp:
         self.created_indexes.append(index_name)
         return index
 
+    def alter_column(self, table_name: str, column_name: str, **kwargs) -> None:
+        _ = (table_name, column_name, kwargs)
+
     def drop_index(self, index_name: str, table_name: str | None = None) -> None:
         self.dropped_indexes.append((index_name, table_name))
 
@@ -90,3 +93,26 @@ def test_upgrade_and_downgrade_compile() -> None:
         ("ix_autonomous_cycle_runs_mandate_created", "autonomous_cycle_runs"),
     ]
     assert fake_op.dropped_tables == ["autonomous_cycle_runs"]
+
+
+def test_campaign_cycle_mandate_nullable_migration_compiles() -> None:
+    module_path = (
+        Path(__file__).resolve().parents[4]
+        / "app"
+        / "db"
+        / "migrations"
+        / "versions"
+        / "20260715_0038_allow_null_mandate_id_on_autonomous_cycle_runs.py"
+    )
+    spec = importlib.util.spec_from_file_location("migration_20260715_0038", module_path)
+    assert spec is not None
+    assert spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+
+    fake_op = _FakeOp()
+    module.op = fake_op
+
+    module.upgrade()
+    module.downgrade()
+    assert True

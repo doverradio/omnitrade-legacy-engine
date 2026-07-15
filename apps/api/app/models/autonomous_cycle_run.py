@@ -24,7 +24,7 @@ class AutonomousCycleRun(Base):
 
     cycle_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, server_default=text("gen_random_uuid()"))
     idempotency_key: Mapped[str] = mapped_column(Text, nullable=False)
-    mandate_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), nullable=False)
+    mandate_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), nullable=True)
     mandate_version_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), nullable=True)
     cycle_kind: Mapped[str] = mapped_column(Text, nullable=False, server_default=text("'autonomous'"))
     capital_campaign_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), nullable=True)

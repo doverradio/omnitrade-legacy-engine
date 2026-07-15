@@ -187,7 +187,7 @@ async def run_campaign_orchestration_preview_for_candle(
 
         cycle = AutonomousCycleRun(
             idempotency_key=idempotency_key,
-            mandate_id=campaign.runtime_campaign_uuid,
+            mandate_id=None,
             mandate_version_id=None,
             cycle_kind=_CAMPAIGN_CYCLE_KIND,
             capital_campaign_id=campaign.campaign_id,

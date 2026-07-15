@@ -70,6 +70,8 @@ _RESEARCH_STATUS_SEVERITIES = {
 }
 
 _WORKER_BOOT_ACTION = "orchestration_worker_started"
+_WORKER_BOOT_FAILED_ACTION = "orchestration_worker_start_failed"
+_FULL_PIPELINE_COMPLETE_ACTION = "orchestration_worker_full_pipeline_completed"
 _REPLAY_FAILURE_ACTION = "decision_package_replay_failed"
 
 
@@ -922,7 +924,31 @@ async def run_orchestration_cycle(
     if snapshot is not None:
         await db.commit()
 
-    set_last_successful_full_pipeline_at(datetime.now(timezone.utc))
+    completed_at = datetime.now(timezone.utc)
+    set_last_successful_full_pipeline_at(completed_at)
+    db.add(
+        AuditLog(
+            actor="orchestration_worker",
+            action=_FULL_PIPELINE_COMPLETE_ACTION,
+            entity_type="orchestration_worker",
+            entity_id=None,
+            before_state=None,
+            after_state={
+                "completed_at": completed_at.isoformat(),
+                "ingestion_assets_ok": ingestion_result.successful_assets,
+                "signals_created": signals_created,
+                "execution_candidates": execution_candidates,
+                "executions_attempted": executions_attempted,
+                "executions_rejected": executions_rejected,
+                "executions_failed": executions_failed,
+                "executions_skipped": executions_skipped,
+                "decisions_inserted": decision_inserted_total,
+                "research_cycles_started": research_cycles_started,
+                "intelligence_snapshots_captured": 1 if snapshot is not None else 0,
+            },
+        )
+    )
+    await db.commit()
 
     return CycleStats(
         ingestion_assets_ok=ingestion_result.successful_assets,
@@ -960,6 +986,24 @@ async def run_forever() -> None:
             await boot_db.commit()
     except Exception:
         logger.warning("Unable to persist orchestration worker startup event", exc_info=True)
+        try:
+            async with AsyncSessionLocal() as boot_failed_db:
+                boot_failed_db.add(
+                    AuditLog(
+                        actor="orchestration_worker",
+                        action=_WORKER_BOOT_FAILED_ACTION,
+                        entity_type="orchestration_worker",
+                        entity_id=None,
+                        before_state=None,
+                        after_state={
+                            "started_at": _STARTED_AT.isoformat(),
+                            "run_id": _RUN_ID,
+                        },
+                    )
+                )
+                await boot_failed_db.commit()
+        except Exception:
+            logger.warning("Unable to persist orchestration worker startup failure event", exc_info=True)
 
     logger.info(
         "Starting continuous pipeline worker poll_interval_seconds=%s candle_interval=%s candle_lookback_limit=%s default_order_quantity=%s",

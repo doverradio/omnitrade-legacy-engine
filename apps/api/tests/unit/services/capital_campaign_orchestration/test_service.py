@@ -151,6 +151,82 @@ async def test_worker_preview_ignores_draft_campaign(monkeypatch: pytest.MonkeyP
 
 
 @pytest.mark.asyncio
+async def test_worker_preview_persists_null_mandate_and_campaign_identity(monkeypatch: pytest.MonkeyPatch) -> None:
+    from app.services.capital_campaign_orchestration.service import run_campaign_orchestration_preview_for_candle
+    from app.models.autonomous_cycle_run import AutonomousCycleRun
+
+    campaign = SimpleNamespace(
+        campaign_id=UUID("aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa"),
+        version=7,
+        status="READY",
+        runtime_campaign_uuid=UUID("bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb"),
+        allowed_instruments=["BTC-USD"],
+        allowed_venues=["kraken_spot"],
+        campaign_modes=[],
+        aggression_mode="BALANCED",
+        accounting_state=SimpleNamespace(model_dump=lambda **_kwargs: {}),
+        remaining_unallocated_capital=Decimal("1"),
+    )
+
+    class _CandleDb(_FakeDb):
+        def __init__(self) -> None:
+            super().__init__()
+            self.scalar_calls = 0
+            self.added = None
+
+        async def scalar(self, _statement):
+            self.scalar_calls += 1
+            if self.scalar_calls == 1:
+                return SimpleNamespace(id=UUID("12345678-1234-1234-1234-1234567890ab"))
+            if self.scalar_calls == 2:
+                return SimpleNamespace(asset_id=UUID("12345678-1234-1234-1234-1234567890ab"), open_time=datetime(2026, 7, 15, 0, 0, tzinfo=timezone.utc), close_time=datetime(2026, 7, 15, 0, 15, tzinfo=timezone.utc))
+            return None
+
+        async def execute(self, _statement):
+            return SimpleNamespace(scalars=lambda: SimpleNamespace(all=lambda: []))
+
+        def add(self, item):
+            self.added = item
+
+        async def flush(self):
+            return None
+
+        async def commit(self):
+            return None
+
+    async def _get_campaign_definition(**_kwargs):
+        return campaign
+
+    async def _list_campaign_definitions(**_kwargs):
+        return SimpleNamespace(items=[campaign])
+
+    async def _compose_campaign_authoritative_cycle(**_kwargs):
+        return SimpleNamespace(
+            composition={
+                "failed_closed": False,
+                "selected_decision": {"decision_kind": "NO_ACTION", "risk_verdict": "NOT_APPLICABLE"},
+                "deterministic_explanation": ["stub"],
+            },
+            preview=SimpleNamespace(model_dump=lambda **_dump_kwargs: {"campaign": "preview"}),
+        )
+
+    monkeypatch.setattr("app.services.capital_campaign_orchestration.service.get_campaign_definition", _get_campaign_definition)
+    monkeypatch.setattr("app.services.capital_campaign_orchestration.service.list_campaign_definitions", _list_campaign_definitions)
+    monkeypatch.setattr("app.services.capital_campaign_orchestration.service.compose_campaign_authoritative_cycle", _compose_campaign_authoritative_cycle)
+
+    db = _CandleDb()
+    payload = await run_campaign_orchestration_preview_for_candle(db=db, campaign_id=campaign.campaign_id, version=campaign.version, allow_draft_preview=False)
+
+    assert payload["cycle_count"] == 1
+    assert isinstance(db.added, AutonomousCycleRun)
+    assert db.added.mandate_id is None
+    assert db.added.mandate_version_id is None
+    assert db.added.cycle_kind == "campaign"
+    assert db.added.capital_campaign_id == campaign.campaign_id
+    assert db.added.capital_campaign_version == campaign.version
+
+
+@pytest.mark.asyncio
 async def test_authoritative_open_candidate_selects_best(monkeypatch: pytest.MonkeyPatch) -> None:
     from app.services.capital_campaign_orchestration.authoritative import compose_campaign_authoritative_cycle
 

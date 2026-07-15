@@ -31,6 +31,10 @@ class _FakeDb:
         compiled_params = compiled.params
         if "action = 'orchestration_worker_started'" in sql:
             return _Result({"restart_count": 3})
+        if "action = 'orchestration_worker_full_pipeline_completed'" in sql:
+            return _Result({"completed_at": datetime(2026, 7, 15, 0, 6, tzinfo=timezone.utc)})
+        if "action = 'orchestration_worker_start_failed'" in sql:
+            return _Result({"exception_count": 3})
         if "action = 'decision_package_replay_failed'" in sql:
             return _Result({"exception_count": 2})
         if "MAX(c.close_time)" in sql:
@@ -68,10 +72,10 @@ async def test_runtime_readiness_reports_restart_and_health_state(monkeypatch: p
 
     assert result.worker_uptime
     assert result.restart_count == 2
-    assert result.last_successful_full_pipeline_at == datetime(2026, 7, 15, 0, 5, tzinfo=timezone.utc)
+    assert result.last_successful_full_pipeline_at == datetime(2026, 7, 15, 0, 6, tzinfo=timezone.utc)
     assert result.last_kraken_candle_processed_at == datetime(2026, 7, 15, 0, 15, tzinfo=timezone.utc)
     assert result.last_autonomous_cycle is not None
     assert result.last_campaign_preview_cycle is not None
-    assert result.unresolved_exceptions == 2
+    assert result.unresolved_exceptions == 3
     assert result.database_health.state == "green"
     assert result.provider_health.ready is True

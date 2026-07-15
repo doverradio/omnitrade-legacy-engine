@@ -460,7 +460,7 @@ async def build_runtime_readiness(*, db: AsyncSession) -> RuntimeReadinessRespon
         generated_at=generated_at,
         worker_uptime=worker_uptime,
         restart_count=max(restart_count - 1, 0),
-        last_successful_full_pipeline_at=get_last_successful_full_pipeline_at(),
+        last_successful_full_pipeline_at=await _load_last_successful_full_pipeline_at(db=db) or get_last_successful_full_pipeline_at(),
         last_kraken_candle_processed_at=await _latest_kraken_candle_close_at(db=db),
         last_autonomous_cycle=last_autonomous_cycle,
         last_campaign_preview_cycle=last_campaign_cycle,
@@ -606,7 +606,8 @@ async def _count_recent_runtime_exceptions(*, db: AsyncSession, now: datetime) -
             "OR action = 'campaign_orchestration_failed' "
             "OR action = 'autonomous_cycle_failed' "
             "OR action = 'strategy_roster_failed' "
-            "OR action = 'research_cycle_failed')"
+            "OR action = 'research_cycle_failed' "
+            "OR action = 'orchestration_worker_start_failed')"
         ),
         {"since": since},
     )
@@ -646,6 +647,21 @@ async def _load_latest_cycle_snapshot(*, db: AsyncSession, cycle_kind: str) -> R
         completed_at=cycle.completed_at,
         failure_reason=cycle.failure_reason,
     )
+
+
+async def _load_last_successful_full_pipeline_at(*, db: AsyncSession) -> datetime | None:
+    row = await db.execute(
+        text(
+            "SELECT created_at AS completed_at "
+            "FROM audit_log "
+            "WHERE action = 'orchestration_worker_full_pipeline_completed' "
+            "ORDER BY created_at DESC, id DESC "
+            "LIMIT 1"
+        )
+    )
+    record = row.mappings().first()
+    completed_at = None if record is None else record.get("completed_at")
+    return completed_at if isinstance(completed_at, datetime) else None
 
 
 async def _get_paper_equity(*, db: AsyncSession) -> Decimal:
