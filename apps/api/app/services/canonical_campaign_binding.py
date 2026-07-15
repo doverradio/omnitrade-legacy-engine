@@ -175,8 +175,27 @@ async def _load_definition(*, db: AsyncSession, campaign_id: UUID, version: int)
     )
 
 
+async def _load_definition_for_update(*, db: AsyncSession, campaign_id: UUID, version: int) -> CapitalCampaignDefinition | None:
+    return await db.scalar(
+        select(CapitalCampaignDefinition)
+        .where(CapitalCampaignDefinition.campaign_id == campaign_id)
+        .where(CapitalCampaignDefinition.version == version)
+        .with_for_update()
+        .limit(1)
+    )
+
+
 async def _load_runtime(*, db: AsyncSession, campaign_id: UUID) -> CapitalCampaign | None:
     return await db.scalar(select(CapitalCampaign).where(CapitalCampaign.uuid == campaign_id).limit(1))
+
+
+async def _load_runtime_for_update(*, db: AsyncSession, campaign_id: UUID) -> CapitalCampaign | None:
+    return await db.scalar(
+        select(CapitalCampaign)
+        .where(CapitalCampaign.uuid == campaign_id)
+        .with_for_update()
+        .limit(1)
+    )
 
 
 async def _load_paper_account(*, db: AsyncSession, paper_account_id: UUID) -> PaperAccount | None:
@@ -216,6 +235,27 @@ async def _load_conflicting_campaigns(*, db: AsyncSession, paper_account_id: UUI
             .where(CapitalCampaign.paper_account_id == paper_account_id)
             .where(CapitalCampaign.exchange == exchange)
             .where(CapitalCampaign.uuid != campaign_id)
+            .where(CapitalCampaign.status.notin_(["ARCHIVED", "COMPLETED"]))
+            .order_by(CapitalCampaign.created_at.desc(), CapitalCampaign.id.desc())
+        )
+    ).scalars().all()
+    return list(rows)
+
+
+async def _load_transition_conflicting_campaigns(
+    *,
+    db: AsyncSession,
+    paper_account_id: UUID,
+    exchange: str,
+    legacy_campaign_id: UUID,
+    canonical_campaign_id: UUID,
+) -> list[CapitalCampaign]:
+    rows = (
+        await db.execute(
+            select(CapitalCampaign)
+            .where(CapitalCampaign.paper_account_id == paper_account_id)
+            .where(CapitalCampaign.exchange == exchange)
+            .where(CapitalCampaign.uuid.notin_([legacy_campaign_id, canonical_campaign_id]))
             .where(CapitalCampaign.status.notin_(["ARCHIVED", "COMPLETED"]))
             .order_by(CapitalCampaign.created_at.desc(), CapitalCampaign.id.desc())
         )
@@ -747,15 +787,339 @@ async def inspect_legacy_campaign_transition(
     return LegacyCampaignTransitionReadinessResult(ready=ready, blockers=sorted(set(blockers)), checks=checks, snapshot=snapshot)
 
 
-async def transition_legacy_campaign_to_canonical_successor(
+async def _inspect_legacy_campaign_transition_locked(
+    *,
+    db: AsyncSession,
+    request: LegacyCampaignTransitionRequest,
+    legacy: CapitalCampaign | None,
+    canonical: CapitalCampaign | None,
+    canonical_definition: CapitalCampaignDefinition | None,
+) -> LegacyCampaignTransitionReadinessResult:
+    environment = _normalize_exchange_environment(request.environment)
+    exchange = _exchange_label(provider=request.provider, environment=environment)
+    checks: list[BindingCheck] = []
+
+    paper_account = await _load_paper_account(db=db, paper_account_id=request.paper_account_id)
+    live_profile = await _load_live_profile(db=db, live_trading_profile_id=request.live_trading_profile_id)
+
+    checks.append(_check(legacy is not None, "legacy_campaign_exists", f"legacy_campaign_id={request.legacy_campaign_id}"))
+    checks.append(_check(canonical is not None, "canonical_campaign_exists", f"canonical_campaign_id={request.canonical_campaign_id}"))
+    checks.append(
+        _check(
+            canonical_definition is not None,
+            "canonical_definition_exists",
+            f"canonical_campaign_version={request.canonical_campaign_version}",
+        )
+    )
+    checks.append(
+        _check(
+            request.legacy_campaign_id != request.canonical_campaign_id,
+            "legacy_and_canonical_distinct",
+            "legacy and canonical campaign ids must differ",
+        )
+    )
+
+    checks.append(_check(paper_account is not None, "paper_account_exists", f"paper_account_id={request.paper_account_id}"))
+    checks.append(_check(live_profile is not None, "live_profile_exists", f"live_trading_profile_id={request.live_trading_profile_id}"))
+    if live_profile is not None:
+        checks.append(
+            _check(
+                live_profile.paper_account_id == request.paper_account_id,
+                "live_profile_owns_paper_account",
+                f"profile_paper_account_id={live_profile.paper_account_id}",
+            )
+        )
+
+    open_live_order_count = 0
+    unresolved_reconciliation_count = 0
+    open_position_count = 0
+    pending_accounting_closure_count = 0
+
+    canonical_open_live_order_count = 0
+    canonical_unresolved_reconciliation_count = 0
+    canonical_open_position_count = 0
+    canonical_pending_accounting_closure_count = 0
+    conflicting_campaign_count = 0
+    legacy_successor_audit: dict[str, Any] | None = None
+
+    if legacy is not None:
+        checks.append(
+            _check(
+                legacy.paper_account_id == request.paper_account_id,
+                "legacy_paper_account_matches",
+                f"legacy_paper_account_id={legacy.paper_account_id}",
+            )
+        )
+        checks.append(
+            _check(
+                legacy.exchange == exchange,
+                "legacy_exchange_matches",
+                f"legacy_exchange={legacy.exchange}",
+            )
+        )
+        checks.append(
+            _check(
+                Decimal(legacy.current_equity) == Decimal(legacy.starting_capital),
+                "legacy_zero_deployed_capital",
+                f"legacy_current_equity={legacy.current_equity} legacy_starting_capital={legacy.starting_capital}",
+            )
+        )
+
+        open_live_order_count = await _count_open_live_orders_for_campaign(
+            db=db,
+            capital_campaign_id=legacy.id,
+            provider=request.provider,
+            environment=environment,
+            product_id=request.product_id,
+        )
+        unresolved_reconciliation_count = await _count_unresolved_reconciliation_events_for_campaign(
+            db=db,
+            capital_campaign_id=legacy.id,
+        )
+        open_position_count = await _count_open_positions_for_campaign(
+            db=db,
+            capital_campaign_id=legacy.id,
+        )
+        pending_accounting_closure_count = await _count_pending_accounting_closure_for_campaign(
+            db=db,
+            capital_campaign_id=legacy.id,
+        )
+
+        latest_transition = await db.scalar(
+            select(AuditLog)
+            .where(AuditLog.entity_type == "capital_campaign")
+            .where(AuditLog.entity_id == legacy.uuid)
+            .where(AuditLog.action == "capital_campaign.transition_to_successor")
+            .order_by(AuditLog.created_at.desc(), AuditLog.id.desc())
+            .limit(1)
+        )
+        if latest_transition is not None:
+            legacy_successor_audit = {
+                "actor": latest_transition.actor,
+                "before_state": latest_transition.before_state,
+                "after_state": latest_transition.after_state,
+                "created_at": latest_transition.created_at,
+            }
+
+        checks.append(
+            _check(
+                open_live_order_count == 0,
+                "legacy_no_open_provider_order",
+                f"open_live_order_count={open_live_order_count}",
+            )
+        )
+        checks.append(
+            _check(
+                unresolved_reconciliation_count == 0,
+                "legacy_clean_reconciliation_state",
+                f"unresolved_reconciliation_count={unresolved_reconciliation_count}",
+            )
+        )
+        checks.append(
+            _check(
+                open_position_count == 0,
+                "legacy_no_open_live_position",
+                f"open_position_count={open_position_count}",
+            )
+        )
+        checks.append(
+            _check(
+                pending_accounting_closure_count == 0,
+                "legacy_no_pending_accounting_closure",
+                f"pending_accounting_closure_count={pending_accounting_closure_count}",
+            )
+        )
+
+    if canonical is not None:
+        checks.append(
+            _check(
+                canonical.definition_campaign_id == request.canonical_campaign_id,
+                "canonical_runtime_definition_identity_matches",
+                f"canonical_definition_campaign_id={canonical.definition_campaign_id}",
+            )
+        )
+        checks.append(
+            _check(
+                canonical.definition_version == request.canonical_campaign_version,
+                "canonical_runtime_definition_version_matches",
+                f"canonical_definition_version={canonical.definition_version}",
+            )
+        )
+        checks.append(
+            _check(
+                canonical.paper_account_id == request.paper_account_id,
+                "canonical_paper_account_matches",
+                f"canonical_paper_account_id={canonical.paper_account_id}",
+            )
+        )
+        checks.append(
+            _check(
+                canonical.exchange == exchange,
+                "canonical_exchange_matches",
+                f"canonical_exchange={canonical.exchange}",
+            )
+        )
+        checks.append(
+            _check(
+                Decimal(canonical.current_equity) == Decimal(canonical.starting_capital),
+                "canonical_runtime_zero_deployed_capital",
+                f"canonical_current_equity={canonical.current_equity} canonical_starting_capital={canonical.starting_capital}",
+            )
+        )
+
+        canonical_open_live_order_count = await _count_open_live_orders_for_campaign(
+            db=db,
+            capital_campaign_id=canonical.id,
+            provider=request.provider,
+            environment=environment,
+            product_id=request.product_id,
+        )
+        canonical_unresolved_reconciliation_count = await _count_unresolved_reconciliation_events_for_campaign(
+            db=db,
+            capital_campaign_id=canonical.id,
+        )
+        canonical_open_position_count = await _count_open_positions_for_campaign(
+            db=db,
+            capital_campaign_id=canonical.id,
+        )
+        canonical_pending_accounting_closure_count = await _count_pending_accounting_closure_for_campaign(
+            db=db,
+            capital_campaign_id=canonical.id,
+        )
+
+        checks.append(
+            _check(
+                canonical_open_live_order_count == 0,
+                "canonical_no_open_provider_order",
+                f"canonical_open_live_order_count={canonical_open_live_order_count}",
+            )
+        )
+        checks.append(
+            _check(
+                canonical_unresolved_reconciliation_count == 0,
+                "canonical_clean_reconciliation_state",
+                f"canonical_unresolved_reconciliation_count={canonical_unresolved_reconciliation_count}",
+            )
+        )
+        checks.append(
+            _check(
+                canonical_open_position_count == 0,
+                "canonical_no_open_live_position",
+                f"canonical_open_position_count={canonical_open_position_count}",
+            )
+        )
+        checks.append(
+            _check(
+                canonical_pending_accounting_closure_count == 0,
+                "canonical_no_pending_accounting_closure",
+                f"canonical_pending_accounting_closure_count={canonical_pending_accounting_closure_count}",
+            )
+        )
+
+    if canonical_definition is not None:
+        checks.append(
+            _check(
+                Decimal(canonical_definition.deployed_capital) == Decimal("0"),
+                "canonical_definition_zero_deployed_capital",
+                f"canonical_definition_deployed_capital={canonical_definition.deployed_capital}",
+            )
+        )
+
+    if paper_account is not None:
+        conflicting_campaigns = await _load_transition_conflicting_campaigns(
+            db=db,
+            paper_account_id=paper_account.id,
+            exchange=exchange,
+            legacy_campaign_id=request.legacy_campaign_id,
+            canonical_campaign_id=request.canonical_campaign_id,
+        )
+        conflicting_campaign_count = len(conflicting_campaigns)
+        checks.append(
+            _check(
+                conflicting_campaign_count == 0,
+                "no_other_active_campaign_conflict",
+                f"conflicting_campaign_count={conflicting_campaign_count}",
+            )
+        )
+
+    if request.confirm:
+        checks.append(_check(True, "operator_confirmation_present", "confirm=true"))
+
+    blockers = [item.code for item in checks if not item.passed]
+    if legacy is not None and legacy.status == "ARCHIVED":
+        if legacy_successor_audit is None:
+            blockers.append("legacy_archived_without_successor_audit")
+        else:
+            after = legacy_successor_audit.get("after_state") if isinstance(legacy_successor_audit, dict) else {}
+            successor_id = str((after or {}).get("successor_campaign_id") or "")
+            successor_version = int((after or {}).get("successor_campaign_version") or 0)
+            if successor_id == str(request.canonical_campaign_id) and successor_version == request.canonical_campaign_version:
+                blockers.append("legacy_already_superseded_by_requested_successor")
+            else:
+                blockers.append("legacy_already_superseded_by_different_successor")
+
+    snapshot = {
+        "legacy_campaign": None if legacy is None else {
+            "id": str(legacy.uuid),
+            "status": legacy.status,
+            "paper_account_id": None if legacy.paper_account_id is None else str(legacy.paper_account_id),
+            "exchange": legacy.exchange,
+            "starting_capital": format(Decimal(legacy.starting_capital), "f"),
+            "current_equity": format(Decimal(legacy.current_equity), "f"),
+        },
+        "canonical_campaign": None if canonical is None else {
+            "id": str(canonical.uuid),
+            "status": canonical.status,
+            "definition_campaign_id": None if canonical.definition_campaign_id is None else str(canonical.definition_campaign_id),
+            "definition_version": canonical.definition_version,
+            "paper_account_id": None if canonical.paper_account_id is None else str(canonical.paper_account_id),
+            "exchange": canonical.exchange,
+            "starting_capital": format(Decimal(canonical.starting_capital), "f"),
+            "current_equity": format(Decimal(canonical.current_equity), "f"),
+        },
+        "canonical_definition": None if canonical_definition is None else {
+            "campaign_id": str(canonical_definition.campaign_id),
+            "version": canonical_definition.version,
+            "deployed_capital": format(Decimal(canonical_definition.deployed_capital), "f"),
+        },
+        "open_live_order_count": open_live_order_count,
+        "unresolved_reconciliation_count": unresolved_reconciliation_count,
+        "open_position_count": open_position_count,
+        "pending_accounting_closure_count": pending_accounting_closure_count,
+        "canonical_open_live_order_count": canonical_open_live_order_count,
+        "canonical_unresolved_reconciliation_count": canonical_unresolved_reconciliation_count,
+        "canonical_open_position_count": canonical_open_position_count,
+        "canonical_pending_accounting_closure_count": canonical_pending_accounting_closure_count,
+        "conflicting_campaign_count": conflicting_campaign_count,
+        "latest_transition_audit": legacy_successor_audit,
+    }
+    ready = not blockers
+    return LegacyCampaignTransitionReadinessResult(ready=ready, blockers=sorted(set(blockers)), checks=checks, snapshot=snapshot)
+
+
+def _session_in_transaction(db: AsyncSession) -> bool:
+    return bool(db.in_transaction()) if hasattr(db, "in_transaction") else False
+
+
+async def _transition_legacy_campaign_to_canonical_successor_without_begin(
     *,
     db: AsyncSession,
     request: LegacyCampaignTransitionRequest,
 ) -> LegacyCampaignTransitionMutationResult:
-    if not request.confirm:
-        raise PermissionError("confirm=true is required")
-
-    readiness = await inspect_legacy_campaign_transition(db=db, request=request)
+    legacy = await _load_runtime_for_update(db=db, campaign_id=request.legacy_campaign_id)
+    canonical = await _load_runtime_for_update(db=db, campaign_id=request.canonical_campaign_id)
+    canonical_definition = await _load_definition_for_update(
+        db=db,
+        campaign_id=request.canonical_campaign_id,
+        version=request.canonical_campaign_version,
+    )
+    readiness = await _inspect_legacy_campaign_transition_locked(
+        db=db,
+        request=request,
+        legacy=legacy,
+        canonical=canonical,
+        canonical_definition=canonical_definition,
+    )
     if not readiness.ready:
         if readiness.snapshot.get("legacy_campaign") and readiness.snapshot["legacy_campaign"].get("status") == "ARCHIVED":
             latest_transition = readiness.snapshot.get("latest_transition_audit")
@@ -778,7 +1142,6 @@ async def transition_legacy_campaign_to_canonical_successor(
                 )
         raise PermissionError("legacy transition prerequisites failed: " + ", ".join(readiness.blockers))
 
-    legacy = await _load_runtime(db=db, campaign_id=request.legacy_campaign_id)
     if legacy is None:
         raise LookupError("legacy campaign not found")
 
@@ -788,29 +1151,28 @@ async def transition_legacy_campaign_to_canonical_successor(
         "exchange": legacy.exchange,
     }
 
-    async with db.begin():
-        legacy.status = "ARCHIVED"
-        legacy.updated_at = datetime.now(timezone.utc)
-        await db.flush()
+    legacy.status = "ARCHIVED"
+    legacy.updated_at = datetime.now(timezone.utc)
+    await db.flush()
 
-        after = {
-            "status": legacy.status,
-            "paper_account_id": None if legacy.paper_account_id is None else str(legacy.paper_account_id),
-            "exchange": legacy.exchange,
-            "successor_campaign_id": str(request.canonical_campaign_id),
-            "successor_campaign_version": request.canonical_campaign_version,
-            "transition_reason": "superseded_by_canonical_campaign",
-        }
-        db.add(
-            AuditLog(
-                actor=request.actor,
-                action="capital_campaign.transition_to_successor",
-                entity_type="capital_campaign",
-                entity_id=legacy.uuid,
-                before_state=before,
-                after_state=after,
-            )
+    after = {
+        "status": legacy.status,
+        "paper_account_id": None if legacy.paper_account_id is None else str(legacy.paper_account_id),
+        "exchange": legacy.exchange,
+        "successor_campaign_id": str(request.canonical_campaign_id),
+        "successor_campaign_version": request.canonical_campaign_version,
+        "transition_reason": "superseded_by_canonical_campaign",
+    }
+    db.add(
+        AuditLog(
+            actor=request.actor,
+            action="capital_campaign.transition_to_successor",
+            entity_type="capital_campaign",
+            entity_id=legacy.uuid,
+            before_state=before,
+            after_state=after,
         )
+    )
 
     return LegacyCampaignTransitionMutationResult(
         changed=True,
@@ -820,6 +1182,21 @@ async def transition_legacy_campaign_to_canonical_successor(
         readiness=readiness,
         audit_created=True,
     )
+
+
+async def transition_legacy_campaign_to_canonical_successor(
+    *,
+    db: AsyncSession,
+    request: LegacyCampaignTransitionRequest,
+) -> LegacyCampaignTransitionMutationResult:
+    if not request.confirm:
+        raise PermissionError("confirm=true is required")
+
+    if _session_in_transaction(db):
+        return await _transition_legacy_campaign_to_canonical_successor_without_begin(db=db, request=request)
+
+    async with db.begin():
+        return await _transition_legacy_campaign_to_canonical_successor_without_begin(db=db, request=request)
 
 
 async def fetch_legacy_campaign_transition_audit(*, db: AsyncSession, legacy_campaign_id: UUID, limit: int = 20) -> dict[str, Any]:
@@ -860,7 +1237,25 @@ async def rollback_legacy_campaign_transition(
     if not request.confirm:
         raise PermissionError("confirm=true is required")
 
-    legacy = await _load_runtime(db=db, campaign_id=request.legacy_campaign_id)
+    if _session_in_transaction(db):
+        return await _rollback_legacy_campaign_transition_without_begin(db=db, request=request)
+
+    async with db.begin():
+        return await _rollback_legacy_campaign_transition_without_begin(db=db, request=request)
+
+
+async def _rollback_legacy_campaign_transition_without_begin(
+    *,
+    db: AsyncSession,
+    request: LegacyCampaignTransitionRequest,
+) -> LegacyCampaignTransitionMutationResult:
+    legacy = await _load_runtime_for_update(db=db, campaign_id=request.legacy_campaign_id)
+    canonical = await _load_runtime_for_update(db=db, campaign_id=request.canonical_campaign_id)
+    canonical_definition = await _load_definition_for_update(
+        db=db,
+        campaign_id=request.canonical_campaign_id,
+        version=request.canonical_campaign_version,
+    )
     if legacy is None:
         raise LookupError("legacy campaign not found")
     if legacy.status != "ARCHIVED":
@@ -882,7 +1277,13 @@ async def rollback_legacy_campaign_transition(
     if successor_id != str(request.canonical_campaign_id) or successor_version != request.canonical_campaign_version:
         raise PermissionError("rollback successor identity mismatch")
 
-    readiness = await inspect_legacy_campaign_transition(db=db, request=request)
+    readiness = await _inspect_legacy_campaign_transition_locked(
+        db=db,
+        request=request,
+        legacy=legacy,
+        canonical=canonical,
+        canonical_definition=canonical_definition,
+    )
     blocking = [
         code
         for code in readiness.blockers
@@ -898,12 +1299,6 @@ async def rollback_legacy_campaign_transition(
     if blocking:
         raise PermissionError("rollback prerequisites failed: " + ", ".join(sorted(blocking)))
 
-    canonical = await _load_runtime(db=db, campaign_id=request.canonical_campaign_id)
-    canonical_definition = await _load_definition(
-        db=db,
-        campaign_id=request.canonical_campaign_id,
-        version=request.canonical_campaign_version,
-    )
     if canonical is None or canonical_definition is None:
         raise PermissionError("rollback unavailable without canonical runtime and definition")
 
@@ -965,28 +1360,27 @@ async def rollback_legacy_campaign_transition(
             audit_created=False,
         )
 
-    async with db.begin():
-        legacy.status = before_status
-        legacy.updated_at = datetime.now(timezone.utc)
-        await db.flush()
+    legacy.status = before_status
+    legacy.updated_at = datetime.now(timezone.utc)
+    await db.flush()
 
-        after = {
-            "status": legacy.status,
-            "paper_account_id": None if legacy.paper_account_id is None else str(legacy.paper_account_id),
-            "exchange": legacy.exchange,
-            "rollback_successor_campaign_id": str(request.canonical_campaign_id),
-            "rollback_successor_campaign_version": request.canonical_campaign_version,
-        }
-        db.add(
-            AuditLog(
-                actor=request.actor,
-                action="capital_campaign.transition_rollback",
-                entity_type="capital_campaign",
-                entity_id=legacy.uuid,
-                before_state=before,
-                after_state=after,
-            )
+    after = {
+        "status": legacy.status,
+        "paper_account_id": None if legacy.paper_account_id is None else str(legacy.paper_account_id),
+        "exchange": legacy.exchange,
+        "rollback_successor_campaign_id": str(request.canonical_campaign_id),
+        "rollback_successor_campaign_version": request.canonical_campaign_version,
+    }
+    db.add(
+        AuditLog(
+            actor=request.actor,
+            action="capital_campaign.transition_rollback",
+            entity_type="capital_campaign",
+            entity_id=legacy.uuid,
+            before_state=before,
+            after_state=after,
         )
+    )
 
     return LegacyCampaignTransitionMutationResult(
         changed=True,
