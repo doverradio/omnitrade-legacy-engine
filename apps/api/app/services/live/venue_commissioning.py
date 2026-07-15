@@ -519,7 +519,7 @@ async def _reconcile_order(
         product_id=run.product_id,
     )
     if order is None:
-        if side == "BUY" and provider_order_id:
+        if provider_order_id and side in {"BUY", "SELL"}:
             fills = await provider.list_fills(
                 credentials=credentials,
                 environment=run.environment,
