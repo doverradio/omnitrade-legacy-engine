@@ -141,8 +141,11 @@ async def test_bind_canonical_campaign_runtime_updates_runtime_row_and_audits(mo
     runtime = _runtime(campaign_id=campaign_id, paper_account_id=None)
 
     monkeypatch.setattr(binding, "_load_definition", _async_return(_definition(campaign_id=campaign_id, version=1)))
+    monkeypatch.setattr(binding, "_load_definition_for_update", _async_return(_definition(campaign_id=campaign_id, version=1)))
     monkeypatch.setattr(binding, "_load_runtime", _async_return(runtime))
+    monkeypatch.setattr(binding, "_load_runtime_for_update", _async_return(runtime))
     monkeypatch.setattr(binding, "_load_paper_account", _async_return(_paper_account(paper_account_id)))
+    monkeypatch.setattr(binding, "_load_paper_account_for_update", _async_return(_paper_account(paper_account_id)))
     monkeypatch.setattr(binding, "_load_live_profile", _async_return(_profile(live_profile_id, paper_account_id)))
     monkeypatch.setattr(binding, "_load_connection", _async_return(_connection()))
     monkeypatch.setattr(binding, "_load_asset", _async_return(_asset()))
@@ -185,8 +188,11 @@ async def test_bind_canonical_campaign_runtime_is_idempotent_on_exact_repeat(mon
     runtime = _runtime(campaign_id=campaign_id, paper_account_id=paper_account_id)
 
     monkeypatch.setattr(binding, "_load_definition", _async_return(_definition(campaign_id=campaign_id, version=1)))
+    monkeypatch.setattr(binding, "_load_definition_for_update", _async_return(_definition(campaign_id=campaign_id, version=1)))
     monkeypatch.setattr(binding, "_load_runtime", _async_return(runtime))
+    monkeypatch.setattr(binding, "_load_runtime_for_update", _async_return(runtime))
     monkeypatch.setattr(binding, "_load_paper_account", _async_return(_paper_account(paper_account_id)))
+    monkeypatch.setattr(binding, "_load_paper_account_for_update", _async_return(_paper_account(paper_account_id)))
     monkeypatch.setattr(binding, "_load_live_profile", _async_return(_profile(live_profile_id, paper_account_id)))
     monkeypatch.setattr(binding, "_load_connection", _async_return(_connection()))
     monkeypatch.setattr(binding, "_load_asset", _async_return(_asset()))
@@ -240,8 +246,11 @@ async def test_bind_canonical_campaign_runtime_rejects_conflicting_repeat(monkey
     db = _FakeDb()
 
     monkeypatch.setattr(binding, "_load_definition", _async_return(_definition(campaign_id=campaign_id, version=1)))
+    monkeypatch.setattr(binding, "_load_definition_for_update", _async_return(_definition(campaign_id=campaign_id, version=1)))
     monkeypatch.setattr(binding, "_load_runtime", _async_return(_runtime(campaign_id=campaign_id, paper_account_id=None)))
+    monkeypatch.setattr(binding, "_load_runtime_for_update", _async_return(_runtime(campaign_id=campaign_id, paper_account_id=None)))
     monkeypatch.setattr(binding, "_load_paper_account", _async_return(_paper_account(paper_account_id)))
+    monkeypatch.setattr(binding, "_load_paper_account_for_update", _async_return(_paper_account(paper_account_id)))
     monkeypatch.setattr(binding, "_load_live_profile", _async_return(_profile(live_profile_id, paper_account_id)))
     monkeypatch.setattr(binding, "_load_connection", _async_return(_connection()))
     monkeypatch.setattr(binding, "_load_asset", _async_return(_asset()))
@@ -274,8 +283,11 @@ async def test_bind_canonical_campaign_runtime_rejects_wrong_version_or_relation
 
     db = _FakeDb()
     monkeypatch.setattr(binding, "_load_definition", _async_return(None))
+    monkeypatch.setattr(binding, "_load_definition_for_update", _async_return(None))
     monkeypatch.setattr(binding, "_load_runtime", _async_return(_runtime(campaign_id=campaign_id, paper_account_id=None)))
+    monkeypatch.setattr(binding, "_load_runtime_for_update", _async_return(_runtime(campaign_id=campaign_id, paper_account_id=None)))
     monkeypatch.setattr(binding, "_load_paper_account", _async_return(_paper_account(paper_account_id)))
+    monkeypatch.setattr(binding, "_load_paper_account_for_update", _async_return(_paper_account(paper_account_id)))
     monkeypatch.setattr(binding, "_load_live_profile", _async_return(_profile(live_profile_id, UUID("aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa"))))
     monkeypatch.setattr(binding, "_load_connection", _async_return(_connection()))
     monkeypatch.setattr(binding, "_load_asset", _async_return(_asset()))
@@ -308,8 +320,11 @@ async def test_bind_canonical_campaign_runtime_rejects_open_order_or_reconciliat
 
     db = _FakeDb()
     monkeypatch.setattr(binding, "_load_definition", _async_return(_definition(campaign_id=campaign_id, version=1)))
+    monkeypatch.setattr(binding, "_load_definition_for_update", _async_return(_definition(campaign_id=campaign_id, version=1)))
     monkeypatch.setattr(binding, "_load_runtime", _async_return(_runtime(campaign_id=campaign_id, paper_account_id=None)))
+    monkeypatch.setattr(binding, "_load_runtime_for_update", _async_return(_runtime(campaign_id=campaign_id, paper_account_id=None)))
     monkeypatch.setattr(binding, "_load_paper_account", _async_return(_paper_account(paper_account_id)))
+    monkeypatch.setattr(binding, "_load_paper_account_for_update", _async_return(_paper_account(paper_account_id)))
     monkeypatch.setattr(binding, "_load_live_profile", _async_return(_profile(live_profile_id, paper_account_id)))
     monkeypatch.setattr(binding, "_load_connection", _async_return(_connection()))
     monkeypatch.setattr(binding, "_load_asset", _async_return(_asset()))
@@ -318,6 +333,318 @@ async def test_bind_canonical_campaign_runtime_rejects_open_order_or_reconciliat
     monkeypatch.setattr(binding, "_count_unresolved_reconciliation_events", _async_return(1))
 
     with pytest.raises(PermissionError):
+        await binding.bind_canonical_campaign_runtime(
+            db=db,
+            request=binding.CanonicalCampaignBindingRequest(
+                campaign_id=campaign_id,
+                campaign_version=1,
+                paper_account_id=paper_account_id,
+                live_trading_profile_id=live_profile_id,
+                provider="kraken_spot",
+                environment="production",
+                product_id="BTC-USD",
+                actor="operator:human",
+                confirm=True,
+            ),
+        )
+
+
+@pytest.mark.asyncio
+async def test_bind_canonical_campaign_runtime_autobegun_session_reuses_existing_transaction(monkeypatch: pytest.MonkeyPatch) -> None:
+    campaign_id = UUID("e9a9e8e9-9574-498d-b49e-f011218c7f2b")
+    paper_account_id = UUID("905a408c-7d8e-4fc7-ad3b-9ff637005d73")
+    live_profile_id = UUID("9da09ae9-475e-41e8-b2c2-717ba5acfa3d")
+
+    db = _FakeDb()
+    db._in_transaction = True
+    runtime = _runtime(campaign_id=campaign_id, paper_account_id=None, exchange=None)
+
+    monkeypatch.setattr(binding, "_load_definition_for_update", _async_return(_definition(campaign_id=campaign_id, version=1)))
+    monkeypatch.setattr(binding, "_load_runtime_for_update", _async_return(runtime))
+    monkeypatch.setattr(binding, "_load_paper_account_for_update", _async_return(_paper_account(paper_account_id)))
+    monkeypatch.setattr(binding, "_load_live_profile", _async_return(_profile(live_profile_id, paper_account_id)))
+    monkeypatch.setattr(binding, "_load_connection", _async_return(_connection()))
+    monkeypatch.setattr(binding, "_load_asset", _async_return(_asset()))
+    monkeypatch.setattr(binding, "_load_conflicting_campaigns", _async_return([]))
+    monkeypatch.setattr(binding, "_count_open_live_orders", _async_return(0))
+    monkeypatch.setattr(binding, "_count_unresolved_reconciliation_events", _async_return(0))
+
+    result = await binding.bind_canonical_campaign_runtime(
+        db=db,
+        request=binding.CanonicalCampaignBindingRequest(
+            campaign_id=campaign_id,
+            campaign_version=1,
+            paper_account_id=paper_account_id,
+            live_trading_profile_id=live_profile_id,
+            provider="kraken_spot",
+            environment="production",
+            product_id="BTC-USD",
+            actor="operator:human",
+            confirm=True,
+        ),
+    )
+
+    assert result.changed is True
+    assert db.begin_calls == 0
+
+
+@pytest.mark.asyncio
+async def test_bind_canonical_campaign_runtime_fails_closed_when_runtime_already_bound_to_different_account_or_exchange(monkeypatch: pytest.MonkeyPatch) -> None:
+    campaign_id = UUID("e9a9e8e9-9574-498d-b49e-f011218c7f2b")
+    paper_account_id = UUID("905a408c-7d8e-4fc7-ad3b-9ff637005d73")
+    live_profile_id = UUID("9da09ae9-475e-41e8-b2c2-717ba5acfa3d")
+
+    db = _FakeDb()
+    runtime = _runtime(
+        campaign_id=campaign_id,
+        paper_account_id=UUID("aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa"),
+        exchange="coinbase",
+    )
+
+    monkeypatch.setattr(binding, "_load_definition_for_update", _async_return(_definition(campaign_id=campaign_id, version=1)))
+    monkeypatch.setattr(binding, "_load_runtime_for_update", _async_return(runtime))
+    monkeypatch.setattr(binding, "_load_paper_account_for_update", _async_return(_paper_account(paper_account_id)))
+    monkeypatch.setattr(binding, "_load_live_profile", _async_return(_profile(live_profile_id, paper_account_id)))
+    monkeypatch.setattr(binding, "_load_connection", _async_return(_connection()))
+    monkeypatch.setattr(binding, "_load_asset", _async_return(_asset()))
+    monkeypatch.setattr(binding, "_load_conflicting_campaigns", _async_return([]))
+    monkeypatch.setattr(binding, "_count_open_live_orders", _async_return(0))
+    monkeypatch.setattr(binding, "_count_unresolved_reconciliation_events", _async_return(0))
+
+    with pytest.raises(PermissionError, match="canonical campaign binding prerequisites failed"):
+        await binding.bind_canonical_campaign_runtime(
+            db=db,
+            request=binding.CanonicalCampaignBindingRequest(
+                campaign_id=campaign_id,
+                campaign_version=1,
+                paper_account_id=paper_account_id,
+                live_trading_profile_id=live_profile_id,
+                provider="kraken_spot",
+                environment="production",
+                product_id="BTC-USD",
+                actor="operator:human",
+                confirm=True,
+            ),
+        )
+
+
+@pytest.mark.asyncio
+async def test_bind_canonical_campaign_runtime_rollback_on_exception_reverts_fields_and_audit(monkeypatch: pytest.MonkeyPatch) -> None:
+    campaign_id = UUID("e9a9e8e9-9574-498d-b49e-f011218c7f2b")
+    paper_account_id = UUID("905a408c-7d8e-4fc7-ad3b-9ff637005d73")
+    live_profile_id = UUID("9da09ae9-475e-41e8-b2c2-717ba5acfa3d")
+
+    class _RollbackAwareTx:
+        def __init__(self, db: "_FailingBindDb") -> None:
+            self._db = db
+
+        async def __aenter__(self):
+            self._db._in_transaction = True
+            self._db._paper_before_tx = self._db.runtime.paper_account_id
+            self._db._exchange_before_tx = self._db.runtime.exchange
+            self._db._added_before_tx = len(self._db.added)
+            return self
+
+        async def __aexit__(self, exc_type, exc, tb):
+            if exc_type is not None:
+                self._db.runtime.paper_account_id = self._db._paper_before_tx
+                self._db.runtime.exchange = self._db._exchange_before_tx
+                del self._db.added[self._db._added_before_tx :]
+            self._db._in_transaction = False
+            _ = exc, tb
+            return False
+
+    class _FailingBindDb(_FakeDb):
+        def __init__(self, runtime: SimpleNamespace) -> None:
+            super().__init__()
+            self.runtime = runtime
+            self._paper_before_tx = None
+            self._exchange_before_tx = None
+            self._added_before_tx = 0
+
+        def begin(self):
+            self.begin_calls += 1
+            return _RollbackAwareTx(self)
+
+        async def flush(self) -> None:
+            self.flushes += 1
+            raise RuntimeError("flush failed")
+
+    runtime = _runtime(campaign_id=campaign_id, paper_account_id=None, exchange=None)
+    db = _FailingBindDb(runtime)
+
+    monkeypatch.setattr(binding, "_load_definition_for_update", _async_return(_definition(campaign_id=campaign_id, version=1)))
+    monkeypatch.setattr(binding, "_load_runtime_for_update", _async_return(runtime))
+    monkeypatch.setattr(binding, "_load_paper_account_for_update", _async_return(_paper_account(paper_account_id)))
+    monkeypatch.setattr(binding, "_load_live_profile", _async_return(_profile(live_profile_id, paper_account_id)))
+    monkeypatch.setattr(binding, "_load_connection", _async_return(_connection()))
+    monkeypatch.setattr(binding, "_load_asset", _async_return(_asset()))
+    monkeypatch.setattr(binding, "_load_conflicting_campaigns", _async_return([]))
+    monkeypatch.setattr(binding, "_count_open_live_orders", _async_return(0))
+    monkeypatch.setattr(binding, "_count_unresolved_reconciliation_events", _async_return(0))
+
+    with pytest.raises(RuntimeError, match="flush failed"):
+        await binding.bind_canonical_campaign_runtime(
+            db=db,
+            request=binding.CanonicalCampaignBindingRequest(
+                campaign_id=campaign_id,
+                campaign_version=1,
+                paper_account_id=paper_account_id,
+                live_trading_profile_id=live_profile_id,
+                provider="kraken_spot",
+                environment="production",
+                product_id="BTC-USD",
+                actor="operator:human",
+                confirm=True,
+            ),
+        )
+
+    assert runtime.paper_account_id is None
+    assert runtime.exchange is None
+    assert len(db.added) == 0
+
+
+@pytest.mark.asyncio
+async def test_bind_canonical_campaign_runtime_retry_is_idempotent_without_duplicate_audit(monkeypatch: pytest.MonkeyPatch) -> None:
+    campaign_id = UUID("e9a9e8e9-9574-498d-b49e-f011218c7f2b")
+    paper_account_id = UUID("905a408c-7d8e-4fc7-ad3b-9ff637005d73")
+    live_profile_id = UUID("9da09ae9-475e-41e8-b2c2-717ba5acfa3d")
+
+    db = _FakeDb()
+    runtime = _runtime(campaign_id=campaign_id, paper_account_id=None, exchange=None)
+
+    monkeypatch.setattr(binding, "_load_definition_for_update", _async_return(_definition(campaign_id=campaign_id, version=1)))
+    monkeypatch.setattr(binding, "_load_runtime_for_update", _async_return(runtime))
+    monkeypatch.setattr(binding, "_load_paper_account_for_update", _async_return(_paper_account(paper_account_id)))
+    monkeypatch.setattr(binding, "_load_live_profile", _async_return(_profile(live_profile_id, paper_account_id)))
+    monkeypatch.setattr(binding, "_load_connection", _async_return(_connection()))
+    monkeypatch.setattr(binding, "_load_asset", _async_return(_asset()))
+    monkeypatch.setattr(binding, "_load_conflicting_campaigns", _async_return([]))
+    monkeypatch.setattr(binding, "_count_open_live_orders", _async_return(0))
+    monkeypatch.setattr(binding, "_count_unresolved_reconciliation_events", _async_return(0))
+
+    first = await binding.bind_canonical_campaign_runtime(
+        db=db,
+        request=binding.CanonicalCampaignBindingRequest(
+            campaign_id=campaign_id,
+            campaign_version=1,
+            paper_account_id=paper_account_id,
+            live_trading_profile_id=live_profile_id,
+            provider="kraken_spot",
+            environment="production",
+            product_id="BTC-USD",
+            actor="operator:human",
+            confirm=True,
+        ),
+    )
+    second = await binding.bind_canonical_campaign_runtime(
+        db=db,
+        request=binding.CanonicalCampaignBindingRequest(
+            campaign_id=campaign_id,
+            campaign_version=1,
+            paper_account_id=paper_account_id,
+            live_trading_profile_id=live_profile_id,
+            provider="kraken_spot",
+            environment="production",
+            product_id="BTC-USD",
+            actor="operator:human",
+            confirm=True,
+        ),
+    )
+
+    assert first.changed is True
+    assert second.changed is False
+    assert second.idempotent is True
+    assert sum(1 for item in db.added if getattr(item, "action", "") == "capital_campaign.bind_runtime") == 1
+
+
+@pytest.mark.asyncio
+async def test_bind_canonical_campaign_runtime_concurrent_style_retries_resolve_to_single_audit(monkeypatch: pytest.MonkeyPatch) -> None:
+    campaign_id = UUID("e9a9e8e9-9574-498d-b49e-f011218c7f2b")
+    paper_account_id = UUID("905a408c-7d8e-4fc7-ad3b-9ff637005d73")
+    live_profile_id = UUID("9da09ae9-475e-41e8-b2c2-717ba5acfa3d")
+
+    class _SerializedTx:
+        def __init__(self, db: "_SerializedDb") -> None:
+            self._db = db
+
+        async def __aenter__(self):
+            await self._db.tx_lock.acquire()
+            self._db._in_transaction = True
+            return self
+
+        async def __aexit__(self, exc_type, exc, tb):
+            self._db._in_transaction = False
+            self._db.tx_lock.release()
+            _ = exc_type, exc, tb
+            return False
+
+    class _SerializedDb(_FakeDb):
+        def __init__(self) -> None:
+            super().__init__()
+            self.tx_lock = asyncio.Lock()
+
+        def begin(self):
+            self.begin_calls += 1
+            return _SerializedTx(self)
+
+    db = _SerializedDb()
+    runtime = _runtime(campaign_id=campaign_id, paper_account_id=None, exchange=None)
+
+    monkeypatch.setattr(binding, "_load_definition_for_update", _async_return(_definition(campaign_id=campaign_id, version=1)))
+    monkeypatch.setattr(binding, "_load_runtime_for_update", _async_return(runtime))
+    monkeypatch.setattr(binding, "_load_paper_account_for_update", _async_return(_paper_account(paper_account_id)))
+    monkeypatch.setattr(binding, "_load_live_profile", _async_return(_profile(live_profile_id, paper_account_id)))
+    monkeypatch.setattr(binding, "_load_connection", _async_return(_connection()))
+    monkeypatch.setattr(binding, "_load_asset", _async_return(_asset()))
+    monkeypatch.setattr(binding, "_load_conflicting_campaigns", _async_return([]))
+    monkeypatch.setattr(binding, "_count_open_live_orders", _async_return(0))
+    monkeypatch.setattr(binding, "_count_unresolved_reconciliation_events", _async_return(0))
+
+    async def _call() -> binding.BindingMutationResult:
+        return await binding.bind_canonical_campaign_runtime(
+            db=db,
+            request=binding.CanonicalCampaignBindingRequest(
+                campaign_id=campaign_id,
+                campaign_version=1,
+                paper_account_id=paper_account_id,
+                live_trading_profile_id=live_profile_id,
+                provider="kraken_spot",
+                environment="production",
+                product_id="BTC-USD",
+                actor="operator:human",
+                confirm=True,
+            ),
+        )
+
+    first, second = await asyncio.gather(_call(), _call())
+
+    assert sum(1 for item in [first, second] if item.changed) == 1
+    assert sum(1 for item in db.added if getattr(item, "action", "") == "capital_campaign.bind_runtime") == 1
+
+
+@pytest.mark.asyncio
+async def test_bind_canonical_campaign_runtime_archived_legacy_requirement_via_conflict_guard(monkeypatch: pytest.MonkeyPatch) -> None:
+    campaign_id = UUID("e9a9e8e9-9574-498d-b49e-f011218c7f2b")
+    legacy_id = UUID("f1e8a655-70ee-47f3-8e9e-89c8735b6542")
+    paper_account_id = UUID("905a408c-7d8e-4fc7-ad3b-9ff637005d73")
+    live_profile_id = UUID("9da09ae9-475e-41e8-b2c2-717ba5acfa3d")
+
+    db = _FakeDb()
+    runtime = _runtime(campaign_id=campaign_id, paper_account_id=None, exchange=None)
+    active_legacy = _legacy_runtime(campaign_id=legacy_id, paper_account_id=paper_account_id, status="READY")
+
+    monkeypatch.setattr(binding, "_load_definition_for_update", _async_return(_definition(campaign_id=campaign_id, version=1)))
+    monkeypatch.setattr(binding, "_load_runtime_for_update", _async_return(runtime))
+    monkeypatch.setattr(binding, "_load_paper_account_for_update", _async_return(_paper_account(paper_account_id)))
+    monkeypatch.setattr(binding, "_load_live_profile", _async_return(_profile(live_profile_id, paper_account_id)))
+    monkeypatch.setattr(binding, "_load_connection", _async_return(_connection()))
+    monkeypatch.setattr(binding, "_load_asset", _async_return(_asset()))
+    monkeypatch.setattr(binding, "_load_conflicting_campaigns", _async_return([active_legacy]))
+    monkeypatch.setattr(binding, "_count_open_live_orders", _async_return(0))
+    monkeypatch.setattr(binding, "_count_unresolved_reconciliation_events", _async_return(0))
+
+    with pytest.raises(PermissionError, match="canonical campaign binding prerequisites failed"):
         await binding.bind_canonical_campaign_runtime(
             db=db,
             request=binding.CanonicalCampaignBindingRequest(
@@ -348,6 +675,45 @@ def test_binding_module_does_not_call_provider_order_submission() -> None:
     assert "submit_order" not in called_names
     assert "create_order" not in called_names
     assert "get_exchange_provider" not in called_names
+
+
+@pytest.mark.asyncio
+async def test_fetch_canonical_campaign_binding_audit_is_read_only(monkeypatch: pytest.MonkeyPatch) -> None:
+    campaign_id = UUID("e9a9e8e9-9574-498d-b49e-f011218c7f2b")
+
+    class _Scalars:
+        def __init__(self, rows):
+            self._rows = rows
+
+        def all(self):
+            return self._rows
+
+    class _Result:
+        def __init__(self, rows):
+            self._rows = rows
+
+        def scalars(self):
+            return _Scalars(self._rows)
+
+    class _AuditDb(_FakeDb):
+        async def execute(self, _statement):
+            row = SimpleNamespace(
+                actor="operator:human",
+                action="capital_campaign.bind_runtime",
+                before_state={"paper_account_id": None, "exchange": None},
+                after_state={"paper_account_id": "905a408c-7d8e-4fc7-ad3b-9ff637005d73", "exchange": "kraken_spot"},
+                created_at=datetime.now(timezone.utc),
+            )
+            return _Result([row])
+
+    db = _AuditDb()
+    payload = await binding.fetch_canonical_campaign_binding_audit(db=db, campaign_id=campaign_id, limit=5)
+
+    assert payload["campaign_id"] == str(campaign_id)
+    assert payload["total"] == 1
+    assert db.added == []
+    assert db.flushes == 0
+    assert db.begin_calls == 0
 
 
 @pytest.mark.asyncio
@@ -837,6 +1203,7 @@ async def test_readiness_true_guarantees_execution_prereqs_on_unchanged_state_an
     monkeypatch.setattr(binding, "_load_definition", _async_return(_definition(campaign_id=canonical_id, version=1)))
     monkeypatch.setattr(binding, "_load_definition_for_update", _async_return(_definition(campaign_id=canonical_id, version=1)))
     monkeypatch.setattr(binding, "_load_paper_account", _async_return(_paper_account(paper_account_id)))
+    monkeypatch.setattr(binding, "_load_paper_account_for_update", _async_return(_paper_account(paper_account_id)))
     monkeypatch.setattr(binding, "_load_live_profile", _async_return(_profile(profile_id, paper_account_id)))
     monkeypatch.setattr(binding, "_load_connection", _async_return(_connection()))
     monkeypatch.setattr(binding, "_load_asset", _async_return(_asset(exchange="kraken_spot")))
@@ -908,6 +1275,7 @@ async def test_subsequent_canonical_bind_succeeds_after_transition(monkeypatch: 
     monkeypatch.setattr(binding, "_load_definition", _async_return(_definition(campaign_id=canonical_id, version=1)))
     monkeypatch.setattr(binding, "_load_definition_for_update", _async_return(_definition(campaign_id=canonical_id, version=1)))
     monkeypatch.setattr(binding, "_load_paper_account", _async_return(_paper_account(paper_account_id)))
+    monkeypatch.setattr(binding, "_load_paper_account_for_update", _async_return(_paper_account(paper_account_id)))
     monkeypatch.setattr(binding, "_load_live_profile", _async_return(_profile(profile_id, paper_account_id)))
     monkeypatch.setattr(binding, "_load_connection", _async_return(_connection()))
     monkeypatch.setattr(binding, "_load_asset", _async_return(_asset(exchange="kraken_spot")))

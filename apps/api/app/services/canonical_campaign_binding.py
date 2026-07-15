@@ -203,6 +203,15 @@ async def _load_paper_account(*, db: AsyncSession, paper_account_id: UUID) -> Pa
     return await db.scalar(select(PaperAccount).where(PaperAccount.id == paper_account_id).limit(1))
 
 
+async def _load_paper_account_for_update(*, db: AsyncSession, paper_account_id: UUID) -> PaperAccount | None:
+    return await db.scalar(
+        select(PaperAccount)
+        .where(PaperAccount.id == paper_account_id)
+        .with_for_update()
+        .limit(1)
+    )
+
+
 async def _load_live_profile(*, db: AsyncSession, live_trading_profile_id: UUID) -> LiveTradingProfile | None:
     return await db.scalar(select(LiveTradingProfile).where(LiveTradingProfile.id == live_trading_profile_id).limit(1))
 
@@ -405,12 +414,30 @@ def _check(condition: bool, code: str, detail: str) -> BindingCheck:
 
 
 async def inspect_canonical_campaign_binding(*, db: AsyncSession, request: CanonicalCampaignBindingRequest) -> BindingReadinessResult:
-    environment = _normalize_exchange_environment(request.environment)
-    exchange = _exchange_label(provider=request.provider, environment=environment)
-
     definition = await _load_definition(db=db, campaign_id=request.campaign_id, version=request.campaign_version)
     runtime = await _load_runtime(db=db, campaign_id=request.campaign_id)
     paper_account = await _load_paper_account(db=db, paper_account_id=request.paper_account_id)
+
+    return await _inspect_canonical_campaign_binding_locked(
+        db=db,
+        request=request,
+        definition=definition,
+        runtime=runtime,
+        paper_account=paper_account,
+    )
+
+
+async def _inspect_canonical_campaign_binding_locked(
+    *,
+    db: AsyncSession,
+    request: CanonicalCampaignBindingRequest,
+    definition: CapitalCampaignDefinition | None,
+    runtime: CapitalCampaign | None,
+    paper_account: PaperAccount | None,
+) -> BindingReadinessResult:
+    environment = _normalize_exchange_environment(request.environment)
+    exchange = _exchange_label(provider=request.provider, environment=environment)
+
     live_profile = await _load_live_profile(db=db, live_trading_profile_id=request.live_trading_profile_id)
     connection = await _load_connection(db=db, provider=request.provider, environment=environment)
     asset = await _load_asset(db=db, provider=request.provider, environment=environment, product_id=request.product_id)
@@ -431,6 +458,8 @@ async def inspect_canonical_campaign_binding(*, db: AsyncSession, request: Canon
     if runtime is not None:
         checks.append(_check(runtime.definition_campaign_id == request.campaign_id, "runtime_definition_pin_matches", f"runtime_definition_campaign_id={runtime.definition_campaign_id}"))
         checks.append(_check(runtime.definition_version == request.campaign_version, "runtime_definition_version_matches", f"runtime_definition_version={runtime.definition_version}"))
+        checks.append(_check(runtime.paper_account_id is None or runtime.paper_account_id == request.paper_account_id, "runtime_paper_account_unbound_or_matches", f"runtime_paper_account_id={runtime.paper_account_id}"))
+        checks.append(_check(runtime.exchange is None or runtime.exchange == exchange, "runtime_exchange_unbound_or_matches", f"runtime_exchange={runtime.exchange}"))
         checks.append(_check(Decimal(runtime.current_equity) == Decimal(runtime.starting_capital), "runtime_zero_deployed_capital", f"current_equity={runtime.current_equity} starting_capital={runtime.starting_capital}"))
     checks.append(_check(paper_account is not None, "paper_account_exists", f"paper_account_id={request.paper_account_id}"))
     if paper_account is not None:
@@ -506,13 +535,39 @@ async def bind_canonical_campaign_runtime(*, db: AsyncSession, request: Canonica
     if not request.confirm:
         raise PermissionError("confirm=true is required")
 
-    readiness = await inspect_canonical_campaign_binding(db=db, request=request)
+    if _session_in_transaction(db):
+        return await _bind_canonical_campaign_runtime_without_begin(db=db, request=request)
+
+    async with db.begin():
+        return await _bind_canonical_campaign_runtime_without_begin(db=db, request=request)
+
+
+async def _bind_canonical_campaign_runtime_without_begin(
+    *,
+    db: AsyncSession,
+    request: CanonicalCampaignBindingRequest,
+) -> BindingMutationResult:
+    environment = _normalize_exchange_environment(request.environment)
+    exchange = _exchange_label(provider=request.provider, environment=environment)
+
+    definition = await _load_definition_for_update(
+        db=db,
+        campaign_id=request.campaign_id,
+        version=request.campaign_version,
+    )
+    runtime = await _load_runtime_for_update(db=db, campaign_id=request.campaign_id)
+    paper_account = await _load_paper_account_for_update(db=db, paper_account_id=request.paper_account_id)
+
+    readiness = await _inspect_canonical_campaign_binding_locked(
+        db=db,
+        request=request,
+        definition=definition,
+        runtime=runtime,
+        paper_account=paper_account,
+    )
     if not readiness.ready:
         raise PermissionError("canonical campaign binding prerequisites failed: " + ", ".join(readiness.blockers))
 
-    environment = _normalize_exchange_environment(request.environment)
-    exchange = _exchange_label(provider=request.provider, environment=environment)
-    runtime = await _load_runtime(db=db, campaign_id=request.campaign_id)
     if runtime is None:
         raise LookupError("runtime campaign not found")
 
@@ -527,28 +582,27 @@ async def bind_canonical_campaign_runtime(*, db: AsyncSession, request: Canonica
     if already_bound:
         return BindingMutationResult(changed=False, idempotent=True, before=before, after=before, readiness=readiness, audit_created=False)
 
-    async with db.begin():
-        runtime.paper_account_id = request.paper_account_id
-        runtime.exchange = exchange
-        runtime.updated_at = datetime.now(timezone.utc)
-        await db.flush()
+    runtime.paper_account_id = request.paper_account_id
+    runtime.exchange = exchange
+    runtime.updated_at = datetime.now(timezone.utc)
+    await db.flush()
 
-        after = {
-            "paper_account_id": str(runtime.paper_account_id) if runtime.paper_account_id is not None else None,
-            "exchange": runtime.exchange,
-            "definition_campaign_id": str(runtime.definition_campaign_id) if runtime.definition_campaign_id is not None else None,
-            "definition_version": runtime.definition_version,
-        }
-        db.add(
-            AuditLog(
-                actor=request.actor,
-                action="capital_campaign.bind_runtime",
-                entity_type="capital_campaign",
-                entity_id=runtime.uuid,
-                before_state=before,
-                after_state=after,
-            )
+    after = {
+        "paper_account_id": str(runtime.paper_account_id) if runtime.paper_account_id is not None else None,
+        "exchange": runtime.exchange,
+        "definition_campaign_id": str(runtime.definition_campaign_id) if runtime.definition_campaign_id is not None else None,
+        "definition_version": runtime.definition_version,
+    }
+    db.add(
+        AuditLog(
+            actor=request.actor,
+            action="capital_campaign.bind_runtime",
+            entity_type="capital_campaign",
+            entity_id=runtime.uuid,
+            before_state=before,
+            after_state=after,
         )
+    )
 
     return BindingMutationResult(changed=True, idempotent=False, before=before, after=after, readiness=readiness, audit_created=True)
 

@@ -3,6 +3,8 @@ from __future__ import annotations
 from types import SimpleNamespace
 from uuid import UUID
 
+import pytest
+
 import app.operator_cli.main as operator_main
 from app.operator_cli.main import parse_args
 
@@ -210,6 +212,50 @@ def test_parse_execution_forensics_command_selectors() -> None:
     assert cycle.since is None
     assert cycle.cycle == UUID("44444444-4444-4444-4444-444444444444")
     assert cycle.json_output is True
+
+
+def test_parse_canonical_campaign_binding_commands() -> None:
+    readiness = parse_args([
+        "canonical-campaign-readiness",
+        "--campaign-id",
+        "e9a9e8e9-9574-498d-b49e-f011218c7f2b",
+        "--campaign-version",
+        "1",
+        "--paper-account-id",
+        "905a408c-7d8e-4fc7-ad3b-9ff637005d73",
+        "--live-trading-profile-id",
+        "9da09ae9-475e-41e8-b2c2-717ba5acfa3d",
+        "--provider",
+        "kraken_spot",
+        "--environment",
+        "production",
+        "--product",
+        "BTC-USD",
+        "--json",
+    ])
+    assert readiness.command == "canonical-campaign-readiness"
+    assert readiness.json_output is True
+
+    audit = parse_args([
+        "canonical-campaign-binding-audit",
+        "--campaign-id",
+        "e9a9e8e9-9574-498d-b49e-f011218c7f2b",
+        "--limit",
+        "10",
+        "--json",
+    ])
+    assert audit.command == "canonical-campaign-binding-audit"
+    assert audit.limit == 10
+    assert audit.json_output is True
+
+
+def test_parse_rejects_nonexistent_canonical_campaign_binding_status_command() -> None:
+    with pytest.raises(SystemExit):
+        parse_args([
+            "canonical-campaign-binding-status",
+            "--campaign-id",
+            "e9a9e8e9-9574-498d-b49e-f011218c7f2b",
+        ])
 
 
 def test_parse_legacy_campaign_transition_commands() -> None:
