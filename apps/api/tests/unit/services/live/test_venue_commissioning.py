@@ -590,6 +590,100 @@ async def test_reconcile_uses_stored_buy_client_order_identity(monkeypatch: pyte
 
 
 @pytest.mark.asyncio
+async def test_resume_with_lookup_missing_and_fill_present_advances_buy_to_holding(monkeypatch: pytest.MonkeyPatch) -> None:
+    db = _FakeDb()
+    now = datetime.now(timezone.utc)
+    run_id = uuid.uuid4()
+    buy_id = vc._build_client_order_id(run_id=run_id, side="BUY")
+    db.connection = SimpleNamespace(provider="kraken_spot", environment="production")
+    db.run = SimpleNamespace(
+        commissioning_run_id=run_id,
+        status="BUY_RECONCILIATION_REQUIRED",
+        provider="kraken_spot",
+        product_id="BTC-USD",
+        environment="production",
+        activated_at=now - timedelta(minutes=1),
+        started_at=now - timedelta(minutes=1),
+        buy_client_order_id=buy_id,
+        buy_provider_order_id="OS6BOV-CAHMZ-55ASP4",
+        buy_idempotency_key=buy_id,
+        buy_submitted_at=now - timedelta(minutes=1),
+        buy_requested_quote_usd=Decimal("5.00"),
+        hold_minutes=30,
+        state_payload={},
+        started_by="operator:human",
+        updated_at=now,
+        duplicate_orders_detected=False,
+        manual_intervention_required=False,
+        sell_client_order_id=None,
+        buy_filled_base_btc=None,
+        buy_filled_quote_usd=None,
+        buy_fee_usd=None,
+        buy_avg_price_usd=None,
+        buy_filled_at=None,
+        hold_started_at=None,
+        hold_due_at=None,
+        sell_provider_order_id=None,
+        sell_idempotency_key=None,
+        sell_submitted_at=None,
+        sell_requested_base_btc=None,
+        sell_filled_base_btc=None,
+        sell_filled_quote_usd=None,
+        sell_fee_usd=None,
+        sell_avg_price_usd=None,
+        sell_filled_at=None,
+        gross_pnl_usd=None,
+        total_fees_usd=None,
+        net_realized_pnl_usd=None,
+        dust_base_btc=None,
+        ledger_matches_kraken=False,
+        completed_at=None,
+        execution_purpose="VENUE_COMMISSIONING",
+    )
+
+    captured: dict[str, object] = {"lookup_calls": 0, "fill_calls": 0}
+
+    class _ProviderStubForResume:
+        def supports_capability(self, _cap: str) -> bool:
+            return True
+
+        async def lookup_order(self, **kwargs):
+            captured["lookup_calls"] = int(captured.get("lookup_calls", 0)) + 1
+            captured["lookup_kwargs"] = kwargs
+            return None
+
+        async def list_fills(self, **kwargs):
+            captured["fill_calls"] = int(captured.get("fill_calls", 0)) + 1
+            captured["fill_kwargs"] = kwargs
+            return [
+                SimpleNamespace(
+                    size=Decimal("0.00007717"),
+                    price=Decimal("64788.10"),
+                    fee=SimpleNamespace(amount=Decimal("0.04")),
+                    occurred_at=now,
+                )
+            ]
+
+    provider = _ProviderStubForResume()
+    monkeypatch.setattr(vc, "get_exchange_provider", lambda *_args, **_kwargs: provider)
+    monkeypatch.setattr("app.services.live_crypto_orders._load_decrypted_credentials", lambda *_args, **_kwargs: {})
+
+    processed = await vc.resume_runs(db=db, actor="orchestration_worker", limit=10)
+
+    assert processed == 1
+    assert captured["lookup_calls"] == 1
+    assert captured["fill_calls"] == 1
+    assert db.run.status == "HOLDING"
+    assert db.run.buy_filled_at == now
+    assert db.run.buy_filled_base_btc == Decimal("0.00007717")
+    assert db.run.buy_filled_quote_usd == Decimal("4.99")
+    assert db.run.buy_avg_price_usd == Decimal("64788.10")
+    assert db.run.buy_fee_usd == Decimal("0.04")
+    assert db.run.hold_started_at == now
+    assert db.run.hold_due_at == now + timedelta(minutes=30)
+
+
+@pytest.mark.asyncio
 async def test_buy_fill_transitions_to_holding(monkeypatch: pytest.MonkeyPatch) -> None:
     db = _FakeDb()
     now = datetime.now(timezone.utc)
