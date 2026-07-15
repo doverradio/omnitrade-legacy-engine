@@ -4,7 +4,7 @@ import uuid
 from datetime import datetime
 from typing import Any
 
-from sqlalchemy import DateTime, Index, Text, UniqueConstraint, text
+from sqlalchemy import CheckConstraint, DateTime, Index, Integer, Text, UniqueConstraint, text
 from sqlalchemy.dialects.postgresql import JSONB, UUID
 from sqlalchemy.orm import Mapped, mapped_column
 
@@ -15,7 +15,10 @@ class AutonomousCycleRun(Base):
     __tablename__ = "autonomous_cycle_runs"
     __table_args__ = (
         UniqueConstraint("idempotency_key", name="uq_autonomous_cycle_runs_idempotency_key"),
+        CheckConstraint("cycle_kind IN ('autonomous','campaign')", name="ck_autonomous_cycle_runs_cycle_kind"),
         Index("ix_autonomous_cycle_runs_mandate_created", "mandate_id", "started_at"),
+        Index("ix_autonomous_cycle_runs_campaign_created", "capital_campaign_id", "started_at"),
+        Index("ix_autonomous_cycle_runs_kind_created", "cycle_kind", "started_at"),
         Index("ix_autonomous_cycle_runs_state", "state"),
     )
 
@@ -23,6 +26,9 @@ class AutonomousCycleRun(Base):
     idempotency_key: Mapped[str] = mapped_column(Text, nullable=False)
     mandate_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), nullable=False)
     mandate_version_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), nullable=True)
+    cycle_kind: Mapped[str] = mapped_column(Text, nullable=False, server_default=text("'autonomous'"))
+    capital_campaign_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), nullable=True)
+    capital_campaign_version: Mapped[int | None] = mapped_column(Integer, nullable=True)
     state: Mapped[str] = mapped_column(Text, nullable=False, server_default=text("'NOT_STARTED'"))
     evaluation_stage: Mapped[str | None] = mapped_column(Text, nullable=True)
     termination_stage: Mapped[str | None] = mapped_column(Text, nullable=True)

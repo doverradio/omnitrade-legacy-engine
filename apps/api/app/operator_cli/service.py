@@ -34,6 +34,12 @@ from app.models.strategy_roster_proposal import StrategyRosterProposal
 from app.models.strategy_roster_proposal_outcome import StrategyRosterProposalOutcome
 from app.models.strategy_roster_run import StrategyRosterRun
 from app.services.autonomous_cycle import AutonomousCycleRequest, run_autonomous_preview_cycle
+from app.services.capital_campaign_orchestration import (
+    fetch_campaign_orchestration_history as _fetch_campaign_orchestration_history,
+    fetch_campaign_orchestration_readiness as _fetch_campaign_orchestration_readiness,
+    fetch_campaign_orchestration_status as _fetch_campaign_orchestration_status,
+    run_campaign_orchestration_preview_for_candle,
+)
 from app.services.strategy_outcomes import fetch_strategy_scorecards
 
 
@@ -1070,6 +1076,26 @@ async def fetch_preview_evidence(*, preview_id: UUID) -> dict[str, Any]:
         )
     )
     return payload
+
+
+async def fetch_campaign_orchestration_readiness(*, campaign_id: UUID | None, version: int | None) -> dict[str, Any]:
+    async with AsyncSessionLocal() as db:
+        return await _fetch_campaign_orchestration_readiness(db=db, campaign_id=campaign_id, version=version)
+
+
+async def fetch_campaign_orchestration_preview(*, campaign_id: UUID | None, version: int | None) -> dict[str, Any]:
+    async with AsyncSessionLocal() as db:
+        return await run_campaign_orchestration_preview_for_candle(db=db, campaign_id=campaign_id, version=version, allow_draft_preview=True)
+
+
+async def fetch_campaign_orchestration_status(*, campaign_id: UUID, version: int | None) -> dict[str, Any]:
+    async with AsyncSessionLocal() as db:
+        return await _fetch_campaign_orchestration_status(db=db, campaign_id=campaign_id, version=version)
+
+
+async def fetch_campaign_orchestration_history(*, campaign_id: UUID, version: int | None, limit: int) -> dict[str, Any]:
+    async with AsyncSessionLocal() as db:
+        return await _fetch_campaign_orchestration_history(db=db, campaign_id=campaign_id, version=version, limit=limit)
 
 
 async def fetch_candle_readiness(

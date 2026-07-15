@@ -42,8 +42,8 @@ CompoundingPolicyType = Literal[
     "STOP_AT_PROFIT_TARGET",
 ]
 
-RiskPreviewVerdict = Literal["ALLOW", "VETO"]
-EvidenceAuthorityClass = Literal["SIMULATED", "OPERATOR_SUPPLIED"]
+RiskPreviewVerdict = Literal["ALLOW", "REDUCE", "VETO"]
+EvidenceAuthorityClass = Literal["SIMULATED", "OPERATOR_SUPPLIED", "AUTHORITATIVE", "UNAVAILABLE", "STALE"]
 
 
 class CampaignCompoundingPolicy(BaseModel):

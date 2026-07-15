@@ -221,7 +221,7 @@ def build_campaign_preview(
             evaluated_at=now,
         )
 
-    if campaign.status not in {"READY", "ACTIVE", "PAUSED"}:
+    if campaign.status not in {"DRAFT", "READY", "ACTIVE", "PAUSED"}:
         return CapitalCampaignPreviewResponse(
             campaign_id=campaign.campaign_id,
             campaign_version=campaign.version,

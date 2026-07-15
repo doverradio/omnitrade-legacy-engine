@@ -41,6 +41,7 @@ from app.services.system_intelligence_snapshots import capture_system_intelligen
 from app.services.strategies import StrategyContext, strategy_registry
 from app.services.strategies.registry import StrategyLookupError
 from app.services.autonomous_cycle import AutonomousCycleRequest, run_autonomous_preview_cycle
+from app.services.capital_campaign_orchestration import run_campaign_orchestration_preview_for_candle
 from app.services.orchestration.venue_commissioning_bridge import service as venue_commissioning_service
 from app.services.strategy_outcomes import score_due_strategy_roster_proposal_outcomes
 from app.services.strategy_roster import StrategyRosterRequest, run_strategy_roster_for_candle
@@ -527,6 +528,13 @@ async def run_orchestration_cycle(
     except Exception:
         await _rollback_active_session(db=db)
         logger.exception("autonomous_cycle_failed trigger=%s", _AUTONOMOUS_CYCLE_TRIGGER)
+
+    if all(hasattr(db, attr) for attr in ("execute", "scalar", "commit")):
+        try:
+            await run_campaign_orchestration_preview_for_candle(db=db, trigger=_AUTONOMOUS_CYCLE_TRIGGER)
+        except Exception:
+            await _rollback_active_session(db=db)
+            logger.exception("campaign_orchestration_failed trigger=%s", _AUTONOMOUS_CYCLE_TRIGGER)
 
     try:
         if kraken_btc_candle is None:

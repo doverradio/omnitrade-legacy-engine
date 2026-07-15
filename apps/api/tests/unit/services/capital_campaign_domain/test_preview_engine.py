@@ -180,6 +180,12 @@ def test_no_qualifying_opportunity_returns_no_action() -> None:
     assert response.no_action is True
 
 
+def test_draft_campaigns_are_preview_eligible() -> None:
+    draft_campaign = _campaign(status="DRAFT")
+    response = build_campaign_preview(campaign=draft_campaign, request=_request(instruments=["BTC-USD"]), now=datetime.now(timezone.utc))
+    assert response.no_action_reason != "campaign_status_not_preview_eligible:DRAFT"
+
+
 def test_one_qualifying_opportunity_selected() -> None:
     response = build_campaign_preview(campaign=_campaign(), request=_request(instruments=["BTC-USD"]), now=datetime.now(timezone.utc))
     assert len(response.proposed_opportunities) == 1

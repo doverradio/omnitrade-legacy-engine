@@ -23,6 +23,10 @@ from app.operator_cli.formatting import (
 )
 from app.operator_cli.service import (
     activate_venue_commission_run,
+    fetch_campaign_orchestration_history,
+    fetch_campaign_orchestration_preview,
+    fetch_campaign_orchestration_readiness,
+    fetch_campaign_orchestration_status,
     execute_preview_cycle,
     fetch_venue_commission_readiness,
     fetch_venue_commission_status,
@@ -230,6 +234,47 @@ def _build_parser() -> argparse.ArgumentParser:
     venue_revoke.add_argument("--confirm", action="store_true")
     venue_revoke.add_argument("--json", action="store_true", dest="json_output")
 
+    campaign_readiness = subparsers.add_parser(
+        "campaign-orchestration-readiness",
+        parents=[common],
+        help="Show campaign orchestration readiness for the Kraken 15m trigger",
+        description="Read-only campaign orchestration readiness diagnostics.",
+    )
+    campaign_readiness.add_argument("--campaign-id", type=UUID, default=None)
+    campaign_readiness.add_argument("--version", type=int, default=None)
+    campaign_readiness.add_argument("--json", action="store_true", dest="json_output")
+
+    campaign_preview = subparsers.add_parser(
+        "campaign-orchestration-preview",
+        parents=[common],
+        help="Run the read-only campaign orchestration preview cycle",
+        description="Preview-only campaign orchestration run on the latest Kraken BTC 15m candle.",
+    )
+    campaign_preview.add_argument("--campaign-id", type=UUID, default=None)
+    campaign_preview.add_argument("--version", type=int, default=None)
+    campaign_preview.add_argument("--json", action="store_true", dest="json_output")
+
+    campaign_status = subparsers.add_parser(
+        "campaign-orchestration-status",
+        parents=[common],
+        help="Show the latest campaign orchestration status",
+        description="Read-only campaign orchestration status summary.",
+    )
+    campaign_status.add_argument("--campaign-id", type=UUID, required=True)
+    campaign_status.add_argument("--version", type=int, default=None)
+    campaign_status.add_argument("--json", action="store_true", dest="json_output")
+
+    campaign_history = subparsers.add_parser(
+        "campaign-orchestration-history",
+        parents=[common],
+        help="Show persisted campaign orchestration history",
+        description="Read-only campaign orchestration history.",
+    )
+    campaign_history.add_argument("--campaign-id", type=UUID, required=True)
+    campaign_history.add_argument("--version", type=int, default=None)
+    campaign_history.add_argument("--limit", type=int, default=20)
+    campaign_history.add_argument("--json", action="store_true", dest="json_output")
+
     return parser
 
 
@@ -260,6 +305,22 @@ async def _run_async(args: argparse.Namespace) -> tuple[int, dict[str, Any], str
         state = str(payload.get("state") or "")
         code = 0 if state in {"COMPLETE", "PREVIEW_READY"} else 1
         return code, payload, text
+
+    if args.command == "campaign-orchestration-readiness":
+        payload = await fetch_campaign_orchestration_readiness(campaign_id=args.campaign_id, version=args.version)
+        return 0, payload, render_json(payload)
+
+    if args.command == "campaign-orchestration-preview":
+        payload = await fetch_campaign_orchestration_preview(campaign_id=args.campaign_id, version=args.version)
+        return 0, payload, render_json(payload)
+
+    if args.command == "campaign-orchestration-status":
+        payload = await fetch_campaign_orchestration_status(campaign_id=args.campaign_id, version=args.version)
+        return 0, payload, render_json(payload)
+
+    if args.command == "campaign-orchestration-history":
+        payload = await fetch_campaign_orchestration_history(campaign_id=args.campaign_id, version=args.version, limit=args.limit)
+        return 0, payload, render_json(payload)
 
     if args.command == "preview-show":
         payload = await fetch_preview_evidence(preview_id=args.preview_id)

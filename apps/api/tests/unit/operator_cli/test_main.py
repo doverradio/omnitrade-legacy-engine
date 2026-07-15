@@ -147,6 +147,38 @@ def test_parse_scorecards_command() -> None:
     assert args.json_output is True
 
 
+def test_parse_campaign_orchestration_commands() -> None:
+    readiness = parse_args([
+        "campaign-orchestration-readiness",
+        "--campaign-id",
+        "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa",
+    ])
+    assert readiness.command == "campaign-orchestration-readiness"
+    assert readiness.campaign_id == UUID("aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa")
+
+    preview = parse_args([
+        "campaign-orchestration-preview",
+    ])
+    assert preview.command == "campaign-orchestration-preview"
+
+    status = parse_args([
+        "campaign-orchestration-status",
+        "--campaign-id",
+        "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa",
+    ])
+    assert status.command == "campaign-orchestration-status"
+
+    history = parse_args([
+        "campaign-orchestration-history",
+        "--campaign-id",
+        "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa",
+        "--limit",
+        "5",
+    ])
+    assert history.command == "campaign-orchestration-history"
+    assert history.limit == 5
+
+
 def test_parse_execution_forensics_command_selectors() -> None:
     latest = parse_args([
         "execution-forensics",

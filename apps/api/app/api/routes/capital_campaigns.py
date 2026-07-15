@@ -30,11 +30,12 @@ from app.schemas.capital_campaign_domain import (
     CapitalCampaignPreviewRequest,
     CapitalCampaignPreviewResponse,
 )
-from app.services.capital_campaign_domain import (
-    create_campaign_draft,
-    get_campaign_definition,
-    list_campaign_definitions,
-    preview_campaign_definition,
+from app.services.capital_campaign_domain import create_campaign_draft, get_campaign_definition, list_campaign_definitions, preview_campaign_definition
+from app.services.capital_campaign_orchestration import (
+    fetch_campaign_orchestration_history,
+    fetch_campaign_orchestration_readiness,
+    fetch_campaign_orchestration_status,
+    run_campaign_orchestration_preview_for_candle,
 )
 from app.services.capital_campaign_profit.service import (
     approve_profit_cycle,
@@ -134,6 +135,59 @@ async def post_capital_campaign_domain_preview_explain(
         version=version,
         request=request,
     )
+
+
+@router.get("/domain/{campaign_id}/orchestration/readiness")
+async def get_capital_campaign_domain_orchestration_readiness(
+    campaign_id: str,
+    version: int | None = Query(default=None),
+    db: AsyncSession = Depends(get_db),
+) -> dict[str, object]:
+    try:
+        parsed_campaign_id = uuid.UUID(campaign_id)
+    except ValueError:
+        raise InvalidRequestError(message="Invalid campaign_id", details={"campaign_id": campaign_id})
+    return await fetch_campaign_orchestration_readiness(db=db, campaign_id=parsed_campaign_id, version=version)
+
+
+@router.post("/domain/{campaign_id}/orchestration/preview")
+async def post_capital_campaign_domain_orchestration_preview(
+    campaign_id: str,
+    version: int | None = Query(default=None),
+    db: AsyncSession = Depends(get_db),
+) -> dict[str, object]:
+    try:
+        parsed_campaign_id = uuid.UUID(campaign_id)
+    except ValueError:
+        raise InvalidRequestError(message="Invalid campaign_id", details={"campaign_id": campaign_id})
+    return await run_campaign_orchestration_preview_for_candle(db=db, campaign_id=parsed_campaign_id, version=version, allow_draft_preview=True)
+
+
+@router.get("/domain/{campaign_id}/orchestration/status")
+async def get_capital_campaign_domain_orchestration_status(
+    campaign_id: str,
+    version: int | None = Query(default=None),
+    db: AsyncSession = Depends(get_db),
+) -> dict[str, object]:
+    try:
+        parsed_campaign_id = uuid.UUID(campaign_id)
+    except ValueError:
+        raise InvalidRequestError(message="Invalid campaign_id", details={"campaign_id": campaign_id})
+    return await fetch_campaign_orchestration_status(db=db, campaign_id=parsed_campaign_id, version=version)
+
+
+@router.get("/domain/{campaign_id}/orchestration/history")
+async def get_capital_campaign_domain_orchestration_history(
+    campaign_id: str,
+    version: int | None = Query(default=None),
+    limit: int = Query(default=20, ge=1, le=100),
+    db: AsyncSession = Depends(get_db),
+) -> dict[str, object]:
+    try:
+        parsed_campaign_id = uuid.UUID(campaign_id)
+    except ValueError:
+        raise InvalidRequestError(message="Invalid campaign_id", details={"campaign_id": campaign_id})
+    return await fetch_campaign_orchestration_history(db=db, campaign_id=parsed_campaign_id, version=version, limit=limit)
 
 
 @router.get("", response_model=CapitalCampaignListResponse)
