@@ -629,6 +629,7 @@ async def start_run(*, db: AsyncSession, actor: str, run_id: uuid.UUID, confirm:
     if run.status in {"BUY_SUBMISSION_PENDING", "BUY_RECONCILIATION_REQUIRED"}:
         order_status, order, fills = await _reconcile_order(db=db, run=run, side="BUY")
         total_base, total_quote, total_fees, latest_fill = _fill_aggregates(fills=fills)
+        buy_fill_evidence_present = total_base > Decimal("0")
         if total_base > Decimal("0"):
             run.buy_filled_base_btc = _quantize(total_base)
             run.buy_filled_quote_usd = _q_usd(total_quote)
@@ -637,7 +638,7 @@ async def start_run(*, db: AsyncSession, actor: str, run_id: uuid.UUID, confirm:
             run.buy_filled_at = latest_fill
         if order is not None and order.provider_order_id and run.buy_provider_order_id is None:
             run.buy_provider_order_id = order.provider_order_id
-        if order_status == "FILLED" and run.buy_filled_base_btc and run.buy_filled_base_btc > Decimal("0"):
+        if (order_status == "FILLED" or (order is None and buy_fill_evidence_present)) and run.buy_filled_base_btc and run.buy_filled_base_btc > Decimal("0"):
             _transition(run, "BUY_FILLED")
             run.hold_started_at = run.buy_filled_at or now
             run.hold_due_at = run.hold_started_at + timedelta(minutes=run.hold_minutes)

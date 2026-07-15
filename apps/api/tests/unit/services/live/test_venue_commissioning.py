@@ -630,6 +630,54 @@ async def test_buy_fill_transitions_to_holding(monkeypatch: pytest.MonkeyPatch) 
 
 
 @pytest.mark.asyncio
+async def test_buy_fills_without_lookup_order_still_transition_to_holding(monkeypatch: pytest.MonkeyPatch) -> None:
+    db = _FakeDb()
+    now = datetime.now(timezone.utc)
+    db.run = SimpleNamespace(
+        commissioning_run_id=uuid.uuid4(),
+        status="BUY_RECONCILIATION_REQUIRED",
+        buy_client_order_id=vc._build_client_order_id(run_id=uuid.uuid4(), side="BUY"),
+        buy_provider_order_id="OS6BOV-CAHMZ-55ASP4",
+        buy_idempotency_key="reconcile-buy-id",
+        buy_submitted_at=now,
+        buy_requested_quote_usd=Decimal("5.00"),
+        hold_minutes=30,
+        state_payload={},
+        started_by=None,
+        started_at=None,
+        updated_at=None,
+        duplicate_orders_detected=False,
+        manual_intervention_required=False,
+        sell_client_order_id=None,
+        buy_filled_base_btc=None,
+        buy_filled_quote_usd=None,
+        buy_fee_usd=None,
+        buy_avg_price_usd=None,
+        buy_filled_at=None,
+        hold_started_at=None,
+        hold_due_at=None,
+    )
+
+    fill = SimpleNamespace(size=Decimal("0.00007717"), price=Decimal("64788.10"), fee=SimpleNamespace(amount=Decimal("0.04")), occurred_at=now)
+
+    async def _reconcile(**_kwargs):
+        return "UNKNOWN", None, [fill]
+
+    monkeypatch.setattr(vc, "_reconcile_order", _reconcile)
+
+    run = await vc.start_run(db=db, actor="operator:human", run_id=db.run.commissioning_run_id, confirm=True)
+
+    assert run.status == "HOLDING"
+    assert run.buy_filled_at == now
+    assert run.buy_filled_base_btc == Decimal("0.00007717")
+    assert run.buy_filled_quote_usd == Decimal("4.99")
+    assert run.buy_avg_price_usd == Decimal("64788.10")
+    assert run.buy_fee_usd == Decimal("0.04")
+    assert run.hold_started_at == now
+    assert run.hold_due_at == now + timedelta(minutes=30)
+
+
+@pytest.mark.asyncio
 async def test_sell_requires_reconciled_buy(monkeypatch: pytest.MonkeyPatch) -> None:
     db = _FakeDb()
     db.run = SimpleNamespace(
