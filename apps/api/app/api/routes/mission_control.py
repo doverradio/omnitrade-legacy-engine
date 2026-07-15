@@ -1,14 +1,17 @@
 from __future__ import annotations
 
 from typing import Any
+from uuid import UUID
 
 from fastapi import APIRouter, Query
 
 from app.db.session import run_read_with_retry
 from app.schemas.mission_control import MissionControlIntelligenceResponse, MissionControlSnapshotHistoryResponse
+from app.schemas.position_lifecycle import PositionLifecycleResponse
 from app.schemas.profit_intelligence import ProfitMetricResponse
 from app.services.mission_control_intelligence import build_mission_control_intelligence
 from app.services.mission_control_snapshot_history import build_snapshot_history
+from app.services.position_lifecycle import build_position_lifecycle_report
 from app.services.profit_intelligence import build_profit_metrics
 
 router = APIRouter(prefix="/mission-control", tags=["mission-control"])
@@ -48,6 +51,27 @@ async def get_mission_control_profit(
             symbol=symbol,
         ),
         operation_name="mission_control_profit",
+    )
+
+
+@router.get("/positions/lifecycle", response_model=PositionLifecycleResponse)
+async def get_position_lifecycle_report(
+    position_id: str | None = Query(default=None),
+    account_id: UUID | None = Query(default=None),
+    campaign_id: int | None = Query(default=None),
+    asset_class: str | None = Query(default=None),
+    recommendation: str | None = Query(default=None),
+) -> PositionLifecycleResponse:
+    return await run_read_with_retry(
+        lambda db: build_position_lifecycle_report(
+            db=db,
+            position_id=position_id,
+            account_id=account_id,
+            campaign_id=campaign_id,
+            asset_class=asset_class,
+            recommendation=recommendation,
+        ),
+        operation_name="mission_control_position_lifecycle",
     )
 
 
