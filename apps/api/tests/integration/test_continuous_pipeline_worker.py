@@ -153,6 +153,21 @@ async def _fake_decision_ingestion(*args, **kwargs):
     return SimpleNamespace(inserted_records=1)
 
 
+def _decision_record() -> SimpleNamespace:
+    return SimpleNamespace(
+        decision_id=uuid.uuid4(),
+        asset={"symbol": "BTCUSDT"},
+        timeframe="1m",
+        supporting_strategies=[{"strategy_identity": "ma_crossover@1", "action": "BUY", "confidence": 0.8}],
+        opposing_strategies=[],
+        expected_reward={"expected_value": "0.05"},
+        generated_signals=[{"action": "buy"}],
+        trade_accepted=True,
+        trade_rejected_reason=None,
+        confidence=Decimal("0.8"),
+    )
+
+
 @pytest.mark.asyncio
 async def test_new_buy_signal_reaches_orchestrator(monkeypatch: pytest.MonkeyPatch) -> None:
     db = _FakeDB()
@@ -258,6 +273,70 @@ async def test_two_enabled_strategies_each_generate_signal(monkeypatch: pytest.M
     generated_signals = [item for item in db.added if item.__class__.__name__ == "Signal"]
     strategy_ids = {item.strategy_id for item in generated_signals}
     assert strategy_ids == {strategy_a.id, strategy_b.id}
+
+
+@pytest.mark.asyncio
+async def test_replay_failure_is_contained_and_audited(monkeypatch: pytest.MonkeyPatch) -> None:
+    db = _FakeDB()
+    asset = _asset()
+    strategy = _strategy_row()
+    parameter_set = _parameter_set()
+    account = SimpleNamespace(id=uuid.uuid4())
+
+    import app.services.orchestration.continuous_pipeline_worker as worker_module
+
+    monkeypatch.setattr(worker_module, "run_ingestion_cycle", _fake_ingestion_cycle)
+    monkeypatch.setattr(worker_module, "ingest_decision_records", _fake_decision_ingestion)
+    monkeypatch.setattr(worker_module, "_load_decision_record_for_signal", _async_return(_decision_record()))
+    monkeypatch.setattr(worker_module, "_load_active_assets", _async_return([asset]))
+    monkeypatch.setattr(worker_module, "_load_active_strategies", _async_return([strategy]))
+    monkeypatch.setattr(worker_module, "_load_latest_parameter_set", _async_return(parameter_set))
+    monkeypatch.setattr(worker_module, "_load_latest_candles", _async_return(_candles(2)))
+    monkeypatch.setattr(worker_module, "_signal_exists", _async_return(False))
+    monkeypatch.setattr(worker_module, "_load_primary_account_by_asset_class", _async_return(account))
+    monkeypatch.setattr(worker_module, "orchestrate_paper_signal_execution", _async_return(SimpleNamespace(execution_status="executed")))
+    monkeypatch.setattr(worker_module.strategy_registry, "get", lambda slug: _FixedStrategy("buy"))
+
+    async def _fail_build(*_args, **_kwargs):
+        raise RuntimeError("decision package read failed")
+
+    monkeypatch.setattr(worker_module.DecisionPackageBuilder, "build_decision_package", _fail_build)
+
+    stats = await run_orchestration_cycle(db=db, client=object(), config=_config())
+
+    assert stats.signals_created == 1
+    assert db.commits > 0
+    assert any(item.__class__.__name__ == "AuditLog" and getattr(item, "action", None) == "decision_package_replay_failed" for item in db.added)
+
+
+@pytest.mark.asyncio
+async def test_replay_cancellation_propagates_when_worker_is_shutting_down(monkeypatch: pytest.MonkeyPatch) -> None:
+    import app.services.orchestration.continuous_pipeline_worker as worker_module
+
+    class _CancelingTask:
+        def cancelling(self) -> int:
+            return 1
+
+    class _FakeEvidenceSessionContext:
+        async def __aenter__(self):
+            return SimpleNamespace()
+
+        async def __aexit__(self, exc_type, exc, tb):
+            return False
+
+    async def _raise_cancelled(*_args, **_kwargs):
+        raise worker_module.asyncio.CancelledError()
+
+    monkeypatch.setattr(worker_module.asyncio, "current_task", lambda: _CancelingTask())
+    monkeypatch.setattr(worker_module.DecisionPackageBuilder, "build_decision_package", _raise_cancelled)
+    monkeypatch.setattr(worker_module, "AsyncSessionLocal", lambda: _FakeEvidenceSessionContext())
+
+    with pytest.raises(worker_module.asyncio.CancelledError):
+        await worker_module._produce_research_evidence(
+            db=_FakeDB(),
+            decision_package_builder=worker_module.DecisionPackageBuilder(),
+            decision_record=_decision_record(),
+        )
 
 
 @pytest.mark.asyncio

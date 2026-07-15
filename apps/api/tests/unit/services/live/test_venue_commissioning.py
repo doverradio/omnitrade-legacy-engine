@@ -351,6 +351,26 @@ async def test_resume_processes_started_run() -> None:
 
 
 @pytest.mark.asyncio
+async def test_resume_ignores_completed_run() -> None:
+    class _CompletedDb(_FakeDb):
+        async def scalars(self, statement):
+            _ = statement
+            return []
+
+    db = _CompletedDb()
+    db.run = SimpleNamespace(
+        commissioning_run_id=uuid.uuid4(),
+        status="COMPLETED",
+        activated_at=datetime.now(timezone.utc),
+        started_at=datetime.now(timezone.utc),
+    )
+
+    processed = await vc.resume_runs(db=db, actor="orchestration_worker", limit=10)
+
+    assert processed == 0
+
+
+@pytest.mark.asyncio
 async def test_start_ambiguous_buy_enters_reconciliation_required(monkeypatch: pytest.MonkeyPatch) -> None:
     db = _FakeDb()
     now = datetime.now(timezone.utc)

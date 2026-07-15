@@ -28,6 +28,7 @@ from app.services.ai_coach.deterministic import evaluate_decision_quality_v0
 from app.services.data.binance_client import BinanceUSClient
 from app.services.data.http_client import AsyncHTTPClient
 from app.services.data.kraken_client import KrakenSpotClient
+from app.services.data.ingestion_status import set_last_successful_full_pipeline_at
 from app.services.decision_quality.deterministic import evaluate_replay_result_v0
 from app.services.decisions.ingestion import build_signal_idempotency_key
 from app.services.decisions.package import DecisionPackageBuilder
@@ -67,6 +68,9 @@ _RESEARCH_STATUS_SEVERITIES = {
     "successful": "green",
     "failed": "red",
 }
+
+_WORKER_BOOT_ACTION = "orchestration_worker_started"
+_REPLAY_FAILURE_ACTION = "decision_package_replay_failed"
 
 
 @dataclass(frozen=True, slots=True)
@@ -359,19 +363,63 @@ async def _produce_research_evidence(
     decision_package_builder: DecisionPackageBuilder,
     decision_record: DecisionRecord,
 ) -> None:
-    package = await decision_package_builder.build_decision_package(db=db, decision_id=decision_record.decision_id)
-    if package is None:
-        return
-
-    decision_package_id = build_decision_package_id(
-        decision_id=package.decision_id,
-        package_hash=package.content_hash,
-        package_version=package.schema_version,
-    )
-
     try:
-        replay_result = await replay_decision_package_v0(db=db, decision_package_id=decision_package_id)
+        async with AsyncSessionLocal() as evidence_db:
+            package = await decision_package_builder.build_decision_package(db=evidence_db, decision_id=decision_record.decision_id)
+            if package is None:
+                return
+
+            decision_package_id = build_decision_package_id(
+                decision_id=package.decision_id,
+                package_hash=package.content_hash,
+                package_version=package.schema_version,
+            )
+
+            replay_result = await replay_decision_package_v0(db=evidence_db, decision_package_id=decision_package_id)
     except ReplayPackageNotFoundError:
+        return
+    except asyncio.CancelledError:
+        current_task = asyncio.current_task()
+        if current_task is not None and hasattr(current_task, "cancelling") and current_task.cancelling():
+            raise
+        logger.exception(
+            "decision_package_replay_cancelled decision_id=%s",
+            decision_record.decision_id,
+        )
+        db.add(
+            AuditLog(
+                actor="orchestration_worker",
+                action=_REPLAY_FAILURE_ACTION,
+                entity_type="decision_package_replay",
+                entity_id=decision_record.decision_id,
+                before_state=None,
+                after_state={
+                    "decision_id": str(decision_record.decision_id),
+                    "failure_type": "CancelledError",
+                },
+            )
+        )
+        return
+    except Exception as exc:
+        logger.exception(
+            "decision_package_replay_failed decision_id=%s failure_type=%s",
+            decision_record.decision_id,
+            exc.__class__.__name__,
+        )
+        db.add(
+            AuditLog(
+                actor="orchestration_worker",
+                action=_REPLAY_FAILURE_ACTION,
+                entity_type="decision_package_replay",
+                entity_id=decision_record.decision_id,
+                before_state=None,
+                after_state={
+                    "decision_id": str(decision_record.decision_id),
+                    "failure_type": exc.__class__.__name__,
+                    "failure_reason": str(exc),
+                },
+            )
+        )
         return
 
     quality_result = evaluate_replay_result_v0(replay_result=replay_result)
@@ -874,6 +922,8 @@ async def run_orchestration_cycle(
     if snapshot is not None:
         await db.commit()
 
+    set_last_successful_full_pipeline_at(datetime.now(timezone.utc))
+
     return CycleStats(
         ingestion_assets_ok=ingestion_result.successful_assets,
         signals_created=signals_created,
@@ -891,6 +941,25 @@ async def run_orchestration_cycle(
 async def run_forever() -> None:
     setup_logging()
     config = WorkerConfig.from_env()
+
+    try:
+        async with AsyncSessionLocal() as boot_db:
+            boot_db.add(
+                AuditLog(
+                    actor="orchestration_worker",
+                    action=_WORKER_BOOT_ACTION,
+                    entity_type="orchestration_worker",
+                    entity_id=None,
+                    before_state=None,
+                    after_state={
+                        "started_at": _STARTED_AT.isoformat(),
+                        "run_id": _RUN_ID,
+                    },
+                )
+            )
+            await boot_db.commit()
+    except Exception:
+        logger.warning("Unable to persist orchestration worker startup event", exc_info=True)
 
     logger.info(
         "Starting continuous pipeline worker poll_interval_seconds=%s candle_interval=%s candle_lookback_limit=%s default_order_quantity=%s",

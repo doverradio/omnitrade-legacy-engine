@@ -20,8 +20,12 @@ from app.schemas.operations import (
     OperationalMonitoringResponse,
     OperationalRunStatusResponse,
     OperationalStatusResponse,
+    RuntimeReadinessCycleSnapshotResponse,
+    RuntimeReadinessHealthResponse,
+    RuntimeReadinessResponse,
 )
-from app.services.data.ingestion_status import get_last_successful_ingestion_at
+from app.services.data.ingestion_status import get_last_successful_full_pipeline_at, get_last_successful_ingestion_at
+from app.models.autonomous_cycle_run import AutonomousCycleRun
 from app.services.exchange_connections.providers.registry import list_registered_exchange_providers
 from app.services.live_crypto_environment import inspect_live_crypto_environment
 from app.services.paper.accounting import build_account_snapshot
@@ -445,6 +449,30 @@ async def build_operational_freshness(*, db: AsyncSession) -> OperationalFreshne
     )
 
 
+async def build_runtime_readiness(*, db: AsyncSession) -> RuntimeReadinessResponse:
+    generated_at = datetime.now(timezone.utc)
+    worker_uptime = compute_uptime(started_at=_STARTED_AT, now=generated_at)
+    restart_count = await _count_worker_restarts(db=db)
+    provider_status = await build_operations_status(db=db)
+    last_autonomous_cycle = await _load_latest_cycle_snapshot(db=db, cycle_kind="autonomous")
+    last_campaign_cycle = await _load_latest_cycle_snapshot(db=db, cycle_kind="campaign")
+    return RuntimeReadinessResponse(
+        generated_at=generated_at,
+        worker_uptime=worker_uptime,
+        restart_count=max(restart_count - 1, 0),
+        last_successful_full_pipeline_at=get_last_successful_full_pipeline_at(),
+        last_kraken_candle_processed_at=await _latest_kraken_candle_close_at(db=db),
+        last_autonomous_cycle=last_autonomous_cycle,
+        last_campaign_preview_cycle=last_campaign_cycle,
+        unresolved_exceptions=await _count_recent_runtime_exceptions(db=db, now=generated_at),
+        database_health=RuntimeReadinessHealthResponse(
+            state=provider_status.system_health["database"].state,
+            detail=provider_status.system_health["database"].detail,
+        ),
+        provider_health=provider_status.live_crypto_readiness,
+    )
+
+
 def _resolve_health(*, alerts: list[OperationalAlertResponse]) -> str:
     if any(item.severity == "red" for item in alerts):
         return "red"
@@ -552,6 +580,72 @@ async def _max_timestamp(*, db: AsyncSession, sql: str) -> datetime | None:
     result = await db.execute(text(sql))
     value = result.scalar_one_or_none()
     return value if isinstance(value, datetime) else None
+
+
+async def _count_worker_restarts(*, db: AsyncSession) -> int:
+    row = await db.execute(
+        text(
+            "SELECT COUNT(*) AS restart_count "
+            "FROM audit_log "
+            "WHERE entity_type = 'orchestration_worker' "
+            "AND action = 'orchestration_worker_started'"
+        )
+    )
+    record = row.mappings().first()
+    return int(record.get("restart_count") or 0) if record is not None else 0
+
+
+async def _count_recent_runtime_exceptions(*, db: AsyncSession, now: datetime) -> int:
+    since = now - timedelta(hours=24)
+    row = await db.execute(
+        text(
+            "SELECT COUNT(*) AS exception_count "
+            "FROM audit_log "
+            "WHERE created_at >= :since "
+            "AND (action = 'decision_package_replay_failed' "
+            "OR action = 'campaign_orchestration_failed' "
+            "OR action = 'autonomous_cycle_failed' "
+            "OR action = 'strategy_roster_failed' "
+            "OR action = 'research_cycle_failed')"
+        ),
+        {"since": since},
+    )
+    record = row.mappings().first()
+    return int(record.get("exception_count") or 0) if record is not None else 0
+
+
+async def _latest_kraken_candle_close_at(*, db: AsyncSession) -> datetime | None:
+    row = await db.execute(
+        text(
+            "SELECT MAX(c.close_time) AS close_time "
+            "FROM candles c "
+            "JOIN assets a ON a.id = c.asset_id "
+            "WHERE a.exchange = 'kraken_spot' "
+            "AND UPPER(a.symbol) IN ('BTC', 'XBT', 'XXBT')"
+        )
+    )
+    record = row.mappings().first()
+    close_time = None if record is None else record.get("close_time")
+    return close_time if isinstance(close_time, datetime) else None
+
+
+async def _load_latest_cycle_snapshot(*, db: AsyncSession, cycle_kind: str) -> RuntimeReadinessCycleSnapshotResponse | None:
+    result = await db.execute(
+        select(AutonomousCycleRun)
+        .where(AutonomousCycleRun.cycle_kind == cycle_kind)
+        .order_by(AutonomousCycleRun.started_at.desc(), AutonomousCycleRun.cycle_id.desc())
+        .limit(1)
+    )
+    cycle = result.scalar_one_or_none()
+    if cycle is None:
+        return None
+    return RuntimeReadinessCycleSnapshotResponse(
+        cycle_id=str(cycle.cycle_id),
+        state=cycle.state,
+        started_at=cycle.started_at,
+        completed_at=cycle.completed_at,
+        failure_reason=cycle.failure_reason,
+    )
 
 
 async def _get_paper_equity(*, db: AsyncSession) -> Decimal:

@@ -73,3 +73,29 @@ class OperationalFreshnessItemResponse(BaseModel):
 class OperationalFreshnessResponse(BaseModel):
     generated_at: datetime
     items: list[OperationalFreshnessItemResponse]
+
+
+class RuntimeReadinessCycleSnapshotResponse(BaseModel):
+    cycle_id: str | None
+    state: str | None
+    started_at: datetime | None
+    completed_at: datetime | None
+    failure_reason: str | None
+
+
+class RuntimeReadinessHealthResponse(BaseModel):
+    state: str
+    detail: str
+
+
+class RuntimeReadinessResponse(BaseModel):
+    generated_at: datetime
+    worker_uptime: str
+    restart_count: int
+    last_successful_full_pipeline_at: datetime | None
+    last_kraken_candle_processed_at: datetime | None
+    last_autonomous_cycle: RuntimeReadinessCycleSnapshotResponse | None
+    last_campaign_preview_cycle: RuntimeReadinessCycleSnapshotResponse | None
+    unresolved_exceptions: int
+    database_health: RuntimeReadinessHealthResponse
+    provider_health: LiveCryptoReadinessResponse
