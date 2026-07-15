@@ -68,6 +68,8 @@ _OPEN_LIVE_ORDER_STATUSES = {
     "RECONCILIATION_REQUIRED",
 }
 
+_KRAKEN_FIRST_FLIGHT_CLIENT_ORDER_NAMESPACE = uuid.UUID("490f2673-3f5c-5db0-8453-8243f05e059e")
+
 _ALLOWED_TRANSITIONS: dict[str, set[str]] = {
     "PREPARED": {"ACTIVE", "REVOKED"},
     "ACTIVE": {"BUY_SUBMISSION_PENDING", "BUY_RECONCILIATION_REQUIRED", "MANUAL_REVIEW_REQUIRED", "REVOKED"},
@@ -398,7 +400,9 @@ async def activate_run(*, db: AsyncSession, actor: str, config: CommissioningCon
 
 
 def _build_client_order_id(*, run_id: uuid.UUID, side: str) -> str:
-    return f"kff-{str(run_id)[:8]}-{side.lower()}"
+    side_token = str(side).strip().upper()
+    material = f"kraken-first-flight:{run_id}:{side_token}"
+    return str(uuid.uuid5(_KRAKEN_FIRST_FLIGHT_CLIENT_ORDER_NAMESPACE, material))
 
 
 async def _reload_run_for_update(*, db: AsyncSession, run_id: uuid.UUID) -> VenueCommissioningRun:
@@ -453,7 +457,10 @@ async def _submit_order(
         required=("create_order", "stable_client_order_id"),
         environment=run.environment,
     )
-    client_order_id = _build_client_order_id(run_id=run.commissioning_run_id, side=side)
+    if side == "BUY":
+        client_order_id = run.buy_client_order_id or _build_client_order_id(run_id=run.commissioning_run_id, side=side)
+    else:
+        client_order_id = run.sell_client_order_id or _build_client_order_id(run_id=run.commissioning_run_id, side=side)
     request = ExchangeOrderSubmissionRequest(
         product_id=run.product_id,
         side=side,

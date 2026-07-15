@@ -8,6 +8,7 @@ from types import SimpleNamespace
 import pytest
 
 from app.services.live import venue_commissioning as vc
+from app.services.exchange_connections.providers.kraken_spot import KrakenSpotClient
 
 
 class _FakeDb:
@@ -384,6 +385,208 @@ async def test_start_ambiguous_buy_enters_reconciliation_required(monkeypatch: p
 
     assert run.status in {"BUY_RECONCILIATION_REQUIRED", "MANUAL_REVIEW_REQUIRED"}
     assert run.buy_submitted_at is not None
+
+
+def test_client_order_id_is_deterministic_uuid5_for_buy_and_sell() -> None:
+    run_id = uuid.UUID("64e28ade-5705-4493-8e53-c3d86f28da97")
+
+    buy_one = vc._build_client_order_id(run_id=run_id, side="BUY")
+    buy_two = vc._build_client_order_id(run_id=run_id, side="BUY")
+    sell_one = vc._build_client_order_id(run_id=run_id, side="SELL")
+    sell_two = vc._build_client_order_id(run_id=run_id, side="SELL")
+
+    buy_uuid = uuid.UUID(buy_one)
+    sell_uuid = uuid.UUID(sell_one)
+
+    assert str(buy_uuid) == buy_one
+    assert str(sell_uuid) == sell_one
+    assert buy_uuid.version == 5
+    assert sell_uuid.version == 5
+    assert buy_one == buy_two
+    assert sell_one == sell_two
+    assert buy_one != sell_one
+
+
+@pytest.mark.asyncio
+async def test_start_replay_keeps_existing_client_order_identity(monkeypatch: pytest.MonkeyPatch) -> None:
+    db = _FakeDb()
+    run_id = uuid.uuid4()
+    seeded_id = vc._build_client_order_id(run_id=run_id, side="BUY")
+    db.run = SimpleNamespace(
+        commissioning_run_id=run_id,
+        status="ACTIVE",
+        provider="kraken_spot",
+        product_id="BTC-USD",
+        environment="production",
+        buy_client_order_id=seeded_id,
+        buy_provider_order_id=None,
+        buy_submitted_at=datetime.now(timezone.utc),
+        buy_idempotency_key=seeded_id,
+        buy_requested_quote_usd=Decimal("5.00"),
+        hold_minutes=30,
+        state_payload={},
+        started_by=None,
+        started_at=None,
+        updated_at=None,
+        duplicate_orders_detected=False,
+        manual_intervention_required=False,
+        sell_client_order_id=None,
+        buy_filled_base_btc=None,
+    )
+
+    async def _submit(*_args, **_kwargs):
+        raise AssertionError("start replay must not submit a second BUY")
+
+    async def _reconcile(**_kwargs):
+        return "OPEN", None, []
+
+    monkeypatch.setattr(vc, "_submit_order", _submit)
+    monkeypatch.setattr(vc, "_reconcile_order", _reconcile)
+
+    run = await vc.start_run(db=db, actor="operator:human", run_id=run_id, confirm=True)
+
+    assert run.buy_client_order_id == seeded_id
+
+
+@pytest.mark.asyncio
+async def test_start_submit_payload_uses_staged_uuid_and_validate_shape(monkeypatch: pytest.MonkeyPatch) -> None:
+    db = _FakeDb()
+    run_id = uuid.uuid4()
+    db.connection = SimpleNamespace(provider="kraken_spot", environment="production")
+    db.run = SimpleNamespace(
+        commissioning_run_id=run_id,
+        status="ACTIVE",
+        provider="kraken_spot",
+        product_id="BTC-USD",
+        environment="production",
+        buy_client_order_id=None,
+        buy_provider_order_id=None,
+        buy_idempotency_key=None,
+        buy_submitted_at=None,
+        buy_requested_quote_usd=Decimal("5.00"),
+        hold_minutes=30,
+        state_payload={},
+        started_by=None,
+        started_at=None,
+        updated_at=None,
+        duplicate_orders_detected=False,
+        manual_intervention_required=False,
+        sell_client_order_id=None,
+        buy_filled_base_btc=None,
+        buy_filled_quote_usd=None,
+        buy_fee_usd=None,
+        buy_avg_price_usd=None,
+        buy_filled_at=None,
+        hold_started_at=None,
+        hold_due_at=datetime.now(timezone.utc) + timedelta(minutes=30),
+        sell_provider_order_id=None,
+        sell_idempotency_key=None,
+        sell_submitted_at=None,
+        sell_requested_base_btc=None,
+    )
+
+    client = KrakenSpotClient()
+    captured_paths: list[str] = []
+    captured_add_order_payload: dict[str, str] = {}
+
+    async def _public(*, path, **_kwargs):
+        if path == "/public/AssetPairs":
+            return {
+                "error": [],
+                "result": {
+                    "XXBTZUSD": {
+                        "altname": "XBTUSD",
+                        "wsname": "XBT/USD",
+                        "base": "BTC",
+                        "quote": "USD",
+                        "status": "online",
+                        "pair_decimals": 1,
+                        "lot_decimals": 8,
+                        "ordermin": "0.00005",
+                        "costmin": "0.5",
+                    }
+                },
+            }
+        if path == "/public/Ticker":
+            return {"error": [], "result": {"XXBTZUSD": {"a": ["50000.0", "1", "1"], "b": ["49999.0", "1", "1"]}}}
+        raise AssertionError(f"unexpected public path {path}")
+
+    async def _private(*, path, payload, **_kwargs):
+        captured_paths.append(path)
+        if path != "/private/AddOrder":
+            raise AssertionError(f"unexpected private path {path}")
+        captured_add_order_payload.clear()
+        captured_add_order_payload.update(payload)
+        return {"error": [], "result": {"txid": ["O-1"], "descr": {"order": "buy market"}}}
+
+    async def _reconcile(**_kwargs):
+        return "OPEN", None, []
+
+    monkeypatch.setattr(client, "_public_request", _public)
+    monkeypatch.setattr(client, "_private_request", _private)
+    monkeypatch.setattr(vc, "get_exchange_provider", lambda *_args, **_kwargs: client)
+    monkeypatch.setattr(vc, "_reconcile_order", _reconcile)
+    monkeypatch.setattr("app.services.live_crypto_orders._load_decrypted_credentials", lambda *_args, **_kwargs: {})
+
+    run = await vc.start_run(db=db, actor="operator:human", run_id=run_id, confirm=True)
+
+    expected_validate_payload = {
+        "ordertype": "market",
+        "type": "buy",
+        "pair": "XBTUSD",
+        "volume": "5.0",
+        "oflags": "fciq,viqc",
+        "cl_ord_id": run.buy_client_order_id,
+        "validate": "true",
+    }
+    expected_live_payload = {key: value for key, value in expected_validate_payload.items() if key != "validate"}
+
+    assert run.buy_client_order_id == vc._build_client_order_id(run_id=run_id, side="BUY")
+    assert run.buy_client_order_id.startswith("kff-") is False
+    assert captured_paths == ["/private/AddOrder"]
+    assert captured_add_order_payload == expected_live_payload
+    assert "validate" not in captured_add_order_payload
+    assert "timeinforce" not in captured_add_order_payload
+
+
+@pytest.mark.asyncio
+async def test_reconcile_uses_stored_buy_client_order_identity(monkeypatch: pytest.MonkeyPatch) -> None:
+    db = _FakeDb()
+    run_id = uuid.uuid4()
+    buy_id = vc._build_client_order_id(run_id=run_id, side="BUY")
+    db.connection = SimpleNamespace(provider="kraken_spot", environment="production")
+    run = SimpleNamespace(
+        provider="kraken_spot",
+        product_id="BTC-USD",
+        environment="production",
+        buy_requested_quote_usd=Decimal("5.00"),
+        hold_minutes=30,
+        buy_provider_order_id="provider-order-1",
+        sell_provider_order_id=None,
+        buy_client_order_id=buy_id,
+        sell_client_order_id=None,
+    )
+
+    captured_lookup: dict[str, object] = {}
+
+    class _LookupProvider:
+        async def lookup_order(self, **kwargs):
+            captured_lookup.update(kwargs)
+            return SimpleNamespace(provider_order_id="provider-order-1", status="OPEN")
+
+        async def list_fills(self, **_kwargs):
+            return []
+
+    provider = _LookupProvider()
+    monkeypatch.setattr(vc, "get_exchange_provider", lambda *_args, **_kwargs: provider)
+    monkeypatch.setattr("app.services.live_crypto_orders._load_decrypted_credentials", lambda *_args, **_kwargs: {})
+
+    status, order, fills = await vc._reconcile_order(db=db, run=run, side="BUY")
+
+    assert status == "OPEN"
+    assert order is not None
+    assert fills == []
+    assert captured_lookup.get("client_order_id") == buy_id
 
 
 @pytest.mark.asyncio
