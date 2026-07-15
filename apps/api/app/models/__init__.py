@@ -21,6 +21,7 @@ from app.models.autonomous_cycle_run import AutonomousCycleRun
 from app.models.backtest import Backtest
 from app.models.backtest_trade import BacktestTrade
 from app.models.capital_campaign import CapitalCampaign
+from app.models.capital_campaign_definition import CapitalCampaignDefinition
 from app.models.capital_campaign_profit_cycle import CapitalCampaignProfitCycle
 from app.models.capital_campaign_profit_policy import CapitalCampaignProfitPolicy
 from app.models.candle import Candle
@@ -93,6 +94,7 @@ __all__ = [
 	"Backtest",
 	"BacktestTrade",
 	"CapitalCampaign",
+	"CapitalCampaignDefinition",
 	"CapitalCampaignProfitCycle",
 	"CapitalCampaignProfitPolicy",
 	"Candle",

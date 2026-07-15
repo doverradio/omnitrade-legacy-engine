@@ -23,6 +23,19 @@ from app.schemas.capital_campaign_profit import (
     CapitalCampaignProfitPolicyResponse,
     CapitalCampaignProfitPolicyUpsertRequest,
 )
+from app.schemas.capital_campaign_domain import (
+    CapitalCampaignDefinitionListResponse,
+    CapitalCampaignDefinitionResponse,
+    CapitalCampaignDraftCreateRequest,
+    CapitalCampaignPreviewRequest,
+    CapitalCampaignPreviewResponse,
+)
+from app.services.capital_campaign_domain import (
+    create_campaign_draft,
+    get_campaign_definition,
+    list_campaign_definitions,
+    preview_campaign_definition,
+)
 from app.services.capital_campaign_profit.service import (
     approve_profit_cycle,
     evaluate_profit_cycle,
@@ -41,6 +54,86 @@ from app.services.capital_campaigns.service import (
 )
 
 router = APIRouter(prefix="/capital-campaigns", tags=["capital-campaigns"])
+
+
+@router.post("/domain/drafts", response_model=CapitalCampaignDefinitionResponse, status_code=201)
+async def post_capital_campaign_domain_draft(
+    request: CapitalCampaignDraftCreateRequest,
+    db: AsyncSession = Depends(get_db),
+) -> CapitalCampaignDefinitionResponse:
+    return await create_campaign_draft(db=db, request=request)
+
+
+@router.get("/domain", response_model=CapitalCampaignDefinitionListResponse)
+async def get_capital_campaign_domain_definitions(
+    campaign_id: str | None = Query(default=None),
+    status: str | None = Query(default=None),
+    latest_only: bool = Query(default=True),
+    db: AsyncSession = Depends(get_db),
+) -> CapitalCampaignDefinitionListResponse:
+    parsed_campaign_id = None
+    if campaign_id is not None:
+        try:
+            parsed_campaign_id = uuid.UUID(campaign_id)
+        except ValueError:
+            raise InvalidRequestError(message="Invalid campaign_id", details={"campaign_id": campaign_id})
+    return await list_campaign_definitions(
+        db=db,
+        campaign_id=parsed_campaign_id,
+        status=status,
+        latest_only=latest_only,
+    )
+
+
+@router.get("/domain/{campaign_id}", response_model=CapitalCampaignDefinitionResponse)
+async def get_capital_campaign_domain_definition(
+    campaign_id: str,
+    version: int | None = Query(default=None),
+    db: AsyncSession = Depends(get_db),
+) -> CapitalCampaignDefinitionResponse:
+    try:
+        parsed_campaign_id = uuid.UUID(campaign_id)
+    except ValueError:
+        raise InvalidRequestError(message="Invalid campaign_id", details={"campaign_id": campaign_id})
+    return await get_campaign_definition(db=db, campaign_id=parsed_campaign_id, version=version)
+
+
+@router.post("/domain/{campaign_id}/preview", response_model=CapitalCampaignPreviewResponse)
+async def post_capital_campaign_domain_preview(
+    campaign_id: str,
+    request: CapitalCampaignPreviewRequest,
+    version: int | None = Query(default=None),
+    db: AsyncSession = Depends(get_db),
+) -> CapitalCampaignPreviewResponse:
+    try:
+        parsed_campaign_id = uuid.UUID(campaign_id)
+    except ValueError:
+        raise InvalidRequestError(message="Invalid campaign_id", details={"campaign_id": campaign_id})
+    return await preview_campaign_definition(
+        db=db,
+        campaign_id=parsed_campaign_id,
+        version=version,
+        request=request,
+    )
+
+
+@router.post("/domain/{campaign_id}/preview/explain", response_model=CapitalCampaignPreviewResponse)
+async def post_capital_campaign_domain_preview_explain(
+    campaign_id: str,
+    request: CapitalCampaignPreviewRequest,
+    version: int | None = Query(default=None),
+    db: AsyncSession = Depends(get_db),
+) -> CapitalCampaignPreviewResponse:
+    try:
+        parsed_campaign_id = uuid.UUID(campaign_id)
+    except ValueError:
+        raise InvalidRequestError(message="Invalid campaign_id", details={"campaign_id": campaign_id})
+    return await preview_campaign_definition(
+        db=db,
+        campaign_id=parsed_campaign_id,
+        version=version,
+        request=request,
+    )
 
 
 @router.get("", response_model=CapitalCampaignListResponse)
