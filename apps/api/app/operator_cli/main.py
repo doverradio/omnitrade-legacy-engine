@@ -22,7 +22,10 @@ from app.operator_cli.formatting import (
     render_venue_commission_text,
 )
 from app.operator_cli.service import (
+    bind_canonical_campaign_runtime,
     activate_venue_commission_run,
+    fetch_canonical_campaign_binding_audit,
+    fetch_canonical_campaign_binding_status,
     fetch_campaign_orchestration_history,
     fetch_campaign_orchestration_preview,
     fetch_campaign_orchestration_readiness,
@@ -36,6 +39,7 @@ from app.operator_cli.service import (
     fetch_execution_forensics,
     fetch_strategy_scorecards_summary,
     fetch_strategy_roster_summary,
+    fetch_risk_ledger_diagnosis,
     fetch_watch_status,
     revoke_venue_commission_run,
     start_venue_commission_run,
@@ -68,6 +72,9 @@ def _build_parser() -> argparse.ArgumentParser:
             "  ./operator venue-commission-start --commissioning-run-id <run_uuid> --confirm --json\n"
             "  ./operator venue-commission-status --commissioning-run-id <run_uuid> --json\n"
             "  ./operator venue-commission-revoke --commissioning-run-id <run_uuid> --confirm --json\n"
+            "  ./operator canonical-campaign-readiness --campaign-id <campaign_uuid> --campaign-version 1 --paper-account-id <paper_uuid> --live-trading-profile-id <profile_uuid> --provider kraken_spot --environment production --product BTC-USD --json\n"
+            "  ./operator canonical-campaign-bind --campaign-id <campaign_uuid> --campaign-version 1 --paper-account-id <paper_uuid> --live-trading-profile-id <profile_uuid> --provider kraken_spot --environment production --product BTC-USD --actor operator:human --confirm --json\n"
+            "  ./operator risk-ledger-diagnosis --account-id <paper_uuid> --json\n"
             "  ./operator status --json\n"
             "  ./operator status --no-color --verbose"
         ),
@@ -233,6 +240,59 @@ def _build_parser() -> argparse.ArgumentParser:
     venue_revoke.add_argument("--actor", type=str, default="operator:human")
     venue_revoke.add_argument("--confirm", action="store_true")
     venue_revoke.add_argument("--json", action="store_true", dest="json_output")
+
+    canonical_readiness = subparsers.add_parser(
+        "canonical-campaign-readiness",
+        parents=[common],
+        help="Evaluate whether the canonical campaign can be bound safely",
+        description="Read-only canonical campaign binding readiness diagnostics.",
+    )
+    canonical_readiness.add_argument("--campaign-id", type=UUID, required=True)
+    canonical_readiness.add_argument("--campaign-version", type=int, required=True)
+    canonical_readiness.add_argument("--paper-account-id", type=UUID, required=True)
+    canonical_readiness.add_argument("--live-trading-profile-id", type=UUID, required=True)
+    canonical_readiness.add_argument("--provider", type=str, required=True)
+    canonical_readiness.add_argument("--environment", type=str, required=True)
+    canonical_readiness.add_argument("--product", type=str, required=True)
+    canonical_readiness.add_argument("--actor", type=str, default="operator:human")
+    canonical_readiness.add_argument("--confirm", action="store_true")
+    canonical_readiness.add_argument("--json", action="store_true", dest="json_output")
+
+    canonical_bind = subparsers.add_parser(
+        "canonical-campaign-bind",
+        parents=[common],
+        help="Bind the canonical runtime campaign to the intended paper account",
+        description="Operator-confirmed canonical campaign binding for a single runtime row.",
+    )
+    canonical_bind.add_argument("--campaign-id", type=UUID, required=True)
+    canonical_bind.add_argument("--campaign-version", type=int, required=True)
+    canonical_bind.add_argument("--paper-account-id", type=UUID, required=True)
+    canonical_bind.add_argument("--live-trading-profile-id", type=UUID, required=True)
+    canonical_bind.add_argument("--provider", type=str, required=True)
+    canonical_bind.add_argument("--environment", type=str, required=True)
+    canonical_bind.add_argument("--product", type=str, required=True)
+    canonical_bind.add_argument("--actor", type=str, default="operator:human")
+    canonical_bind.add_argument("--confirm", action="store_true")
+    canonical_bind.add_argument("--json", action="store_true", dest="json_output")
+
+    canonical_audit = subparsers.add_parser(
+        "canonical-campaign-binding-audit",
+        parents=[common],
+        help="Show immutable audit evidence for canonical campaign binding",
+        description="Read-only binding audit evidence for one canonical campaign.",
+    )
+    canonical_audit.add_argument("--campaign-id", type=UUID, required=True)
+    canonical_audit.add_argument("--limit", type=int, default=20)
+    canonical_audit.add_argument("--json", action="store_true", dest="json_output")
+
+    risk_diagnosis = subparsers.add_parser(
+        "risk-ledger-diagnosis",
+        parents=[common],
+        help="Explain the persisted risk inputs, formulas, and snapshot deltas for one paper account",
+        description="Read-only risk ledger diagnosis for one paper account.",
+    )
+    risk_diagnosis.add_argument("--account-id", type=UUID, required=True)
+    risk_diagnosis.add_argument("--json", action="store_true", dest="json_output")
 
     campaign_readiness = subparsers.add_parser(
         "campaign-orchestration-readiness",
@@ -426,6 +486,42 @@ async def _run_async(args: argparse.Namespace) -> tuple[int, dict[str, Any], str
         )
         text = render_json(payload) if args.json_output else render_venue_commission_text(payload, options)
         return 0, payload, text
+
+    if args.command == "canonical-campaign-readiness":
+        payload = await fetch_canonical_campaign_binding_status(
+            campaign_id=args.campaign_id,
+            campaign_version=args.campaign_version,
+            paper_account_id=args.paper_account_id,
+            live_trading_profile_id=args.live_trading_profile_id,
+            provider=args.provider,
+            environment=args.environment,
+            product_id=args.product,
+            actor=args.actor,
+            confirm=bool(args.confirm),
+        )
+        return 0, payload, render_json(payload)
+
+    if args.command == "canonical-campaign-bind":
+        payload = await bind_canonical_campaign_runtime(
+            campaign_id=args.campaign_id,
+            campaign_version=args.campaign_version,
+            paper_account_id=args.paper_account_id,
+            live_trading_profile_id=args.live_trading_profile_id,
+            provider=args.provider,
+            environment=args.environment,
+            product_id=args.product,
+            actor=args.actor,
+            confirm=bool(args.confirm),
+        )
+        return 0, payload, render_json(payload)
+
+    if args.command == "canonical-campaign-binding-audit":
+        payload = await fetch_canonical_campaign_binding_audit(campaign_id=args.campaign_id, limit=args.limit)
+        return 0, payload, render_json(payload)
+
+    if args.command == "risk-ledger-diagnosis":
+        payload = await fetch_risk_ledger_diagnosis(account_id=args.account_id)
+        return 0, payload, render_json(payload)
 
     payload = await fetch_operator_status(
         mandate_id=args.mandate_id,

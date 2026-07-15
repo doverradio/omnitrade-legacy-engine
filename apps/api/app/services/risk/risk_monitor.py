@@ -278,8 +278,8 @@ async def get_risk_status(*, db: AsyncSession, account_id: uuid.UUID) -> RiskSta
         active_cooldowns_state=active_cooldowns_state,
         active_no_trade_zones_state=active_no_trade_zones_state,
         policy_source=effective_policy.source,
-        daily_loss_input_source="fallback_starting_balance",
-        drawdown_input_source="fallback_starting_balance",
+        daily_loss_input_source="current_cash_balance",
+        drawdown_input_source="current_cash_balance",
     )
 
 

@@ -24,6 +24,7 @@ from app.models.decision_record import DecisionRecord
 from app.models.decision_snapshot import DecisionSnapshot
 from app.models.exchange_connection import ExchangeConnection
 from app.models.live_crypto_order import LiveCryptoOrder
+from app.models.paper_account import PaperAccount
 from app.models.risk_event import RiskEvent
 from app.models.signal import Signal
 from app.models.venue_commissioning_run import VenueCommissioningRun
@@ -34,12 +35,21 @@ from app.models.strategy_roster_proposal import StrategyRosterProposal
 from app.models.strategy_roster_proposal_outcome import StrategyRosterProposalOutcome
 from app.models.strategy_roster_run import StrategyRosterRun
 from app.services.autonomous_cycle import AutonomousCycleRequest, run_autonomous_preview_cycle
+from app.services.canonical_campaign_binding import (
+    CanonicalCampaignBindingRequest,
+    bind_canonical_campaign_runtime as _bind_canonical_campaign_runtime,
+    fetch_canonical_campaign_binding_audit as _fetch_canonical_campaign_binding_audit,
+    inspect_canonical_campaign_binding as _inspect_canonical_campaign_binding,
+)
 from app.services.capital_campaign_orchestration import (
     fetch_campaign_orchestration_history as _fetch_campaign_orchestration_history,
     fetch_campaign_orchestration_readiness as _fetch_campaign_orchestration_readiness,
     fetch_campaign_orchestration_status as _fetch_campaign_orchestration_status,
     run_campaign_orchestration_preview_for_candle,
 )
+from app.services.paper.accounting import build_account_snapshot
+from app.services.risk import risk_monitor
+from app.services.risk.risk_context import resolve_effective_risk_policy
 from app.services.strategy_outcomes import fetch_strategy_scorecards
 
 
@@ -1401,6 +1411,141 @@ async def fetch_operator_status(
     }
 
 
+async def fetch_risk_ledger_diagnosis(*, account_id: UUID) -> dict[str, Any]:
+    async with AsyncSessionLocal() as db:
+        account = await db.get(PaperAccount, account_id)
+        if account is None:
+            raise ValueError(f"Paper account {account_id} not found")
+
+        effective_policy = await resolve_effective_risk_policy(db=db, paper_account_id=account.id)
+        latest_trade = await db.scalar(
+            select(Trade)
+            .where(Trade.paper_account_id == account.id)
+            .order_by(desc(Trade.executed_at), desc(Trade.id))
+            .limit(1)
+        )
+        trade_count = int(
+            (await db.scalar(select(func.count()).select_from(Trade).where(Trade.paper_account_id == account.id))) or 0
+        )
+
+        risk_status = await risk_monitor.get_risk_status(db=db, account_id=account.id)
+        snapshot = await build_account_snapshot(
+            db=db,
+            paper_account_id=account.id,
+            starting_balance=account.starting_balance,
+        )
+
+    starting_balance = Decimal(account.starting_balance)
+    current_cash_balance = Decimal(account.current_cash_balance)
+    daily_loss_limit = starting_balance * Decimal(effective_policy.max_daily_loss_pct)
+    drawdown_limit = starting_balance * Decimal(effective_policy.max_drawdown_pct)
+    daily_loss_used = max(Decimal("0"), starting_balance - current_cash_balance)
+    latest_trade_executed_at = None if latest_trade is None else latest_trade.executed_at
+    balance_source_timestamp = latest_trade_executed_at or account.created_at
+    snapshot_gap_cash = snapshot.cash_balance - current_cash_balance
+    snapshot_gap_equity = snapshot.equity - current_cash_balance
+
+    return {
+        "account": {
+            "account_id": str(account.id),
+            "created_at": account.created_at,
+            "asset_class": account.asset_class,
+            "is_active": bool(account.is_active),
+        },
+        "evaluation": {
+            "generated_at": datetime.now(timezone.utc),
+            "policy_source": effective_policy.source,
+            "status_input_source": risk_status.daily_loss_input_source,
+            "latest_trade_executed_at": latest_trade_executed_at,
+            "balance_source_timestamp": balance_source_timestamp,
+            "trade_count": trade_count,
+        },
+        "inputs": {
+            "starting_balance": {
+                "value": format(starting_balance, "f"),
+                "source": "paper_accounts.starting_balance",
+                "record_created_at": account.created_at,
+            },
+            "current_cash_balance": {
+                "value": format(current_cash_balance, "f"),
+                "source": "paper_accounts.current_cash_balance",
+                "record_created_at": account.created_at,
+                "latest_trade_executed_at": latest_trade_executed_at,
+            },
+            "max_daily_loss_pct": {
+                "value": format(effective_policy.max_daily_loss_pct, "f"),
+                "source": effective_policy.source,
+            },
+            "max_drawdown_pct": {
+                "value": format(effective_policy.max_drawdown_pct, "f"),
+                "source": effective_policy.source,
+            },
+        },
+        "formulas": {
+            "daily_loss.used": "max(0, starting_balance - current_cash_balance)",
+            "daily_loss.limit": "starting_balance * max_daily_loss_pct",
+            "daily_loss.pct_used": "daily_loss.used / daily_loss.limit if daily_loss.limit > 0 else 0",
+            "drawdown.used": "max(0, starting_balance - current_cash_balance)",
+            "drawdown.limit": "starting_balance * max_drawdown_pct",
+            "drawdown.pct_used": "drawdown.used / drawdown.limit if drawdown.limit > 0 else 0",
+        },
+        "status": {
+            "daily_loss": {
+                "used": format(risk_status.daily_loss.used, "f"),
+                "limit": format(risk_status.daily_loss.limit, "f"),
+                "pct_used": format(risk_status.daily_loss.pct_used, "f"),
+            },
+            "drawdown": {
+                "used": format(risk_status.drawdown.used, "f"),
+                "limit": format(risk_status.drawdown.limit, "f"),
+                "pct_used": format(risk_status.drawdown.pct_used, "f"),
+            },
+            "daily_loss_input_source": risk_status.daily_loss_input_source,
+            "drawdown_input_source": risk_status.drawdown_input_source,
+        },
+        "snapshot": {
+            "cash_balance": format(snapshot.cash_balance, "f"),
+            "position_value": format(snapshot.position_value, "f"),
+            "equity": format(snapshot.equity, "f"),
+            "equity_return_usd": format(snapshot.equity_return_usd, "f"),
+            "equity_return_pct": format(snapshot.equity_return_pct, "f"),
+            "positions": [
+                {
+                    "asset_id": str(item.asset_id),
+                    "symbol": item.symbol,
+                    "quantity": format(item.quantity, "f"),
+                    "avg_entry_price": format(item.avg_entry_price, "f"),
+                    "position_value": format(item.position_value, "f"),
+                    "unrealized_pnl_usd": format(item.unrealized_pnl_usd, "f"),
+                    "unrealized_pnl_pct": format(item.unrealized_pnl_pct, "f"),
+                }
+                for item in snapshot.positions
+            ],
+        },
+        "diagnosis": {
+            "persisted_cash_balance_minus_computed_cash_balance": format(snapshot_gap_cash, "f"),
+            "persisted_cash_balance_minus_snapshot_equity": format(snapshot_gap_equity, "f"),
+            "ledger_alignment": "aligned" if snapshot_gap_cash == Decimal("0") else "divergent",
+            "recomputed": {
+                "daily_loss": {
+                    "used": format(daily_loss_used, "f"),
+                    "limit": format(daily_loss_limit, "f"),
+                },
+                "drawdown": {
+                    "used": format(daily_loss_used, "f"),
+                    "limit": format(drawdown_limit, "f"),
+                },
+            },
+            "status_matches_formula": {
+                "daily_loss_used": format(Decimal(risk_status.daily_loss.used) - daily_loss_used, "f"),
+                "daily_loss_limit": format(Decimal(risk_status.daily_loss.limit) - daily_loss_limit, "f"),
+                "drawdown_used": format(Decimal(risk_status.drawdown.used) - daily_loss_used, "f"),
+                "drawdown_limit": format(Decimal(risk_status.drawdown.limit) - drawdown_limit, "f"),
+            },
+        },
+    }
+
+
 async def fetch_watch_status(
     *,
     mandate_id: UUID | None,
@@ -1733,3 +1878,79 @@ async def revoke_venue_commission_run(*, actor: str, commissioning_run_id: UUID,
         "revoke": "processed",
         "run": _serialize_commissioning_run(run),
     }
+
+
+async def inspect_canonical_campaign_binding(*, campaign_id: UUID, campaign_version: int, paper_account_id: UUID, live_trading_profile_id: UUID, provider: str, environment: str, product_id: str, actor: str, confirm: bool) -> dict[str, Any]:
+    async with AsyncSessionLocal() as db:
+        result = await _inspect_canonical_campaign_binding(
+            db=db,
+            request=CanonicalCampaignBindingRequest(
+                campaign_id=campaign_id,
+                campaign_version=campaign_version,
+                paper_account_id=paper_account_id,
+                live_trading_profile_id=live_trading_profile_id,
+                provider=provider,
+                environment=environment,
+                product_id=product_id,
+                actor=actor,
+                confirm=confirm,
+            ),
+        )
+
+    return {
+        "ready": result.ready,
+        "blockers": result.blockers,
+        "checks": [{"code": item.code, "passed": item.passed, "detail": item.detail} for item in result.checks],
+        "snapshot": result.snapshot,
+    }
+
+
+async def bind_canonical_campaign_runtime(*, campaign_id: UUID, campaign_version: int, paper_account_id: UUID, live_trading_profile_id: UUID, provider: str, environment: str, product_id: str, actor: str, confirm: bool) -> dict[str, Any]:
+    async with AsyncSessionLocal() as db:
+        result = await _bind_canonical_campaign_runtime(
+            db=db,
+            request=CanonicalCampaignBindingRequest(
+                campaign_id=campaign_id,
+                campaign_version=campaign_version,
+                paper_account_id=paper_account_id,
+                live_trading_profile_id=live_trading_profile_id,
+                provider=provider,
+                environment=environment,
+                product_id=product_id,
+                actor=actor,
+                confirm=confirm,
+            ),
+        )
+
+    return {
+        "changed": result.changed,
+        "idempotent": result.idempotent,
+        "audit_created": result.audit_created,
+        "before": result.before,
+        "after": result.after,
+        "readiness": {
+            "ready": result.readiness.ready,
+            "blockers": result.readiness.blockers,
+            "checks": [{"code": item.code, "passed": item.passed, "detail": item.detail} for item in result.readiness.checks],
+            "snapshot": result.readiness.snapshot,
+        },
+    }
+
+
+async def fetch_canonical_campaign_binding_status(*, campaign_id: UUID, campaign_version: int, paper_account_id: UUID, live_trading_profile_id: UUID, provider: str, environment: str, product_id: str, actor: str, confirm: bool) -> dict[str, Any]:
+    return await inspect_canonical_campaign_binding(
+        campaign_id=campaign_id,
+        campaign_version=campaign_version,
+        paper_account_id=paper_account_id,
+        live_trading_profile_id=live_trading_profile_id,
+        provider=provider,
+        environment=environment,
+        product_id=product_id,
+        actor=actor,
+        confirm=confirm,
+    )
+
+
+async def fetch_canonical_campaign_binding_audit(*, campaign_id: UUID, limit: int = 20) -> dict[str, Any]:
+    async with AsyncSessionLocal() as db:
+        return await _fetch_canonical_campaign_binding_audit(db=db, campaign_id=campaign_id, limit=limit)
