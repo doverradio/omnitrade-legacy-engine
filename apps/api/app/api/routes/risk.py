@@ -67,6 +67,18 @@ async def risk_status(account_id: uuid.UUID, db: AsyncSession = Depends(get_db))
             policy_source=status.policy_source,
             daily_loss_input_source=status.daily_loss_input_source,
             drawdown_input_source=status.drawdown_input_source,
+            current_equity=status.current_equity,
+            current_cash_balance=status.current_cash_balance,
+            current_position_value=status.current_position_value,
+            start_of_day_equity=status.start_of_day_equity,
+            high_water_mark_equity=status.high_water_mark_equity,
+            valuation_price_timestamp=status.valuation_price_timestamp,
+            valuation_source=status.valuation_source,
+            valuation_state=status.valuation_state,
+            daily_loss_baseline_source=status.daily_loss_baseline_source,
+            drawdown_baseline_source=status.drawdown_baseline_source,
+            baseline_state=status.baseline_state,
+            generated_at=status.generated_at,
         ),
     )
 

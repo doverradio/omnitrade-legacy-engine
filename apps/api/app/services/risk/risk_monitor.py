@@ -8,12 +8,14 @@ from decimal import Decimal
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.config import get_settings
 from app.core.errors import InvalidRequestError, NotFoundError, ServiceUnavailableError
 from app.models.audit_log import AuditLog
 from app.models.paper_account import PaperAccount
 from app.models.risk_event import RiskEvent
 from app.models.risk_kill_switch import RiskKillSwitch
 from app.models.risk_rule_config import RiskRuleConfig
+from app.services.risk.equity_evidence import resolve_equity_risk_evidence
 from app.services.risk.risk_context import RISK_POLICY_DEFAULTS, resolve_effective_risk_policy
 
 
@@ -52,6 +54,18 @@ class RiskStatusData:
     policy_source: str
     daily_loss_input_source: str
     drawdown_input_source: str
+    current_equity: Decimal
+    current_cash_balance: Decimal
+    current_position_value: Decimal
+    start_of_day_equity: Decimal
+    high_water_mark_equity: Decimal
+    valuation_price_timestamp: datetime | None
+    valuation_source: str
+    valuation_state: str
+    daily_loss_baseline_source: str
+    drawdown_baseline_source: str
+    baseline_state: str
+    generated_at: datetime
 
 
 @dataclass(frozen=True, slots=True)
@@ -192,6 +206,7 @@ def _is_loosening(
 async def get_risk_status(*, db: AsyncSession, account_id: uuid.UUID) -> RiskStatusData:
     account = await _get_account_or_404(db, account_id)
     effective_policy = await resolve_effective_risk_policy(db=db, paper_account_id=account.id)
+    settings = get_settings()
 
     global_stmt = select(RiskKillSwitch).where(
         RiskKillSwitch.scope == "global",
@@ -234,26 +249,52 @@ async def get_risk_status(*, db: AsyncSession, account_id: uuid.UUID) -> RiskSta
         "active_state_unavailable_from_risk_events" if no_trade_event is not None else "unavailable_not_persisted"
     )
 
-    equity = Decimal(account.current_cash_balance)
-    starting_balance = Decimal(account.starting_balance)
-    if starting_balance <= Decimal("0"):
+    equity_evidence = await resolve_equity_risk_evidence(
+        db=db,
+        paper_account=account,
+        actor="risk_monitor",
+        max_price_age_seconds=settings.live_crypto_price_max_age_seconds,
+    )
+    if not equity_evidence.ready:
+        raise ServiceUnavailableError(
+            "Risk status unavailable: equity evidence is untrusted",
+            details={
+                "account_id": str(account.id),
+                "reason": equity_evidence.fail_closed_reason,
+                "valuation_state": equity_evidence.valuation.valuation_state,
+                "baseline_state": equity_evidence.baseline.baseline_state,
+                "missing_price_assets": equity_evidence.valuation.missing_price_assets,
+                "stale_price_assets": equity_evidence.valuation.stale_price_assets,
+                "unresolved_reconciliation_count": equity_evidence.unresolved_reconciliation_count,
+                "unknown_provider_order_count": equity_evidence.unknown_provider_order_count,
+            },
+        )
+
+    start_of_day_equity = equity_evidence.baseline.start_of_day_equity
+    high_water_mark_equity = equity_evidence.baseline.high_water_mark_equity
+    current_equity = equity_evidence.valuation.current_equity
+    if start_of_day_equity <= Decimal("0"):
         daily_limit = Decimal("0")
+    else:
+        daily_limit = start_of_day_equity * effective_policy.max_daily_loss_pct
+
+    if high_water_mark_equity <= Decimal("0"):
         drawdown_limit = Decimal("0")
     else:
-        daily_limit = starting_balance * effective_policy.max_daily_loss_pct
-        drawdown_limit = starting_balance * effective_policy.max_drawdown_pct
+        drawdown_limit = high_water_mark_equity * effective_policy.max_drawdown_pct
 
-    loss = max(Decimal("0"), starting_balance - equity)
+    daily_loss_used = max(Decimal("0"), start_of_day_equity - current_equity)
+    drawdown_used = max(Decimal("0"), high_water_mark_equity - current_equity)
 
     daily_usage = RiskStatusUsage(
-        used=loss,
+        used=daily_loss_used,
         limit=daily_limit,
-        pct_used=_compute_pct_used(loss, daily_limit),
+        pct_used=_compute_pct_used(daily_loss_used, daily_limit),
     )
     drawdown_usage = RiskStatusUsage(
-        used=loss,
+        used=drawdown_used,
         limit=drawdown_limit,
-        pct_used=_compute_pct_used(loss, drawdown_limit),
+        pct_used=_compute_pct_used(drawdown_used, drawdown_limit),
     )
 
     paused_reason: str | None = None
@@ -278,8 +319,20 @@ async def get_risk_status(*, db: AsyncSession, account_id: uuid.UUID) -> RiskSta
         active_cooldowns_state=active_cooldowns_state,
         active_no_trade_zones_state=active_no_trade_zones_state,
         policy_source=effective_policy.source,
-        daily_loss_input_source="current_cash_balance",
-        drawdown_input_source="current_cash_balance",
+        daily_loss_input_source="current_equity",
+        drawdown_input_source="current_equity",
+        current_equity=current_equity,
+        current_cash_balance=equity_evidence.valuation.cash_balance,
+        current_position_value=equity_evidence.valuation.position_value,
+        start_of_day_equity=start_of_day_equity,
+        high_water_mark_equity=high_water_mark_equity,
+        valuation_price_timestamp=equity_evidence.valuation.latest_price_timestamp,
+        valuation_source=equity_evidence.valuation.valuation_source,
+        valuation_state=equity_evidence.valuation.valuation_state,
+        daily_loss_baseline_source=equity_evidence.baseline.start_of_day_source,
+        drawdown_baseline_source=equity_evidence.baseline.high_water_mark_source,
+        baseline_state=equity_evidence.baseline.baseline_state,
+        generated_at=equity_evidence.valuation.generated_at,
     )
 
 

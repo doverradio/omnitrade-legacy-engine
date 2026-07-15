@@ -49,6 +49,7 @@ from app.services.capital_campaign_orchestration import (
 )
 from app.services.paper.accounting import build_account_snapshot
 from app.services.risk import risk_monitor
+from app.services.risk.equity_evidence import resolve_equity_risk_evidence
 from app.services.risk.risk_context import resolve_effective_risk_policy
 from app.services.strategy_outcomes import fetch_strategy_scorecards
 
@@ -1412,6 +1413,7 @@ async def fetch_operator_status(
 
 
 async def fetch_risk_ledger_diagnosis(*, account_id: UUID) -> dict[str, Any]:
+    settings = get_settings()
     async with AsyncSessionLocal() as db:
         account = await db.get(PaperAccount, account_id)
         if account is None:
@@ -1428,7 +1430,49 @@ async def fetch_risk_ledger_diagnosis(*, account_id: UUID) -> dict[str, Any]:
             (await db.scalar(select(func.count()).select_from(Trade).where(Trade.paper_account_id == account.id))) or 0
         )
 
-        risk_status = await risk_monitor.get_risk_status(db=db, account_id=account.id)
+        equity_evidence = await resolve_equity_risk_evidence(
+            db=db,
+            paper_account=account,
+            actor="operator_cli:risk_diagnosis",
+            max_price_age_seconds=settings.live_crypto_price_max_age_seconds,
+        )
+
+        status_payload: dict[str, Any] | None = None
+        status_error: dict[str, Any] | None = None
+        try:
+            risk_status = await risk_monitor.get_risk_status(db=db, account_id=account.id)
+            status_payload = {
+                "daily_loss": {
+                    "used": format(risk_status.daily_loss.used, "f"),
+                    "limit": format(risk_status.daily_loss.limit, "f"),
+                    "pct_used": format(risk_status.daily_loss.pct_used, "f"),
+                },
+                "drawdown": {
+                    "used": format(risk_status.drawdown.used, "f"),
+                    "limit": format(risk_status.drawdown.limit, "f"),
+                    "pct_used": format(risk_status.drawdown.pct_used, "f"),
+                },
+                "daily_loss_input_source": risk_status.daily_loss_input_source,
+                "drawdown_input_source": risk_status.drawdown_input_source,
+                "current_equity": format(risk_status.current_equity, "f"),
+                "current_cash_balance": format(risk_status.current_cash_balance, "f"),
+                "current_position_value": format(risk_status.current_position_value, "f"),
+                "start_of_day_equity": format(risk_status.start_of_day_equity, "f"),
+                "high_water_mark_equity": format(risk_status.high_water_mark_equity, "f"),
+                "valuation_source": risk_status.valuation_source,
+                "valuation_state": risk_status.valuation_state,
+                "daily_loss_baseline_source": risk_status.daily_loss_baseline_source,
+                "drawdown_baseline_source": risk_status.drawdown_baseline_source,
+                "baseline_state": risk_status.baseline_state,
+                "generated_at": risk_status.generated_at,
+            }
+        except Exception as exc:  # pragma: no cover - defensive payload branch
+            status_error = {
+                "error": str(exc),
+                "equity_evidence_ready": equity_evidence.ready,
+                "equity_evidence_fail_closed_reason": equity_evidence.fail_closed_reason,
+            }
+
         snapshot = await build_account_snapshot(
             db=db,
             paper_account_id=account.id,
@@ -1437,9 +1481,24 @@ async def fetch_risk_ledger_diagnosis(*, account_id: UUID) -> dict[str, Any]:
 
     starting_balance = Decimal(account.starting_balance)
     current_cash_balance = Decimal(account.current_cash_balance)
-    daily_loss_limit = starting_balance * Decimal(effective_policy.max_daily_loss_pct)
-    drawdown_limit = starting_balance * Decimal(effective_policy.max_drawdown_pct)
-    daily_loss_used = max(Decimal("0"), starting_balance - current_cash_balance)
+    old_daily_loss_limit = starting_balance * Decimal(effective_policy.max_daily_loss_pct)
+    old_drawdown_limit = starting_balance * Decimal(effective_policy.max_drawdown_pct)
+    old_daily_loss_used = max(Decimal("0"), starting_balance - current_cash_balance)
+    old_drawdown_used = old_daily_loss_used
+
+    authoritative_start_of_day_equity = equity_evidence.baseline.start_of_day_equity
+    authoritative_high_water_mark_equity = equity_evidence.baseline.high_water_mark_equity
+    authoritative_current_equity = equity_evidence.valuation.current_equity
+    authoritative_daily_loss_used = max(Decimal("0"), authoritative_start_of_day_equity - authoritative_current_equity)
+    authoritative_drawdown_used = max(Decimal("0"), authoritative_high_water_mark_equity - authoritative_current_equity)
+    authoritative_daily_loss_limit = authoritative_start_of_day_equity * Decimal(effective_policy.max_daily_loss_pct)
+    authoritative_drawdown_limit = authoritative_high_water_mark_equity * Decimal(effective_policy.max_drawdown_pct)
+
+    old_daily_loss_pct = old_daily_loss_used / old_daily_loss_limit if old_daily_loss_limit > 0 else Decimal("0")
+    old_drawdown_pct = old_drawdown_used / old_drawdown_limit if old_drawdown_limit > 0 else Decimal("0")
+    authoritative_daily_loss_pct = authoritative_daily_loss_used / authoritative_daily_loss_limit if authoritative_daily_loss_limit > 0 else Decimal("0")
+    authoritative_drawdown_pct = authoritative_drawdown_used / authoritative_drawdown_limit if authoritative_drawdown_limit > 0 else Decimal("0")
+
     latest_trade_executed_at = None if latest_trade is None else latest_trade.executed_at
     balance_source_timestamp = latest_trade_executed_at or account.created_at
     snapshot_gap_cash = snapshot.cash_balance - current_cash_balance
@@ -1455,7 +1514,7 @@ async def fetch_risk_ledger_diagnosis(*, account_id: UUID) -> dict[str, Any]:
         "evaluation": {
             "generated_at": datetime.now(timezone.utc),
             "policy_source": effective_policy.source,
-            "status_input_source": risk_status.daily_loss_input_source,
+            "status_input_source": None if status_payload is None else status_payload.get("daily_loss_input_source"),
             "latest_trade_executed_at": latest_trade_executed_at,
             "balance_source_timestamp": balance_source_timestamp,
             "trade_count": trade_count,
@@ -1482,26 +1541,32 @@ async def fetch_risk_ledger_diagnosis(*, account_id: UUID) -> dict[str, Any]:
             },
         },
         "formulas": {
-            "daily_loss.used": "max(0, starting_balance - current_cash_balance)",
-            "daily_loss.limit": "starting_balance * max_daily_loss_pct",
-            "daily_loss.pct_used": "daily_loss.used / daily_loss.limit if daily_loss.limit > 0 else 0",
-            "drawdown.used": "max(0, starting_balance - current_cash_balance)",
-            "drawdown.limit": "starting_balance * max_drawdown_pct",
-            "drawdown.pct_used": "drawdown.used / drawdown.limit if drawdown.limit > 0 else 0",
+            "legacy_cash_only.daily_loss.used": "max(0, starting_balance - current_cash_balance)",
+            "legacy_cash_only.daily_loss.limit": "starting_balance * max_daily_loss_pct",
+            "legacy_cash_only.drawdown.used": "max(0, starting_balance - current_cash_balance)",
+            "legacy_cash_only.drawdown.limit": "starting_balance * max_drawdown_pct",
+            "authoritative_equity.daily_loss.used": "max(0, start_of_day_equity - current_equity)",
+            "authoritative_equity.daily_loss.limit": "start_of_day_equity * max_daily_loss_pct",
+            "authoritative_equity.drawdown.used": "max(0, high_water_mark_equity - current_equity)",
+            "authoritative_equity.drawdown.limit": "high_water_mark_equity * max_drawdown_pct",
+            "pct_used": "used / limit if limit > 0 else 0",
         },
-        "status": {
-            "daily_loss": {
-                "used": format(risk_status.daily_loss.used, "f"),
-                "limit": format(risk_status.daily_loss.limit, "f"),
-                "pct_used": format(risk_status.daily_loss.pct_used, "f"),
-            },
-            "drawdown": {
-                "used": format(risk_status.drawdown.used, "f"),
-                "limit": format(risk_status.drawdown.limit, "f"),
-                "pct_used": format(risk_status.drawdown.pct_used, "f"),
-            },
-            "daily_loss_input_source": risk_status.daily_loss_input_source,
-            "drawdown_input_source": risk_status.drawdown_input_source,
+        "status": status_payload,
+        "status_error": status_error,
+        "equity_evidence": {
+            "ready": equity_evidence.ready,
+            "fail_closed_reason": equity_evidence.fail_closed_reason,
+            "valuation_state": equity_evidence.valuation.valuation_state,
+            "valuation_source": equity_evidence.valuation.valuation_source,
+            "latest_price_timestamp": equity_evidence.valuation.latest_price_timestamp,
+            "stale_cutoff": equity_evidence.valuation.stale_cutoff,
+            "missing_price_assets": equity_evidence.valuation.missing_price_assets,
+            "stale_price_assets": equity_evidence.valuation.stale_price_assets,
+            "unresolved_reconciliation_count": equity_evidence.unresolved_reconciliation_count,
+            "unknown_provider_order_count": equity_evidence.unknown_provider_order_count,
+            "start_of_day_source": equity_evidence.baseline.start_of_day_source,
+            "high_water_mark_source": equity_evidence.baseline.high_water_mark_source,
+            "baseline_state": equity_evidence.baseline.baseline_state,
         },
         "snapshot": {
             "cash_balance": format(snapshot.cash_balance, "f"),
@@ -1526,21 +1591,38 @@ async def fetch_risk_ledger_diagnosis(*, account_id: UUID) -> dict[str, Any]:
             "persisted_cash_balance_minus_computed_cash_balance": format(snapshot_gap_cash, "f"),
             "persisted_cash_balance_minus_snapshot_equity": format(snapshot_gap_equity, "f"),
             "ledger_alignment": "aligned" if snapshot_gap_cash == Decimal("0") else "divergent",
-            "recomputed": {
+            "legacy_cash_only": {
                 "daily_loss": {
-                    "used": format(daily_loss_used, "f"),
-                    "limit": format(daily_loss_limit, "f"),
+                    "used": format(old_daily_loss_used, "f"),
+                    "limit": format(old_daily_loss_limit, "f"),
+                    "pct_used": format(old_daily_loss_pct, "f"),
                 },
                 "drawdown": {
-                    "used": format(daily_loss_used, "f"),
-                    "limit": format(drawdown_limit, "f"),
+                    "used": format(old_drawdown_used, "f"),
+                    "limit": format(old_drawdown_limit, "f"),
+                    "pct_used": format(old_drawdown_pct, "f"),
                 },
             },
-            "status_matches_formula": {
-                "daily_loss_used": format(Decimal(risk_status.daily_loss.used) - daily_loss_used, "f"),
-                "daily_loss_limit": format(Decimal(risk_status.daily_loss.limit) - daily_loss_limit, "f"),
-                "drawdown_used": format(Decimal(risk_status.drawdown.used) - daily_loss_used, "f"),
-                "drawdown_limit": format(Decimal(risk_status.drawdown.limit) - drawdown_limit, "f"),
+            "authoritative_equity_based": {
+                "daily_loss": {
+                    "used": format(authoritative_daily_loss_used, "f"),
+                    "limit": format(authoritative_daily_loss_limit, "f"),
+                    "pct_used": format(authoritative_daily_loss_pct, "f"),
+                },
+                "drawdown": {
+                    "used": format(authoritative_drawdown_used, "f"),
+                    "limit": format(authoritative_drawdown_limit, "f"),
+                    "pct_used": format(authoritative_drawdown_pct, "f"),
+                },
+                "current_equity": format(authoritative_current_equity, "f"),
+                "current_cash_balance": format(equity_evidence.valuation.cash_balance, "f"),
+                "current_position_value": format(equity_evidence.valuation.position_value, "f"),
+                "start_of_day_equity": format(authoritative_start_of_day_equity, "f"),
+                "high_water_mark_equity": format(authoritative_high_water_mark_equity, "f"),
+                "valuation_source": equity_evidence.valuation.valuation_source,
+                "valuation_state": equity_evidence.valuation.valuation_state,
+                "daily_loss_baseline_source": equity_evidence.baseline.start_of_day_source,
+                "drawdown_baseline_source": equity_evidence.baseline.high_water_mark_source,
             },
         },
     }

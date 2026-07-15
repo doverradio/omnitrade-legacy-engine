@@ -3,6 +3,7 @@ from __future__ import annotations
 import uuid
 from datetime import datetime, timezone
 from decimal import Decimal
+from types import SimpleNamespace
 from typing import Any
 
 import pytest
@@ -26,6 +27,36 @@ from app.services.signals.execution_orchestrator import (
     SignalExecutionRequest,
     orchestrate_paper_signal_execution,
 )
+
+
+def _trusted_execution_risk_context(*, now: datetime) -> SimpleNamespace:
+    return SimpleNamespace(
+        account_equity=Decimal("25"),
+        start_of_day_equity=Decimal("25"),
+        current_equity=Decimal("25"),
+        max_position_size_pct=Decimal("0.10"),
+        max_daily_loss_pct=Decimal("0.03"),
+        high_water_mark_equity=Decimal("25"),
+        max_drawdown_pct=Decimal("0.10"),
+        consecutive_losses_on_pair=0,
+        cooldown_after_losses=3,
+        last_loss_at=None,
+        cooldown_duration_minutes=Decimal("1440"),
+        evaluation_time=now,
+        data_is_stale=False,
+        data_has_gaps=False,
+        global_kill_switch_engaged_state=False,
+        global_kill_switch_rearm_required=False,
+        account_kill_switch_engaged_state=False,
+        account_kill_switch_rearm_required=False,
+        global_kill_switch_state_observed=True,
+        account_kill_switch_state_observed=True,
+        risk_policy_source="system_default_config",
+        runtime_cooldown_state="unavailable_not_persisted",
+        runtime_no_trade_zone_state="unavailable_not_persisted",
+        start_of_day_equity_source="rolled_from_prior_last_equity",
+        high_water_mark_equity_source="updated_from_current_equity_observation",
+    )
 
 
 class _ScalarResult:
@@ -253,7 +284,7 @@ async def test_orchestrator_prevents_duplicate_signal_execution(monkeypatch: pyt
 
 
 @pytest.mark.asyncio
-async def test_orchestrator_rejects_stock_to_internal_sim_path() -> None:
+async def test_orchestrator_rejects_stock_to_internal_sim_path(monkeypatch: pytest.MonkeyPatch) -> None:
     now = datetime(2026, 7, 6, tzinfo=timezone.utc)
     account = PaperAccount(
         id=uuid.uuid4(),
@@ -275,6 +306,13 @@ async def test_orchestrator_rejects_stock_to_internal_sim_path() -> None:
     )
 
     session = _FakeSession(accounts=[account], assets=[stock_asset], trades=[])
+
+    import app.services.signals.execution_orchestrator as orchestrator_module
+
+    async def fake_resolve_execution_risk_context(*_args, **_kwargs):
+        return _trusted_execution_risk_context(now=now)
+
+    monkeypatch.setattr(orchestrator_module, "resolve_execution_risk_context", fake_resolve_execution_risk_context)
 
     with pytest.raises(InvalidRequestError):
         await orchestrate_paper_signal_execution(
@@ -338,8 +376,12 @@ async def test_orchestrator_routes_stock_to_alpaca(monkeypatch: pytest.MonkeyPat
 
     import app.services.signals.execution_orchestrator as orchestrator_module
 
+    async def fake_resolve_execution_risk_context(*_args, **_kwargs):
+        return _trusted_execution_risk_context(now=now)
+
     monkeypatch.setattr(orchestrator_module, "AsyncHTTPClient", lambda: _NoopHttpClient())
     monkeypatch.setattr(orchestrator_module, "submit_alpaca_paper_order", fake_submit_alpaca_paper_order)
+    monkeypatch.setattr(orchestrator_module, "resolve_execution_risk_context", fake_resolve_execution_risk_context)
 
     result = await orchestrate_paper_signal_execution(
         db=session,
@@ -723,7 +765,9 @@ async def test_orchestrator_with_bootstrapped_account_kill_switch_progresses_pas
 
 
 @pytest.mark.asyncio
-async def test_orchestrator_rejects_sell_without_position_as_structured_execution_rejection() -> None:
+async def test_orchestrator_rejects_sell_without_position_as_structured_execution_rejection(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     now = datetime(2026, 7, 6, tzinfo=timezone.utc)
     account = PaperAccount(
         id=uuid.uuid4(),
@@ -764,6 +808,13 @@ async def test_orchestrator_rejects_sell_without_position_as_structured_executio
             )
         ],
     )
+
+    import app.services.signals.execution_orchestrator as orchestrator_module
+
+    async def fake_resolve_execution_risk_context(*_args, **_kwargs):
+        return _trusted_execution_risk_context(now=now)
+
+    monkeypatch.setattr(orchestrator_module, "resolve_execution_risk_context", fake_resolve_execution_risk_context)
 
     result = await orchestrate_paper_signal_execution(
         db=session,

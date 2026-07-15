@@ -8,12 +8,13 @@ from decimal import Decimal
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.config import get_settings
 from app.models.asset import Asset
 from app.models.candle import Candle
 from app.models.paper_account import PaperAccount
 from app.models.risk_kill_switch import RiskKillSwitch
 from app.models.risk_rule_config import RiskRuleConfig
-from app.services.paper.accounting import build_account_snapshot
+from app.services.risk.equity_evidence import resolve_equity_risk_evidence
 
 
 RISK_POLICY_DEFAULTS = {
@@ -145,12 +146,7 @@ async def resolve_execution_risk_context(
     asset: Asset,
 ) -> ExecutionRiskContext:
     now = datetime.now(timezone.utc)
-
-    snapshot = await build_account_snapshot(
-        db=db,
-        paper_account_id=paper_account.id,
-        starting_balance=paper_account.starting_balance,
-    )
+    settings = get_settings()
 
     effective_rules = await _resolve_effective_risk_rules(db=db, paper_account_id=paper_account.id)
     global_engaged, global_rearm_required = await _resolve_kill_switch_state(db=db, scope="global", paper_account_id=None)
@@ -159,13 +155,28 @@ async def resolve_execution_risk_context(
         scope="account",
         paper_account_id=paper_account.id,
     )
-    data_is_stale, data_has_gaps = await _resolve_data_quality_inputs(db=db, asset_id=asset.id, evaluation_time=now)
+    equity_evidence = await resolve_equity_risk_evidence(
+        db=db,
+        paper_account=paper_account,
+        actor="risk_context",
+        max_price_age_seconds=settings.live_crypto_price_max_age_seconds,
+    )
 
-    # Start-of-day and high-water mark persistence are not yet modeled for paper accounts,
-    # so execution uses explicit conservative fallbacks from existing account/snapshot values.
-    start_of_day_equity = Decimal(paper_account.starting_balance)
-    current_equity = Decimal(snapshot.equity)
-    high_water_mark_equity = max(start_of_day_equity, current_equity)
+    candle_data_is_stale, candle_data_has_gaps = await _resolve_data_quality_inputs(db=db, asset_id=asset.id, evaluation_time=now)
+    valuation_is_stale = equity_evidence.valuation.valuation_state == "stale_price_evidence"
+    valuation_has_gaps = equity_evidence.valuation.valuation_state in {"missing_price_evidence", "inconsistent_account_state"}
+    baseline_has_gaps = not equity_evidence.baseline.baseline_ready
+    reconciliation_has_gaps = (
+        equity_evidence.unresolved_reconciliation_count > 0
+        or equity_evidence.unknown_provider_order_count > 0
+    )
+
+    data_is_stale = candle_data_is_stale or valuation_is_stale
+    data_has_gaps = candle_data_has_gaps or valuation_has_gaps or baseline_has_gaps or reconciliation_has_gaps
+
+    start_of_day_equity = equity_evidence.baseline.start_of_day_equity
+    current_equity = equity_evidence.valuation.current_equity
+    high_water_mark_equity = equity_evidence.baseline.high_water_mark_equity
 
     return ExecutionRiskContext(
         account_equity=current_equity,
@@ -191,6 +202,6 @@ async def resolve_execution_risk_context(
         risk_policy_source=str(effective_rules["source"]),
         runtime_cooldown_state="unavailable_not_persisted",
         runtime_no_trade_zone_state="unavailable_not_persisted",
-        start_of_day_equity_source="fallback_starting_balance",
-        high_water_mark_equity_source="fallback_max_starting_vs_current",
+        start_of_day_equity_source=equity_evidence.baseline.start_of_day_source,
+        high_water_mark_equity_source=equity_evidence.baseline.high_water_mark_source,
     )

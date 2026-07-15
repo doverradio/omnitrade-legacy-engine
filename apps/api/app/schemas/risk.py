@@ -50,6 +50,18 @@ class AccountRiskStatusResponse(BaseModel):
     policy_source: str | None = None
     daily_loss_input_source: str | None = None
     drawdown_input_source: str | None = None
+    current_equity: Decimal | None = None
+    current_cash_balance: Decimal | None = None
+    current_position_value: Decimal | None = None
+    start_of_day_equity: Decimal | None = None
+    high_water_mark_equity: Decimal | None = None
+    valuation_price_timestamp: datetime | None = None
+    valuation_source: str | None = None
+    valuation_state: str | None = None
+    daily_loss_baseline_source: str | None = None
+    drawdown_baseline_source: str | None = None
+    baseline_state: str | None = None
+    generated_at: datetime | None = None
 
 
 class RiskStatusResponse(BaseModel):

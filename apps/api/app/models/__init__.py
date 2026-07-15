@@ -48,6 +48,7 @@ from app.models.venue_commissioning_run import VenueCommissioningRun
 from app.models.parameter_set import ParameterSet
 from app.models.paper_account import PaperAccount
 from app.models.risk_event import RiskEvent
+from app.models.risk_equity_baseline import RiskEquityBaseline
 from app.models.risk_kill_switch import RiskKillSwitch
 from app.models.risk_rule_config import RiskRuleConfig
 from app.models.signal import Signal
@@ -121,6 +122,7 @@ __all__ = [
 	"PaperAccount",
 	"ParameterSet",
 	"RiskEvent",
+	"RiskEquityBaseline",
 	"RiskKillSwitch",
 	"RiskRuleConfig",
 	"Signal",
