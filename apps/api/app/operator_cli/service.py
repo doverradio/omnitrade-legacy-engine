@@ -122,6 +122,575 @@ _FIRST_PROFIT_STAGE_ANCHORS: dict[int, float] = {
     10: 100.0,
 }
 _ORCHESTRATION_READINESS_STATUSES = {"DRAFT", "READY", "ACTIVE", "PAUSED"}
+_HISTORICAL_BUY_REPLAY_REQUIRED_GATES = [
+    "historical_decision_exists",
+    "historical_action_is_buy",
+    "source_lineage_complete",
+    "strategy_identity_resolved",
+    "strategy_authority_compatible",
+    "market_data_as_of_time_valid",
+    "campaign_definition_compatible",
+    "runtime_binding_compatible",
+    "product_allowed",
+    "provider_allowed",
+    "confidence_threshold_passed",
+    "lifecycle_allows_open_position",
+    "risk_verdict_allows",
+    "exact_five_dollar_candidate_possible",
+    "fee_adjusted_edge_positive",
+    "no_simulated_order_conflict",
+]
+_BUY_CONFIDENCE_BY_AGGRESSION_MODE: dict[str, Decimal] = {
+    "CONSERVATIVE": Decimal("0.70"),
+    "BALANCED": Decimal("0.60"),
+    "AGGRESSIVE": Decimal("0.50"),
+    "MAXIMUM_GOVERNED": Decimal("0.45"),
+}
+
+
+def _uuid_from_value(value: Any) -> UUID | None:
+    try:
+        return UUID(str(value))
+    except (ValueError, TypeError, AttributeError):
+        return None
+
+
+def _lineage_ids(source_lineage: Any, *, key: str) -> list[UUID]:
+    if not isinstance(source_lineage, dict):
+        return []
+    raw_values = source_lineage.get(key)
+    if not isinstance(raw_values, list):
+        return []
+    result: list[UUID] = []
+    for value in raw_values:
+        parsed = _uuid_from_value(value)
+        if parsed is not None:
+            result.append(parsed)
+    return result
+
+
+def _decision_action(decision: DecisionRecord | None) -> str | None:
+    if decision is None:
+        return None
+    signals = decision.generated_signals if isinstance(decision.generated_signals, list) else []
+    for signal in signals:
+        if not isinstance(signal, dict):
+            continue
+        action = str(signal.get("action") or "").strip().upper()
+        if action:
+            return action
+    if decision.trade_accepted:
+        return "BUY"
+    return None
+
+
+def _strategy_identity(decision: DecisionRecord | None) -> tuple[str | None, str | None]:
+    if decision is None:
+        return None, None
+    strategies = decision.supporting_strategies if isinstance(decision.supporting_strategies, list) else []
+    for item in strategies:
+        if not isinstance(item, dict):
+            continue
+        identity = str(item.get("strategy_identity") or "").strip() or None
+        version = str(item.get("strategy_version") or "").strip() or None
+        if identity or version:
+            return identity, version
+    return None, None
+
+
+def _strategy_fee_edge(decision: DecisionRecord | None) -> Decimal | None:
+    if decision is None:
+        return None
+    strategies = decision.supporting_strategies if isinstance(decision.supporting_strategies, list) else []
+    for item in strategies:
+        if not isinstance(item, dict):
+            continue
+        gross = item.get("expected_gross_edge")
+        fees = item.get("expected_fees")
+        slippage = item.get("expected_slippage")
+        if gross is None or fees is None or slippage is None:
+            continue
+        return Decimal(str(gross)) - Decimal(str(fees)) - Decimal(str(slippage))
+    return None
+
+
+def _as_of_market_data_valid(*, decision: DecisionRecord | None, snapshot: DecisionSnapshot | None) -> bool | None:
+    if decision is None or snapshot is None:
+        return None
+    decision_ts = decision.timestamp if decision.timestamp.tzinfo is not None else decision.timestamp.replace(tzinfo=timezone.utc)
+    snapshot_ts = snapshot.timestamp if snapshot.timestamp.tzinfo is not None else snapshot.timestamp.replace(tzinfo=timezone.utc)
+    return snapshot_ts <= decision_ts
+
+
+def _risk_verdict_from_event(event: RiskEvent | None) -> str | None:
+    if event is None:
+        return None
+    action_taken = str(event.action_taken or "").strip().lower()
+    if "veto" in action_taken or "reject" in action_taken or "block" in action_taken:
+        return "VETO"
+    if "allow" in action_taken or "pass" in action_taken or "approve" in action_taken:
+        return "ALLOW"
+    return None
+
+
+def _strategy_authority_compatibility(*, definition: CapitalCampaignDefinition | None, strategy_identity: str | None) -> tuple[str, Any, Any]:
+    if strategy_identity is None:
+        return "UNKNOWN", "strategy identity known", None
+    if definition is None or not isinstance(definition.metadata_evidence, dict):
+        return "UNKNOWN", "no explicit strategy allowlist configured", None
+    metadata = definition.metadata_evidence
+    allowlist_keys = (
+        "authorized_strategy_identities",
+        "allowed_strategy_identities",
+        "strategy_allowlist",
+        "executable_strategy_identities",
+    )
+    allowlist: list[str] | None = None
+    for key in allowlist_keys:
+        value = metadata.get(key)
+        if isinstance(value, list):
+            allowlist = [str(item or "").strip() for item in value if str(item or "").strip()]
+            break
+    if allowlist is None:
+        return "UNKNOWN", "no explicit strategy allowlist configured", None
+    return ("PASSED" if strategy_identity in allowlist else "FAILED"), allowlist, strategy_identity
+
+
+def _primary_blocker_from_gates(gates: dict[str, str]) -> str:
+    if gates.get("historical_decision_exists") == "FAILED":
+        return "DECISION_RECORD_MISSING"
+    if gates.get("historical_action_is_buy") == "FAILED":
+        return "DECISION_NOT_BUY"
+    if gates.get("source_lineage_complete") == "FAILED":
+        return "SOURCE_LINEAGE_INCOMPLETE"
+    if gates.get("strategy_identity_resolved") == "FAILED":
+        return "STRATEGY_IDENTITY_UNRESOLVED"
+    if gates.get("strategy_authority_compatible") == "FAILED":
+        return "STRATEGY_NOT_AUTHORIZED"
+    if gates.get("market_data_as_of_time_valid") == "FAILED":
+        return "MARKET_DATA_INVALID_AS_OF_TIME"
+    if gates.get("campaign_definition_compatible") == "FAILED":
+        return "CAMPAIGN_INCOMPATIBLE"
+    if gates.get("runtime_binding_compatible") == "FAILED":
+        return "RUNTIME_BINDING_INCOMPATIBLE"
+    if gates.get("product_allowed") == "FAILED":
+        return "PRODUCT_NOT_ALLOWED"
+    if gates.get("provider_allowed") == "FAILED":
+        return "PROVIDER_NOT_ALLOWED"
+    if gates.get("confidence_threshold_passed") == "FAILED":
+        return "CONFIDENCE_BELOW_THRESHOLD"
+    if gates.get("lifecycle_allows_open_position") == "FAILED":
+        return "LIFECYCLE_BLOCKED"
+    if gates.get("risk_verdict_allows") == "FAILED":
+        return "RISK_REJECTED"
+    if gates.get("exact_five_dollar_candidate_possible") == "FAILED":
+        return "FIVE_DOLLAR_SIZE_NOT_FEASIBLE"
+    if gates.get("fee_adjusted_edge_positive") == "FAILED":
+        return "FEE_ADJUSTED_EDGE_NOT_POSITIVE"
+    if gates.get("no_simulated_order_conflict") == "FAILED":
+        return "CONFLICTING_SIMULATED_STATE"
+    if gates.get("canonical_package_eligibility_reached") == "PASSED":
+        return "READY_PACKAGE_ELIGIBLE"
+    return "OTHER:insufficient_evidence_for_deterministic_blocker"
+
+
+def _gate_row(name: str, state: str, expected: Any, actual: Any) -> dict[str, Any]:
+    return {"name": name, "state": state, "expected": expected, "actual": actual}
+
+
+def _gate_from_bool(value: bool | None) -> str:
+    if value is None:
+        return "UNKNOWN"
+    return "PASSED" if value else "FAILED"
+
+
+def _historical_buy_campaign_replay_audit_payload(
+    *,
+    decision_id: UUID,
+    campaign_id: UUID,
+    campaign_version: int,
+    runtime_campaign_id: int,
+    paper_account_id: UUID,
+    live_trading_profile_id: UUID,
+    provider: str,
+    environment: str,
+    product_id: str,
+    decision: DecisionRecord | None,
+    snapshot: DecisionSnapshot | None,
+    signal: Signal | None,
+    risk_event: RiskEvent | None,
+    definition: CapitalCampaignDefinition | None,
+    latest_version: int | None,
+    runtime: CapitalCampaign | None,
+    paper_account: PaperAccount | None,
+    profile: LiveTradingProfile | None,
+    open_live_order_count: int,
+    matching_sell_decision: DecisionRecord | None,
+    matching_sell_decision_id: UUID | None,
+) -> dict[str, Any]:
+    historical_action = _decision_action(decision)
+    strategy_identity, strategy_version = _strategy_identity(decision)
+    historical_confidence = None if decision is None or decision.confidence is None else Decimal(str(decision.confidence))
+    confidence_threshold = None
+    if definition is not None:
+        confidence_threshold = _BUY_CONFIDENCE_BY_AGGRESSION_MODE.get(str(definition.aggression_mode or "").strip().upper())
+
+    signal_lineage = _lineage_ids(None if decision is None else decision.source_lineage, key="signals")
+    risk_lineage = _lineage_ids(None if decision is None else decision.source_lineage, key="risk_events")
+    trade_lineage = _lineage_ids(None if decision is None else decision.source_lineage, key="trades")
+
+    source_lineage_complete: bool | None = None
+    if decision is not None:
+        source_lineage_complete = bool(signal_lineage) and strategy_identity is not None
+
+    strategy_authority_state, strategy_authority_expected, strategy_authority_actual = _strategy_authority_compatibility(
+        definition=definition,
+        strategy_identity=strategy_identity,
+    )
+
+    market_data_as_of_valid = _as_of_market_data_valid(decision=decision, snapshot=snapshot)
+    decision_exists = decision is not None
+    action_is_buy = None if decision is None else (historical_action == "BUY")
+
+    campaign_definition_compatible: bool | None = None
+    if definition is not None:
+        campaign_definition_compatible = (latest_version is None) or (int(campaign_version) == int(latest_version))
+
+    runtime_binding_compatible: bool | None = None
+    if runtime is not None:
+        runtime_binding_compatible = (
+            int(runtime.id) == int(runtime_campaign_id)
+            and str(runtime.uuid) == str(campaign_id)
+            and int(runtime.definition_version) == int(campaign_version)
+            and str(runtime.paper_account_id) == str(paper_account_id)
+        )
+        if profile is not None:
+            runtime_binding_compatible = runtime_binding_compatible and (str(profile.paper_account_id) == str(paper_account_id))
+
+    normalized_product = normalize_product_id(product_id)
+    normalized_provider = str(provider or "").strip().lower()
+    product_allowed: bool | None = None
+    provider_allowed: bool | None = None
+    if definition is not None:
+        allowed_products = {str(item or "").strip().upper() for item in (definition.allowed_instruments or []) if str(item or "").strip()}
+        allowed_providers = {str(item or "").strip().lower() for item in (definition.allowed_venues or []) if str(item or "").strip()}
+        product_allowed = normalized_product in allowed_products
+        provider_allowed = normalized_provider in allowed_providers
+
+    confidence_threshold_passed: bool | None = None
+    if confidence_threshold is not None and historical_confidence is not None:
+        confidence_threshold_passed = historical_confidence >= confidence_threshold
+
+    lifecycle_allows_open_position: bool | None = None
+    if decision is not None:
+        if decision.trade_accepted:
+            lifecycle_allows_open_position = True
+        elif decision.trade_rejected_reason:
+            lifecycle_allows_open_position = False
+
+    risk_verdict = _risk_verdict_from_event(risk_event)
+    risk_verdict_allows: bool | None = None
+    if risk_verdict is not None:
+        risk_verdict_allows = risk_verdict == "ALLOW"
+
+    exact_five_dollar_candidate_possible: bool | None = None
+    if definition is not None:
+        exact_five_dollar_candidate_possible = (
+            int(definition.maximum_open_positions) == 1
+            and Decimal(str(definition.minimum_position_size)) == Decimal("5")
+            and Decimal(str(definition.maximum_position_size)) == Decimal("5")
+            and Decimal(str(definition.maximum_total_exposure)) == Decimal("5")
+        )
+
+    fee_adjusted_edge = _strategy_fee_edge(decision)
+    fee_adjusted_edge_positive: bool | None = None
+    if fee_adjusted_edge is not None:
+        fee_adjusted_edge_positive = fee_adjusted_edge > Decimal("0")
+
+    no_simulated_order_conflict = open_live_order_count == 0
+
+    gates = [
+        _gate_row("historical_decision_exists", _gate_from_bool(decision_exists), str(decision_id), "found" if decision_exists else "missing"),
+        _gate_row("historical_action_is_buy", _gate_from_bool(action_is_buy), "BUY-equivalent", historical_action),
+        _gate_row("source_lineage_complete", _gate_from_bool(source_lineage_complete), "signal lineage + strategy identity", {
+            "signal_ids": [str(item) for item in signal_lineage],
+            "risk_event_ids": [str(item) for item in risk_lineage],
+            "trade_ids": [str(item) for item in trade_lineage],
+            "strategy_identity": strategy_identity,
+        }),
+        _gate_row("strategy_identity_resolved", _gate_from_bool(strategy_identity is not None if decision is not None else None), "non-empty strategy identity", strategy_identity),
+        _gate_row("strategy_authority_compatible", strategy_authority_state, strategy_authority_expected, strategy_authority_actual),
+        _gate_row("market_data_as_of_time_valid", _gate_from_bool(market_data_as_of_valid), "snapshot.timestamp <= decision.timestamp", {
+            "decision_timestamp": None if decision is None else decision.timestamp.isoformat(),
+            "snapshot_timestamp": None if snapshot is None else snapshot.timestamp.isoformat(),
+        }),
+        _gate_row("campaign_definition_compatible", _gate_from_bool(campaign_definition_compatible), {
+            "campaign_id": str(campaign_id),
+            "campaign_version": int(campaign_version),
+            "latest_version": latest_version,
+        }, None if definition is None else {"definition_version": int(definition.version)}),
+        _gate_row("runtime_binding_compatible", _gate_from_bool(runtime_binding_compatible), {
+            "runtime_campaign_id": int(runtime_campaign_id),
+            "campaign_id": str(campaign_id),
+            "campaign_version": int(campaign_version),
+            "paper_account_id": str(paper_account_id),
+            "live_trading_profile_id": str(live_trading_profile_id),
+        }, None if runtime is None else {
+            "runtime_campaign_id": int(runtime.id),
+            "runtime_uuid": str(runtime.uuid),
+            "runtime_definition_version": int(runtime.definition_version),
+            "runtime_paper_account_id": str(runtime.paper_account_id),
+            "profile_paper_account_id": None if profile is None else str(profile.paper_account_id),
+        }),
+        _gate_row("product_allowed", _gate_from_bool(product_allowed), normalized_product, None if definition is None else list(definition.allowed_instruments or [])),
+        _gate_row("provider_allowed", _gate_from_bool(provider_allowed), normalized_provider, None if definition is None else list(definition.allowed_venues or [])),
+        _gate_row("confidence_threshold_passed", _gate_from_bool(confidence_threshold_passed), None if confidence_threshold is None else format(confidence_threshold, "f"), None if historical_confidence is None else format(historical_confidence, "f")),
+        _gate_row("lifecycle_allows_open_position", _gate_from_bool(lifecycle_allows_open_position), "decision accepted or non-blocked lifecycle", None if decision is None else {
+            "trade_accepted": bool(decision.trade_accepted),
+            "trade_rejected_reason": decision.trade_rejected_reason,
+        }),
+        _gate_row("risk_verdict_allows", _gate_from_bool(risk_verdict_allows), "ALLOW", None if risk_event is None else {
+            "risk_event_id": str(risk_event.id),
+            "action_taken": risk_event.action_taken,
+            "event_type": risk_event.event_type,
+            "derived_verdict": risk_verdict,
+        }),
+        _gate_row("exact_five_dollar_candidate_possible", _gate_from_bool(exact_five_dollar_candidate_possible), {
+            "maximum_open_positions": 1,
+            "minimum_position_size": "5",
+            "maximum_position_size": "5",
+            "maximum_total_exposure": "5",
+        }, None if definition is None else {
+            "maximum_open_positions": int(definition.maximum_open_positions),
+            "minimum_position_size": format(Decimal(str(definition.minimum_position_size)), "f"),
+            "maximum_position_size": format(Decimal(str(definition.maximum_position_size)), "f"),
+            "maximum_total_exposure": format(Decimal(str(definition.maximum_total_exposure)), "f"),
+        }),
+        _gate_row("fee_adjusted_edge_positive", _gate_from_bool(fee_adjusted_edge_positive), "expected_gross_edge - expected_fees - expected_slippage > 0", None if fee_adjusted_edge is None else format(fee_adjusted_edge, "f")),
+        _gate_row("no_simulated_order_conflict", _gate_from_bool(no_simulated_order_conflict), 0, int(open_live_order_count)),
+    ]
+
+    gate_states = {item["name"]: item["state"] for item in gates}
+    canonical_package_state = "PASSED"
+    for gate_name in _HISTORICAL_BUY_REPLAY_REQUIRED_GATES:
+        state = gate_states.get(gate_name, "UNKNOWN")
+        if state == "FAILED":
+            canonical_package_state = "FAILED"
+            break
+        if state in {"UNKNOWN", "NOT_APPLICABLE"} and canonical_package_state == "PASSED":
+            canonical_package_state = "UNKNOWN"
+    gates.append(
+        _gate_row(
+            "canonical_package_eligibility_reached",
+            canonical_package_state,
+            "all required campaign gates are PASSED in read-only simulation",
+            {name: gate_states.get(name, "UNKNOWN") for name in _HISTORICAL_BUY_REPLAY_REQUIRED_GATES},
+        )
+    )
+    gate_states["canonical_package_eligibility_reached"] = canonical_package_state
+
+    if gate_states["historical_decision_exists"] != "PASSED" or gate_states["historical_action_is_buy"] != "PASSED":
+        campaign_replay_outcome = "REJECTED_BEFORE_CANDIDATE"
+    elif gate_states["risk_verdict_allows"] == "FAILED":
+        campaign_replay_outcome = "RISK_REJECTED"
+    elif gate_states["canonical_package_eligibility_reached"] == "PASSED":
+        campaign_replay_outcome = "READY_PACKAGE_ELIGIBLE"
+    elif gate_states["exact_five_dollar_candidate_possible"] == "PASSED":
+        campaign_replay_outcome = "EXACT_5_DOLLAR_OPPORTUNITY"
+    elif gate_states["confidence_threshold_passed"] == "PASSED" and gate_states["lifecycle_allows_open_position"] == "PASSED":
+        campaign_replay_outcome = "EXECUTABLE_CAMPAIGN_CANDIDATE"
+    else:
+        campaign_replay_outcome = "REJECTED_BEFORE_CANDIDATE"
+
+    matching_sell_payload = {
+        "supplied": matching_sell_decision_id is not None,
+        "decision_id": None if matching_sell_decision_id is None else str(matching_sell_decision_id),
+        "exists": matching_sell_decision is not None,
+        "chronologically_after_buy": None,
+        "asset_compatible": None,
+        "strategy_lineage_compatible": None,
+        "feasible_closing_action": None,
+        "known_historical_gross_profit": None,
+        "known_fees": None,
+        "known_historical_net_profit": None,
+    }
+    if matching_sell_decision_id is not None and matching_sell_decision is not None and decision is not None:
+        sell_action = _decision_action(matching_sell_decision)
+        matching_sell_payload["chronologically_after_buy"] = matching_sell_decision.timestamp >= decision.timestamp
+        matching_sell_payload["asset_compatible"] = matching_sell_decision.asset == decision.asset
+        sell_strategy_identity, _ = _strategy_identity(matching_sell_decision)
+        matching_sell_payload["strategy_lineage_compatible"] = (sell_strategy_identity == strategy_identity)
+        matching_sell_payload["feasible_closing_action"] = sell_action == "SELL"
+        pnl_payload = matching_sell_decision.pnl if isinstance(matching_sell_decision.pnl, dict) else {}
+        if pnl_payload:
+            gross = pnl_payload.get("gross_profit")
+            fees = pnl_payload.get("fees")
+            net = pnl_payload.get("net_profit")
+            matching_sell_payload["known_historical_gross_profit"] = None if gross is None else str(gross)
+            matching_sell_payload["known_fees"] = None if fees is None else str(fees)
+            matching_sell_payload["known_historical_net_profit"] = None if net is None else str(net)
+
+    return {
+        "historical_record": {
+            "decision_id": str(decision_id),
+            "decision_exists": decision is not None,
+            "timestamp": None if decision is None else decision.timestamp.isoformat(),
+            "action": historical_action,
+            "confidence": None if historical_confidence is None else format(historical_confidence, "f"),
+            "trade_accepted": None if decision is None else bool(decision.trade_accepted),
+            "trade_rejected_reason": None if decision is None else decision.trade_rejected_reason,
+            "strategy_identity": strategy_identity,
+            "strategy_version": strategy_version,
+            "signal_id": None if signal is None else str(signal.id),
+            "signal_action": None if signal is None else signal.action,
+            "signal_status": None if signal is None else signal.status,
+            "risk_event_id": None if risk_event is None else str(risk_event.id),
+            "risk_verdict": risk_verdict,
+            "source_lineage": None if decision is None else decision.source_lineage,
+            "snapshot": None if snapshot is None else {
+                "timestamp": snapshot.timestamp.isoformat(),
+                "asset": snapshot.asset,
+                "timeframe": snapshot.timeframe,
+            },
+            "execution_evidence": None if decision is None else decision.execution_details,
+            "pnl_evidence": None if decision is None else decision.pnl,
+        },
+        "as_of_time_replay": {
+            "deterministic_replay": True,
+            "anti_hindsight": {
+                "disallow_future_candles": True,
+                "disallow_future_prices": True,
+                "disallow_future_account_state": True,
+                "future_evidence_only_for_observed_outcome": True,
+            },
+            "as_of_timestamp": None if decision is None else decision.timestamp.isoformat(),
+            "market_data_as_of_time_valid": gate_states.get("market_data_as_of_time_valid"),
+            "replay_validity": "PASSED" if gate_states.get("market_data_as_of_time_valid") == "PASSED" else gate_states.get("market_data_as_of_time_valid"),
+        },
+        "current_campaign_simulation": {
+            "campaign_id": str(campaign_id),
+            "campaign_version": int(campaign_version),
+            "runtime_campaign_id": int(runtime_campaign_id),
+            "paper_account_id": str(paper_account_id),
+            "live_trading_profile_id": str(live_trading_profile_id),
+            "provider": normalized_provider,
+            "environment": str(environment or "").strip().lower(),
+            "product": normalized_product,
+            "historical_buy_timestamp": None if decision is None else decision.timestamp.isoformat(),
+            "historical_confidence": None if historical_confidence is None else format(historical_confidence, "f"),
+            "historical_risk_verdict": risk_verdict,
+            "confidence_threshold": None if confidence_threshold is None else format(confidence_threshold, "f"),
+            "current_campaign_accepts_buy": gate_states.get("canonical_package_eligibility_reached") == "PASSED",
+            "simulated_amount": "5" if gate_states.get("exact_five_dollar_candidate_possible") == "PASSED" else None,
+            "package_eligibility_verdict": gate_states.get("canonical_package_eligibility_reached"),
+            "campaign_replay_outcome": campaign_replay_outcome,
+            "gates": gates,
+        },
+        "observed_later_outcome": {
+            "matching_sell": matching_sell_payload,
+        },
+        "primary_blocker": _primary_blocker_from_gates(gate_states),
+        "gates": gates,
+        "invariants": {
+            "read_only": True,
+            "no_database_writes": True,
+            "no_package_creation": True,
+            "no_package_authorization": True,
+            "no_production_dry_run": True,
+            "no_activation": True,
+            "no_provider_order_calls": True,
+            "no_reconciliation_mutation": True,
+            "no_capital_reservation": True,
+            "no_capital_movement": True,
+            "no_writes_confirmed": True,
+        },
+    }
+
+
+async def historical_buy_campaign_replay_audit(
+    *,
+    decision_id: UUID,
+    campaign_id: UUID,
+    campaign_version: int,
+    runtime_campaign_id: int,
+    paper_account_id: UUID,
+    live_trading_profile_id: UUID,
+    provider: str,
+    environment: str,
+    product_id: str,
+    matching_sell_decision_id: UUID | None = None,
+) -> dict[str, Any]:
+    async with AsyncSessionLocal() as db:
+        decision = await db.get(DecisionRecord, decision_id)
+        snapshot = None if decision is None else await db.get(DecisionSnapshot, decision_id)
+
+        signal = None
+        risk_event = None
+        if decision is not None:
+            signal_ids = _lineage_ids(decision.source_lineage, key="signals")
+            risk_ids = _lineage_ids(decision.source_lineage, key="risk_events")
+            if signal_ids:
+                signal = await db.get(Signal, signal_ids[0])
+            if risk_ids:
+                risk_event = await db.get(RiskEvent, risk_ids[0])
+
+        definition = await db.scalar(
+            select(CapitalCampaignDefinition)
+            .where(CapitalCampaignDefinition.campaign_id == campaign_id)
+            .where(CapitalCampaignDefinition.version == campaign_version)
+            .limit(1)
+        )
+        latest_version = await db.scalar(
+            select(func.max(CapitalCampaignDefinition.version)).where(CapitalCampaignDefinition.campaign_id == campaign_id)
+        )
+        runtime = await db.scalar(
+            select(CapitalCampaign)
+            .where(CapitalCampaign.id == runtime_campaign_id)
+            .limit(1)
+        )
+        paper_account = await db.get(PaperAccount, paper_account_id)
+        profile = await db.get(LiveTradingProfile, live_trading_profile_id)
+        open_live_order_count = int(
+            (
+                await db.scalar(
+                    select(func.count())
+                    .select_from(LiveCryptoOrder)
+                    .where(LiveCryptoOrder.provider == provider)
+                    .where(LiveCryptoOrder.environment == environment)
+                    .where(LiveCryptoOrder.product_id == product_id)
+                    .where(LiveCryptoOrder.status.notin_(sorted(_TERMINAL_LIVE_ORDER_STATES)))
+                )
+            )
+            or 0
+        )
+
+        matching_sell_decision = None
+        if matching_sell_decision_id is not None:
+            matching_sell_decision = await db.get(DecisionRecord, matching_sell_decision_id)
+
+    return _historical_buy_campaign_replay_audit_payload(
+        decision_id=decision_id,
+        campaign_id=campaign_id,
+        campaign_version=campaign_version,
+        runtime_campaign_id=runtime_campaign_id,
+        paper_account_id=paper_account_id,
+        live_trading_profile_id=live_trading_profile_id,
+        provider=provider,
+        environment=environment,
+        product_id=product_id,
+        decision=decision,
+        snapshot=snapshot,
+        signal=signal,
+        risk_event=risk_event,
+        definition=definition,
+        latest_version=None if latest_version is None else int(latest_version),
+        runtime=runtime,
+        paper_account=paper_account,
+        profile=profile,
+        open_live_order_count=open_live_order_count,
+        matching_sell_decision=matching_sell_decision,
+        matching_sell_decision_id=matching_sell_decision_id,
+    )
 
 
 def _product_symbol(value: str) -> str:

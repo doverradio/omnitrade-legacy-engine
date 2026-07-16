@@ -567,6 +567,38 @@ def test_parse_campaign_unattended_eligibility_audit_command() -> None:
     assert args.json_output is True
 
 
+def test_parse_historical_buy_campaign_replay_audit_command() -> None:
+    args = parse_args([
+        "historical-buy-campaign-replay-audit",
+        "--decision-id",
+        "939b4ea0-4d25-4970-8eff-0b7596c7557d",
+        "--campaign-id",
+        "e9a9e8e9-9574-498d-b49e-f011218c7f2b",
+        "--campaign-version",
+        "1",
+        "--runtime-campaign-id",
+        "2",
+        "--paper-account-id",
+        "8e76a2fa-ae85-45c6-95d1-798cce8f8cc9",
+        "--live-trading-profile-id",
+        "9da09ae9-475e-41e8-b2c2-717ba5acfa3d",
+        "--provider",
+        "kraken_spot",
+        "--environment",
+        "production",
+        "--product",
+        "BTC-USD",
+        "--matching-sell-decision-id",
+        "cc1f15f2-d2f7-4ac6-bdc5-9fc84f742a28",
+        "--json",
+    ])
+    assert args.command == "historical-buy-campaign-replay-audit"
+    assert str(args.decision_id) == "939b4ea0-4d25-4970-8eff-0b7596c7557d"
+    assert str(args.matching_sell_decision_id) == "cc1f15f2-d2f7-4ac6-bdc5-9fc84f742a28"
+    assert args.runtime_campaign_id == 2
+    assert args.json_output is True
+
+
 def test_parse_canonical_campaign_authority_audit_rejects_malformed_uuid() -> None:
     with pytest.raises(SystemExit):
         parse_args([
@@ -987,6 +1019,49 @@ async def test_run_async_routes_campaign_unattended_eligibility_audit(monkeypatc
     assert code == 0
     assert payload["root_cause_code"] == "ELIGIBLE"
     assert "would_appear_in_unattended_candidate_list_today" in text
+
+
+@pytest.mark.asyncio
+async def test_run_async_routes_historical_buy_campaign_replay_audit(monkeypatch: pytest.MonkeyPatch) -> None:
+    args = parse_args([
+        "historical-buy-campaign-replay-audit",
+        "--decision-id",
+        "939b4ea0-4d25-4970-8eff-0b7596c7557d",
+        "--campaign-id",
+        "e9a9e8e9-9574-498d-b49e-f011218c7f2b",
+        "--campaign-version",
+        "1",
+        "--runtime-campaign-id",
+        "2",
+        "--paper-account-id",
+        "8e76a2fa-ae85-45c6-95d1-798cce8f8cc9",
+        "--live-trading-profile-id",
+        "9da09ae9-475e-41e8-b2c2-717ba5acfa3d",
+        "--provider",
+        "kraken_spot",
+        "--environment",
+        "production",
+        "--product",
+        "BTC-USD",
+        "--matching-sell-decision-id",
+        "cc1f15f2-d2f7-4ac6-bdc5-9fc84f742a28",
+        "--json",
+    ])
+
+    async def _fake_audit(**kwargs):
+        assert str(kwargs["decision_id"]) == "939b4ea0-4d25-4970-8eff-0b7596c7557d"
+        assert str(kwargs["matching_sell_decision_id"]) == "cc1f15f2-d2f7-4ac6-bdc5-9fc84f742a28"
+        return {
+            "primary_blocker": "READY_PACKAGE_ELIGIBLE",
+            "current_campaign_simulation": {"campaign_replay_outcome": "READY_PACKAGE_ELIGIBLE"},
+        }
+
+    monkeypatch.setattr(operator_main, "historical_buy_campaign_replay_audit", _fake_audit)
+    code, payload, text = await operator_main._run_async(args)
+
+    assert code == 0
+    assert payload["primary_blocker"] == "READY_PACKAGE_ELIGIBLE"
+    assert "campaign_replay_outcome" in text
 
 
 def test_parse_rejects_nonexistent_canonical_campaign_binding_status_command() -> None:

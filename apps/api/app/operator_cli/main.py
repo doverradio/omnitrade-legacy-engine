@@ -57,6 +57,7 @@ from app.operator_cli.service import (
     fetch_strategy_scorecards_summary,
     fetch_strategy_roster_summary,
     first_autonomous_profit_status,
+    historical_buy_campaign_replay_audit,
     fetch_risk_ledger_diagnosis,
     fetch_watch_status,
     refresh_provider_balance_evidence,
@@ -751,6 +752,24 @@ def _build_parser() -> argparse.ArgumentParser:
     unattended_eligibility.add_argument("--product", type=str, required=True)
     unattended_eligibility.add_argument("--json", action="store_true", dest="json_output")
 
+    historical_buy_replay = subparsers.add_parser(
+        "historical-buy-campaign-replay-audit",
+        parents=[common],
+        help="Read-only replay of a historical BUY decision through current campaign gates",
+        description="Deterministic as-of-time read-only replay for one historical BUY decision against current campaign constraints.",
+    )
+    historical_buy_replay.add_argument("--decision-id", type=UUID, required=True)
+    historical_buy_replay.add_argument("--campaign-id", type=UUID, required=True)
+    historical_buy_replay.add_argument("--campaign-version", type=int, required=True)
+    historical_buy_replay.add_argument("--runtime-campaign-id", type=int, required=True)
+    historical_buy_replay.add_argument("--paper-account-id", type=UUID, required=True)
+    historical_buy_replay.add_argument("--live-trading-profile-id", type=UUID, required=True)
+    historical_buy_replay.add_argument("--provider", type=str, required=True)
+    historical_buy_replay.add_argument("--environment", type=str, required=True)
+    historical_buy_replay.add_argument("--product", type=str, required=True)
+    historical_buy_replay.add_argument("--matching-sell-decision-id", type=UUID, default=None)
+    historical_buy_replay.add_argument("--json", action="store_true", dest="json_output")
+
     return parser
 
 
@@ -1189,6 +1208,21 @@ async def _run_async(args: argparse.Namespace) -> tuple[int, dict[str, Any], str
             provider=args.provider,
             environment=args.environment,
             product_id=args.product,
+        )
+        return 0, payload, render_json(payload)
+
+    if args.command == "historical-buy-campaign-replay-audit":
+        payload = await historical_buy_campaign_replay_audit(
+            decision_id=args.decision_id,
+            campaign_id=args.campaign_id,
+            campaign_version=args.campaign_version,
+            runtime_campaign_id=args.runtime_campaign_id,
+            paper_account_id=args.paper_account_id,
+            live_trading_profile_id=args.live_trading_profile_id,
+            provider=args.provider,
+            environment=args.environment,
+            product_id=args.product,
+            matching_sell_decision_id=args.matching_sell_decision_id,
         )
         return 0, payload, render_json(payload)
 
