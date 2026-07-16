@@ -878,6 +878,41 @@ async def run_orchestration_cycle(
                 db=db,
                 trigger=_AUTONOMOUS_CYCLE_TRIGGER,
             )
+            payload = orchestration_payload if isinstance(orchestration_payload, dict) else {}
+            cycle_count = int(payload.get("cycle_count") or 0)
+            preview_reason = str(payload.get("reason") or "")
+            considered_campaigns = payload.get("considered_campaigns") if isinstance(payload.get("considered_campaigns"), list) else []
+            eligible_campaigns = payload.get("eligible_campaigns") if isinstance(payload.get("eligible_campaigns"), list) else []
+            skipped_campaigns = payload.get("skipped_campaigns") if isinstance(payload.get("skipped_campaigns"), list) else []
+            logger.info(
+                "campaign_orchestration_preview_result trigger=%s resolved_candle_id=%s resolved_candle_symbol=%s resolved_candle_product=%s resolved_candle_provider=%s resolved_candle_interval=%s resolved_candle_close_time=%s preview_reason=%s cycle_count=%s considered_campaigns=%s eligible_campaigns=%s skipped_campaigns=%s",
+                _AUTONOMOUS_CYCLE_TRIGGER,
+                None if kraken_btc_candle is None else getattr(kraken_btc_candle, "id", None),
+                _AUTONOMOUS_CYCLE_PRODUCT_ID.split("-")[0],
+                _AUTONOMOUS_CYCLE_PRODUCT_ID,
+                _AUTONOMOUS_CYCLE_PROVIDER,
+                _AUTONOMOUS_CYCLE_INTERVAL,
+                None if kraken_btc_candle is None else _as_utc_iso(kraken_btc_candle.close_time),
+                preview_reason,
+                cycle_count,
+                json.dumps(considered_campaigns, sort_keys=True, separators=(",", ":")),
+                json.dumps(eligible_campaigns, sort_keys=True, separators=(",", ":")),
+                json.dumps(skipped_campaigns, sort_keys=True, separators=(",", ":")),
+            )
+            if cycle_count == 0:
+                skip_reason = preview_reason or "no_campaign_candidates"
+                logger.info(
+                    "campaign_orchestration_preview_skipped trigger=%s resolved_candle_id=%s resolved_candle_symbol=%s resolved_candle_product=%s resolved_candle_provider=%s resolved_candle_interval=%s resolved_candle_close_time=%s reason=%s cycle_count=%s",
+                    _AUTONOMOUS_CYCLE_TRIGGER,
+                    None if kraken_btc_candle is None else getattr(kraken_btc_candle, "id", None),
+                    _AUTONOMOUS_CYCLE_PRODUCT_ID.split("-")[0],
+                    _AUTONOMOUS_CYCLE_PRODUCT_ID,
+                    _AUTONOMOUS_CYCLE_PROVIDER,
+                    _AUTONOMOUS_CYCLE_INTERVAL,
+                    None if kraken_btc_candle is None else _as_utc_iso(kraken_btc_candle.close_time),
+                    skip_reason,
+                    cycle_count,
+                )
             await _attempt_automatic_ready_package_creation(
                 db=db,
                 orchestration_payload=orchestration_payload,

@@ -75,6 +75,14 @@ class _ResumeCapableDB(_FakeDB):
         self.pending.clear()
 
 
+class _CampaignPreviewCapableDB(_FakeDB):
+    async def scalar(self, *_args, **_kwargs):
+        return None
+
+    async def execute(self, *_args, **_kwargs):
+        return SimpleNamespace(scalars=lambda: SimpleNamespace(all=lambda: []))
+
+
 class _FixedStrategy:
     def __init__(self, action: str) -> None:
         self._action = action
@@ -210,6 +218,171 @@ def _automatic_cycle(
 
 def _automatic_payload(cycle: SimpleNamespace) -> dict[str, object]:
     return {"cycles": [{"cycle_id": str(cycle.cycle_id)}]}
+
+
+def _not_due_research_result() -> SimpleNamespace:
+    return SimpleNamespace(
+        started=False,
+        reason="not_due",
+        campaign_id=None,
+        candidates_generated=0,
+        candidates_evaluated=0,
+        descendants_generated=0,
+        champion=None,
+    )
+
+
+def _patch_worker_for_campaign_preview_observability(monkeypatch: pytest.MonkeyPatch, worker_module, preview_payload: dict[str, object]) -> None:
+    monkeypatch.setattr(worker_module, "run_ingestion_cycle", _fake_ingestion_cycle)
+    monkeypatch.setattr(worker_module, "run_campaign_orchestration_preview_for_candle", _async_return(preview_payload))
+    monkeypatch.setattr(worker_module, "_attempt_automatic_ready_package_creation", _async_return(None))
+    monkeypatch.setattr(worker_module, "_load_active_assets", _async_return([]))
+    monkeypatch.setattr(worker_module, "_load_active_strategies", _async_return([]))
+    monkeypatch.setattr(worker_module, "run_deterministic_research_cycle_if_due", _async_return(_not_due_research_result()))
+    monkeypatch.setattr(worker_module, "capture_system_intelligence_snapshot_if_due", _async_return(None))
+
+
+@pytest.mark.asyncio
+async def test_campaign_preview_candle_not_found_emits_exact_skip_reason(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    import app.services.orchestration.continuous_pipeline_worker as worker_module
+
+    caplog.set_level(logging.INFO)
+    db = _CampaignPreviewCapableDB()
+    _patch_worker_for_campaign_preview_observability(
+        monkeypatch,
+        worker_module,
+        {
+            "mode": "campaign_orchestration_preview",
+            "trigger": "kraken_btc_15m_candle_close",
+            "ready": False,
+            "reason": "latest_btc_15m_candle_not_found",
+            "cycle_count": 0,
+            "cycles": [],
+        },
+    )
+
+    stats = await run_orchestration_cycle(db=db, client=object(), config=_config())
+
+    assert stats.ingestion_assets_ok == 1
+    assert "campaign_orchestration_preview_result" in caplog.text
+    assert "preview_reason=latest_btc_15m_candle_not_found" in caplog.text
+    assert "campaign_orchestration_preview_skipped" in caplog.text
+    assert "reason=latest_btc_15m_candle_not_found" in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_campaign_preview_no_candidates_emits_exact_skip_reason(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    import app.services.orchestration.continuous_pipeline_worker as worker_module
+
+    caplog.set_level(logging.INFO)
+    db = _CampaignPreviewCapableDB()
+    _patch_worker_for_campaign_preview_observability(
+        monkeypatch,
+        worker_module,
+        {
+            "mode": "campaign_orchestration_preview",
+            "trigger": "kraken_btc_15m_candle_close",
+            "ready": False,
+            "reason": "no_campaign_candidates",
+            "cycle_count": 0,
+            "cycles": [],
+            "considered_campaigns": [
+                {"campaign_id": "e9a9e8e9-9574-498d-b49e-f011218c7f2b", "version": 1},
+            ],
+            "eligible_campaigns": [],
+            "skipped_campaigns": [
+                {
+                    "campaign_id": "e9a9e8e9-9574-498d-b49e-f011218c7f2b",
+                    "version": 1,
+                    "reason": "not_ready",
+                }
+            ],
+        },
+    )
+
+    stats = await run_orchestration_cycle(db=db, client=object(), config=_config())
+
+    assert stats.ingestion_assets_ok == 1
+    assert "campaign_orchestration_preview_result" in caplog.text
+    assert "preview_reason=no_campaign_candidates" in caplog.text
+    assert "campaign_orchestration_preview_skipped" in caplog.text
+    assert "reason=no_campaign_candidates" in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_campaign_preview_success_logs_positive_cycle_count_and_no_mutating_ops(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    import app.services.canonical_preview_package as canonical_package
+    import app.services.live_crypto_orders as live_crypto_orders
+    import app.services.orchestration.continuous_pipeline_worker as worker_module
+
+    called = {
+        "authorize": 0,
+        "activate": 0,
+        "dry_run": 0,
+        "provider_submit": 0,
+    }
+
+    async def _unexpected_authorize(*args, **kwargs):
+        called["authorize"] += 1
+        raise AssertionError("authorize should not be called")
+
+    async def _unexpected_activate(*args, **kwargs):
+        called["activate"] += 1
+        raise AssertionError("activate should not be called")
+
+    async def _unexpected_dry_run(*args, **kwargs):
+        called["dry_run"] += 1
+        raise AssertionError("dry run should not be called")
+
+    async def _unexpected_submit(*args, **kwargs):
+        called["provider_submit"] += 1
+        raise AssertionError("provider submit should not be called")
+
+    caplog.set_level(logging.INFO)
+    db = _CampaignPreviewCapableDB()
+    monkeypatch.setattr(canonical_package, "authorize_canonical_preview_package", _unexpected_authorize)
+    monkeypatch.setattr(canonical_package, "activate_canonical_proving_campaign", _unexpected_activate)
+    monkeypatch.setattr(canonical_package, "run_dry_run_for_canonical_preview_package", _unexpected_dry_run)
+    monkeypatch.setattr(live_crypto_orders.LiveCryptoOrderService, "submit", _unexpected_submit)
+    _patch_worker_for_campaign_preview_observability(
+        monkeypatch,
+        worker_module,
+        {
+            "mode": "campaign_orchestration_preview",
+            "trigger": "kraken_btc_15m_candle_close",
+            "ready": True,
+            "reason": None,
+            "cycle_count": 1,
+            "cycles": [{"cycle_id": str(uuid.uuid4())}],
+            "considered_campaigns": [
+                {"campaign_id": "e9a9e8e9-9574-498d-b49e-f011218c7f2b", "version": 1},
+            ],
+            "eligible_campaigns": [
+                {"campaign_id": "e9a9e8e9-9574-498d-b49e-f011218c7f2b", "version": 1},
+            ],
+            "skipped_campaigns": [],
+        },
+    )
+
+    stats = await run_orchestration_cycle(db=db, client=object(), config=_config())
+
+    assert stats.ingestion_assets_ok == 1
+    assert "campaign_orchestration_preview_result" in caplog.text
+    assert "cycle_count=1" in caplog.text
+    assert "campaign_orchestration_preview_skipped" not in caplog.text
+    assert called["authorize"] == 0
+    assert called["activate"] == 0
+    assert called["dry_run"] == 0
+    assert called["provider_submit"] == 0
 
 
 @pytest.mark.asyncio
