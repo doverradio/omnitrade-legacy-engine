@@ -1144,3 +1144,103 @@ def render_buy_opportunity_diagnostic_text(payload: dict[str, Any], options: Ren
     lines.append(f"READY packages: {summary.get('ready_packages', 0)}")
     lines.append(f"Primary blocker: {summary.get('primary_blocker', 'none')}")
     return "\n".join(lines)
+
+
+def render_hold_decision_diagnostic_text(payload: dict[str, Any], options: RenderOptions) -> str:
+    totals = payload.get("totals") or {}
+    summary = payload.get("summary") or {}
+    campaign = payload.get("canonical_proving_campaign") or {}
+    window = payload.get("window") or {}
+    holds = payload.get("hold_decisions") or []
+
+    lines = _frame_header("HOLD DECISION DIAGNOSTIC", options)
+    lines.extend(
+        _section(
+            "Scope",
+            [
+                ("Window", f"Last {window.get('hours', 24)} hours"),
+                ("Start", _fmt(window.get("start"), default="Unavailable")),
+                ("End", _fmt(window.get("end"), default="Unavailable")),
+                ("Campaign ID", _fmt(campaign.get("campaign_id"), default="Unavailable")),
+                ("Campaign Version", _fmt(campaign.get("campaign_version"), default="Unavailable")),
+            ],
+            options,
+        )
+    )
+
+    lines.extend(
+        _section(
+            "Totals",
+            [
+                ("Strategy evaluations", _fmt(totals.get("strategy_evaluations"), default="0")),
+                ("BUY opportunities", _fmt(totals.get("buy_opportunities"), default="0")),
+                ("SELL opportunities", _fmt(totals.get("sell_opportunities"), default="0")),
+                ("HOLD decisions", _fmt(totals.get("hold_decisions"), default="0")),
+            ],
+            options,
+        )
+    )
+
+    for item in holds:
+        lines.append("HOLD decision")
+        lines.append("-------------" if not options.unicode_enabled else "─────────────")
+        lines.append(f"Decision timestamp: {_fmt(item.get('decision_timestamp'), default='Unavailable')}")
+        lines.append(f"Product: {_fmt(item.get('product'), default='Unavailable')}")
+        lines.append(f"Strategy identity: {_fmt(item.get('strategy_identity'), default='Unavailable')}")
+        lines.append(f"Strategy version: {_fmt(item.get('strategy_version'), default='Unavailable')}")
+        lines.append(f"Candle ID: {_fmt(item.get('candle_id'), default='Unavailable')}")
+        lines.append(f"Candle close time: {_fmt(item.get('candle_close_time'), default='Unavailable')}")
+        lines.append(f"HOLD reason: {_fmt(item.get('hold_reason'), default='Unavailable')}")
+        lines.append("")
+
+        lines.append("BUY conditions")
+        lines.append("--------------" if not options.unicode_enabled else "──────────────")
+        for condition in item.get("buy_conditions") or []:
+            lines.append(f"- {condition.get('condition')}")
+            lines.append(f"  actual value: {_fmt(condition.get('actual_value'), default='Unavailable')}")
+            lines.append(f"  required threshold: {_fmt(condition.get('required_threshold'), default='Unavailable')}")
+            lines.append(f"  pass/fail: {'pass' if condition.get('pass') else 'fail'}")
+        lines.append("")
+
+        lines.append("SELL conditions")
+        lines.append("---------------" if not options.unicode_enabled else "───────────────")
+        for condition in item.get("sell_conditions") or []:
+            lines.append(f"- {condition.get('condition')}")
+            lines.append(f"  actual value: {_fmt(condition.get('actual_value'), default='Unavailable')}")
+            lines.append(f"  required threshold: {_fmt(condition.get('required_threshold'), default='Unavailable')}")
+            lines.append(f"  pass/fail: {'pass' if condition.get('pass') else 'fail'}")
+        lines.append("")
+
+        lines.append(f"First unmet BUY condition: {_fmt(item.get('first_unmet_buy_condition'), default='none')}")
+        distance = item.get("distance_to_buy") if isinstance(item.get("distance_to_buy"), dict) else None
+        if distance is None:
+            lines.append("Distance to BUY: unavailable")
+        else:
+            lines.append(f"Distance to BUY: {_fmt(distance.get('distance'), default='Unavailable')} {_fmt(distance.get('unit'), default='')}")
+
+        missing = item.get("missing_evidence") or []
+        if missing:
+            lines.append("Missing evidence")
+            lines.append("----------------" if not options.unicode_enabled else "────────────────")
+            for evidence in missing:
+                lines.append(f"- {evidence}")
+        lines.append("")
+
+    lines.append("Strategy evaluations:")
+    lines.append(str(summary.get("strategy_evaluations", 0)))
+    lines.append("")
+    lines.append("BUY opportunities:")
+    lines.append(str(summary.get("buy_opportunities", 0)))
+    lines.append("")
+    lines.append("SELL opportunities:")
+    lines.append(str(summary.get("sell_opportunities", 0)))
+    lines.append("")
+    lines.append("HOLD decisions:")
+    lines.append(str(summary.get("hold_decisions", 0)))
+    lines.append("")
+    lines.append("Most common HOLD reason:")
+    lines.append(str(summary.get("most_common_hold_reason", "none")))
+    lines.append("")
+    lines.append("Most common unmet BUY condition:")
+    lines.append(str(summary.get("most_common_unmet_buy_condition", "none")))
+    return "\n".join(lines)

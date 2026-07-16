@@ -902,6 +902,383 @@ async def buy_opportunity_diagnostic() -> dict[str, Any]:
     }
 
 
+def _decimal_or_none(value: Any) -> Decimal | None:
+    if value is None:
+        return None
+    try:
+        return Decimal(str(value))
+    except Exception:
+        return None
+
+
+def _extract_hold_reason(cycle: AutonomousCycleRun) -> str:
+    context = cycle.cycle_context if isinstance(cycle.cycle_context, dict) else {}
+    composition = context.get("authoritative_composition") if isinstance(context.get("authoritative_composition"), dict) else {}
+    selected = composition.get("selected_decision") if isinstance(composition.get("selected_decision"), dict) else {}
+    reason = str(selected.get("reason") or "").strip()
+    if reason:
+        return reason
+    reason = str(cycle.failure_reason or "").strip()
+    if reason:
+        return reason
+    for code in cycle.deterministic_explanation or []:
+        token = str(code or "").strip()
+        if token.startswith("CHECK_FAILED:"):
+            return token.split(":", 1)[1]
+    return "hold_reason_missing"
+
+
+def _extract_product(context: dict[str, Any], selected: dict[str, Any]) -> str | None:
+    supported_trigger = context.get("supported_trigger") if isinstance(context.get("supported_trigger"), dict) else {}
+    trigger_product = str(supported_trigger.get("product_id") or "").strip()
+    if trigger_product:
+        return trigger_product
+    instrument = str(selected.get("instrument") or "").strip()
+    return instrument or None
+
+
+def _extract_candle_fields(context: dict[str, Any], composition: dict[str, Any], instrument: str | None) -> tuple[str | None, str | None]:
+    candle = context.get("candle") if isinstance(context.get("candle"), dict) else {}
+    close_time = str(candle.get("close_time") or "").strip() or None
+
+    authoritative = composition.get("authoritative_evidence") if isinstance(composition.get("authoritative_evidence"), dict) else {}
+    market_map = authoritative.get("market") if isinstance(authoritative.get("market"), dict) else {}
+
+    market_entry: dict[str, Any] | None = None
+    if instrument and isinstance(market_map.get(instrument), dict):
+        market_entry = market_map.get(instrument)
+    elif market_map:
+        first = next(iter(market_map.values()))
+        market_entry = first if isinstance(first, dict) else None
+
+    candle_id = None
+    if market_entry is not None:
+        source_identity = market_entry.get("source_identity") if isinstance(market_entry.get("source_identity"), dict) else {}
+        raw_candle_id = source_identity.get("candle_id") or market_entry.get("latest_closed_candle_id")
+        candle_id = None if raw_candle_id is None else str(raw_candle_id)
+
+    return candle_id, close_time
+
+
+def _extract_candidate(composition: dict[str, Any], instrument: str | None) -> tuple[dict[str, Any] | None, dict[str, Any] | None]:
+    eligible = composition.get("eligible_candidates") if isinstance(composition.get("eligible_candidates"), list) else []
+    rejected = composition.get("rejected_candidates") if isinstance(composition.get("rejected_candidates"), list) else []
+
+    eligible_match = None
+    for item in eligible:
+        if not isinstance(item, dict):
+            continue
+        if instrument is None or str(item.get("instrument") or "").strip() == instrument:
+            eligible_match = item
+            break
+
+    rejected_match = None
+    for item in rejected:
+        if not isinstance(item, dict):
+            continue
+        if instrument is None or str(item.get("instrument") or "").strip() == instrument:
+            rejected_match = item
+            break
+
+    return eligible_match, rejected_match
+
+
+def _condition_row(*, name: str, actual: Any, required: Any, passed: bool) -> dict[str, Any]:
+    return {
+        "condition": name,
+        "actual_value": actual,
+        "required_threshold": required,
+        "pass": bool(passed),
+    }
+
+
+def _distance_to_requirement(*, condition: dict[str, Any]) -> dict[str, Any] | None:
+    if bool(condition.get("pass")):
+        return None
+
+    condition_name = str(condition.get("condition") or "")
+    actual = _decimal_or_none(condition.get("actual_value"))
+    required = condition.get("required_threshold")
+    required_decimal = _decimal_or_none(required)
+
+    if condition_name == "expected_net_dollars_positive_for_buy" and actual is not None:
+        remaining = Decimal("0") - actual
+        if remaining < Decimal("0"):
+            remaining = Decimal("0")
+        return {
+            "condition": condition_name,
+            "distance": format(remaining, "f"),
+            "unit": "USD",
+        }
+
+    if required_decimal is not None and actual is not None:
+        remaining = required_decimal - actual
+        if remaining < Decimal("0"):
+            remaining = Decimal("0")
+        return {
+            "condition": condition_name,
+            "distance": format(remaining, "f"),
+            "unit": "points",
+        }
+
+    return None
+
+
+async def hold_decision_diagnostic() -> dict[str, Any]:
+    now = datetime.now(timezone.utc)
+    window_start = now - timedelta(hours=24)
+
+    async with AsyncSessionLocal() as db:
+        campaign_id, campaign_version, identity_source = await _resolve_canonical_proving_campaign_identity(db=db)
+        if campaign_id is None or campaign_version is None:
+            return {
+                "window": {"hours": 24, "start": window_start.isoformat(), "end": now.isoformat()},
+                "canonical_proving_campaign": None,
+                "hold_decisions": [],
+                "totals": {
+                    "strategy_evaluations": 0,
+                    "buy_opportunities": 0,
+                    "sell_opportunities": 0,
+                    "hold_decisions": 0,
+                },
+                "summary": {
+                    "strategy_evaluations": 0,
+                    "buy_opportunities": 0,
+                    "sell_opportunities": 0,
+                    "hold_decisions": 0,
+                    "most_common_hold_reason": "none",
+                    "most_common_unmet_buy_condition": "none",
+                },
+                "identity_source": identity_source,
+                "invariants": {
+                    "read_only": True,
+                    "no_database_writes": True,
+                    "no_package_creation": True,
+                    "no_order_submission": True,
+                },
+            }
+
+        cycles = list(
+            (
+                await db.execute(
+                    select(AutonomousCycleRun)
+                    .where(AutonomousCycleRun.cycle_kind == "campaign")
+                    .where(AutonomousCycleRun.capital_campaign_id == campaign_id)
+                    .where(AutonomousCycleRun.capital_campaign_version == campaign_version)
+                    .where(AutonomousCycleRun.started_at >= window_start)
+                    .where(AutonomousCycleRun.started_at <= now)
+                    .order_by(desc(AutonomousCycleRun.started_at), desc(AutonomousCycleRun.cycle_id))
+                )
+            ).scalars().all()
+        )
+
+    buy_cycles = [cycle for cycle in cycles if str(cycle.proposed_action or "").upper() == "OPEN_POSITION_PROPOSED"]
+    sell_cycles = [cycle for cycle in cycles if str(cycle.proposed_action or "").upper() == "CLOSE_POSITION_PROPOSED"]
+    hold_cycles = [cycle for cycle in cycles if cycle not in buy_cycles and cycle not in sell_cycles]
+
+    hold_reason_counter: Counter[str] = Counter()
+    unmet_buy_counter: Counter[str] = Counter()
+    hold_rows: list[dict[str, Any]] = []
+
+    for cycle in hold_cycles:
+        context = cycle.cycle_context if isinstance(cycle.cycle_context, dict) else {}
+        composition = context.get("authoritative_composition") if isinstance(context.get("authoritative_composition"), dict) else {}
+        selected = composition.get("selected_decision") if isinstance(composition.get("selected_decision"), dict) else {}
+
+        product = _extract_product(context=context, selected=selected)
+        strategy_identity = str(selected.get("strategy_identity") or "").strip() or None
+        strategy_version = str(selected.get("strategy_version") or "").strip() or None
+        hold_reason = _extract_hold_reason(cycle)
+        hold_reason_counter[hold_reason] += 1
+
+        instrument = str(selected.get("instrument") or product or "").strip() or None
+        candle_id, candle_close_time = _extract_candle_fields(context=context, composition=composition, instrument=instrument)
+        eligible_candidate, rejected_candidate = _extract_candidate(composition=composition, instrument=instrument)
+
+        buy_conditions: list[dict[str, Any]] = []
+        sell_conditions: list[dict[str, Any]] = []
+        missing_evidence: list[str] = []
+
+        decision_kind = str(selected.get("decision_kind") or "").strip() or None
+        buy_conditions.append(
+            _condition_row(
+                name="decision_kind_open_position",
+                actual=decision_kind,
+                required="OPEN_POSITION_PROPOSED",
+                passed=decision_kind == "OPEN_POSITION_PROPOSED",
+            )
+        )
+
+        buy_expected_net = None
+        if isinstance(eligible_candidate, dict):
+            buy_expected_net = eligible_candidate.get("expected_net_dollars")
+        if buy_expected_net is None and isinstance(rejected_candidate, dict):
+            buy_expected_net = rejected_candidate.get("expected_net_dollars")
+        if buy_expected_net is None and hold_reason == "non_positive_net_edge":
+            missing_evidence.append("buy_condition.expected_net_dollars")
+        buy_expected_net_dec = _decimal_or_none(buy_expected_net)
+        buy_conditions.append(
+            _condition_row(
+                name="expected_net_dollars_positive_for_buy",
+                actual=None if buy_expected_net_dec is None else format(buy_expected_net_dec, "f"),
+                required="> 0",
+                passed=buy_expected_net_dec is not None and buy_expected_net_dec > Decimal("0"),
+            )
+        )
+
+        risk_verdict = str(selected.get("risk_verdict") or "").strip() or None
+        if risk_verdict is None and isinstance(rejected_candidate, dict):
+            risk_blob = rejected_candidate.get("risk") if isinstance(rejected_candidate.get("risk"), dict) else {}
+            risk_verdict = str(risk_blob.get("verdict") or "").strip() or None
+        if risk_verdict is None:
+            missing_evidence.append("buy_condition.risk_verdict")
+        buy_conditions.append(
+            _condition_row(
+                name="risk_verdict_allows_buy",
+                actual=risk_verdict,
+                required="ALLOW (not VETO)",
+                passed=risk_verdict is not None and risk_verdict != "VETO",
+            )
+        )
+
+        market_freshness = None
+        authoritative = composition.get("authoritative_evidence") if isinstance(composition.get("authoritative_evidence"), dict) else {}
+        market_map = authoritative.get("market") if isinstance(authoritative.get("market"), dict) else {}
+        market_entry = market_map.get(instrument) if instrument is not None and isinstance(market_map.get(instrument), dict) else None
+        if market_entry is None and market_map:
+            candidate_entry = next(iter(market_map.values()))
+            market_entry = candidate_entry if isinstance(candidate_entry, dict) else None
+        if market_entry is not None:
+            market_freshness = str(market_entry.get("freshness") or "").strip() or None
+        if market_freshness is None:
+            missing_evidence.append("buy_condition.market_freshness")
+        buy_conditions.append(
+            _condition_row(
+                name="market_evidence_fresh_for_buy",
+                actual=market_freshness,
+                required="fresh",
+                passed=market_freshness == "fresh",
+            )
+        )
+
+        sell_conditions.append(
+            _condition_row(
+                name="decision_kind_close_position",
+                actual=decision_kind,
+                required="CLOSE_POSITION_PROPOSED",
+                passed=decision_kind == "CLOSE_POSITION_PROPOSED",
+            )
+        )
+
+        open_position_actual = None
+        position_map = authoritative.get("position") if isinstance(authoritative.get("position"), dict) else {}
+        position_entry = position_map.get(instrument) if instrument is not None and isinstance(position_map.get(instrument), dict) else None
+        if position_entry is None and position_map:
+            candidate_position = next(iter(position_map.values()))
+            position_entry = candidate_position if isinstance(candidate_position, dict) else None
+        if isinstance(position_entry, dict):
+            position_blob = position_entry.get("position") if isinstance(position_entry.get("position"), dict) else {}
+            open_position_actual = position_blob.get("quantity")
+        if open_position_actual is None:
+            missing_evidence.append("sell_condition.open_position_quantity")
+        open_position_qty = _decimal_or_none(open_position_actual)
+        sell_conditions.append(
+            _condition_row(
+                name="open_position_exists_for_sell",
+                actual=None if open_position_qty is None else format(open_position_qty, "f"),
+                required="> 0",
+                passed=open_position_qty is not None and open_position_qty > Decimal("0"),
+            )
+        )
+
+        sell_expected_net = None
+        if isinstance(eligible_candidate, dict):
+            sell_expected_net = eligible_candidate.get("expected_net_dollars")
+        if sell_expected_net is None and isinstance(rejected_candidate, dict):
+            sell_expected_net = rejected_candidate.get("expected_net_dollars")
+        if sell_expected_net is None:
+            missing_evidence.append("sell_condition.expected_net_dollars")
+        sell_expected_net_dec = _decimal_or_none(sell_expected_net)
+        sell_conditions.append(
+            _condition_row(
+                name="expected_net_dollars_positive_for_sell",
+                actual=None if sell_expected_net_dec is None else format(sell_expected_net_dec, "f"),
+                required="> 0",
+                passed=sell_expected_net_dec is not None and sell_expected_net_dec > Decimal("0"),
+            )
+        )
+
+        if strategy_identity is None:
+            missing_evidence.append("strategy_identity")
+        if strategy_version is None:
+            missing_evidence.append("strategy_version")
+        if candle_id is None:
+            missing_evidence.append("candle_id")
+        if candle_close_time is None:
+            missing_evidence.append("candle_close_time")
+
+        # Strategy-level BUY/SELL rule traces (e.g., MA crossover thresholds) are not persisted in campaign cycle records.
+        missing_evidence.append("strategy_buy_rule_trace")
+        missing_evidence.append("strategy_sell_rule_trace")
+
+        first_unmet_buy_condition = next((item for item in buy_conditions if not bool(item.get("pass"))), None)
+        first_unmet_name = None if first_unmet_buy_condition is None else str(first_unmet_buy_condition.get("condition"))
+        if first_unmet_name:
+            unmet_buy_counter[first_unmet_name] += 1
+
+        distance_to_buy = None if first_unmet_buy_condition is None else _distance_to_requirement(condition=first_unmet_buy_condition)
+
+        hold_rows.append(
+            {
+                "decision_timestamp": cycle.started_at.isoformat(),
+                "product": product,
+                "strategy_identity": strategy_identity,
+                "strategy_version": strategy_version,
+                "candle_id": candle_id,
+                "candle_close_time": candle_close_time,
+                "hold_reason": hold_reason,
+                "buy_conditions": buy_conditions,
+                "sell_conditions": sell_conditions,
+                "first_unmet_buy_condition": first_unmet_name,
+                "distance_to_buy": distance_to_buy,
+                "missing_evidence": sorted(set(missing_evidence)),
+            }
+        )
+
+    most_common_hold_reason = hold_reason_counter.most_common(1)[0][0] if hold_reason_counter else "none"
+    most_common_unmet_buy = unmet_buy_counter.most_common(1)[0][0] if unmet_buy_counter else "none"
+
+    return {
+        "window": {"hours": 24, "start": window_start.isoformat(), "end": now.isoformat()},
+        "canonical_proving_campaign": {
+            "campaign_id": str(campaign_id),
+            "campaign_version": int(campaign_version),
+        },
+        "identity_source": identity_source,
+        "totals": {
+            "strategy_evaluations": len(cycles),
+            "buy_opportunities": len(buy_cycles),
+            "sell_opportunities": len(sell_cycles),
+            "hold_decisions": len(hold_cycles),
+        },
+        "hold_decisions": hold_rows,
+        "summary": {
+            "strategy_evaluations": len(cycles),
+            "buy_opportunities": len(buy_cycles),
+            "sell_opportunities": len(sell_cycles),
+            "hold_decisions": len(hold_cycles),
+            "most_common_hold_reason": most_common_hold_reason,
+            "most_common_unmet_buy_condition": most_common_unmet_buy,
+        },
+        "invariants": {
+            "read_only": True,
+            "no_database_writes": True,
+            "no_package_creation": True,
+            "no_order_submission": True,
+        },
+    }
+
+
 def _product_symbol(value: str) -> str:
     normalized = normalize_product_id(value)
     return normalized.split("-", 1)[0] if "-" in normalized else normalized

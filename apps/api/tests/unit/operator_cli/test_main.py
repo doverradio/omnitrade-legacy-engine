@@ -608,6 +608,15 @@ def test_parse_buy_opportunity_diagnostic_command() -> None:
     assert args.json_output is True
 
 
+def test_parse_hold_decision_diagnostic_command() -> None:
+    args = parse_args([
+        "hold-decision-diagnostic",
+        "--json",
+    ])
+    assert args.command == "hold-decision-diagnostic"
+    assert args.json_output is True
+
+
 def test_parse_canonical_campaign_authority_audit_rejects_malformed_uuid() -> None:
     with pytest.raises(SystemExit):
         parse_args([
@@ -1102,6 +1111,39 @@ async def test_run_async_routes_buy_opportunity_diagnostic(monkeypatch: pytest.M
     assert code == 0
     assert payload["summary"]["primary_blocker"] == "Risk"
     assert "buy_opportunities" in text
+
+
+@pytest.mark.asyncio
+async def test_run_async_routes_hold_decision_diagnostic(monkeypatch: pytest.MonkeyPatch) -> None:
+    args = parse_args([
+        "hold-decision-diagnostic",
+        "--json",
+    ])
+
+    async def _fake_diagnostic():
+        return {
+            "totals": {
+                "strategy_evaluations": 7,
+                "buy_opportunities": 2,
+                "sell_opportunities": 1,
+                "hold_decisions": 4,
+            },
+            "summary": {
+                "strategy_evaluations": 7,
+                "buy_opportunities": 2,
+                "sell_opportunities": 1,
+                "hold_decisions": 4,
+                "most_common_hold_reason": "non_positive_net_edge",
+                "most_common_unmet_buy_condition": "expected_net_dollars_positive_for_buy",
+            },
+        }
+
+    monkeypatch.setattr(operator_main, "hold_decision_diagnostic", _fake_diagnostic)
+    code, payload, text = await operator_main._run_async(args)
+
+    assert code == 0
+    assert payload["summary"]["most_common_hold_reason"] == "non_positive_net_edge"
+    assert "hold_decisions" in text
 
 
 def test_parse_rejects_nonexistent_canonical_campaign_binding_status_command() -> None:

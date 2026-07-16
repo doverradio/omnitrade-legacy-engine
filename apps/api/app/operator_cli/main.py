@@ -10,6 +10,7 @@ from uuid import UUID, uuid4
 
 from app.operator_cli.formatting import (
     render_buy_opportunity_diagnostic_text,
+    render_hold_decision_diagnostic_text,
     render_candles_text,
     render_execution_forensics_text,
     render_json,
@@ -24,6 +25,7 @@ from app.operator_cli.formatting import (
 )
 from app.operator_cli.service import (
         buy_opportunity_diagnostic,
+    hold_decision_diagnostic,
     activate_canonical_proving_campaign_bundle,
     bind_canonical_campaign_runtime,
     authorize_canonical_preview_package_bundle,
@@ -780,6 +782,14 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     buy_opportunity.add_argument("--json", action="store_true", dest="json_output")
 
+    hold_diagnostic = subparsers.add_parser(
+        "hold-decision-diagnostic",
+        parents=[common],
+        help="Read-only 24h diagnostic for canonical proving HOLD decisions",
+        description="Analyzes last 24h canonical proving campaign HOLD decisions with persisted condition evidence and missing evidence reporting.",
+    )
+    hold_diagnostic.add_argument("--json", action="store_true", dest="json_output")
+
     return parser
 
 
@@ -1239,6 +1249,11 @@ async def _run_async(args: argparse.Namespace) -> tuple[int, dict[str, Any], str
     if args.command == "buy-opportunity-diagnostic":
         payload = await buy_opportunity_diagnostic()
         text = render_json(payload) if args.json_output else render_buy_opportunity_diagnostic_text(payload, options)
+        return 0, payload, text
+
+    if args.command == "hold-decision-diagnostic":
+        payload = await hold_decision_diagnostic()
+        text = render_json(payload) if args.json_output else render_hold_decision_diagnostic_text(payload, options)
         return 0, payload, text
 
     if args.command == "legacy-campaign-transition-readiness":
