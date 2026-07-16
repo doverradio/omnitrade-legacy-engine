@@ -63,6 +63,10 @@ from app.services.canonical_preview_package import (
     revoke_canonical_proving_activation,
     run_dry_run_for_canonical_preview_package,
 )
+from app.services.canonical_paper_cash_causality_audit import (
+    CanonicalPaperCashCausalityAuditRequest,
+    run_canonical_paper_cash_causality_audit,
+)
 from app.services.canonical_campaign_authority_audit import (
     CanonicalCampaignAuthorityAuditRequest,
     run_canonical_campaign_authority_audit,
@@ -2063,6 +2067,33 @@ async def fetch_canonical_campaign_binding_status(*, campaign_id: UUID, campaign
 async def fetch_canonical_campaign_binding_audit(*, campaign_id: UUID, limit: int = 20) -> dict[str, Any]:
     async with AsyncSessionLocal() as db:
         return await _fetch_canonical_campaign_binding_audit(db=db, campaign_id=campaign_id, limit=limit)
+
+
+async def canonical_paper_cash_causality_audit(
+    *,
+    campaign_id: UUID,
+    campaign_version: int,
+    runtime_campaign_id: int,
+    paper_account_id: UUID,
+    live_trading_profile_id: UUID,
+    provider: str,
+    environment: str,
+    product_id: str,
+) -> dict[str, Any]:
+    async with AsyncSessionLocal() as db:
+        return await run_canonical_paper_cash_causality_audit(
+            db=db,
+            request=CanonicalPaperCashCausalityAuditRequest(
+                campaign_id=campaign_id,
+                campaign_version=campaign_version,
+                runtime_campaign_id=runtime_campaign_id,
+                paper_account_id=paper_account_id,
+                live_trading_profile_id=live_trading_profile_id,
+                provider=provider,
+                environment=environment,
+                product=product_id,
+            ),
+        )
 
 
 async def canonical_campaign_authority_audit(

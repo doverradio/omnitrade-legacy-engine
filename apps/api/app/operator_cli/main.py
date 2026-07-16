@@ -26,6 +26,7 @@ from app.operator_cli.service import (
     bind_canonical_campaign_runtime,
     authorize_canonical_preview_package_bundle,
     canonical_campaign_authority_audit,
+    canonical_paper_cash_causality_audit,
     canonical_preview_package_history,
     canonical_preview_package_readiness,
     canonical_proving_activation_status,
@@ -90,6 +91,7 @@ def _build_parser() -> argparse.ArgumentParser:
             "  ./operator canonical-campaign-readiness --campaign-id <campaign_uuid> --campaign-version 1 --paper-account-id <paper_uuid> --live-trading-profile-id <profile_uuid> --provider kraken_spot --environment production --product BTC-USD --json\n"
             "  ./operator canonical-campaign-bind --campaign-id <campaign_uuid> --campaign-version 1 --paper-account-id <paper_uuid> --live-trading-profile-id <profile_uuid> --provider kraken_spot --environment production --product BTC-USD --actor operator:human --confirm --json\n"
             "  ./operator canonical-campaign-authority-audit --campaign-id <campaign_uuid> --campaign-version 1 --cycle-id <cycle_uuid> --paper-account-id <paper_uuid> --live-trading-profile-id <profile_uuid> --provider kraken_spot --environment production --product BTC-USD --json\n"
+            "  ./operator canonical-paper-cash-causality-audit --campaign-id <campaign_uuid> --campaign-version 1 --runtime-campaign-id <runtime_id> --paper-account-id <paper_uuid> --live-trading-profile-id <profile_uuid> --provider kraken_spot --environment production --product BTC-USD --json\n"
             "  ./operator legacy-campaign-transition-readiness --legacy-campaign-id <legacy_uuid> --canonical-campaign-id <canonical_uuid> --canonical-campaign-version 1 --paper-account-id <paper_uuid> --live-trading-profile-id <profile_uuid> --provider kraken_spot --environment production --product BTC-USD --json\n"
             "  ./operator legacy-campaign-transition-execute --legacy-campaign-id <legacy_uuid> --canonical-campaign-id <canonical_uuid> --canonical-campaign-version 1 --paper-account-id <paper_uuid> --live-trading-profile-id <profile_uuid> --provider kraken_spot --environment production --product BTC-USD --actor operator:human --confirm --json\n"
             "  ./operator legacy-campaign-transition-audit --legacy-campaign-id <legacy_uuid> --json\n"
@@ -320,6 +322,22 @@ def _build_parser() -> argparse.ArgumentParser:
     canonical_authority.add_argument("--environment", type=str, required=True)
     canonical_authority.add_argument("--product", type=str, required=True)
     canonical_authority.add_argument("--json", action="store_true", dest="json_output")
+
+    paper_cash_causality = subparsers.add_parser(
+        "canonical-paper-cash-causality-audit",
+        parents=[common],
+        help="Read-only causality reconstruction for canonical paper-account cash",
+        description="Read-only canonical paper-account cash causality audit with exact identities.",
+    )
+    paper_cash_causality.add_argument("--campaign-id", type=UUID, required=True)
+    paper_cash_causality.add_argument("--campaign-version", type=int, required=True)
+    paper_cash_causality.add_argument("--runtime-campaign-id", type=int, required=True)
+    paper_cash_causality.add_argument("--paper-account-id", type=UUID, required=True)
+    paper_cash_causality.add_argument("--live-trading-profile-id", type=UUID, required=True)
+    paper_cash_causality.add_argument("--provider", type=str, required=True)
+    paper_cash_causality.add_argument("--environment", type=str, required=True)
+    paper_cash_causality.add_argument("--product", type=str, required=True)
+    paper_cash_causality.add_argument("--json", action="store_true", dest="json_output")
 
     legacy_transition_readiness = subparsers.add_parser(
         "legacy-campaign-transition-readiness",
@@ -847,6 +865,19 @@ async def _run_async(args: argparse.Namespace) -> tuple[int, dict[str, Any], str
             campaign_id=args.campaign_id,
             campaign_version=args.campaign_version,
             cycle_id=args.cycle_id,
+            paper_account_id=args.paper_account_id,
+            live_trading_profile_id=args.live_trading_profile_id,
+            provider=args.provider,
+            environment=args.environment,
+            product_id=args.product,
+        )
+        return 0, payload, render_json(payload)
+
+    if args.command == "canonical-paper-cash-causality-audit":
+        payload = await canonical_paper_cash_causality_audit(
+            campaign_id=args.campaign_id,
+            campaign_version=args.campaign_version,
+            runtime_campaign_id=args.runtime_campaign_id,
             paper_account_id=args.paper_account_id,
             live_trading_profile_id=args.live_trading_profile_id,
             provider=args.provider,

@@ -245,10 +245,14 @@ async def test_canonical_read_only_bundle_wrappers_do_not_commit(monkeypatch: py
     async def _fake_authority_audit(**_kwargs):
         return {"command": "canonical-campaign-authority-audit", "ok": True}
 
+    async def _fake_cash_causality_audit(**_kwargs):
+        return {"command": "canonical-paper-cash-causality-audit", "ok": True}
+
     monkeypatch.setattr(service, "get_canonical_preview_package", _fake_show)
     monkeypatch.setattr(service, "list_canonical_preview_package_history", _fake_history)
     monkeypatch.setattr(service, "get_canonical_proving_activation_status", _fake_activation_status)
     monkeypatch.setattr(service, "run_canonical_campaign_authority_audit", _fake_authority_audit)
+    monkeypatch.setattr(service, "run_canonical_paper_cash_causality_audit", _fake_cash_causality_audit)
 
     show_payload = await service.show_canonical_preview_package_bundle(package_id=uuid4())
     readiness_payload = await service.canonical_preview_package_readiness(package_id=uuid4())
@@ -264,11 +268,48 @@ async def test_canonical_read_only_bundle_wrappers_do_not_commit(monkeypatch: py
         environment="production",
         product_id="BTC-USD",
     )
+    cash_payload = await service.canonical_paper_cash_causality_audit(
+        campaign_id=uuid4(),
+        campaign_version=1,
+        runtime_campaign_id=2,
+        paper_account_id=uuid4(),
+        live_trading_profile_id=uuid4(),
+        provider="kraken_spot",
+        environment="production",
+        product_id="BTC-USD",
+    )
 
     assert show_payload["readiness"]["ready"] is True
     assert readiness_payload["readiness"]["ready"] is True
     assert history_payload["count"] == 0
     assert status_payload["activated"] is False
     assert authority_payload["ok"] is True
+    assert cash_payload["ok"] is True
     assert db.commits == 0
     assert db.rollbacks == 0
+
+
+@pytest.mark.asyncio
+async def test_canonical_paper_cash_causality_wrapper_failure_does_not_commit(monkeypatch: pytest.MonkeyPatch) -> None:
+    db = _FakeDb()
+    monkeypatch.setattr(service, "AsyncSessionLocal", lambda: _SessionContext(db))
+
+    async def _boom(**_kwargs):
+        raise RuntimeError("audit failed")
+
+    monkeypatch.setattr(service, "run_canonical_paper_cash_causality_audit", _boom)
+
+    with pytest.raises(RuntimeError, match="audit failed"):
+        await service.canonical_paper_cash_causality_audit(
+            campaign_id=uuid4(),
+            campaign_version=1,
+            runtime_campaign_id=2,
+            paper_account_id=uuid4(),
+            live_trading_profile_id=uuid4(),
+            provider="kraken_spot",
+            environment="production",
+            product_id="BTC-USD",
+        )
+
+    assert db.commits == 0
+    assert db.rollbacks == 1

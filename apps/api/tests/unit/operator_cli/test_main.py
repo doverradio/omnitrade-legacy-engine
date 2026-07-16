@@ -275,6 +275,55 @@ def test_parse_canonical_campaign_authority_audit_command() -> None:
     assert args.json_output is True
 
 
+def test_parse_canonical_paper_cash_causality_audit_command() -> None:
+    args = parse_args([
+        "canonical-paper-cash-causality-audit",
+        "--campaign-id",
+        "e9a9e8e9-9574-498d-b49e-f011218c7f2b",
+        "--campaign-version",
+        "1",
+        "--runtime-campaign-id",
+        "2",
+        "--paper-account-id",
+        "905a408c-7d8e-4fc7-ad3b-9ff637005d73",
+        "--live-trading-profile-id",
+        "9da09ae9-475e-41e8-b2c2-717ba5acfa3d",
+        "--provider",
+        "kraken_spot",
+        "--environment",
+        "production",
+        "--product",
+        "BTC-USD",
+        "--json",
+    ])
+    assert args.command == "canonical-paper-cash-causality-audit"
+    assert args.runtime_campaign_id == 2
+    assert args.json_output is True
+
+
+def test_parse_canonical_paper_cash_causality_audit_rejects_malformed_uuid() -> None:
+    with pytest.raises(SystemExit):
+        parse_args([
+            "canonical-paper-cash-causality-audit",
+            "--campaign-id",
+            "not-a-uuid",
+            "--campaign-version",
+            "1",
+            "--runtime-campaign-id",
+            "2",
+            "--paper-account-id",
+            "905a408c-7d8e-4fc7-ad3b-9ff637005d73",
+            "--live-trading-profile-id",
+            "9da09ae9-475e-41e8-b2c2-717ba5acfa3d",
+            "--provider",
+            "kraken_spot",
+            "--environment",
+            "production",
+            "--product",
+            "BTC-USD",
+        ])
+
+
 def test_parse_canonical_campaign_authority_audit_rejects_malformed_uuid() -> None:
     with pytest.raises(SystemExit):
         parse_args([
@@ -331,6 +380,41 @@ async def test_run_async_routes_canonical_campaign_authority_audit(monkeypatch: 
     assert code == 0
     assert payload["ok"] is True
     assert "canonical-campaign-authority-audit" in text
+
+
+@pytest.mark.asyncio
+async def test_run_async_routes_canonical_paper_cash_causality_audit(monkeypatch: pytest.MonkeyPatch) -> None:
+    args = parse_args([
+        "canonical-paper-cash-causality-audit",
+        "--campaign-id",
+        "e9a9e8e9-9574-498d-b49e-f011218c7f2b",
+        "--campaign-version",
+        "1",
+        "--runtime-campaign-id",
+        "2",
+        "--paper-account-id",
+        "905a408c-7d8e-4fc7-ad3b-9ff637005d73",
+        "--live-trading-profile-id",
+        "9da09ae9-475e-41e8-b2c2-717ba5acfa3d",
+        "--provider",
+        "kraken_spot",
+        "--environment",
+        "production",
+        "--product",
+        "BTC-USD",
+        "--json",
+    ])
+
+    async def _fake_audit(**kwargs):
+        assert kwargs["runtime_campaign_id"] == 2
+        return {"ok": True, "command": "canonical-paper-cash-causality-audit"}
+
+    monkeypatch.setattr(operator_main, "canonical_paper_cash_causality_audit", _fake_audit)
+    code, payload, text = await operator_main._run_async(args)
+
+    assert code == 0
+    assert payload["ok"] is True
+    assert "canonical-paper-cash-causality-audit" in text
 
 
 def test_parse_rejects_nonexistent_canonical_campaign_binding_status_command() -> None:
