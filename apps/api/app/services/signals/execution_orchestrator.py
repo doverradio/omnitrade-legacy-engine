@@ -5,6 +5,7 @@ import uuid
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from decimal import Decimal
+from typing import Any
 
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -17,6 +18,7 @@ from app.models.candle import Candle
 from app.models.paper_account import PaperAccount
 from app.models.risk_event import RiskEvent
 from app.models.trade import Trade
+from app.models.live_trading_profile import LiveTradingProfile
 from app.services.data.http_client import AsyncHTTPClient
 from app.services.paper.alpaca_paper import submit_alpaca_paper_order
 from app.services.paper.internal_sim import execute_internal_crypto_fill
@@ -72,6 +74,44 @@ _EXPECTED_EXECUTION_REJECTION_MESSAGES: dict[str, tuple[str, str]] = {
         "Insufficient paper cash balance",
     ),
 }
+
+
+async def _new_entries_blocked_for_legacy_proving_account(
+    *,
+    db: AsyncSession,
+    paper_account_id: uuid.UUID,
+) -> bool:
+    rows = list(
+        (
+            await db.execute(
+                select(LiveTradingProfile.paper_account_id, LiveTradingProfile.provenance_metadata)
+                .where(LiveTradingProfile.paper_account_id != paper_account_id)
+                .order_by(LiveTradingProfile.updated_at.desc())
+                .limit(500)
+            )
+        ).all()
+    )
+    target_account_id = str(paper_account_id)
+    for successor_account_id, provenance_metadata in rows:
+        if not isinstance(provenance_metadata, dict):
+            continue
+        transition = provenance_metadata.get("dedicated_proving_transition")
+        if not isinstance(transition, dict):
+            continue
+
+        old_account_id = str(transition.get("old_paper_account_id") or "")
+        if old_account_id != target_account_id:
+            continue
+
+        expected_new_account_id = str(transition.get("new_paper_account_id") or "")
+        observed_successor_account_id = str(successor_account_id)
+        if expected_new_account_id and expected_new_account_id == observed_successor_account_id and expected_new_account_id != old_account_id:
+            return True
+
+        # Evidence exists for this old account but is malformed/inconsistent; fail closed for new BUY entries.
+        if expected_new_account_id != observed_successor_account_id or expected_new_account_id == old_account_id:
+            return True
+    return False
 
 
 def _map_common_execution_status(*, venue: str, venue_status: str | None, filled_qty: Decimal | None) -> str:
@@ -286,6 +326,41 @@ async def orchestrate_paper_signal_execution(
         )
 
     approved_quantity = risk_result.approved_quantity
+
+    if request.side == "buy" and await _new_entries_blocked_for_legacy_proving_account(
+        db=db,
+        paper_account_id=request.paper_account_id,
+    ):
+        await _record_execution_rejection(
+            db=db,
+            request=request,
+            asset=asset,
+            reason_code="OLD_PROVING_ACCOUNT_NEW_ENTRIES_BLOCKED",
+            reason_text="New entries are blocked on superseded proving account; exits remain allowed",
+            details={
+                "paper_account_id": str(request.paper_account_id),
+                "policy": "legacy_proving_account_new_entries_blocked",
+            },
+        )
+        return SignalExecutionResult(
+            signal_id=request.signal_id,
+            paper_account_id=request.paper_account_id,
+            asset_id=request.asset_id,
+            execution_status="rejected",
+            outcome="REJECTED",
+            execution_venue="risk_engine",
+            is_paper=True,
+            trade_id=None,
+            broker_order_id=None,
+            venue_status="rejected",
+            message="New entries are blocked on superseded proving account; exits remain allowed",
+            reason_code="OLD_PROVING_ACCOUNT_NEW_ENTRIES_BLOCKED",
+            reason_text="New entries are blocked on superseded proving account; exits remain allowed",
+            reason_details={
+                "paper_account_id": str(request.paper_account_id),
+                "policy": "legacy_proving_account_new_entries_blocked",
+            },
+        )
 
     if asset.asset_class == "crypto":
         if account.asset_class != "crypto":

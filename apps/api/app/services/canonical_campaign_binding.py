@@ -32,6 +32,7 @@ _TERMINAL_PACKAGE_STATES = {"COMPLETED", "FAILED_CLOSED", "EXPIRED", "INVALIDATE
 _TERMINAL_ACTIVATION_STATES = {"REVOKED", "EXPIRED", "INVALIDATED", "COMPLETED"}
 _TERMINAL_LIVE_ORDER_STATES = {"DRY_RUN_READY", "DRY_RUN_BLOCKED", "FILLED", "CANCELLED", "FAILED", "REJECTED", "EXPIRED", "COMPLETED"}
 _PROVING_CAP_USD = Decimal("5")
+_PROVING_MIN_STARTING_BALANCE_USD = Decimal("0")
 _PROVING_READINESS_VERDICT_ALLOWLIST = frozenset({"READY_FOR_OPERATOR_REVIEW"})
 _ACCEPTED_CONNECTION_STATUSES = frozenset({"connected"})
 _ACCEPTED_ACCOUNT_STATUSES = frozenset({"active", "enabled", "ok", "normal"})
@@ -517,7 +518,13 @@ async def _inspect_canonical_proving_account_transition_locked(
     checks.append(_check(usd_available is not None, "usd_available_present", f"usd_available={usd_available}"))
     checks.append(_check(current_cash_balance <= (usd_available or Decimal("0")), "initial_cash_not_exceed_provider_available", f"initial_cash={current_cash_balance} provider_usd_available={usd_available}"))
     checks.append(_check(starting_balance == current_cash_balance, "starting_cash_equals_liquid_unreserved_usd", f"starting_balance={starting_balance} current_cash_balance={current_cash_balance}"))
-    checks.append(_check(starting_balance >= Decimal("25"), "paper_account_schema_starting_balance_minimum", f"starting_balance={starting_balance}"))
+    checks.append(
+        _check(
+            starting_balance >= _PROVING_MIN_STARTING_BALANCE_USD,
+            "paper_account_schema_starting_balance_non_negative",
+            f"starting_balance={starting_balance}",
+        )
+    )
     checks.append(_check(len(unpriced_holdings) == 0, "no_unpriced_holdings", f"unpriced_holdings={unpriced_holdings}"))
     if equity_delta is None:
         checks.append(_check(False, "provider_equity_present", "total_provider_equity missing"))
@@ -797,7 +804,7 @@ async def _transition_canonical_proving_account_without_begin(
 
     evidence = readiness.snapshot.get("provider_balance_evidence") if isinstance(readiness.snapshot, dict) else {}
     proposed = readiness.snapshot.get("proposed_new_account") if isinstance(readiness.snapshot, dict) else {}
-    starting_balance = Decimal(str((proposed or {}).get("starting_balance") or "25"))
+    starting_balance = Decimal(str((proposed or {}).get("starting_balance") or "0"))
     current_cash_balance = Decimal(str((proposed or {}).get("current_cash_balance") or "0"))
     evidence_source_id = str((evidence or {}).get("evidence_source_id") or "")
     evidence_observed_at = str((evidence or {}).get("evidence_observed_at") or "")

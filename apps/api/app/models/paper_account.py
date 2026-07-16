@@ -15,7 +15,7 @@ class PaperAccount(Base):
     __tablename__ = "paper_accounts"
     __table_args__ = (
         CheckConstraint("asset_class IN ('crypto', 'stock')", name="ck_paper_accounts_asset_class"),
-        CheckConstraint("starting_balance >= 25", name="ck_paper_accounts_starting_balance_min"),
+        CheckConstraint("starting_balance >= 0", name="ck_paper_accounts_starting_balance_min"),
     )
 
     id: Mapped[uuid.UUID] = mapped_column(

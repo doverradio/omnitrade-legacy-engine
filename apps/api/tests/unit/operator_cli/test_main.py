@@ -380,6 +380,51 @@ def test_parse_canonical_proving_account_transition_commands() -> None:
     assert execute.confirm is True
 
 
+def test_parse_exchange_refresh_and_proving_cap_transition_commands() -> None:
+    refresh = parse_args([
+        "exchange-connection-refresh-balances",
+        "--provider",
+        "kraken_spot",
+        "--environment",
+        "production",
+        "--actor",
+        "operator:human",
+        "--json",
+    ])
+    assert refresh.command == "exchange-connection-refresh-balances"
+    assert refresh.provider == "kraken_spot"
+    assert refresh.environment == "production"
+    assert refresh.json_output is True
+
+    preview = parse_args([
+        "canonical-proving-cap-transition-preview",
+        "--campaign-id",
+        "e9a9e8e9-9574-498d-b49e-f011218c7f2b",
+        "--campaign-version",
+        "1",
+        "--json",
+    ])
+    assert preview.command == "canonical-proving-cap-transition-preview"
+    assert preview.campaign_version == 1
+
+    execute = parse_args([
+        "canonical-proving-cap-transition-execute",
+        "--campaign-id",
+        "e9a9e8e9-9574-498d-b49e-f011218c7f2b",
+        "--campaign-version",
+        "1",
+        "--actor",
+        "operator:human",
+        "--idempotency-key",
+        "cap-1",
+        "--confirm",
+        "--json",
+    ])
+    assert execute.command == "canonical-proving-cap-transition-execute"
+    assert execute.idempotency_key == "cap-1"
+    assert execute.confirm is True
+
+
 def test_parse_canonical_campaign_authority_audit_rejects_malformed_uuid() -> None:
     with pytest.raises(SystemExit):
         parse_args([
@@ -548,6 +593,73 @@ async def test_run_async_routes_canonical_proving_account_transition_execute(mon
     assert code == 0
     assert payload["ok"] is True
     assert "canonical-proving-account-transition-execute" in text
+
+
+@pytest.mark.asyncio
+async def test_run_async_routes_exchange_refresh_and_proving_cap_transition(monkeypatch: pytest.MonkeyPatch) -> None:
+    refresh_args = parse_args([
+        "exchange-connection-refresh-balances",
+        "--provider",
+        "kraken_spot",
+        "--environment",
+        "production",
+        "--actor",
+        "operator:human",
+        "--json",
+    ])
+
+    async def _fake_refresh(**kwargs):
+        assert kwargs["provider"] == "kraken_spot"
+        return {"ok": True, "command": "exchange-connection-refresh-balances"}
+
+    monkeypatch.setattr(operator_main, "refresh_provider_balance_evidence", _fake_refresh)
+    refresh_code, refresh_payload, refresh_text = await operator_main._run_async(refresh_args)
+    assert refresh_code == 0
+    assert refresh_payload["ok"] is True
+    assert "exchange-connection-refresh-balances" in refresh_text
+
+    preview_args = parse_args([
+        "canonical-proving-cap-transition-preview",
+        "--campaign-id",
+        "e9a9e8e9-9574-498d-b49e-f011218c7f2b",
+        "--campaign-version",
+        "1",
+        "--json",
+    ])
+
+    async def _fake_preview(**kwargs):
+        assert kwargs["campaign_version"] == 1
+        return {"ready": True, "command": "canonical-proving-cap-transition-preview"}
+
+    monkeypatch.setattr(operator_main, "canonical_proving_cap_transition_preview", _fake_preview)
+    preview_code, preview_payload, preview_text = await operator_main._run_async(preview_args)
+    assert preview_code == 0
+    assert preview_payload["ready"] is True
+    assert "canonical-proving-cap-transition-preview" in preview_text
+
+    execute_args = parse_args([
+        "canonical-proving-cap-transition-execute",
+        "--campaign-id",
+        "e9a9e8e9-9574-498d-b49e-f011218c7f2b",
+        "--campaign-version",
+        "1",
+        "--actor",
+        "operator:human",
+        "--idempotency-key",
+        "cap-1",
+        "--confirm",
+        "--json",
+    ])
+
+    async def _fake_execute(**kwargs):
+        assert kwargs["idempotency_key"] == "cap-1"
+        return {"changed": True, "command": "canonical-proving-cap-transition-execute"}
+
+    monkeypatch.setattr(operator_main, "canonical_proving_cap_transition_execute", _fake_execute)
+    execute_code, execute_payload, execute_text = await operator_main._run_async(execute_args)
+    assert execute_code == 0
+    assert execute_payload["changed"] is True
+    assert "canonical-proving-cap-transition-execute" in execute_text
 
 
 def test_parse_rejects_nonexistent_canonical_campaign_binding_status_command() -> None:

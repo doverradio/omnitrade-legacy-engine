@@ -229,6 +229,49 @@ def test_create_paper_account_bootstraps_account_kill_switch() -> None:
     assert switch.reason == "account_bootstrap_default"
 
 
+def test_create_paper_account_rejects_starting_balance_below_25() -> None:
+    session = _FakeSession(accounts=[], trades=[], assets=[], candles=[])
+
+    with create_test_client(session) as client:
+        response = client.post(
+            "/paper/account",
+            json={
+                "name": "Too Small",
+                "asset_class": "crypto",
+                "starting_balance": "23.81",
+            },
+        )
+
+    assert response.status_code == 400
+    payload = response.json()
+    assert payload["error"]["message"] == "starting_balance must be at least 25"
+
+
+def test_create_paper_account_rejects_starting_balance_of_5_and_0() -> None:
+    session = _FakeSession(accounts=[], trades=[], assets=[], candles=[])
+
+    with create_test_client(session) as client:
+        five_response = client.post(
+            "/paper/account",
+            json={
+                "name": "Five Dollars",
+                "asset_class": "crypto",
+                "starting_balance": "5",
+            },
+        )
+        zero_response = client.post(
+            "/paper/account",
+            json={
+                "name": "Zero Dollars",
+                "asset_class": "crypto",
+                "starting_balance": "0",
+            },
+        )
+
+    assert five_response.status_code == 400
+    assert zero_response.status_code == 400
+
+
 def test_get_paper_account_not_found() -> None:
     with create_test_client(_FakeSession(accounts=[], trades=[], assets=[], candles=[])) as client:
         response = client.get("/paper/account")

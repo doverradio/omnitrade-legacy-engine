@@ -392,6 +392,56 @@ async def test_exact_5_risk_availability_after_valid_initialization(monkeypatch:
     assert codes["risk_liquid_cash_supports_exact_5"] is True
 
 
+@pytest.mark.asyncio
+async def test_low_liquidity_initialization_is_not_blocked_by_legacy_25_minimum(monkeypatch: pytest.MonkeyPatch) -> None:
+    old_account_id = uuid4()
+    _configure_happy_path(monkeypatch, old_account_id=old_account_id)
+    monkeypatch.setattr(
+        binding,
+        "_latest_exchange_connection",
+        _async_return(_connection(usd_available=Decimal("4.33159379773015"), total_equity=Decimal("41.33159379773015"))),
+    )
+
+    db = _FakeDb(runtime=_runtime(paper_account_id=old_account_id), live_profile=_profile(paper_account_id=old_account_id))
+    result = await binding.inspect_canonical_proving_account_transition(db=db, request=_request())
+    codes = {item.code: item.passed for item in result.checks}
+    assert codes["paper_account_schema_starting_balance_non_negative"] is True
+    assert codes["risk_liquid_cash_supports_exact_5"] is False
+
+
+@pytest.mark.asyncio
+async def test_provider_backed_starting_balance_23_81_is_truthful_and_ready(monkeypatch: pytest.MonkeyPatch) -> None:
+    old_account_id = uuid4()
+    _configure_happy_path(monkeypatch, old_account_id=old_account_id)
+    monkeypatch.setattr(
+        binding,
+        "_latest_exchange_connection",
+        _async_return(_connection(usd_available=Decimal("23.81"), total_equity=Decimal("60.81"))),
+    )
+    db = _FakeDb(runtime=_runtime(paper_account_id=old_account_id), live_profile=_profile(paper_account_id=old_account_id))
+    result = await binding.inspect_canonical_proving_account_transition(db=db, request=_request())
+    codes = {item.code: item.passed for item in result.checks}
+    assert result.snapshot["proposed_new_account"]["starting_balance"] == "23.81"
+    assert codes["paper_account_schema_starting_balance_non_negative"] is True
+    assert codes["risk_liquid_cash_supports_exact_5"] is True
+
+
+@pytest.mark.asyncio
+async def test_provider_backed_starting_balance_exact_5_is_allowed(monkeypatch: pytest.MonkeyPatch) -> None:
+    old_account_id = uuid4()
+    _configure_happy_path(monkeypatch, old_account_id=old_account_id)
+    monkeypatch.setattr(
+        binding,
+        "_latest_exchange_connection",
+        _async_return(_connection(usd_available=Decimal("5"), total_equity=Decimal("42"))),
+    )
+    db = _FakeDb(runtime=_runtime(paper_account_id=old_account_id), live_profile=_profile(paper_account_id=old_account_id))
+    result = await binding.inspect_canonical_proving_account_transition(db=db, request=_request())
+    codes = {item.code: item.passed for item in result.checks}
+    assert result.snapshot["proposed_new_account"]["starting_balance"] == "5"
+    assert codes["risk_liquid_cash_supports_exact_5"] is True
+
+
 def test_transition_contains_no_order_submission_calls() -> None:
     source = inspect.getsource(binding.transition_canonical_proving_account)
     assert "create_order(" not in source

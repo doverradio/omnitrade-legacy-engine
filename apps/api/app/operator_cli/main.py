@@ -29,6 +29,8 @@ from app.operator_cli.service import (
     canonical_paper_cash_causality_audit,
     canonical_proving_account_transition_execute,
     canonical_proving_account_transition_preview,
+    canonical_proving_cap_transition_execute,
+    canonical_proving_cap_transition_preview,
     canonical_preview_package_history,
     canonical_preview_package_readiness,
     canonical_proving_activation_status,
@@ -52,6 +54,7 @@ from app.operator_cli.service import (
     fetch_strategy_roster_summary,
     fetch_risk_ledger_diagnosis,
     fetch_watch_status,
+    refresh_provider_balance_evidence,
     inspect_legacy_campaign_transition,
     pause_canonical_proving_activation_bundle,
     rollback_legacy_campaign_transition,
@@ -381,6 +384,40 @@ def _build_parser() -> argparse.ArgumentParser:
     proving_account_execute.add_argument("--expected-evidence-observed-at", type=str, default=None)
     proving_account_execute.add_argument("--confirm", action="store_true")
     proving_account_execute.add_argument("--json", action="store_true", dest="json_output")
+
+    refresh_provider_balances = subparsers.add_parser(
+        "exchange-connection-refresh-balances",
+        parents=[common],
+        help="Refresh provider balance evidence through sanctioned exchange-connection flow",
+        description="Refreshes persisted provider balance evidence without any order submission.",
+    )
+    refresh_provider_balances.add_argument("--provider", type=str, required=True)
+    refresh_provider_balances.add_argument("--environment", type=str, required=True)
+    refresh_provider_balances.add_argument("--actor", type=str, default="operator:human")
+    refresh_provider_balances.add_argument("--json", action="store_true", dest="json_output")
+
+    proving_cap_preview = subparsers.add_parser(
+        "canonical-proving-cap-transition-preview",
+        parents=[common],
+        help="Preview exact $5 proving cap transition for canonical campaign definition",
+        description="Read-only preview for exact proving cap transition to maximum_position_size=5 and maximum_total_exposure=5.",
+    )
+    proving_cap_preview.add_argument("--campaign-id", type=UUID, required=True)
+    proving_cap_preview.add_argument("--campaign-version", type=int, required=True)
+    proving_cap_preview.add_argument("--json", action="store_true", dest="json_output")
+
+    proving_cap_execute = subparsers.add_parser(
+        "canonical-proving-cap-transition-execute",
+        parents=[common],
+        help="Execute exact $5 proving cap transition for canonical campaign definition",
+        description="Operator-confirmed exact proving cap transition with idempotent audit.",
+    )
+    proving_cap_execute.add_argument("--campaign-id", type=UUID, required=True)
+    proving_cap_execute.add_argument("--campaign-version", type=int, required=True)
+    proving_cap_execute.add_argument("--actor", type=str, default="operator:human")
+    proving_cap_execute.add_argument("--idempotency-key", type=str, required=True)
+    proving_cap_execute.add_argument("--confirm", action="store_true")
+    proving_cap_execute.add_argument("--json", action="store_true", dest="json_output")
 
     legacy_transition_readiness = subparsers.add_parser(
         "legacy-campaign-transition-readiness",
@@ -959,6 +996,31 @@ async def _run_async(args: argparse.Namespace) -> tuple[int, dict[str, Any], str
             idempotency_key=args.idempotency_key,
             expected_evidence_source_id=args.expected_evidence_source_id,
             expected_evidence_observed_at=args.expected_evidence_observed_at,
+        )
+        return 0, payload, render_json(payload)
+
+    if args.command == "exchange-connection-refresh-balances":
+        payload = await refresh_provider_balance_evidence(
+            provider=args.provider,
+            environment=args.environment,
+            actor=args.actor,
+        )
+        return 0, payload, render_json(payload)
+
+    if args.command == "canonical-proving-cap-transition-preview":
+        payload = await canonical_proving_cap_transition_preview(
+            campaign_id=args.campaign_id,
+            campaign_version=args.campaign_version,
+        )
+        return (0 if bool(payload.get("ready")) else 1), payload, render_json(payload)
+
+    if args.command == "canonical-proving-cap-transition-execute":
+        payload = await canonical_proving_cap_transition_execute(
+            campaign_id=args.campaign_id,
+            campaign_version=args.campaign_version,
+            actor=args.actor,
+            confirm=bool(args.confirm),
+            idempotency_key=args.idempotency_key,
         )
         return 0, payload, render_json(payload)
 

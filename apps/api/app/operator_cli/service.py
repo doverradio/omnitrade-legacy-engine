@@ -19,11 +19,15 @@ from app.models.autonomous_capital_mandate import AutonomousCapitalMandate
 from app.models.autonomous_cycle_run import AutonomousCycleRun
 from app.models.candle import Candle
 from app.models.capital_campaign import CapitalCampaign
+from app.models.capital_campaign_definition import CapitalCampaignDefinition
+from app.models.canonical_preview_package import CanonicalPreviewPackage
+from app.models.canonical_proving_activation import CanonicalProvingActivation
 from app.models.crypto_order_preview import CryptoOrderPreview
 from app.models.decision_record import DecisionRecord
 from app.models.decision_snapshot import DecisionSnapshot
 from app.models.exchange_connection import ExchangeConnection
 from app.models.live_crypto_order import LiveCryptoOrder
+from app.models.live_reconciliation_event import LiveReconciliationEvent
 from app.models.paper_account import PaperAccount
 from app.models.risk_event import RiskEvent
 from app.models.signal import Signal
@@ -80,6 +84,7 @@ from app.services.capital_campaign_orchestration import (
     fetch_campaign_orchestration_status as _fetch_campaign_orchestration_status,
     run_campaign_orchestration_preview_for_candle,
 )
+from app.services.exchange_connections import refresh_exchange_balances as _refresh_exchange_balances
 from app.services.paper.accounting import build_account_snapshot
 from app.services.risk import risk_monitor
 from app.services.risk.equity_evidence import resolve_equity_risk_evidence
@@ -88,6 +93,20 @@ from app.services.strategy_outcomes import fetch_strategy_scorecards
 
 
 _EXECUTION_FORENSICS_MAX_SINCE_CYCLES = 200
+_PROVING_CAP_TARGET_USD = Decimal("5")
+_TERMINAL_PACKAGE_STATES = {"COMPLETED", "FAILED_CLOSED", "EXPIRED", "INVALIDATED", "SUPERSEDED"}
+_TERMINAL_ACTIVATION_STATES = {"REVOKED", "EXPIRED", "INVALIDATED", "COMPLETED"}
+_TERMINAL_LIVE_ORDER_STATES = {"DRY_RUN_READY", "DRY_RUN_BLOCKED", "FILLED", "CANCELLED", "FAILED", "REJECTED", "EXPIRED", "COMPLETED"}
+_UNRESOLVED_RECONCILIATION_STATES = {"open", "partially_filled", "reconciliation_required", "unknown", "conflict", "balance_mismatch"}
+
+
+def _runtime_exchange_scope(runtime_exchange: str | None) -> tuple[str | None, str | None]:
+    raw = (runtime_exchange or "").strip().lower()
+    if not raw:
+        return None, None
+    if raw.endswith("_sandbox"):
+        return raw.removesuffix("_sandbox"), "sandbox"
+    return raw, "production"
 
 
 def _coerce_decimal(value: Any) -> str | None:
@@ -2519,3 +2538,378 @@ async def canonical_proving_account_transition_execute(
             "snapshot": result.readiness.snapshot,
         },
     }
+
+
+async def refresh_provider_balance_evidence(
+    *,
+    provider: str,
+    environment: str,
+    actor: str,
+) -> dict[str, Any]:
+    normalized_provider = provider.strip().lower()
+    normalized_environment = environment.strip().lower()
+
+    async with AsyncSessionLocal() as db:
+        connection = await db.scalar(
+            select(ExchangeConnection)
+            .where(ExchangeConnection.provider == normalized_provider)
+            .where(ExchangeConnection.environment == normalized_environment)
+            .order_by(desc(ExchangeConnection.updated_at), desc(ExchangeConnection.exchange_connection_id))
+            .limit(1)
+        )
+        if connection is None:
+            raise LookupError(
+                f"exchange connection not found for provider={normalized_provider} environment={normalized_environment}"
+            )
+
+        refreshed = await _refresh_exchange_balances(
+            db=db,
+            exchange_connection_id=connection.exchange_connection_id,
+            actor=actor,
+        )
+
+        return {
+            "provider": refreshed.provider,
+            "environment": refreshed.environment,
+            "exchange_connection_id": str(refreshed.exchange_connection_id),
+            "status": refreshed.status,
+            "readiness_verdict": refreshed.readiness.verdict,
+            "total_equity_usd": None if refreshed.total_equity_usd is None else format(refreshed.total_equity_usd, "f"),
+            "last_successful_sync_at": None
+            if refreshed.last_successful_sync_at is None
+            else refreshed.last_successful_sync_at.isoformat(),
+            "last_verified_at": refreshed.readiness.checked_at.isoformat(),
+            "invariants": {
+                "no_order_submission": True,
+                "sanctioned_refresh_path": "exchange_connections.refresh_exchange_balances",
+            },
+        }
+
+
+async def canonical_proving_cap_transition_preview(
+    *,
+    campaign_id: UUID,
+    campaign_version: int,
+) -> dict[str, Any]:
+    blockers: list[str] = []
+    async with AsyncSessionLocal() as db:
+        definition = await db.scalar(
+            select(CapitalCampaignDefinition)
+            .where(CapitalCampaignDefinition.campaign_id == campaign_id)
+            .where(CapitalCampaignDefinition.version == campaign_version)
+            .limit(1)
+        )
+        runtime = await db.scalar(
+            select(CapitalCampaign)
+            .where(CapitalCampaign.uuid == campaign_id)
+            .limit(1)
+        )
+        if definition is None:
+            blockers.append("definition_not_found")
+        if runtime is None:
+            blockers.append("runtime_campaign_not_found")
+        if definition is not None and runtime is not None and runtime.definition_version != definition.version:
+            blockers.append("runtime_definition_version_mismatch")
+        if definition is not None and Decimal(str(definition.minimum_position_size)) != _PROVING_CAP_TARGET_USD:
+            blockers.append("minimum_position_size_must_equal_5")
+        if definition is not None and int(definition.maximum_open_positions) != 1:
+            blockers.append("maximum_open_positions_must_equal_1")
+
+        active_package_count = 0
+        active_activation_count = 0
+        open_live_order_count = 0
+        unresolved_reconciliation_count = 0
+        non_compliant_activation_count = 0
+        if definition is not None:
+            active_package_count = int(
+                await db.scalar(
+                    select(func.count())
+                    .select_from(CanonicalPreviewPackage)
+                    .where(CanonicalPreviewPackage.campaign_id == campaign_id)
+                    .where(CanonicalPreviewPackage.campaign_version == campaign_version)
+                    .where(CanonicalPreviewPackage.package_state.notin_(sorted(_TERMINAL_PACKAGE_STATES)))
+                )
+                or 0
+            )
+            non_compliant_activation_count = int(
+                await db.scalar(
+                    select(func.count())
+                    .select_from(CanonicalProvingActivation)
+                    .where(CanonicalProvingActivation.campaign_id == campaign_id)
+                    .where(CanonicalProvingActivation.campaign_version == campaign_version)
+                    .where(CanonicalProvingActivation.no_leverage.is_(False))
+                )
+                or 0
+            )
+        if definition is not None and runtime is not None:
+            runtime_provider, runtime_environment = _runtime_exchange_scope(getattr(runtime, "exchange", None))
+            active_activation_count = int(
+                await db.scalar(
+                    select(func.count())
+                    .select_from(CanonicalProvingActivation)
+                    .where(CanonicalProvingActivation.campaign_id == campaign_id)
+                    .where(CanonicalProvingActivation.campaign_version == campaign_version)
+                    .where(CanonicalProvingActivation.activation_state.notin_(sorted(_TERMINAL_ACTIVATION_STATES)))
+                )
+                or 0
+            )
+            open_live_order_count = int(
+                await db.scalar(
+                    select(func.count())
+                    .select_from(LiveCryptoOrder)
+                    .where(LiveCryptoOrder.provider == runtime_provider if runtime_provider is not None else True)
+                    .where(LiveCryptoOrder.environment == runtime_environment if runtime_environment is not None else True)
+                    .where(LiveCryptoOrder.status.notin_(sorted(_TERMINAL_LIVE_ORDER_STATES)))
+                )
+                or 0
+            )
+            unresolved_reconciliation_count = int(
+                await db.scalar(
+                    select(func.count())
+                    .select_from(LiveReconciliationEvent)
+                    .where(LiveReconciliationEvent.capital_campaign_id == runtime.id)
+                    .where(LiveReconciliationEvent.reconciliation_status.in_(sorted(_UNRESOLVED_RECONCILIATION_STATES)))
+                )
+                or 0
+            )
+
+        if active_package_count > 0:
+            blockers.append("no_active_canonical_package")
+        if active_activation_count > 0:
+            blockers.append("no_active_proving_activation")
+        if non_compliant_activation_count > 0:
+            blockers.append("no_leverage_boundary_violated")
+        if definition is not None and Decimal(str(definition.deployed_capital)) > Decimal("0"):
+            blockers.append("no_deployed_capital")
+        if open_live_order_count > 0:
+            blockers.append("no_open_live_orders")
+        if unresolved_reconciliation_count > 0:
+            blockers.append("no_unresolved_reconciliation_state")
+
+        before = {
+            "maximum_position_size": None if definition is None else format(Decimal(str(definition.maximum_position_size)), "f"),
+            "maximum_total_exposure": None if definition is None else format(Decimal(str(definition.maximum_total_exposure)), "f"),
+            "minimum_position_size": None if definition is None else format(Decimal(str(definition.minimum_position_size)), "f"),
+            "maximum_open_positions": None if definition is None else int(definition.maximum_open_positions),
+            "deployed_capital": None if definition is None else format(Decimal(str(definition.deployed_capital)), "f"),
+        }
+        after = {
+            "maximum_position_size": format(_PROVING_CAP_TARGET_USD, "f"),
+            "maximum_total_exposure": format(_PROVING_CAP_TARGET_USD, "f"),
+        }
+        already_exact = (
+            definition is not None
+            and Decimal(str(definition.maximum_position_size)) == _PROVING_CAP_TARGET_USD
+            and Decimal(str(definition.maximum_total_exposure)) == _PROVING_CAP_TARGET_USD
+        )
+
+        return {
+            "ready": len(blockers) == 0,
+            "blockers": blockers,
+            "campaign_id": str(campaign_id),
+            "campaign_version": campaign_version,
+            "before": before,
+            "proposed": after,
+            "already_exact": already_exact,
+            "invariants": {
+                "exact_proving_cap_usd": format(_PROVING_CAP_TARGET_USD, "f"),
+                "no_order_submission": True,
+                "active_package_count": active_package_count,
+                "active_activation_count": active_activation_count,
+                "open_live_order_count": open_live_order_count,
+                "unresolved_reconciliation_count": unresolved_reconciliation_count,
+                "non_compliant_activation_count": non_compliant_activation_count,
+            },
+        }
+
+
+async def canonical_proving_cap_transition_execute(
+    *,
+    campaign_id: UUID,
+    campaign_version: int,
+    actor: str,
+    confirm: bool,
+    idempotency_key: str,
+) -> dict[str, Any]:
+    if not confirm:
+        raise PermissionError("confirm=true is required")
+    if not idempotency_key.strip():
+        raise PermissionError("idempotency_key is required")
+
+    async with AsyncSessionLocal() as db:
+        async with db.begin():
+            definition = await db.scalar(
+                select(CapitalCampaignDefinition)
+                .where(CapitalCampaignDefinition.campaign_id == campaign_id)
+                .where(CapitalCampaignDefinition.version == campaign_version)
+                .with_for_update()
+                .limit(1)
+            )
+            runtime = await db.scalar(
+                select(CapitalCampaign)
+                .where(CapitalCampaign.uuid == campaign_id)
+                .with_for_update()
+                .limit(1)
+            )
+            blockers: list[str] = []
+            if definition is None:
+                blockers.append("definition_not_found")
+            if runtime is None:
+                blockers.append("runtime_campaign_not_found")
+            if definition is not None and runtime is not None and runtime.definition_version != definition.version:
+                blockers.append("runtime_definition_version_mismatch")
+            if definition is not None and Decimal(str(definition.minimum_position_size)) != _PROVING_CAP_TARGET_USD:
+                blockers.append("minimum_position_size_must_equal_5")
+            if definition is not None and int(definition.maximum_open_positions) != 1:
+                blockers.append("maximum_open_positions_must_equal_1")
+
+            active_package_count = 0
+            active_activation_count = 0
+            open_live_order_count = 0
+            unresolved_reconciliation_count = 0
+            non_compliant_activation_count = 0
+            if definition is not None:
+                active_package_count = int(
+                    await db.scalar(
+                        select(func.count())
+                        .select_from(CanonicalPreviewPackage)
+                        .where(CanonicalPreviewPackage.campaign_id == campaign_id)
+                        .where(CanonicalPreviewPackage.campaign_version == campaign_version)
+                        .where(CanonicalPreviewPackage.package_state.notin_(sorted(_TERMINAL_PACKAGE_STATES)))
+                    )
+                    or 0
+                )
+                non_compliant_activation_count = int(
+                    await db.scalar(
+                        select(func.count())
+                        .select_from(CanonicalProvingActivation)
+                        .where(CanonicalProvingActivation.campaign_id == campaign_id)
+                        .where(CanonicalProvingActivation.campaign_version == campaign_version)
+                        .where(CanonicalProvingActivation.no_leverage.is_(False))
+                    )
+                    or 0
+                )
+            if definition is not None and runtime is not None:
+                runtime_provider, runtime_environment = _runtime_exchange_scope(getattr(runtime, "exchange", None))
+                active_activation_count = int(
+                    await db.scalar(
+                        select(func.count())
+                        .select_from(CanonicalProvingActivation)
+                        .where(CanonicalProvingActivation.campaign_id == campaign_id)
+                        .where(CanonicalProvingActivation.campaign_version == campaign_version)
+                        .where(CanonicalProvingActivation.activation_state.notin_(sorted(_TERMINAL_ACTIVATION_STATES)))
+                    )
+                    or 0
+                )
+                open_live_order_count = int(
+                    await db.scalar(
+                        select(func.count())
+                        .select_from(LiveCryptoOrder)
+                        .where(LiveCryptoOrder.provider == runtime_provider if runtime_provider is not None else True)
+                        .where(LiveCryptoOrder.environment == runtime_environment if runtime_environment is not None else True)
+                        .where(LiveCryptoOrder.status.notin_(sorted(_TERMINAL_LIVE_ORDER_STATES)))
+                    )
+                    or 0
+                )
+                unresolved_reconciliation_count = int(
+                    await db.scalar(
+                        select(func.count())
+                        .select_from(LiveReconciliationEvent)
+                        .where(LiveReconciliationEvent.capital_campaign_id == runtime.id)
+                        .where(LiveReconciliationEvent.reconciliation_status.in_(sorted(_UNRESOLVED_RECONCILIATION_STATES)))
+                    )
+                    or 0
+                )
+
+            if active_package_count > 0:
+                blockers.append("no_active_canonical_package")
+            if active_activation_count > 0:
+                blockers.append("no_active_proving_activation")
+            if non_compliant_activation_count > 0:
+                blockers.append("no_leverage_boundary_violated")
+            if definition is not None and Decimal(str(definition.deployed_capital)) > Decimal("0"):
+                blockers.append("no_deployed_capital")
+            if open_live_order_count > 0:
+                blockers.append("no_open_live_orders")
+            if unresolved_reconciliation_count > 0:
+                blockers.append("no_unresolved_reconciliation_state")
+
+            before_preview = {
+                "maximum_position_size": None if definition is None else format(Decimal(str(definition.maximum_position_size)), "f"),
+                "maximum_total_exposure": None if definition is None else format(Decimal(str(definition.maximum_total_exposure)), "f"),
+                "minimum_position_size": None if definition is None else format(Decimal(str(definition.minimum_position_size)), "f"),
+                "maximum_open_positions": None if definition is None else int(definition.maximum_open_positions),
+                "deployed_capital": None if definition is None else format(Decimal(str(definition.deployed_capital)), "f"),
+            }
+            proposed_preview = {
+                "maximum_position_size": format(_PROVING_CAP_TARGET_USD, "f"),
+                "maximum_total_exposure": format(_PROVING_CAP_TARGET_USD, "f"),
+            }
+            preview = {
+                "ready": len(blockers) == 0,
+                "blockers": blockers,
+                "before": before_preview,
+                "proposed": proposed_preview,
+            }
+            if not preview["ready"]:
+                raise PermissionError("proving cap transition prerequisites failed: " + ", ".join(preview["blockers"]))
+            if definition is None:
+                raise LookupError("campaign definition not found")
+
+            latest_audit = await db.scalar(
+                select(AuditLog)
+                .where(AuditLog.entity_type == "capital_campaign")
+                .where(AuditLog.entity_id == campaign_id)
+                .where(AuditLog.action == "capital_campaign.proving_cap_transition")
+                .order_by(desc(AuditLog.created_at), desc(AuditLog.id))
+                .with_for_update()
+                .limit(1)
+            )
+
+            if latest_audit is not None and isinstance(latest_audit.after_state, dict):
+                prior_key = str(latest_audit.after_state.get("idempotency_key") or "")
+                prior_cap = str(latest_audit.after_state.get("maximum_position_size") or "")
+                if prior_key == idempotency_key and prior_cap == format(_PROVING_CAP_TARGET_USD, "f"):
+                    return {
+                        "changed": False,
+                        "idempotent": True,
+                        "audit_created": False,
+                        "campaign_id": str(campaign_id),
+                        "campaign_version": campaign_version,
+                        "before": preview["before"],
+                        "after": preview["proposed"],
+                    }
+                if prior_key and prior_key != idempotency_key:
+                    raise PermissionError("conflicting retry blocked: proving cap transition already executed")
+
+            before = dict(preview["before"])
+            definition.maximum_position_size = _PROVING_CAP_TARGET_USD
+            definition.maximum_total_exposure = _PROVING_CAP_TARGET_USD
+            definition.updated_at = datetime.now(timezone.utc)
+
+            after = {
+                "maximum_position_size": format(_PROVING_CAP_TARGET_USD, "f"),
+                "maximum_total_exposure": format(_PROVING_CAP_TARGET_USD, "f"),
+                "idempotency_key": idempotency_key,
+                "runtime_campaign_id": None if runtime is None else runtime.id,
+            }
+            db.add(
+                AuditLog(
+                    actor=actor,
+                    action="capital_campaign.proving_cap_transition",
+                    entity_type="capital_campaign",
+                    entity_id=campaign_id,
+                    before_state=before,
+                    after_state=after,
+                )
+            )
+
+        return {
+            "changed": True,
+            "idempotent": False,
+            "audit_created": True,
+            "campaign_id": str(campaign_id),
+            "campaign_version": campaign_version,
+            "before": before,
+            "after": after,
+        }
