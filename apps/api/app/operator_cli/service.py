@@ -2612,8 +2612,6 @@ async def canonical_proving_cap_transition_preview(
             blockers.append("runtime_definition_version_mismatch")
         if definition is not None and Decimal(str(definition.minimum_position_size)) != _PROVING_CAP_TARGET_USD:
             blockers.append("minimum_position_size_must_equal_5")
-        if definition is not None and int(definition.maximum_open_positions) != 1:
-            blockers.append("maximum_open_positions_must_equal_1")
 
         active_package_count = 0
         active_activation_count = 0
@@ -2694,11 +2692,13 @@ async def canonical_proving_cap_transition_preview(
             "deployed_capital": None if definition is None else format(Decimal(str(definition.deployed_capital)), "f"),
         }
         after = {
+            "maximum_open_positions": 1,
             "maximum_position_size": format(_PROVING_CAP_TARGET_USD, "f"),
             "maximum_total_exposure": format(_PROVING_CAP_TARGET_USD, "f"),
         }
         already_exact = (
             definition is not None
+            and int(definition.maximum_open_positions) == 1
             and Decimal(str(definition.maximum_position_size)) == _PROVING_CAP_TARGET_USD
             and Decimal(str(definition.maximum_total_exposure)) == _PROVING_CAP_TARGET_USD
         )
@@ -2760,8 +2760,6 @@ async def canonical_proving_cap_transition_execute(
                 blockers.append("runtime_definition_version_mismatch")
             if definition is not None and Decimal(str(definition.minimum_position_size)) != _PROVING_CAP_TARGET_USD:
                 blockers.append("minimum_position_size_must_equal_5")
-            if definition is not None and int(definition.maximum_open_positions) != 1:
-                blockers.append("maximum_open_positions_must_equal_1")
 
             active_package_count = 0
             active_activation_count = 0
@@ -2842,6 +2840,7 @@ async def canonical_proving_cap_transition_execute(
                 "deployed_capital": None if definition is None else format(Decimal(str(definition.deployed_capital)), "f"),
             }
             proposed_preview = {
+                "maximum_open_positions": 1,
                 "maximum_position_size": format(_PROVING_CAP_TARGET_USD, "f"),
                 "maximum_total_exposure": format(_PROVING_CAP_TARGET_USD, "f"),
             }
@@ -2883,11 +2882,13 @@ async def canonical_proving_cap_transition_execute(
                     raise PermissionError("conflicting retry blocked: proving cap transition already executed")
 
             before = dict(preview["before"])
+            definition.maximum_open_positions = 1
             definition.maximum_position_size = _PROVING_CAP_TARGET_USD
             definition.maximum_total_exposure = _PROVING_CAP_TARGET_USD
             definition.updated_at = datetime.now(timezone.utc)
 
             after = {
+                "maximum_open_positions": 1,
                 "maximum_position_size": format(_PROVING_CAP_TARGET_USD, "f"),
                 "maximum_total_exposure": format(_PROVING_CAP_TARGET_USD, "f"),
                 "idempotency_key": idempotency_key,

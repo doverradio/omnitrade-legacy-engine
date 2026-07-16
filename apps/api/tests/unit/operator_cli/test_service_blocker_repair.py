@@ -53,7 +53,7 @@ class _FakeDb:
             maximum_position_size=Decimal("10"),
             maximum_total_exposure=Decimal("12"),
             minimum_position_size=Decimal("5"),
-            maximum_open_positions=1,
+            maximum_open_positions=2,
             deployed_capital=Decimal("0"),
             updated_at=datetime.now(timezone.utc),
         )
@@ -208,6 +208,10 @@ async def test_proving_cap_preview_is_read_only(monkeypatch: pytest.MonkeyPatch)
     )
 
     assert payload["ready"] is True
+    assert payload["before"]["maximum_open_positions"] == 2
+    assert payload["proposed"]["maximum_open_positions"] == 1
+    assert payload["proposed"]["maximum_position_size"] == "5"
+    assert payload["proposed"]["maximum_total_exposure"] == "5"
     assert db.commits == 0
     assert db.added == []
 
@@ -246,6 +250,8 @@ async def test_proving_cap_execute_applies_only_cap_fields_and_writes_audit(monk
     )
 
     assert payload["changed"] is True
+    assert payload["before"]["maximum_open_positions"] == 2
+    assert payload["after"]["maximum_open_positions"] == 1
     assert db.definition.maximum_position_size == Decimal("5")
     assert db.definition.maximum_total_exposure == Decimal("5")
     assert db.definition.minimum_position_size == Decimal("5")
