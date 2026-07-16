@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
+import json
 import logging
 import os
 import uuid
@@ -13,17 +15,25 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.models.audit_log import AuditLog
 from app.models.autonomous_capital_mandate import AutonomousCapitalMandate
+from app.models.autonomous_cycle_run import AutonomousCycleRun
+from app.models.canonical_preview_package import CanonicalPreviewPackage
+from app.models.canonical_proving_activation import CanonicalProvingActivation
+from app.models.capital_campaign import CapitalCampaign
 from app.core.logging import setup_logging
 from app.db.session import AsyncSessionLocal, dispose_database_engine, is_retryable_db_connection_error
 from app.models.asset import Asset
 from app.models.candle import Candle
 from app.models.decision_record import DecisionRecord
+from app.models.live_crypto_order import LiveCryptoOrder
+from app.models.live_reconciliation_event import LiveReconciliationEvent
+from app.models.live_trading_profile import LiveTradingProfile
 from app.models.paper_account import PaperAccount
 from app.models.parameter_set import ParameterSet
 from app.models.signal import Signal as SignalModel
 from app.models.strategy import Strategy as StrategyModel
 from app.models.validation_run import ValidationRun
 from app.models.validation_run_event import ValidationRunEvent
+from app.services.canonical_preview_package import CanonicalPreviewPackageCreateRequest, create_canonical_preview_package
 from app.services.ai_coach.deterministic import evaluate_decision_quality_v0
 from app.services.data.binance_client import BinanceUSClient
 from app.services.data.http_client import AsyncHTTPClient
@@ -73,6 +83,13 @@ _WORKER_BOOT_ACTION = "orchestration_worker_started"
 _WORKER_BOOT_FAILED_ACTION = "orchestration_worker_start_failed"
 _FULL_PIPELINE_COMPLETE_ACTION = "orchestration_worker_full_pipeline_completed"
 _REPLAY_FAILURE_ACTION = "decision_package_replay_failed"
+
+_CANONICAL_READY_PACKAGE_AMOUNT = Decimal("5")
+_CANONICAL_READY_PACKAGE_ACTOR = "orchestration_worker:auto_ready_package"
+_CANONICAL_READY_STATES = {"READY", "AUTHORIZED", "DRY_RUN_PASSED", "ACTIVATED"}
+_ACTIVE_PROVING_STATES = {"ACTIVE"}
+_OPEN_LIVE_ORDER_STATES = {"SUBMISSION_PENDING", "ACKNOWLEDGED", "SUBMITTED", "PARTIALLY_FILLED", "RECONCILIATION_REQUIRED"}
+_UNRESOLVED_RECONCILIATION_STATES = {"open", "partially_filled", "reconciliation_required", "unknown", "conflict", "balance_mismatch"}
 
 
 @dataclass(frozen=True, slots=True)
@@ -544,6 +561,282 @@ def _signal_status_from_execution_status(execution_status: str) -> str:
     return "generated"
 
 
+def _as_utc_iso(value: datetime | str | None) -> str | None:
+    if value is None:
+        return None
+    if isinstance(value, datetime):
+        if value.tzinfo is None:
+            return value.replace(tzinfo=timezone.utc).isoformat()
+        return value.astimezone(timezone.utc).isoformat()
+    raw = str(value).strip()
+    if not raw:
+        return None
+    if raw.endswith("Z"):
+        raw = f"{raw[:-1]}+00:00"
+    try:
+        parsed = datetime.fromisoformat(raw)
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed.astimezone(timezone.utc).isoformat()
+
+
+def _coerce_decimal(value: object) -> Decimal | None:
+    if value is None:
+        return None
+    try:
+        return value if isinstance(value, Decimal) else Decimal(str(value))
+    except Exception:
+        return None
+
+
+def _build_automatic_ready_package_idempotency_key(
+    *,
+    campaign_id: uuid.UUID,
+    campaign_version: int,
+    candle_close_time: str,
+    decision_record_id: uuid.UUID,
+    proposed_action: str,
+    product: str,
+    provider: str,
+    environment: str,
+) -> str:
+    payload = {
+        "campaign_id": str(campaign_id),
+        "campaign_version": int(campaign_version),
+        "candle_close_time": candle_close_time,
+        "decision_record_id": str(decision_record_id),
+        "proposed_action": proposed_action.strip().upper(),
+        "product": product.strip().upper(),
+        "provider": provider.strip().lower(),
+        "environment": environment.strip().lower(),
+    }
+    encoded = json.dumps(payload, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
+
+
+async def _load_cycle_by_id(*, db: AsyncSession, cycle_id: uuid.UUID) -> AutonomousCycleRun | None:
+    return await db.scalar(select(AutonomousCycleRun).where(AutonomousCycleRun.cycle_id == cycle_id).limit(1))
+
+
+async def _load_runtime_campaign(*, db: AsyncSession, campaign_id: uuid.UUID) -> CapitalCampaign | None:
+    return await db.scalar(select(CapitalCampaign).where(CapitalCampaign.uuid == campaign_id).limit(1))
+
+
+async def _load_live_trading_profile_for_paper_account(*, db: AsyncSession, paper_account_id: uuid.UUID) -> LiveTradingProfile | None:
+    return await db.scalar(
+        select(LiveTradingProfile)
+        .where(LiveTradingProfile.paper_account_id == paper_account_id)
+        .order_by(LiveTradingProfile.created_at.desc(), LiveTradingProfile.id.desc())
+        .limit(1)
+    )
+
+
+async def _has_active_ready_package_for_opportunity(*, db: AsyncSession, decision_record_id: uuid.UUID) -> bool:
+    row = await db.scalar(
+        select(CanonicalPreviewPackage.package_id)
+        .where(CanonicalPreviewPackage.decision_record_id == decision_record_id)
+        .where(CanonicalPreviewPackage.package_state.in_(_CANONICAL_READY_STATES))
+        .limit(1)
+    )
+    return row is not None
+
+
+async def _has_active_proving_activation(*, db: AsyncSession, campaign_id: uuid.UUID, campaign_version: int, provider: str, environment: str, product: str) -> bool:
+    row = await db.scalar(
+        select(CanonicalProvingActivation.activation_id)
+        .where(CanonicalProvingActivation.campaign_id == campaign_id)
+        .where(CanonicalProvingActivation.campaign_version == campaign_version)
+        .where(CanonicalProvingActivation.provider == provider)
+        .where(CanonicalProvingActivation.environment == environment)
+        .where(CanonicalProvingActivation.product == product)
+        .where(CanonicalProvingActivation.activation_state.in_(_ACTIVE_PROVING_STATES))
+        .limit(1)
+    )
+    return row is not None
+
+
+async def _has_open_live_order(*, db: AsyncSession, provider: str, environment: str, product: str) -> bool:
+    row = await db.scalar(
+        select(LiveCryptoOrder.live_crypto_order_id)
+        .where(LiveCryptoOrder.provider == provider)
+        .where(LiveCryptoOrder.environment == environment)
+        .where(LiveCryptoOrder.product_id == product)
+        .where(LiveCryptoOrder.status.in_(_OPEN_LIVE_ORDER_STATES))
+        .limit(1)
+    )
+    return row is not None
+
+
+async def _has_unresolved_reconciliation(*, db: AsyncSession, provider: str, environment: str, product: str) -> bool:
+    row = await db.scalar(
+        select(LiveReconciliationEvent.id)
+        .join(
+            LiveCryptoOrder,
+            LiveCryptoOrder.live_crypto_order_id == LiveReconciliationEvent.live_crypto_order_id,
+        )
+        .where(LiveCryptoOrder.provider == provider)
+        .where(LiveCryptoOrder.environment == environment)
+        .where(LiveCryptoOrder.product_id == product)
+        .where(LiveReconciliationEvent.reconciliation_status.in_(_UNRESOLVED_RECONCILIATION_STATES))
+        .limit(1)
+    )
+    return row is not None
+
+
+async def _attempt_automatic_ready_package_creation(
+    *,
+    db: AsyncSession,
+    orchestration_payload: dict[str, object] | None,
+) -> None:
+    cycles = [] if not isinstance(orchestration_payload, dict) else list(orchestration_payload.get("cycles") or [])
+    for cycle_summary in cycles:
+        if not isinstance(cycle_summary, dict):
+            continue
+        cycle_id_raw = cycle_summary.get("cycle_id")
+        if cycle_id_raw is None:
+            continue
+
+        cycle_id = uuid.UUID(str(cycle_id_raw))
+        cycle = await _load_cycle_by_id(db=db, cycle_id=cycle_id)
+        if cycle is None:
+            continue
+
+        campaign_id = cycle.capital_campaign_id
+        campaign_version = cycle.capital_campaign_version
+        decision_record_id = cycle.decision_record_id
+        cycle_context = cycle.cycle_context if isinstance(cycle.cycle_context, dict) else {}
+        composition = cycle_context.get("authoritative_composition") if isinstance(cycle_context.get("authoritative_composition"), dict) else {}
+        selected_decision = composition.get("selected_decision") if isinstance(composition.get("selected_decision"), dict) else {}
+        candle = cycle_context.get("candle") if isinstance(cycle_context.get("candle"), dict) else {}
+
+        provider = _AUTONOMOUS_CYCLE_PROVIDER
+        environment = "production"
+        product = _AUTONOMOUS_CYCLE_PRODUCT_ID
+        proposed_action = str(composition.get("proposed_action") or cycle.proposed_action or "").strip().upper()
+        decision_kind = str(selected_decision.get("decision_kind") or "").strip().upper()
+        risk_verdict = str(selected_decision.get("risk_verdict") or cycle.risk_verdict or "").strip().upper()
+        evidence_freshness = str(selected_decision.get("evidence_freshness") or "").strip().lower()
+        sizing_trace = selected_decision.get("sizing_trace") if isinstance(selected_decision.get("sizing_trace"), dict) else {}
+        final_amount = _coerce_decimal(sizing_trace.get("final_amount"))
+        candle_close_time = _as_utc_iso(candle.get("close_time"))
+
+        skip_reason = None
+        if campaign_id is None or campaign_version is None:
+            skip_reason = "campaign_identity_missing"
+        elif provider != _AUTONOMOUS_CYCLE_PROVIDER or environment != "production" or product != _AUTONOMOUS_CYCLE_PRODUCT_ID:
+            skip_reason = "scope_not_supported"
+        elif cycle.termination_stage in {"hold_no_package_created", "failed_closed"}:
+            skip_reason = f"termination_stage_{cycle.termination_stage}"
+        elif proposed_action not in {"OPEN_POSITION_PROPOSED", "BUY", "OPEN_POSITION"} and decision_kind not in {"OPEN_POSITION_PROPOSED", "BUY", "OPEN_POSITION"}:
+            skip_reason = "non_executable_action"
+        elif decision_record_id is None:
+            skip_reason = "missing_decision_record_id"
+        elif evidence_freshness and evidence_freshness != "fresh":
+            skip_reason = "stale_market_data"
+        elif risk_verdict != "ALLOW":
+            skip_reason = "risk_not_permitted"
+        elif final_amount != _CANONICAL_READY_PACKAGE_AMOUNT:
+            skip_reason = "non_canonical_amount"
+        elif candle_close_time is None:
+            skip_reason = "missing_candle_close_time"
+
+        package_id: str | None = None
+        idempotency_key: str | None = None
+        if skip_reason is None:
+            if await _has_active_ready_package_for_opportunity(db=db, decision_record_id=decision_record_id):
+                skip_reason = "active_ready_package_exists"
+            elif await _has_active_proving_activation(
+                db=db,
+                campaign_id=campaign_id,
+                campaign_version=campaign_version,
+                provider=provider,
+                environment=environment,
+                product=product,
+            ):
+                skip_reason = "active_proving_activation_exists"
+            elif await _has_open_live_order(db=db, provider=provider, environment=environment, product=product):
+                skip_reason = "open_live_order_exists"
+            elif await _has_unresolved_reconciliation(db=db, provider=provider, environment=environment, product=product):
+                skip_reason = "unresolved_reconciliation_exists"
+
+        if skip_reason is None:
+            runtime_campaign = await _load_runtime_campaign(db=db, campaign_id=campaign_id)
+            if runtime_campaign is None or runtime_campaign.paper_account_id is None:
+                skip_reason = "runtime_campaign_or_paper_account_missing"
+            else:
+                profile = await _load_live_trading_profile_for_paper_account(
+                    db=db,
+                    paper_account_id=runtime_campaign.paper_account_id,
+                )
+                if profile is None:
+                    skip_reason = "live_trading_profile_missing"
+                else:
+                    idempotency_key = _build_automatic_ready_package_idempotency_key(
+                        campaign_id=campaign_id,
+                        campaign_version=campaign_version,
+                        candle_close_time=candle_close_time,
+                        decision_record_id=decision_record_id,
+                        proposed_action=proposed_action or decision_kind,
+                        product=product,
+                        provider=provider,
+                        environment=environment,
+                    )
+                    payload = await create_canonical_preview_package(
+                        db=db,
+                        request=CanonicalPreviewPackageCreateRequest(
+                            campaign_id=campaign_id,
+                            campaign_version=campaign_version,
+                            paper_account_id=runtime_campaign.paper_account_id,
+                            live_trading_profile_id=profile.id,
+                            provider=provider,
+                            environment=environment,
+                            product=product,
+                            max_proposed_order_amount=_CANONICAL_READY_PACKAGE_AMOUNT,
+                            actor=_CANONICAL_READY_PACKAGE_ACTOR,
+                            idempotency_key=idempotency_key,
+                        ),
+                    )
+                    package = payload.get("package") if isinstance(payload, dict) else None
+                    package_id = None if not isinstance(package, dict) else str(package.get("package_id") or "") or None
+                    if bool(payload.get("idempotent")):
+                        logger.info(
+                            "automatic_ready_package_replayed campaign_id=%s campaign_version=%s cycle_id=%s candle_close_time=%s decision_record_id=%s package_id=%s idempotency_key=%s",
+                            campaign_id,
+                            campaign_version,
+                            cycle_id,
+                            candle_close_time,
+                            decision_record_id,
+                            package_id,
+                            idempotency_key,
+                        )
+                    else:
+                        logger.info(
+                            "automatic_ready_package_created campaign_id=%s campaign_version=%s cycle_id=%s candle_close_time=%s decision_record_id=%s package_id=%s idempotency_key=%s",
+                            campaign_id,
+                            campaign_version,
+                            cycle_id,
+                            candle_close_time,
+                            decision_record_id,
+                            package_id,
+                            idempotency_key,
+                        )
+
+        if skip_reason is not None:
+            logger.info(
+                "automatic_ready_package_skipped campaign_id=%s campaign_version=%s cycle_id=%s candle_close_time=%s decision_record_id=%s package_id=%s idempotency_key=%s reason=%s",
+                campaign_id,
+                campaign_version,
+                cycle_id,
+                candle_close_time,
+                decision_record_id,
+                package_id,
+                idempotency_key,
+                skip_reason,
+            )
+
+
 async def run_orchestration_cycle(
     db: AsyncSession,
     *,
@@ -581,7 +874,15 @@ async def run_orchestration_cycle(
 
     if all(hasattr(db, attr) for attr in ("execute", "scalar", "commit")):
         try:
-            await run_campaign_orchestration_preview_for_candle(db=db, trigger=_AUTONOMOUS_CYCLE_TRIGGER)
+            orchestration_payload = await run_campaign_orchestration_preview_for_candle(
+                db=db,
+                trigger=_AUTONOMOUS_CYCLE_TRIGGER,
+            )
+            await _attempt_automatic_ready_package_creation(
+                db=db,
+                orchestration_payload=orchestration_payload,
+            )
+            await db.commit()
         except Exception:
             await _rollback_active_session(db=db)
             logger.exception("campaign_orchestration_failed trigger=%s", _AUTONOMOUS_CYCLE_TRIGGER)

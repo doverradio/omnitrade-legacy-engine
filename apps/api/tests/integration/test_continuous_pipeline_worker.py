@@ -168,6 +168,279 @@ def _decision_record() -> SimpleNamespace:
     )
 
 
+_MISSING = object()
+
+
+def _automatic_cycle(
+    *,
+    decision_record_id: uuid.UUID | None | object = _MISSING,
+    termination_stage: str = "preview_generated",
+    proposed_action: str = "OPEN_POSITION_PROPOSED",
+    decision_kind: str = "OPEN_POSITION_PROPOSED",
+    risk_verdict: str = "ALLOW",
+    freshness: str = "fresh",
+    final_amount: str = "5",
+) -> SimpleNamespace:
+    cycle_id = uuid.uuid4()
+    campaign_id = uuid.UUID("aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa")
+    if decision_record_id is _MISSING:
+        decision_record_id = uuid.UUID("bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb")
+    return SimpleNamespace(
+        cycle_id=cycle_id,
+        capital_campaign_id=campaign_id,
+        capital_campaign_version=3,
+        decision_record_id=decision_record_id,
+        termination_stage=termination_stage,
+        proposed_action=proposed_action,
+        risk_verdict=risk_verdict,
+        cycle_context={
+            "candle": {"close_time": "2026-07-15T00:15:00+00:00"},
+            "authoritative_composition": {
+                "proposed_action": proposed_action,
+                "selected_decision": {
+                    "decision_kind": decision_kind,
+                    "risk_verdict": risk_verdict,
+                    "evidence_freshness": freshness,
+                    "sizing_trace": {"final_amount": final_amount},
+                },
+            },
+        },
+    )
+
+
+def _automatic_payload(cycle: SimpleNamespace) -> dict[str, object]:
+    return {"cycles": [{"cycle_id": str(cycle.cycle_id)}]}
+
+
+@pytest.mark.asyncio
+async def test_automatic_ready_package_executable_buy_creates_one_ready_package(monkeypatch: pytest.MonkeyPatch) -> None:
+    import app.services.orchestration.continuous_pipeline_worker as worker_module
+
+    cycle = _automatic_cycle()
+    runtime_campaign = SimpleNamespace(paper_account_id=uuid.uuid4())
+    profile = SimpleNamespace(id=uuid.uuid4())
+    package_id = str(uuid.uuid4())
+    calls: list[object] = []
+
+    async def _fake_create(*, db, request):
+        calls.append(request)
+        return {
+            "idempotent": False,
+            "package": {"package_id": package_id, "package_state": "READY"},
+            "readiness": {"ready": True, "package_state": "READY"},
+        }
+
+    monkeypatch.setattr(worker_module, "_load_cycle_by_id", _async_return(cycle))
+    monkeypatch.setattr(worker_module, "_has_active_ready_package_for_opportunity", _async_return(False))
+    monkeypatch.setattr(worker_module, "_has_active_proving_activation", _async_return(False))
+    monkeypatch.setattr(worker_module, "_has_open_live_order", _async_return(False))
+    monkeypatch.setattr(worker_module, "_has_unresolved_reconciliation", _async_return(False))
+    monkeypatch.setattr(worker_module, "_load_runtime_campaign", _async_return(runtime_campaign))
+    monkeypatch.setattr(worker_module, "_load_live_trading_profile_for_paper_account", _async_return(profile))
+    monkeypatch.setattr(worker_module, "create_canonical_preview_package", _fake_create)
+
+    await worker_module._attempt_automatic_ready_package_creation(db=object(), orchestration_payload=_automatic_payload(cycle))
+
+    assert len(calls) == 1
+    assert calls[0].max_proposed_order_amount == Decimal("5")
+
+
+@pytest.mark.asyncio
+async def test_automatic_ready_package_replayed_identical_opportunity_returns_same_package(monkeypatch: pytest.MonkeyPatch) -> None:
+    import app.services.orchestration.continuous_pipeline_worker as worker_module
+
+    cycle = _automatic_cycle()
+    runtime_campaign = SimpleNamespace(paper_account_id=uuid.uuid4())
+    profile = SimpleNamespace(id=uuid.uuid4())
+    package_id = str(uuid.uuid4())
+    seen: dict[str, str] = {}
+    request_keys: list[str] = []
+
+    async def _fake_create(*, db, request):
+        request_keys.append(request.idempotency_key)
+        if request.idempotency_key in seen:
+            return {
+                "idempotent": True,
+                "package": {"package_id": seen[request.idempotency_key], "package_state": "READY"},
+                "readiness": {"ready": True, "package_state": "READY"},
+            }
+        seen[request.idempotency_key] = package_id
+        return {
+            "idempotent": False,
+            "package": {"package_id": package_id, "package_state": "READY"},
+            "readiness": {"ready": True, "package_state": "READY"},
+        }
+
+    monkeypatch.setattr(worker_module, "_load_cycle_by_id", _async_return(cycle))
+    monkeypatch.setattr(worker_module, "_has_active_ready_package_for_opportunity", _async_return(False))
+    monkeypatch.setattr(worker_module, "_has_active_proving_activation", _async_return(False))
+    monkeypatch.setattr(worker_module, "_has_open_live_order", _async_return(False))
+    monkeypatch.setattr(worker_module, "_has_unresolved_reconciliation", _async_return(False))
+    monkeypatch.setattr(worker_module, "_load_runtime_campaign", _async_return(runtime_campaign))
+    monkeypatch.setattr(worker_module, "_load_live_trading_profile_for_paper_account", _async_return(profile))
+    monkeypatch.setattr(worker_module, "create_canonical_preview_package", _fake_create)
+
+    payload = _automatic_payload(cycle)
+    await worker_module._attempt_automatic_ready_package_creation(db=object(), orchestration_payload=payload)
+    await worker_module._attempt_automatic_ready_package_creation(db=object(), orchestration_payload=payload)
+
+    assert len(request_keys) == 2
+    assert request_keys[0] == request_keys[1]
+
+
+@pytest.mark.asyncio
+async def test_automatic_ready_package_worker_restart_does_not_duplicate(monkeypatch: pytest.MonkeyPatch) -> None:
+    import app.services.orchestration.continuous_pipeline_worker as worker_module
+
+    cycle = _automatic_cycle()
+    runtime_campaign = SimpleNamespace(paper_account_id=uuid.uuid4())
+    profile = SimpleNamespace(id=uuid.uuid4())
+    created_by_key: dict[str, str] = {}
+    created_count = {"value": 0}
+
+    async def _fake_create(*, db, request):
+        if request.idempotency_key in created_by_key:
+            return {
+                "idempotent": True,
+                "package": {"package_id": created_by_key[request.idempotency_key], "package_state": "READY"},
+                "readiness": {"ready": True, "package_state": "READY"},
+            }
+        created_count["value"] += 1
+        package_id = str(uuid.uuid4())
+        created_by_key[request.idempotency_key] = package_id
+        return {
+            "idempotent": False,
+            "package": {"package_id": package_id, "package_state": "READY"},
+            "readiness": {"ready": True, "package_state": "READY"},
+        }
+
+    monkeypatch.setattr(worker_module, "_load_cycle_by_id", _async_return(cycle))
+    monkeypatch.setattr(worker_module, "_has_active_ready_package_for_opportunity", _async_return(False))
+    monkeypatch.setattr(worker_module, "_has_active_proving_activation", _async_return(False))
+    monkeypatch.setattr(worker_module, "_has_open_live_order", _async_return(False))
+    monkeypatch.setattr(worker_module, "_has_unresolved_reconciliation", _async_return(False))
+    monkeypatch.setattr(worker_module, "_load_runtime_campaign", _async_return(runtime_campaign))
+    monkeypatch.setattr(worker_module, "_load_live_trading_profile_for_paper_account", _async_return(profile))
+    monkeypatch.setattr(worker_module, "create_canonical_preview_package", _fake_create)
+
+    payload = _automatic_payload(cycle)
+    await worker_module._attempt_automatic_ready_package_creation(db=object(), orchestration_payload=payload)
+    await worker_module._attempt_automatic_ready_package_creation(db=object(), orchestration_payload=payload)
+
+    assert created_count["value"] == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("cycle", "active_ready", "active_activation", "open_order", "unresolved_recon"),
+    [
+        (_automatic_cycle(termination_stage="hold_no_package_created", proposed_action="HOLD", decision_kind="HOLD"), False, False, False, False),
+        (_automatic_cycle(termination_stage="failed_closed", proposed_action="FAILED_CLOSED", decision_kind="MANUAL_REVIEW_REQUIRED"), False, False, False, False),
+        (_automatic_cycle(freshness="stale"), False, False, False, False),
+        (_automatic_cycle(decision_record_id=None), False, False, False, False),
+        (_automatic_cycle(risk_verdict="VETO"), False, False, False, False),
+        (_automatic_cycle(final_amount="4.50"), False, False, False, False),
+        (_automatic_cycle(), True, False, False, False),
+        (_automatic_cycle(), False, True, False, False),
+        (_automatic_cycle(), False, False, True, False),
+        (_automatic_cycle(), False, False, False, True),
+    ],
+)
+async def test_automatic_ready_package_skip_conditions_create_no_package(
+    monkeypatch: pytest.MonkeyPatch,
+    cycle: SimpleNamespace,
+    active_ready: bool,
+    active_activation: bool,
+    open_order: bool,
+    unresolved_recon: bool,
+) -> None:
+    import app.services.orchestration.continuous_pipeline_worker as worker_module
+
+    create_calls = {"count": 0}
+
+    async def _fake_create(*, db, request):
+        create_calls["count"] += 1
+        return {
+            "idempotent": False,
+            "package": {"package_id": str(uuid.uuid4()), "package_state": "READY"},
+            "readiness": {"ready": True, "package_state": "READY"},
+        }
+
+    monkeypatch.setattr(worker_module, "_load_cycle_by_id", _async_return(cycle))
+    monkeypatch.setattr(worker_module, "_has_active_ready_package_for_opportunity", _async_return(active_ready))
+    monkeypatch.setattr(worker_module, "_has_active_proving_activation", _async_return(active_activation))
+    monkeypatch.setattr(worker_module, "_has_open_live_order", _async_return(open_order))
+    monkeypatch.setattr(worker_module, "_has_unresolved_reconciliation", _async_return(unresolved_recon))
+    monkeypatch.setattr(worker_module, "_load_runtime_campaign", _async_return(SimpleNamespace(paper_account_id=uuid.uuid4())))
+    monkeypatch.setattr(worker_module, "_load_live_trading_profile_for_paper_account", _async_return(SimpleNamespace(id=uuid.uuid4())))
+    monkeypatch.setattr(worker_module, "create_canonical_preview_package", _fake_create)
+
+    await worker_module._attempt_automatic_ready_package_creation(db=object(), orchestration_payload=_automatic_payload(cycle))
+
+    assert create_calls["count"] == 0
+
+
+@pytest.mark.asyncio
+async def test_automatic_ready_package_path_never_calls_authorize_activate_dryrun_or_provider_submit(monkeypatch: pytest.MonkeyPatch) -> None:
+    import app.services.canonical_preview_package as canonical_package
+    import app.services.live_crypto_orders as live_crypto_orders
+    import app.services.orchestration.continuous_pipeline_worker as worker_module
+
+    cycle = _automatic_cycle()
+    runtime_campaign = SimpleNamespace(paper_account_id=uuid.uuid4())
+    profile = SimpleNamespace(id=uuid.uuid4())
+    called = {
+        "authorize": 0,
+        "activate": 0,
+        "dry_run": 0,
+        "provider_submit": 0,
+    }
+
+    async def _unexpected_authorize(*args, **kwargs):
+        called["authorize"] += 1
+        raise AssertionError("authorize should not be called")
+
+    async def _unexpected_activate(*args, **kwargs):
+        called["activate"] += 1
+        raise AssertionError("activate should not be called")
+
+    async def _unexpected_dry_run(*args, **kwargs):
+        called["dry_run"] += 1
+        raise AssertionError("dry run should not be called")
+
+    async def _unexpected_submit(*args, **kwargs):
+        called["provider_submit"] += 1
+        raise AssertionError("provider submit should not be called")
+
+    async def _fake_create(*, db, request):
+        return {
+            "idempotent": False,
+            "package": {"package_id": str(uuid.uuid4()), "package_state": "READY"},
+            "readiness": {"ready": True, "package_state": "READY"},
+        }
+
+    monkeypatch.setattr(canonical_package, "authorize_canonical_preview_package", _unexpected_authorize)
+    monkeypatch.setattr(canonical_package, "activate_canonical_proving_campaign", _unexpected_activate)
+    monkeypatch.setattr(canonical_package, "run_dry_run_for_canonical_preview_package", _unexpected_dry_run)
+    monkeypatch.setattr(live_crypto_orders.LiveCryptoOrderService, "submit", _unexpected_submit)
+
+    monkeypatch.setattr(worker_module, "_load_cycle_by_id", _async_return(cycle))
+    monkeypatch.setattr(worker_module, "_has_active_ready_package_for_opportunity", _async_return(False))
+    monkeypatch.setattr(worker_module, "_has_active_proving_activation", _async_return(False))
+    monkeypatch.setattr(worker_module, "_has_open_live_order", _async_return(False))
+    monkeypatch.setattr(worker_module, "_has_unresolved_reconciliation", _async_return(False))
+    monkeypatch.setattr(worker_module, "_load_runtime_campaign", _async_return(runtime_campaign))
+    monkeypatch.setattr(worker_module, "_load_live_trading_profile_for_paper_account", _async_return(profile))
+    monkeypatch.setattr(worker_module, "create_canonical_preview_package", _fake_create)
+
+    await worker_module._attempt_automatic_ready_package_creation(db=object(), orchestration_payload=_automatic_payload(cycle))
+
+    assert called["authorize"] == 0
+    assert called["activate"] == 0
+    assert called["dry_run"] == 0
+    assert called["provider_submit"] == 0
+
+
 @pytest.mark.asyncio
 async def test_new_buy_signal_reaches_orchestrator(monkeypatch: pytest.MonkeyPatch) -> None:
     db = _FakeDB()
