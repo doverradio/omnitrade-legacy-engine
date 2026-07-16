@@ -215,6 +215,41 @@ def _strategy_identity_is_coherent(*, strategy_identity: str | None, strategy_ve
     return identity_version is None or reported_only_version == identity_version
 
 
+def _resolve_decision_signal_identity(decision_record: DecisionRecord) -> tuple[str | None, str | None, str | None, str | None]:
+    signals = decision_record.generated_signals if isinstance(decision_record.generated_signals, list) else []
+    identities: list[tuple[str, str, str]] = []
+    for item in signals:
+        if not isinstance(item, dict):
+            continue
+        raw_signal_identity = str(item.get("strategy_identity") or item.get("strategy") or item.get("strategy_slug") or "").strip()
+        raw_signal_version = str(item.get("strategy_version") or item.get("version") or "").strip()
+        signal_action = str(item.get("action") or "").strip().upper()
+        if not raw_signal_identity and not raw_signal_version:
+            continue
+
+        signal_slug, signal_identity_version = _split_strategy_identity(raw_signal_identity)
+        version_slug, version_only = _split_strategy_identity(raw_signal_version)
+
+        if signal_slug and version_only and version_slug and version_slug != signal_slug:
+            return None, None, None, "strategy_identity_incoherent"
+
+        resolved_slug = signal_slug or version_slug
+        resolved_version = version_only or signal_identity_version
+        if not resolved_slug:
+            return None, None, None, "strategy_evidence_unavailable"
+        resolved_identity = resolved_slug if resolved_version is None else f"{resolved_slug}@{resolved_version}"
+        identities.append((resolved_identity, resolved_identity, signal_action or "HOLD"))
+
+    if not identities:
+        return None, None, None, "strategy_evidence_unavailable"
+
+    unique = {(identity, version, action) for identity, version, action in identities}
+    if len(unique) > 1:
+        return None, None, None, "strategy_identity_incoherent"
+    identity, version, action = identities[0]
+    return identity, version, action, None
+
+
 async def _load_runtime_campaign(*, db: AsyncSession, runtime_campaign_uuid: UUID) -> CapitalCampaign | None:
     return await db.scalar(select(CapitalCampaign).where(CapitalCampaign.uuid == runtime_campaign_uuid).limit(1))
 
@@ -321,9 +356,11 @@ async def _load_latest_strategy_evidence(
     if matching_support is None:
         return None, "strategy_evidence_unavailable"
 
-    if preferred_strategy_identity and proposal.strategy_identity != preferred_strategy_identity and str(
-        matching_support.get("strategy_identity") or matching_support.get("strategy_id") or ""
-    ).strip() != preferred_strategy_identity:
+    decision_strategy_identity, decision_strategy_version, decision_action, identity_error = _resolve_decision_signal_identity(decision_record)
+    if identity_error is not None:
+        return None, identity_error
+
+    if preferred_strategy_identity and decision_strategy_identity != preferred_strategy_identity and proposal.strategy_identity != preferred_strategy_identity:
         return None, "strategy_evidence_unavailable"
 
     expected_value = None
@@ -347,9 +384,9 @@ async def _load_latest_strategy_evidence(
         "freshness": "fresh",
         "availability": "available",
         "reason": "strategy evidence resolved from persisted decision and roster records",
-        "strategy_identity": str(matching_support.get("strategy_identity") or matching_support.get("strategy_id") or proposal.strategy_identity),
-        "strategy_version": str(matching_support.get("version") or proposal.strategy_version),
-        "action": str(matching_support.get("action") or proposal.action),
+        "strategy_identity": decision_strategy_identity,
+        "strategy_version": decision_strategy_version,
+        "action": decision_action,
         "score": str(matching_support.get("score")) if matching_support.get("score") is not None else (format(proposal.strength, "f") if proposal.strength is not None else None),
         "confidence": str(matching_support.get("confidence")) if matching_support.get("confidence") is not None else (format(proposal.confidence, "f") if proposal.confidence is not None else None),
         "sample_size": best_scorecard.aggregate.total_evaluated,
