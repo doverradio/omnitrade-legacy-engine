@@ -34,6 +34,7 @@ from app.operator_cli.service import (
     canonical_preview_package_history,
     canonical_preview_package_readiness,
     canonical_proving_activation_status,
+    campaign_unattended_eligibility_audit,
     create_canonical_preview_package_bundle,
     activate_venue_commission_run,
     fetch_canonical_campaign_binding_audit,
@@ -674,6 +675,19 @@ def _build_parser() -> argparse.ArgumentParser:
     first_profit.add_argument("--product", type=str, required=True)
     first_profit.add_argument("--json", action="store_true", dest="json_output")
 
+    unattended_eligibility = subparsers.add_parser(
+        "campaign-unattended-eligibility-audit",
+        parents=[common],
+        help="Read-only audit for unattended campaign orchestration eligibility",
+        description="Audits exact unattended campaign-selection gates for one campaign/version without writing state.",
+    )
+    unattended_eligibility.add_argument("--campaign-id", type=UUID, required=True)
+    unattended_eligibility.add_argument("--campaign-version", type=int, required=True)
+    unattended_eligibility.add_argument("--provider", type=str, required=True)
+    unattended_eligibility.add_argument("--environment", type=str, required=True)
+    unattended_eligibility.add_argument("--product", type=str, required=True)
+    unattended_eligibility.add_argument("--json", action="store_true", dest="json_output")
+
     return parser
 
 
@@ -1048,6 +1062,16 @@ async def _run_async(args: argparse.Namespace) -> tuple[int, dict[str, Any], str
             runtime_campaign_id=args.runtime_campaign_id,
             paper_account_id=args.paper_account_id,
             live_trading_profile_id=args.live_trading_profile_id,
+            provider=args.provider,
+            environment=args.environment,
+            product_id=args.product,
+        )
+        return 0, payload, render_json(payload)
+
+    if args.command == "campaign-unattended-eligibility-audit":
+        payload = await campaign_unattended_eligibility_audit(
+            campaign_id=args.campaign_id,
+            campaign_version=args.campaign_version,
             provider=args.provider,
             environment=args.environment,
             product_id=args.product,

@@ -87,6 +87,8 @@ from app.services.capital_campaign_orchestration import (
     fetch_campaign_orchestration_status as _fetch_campaign_orchestration_status,
     run_campaign_orchestration_preview_for_candle,
 )
+from app.services.capital_campaign_orchestration.service import _eligible_for_orchestration
+from app.services.capital_campaign_domain.service import list_campaign_definitions as _list_campaign_definitions
 from app.services.exchange_connections import refresh_exchange_balances as _refresh_exchange_balances
 from app.services.paper.accounting import build_account_snapshot
 from app.services.risk import risk_monitor
@@ -115,11 +117,414 @@ _FIRST_PROFIT_STAGE_ANCHORS: dict[int, float] = {
     9: 99.97,
     10: 100.0,
 }
+_ORCHESTRATION_READINESS_STATUSES = {"DRAFT", "READY", "ACTIVE", "PAUSED"}
 
 
 def _product_symbol(value: str) -> str:
     normalized = normalize_product_id(value)
     return normalized.split("-", 1)[0] if "-" in normalized else normalized
+
+
+def _gate_state(*, passed: bool | None) -> str:
+    if passed is None:
+        return "NOT_APPLICABLE"
+    return "PASSED" if passed else "FAILED"
+
+
+def _normalized_allowed(values: Any, *, lower: bool) -> list[str]:
+    if not isinstance(values, list):
+        return []
+    out: list[str] = []
+    for value in values:
+        item = str(value or "").strip()
+        if not item:
+            continue
+        out.append(item.lower() if lower else item.upper())
+    return sorted(set(out))
+
+
+def _parse_effective_timestamp(value: Any) -> datetime | None:
+    if value is None:
+        return None
+    if isinstance(value, datetime):
+        return value if value.tzinfo is not None else value.replace(tzinfo=timezone.utc)
+    raw = str(value).strip()
+    if not raw:
+        return None
+    if raw.endswith("Z"):
+        raw = f"{raw[:-1]}+00:00"
+    try:
+        parsed = datetime.fromisoformat(raw)
+    except ValueError:
+        return None
+    return parsed if parsed.tzinfo is not None else parsed.replace(tzinfo=timezone.utc)
+
+
+def _root_cause_code(*, gates: dict[str, str], runtime_linked_uuid: str | None, campaign_id: UUID, would_appear: bool) -> str:
+    if gates.get("definition_row_exists") == "FAILED":
+        return "DEFINITION_ROW_MISSING"
+    if gates.get("requested_version_is_latest") == "FAILED":
+        return "REQUESTED_VERSION_NOT_LATEST"
+    if gates.get("runtime_campaign_exists") == "FAILED":
+        if runtime_linked_uuid and runtime_linked_uuid != str(campaign_id):
+            return "RUNTIME_UUID_LINK_MISMATCH"
+        return "RUNTIME_CAMPAIGN_MISSING"
+    if gates.get("runtime_uuid_link_matches") == "FAILED":
+        return "RUNTIME_UUID_LINK_MISMATCH"
+    if gates.get("runtime_definition_version_matches") == "FAILED":
+        return "RUNTIME_DEFINITION_VERSION_MISMATCH"
+    if gates.get("status_allowed_for_orchestration") == "FAILED":
+        return "CAMPAIGN_STATUS_INELIGIBLE"
+    if gates.get("draft_allowed_in_unattended_mode") == "FAILED":
+        return "DRAFT_EXCLUDED_FROM_UNATTENDED_MODE"
+    if gates.get("product_allowed") == "FAILED":
+        return "PRODUCT_NOT_ALLOWED"
+    if gates.get("provider_allowed") == "FAILED":
+        return "PROVIDER_NOT_ALLOWED"
+    if gates.get("effective_time_window_valid") == "FAILED":
+        return "CAMPAIGN_OUTSIDE_EFFECTIVE_WINDOW"
+    if would_appear:
+        return "ELIGIBLE"
+    return "OTHER:unresolved_unattended_selection_miss"
+
+
+def _build_campaign_unattended_eligibility_audit_payload(
+    *,
+    campaign_id: UUID,
+    campaign_version: int,
+    provider: str,
+    environment: str,
+    product_id: str,
+    definition: CapitalCampaignDefinition | None,
+    available_versions: list[int],
+    latest_version: int | None,
+    runtime_exact: CapitalCampaign | None,
+    runtime_linked: CapitalCampaign | None,
+    unattended_considered: list[dict[str, Any]],
+    unattended_eligible: list[dict[str, Any]],
+    unattended_skipped: list[dict[str, Any]],
+) -> dict[str, Any]:
+    now = datetime.now(timezone.utc)
+    normalized_product = normalize_product_id(product_id)
+    normalized_provider = str(provider or "").strip().lower()
+    normalized_environment = str(environment or "").strip().lower()
+
+    definition_exists = definition is not None
+    requested_is_latest = None if latest_version is None else (int(campaign_version) == int(latest_version))
+
+    runtime_exists = None if not definition_exists else (runtime_exact is not None)
+    runtime_uuid_link_matches = None
+    if definition_exists and runtime_exact is not None:
+        runtime_uuid_link_matches = str(runtime_exact.uuid) == str(definition.campaign_id)
+
+    runtime_definition_version_matches = None
+    if definition_exists and runtime_exact is not None:
+        runtime_definition_version_matches = int(getattr(runtime_exact, "definition_version", -1) or -1) == int(definition.version)
+
+    status_allowed = None
+    draft_allowed = None
+    product_allowed = None
+    provider_allowed = None
+    effective_window_valid = None
+
+    allowed_instruments: list[str] = []
+    allowed_venues: list[str] = []
+    effective_start = None
+    effective_end = None
+    campaign_modes: list[str] = []
+
+    if definition_exists:
+        allowed_instruments = _normalized_allowed(getattr(definition, "allowed_instruments", []), lower=False)
+        allowed_venues = _normalized_allowed(getattr(definition, "allowed_venues", []), lower=True)
+        campaign_modes = list(getattr(definition, "campaign_modes", []) or [])
+        status = str(getattr(definition, "status", "")).strip().upper()
+        status_allowed = status in _ORCHESTRATION_READINESS_STATUSES
+        draft_allowed = status != "DRAFT"
+        product_allowed = normalized_product in allowed_instruments
+        provider_allowed = normalized_provider in allowed_venues
+        metadata_evidence = getattr(definition, "metadata_evidence", {}) if isinstance(getattr(definition, "metadata_evidence", {}), dict) else {}
+        effective_start = _parse_effective_timestamp(metadata_evidence.get("effective_start_at") or metadata_evidence.get("start_at"))
+        effective_end = _parse_effective_timestamp(metadata_evidence.get("effective_end_at") or metadata_evidence.get("end_at"))
+        if effective_start is not None or effective_end is not None:
+            effective_window_valid = (effective_start is None or now >= effective_start) and (effective_end is None or now <= effective_end)
+
+    unattended_keys = {(str(item.get("campaign_id")), int(item.get("version"))) for item in unattended_eligible}
+    would_appear = (str(campaign_id), int(campaign_version)) in unattended_keys
+
+    gate_rows = [
+        {
+            "name": "latest_definition_exists",
+            "state": _gate_state(passed=latest_version is not None),
+            "expected": "latest definition version exists",
+            "actual": None if latest_version is None else str(latest_version),
+        },
+        {
+            "name": "definition_row_exists",
+            "state": _gate_state(passed=definition_exists),
+            "expected": f"capital_campaign_definitions row for campaign_id={campaign_id} version={campaign_version}",
+            "actual": "found" if definition_exists else "missing",
+        },
+        {
+            "name": "requested_version_is_latest",
+            "state": _gate_state(passed=requested_is_latest),
+            "expected": None if latest_version is None else str(latest_version),
+            "actual": str(campaign_version),
+        },
+        {
+            "name": "runtime_campaign_exists",
+            "state": _gate_state(passed=runtime_exists),
+            "expected": None if not definition_exists else f"capital_campaigns.uuid={campaign_id}",
+            "actual": None if runtime_exact is None else str(runtime_exact.id),
+        },
+        {
+            "name": "runtime_uuid_link_matches",
+            "state": _gate_state(passed=runtime_uuid_link_matches),
+            "expected": None if runtime_exact is None else str(campaign_id),
+            "actual": None if runtime_exact is None else str(runtime_exact.uuid),
+        },
+        {
+            "name": "runtime_definition_version_matches",
+            "state": _gate_state(passed=runtime_definition_version_matches),
+            "expected": None if runtime_exact is None or definition is None else str(definition.version),
+            "actual": None if runtime_exact is None else str(getattr(runtime_exact, "definition_version", None)),
+        },
+        {
+            "name": "status_allowed_for_orchestration",
+            "state": _gate_state(passed=status_allowed),
+            "expected": sorted(_ORCHESTRATION_READINESS_STATUSES),
+            "actual": None if definition is None else str(getattr(definition, "status", None)),
+        },
+        {
+            "name": "draft_allowed_in_unattended_mode",
+            "state": _gate_state(passed=draft_allowed),
+            "expected": "status != DRAFT (allow_draft_preview=False)",
+            "actual": None if definition is None else str(getattr(definition, "status", None)),
+        },
+        {
+            "name": "product_allowed",
+            "state": _gate_state(passed=product_allowed),
+            "expected": normalized_product,
+            "actual": allowed_instruments,
+        },
+        {
+            "name": "provider_allowed",
+            "state": _gate_state(passed=provider_allowed),
+            "expected": normalized_provider,
+            "actual": allowed_venues,
+        },
+        {
+            "name": "effective_time_window_valid",
+            "state": _gate_state(passed=effective_window_valid),
+            "expected": "now within [effective_start_at,effective_end_at] when configured",
+            "actual": {
+                "now": now.isoformat(),
+                "effective_start_at": None if effective_start is None else effective_start.isoformat(),
+                "effective_end_at": None if effective_end is None else effective_end.isoformat(),
+            },
+        },
+        {
+            "name": "environment_filter_applies",
+            "state": "NOT_APPLICABLE",
+            "expected": "unattended campaign selection does not filter by environment",
+            "actual": normalized_environment,
+        },
+    ]
+
+    gate_state_map = {item["name"]: item["state"] for item in gate_rows}
+    root_code = _root_cause_code(
+        gates=gate_state_map,
+        runtime_linked_uuid=None if runtime_linked is None else str(runtime_linked.uuid),
+        campaign_id=campaign_id,
+        would_appear=would_appear,
+    )
+
+    definition_payload = None
+    if definition is not None:
+        definition_payload = {
+            "campaign_id": str(definition.campaign_id),
+            "version": int(definition.version),
+            "status": str(definition.status),
+            "allowed_instruments": list(definition.allowed_instruments or []),
+            "allowed_venues": list(definition.allowed_venues or []),
+            "effective_start_at": None if effective_start is None else effective_start.isoformat(),
+            "effective_end_at": None if effective_end is None else effective_end.isoformat(),
+            "campaign_modes": campaign_modes,
+            "orchestration_enablement": {
+                "status_allowed": bool(status_allowed) if status_allowed is not None else None,
+                "draft_allowed_in_unattended": bool(draft_allowed) if draft_allowed is not None else None,
+            },
+        }
+
+    runtime_payload = None
+    if runtime_exact is not None:
+        runtime_payload = {
+            "runtime_id": int(runtime_exact.id),
+            "uuid": str(runtime_exact.uuid),
+            "definition_version": getattr(runtime_exact, "definition_version", None),
+            "status": getattr(runtime_exact, "status", None),
+            "paper_account_id": None if getattr(runtime_exact, "paper_account_id", None) is None else str(runtime_exact.paper_account_id),
+            "starting_capital": _decimal_str(getattr(runtime_exact, "starting_capital", None)),
+            "current_equity": _decimal_str(getattr(runtime_exact, "current_equity", None)),
+            "realized_profit": _decimal_str(getattr(runtime_exact, "realized_profit", None)),
+            "unrealized_profit": _decimal_str(getattr(runtime_exact, "unrealized_profit", None)),
+            "roi": _decimal_str(getattr(runtime_exact, "roi", None)),
+        }
+
+    return {
+        "campaign_id": str(campaign_id),
+        "campaign_version": int(campaign_version),
+        "provider": normalized_provider,
+        "environment": normalized_environment,
+        "product": normalized_product,
+        "definition_row_exists": definition_exists,
+        "available_definition_versions": available_versions,
+        "latest_definition_version": latest_version,
+        "definition": definition_payload,
+        "runtime": runtime_payload,
+        "runtime_linked_record": None
+        if runtime_linked is None
+        else {
+            "runtime_id": int(runtime_linked.id),
+            "uuid": str(runtime_linked.uuid),
+            "definition_campaign_id": None
+            if getattr(runtime_linked, "definition_campaign_id", None) is None
+            else str(runtime_linked.definition_campaign_id),
+            "definition_version": getattr(runtime_linked, "definition_version", None),
+        },
+        "unattended_scan": {
+            "considered_campaigns": unattended_considered,
+            "eligible_campaigns": unattended_eligible,
+            "skipped_campaigns": unattended_skipped,
+            "would_appear_in_unattended_candidate_list_today": would_appear,
+        },
+        "gates": gate_rows,
+        "root_cause_code": root_code,
+        "invariants": {
+            "read_only": True,
+            "no_database_writes": True,
+            "no_campaign_transition": True,
+            "no_package_creation": True,
+            "no_authorization": True,
+            "no_activation": True,
+            "no_provider_order_submission": True,
+            "no_capital_movement": True,
+        },
+    }
+
+
+async def campaign_unattended_eligibility_audit(
+    *,
+    campaign_id: UUID,
+    campaign_version: int,
+    provider: str,
+    environment: str,
+    product_id: str,
+) -> dict[str, Any]:
+    async with AsyncSessionLocal() as db:
+        definition = await db.scalar(
+            select(CapitalCampaignDefinition)
+            .where(CapitalCampaignDefinition.campaign_id == campaign_id)
+            .where(CapitalCampaignDefinition.version == campaign_version)
+            .limit(1)
+        )
+
+        available_version_rows = list(
+            (
+                await db.execute(
+                    select(CapitalCampaignDefinition.version)
+                    .where(CapitalCampaignDefinition.campaign_id == campaign_id)
+                    .order_by(desc(CapitalCampaignDefinition.version))
+                )
+            ).scalars().all()
+        )
+        available_versions = [int(item) for item in available_version_rows]
+        latest_version = max(available_versions) if available_versions else None
+
+        runtime_exact = await db.scalar(
+            select(CapitalCampaign)
+            .where(CapitalCampaign.uuid == campaign_id)
+            .order_by(desc(CapitalCampaign.updated_at), desc(CapitalCampaign.id))
+            .limit(1)
+        )
+        runtime_linked = await db.scalar(
+            select(CapitalCampaign)
+            .where(CapitalCampaign.definition_campaign_id == campaign_id)
+            .order_by(desc(CapitalCampaign.updated_at), desc(CapitalCampaign.id))
+            .limit(1)
+        )
+
+        unattended_scan = await _list_campaign_definitions(
+            db=db,
+            campaign_id=None,
+            status=None,
+            latest_only=True,
+        )
+        considered_campaigns = [
+            {
+                "campaign_id": str(item.campaign_id),
+                "version": int(item.version),
+                "status": str(item.status),
+            }
+            for item in unattended_scan.items
+        ]
+
+        unattended_eligible: list[dict[str, Any]] = []
+        unattended_skipped: list[dict[str, Any]] = []
+        for item in unattended_scan.items:
+            eligible_scope = _eligible_for_orchestration(campaign=item)
+            status_value = str(getattr(item, "status", "")).strip().upper()
+            if not eligible_scope:
+                reasons: list[str] = []
+                if status_value not in _ORCHESTRATION_READINESS_STATUSES:
+                    reasons.append("status_not_ready_for_orchestration")
+                normalized_instruments = _normalized_allowed(getattr(item, "allowed_instruments", []), lower=False)
+                normalized_venues = _normalized_allowed(getattr(item, "allowed_venues", []), lower=True)
+                if normalize_product_id(product_id) not in normalized_instruments:
+                    reasons.append("product_not_allowed")
+                if str(provider or "").strip().lower() not in normalized_venues:
+                    reasons.append("provider_not_allowed")
+                unattended_skipped.append(
+                    {
+                        "campaign_id": str(item.campaign_id),
+                        "version": int(item.version),
+                        "reason": ",".join(reasons) if reasons else "ineligible_scope",
+                    }
+                )
+                continue
+
+            if status_value == "DRAFT":
+                unattended_skipped.append(
+                    {
+                        "campaign_id": str(item.campaign_id),
+                        "version": int(item.version),
+                        "reason": "draft_excluded_from_unattended_mode",
+                    }
+                )
+                continue
+
+            unattended_eligible.append(
+                {
+                    "campaign_id": str(item.campaign_id),
+                    "version": int(item.version),
+                    "status": status_value,
+                }
+            )
+
+    return _build_campaign_unattended_eligibility_audit_payload(
+        campaign_id=campaign_id,
+        campaign_version=campaign_version,
+        provider=provider,
+        environment=environment,
+        product_id=product_id,
+        definition=definition,
+        available_versions=available_versions,
+        latest_version=latest_version,
+        runtime_exact=runtime_exact,
+        runtime_linked=runtime_linked,
+        unattended_considered=considered_campaigns,
+        unattended_eligible=unattended_eligible,
+        unattended_skipped=unattended_skipped,
+    )
 
 
 def _interval_minutes(interval: str | None) -> int | None:

@@ -452,6 +452,29 @@ def test_parse_first_autonomous_profit_status_command() -> None:
     assert args.json_output is True
 
 
+def test_parse_campaign_unattended_eligibility_audit_command() -> None:
+    args = parse_args([
+        "campaign-unattended-eligibility-audit",
+        "--campaign-id",
+        "e9a9e8e9-9574-498d-b49e-f011218c7f2b",
+        "--campaign-version",
+        "1",
+        "--provider",
+        "kraken_spot",
+        "--environment",
+        "production",
+        "--product",
+        "BTC-USD",
+        "--json",
+    ])
+    assert args.command == "campaign-unattended-eligibility-audit"
+    assert args.campaign_version == 1
+    assert args.provider == "kraken_spot"
+    assert args.environment == "production"
+    assert args.product == "BTC-USD"
+    assert args.json_output is True
+
+
 def test_parse_canonical_campaign_authority_audit_rejects_malformed_uuid() -> None:
     with pytest.raises(SystemExit):
         parse_args([
@@ -722,6 +745,39 @@ async def test_run_async_routes_first_autonomous_profit_status(monkeypatch: pyte
     assert code == 0
     assert payload["status"] == "WAITING_FOR_EXECUTABLE_SIGNAL"
     assert "completion_percent" in text
+
+
+@pytest.mark.asyncio
+async def test_run_async_routes_campaign_unattended_eligibility_audit(monkeypatch: pytest.MonkeyPatch) -> None:
+    args = parse_args([
+        "campaign-unattended-eligibility-audit",
+        "--campaign-id",
+        "e9a9e8e9-9574-498d-b49e-f011218c7f2b",
+        "--campaign-version",
+        "1",
+        "--provider",
+        "kraken_spot",
+        "--environment",
+        "production",
+        "--product",
+        "BTC-USD",
+        "--json",
+    ])
+
+    async def _fake_audit(**kwargs):
+        assert kwargs["campaign_version"] == 1
+        assert kwargs["provider"] == "kraken_spot"
+        return {
+            "root_cause_code": "ELIGIBLE",
+            "unattended_scan": {"would_appear_in_unattended_candidate_list_today": True},
+        }
+
+    monkeypatch.setattr(operator_main, "campaign_unattended_eligibility_audit", _fake_audit)
+    code, payload, text = await operator_main._run_async(args)
+
+    assert code == 0
+    assert payload["root_cause_code"] == "ELIGIBLE"
+    assert "would_appear_in_unattended_candidate_list_today" in text
 
 
 def test_parse_rejects_nonexistent_canonical_campaign_binding_status_command() -> None:
