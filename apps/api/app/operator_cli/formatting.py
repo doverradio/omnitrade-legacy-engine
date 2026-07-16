@@ -1074,4 +1074,73 @@ def render_venue_commission_text(payload: dict[str, Any], options: RenderOptions
             )
         )
 
+    diagnostics = payload.get("diagnostics") if isinstance(payload.get("diagnostics"), list) else []
+    if diagnostics:
+        lines.append("Diagnostics")
+        lines.append("-----------" if not options.unicode_enabled else "───────────")
+        for item in diagnostics:
+            code = _fmt(item.get("code"), default="unknown")
+            stage = _fmt(item.get("stage"), default="unknown")
+            detail = _fmt(item.get("detail"), default="")
+            lines.append(f"- {code} @ {stage}{'' if detail in {'', 'unknown'} else f' ({detail})'}")
+        lines.append("")
+
+    return "\n".join(lines)
+
+
+def render_buy_opportunity_diagnostic_text(payload: dict[str, Any], options: RenderOptions) -> str:
+    totals = payload.get("totals") or {}
+    summary = payload.get("summary") or {}
+    campaign = payload.get("canonical_proving_campaign") or {}
+    window = payload.get("window") or {}
+    buy_rows = payload.get("buy_blockers") or []
+
+    lines = _frame_header("BUY OPPORTUNITY DIAGNOSTIC", options)
+    lines.extend(
+        _section(
+            "Scope",
+            [
+                ("Window", f"Last {window.get('hours', 24)} hours"),
+                ("Start", _fmt(window.get("start"), default="Unavailable")),
+                ("End", _fmt(window.get("end"), default="Unavailable")),
+                ("Campaign ID", _fmt(campaign.get("campaign_id"), default="Unavailable")),
+                ("Campaign Version", _fmt(campaign.get("campaign_version"), default="Unavailable")),
+            ],
+            options,
+        )
+    )
+
+    lines.extend(
+        _section(
+            "Totals",
+            [
+                ("Strategy evaluations", _fmt(totals.get("strategy_evaluations"), default="0")),
+                ("BUY opportunities", _fmt(totals.get("buy_opportunities"), default="0")),
+                ("SELL opportunities", _fmt(totals.get("sell_opportunities"), default="0")),
+                ("HOLD decisions", _fmt(totals.get("hold_decisions"), default="0")),
+            ],
+            options,
+        )
+    )
+
+    if payload.get("no_buy_opportunities"):
+        lines.append("No BUY opportunities existed in the last 24 hours.")
+        lines.append("")
+    else:
+        lines.append("BUY blockers")
+        lines.append("------------" if not options.unicode_enabled else "────────────")
+        for item in buy_rows:
+            cycle_id = _fmt(item.get("cycle_id"), default="unknown")
+            blocker = _fmt(item.get("first_blocker"), default="other")
+            reason = _fmt(item.get("blocker_reason"), default="unknown")
+            ready = bool(item.get("ready_package"))
+            ready_note = "ready package: yes" if ready else "ready package: no"
+            lines.append(f"- cycle {cycle_id}: blocker={blocker} ({reason}) [{ready_note}]")
+        lines.append("")
+
+    lines.append("Summary")
+    lines.append("-------" if not options.unicode_enabled else "───────")
+    lines.append(f"BUY opportunities: {summary.get('buy_opportunities', 0)}")
+    lines.append(f"READY packages: {summary.get('ready_packages', 0)}")
+    lines.append(f"Primary blocker: {summary.get('primary_blocker', 'none')}")
     return "\n".join(lines)

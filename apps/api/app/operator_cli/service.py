@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections import Counter
 import re
 from datetime import datetime, timezone
 from datetime import timedelta
@@ -146,6 +147,7 @@ _BUY_CONFIDENCE_BY_AGGRESSION_MODE: dict[str, Decimal] = {
     "AGGRESSIVE": Decimal("0.50"),
     "MAXIMUM_GOVERNED": Decimal("0.45"),
 }
+_READY_PACKAGE_STATES = {"READY", "AUTHORIZED", "DRY_RUN_PASSED", "ACTIVATED"}
 
 
 def _uuid_from_value(value: Any) -> UUID | None:
@@ -691,6 +693,213 @@ async def historical_buy_campaign_replay_audit(
         matching_sell_decision=matching_sell_decision,
         matching_sell_decision_id=matching_sell_decision_id,
     )
+
+
+def _classify_buy_blocker(reason: str) -> str:
+    normalized = str(reason or "").strip().lower()
+    if "confidence" in normalized:
+        return "confidence"
+    if "risk" in normalized or "veto" in normalized or "reject" in normalized:
+        return "Risk"
+    if "fee" in normalized or "net_edge" in normalized or "slippage" in normalized:
+        return "fees"
+    if (
+        "campaign" in normalized
+        or "provider_product" in normalized
+        or "runtime_campaign" in normalized
+        or "product_not_allowed" in normalized
+    ):
+        return "campaign eligibility"
+    if "exposure" in normalized or "allocation" in normalized or "deployed" in normalized:
+        return "exposure"
+    if "maximum_open_positions" in normalized or "position_limit" in normalized:
+        return "position limits"
+    if "existing_position" in normalized or "hold_position" in normalized or "position_below" in normalized:
+        return "existing position"
+    if "package" in normalized or "preview" in normalized or "eligible" in normalized:
+        return "package eligibility"
+    return "other"
+
+
+def _extract_cycle_blocker_reason(cycle: AutonomousCycleRun) -> str:
+    context = cycle.cycle_context if isinstance(cycle.cycle_context, dict) else {}
+    composition = context.get("authoritative_composition") if isinstance(context.get("authoritative_composition"), dict) else {}
+    selected = composition.get("selected_decision") if isinstance(composition.get("selected_decision"), dict) else {}
+
+    selected_reason = str(selected.get("reason") or "").strip()
+    if selected_reason:
+        return selected_reason
+
+    failure_reason = str(cycle.failure_reason or "").strip()
+    if failure_reason:
+        return failure_reason
+
+    for code in cycle.deterministic_explanation or []:
+        token = str(code or "").strip()
+        if token.startswith("CHECK_FAILED:"):
+            return token.split(":", 1)[1]
+
+    return "package_not_created"
+
+
+async def _resolve_canonical_proving_campaign_identity(*, db: Any) -> tuple[UUID | None, int | None, str]:
+    activation = await db.scalar(
+        select(CanonicalProvingActivation)
+        .order_by(desc(CanonicalProvingActivation.activated_at), desc(CanonicalProvingActivation.created_at))
+        .limit(1)
+    )
+    if activation is not None:
+        return activation.campaign_id, int(activation.campaign_version), "canonical_proving_activation"
+
+    definition = await db.scalar(
+        select(CapitalCampaignDefinition)
+        .where(CapitalCampaignDefinition.maximum_open_positions == 1)
+        .where(CapitalCampaignDefinition.minimum_position_size == Decimal("5"))
+        .where(CapitalCampaignDefinition.maximum_position_size == Decimal("5"))
+        .where(CapitalCampaignDefinition.maximum_total_exposure == Decimal("5"))
+        .where(CapitalCampaignDefinition.aggression_mode == "MAXIMUM_GOVERNED")
+        .order_by(desc(CapitalCampaignDefinition.updated_at), desc(CapitalCampaignDefinition.version))
+        .limit(1)
+    )
+    if definition is not None:
+        return definition.campaign_id, int(definition.version), "capital_campaign_definition"
+
+    return None, None, "not_found"
+
+
+async def buy_opportunity_diagnostic() -> dict[str, Any]:
+    now = datetime.now(timezone.utc)
+    window_start = now - timedelta(hours=24)
+
+    async with AsyncSessionLocal() as db:
+        campaign_id, campaign_version, identity_source = await _resolve_canonical_proving_campaign_identity(db=db)
+        if campaign_id is None or campaign_version is None:
+            return {
+                "window": {"hours": 24, "start": window_start.isoformat(), "end": now.isoformat()},
+                "canonical_proving_campaign": None,
+                "totals": {
+                    "strategy_evaluations": 0,
+                    "buy_opportunities": 0,
+                    "sell_opportunities": 0,
+                    "hold_decisions": 0,
+                    "ready_packages": 0,
+                },
+                "buy_blockers": [],
+                "no_buy_opportunities": True,
+                "summary": {
+                    "buy_opportunities": 0,
+                    "ready_packages": 0,
+                    "primary_blocker": "none",
+                },
+                "identity_source": identity_source,
+                "invariants": {
+                    "read_only": True,
+                    "no_database_writes": True,
+                    "no_package_creation": True,
+                    "no_order_submission": True,
+                },
+            }
+
+        cycles = list(
+            (
+                await db.execute(
+                    select(AutonomousCycleRun)
+                    .where(AutonomousCycleRun.cycle_kind == "campaign")
+                    .where(AutonomousCycleRun.capital_campaign_id == campaign_id)
+                    .where(AutonomousCycleRun.capital_campaign_version == campaign_version)
+                    .where(AutonomousCycleRun.started_at >= window_start)
+                    .where(AutonomousCycleRun.started_at <= now)
+                    .order_by(desc(AutonomousCycleRun.started_at), desc(AutonomousCycleRun.cycle_id))
+                )
+            ).scalars().all()
+        )
+
+        packages = list(
+            (
+                await db.execute(
+                    select(CanonicalPreviewPackage)
+                    .where(CanonicalPreviewPackage.campaign_id == campaign_id)
+                    .where(CanonicalPreviewPackage.campaign_version == campaign_version)
+                    .where(CanonicalPreviewPackage.side == "BUY")
+                    .where(CanonicalPreviewPackage.generated_at >= window_start)
+                    .where(CanonicalPreviewPackage.generated_at <= now)
+                    .order_by(desc(CanonicalPreviewPackage.generated_at), desc(CanonicalPreviewPackage.package_id))
+                )
+            ).scalars().all()
+        )
+
+    strategy_evaluations = len(cycles)
+    buy_cycles = [cycle for cycle in cycles if str(cycle.proposed_action or "").upper() == "OPEN_POSITION_PROPOSED"]
+    sell_cycles = [cycle for cycle in cycles if str(cycle.proposed_action or "").upper() == "CLOSE_POSITION_PROPOSED"]
+    hold_cycles = [cycle for cycle in cycles if cycle not in buy_cycles and cycle not in sell_cycles]
+
+    package_by_decision_id: dict[UUID, CanonicalPreviewPackage] = {}
+    for package in packages:
+        if package.decision_record_id in package_by_decision_id:
+            continue
+        package_by_decision_id[package.decision_record_id] = package
+
+    ready_packages = sum(1 for package in packages if str(package.package_state or "").upper() in _READY_PACKAGE_STATES)
+    buy_blockers: list[dict[str, Any]] = []
+    blocked_counter: Counter[str] = Counter()
+    for cycle in buy_cycles:
+        package = package_by_decision_id.get(cycle.decision_record_id) if cycle.decision_record_id is not None else None
+        is_ready = package is not None and str(package.package_state or "").upper() in _READY_PACKAGE_STATES
+
+        if is_ready:
+            reason = "ready_package_created"
+            blocker = "other"
+        elif package is not None:
+            reason = str(package.invalidated_reason or package.package_state or "package_not_ready")
+            blocker = _classify_buy_blocker(reason)
+            blocked_counter[blocker] += 1
+        else:
+            reason = _extract_cycle_blocker_reason(cycle)
+            blocker = _classify_buy_blocker(reason)
+            blocked_counter[blocker] += 1
+
+        buy_blockers.append(
+            {
+                "cycle_id": str(cycle.cycle_id),
+                "decision_record_id": None if cycle.decision_record_id is None else str(cycle.decision_record_id),
+                "evaluated_at": cycle.started_at.isoformat(),
+                "ready_package": is_ready,
+                "package_id": None if package is None else str(package.package_id),
+                "package_state": None if package is None else str(package.package_state),
+                "first_blocker": blocker,
+                "blocker_reason": reason,
+            }
+        )
+
+    primary_blocker = blocked_counter.most_common(1)[0][0] if blocked_counter else "none"
+    return {
+        "window": {"hours": 24, "start": window_start.isoformat(), "end": now.isoformat()},
+        "canonical_proving_campaign": {
+            "campaign_id": str(campaign_id),
+            "campaign_version": int(campaign_version),
+        },
+        "identity_source": identity_source,
+        "totals": {
+            "strategy_evaluations": strategy_evaluations,
+            "buy_opportunities": len(buy_cycles),
+            "sell_opportunities": len(sell_cycles),
+            "hold_decisions": len(hold_cycles),
+            "ready_packages": ready_packages,
+        },
+        "buy_blockers": buy_blockers,
+        "no_buy_opportunities": len(buy_cycles) == 0,
+        "summary": {
+            "buy_opportunities": len(buy_cycles),
+            "ready_packages": ready_packages,
+            "primary_blocker": primary_blocker,
+        },
+        "invariants": {
+            "read_only": True,
+            "no_database_writes": True,
+            "no_package_creation": True,
+            "no_order_submission": True,
+        },
+    }
 
 
 def _product_symbol(value: str) -> str:

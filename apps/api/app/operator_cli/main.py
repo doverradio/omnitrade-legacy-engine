@@ -9,6 +9,7 @@ from typing import Any
 from uuid import UUID, uuid4
 
 from app.operator_cli.formatting import (
+    render_buy_opportunity_diagnostic_text,
     render_candles_text,
     render_execution_forensics_text,
     render_json,
@@ -22,6 +23,7 @@ from app.operator_cli.formatting import (
     render_venue_commission_text,
 )
 from app.operator_cli.service import (
+        buy_opportunity_diagnostic,
     activate_canonical_proving_campaign_bundle,
     bind_canonical_campaign_runtime,
     authorize_canonical_preview_package_bundle,
@@ -770,6 +772,14 @@ def _build_parser() -> argparse.ArgumentParser:
     historical_buy_replay.add_argument("--matching-sell-decision-id", type=UUID, default=None)
     historical_buy_replay.add_argument("--json", action="store_true", dest="json_output")
 
+    buy_opportunity = subparsers.add_parser(
+        "buy-opportunity-diagnostic",
+        parents=[common],
+        help="Read-only 24h diagnostic for canonical proving BUY opportunity outcomes",
+        description="Analyzes last 24h canonical proving campaign evaluations, BUY/SELL/HOLD counts, BUY blockers, and READY package summary.",
+    )
+    buy_opportunity.add_argument("--json", action="store_true", dest="json_output")
+
     return parser
 
 
@@ -1225,6 +1235,11 @@ async def _run_async(args: argparse.Namespace) -> tuple[int, dict[str, Any], str
             matching_sell_decision_id=args.matching_sell_decision_id,
         )
         return 0, payload, render_json(payload)
+
+    if args.command == "buy-opportunity-diagnostic":
+        payload = await buy_opportunity_diagnostic()
+        text = render_json(payload) if args.json_output else render_buy_opportunity_diagnostic_text(payload, options)
+        return 0, payload, text
 
     if args.command == "legacy-campaign-transition-readiness":
         payload = await inspect_legacy_campaign_transition(
