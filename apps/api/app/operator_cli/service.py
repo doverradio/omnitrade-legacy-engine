@@ -27,7 +27,9 @@ from app.models.decision_record import DecisionRecord
 from app.models.decision_snapshot import DecisionSnapshot
 from app.models.exchange_connection import ExchangeConnection
 from app.models.live_crypto_order import LiveCryptoOrder
+from app.models.live_approval_event import LiveApprovalEvent
 from app.models.live_reconciliation_event import LiveReconciliationEvent
+from app.models.live_trading_profile import LiveTradingProfile
 from app.models.paper_account import PaperAccount
 from app.models.risk_event import RiskEvent
 from app.models.signal import Signal
@@ -98,6 +100,710 @@ _TERMINAL_PACKAGE_STATES = {"COMPLETED", "FAILED_CLOSED", "EXPIRED", "INVALIDATE
 _TERMINAL_ACTIVATION_STATES = {"REVOKED", "EXPIRED", "INVALIDATED", "COMPLETED"}
 _TERMINAL_LIVE_ORDER_STATES = {"DRY_RUN_READY", "DRY_RUN_BLOCKED", "FILLED", "CANCELLED", "FAILED", "REJECTED", "EXPIRED", "COMPLETED"}
 _UNRESOLVED_RECONCILIATION_STATES = {"open", "partially_filled", "reconciliation_required", "unknown", "conflict", "balance_mismatch"}
+_KRKN_BTC_INTERVAL = "15m"
+_INTERVAL_INGESTION_GRACE_MINUTES = {"15m": 5}
+_FIRST_PROFIT_STAGE_ANCHORS: dict[int, float] = {
+    1: 75.0,
+    2: 99.6,
+    3: 99.7,
+    4: 99.75,
+    5: 99.8,
+    6: 99.85,
+    7: 99.9,
+    8: 99.93,
+    9: 99.97,
+    10: 100.0,
+}
+
+
+def _interval_minutes(interval: str | None) -> int | None:
+    raw = str(interval or "").strip().lower()
+    if not raw:
+        return None
+    if raw.endswith("m"):
+        value = raw[:-1]
+        return int(value) if value.isdigit() and int(value) > 0 else None
+    if raw.endswith("h"):
+        value = raw[:-1]
+        return int(value) * 60 if value.isdigit() and int(value) > 0 else None
+    if raw.endswith("d"):
+        value = raw[:-1]
+        return int(value) * 1440 if value.isdigit() and int(value) > 0 else None
+    return None
+
+
+def _strategy_identity_is_coherent(*, strategy_identity: str | None, strategy_version: str | None) -> bool:
+    identity = str(strategy_identity or "").strip()
+    version = str(strategy_version or "").strip()
+    if not identity:
+        return False
+    if "@" not in identity:
+        return identity == version or not version
+    slug, identity_version = identity.split("@", 1)
+    slug = slug.strip()
+    identity_version = identity_version.strip()
+    if not slug or not identity_version:
+        return False
+    if not version:
+        return False
+    if "@" in version:
+        v_slug, v_version = version.split("@", 1)
+        return v_slug.strip() == slug and v_version.strip() == identity_version
+    return version == identity_version
+
+
+def _latest_cycle_outcome(cycle: AutonomousCycleRun | None) -> tuple[str | None, str | None, str | None, str | None, str | None]:
+    if cycle is None:
+        return None, None, None, None, None
+    context = cycle.cycle_context if isinstance(cycle.cycle_context, dict) else {}
+    composition = context.get("authoritative_composition") if isinstance(context.get("authoritative_composition"), dict) else {}
+    selected = composition.get("selected_decision") if isinstance(composition.get("selected_decision"), dict) else {}
+    strategy_identity = str(selected.get("strategy_identity") or "").strip() or None
+    strategy_version = str(selected.get("strategy_version") or "").strip() or None
+    return (
+        str(cycle.proposed_action or "").strip() or None,
+        str(cycle.failure_reason or selected.get("reason") or "").strip() or None,
+        str(selected.get("decision_record_id") or "").strip() or None,
+        strategy_identity,
+        strategy_version,
+    )
+
+
+def _derive_first_autonomous_profit_status(evidence: dict[str, Any]) -> dict[str, Any]:
+    now = evidence["now"]
+    runtime = evidence.get("runtime")
+    definition = evidence.get("definition")
+    paper_account = evidence.get("paper_account")
+    profile = evidence.get("profile")
+    connection = evidence.get("connection")
+    latest_candle = evidence.get("latest_candle")
+    latest_cycle = evidence.get("latest_cycle")
+    ready_package = evidence.get("ready_package")
+    approval_event = evidence.get("approval_event")
+    activation = evidence.get("activation")
+    buy_submitted = bool(evidence.get("buy_submitted"))
+    buy_fill_reconciled = bool(evidence.get("buy_fill_reconciled"))
+    sell_submitted = bool(evidence.get("sell_submitted"))
+    sell_fill_reconciled = bool(evidence.get("sell_fill_reconciled"))
+    position_open = bool(evidence.get("position_open"))
+    unresolved_reconciliation_count = int(evidence.get("unresolved_reconciliation_count") or 0)
+    open_live_order_count = int(evidence.get("open_live_order_count") or 0)
+    latest_reconciliation_unknown_count = int(evidence.get("unknown_reconciliation_count") or 0)
+    provider_equity = evidence.get("provider_equity")
+    paper_liquid_cash = evidence.get("paper_liquid_cash")
+    provider_readiness_verdict = str(evidence.get("provider_readiness_verdict") or "").strip()
+    provider_balance_synced_at = evidence.get("provider_balance_synced_at")
+    latest_ingestion_candle_at = evidence.get("latest_ingestion_candle_at")
+    realized_gross_profit = evidence.get("realized_gross_profit")
+    fees = evidence.get("fees")
+    realized_net_profit = evidence.get("realized_net_profit")
+    autonomous_buy_provenance = bool(evidence.get("autonomous_buy_provenance"))
+    autonomous_sell_provenance = bool(evidence.get("autonomous_sell_provenance"))
+    starting_reconciled_usd = evidence.get("starting_reconciled_usd")
+    ending_reconciled_usd = evidence.get("ending_reconciled_usd")
+
+    latest_cycle_outcome, latest_cycle_reason, latest_cycle_decision_record_id, latest_strategy_identity, latest_strategy_version = _latest_cycle_outcome(latest_cycle)
+    latest_strategy_coherent = _strategy_identity_is_coherent(
+        strategy_identity=latest_strategy_identity,
+        strategy_version=latest_strategy_version,
+    ) if latest_strategy_identity is not None and latest_strategy_version is not None else False
+
+    freshness_seconds = None
+    freshness_minutes = None
+    candle_interval_minutes = None
+    ingestion_grace_minutes = None
+    maximum_age_minutes = None
+    freshness_verdict = "unavailable"
+    if latest_candle is not None and getattr(latest_candle, "close_time", None) is not None:
+        close_time = latest_candle.close_time.astimezone(timezone.utc)
+        freshness_seconds = int((now - close_time).total_seconds())
+        freshness_minutes = freshness_seconds // 60
+        candle_interval_minutes = _interval_minutes(getattr(latest_candle, "interval", None))
+        ingestion_grace_minutes = _INTERVAL_INGESTION_GRACE_MINUTES.get(str(getattr(latest_candle, "interval", "")).strip().lower(), 0)
+        if candle_interval_minutes is None:
+            freshness_verdict = "fail_closed_interval_unparseable"
+        elif freshness_seconds < 0:
+            freshness_verdict = "fail_closed_future_timestamp"
+        else:
+            maximum_age_minutes = candle_interval_minutes + ingestion_grace_minutes
+            freshness_verdict = "fresh" if freshness_seconds <= (maximum_age_minutes * 60) else "stale"
+
+    provider_connected = connection is not None and str(getattr(connection, "status", "")) == "connected"
+    provider_ready = provider_readiness_verdict in {"READY_FOR_OPERATOR_REVIEW", "READY", "connected"}
+    provider_balance_fresh = provider_balance_synced_at is not None and isinstance(provider_balance_synced_at, datetime) and int((now - provider_balance_synced_at.astimezone(timezone.utc)).total_seconds()) <= 1800
+    provider_reconciliation_clean = unresolved_reconciliation_count == 0 and latest_reconciliation_unknown_count == 0
+    runtime_campaign_matches = runtime is not None and str(getattr(runtime, "uuid", "")) == str(evidence["campaign_id"]) and int(getattr(runtime, "definition_version", -1)) == int(evidence["campaign_version"])
+    runtime_uses_dedicated_account = runtime is not None and str(getattr(runtime, "paper_account_id", "")) == str(evidence["paper_account_id"])
+    profile_uses_dedicated_account = profile is not None and str(getattr(profile, "paper_account_id", "")) == str(evidence["paper_account_id"])
+    dedicated_account_active = paper_account is not None and bool(getattr(paper_account, "is_active", False))
+    paper_cash_reconciled = unresolved_reconciliation_count == 0
+    paper_liquid_cash_supports_exact_5 = paper_liquid_cash is not None and Decimal(str(paper_liquid_cash)) >= Decimal("5")
+    max_open_positions_one = definition is not None and int(getattr(definition, "maximum_open_positions", -1)) == 1
+    minimum_position_size_five = definition is not None and Decimal(str(getattr(definition, "minimum_position_size", "-1"))) == Decimal("5")
+    maximum_position_size_five = definition is not None and Decimal(str(getattr(definition, "maximum_position_size", "-1"))) == Decimal("5")
+    maximum_total_exposure_five = definition is not None and Decimal(str(getattr(definition, "maximum_total_exposure", "-1"))) == Decimal("5")
+    latest_btc_candle_fresh = freshness_verdict == "fresh"
+    latest_cycle_truthful_terminal = latest_cycle is not None and str(getattr(latest_cycle, "state", "")) in {"COMPLETE", "FAILED_CLOSED"} and str(getattr(latest_cycle, "termination_stage", "")) in {"preview_generated", "hold_no_package_created", "failed_closed"}
+    worker_recently_ingested = latest_ingestion_candle_at is not None and int((now - latest_ingestion_candle_at.astimezone(timezone.utc)).total_seconds()) <= 1800
+    decision_record_linkage_present = latest_cycle_decision_record_id is not None if latest_cycle is not None else False
+
+    ready_package_current = ready_package is not None
+    package_historically_advanced = approval_event is not None or activation is not None or buy_submitted or buy_fill_reconciled or sell_submitted or sell_fill_reconciled
+    hold_no_package_expected = latest_cycle_outcome == "HOLD" and not ready_package_current and not package_historically_advanced
+    package_progress_distinguishable = hold_no_package_expected or ready_package_current or package_historically_advanced
+
+    exact_package_authorization = approval_event is not None or activation is not None or buy_submitted or buy_fill_reconciled or sell_submitted or sell_fill_reconciled
+    dry_run_passed = bool(evidence.get("dry_run_passed")) or activation is not None or buy_submitted or buy_fill_reconciled or sell_submitted or sell_fill_reconciled
+    bounded_activation_exists = activation is not None or buy_submitted or buy_fill_reconciled or sell_submitted or sell_fill_reconciled
+
+    autonomous_buy_submitted = buy_submitted and autonomous_buy_provenance
+    autonomous_buy_fill_reconciled = buy_fill_reconciled and autonomous_buy_provenance
+    autonomous_sell_submitted = sell_submitted and autonomous_sell_provenance
+    autonomous_sell_fill_reconciled = sell_fill_reconciled and autonomous_sell_provenance
+    position_managed_historically = autonomous_buy_fill_reconciled and (autonomous_sell_submitted or autonomous_sell_fill_reconciled)
+
+    positive_realized_net_profit = realized_net_profit is not None and Decimal(str(realized_net_profit)) > Decimal("0")
+    ending_usd_exceeds_starting_usd = (
+        starting_reconciled_usd is not None
+        and ending_reconciled_usd is not None
+        and Decimal(str(ending_reconciled_usd)) > Decimal(str(starting_reconciled_usd))
+    )
+    fees_known = fees is not None
+
+    stage_1_complete = all([
+        provider_connected,
+        provider_ready,
+        runtime_uses_dedicated_account,
+        profile_uses_dedicated_account,
+        paper_cash_reconciled,
+        paper_liquid_cash_supports_exact_5,
+        max_open_positions_one,
+        minimum_position_size_five,
+        maximum_position_size_five,
+        maximum_total_exposure_five,
+        provider_reconciliation_clean,
+    ])
+    stage_2_complete = all([
+        stage_1_complete,
+        latest_btc_candle_fresh,
+        worker_recently_ingested,
+        latest_strategy_coherent,
+        latest_cycle_truthful_terminal,
+    ])
+    stage_3_complete = stage_2_complete and (ready_package_current or package_historically_advanced)
+    stage_4_complete = stage_3_complete and exact_package_authorization
+    stage_5_complete = stage_4_complete and dry_run_passed
+    stage_6_complete = stage_5_complete and bounded_activation_exists
+    stage_7_complete = stage_6_complete and autonomous_buy_submitted and autonomous_buy_fill_reconciled
+    stage_8_complete = stage_7_complete and position_managed_historically
+    stage_9_complete = stage_8_complete and autonomous_sell_submitted and autonomous_sell_fill_reconciled
+    stage_10_complete = stage_9_complete and all([
+        autonomous_buy_provenance,
+        autonomous_buy_fill_reconciled,
+        autonomous_sell_provenance,
+        autonomous_sell_fill_reconciled,
+        fees_known,
+        ending_usd_exceeds_starting_usd,
+        positive_realized_net_profit,
+    ])
+
+    stage_rows = [
+        (1, "FOUNDATION_READY", stage_1_complete),
+        (2, "AUTONOMOUS_EVALUATION_READY", stage_2_complete),
+        (3, "READY_PACKAGE_CREATED", stage_3_complete),
+        (4, "PACKAGE_AUTHORIZED", stage_4_complete),
+        (5, "DRY_RUN_PASSED", stage_5_complete),
+        (6, "BOUNDED_ACTIVATION", stage_6_complete),
+        (7, "LIVE_BUY_RECONCILED", stage_7_complete),
+        (8, "POSITION_MANAGED", stage_8_complete),
+        (9, "LIVE_SELL_RECONCILED", stage_9_complete),
+        (10, "POSITIVE_NET_PROFIT_CONFIRMED", stage_10_complete),
+    ]
+
+    highest_contiguous_stage = 0
+    for stage_number, _, completed in stage_rows:
+        if completed:
+            highest_contiguous_stage = stage_number
+            continue
+        break
+
+    def _checkpoint_state(*, passed: bool, waiting: bool = False, not_applicable: bool = False, completed_historically: bool = False) -> str:
+        if passed:
+            return "PASSED"
+        if completed_historically:
+            return "COMPLETED_HISTORICALLY"
+        if not_applicable:
+            return "NOT_APPLICABLE"
+        if waiting:
+            return "WAITING"
+        return "FAILED"
+
+    checkpoint_rows = [
+        ("provider_connection_connected", provider_connected, _checkpoint_state(passed=provider_connected)),
+        ("provider_readiness_acceptable", provider_ready, _checkpoint_state(passed=provider_ready)),
+        ("provider_balance_fresh", provider_balance_fresh, _checkpoint_state(passed=provider_balance_fresh, completed_historically=stage_9_complete and not provider_balance_fresh)),
+        ("provider_reconciliation_clean", provider_reconciliation_clean, _checkpoint_state(passed=provider_reconciliation_clean)),
+        ("runtime_campaign_matches", runtime_campaign_matches, _checkpoint_state(passed=runtime_campaign_matches)),
+        ("runtime_uses_dedicated_account", runtime_uses_dedicated_account, _checkpoint_state(passed=runtime_uses_dedicated_account)),
+        ("profile_uses_dedicated_account", profile_uses_dedicated_account, _checkpoint_state(passed=profile_uses_dedicated_account)),
+        ("dedicated_account_active", dedicated_account_active, _checkpoint_state(passed=dedicated_account_active)),
+        ("paper_cash_reconciled", paper_cash_reconciled, _checkpoint_state(passed=paper_cash_reconciled)),
+        ("paper_liquid_cash_supports_exact_5", paper_liquid_cash_supports_exact_5, _checkpoint_state(passed=paper_liquid_cash_supports_exact_5)),
+        ("max_open_positions_one", max_open_positions_one, _checkpoint_state(passed=max_open_positions_one)),
+        ("minimum_position_size_five", minimum_position_size_five, _checkpoint_state(passed=minimum_position_size_five)),
+        ("maximum_position_size_five", maximum_position_size_five, _checkpoint_state(passed=maximum_position_size_five)),
+        ("maximum_total_exposure_five", maximum_total_exposure_five, _checkpoint_state(passed=maximum_total_exposure_five)),
+        ("latest_btc_candle_fresh_interval_aware", latest_btc_candle_fresh, _checkpoint_state(passed=latest_btc_candle_fresh, waiting=stage_1_complete and not latest_btc_candle_fresh)),
+        ("latest_cycle_truthful_terminal", latest_cycle_truthful_terminal, _checkpoint_state(passed=latest_cycle_truthful_terminal)),
+        ("worker_recently_ingested_kraken_btc", worker_recently_ingested, _checkpoint_state(passed=worker_recently_ingested, waiting=stage_1_complete and not worker_recently_ingested)),
+        ("latest_strategy_identity_coherent", latest_strategy_coherent, _checkpoint_state(passed=latest_strategy_coherent)),
+        ("decision_record_linkage_present_when_applicable", decision_record_linkage_present, _checkpoint_state(passed=decision_record_linkage_present, not_applicable=latest_cycle is None)),
+        ("ready_package_progress_distinguishable", package_progress_distinguishable, _checkpoint_state(passed=ready_package_current, not_applicable=hold_no_package_expected, completed_historically=package_historically_advanced and not ready_package_current, waiting=not hold_no_package_expected and not ready_package_current and not package_historically_advanced)),
+        ("exact_package_authorization_exists", exact_package_authorization, _checkpoint_state(passed=approval_event is not None, not_applicable=hold_no_package_expected and not package_historically_advanced, completed_historically=exact_package_authorization and approval_event is None, waiting=stage_3_complete and not exact_package_authorization)),
+        ("production_dry_run_passed", dry_run_passed, _checkpoint_state(passed=bool(evidence.get("dry_run_passed")), not_applicable=hold_no_package_expected and not package_historically_advanced, completed_historically=dry_run_passed and not bool(evidence.get("dry_run_passed")), waiting=stage_4_complete and not dry_run_passed)),
+        ("bounded_proving_activation_exists", bounded_activation_exists, _checkpoint_state(passed=activation is not None, not_applicable=hold_no_package_expected and not package_historically_advanced, completed_historically=bounded_activation_exists and activation is None, waiting=stage_5_complete and not bounded_activation_exists)),
+        ("live_buy_order_submitted", autonomous_buy_submitted, _checkpoint_state(passed=autonomous_buy_submitted, waiting=stage_6_complete and not autonomous_buy_submitted)),
+        ("live_buy_fill_reconciled", autonomous_buy_fill_reconciled, _checkpoint_state(passed=autonomous_buy_fill_reconciled, waiting=autonomous_buy_submitted and not autonomous_buy_fill_reconciled)),
+        ("open_live_btc_position_exists", position_open, _checkpoint_state(passed=position_open, completed_historically=position_managed_historically and not position_open, waiting=stage_7_complete and not position_managed_historically, not_applicable=not stage_7_complete)),
+        ("live_sell_order_submitted", autonomous_sell_submitted, _checkpoint_state(passed=autonomous_sell_submitted, waiting=stage_8_complete and not autonomous_sell_submitted, not_applicable=not stage_8_complete)),
+        ("live_sell_fill_reconciled", autonomous_sell_fill_reconciled, _checkpoint_state(passed=autonomous_sell_fill_reconciled, waiting=autonomous_sell_submitted and not autonomous_sell_fill_reconciled, not_applicable=not stage_8_complete)),
+        ("realized_fees_known", fees_known, _checkpoint_state(passed=fees_known, waiting=stage_9_complete and not fees_known, not_applicable=not stage_9_complete)),
+        ("ending_usd_exceeds_starting_usd", ending_usd_exceeds_starting_usd, _checkpoint_state(passed=ending_usd_exceeds_starting_usd, waiting=stage_9_complete and fees_known and not ending_usd_exceeds_starting_usd, not_applicable=not stage_9_complete)),
+    ]
+
+    completed_checkpoint_count = sum(1 for _, _, state in checkpoint_rows if state in {"PASSED", "COMPLETED_HISTORICALLY", "NOT_APPLICABLE"})
+    total_checkpoint_count = len(checkpoint_rows)
+
+    first_profit_complete = stage_10_complete
+
+    critical_blocking_gate = next(
+        (
+            name
+            for name, passed, _ in checkpoint_rows
+            if not passed
+            and name
+            in {
+                "provider_connection_connected",
+                "provider_readiness_acceptable",
+                "provider_reconciliation_clean",
+                "runtime_campaign_matches",
+                "runtime_uses_dedicated_account",
+                "profile_uses_dedicated_account",
+                "dedicated_account_active",
+                "paper_cash_reconciled",
+                "latest_strategy_identity_coherent",
+                "decision_record_linkage_present_when_applicable",
+            }
+        ),
+        None,
+    )
+
+    if first_profit_complete:
+        status = "FIRST_AUTONOMOUS_NET_PROFIT_COMPLETE"
+        blocking_gate = None
+    elif critical_blocking_gate is not None:
+        status = "BLOCKED"
+        blocking_gate = critical_blocking_gate
+    elif freshness_verdict != "fresh":
+        status = "WAITING_FOR_FRESH_MARKET_DATA"
+        blocking_gate = "latest_btc_candle_fresh_interval_aware"
+    elif ready_package is not None and approval_event is None:
+        status = "READY_PACKAGE_AVAILABLE"
+        blocking_gate = "exact_package_authorization_exists"
+    elif approval_event is not None and not bool(evidence.get("dry_run_passed")):
+        status = "WAITING_FOR_DRY_RUN"
+        blocking_gate = "production_dry_run_passed"
+    elif bool(evidence.get("dry_run_passed")) and activation is None:
+        status = "WAITING_FOR_ACTIVATION"
+        blocking_gate = "bounded_proving_activation_exists"
+    elif buy_submitted and not buy_fill_reconciled:
+        status = "WAITING_FOR_BUY_FILL"
+        blocking_gate = "live_buy_fill_reconciled"
+    elif position_open and not sell_submitted:
+        status = "POSITION_OPEN"
+        blocking_gate = "live_sell_order_submitted"
+    elif sell_submitted and not sell_fill_reconciled:
+        status = "WAITING_FOR_SELL_FILL"
+        blocking_gate = "live_sell_fill_reconciled"
+    elif buy_fill_reconciled and sell_fill_reconciled:
+        status = "VERIFYING_NET_PROFIT"
+        blocking_gate = "ending_usd_exceeds_starting_usd"
+    elif latest_cycle_outcome == "HOLD":
+        status = "WAITING_FOR_EXECUTABLE_SIGNAL"
+        blocking_gate = "latest_cycle_truthful_terminal"
+    else:
+        status = "BLOCKED"
+        blocking_gate = next((name for name, passed, _ in checkpoint_rows if not passed and name != "ready_package_progress_distinguishable"), "missing_safety_evidence")
+
+    completion_percent = _FIRST_PROFIT_STAGE_ANCHORS.get(highest_contiguous_stage, 0.0)
+
+    next_action_map = {
+        "BLOCKED": "run evidence audit and fix the first failed safety gate",
+        "WAITING_FOR_FRESH_MARKET_DATA": "wait for next closed Kraken BTC 15m candle ingestion",
+        "WAITING_FOR_EXECUTABLE_SIGNAL": "wait for actionable BUY or SELL decision evidence",
+        "READY_PACKAGE_AVAILABLE": "record canonical package authorization",
+        "WAITING_FOR_AUTHORIZATION": "record canonical package authorization",
+        "WAITING_FOR_DRY_RUN": "run canonical package dry run",
+        "WAITING_FOR_ACTIVATION": "activate bounded proving",
+        "WAITING_FOR_BUY_FILL": "wait for BUY fill reconciliation",
+        "POSITION_OPEN": "wait for SELL signal and submit bounded SELL",
+        "WAITING_FOR_SELL_FILL": "wait for SELL fill reconciliation",
+        "VERIFYING_NET_PROFIT": "verify reconciled net profit including fees",
+        "FIRST_AUTONOMOUS_NET_PROFIT_COMPLETE": "record milestone completion evidence",
+    }
+
+    safe_to_submit_order_now = status in {"READY_PACKAGE_AVAILABLE", "WAITING_FOR_AUTHORIZATION", "WAITING_FOR_DRY_RUN", "WAITING_FOR_ACTIVATION"} and open_live_order_count == 0 and unresolved_reconciliation_count == 0
+
+    return {
+        "completion_percent": completion_percent,
+        "completed_checkpoint_count": completed_checkpoint_count,
+        "total_checkpoint_count": total_checkpoint_count,
+        "status": status,
+        "blocking_gate": blocking_gate,
+        "latest_cycle_id": None if latest_cycle is None else str(latest_cycle.cycle_id),
+        "latest_cycle_outcome": latest_cycle_outcome,
+        "latest_cycle_reason": latest_cycle_reason,
+        "ready_package_id": None if ready_package is None else str(ready_package.package_id),
+        "activation_id": None if activation is None else str(activation.activation_id),
+        "provider_equity": None if provider_equity is None else format(Decimal(str(provider_equity)), "f"),
+        "paper_liquid_cash": None if paper_liquid_cash is None else format(Decimal(str(paper_liquid_cash)), "f"),
+        "open_live_order_count": open_live_order_count,
+        "unresolved_reconciliation_count": unresolved_reconciliation_count,
+        "live_position_state": "OPEN" if position_open else "FLAT",
+        "realized_gross_profit": None if realized_gross_profit is None else format(Decimal(str(realized_gross_profit)), "f"),
+        "fees": None if fees is None else format(Decimal(str(fees)), "f"),
+        "realized_net_profit": None if realized_net_profit is None else format(Decimal(str(realized_net_profit)), "f"),
+        "safe_to_submit_order_now": safe_to_submit_order_now,
+        "exact_next_operator_action": next_action_map.get(status, "review checkpoint evidence"),
+        "stage": {
+            "highest_contiguous_completed": highest_contiguous_stage,
+            "name": dict((n, s) for n, s, _ in stage_rows).get(highest_contiguous_stage, "NONE"),
+            "rows": [
+                {
+                    "number": stage_number,
+                    "name": stage_name,
+                    "completed": completed,
+                    "anchor_percent": _FIRST_PROFIT_STAGE_ANCHORS[stage_number],
+                }
+                for stage_number, stage_name, completed in stage_rows
+            ],
+        },
+        "evidence": {
+            "provider_balance_synced_at": None if provider_balance_synced_at is None else provider_balance_synced_at.isoformat(),
+            "latest_candle_close_time": None if latest_candle is None else latest_candle.close_time.isoformat(),
+            "evaluation_time": now.isoformat(),
+            "freshness_seconds": freshness_seconds,
+            "freshness_minutes": freshness_minutes,
+            "candle_interval_minutes": candle_interval_minutes,
+            "ingestion_grace_minutes": ingestion_grace_minutes,
+            "maximum_age_minutes": maximum_age_minutes,
+            "freshness_verdict": freshness_verdict,
+            "latest_decision_record_id": latest_cycle_decision_record_id,
+            "latest_strategy_identity": latest_strategy_identity,
+            "latest_strategy_version": latest_strategy_version,
+            "latest_ingestion_candle_at": None if latest_ingestion_candle_at is None else latest_ingestion_candle_at.isoformat(),
+            "approval_event_id": None if approval_event is None else str(approval_event.id),
+            "dry_run_live_crypto_order_id": None if activation is None else str(activation.dry_run_live_crypto_order_id),
+            "autonomous_buy_provenance": autonomous_buy_provenance,
+            "autonomous_sell_provenance": autonomous_sell_provenance,
+            "starting_reconciled_usd": None if starting_reconciled_usd is None else format(Decimal(str(starting_reconciled_usd)), "f"),
+            "ending_reconciled_usd": None if ending_reconciled_usd is None else format(Decimal(str(ending_reconciled_usd)), "f"),
+            "package_progress_mode": (
+                "hold_no_package_expected"
+                if hold_no_package_expected
+                else "ready_package_current"
+                if ready_package_current
+                else "ready_package_historically_advanced"
+                if package_historically_advanced
+                else "undetermined"
+            ),
+        },
+        "checkpoints": [
+            {"name": name, "passed": passed, "state": state}
+            for name, passed, state in checkpoint_rows
+        ],
+        "formula": {
+            "completion_percent": "stage anchor for highest contiguous completed stage",
+            "stage_anchors": _FIRST_PROFIT_STAGE_ANCHORS,
+            "milestone_complete": "autonomous_buy_provenance AND autonomous_buy_fill_reconciled AND autonomous_sell_provenance AND autonomous_sell_fill_reconciled AND fees_known AND ending_usd_exceeds_starting_usd AND realized_net_profit > 0",
+        },
+    }
+
+
+async def _gather_first_autonomous_profit_evidence(
+    *,
+    campaign_id: UUID,
+    campaign_version: int,
+    runtime_campaign_id: int,
+    paper_account_id: UUID,
+    live_trading_profile_id: UUID,
+    provider: str,
+    environment: str,
+    product_id: str,
+) -> dict[str, Any]:
+    now = datetime.now(timezone.utc)
+    async with AsyncSessionLocal() as db:
+        connection = await db.scalar(
+            select(ExchangeConnection)
+            .where(ExchangeConnection.provider == provider)
+            .where(ExchangeConnection.environment == environment)
+            .order_by(desc(ExchangeConnection.updated_at), desc(ExchangeConnection.exchange_connection_id))
+            .limit(1)
+        )
+        runtime = await db.scalar(select(CapitalCampaign).where(CapitalCampaign.id == runtime_campaign_id).limit(1))
+        definition = await db.scalar(
+            select(CapitalCampaignDefinition)
+            .where(CapitalCampaignDefinition.campaign_id == campaign_id)
+            .where(CapitalCampaignDefinition.version == campaign_version)
+            .limit(1)
+        )
+        paper_account = await db.get(PaperAccount, paper_account_id)
+        profile = await db.get(LiveTradingProfile, live_trading_profile_id)
+
+        asset_symbol = _product_symbol(product_id)
+        asset = await db.scalar(
+            select(Asset)
+            .where(Asset.symbol == asset_symbol)
+            .where(Asset.exchange == provider)
+            .where(Asset.asset_class == "crypto")
+            .where(Asset.is_active.is_(True))
+            .order_by(desc(Asset.created_at), desc(Asset.id))
+            .limit(1)
+        )
+
+        latest_candle = None
+        latest_ingestion_candle_at = None
+        if asset is not None:
+            latest_candle = await db.scalar(
+                select(Candle)
+                .where(Candle.asset_id == asset.id)
+                .where(Candle.interval == _KRKN_BTC_INTERVAL)
+                .where(Candle.close_time <= now)
+                .order_by(desc(Candle.close_time), desc(Candle.id))
+                .limit(1)
+            )
+            latest_ingestion_candle_at = await db.scalar(
+                select(Candle.created_at)
+                .where(Candle.asset_id == asset.id)
+                .where(Candle.interval == _KRKN_BTC_INTERVAL)
+                .order_by(desc(Candle.close_time), desc(Candle.id))
+                .limit(1)
+            )
+
+        latest_cycle = await db.scalar(
+            select(AutonomousCycleRun)
+            .where(AutonomousCycleRun.capital_campaign_id == campaign_id)
+            .where(AutonomousCycleRun.capital_campaign_version == campaign_version)
+            .order_by(desc(AutonomousCycleRun.started_at), desc(AutonomousCycleRun.cycle_id))
+            .limit(1)
+        )
+
+        ready_package = await db.scalar(
+            select(CanonicalPreviewPackage)
+            .where(CanonicalPreviewPackage.campaign_id == campaign_id)
+            .where(CanonicalPreviewPackage.campaign_version == campaign_version)
+            .where(CanonicalPreviewPackage.package_state == "READY")
+            .order_by(desc(CanonicalPreviewPackage.generated_at), desc(CanonicalPreviewPackage.package_id))
+            .limit(1)
+        )
+
+        approval_event = None
+        if ready_package is not None:
+            approval_rows = list(
+                (
+                    await db.execute(
+                        select(LiveApprovalEvent)
+                        .where(LiveApprovalEvent.live_trading_profile_id == live_trading_profile_id)
+                        .where(LiveApprovalEvent.approval_state == "approved")
+                        .where(LiveApprovalEvent.checkpoint_type == "bounded_proving_entry")
+                        .order_by(desc(LiveApprovalEvent.recorded_at), desc(LiveApprovalEvent.id))
+                        .limit(100)
+                    )
+                ).scalars().all()
+            )
+            for item in approval_rows:
+                scope = item.approval_scope if isinstance(item.approval_scope, dict) else {}
+                if str(scope.get("canonical_preview_package_id") or "") == str(ready_package.package_id):
+                    approval_event = item
+                    break
+
+        activation = await db.scalar(
+            select(CanonicalProvingActivation)
+            .where(CanonicalProvingActivation.campaign_id == campaign_id)
+            .where(CanonicalProvingActivation.campaign_version == campaign_version)
+            .where(CanonicalProvingActivation.provider == provider)
+            .where(CanonicalProvingActivation.environment == environment)
+            .where(CanonicalProvingActivation.product == product_id)
+            .order_by(desc(CanonicalProvingActivation.activated_at), desc(CanonicalProvingActivation.activation_id))
+            .limit(1)
+        )
+
+        unresolved_reconciliation_count = int(
+            (
+                await db.scalar(
+                    select(func.count())
+                    .select_from(LiveReconciliationEvent)
+                    .where(LiveReconciliationEvent.live_trading_profile_id == live_trading_profile_id)
+                    .where(LiveReconciliationEvent.reconciliation_status.in_(sorted(_UNRESOLVED_RECONCILIATION_STATES)))
+                )
+            )
+            or 0
+        )
+        unknown_reconciliation_count = int(
+            (
+                await db.scalar(
+                    select(func.count())
+                    .select_from(LiveReconciliationEvent)
+                    .where(LiveReconciliationEvent.live_trading_profile_id == live_trading_profile_id)
+                    .where(LiveReconciliationEvent.reconciliation_status == "unknown")
+                )
+            )
+            or 0
+        )
+        open_live_order_count = int(
+            (
+                await db.scalar(
+                    select(func.count())
+                    .select_from(LiveCryptoOrder)
+                    .where(LiveCryptoOrder.provider == provider)
+                    .where(LiveCryptoOrder.environment == environment)
+                    .where(LiveCryptoOrder.product_id == product_id)
+                    .where(LiveCryptoOrder.status.notin_(sorted(_TERMINAL_LIVE_ORDER_STATES)))
+                )
+            )
+            or 0
+        )
+
+        orders = list(
+            (
+                await db.execute(
+                    select(LiveCryptoOrder)
+                    .where(LiveCryptoOrder.provider == provider)
+                    .where(LiveCryptoOrder.environment == environment)
+                    .where(LiveCryptoOrder.product_id == product_id)
+                    .order_by(desc(LiveCryptoOrder.created_at), desc(LiveCryptoOrder.live_crypto_order_id))
+                    .limit(200)
+                )
+            ).scalars().all()
+        )
+        buy_submitted = any(str(item.side).upper() == "BUY" and item.submitted_at is not None for item in orders)
+        buy_fill_reconciled = any(str(item.side).upper() == "BUY" and item.filled_at is not None for item in orders)
+        sell_submitted = any(str(item.side).upper() == "SELL" and item.submitted_at is not None for item in orders)
+        sell_fill_reconciled = any(str(item.side).upper() == "SELL" and item.filled_at is not None for item in orders)
+        autonomous_buy_provenance = any(
+            str(item.side).upper() == "BUY"
+            and item.decision_record_id is not None
+            and item.submitted_at is not None
+            for item in orders
+        )
+        autonomous_sell_provenance = any(
+            str(item.side).upper() == "SELL"
+            and item.decision_record_id is not None
+            and item.submitted_at is not None
+            for item in orders
+        )
+
+        position_open = False
+        if asset is not None and paper_account is not None:
+            trades = list(
+                (
+                    await db.execute(
+                        select(Trade)
+                        .where(Trade.paper_account_id == paper_account.id)
+                        .where(Trade.asset_id == asset.id)
+                        .order_by(Trade.executed_at.asc(), Trade.id.asc())
+                    )
+                ).scalars().all()
+            )
+            net_qty = Decimal("0")
+            for item in trades:
+                qty = Decimal(str(item.quantity))
+                if str(item.side).lower() == "buy":
+                    net_qty += qty
+                elif str(item.side).lower() == "sell":
+                    net_qty -= qty
+            position_open = net_qty > Decimal("0")
+
+        dry_run_passed = False
+        if activation is not None:
+            dry_run_order = await db.get(LiveCryptoOrder, activation.dry_run_live_crypto_order_id)
+            dry_run_passed = dry_run_order is not None and str(dry_run_order.status) == "DRY_RUN_READY"
+
+    realized_net_profit = None if runtime is None else Decimal(str(runtime.realized_profit))
+    fees = None if runtime is None else Decimal(str(runtime.fees))
+    realized_gross_profit = None if realized_net_profit is None or fees is None else (realized_net_profit + fees)
+    starting_reconciled_usd = None if runtime is None else Decimal(str(runtime.starting_capital))
+    ending_reconciled_usd = None if runtime is None else Decimal(str(runtime.current_equity))
+    paper_liquid_cash = None if paper_account is None else Decimal(str(paper_account.current_cash_balance))
+    provider_equity = None if connection is None else connection.total_equity_usd
+
+    return {
+        "now": now,
+        "campaign_id": campaign_id,
+        "campaign_version": campaign_version,
+        "paper_account_id": paper_account_id,
+        "connection": connection,
+        "runtime": runtime,
+        "definition": definition,
+        "paper_account": paper_account,
+        "profile": profile,
+        "latest_candle": latest_candle,
+        "latest_ingestion_candle_at": latest_ingestion_candle_at,
+        "latest_cycle": latest_cycle,
+        "ready_package": ready_package,
+        "approval_event": approval_event,
+        "activation": activation,
+        "unresolved_reconciliation_count": unresolved_reconciliation_count,
+        "unknown_reconciliation_count": unknown_reconciliation_count,
+        "open_live_order_count": open_live_order_count,
+        "buy_submitted": buy_submitted,
+        "buy_fill_reconciled": buy_fill_reconciled,
+        "sell_submitted": sell_submitted,
+        "sell_fill_reconciled": sell_fill_reconciled,
+        "autonomous_buy_provenance": autonomous_buy_provenance,
+        "autonomous_sell_provenance": autonomous_sell_provenance,
+        "position_open": position_open,
+        "dry_run_passed": dry_run_passed,
+        "provider_equity": provider_equity,
+        "paper_liquid_cash": paper_liquid_cash,
+        "provider_readiness_verdict": None if connection is None else connection.last_readiness_verdict,
+        "provider_balance_synced_at": None if connection is None else connection.last_successful_sync_at,
+        "starting_reconciled_usd": starting_reconciled_usd,
+        "ending_reconciled_usd": ending_reconciled_usd,
+        "realized_gross_profit": realized_gross_profit,
+        "fees": fees,
+        "realized_net_profit": realized_net_profit,
+    }
+
+
+async def first_autonomous_profit_status(
+    *,
+    campaign_id: UUID,
+    campaign_version: int,
+    runtime_campaign_id: int,
+    paper_account_id: UUID,
+    live_trading_profile_id: UUID,
+    provider: str,
+    environment: str,
+    product_id: str,
+) -> dict[str, Any]:
+    evidence = await _gather_first_autonomous_profit_evidence(
+        campaign_id=campaign_id,
+        campaign_version=campaign_version,
+        runtime_campaign_id=runtime_campaign_id,
+        paper_account_id=paper_account_id,
+        live_trading_profile_id=live_trading_profile_id,
+        provider=provider,
+        environment=environment,
+        product_id=product_id,
+    )
+    payload = _derive_first_autonomous_profit_status(evidence)
+    payload["invariants"] = {
+        "read_only": True,
+        "no_provider_order_submission": True,
+        "checkpoint_count": 30,
+    }
+    return payload
 
 
 def _runtime_exchange_scope(runtime_exchange: str | None) -> tuple[str | None, str | None]:

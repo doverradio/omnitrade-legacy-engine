@@ -425,6 +425,33 @@ def test_parse_exchange_refresh_and_proving_cap_transition_commands() -> None:
     assert execute.confirm is True
 
 
+def test_parse_first_autonomous_profit_status_command() -> None:
+    args = parse_args([
+        "first-autonomous-profit-status",
+        "--campaign-id",
+        "e9a9e8e9-9574-498d-b49e-f011218c7f2b",
+        "--campaign-version",
+        "1",
+        "--runtime-campaign-id",
+        "2",
+        "--paper-account-id",
+        "905a408c-7d8e-4fc7-ad3b-9ff637005d73",
+        "--live-trading-profile-id",
+        "9da09ae9-475e-41e8-b2c2-717ba5acfa3d",
+        "--provider",
+        "kraken_spot",
+        "--environment",
+        "production",
+        "--product",
+        "BTC-USD",
+        "--json",
+    ])
+    assert args.command == "first-autonomous-profit-status"
+    assert args.campaign_version == 1
+    assert args.runtime_campaign_id == 2
+    assert args.json_output is True
+
+
 def test_parse_canonical_campaign_authority_audit_rejects_malformed_uuid() -> None:
     with pytest.raises(SystemExit):
         parse_args([
@@ -660,6 +687,41 @@ async def test_run_async_routes_exchange_refresh_and_proving_cap_transition(monk
     assert execute_code == 0
     assert execute_payload["changed"] is True
     assert "canonical-proving-cap-transition-execute" in execute_text
+
+
+@pytest.mark.asyncio
+async def test_run_async_routes_first_autonomous_profit_status(monkeypatch: pytest.MonkeyPatch) -> None:
+    args = parse_args([
+        "first-autonomous-profit-status",
+        "--campaign-id",
+        "e9a9e8e9-9574-498d-b49e-f011218c7f2b",
+        "--campaign-version",
+        "1",
+        "--runtime-campaign-id",
+        "2",
+        "--paper-account-id",
+        "905a408c-7d8e-4fc7-ad3b-9ff637005d73",
+        "--live-trading-profile-id",
+        "9da09ae9-475e-41e8-b2c2-717ba5acfa3d",
+        "--provider",
+        "kraken_spot",
+        "--environment",
+        "production",
+        "--product",
+        "BTC-USD",
+        "--json",
+    ])
+
+    async def _fake_status(**kwargs):
+        assert kwargs["runtime_campaign_id"] == 2
+        return {"status": "WAITING_FOR_EXECUTABLE_SIGNAL", "completion_percent": 33}
+
+    monkeypatch.setattr(operator_main, "first_autonomous_profit_status", _fake_status)
+    code, payload, text = await operator_main._run_async(args)
+
+    assert code == 0
+    assert payload["status"] == "WAITING_FOR_EXECUTABLE_SIGNAL"
+    assert "completion_percent" in text
 
 
 def test_parse_rejects_nonexistent_canonical_campaign_binding_status_command() -> None:

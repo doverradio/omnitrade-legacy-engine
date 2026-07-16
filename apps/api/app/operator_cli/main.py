@@ -52,6 +52,7 @@ from app.operator_cli.service import (
     fetch_execution_forensics,
     fetch_strategy_scorecards_summary,
     fetch_strategy_roster_summary,
+    first_autonomous_profit_status,
     fetch_risk_ledger_diagnosis,
     fetch_watch_status,
     refresh_provider_balance_evidence,
@@ -657,6 +658,22 @@ def _build_parser() -> argparse.ArgumentParser:
     proving_revoke.add_argument("--idempotency-key", type=str, required=True)
     proving_revoke.add_argument("--json", action="store_true", dest="json_output")
 
+    first_profit = subparsers.add_parser(
+        "first-autonomous-profit-status",
+        parents=[common],
+        help="Read-only progress status for first autonomous net profit milestone",
+        description="Reads authoritative evidence and reports deterministic milestone progress without writing any state.",
+    )
+    first_profit.add_argument("--campaign-id", type=UUID, required=True)
+    first_profit.add_argument("--campaign-version", type=int, required=True)
+    first_profit.add_argument("--runtime-campaign-id", type=int, required=True)
+    first_profit.add_argument("--paper-account-id", type=UUID, required=True)
+    first_profit.add_argument("--live-trading-profile-id", type=UUID, required=True)
+    first_profit.add_argument("--provider", type=str, required=True)
+    first_profit.add_argument("--environment", type=str, required=True)
+    first_profit.add_argument("--product", type=str, required=True)
+    first_profit.add_argument("--json", action="store_true", dest="json_output")
+
     return parser
 
 
@@ -1021,6 +1038,19 @@ async def _run_async(args: argparse.Namespace) -> tuple[int, dict[str, Any], str
             actor=args.actor,
             confirm=bool(args.confirm),
             idempotency_key=args.idempotency_key,
+        )
+        return 0, payload, render_json(payload)
+
+    if args.command == "first-autonomous-profit-status":
+        payload = await first_autonomous_profit_status(
+            campaign_id=args.campaign_id,
+            campaign_version=args.campaign_version,
+            runtime_campaign_id=args.runtime_campaign_id,
+            paper_account_id=args.paper_account_id,
+            live_trading_profile_id=args.live_trading_profile_id,
+            provider=args.provider,
+            environment=args.environment,
+            product_id=args.product,
         )
         return 0, payload, render_json(payload)
 

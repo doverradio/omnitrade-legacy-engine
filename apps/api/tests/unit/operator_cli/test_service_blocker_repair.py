@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import asyncio
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 from types import SimpleNamespace
 from uuid import uuid4
@@ -366,3 +366,226 @@ def test_proving_cap_execute_contains_no_order_path_calls() -> None:
     assert "create_order" not in source
     assert "submit_alpaca_paper_order" not in source
     assert "execute_internal_crypto_fill" not in source
+
+
+def _build_profit_evidence(**overrides):
+    now = datetime.now(timezone.utc)
+    base = {
+        "now": now,
+        "campaign_id": uuid4(),
+        "campaign_version": 1,
+        "paper_account_id": uuid4(),
+        "connection": SimpleNamespace(status="connected", last_readiness_verdict="READY_FOR_OPERATOR_REVIEW", last_successful_sync_at=now),
+        "runtime": SimpleNamespace(uuid=uuid4(), definition_version=1, paper_account_id=uuid4(), realized_profit=Decimal("0"), fees=Decimal("0")),
+        "definition": SimpleNamespace(maximum_open_positions=1, minimum_position_size=Decimal("5"), maximum_position_size=Decimal("5"), maximum_total_exposure=Decimal("5")),
+        "paper_account": SimpleNamespace(is_active=True, current_cash_balance=Decimal("23.7205")),
+        "profile": SimpleNamespace(paper_account_id=uuid4()),
+        "latest_candle": SimpleNamespace(close_time=now - timedelta(minutes=18), interval="15m"),
+        "latest_ingestion_candle_at": now - timedelta(minutes=5),
+        "latest_cycle": SimpleNamespace(
+            cycle_id=uuid4(),
+            state="COMPLETE",
+            termination_stage="hold_no_package_created",
+            proposed_action="HOLD",
+            failure_reason=None,
+            cycle_context={"authoritative_composition": {"selected_decision": {"decision_record_id": str(uuid4()), "strategy_identity": "ma_crossover@1.0.0", "strategy_version": "ma_crossover@1.0.0", "reason": "strategy_hold_signal"}}},
+        ),
+        "ready_package": None,
+        "approval_event": None,
+        "activation": None,
+        "unresolved_reconciliation_count": 0,
+        "unknown_reconciliation_count": 0,
+        "open_live_order_count": 0,
+        "buy_submitted": False,
+        "buy_fill_reconciled": False,
+        "sell_submitted": False,
+        "sell_fill_reconciled": False,
+        "autonomous_buy_provenance": False,
+        "autonomous_sell_provenance": False,
+        "position_open": False,
+        "dry_run_passed": False,
+        "provider_equity": "62.10",
+        "paper_liquid_cash": Decimal("23.7205"),
+        "provider_readiness_verdict": "READY_FOR_OPERATOR_REVIEW",
+        "provider_balance_synced_at": now,
+        "starting_reconciled_usd": Decimal("100.00"),
+        "ending_reconciled_usd": Decimal("100.00"),
+        "realized_gross_profit": Decimal("0"),
+        "fees": Decimal("0"),
+        "realized_net_profit": Decimal("0"),
+    }
+    base["runtime"].uuid = base["campaign_id"]
+    base["runtime"].paper_account_id = base["paper_account_id"]
+    base["profile"].paper_account_id = base["paper_account_id"]
+    base.update(overrides)
+    return base
+
+
+def test_first_profit_status_hold_reports_waiting_for_executable_signal() -> None:
+    payload = service._derive_first_autonomous_profit_status(_build_profit_evidence())
+    assert payload["status"] == "WAITING_FOR_EXECUTABLE_SIGNAL"
+    assert payload["completion_percent"] == 99.6
+
+
+def test_first_profit_status_hold_is_not_blocked() -> None:
+    payload = service._derive_first_autonomous_profit_status(_build_profit_evidence())
+    assert payload["status"] != "BLOCKED"
+
+
+def test_first_profit_status_stale_market_data() -> None:
+    evidence = _build_profit_evidence(latest_candle=SimpleNamespace(close_time=datetime.now(timezone.utc) - timedelta(minutes=21), interval="15m"))
+    payload = service._derive_first_autonomous_profit_status(evidence)
+    assert payload["status"] == "WAITING_FOR_FRESH_MARKET_DATA"
+    assert payload["completion_percent"] < 99.6
+
+
+def test_first_profit_status_ready_package_available() -> None:
+    evidence = _build_profit_evidence(ready_package=SimpleNamespace(package_id=uuid4()))
+    payload = service._derive_first_autonomous_profit_status(evidence)
+    assert payload["status"] == "READY_PACKAGE_AVAILABLE"
+    assert payload["completion_percent"] == 99.7
+
+
+def test_first_profit_status_authorized_package_anchor() -> None:
+    evidence = _build_profit_evidence(
+        ready_package=SimpleNamespace(package_id=uuid4()),
+        approval_event=SimpleNamespace(id=uuid4()),
+    )
+    payload = service._derive_first_autonomous_profit_status(evidence)
+    assert payload["completion_percent"] == 99.75
+
+
+def test_first_profit_status_activation_anchor() -> None:
+    evidence = _build_profit_evidence(
+        approval_event=SimpleNamespace(id=uuid4()),
+        activation=SimpleNamespace(activation_id=uuid4(), dry_run_live_crypto_order_id=uuid4()),
+    )
+    payload = service._derive_first_autonomous_profit_status(evidence)
+    assert payload["completion_percent"] == 99.85
+
+
+def test_first_profit_status_reconciled_buy_anchor() -> None:
+    evidence = _build_profit_evidence(
+        activation=SimpleNamespace(activation_id=uuid4(), dry_run_live_crypto_order_id=uuid4()),
+        buy_submitted=True,
+        buy_fill_reconciled=True,
+        autonomous_buy_provenance=True,
+        position_open=True,
+    )
+    payload = service._derive_first_autonomous_profit_status(evidence)
+    assert payload["completion_percent"] == 99.9
+
+
+def test_first_profit_status_closed_position_preserves_stage_8_credit() -> None:
+    evidence = _build_profit_evidence(
+        activation=SimpleNamespace(activation_id=uuid4(), dry_run_live_crypto_order_id=uuid4()),
+        buy_submitted=True,
+        buy_fill_reconciled=True,
+        autonomous_buy_provenance=True,
+        sell_submitted=True,
+        autonomous_sell_provenance=True,
+        position_open=False,
+    )
+    payload = service._derive_first_autonomous_profit_status(evidence)
+    checkpoint = next(item for item in payload["checkpoints"] if item["name"] == "open_live_btc_position_exists")
+    assert checkpoint["state"] == "COMPLETED_HISTORICALLY"
+
+
+def test_first_profit_status_missing_safety_evidence_is_blocked() -> None:
+    evidence = _build_profit_evidence(connection=None)
+    payload = service._derive_first_autonomous_profit_status(evidence)
+    assert payload["status"] == "BLOCKED"
+
+
+def test_first_profit_status_open_position_reports_position_open() -> None:
+    evidence = _build_profit_evidence(
+        activation=SimpleNamespace(activation_id=uuid4(), dry_run_live_crypto_order_id=uuid4()),
+        position_open=True,
+        buy_submitted=True,
+        buy_fill_reconciled=True,
+        autonomous_buy_provenance=True,
+    )
+    payload = service._derive_first_autonomous_profit_status(evidence)
+    assert payload["status"] == "POSITION_OPEN"
+
+
+def test_first_profit_status_negative_net_not_100_percent() -> None:
+    evidence = _build_profit_evidence(
+        activation=SimpleNamespace(activation_id=uuid4(), dry_run_live_crypto_order_id=uuid4()),
+        buy_submitted=True,
+        buy_fill_reconciled=True,
+        autonomous_buy_provenance=True,
+        sell_submitted=True,
+        sell_fill_reconciled=True,
+        autonomous_sell_provenance=True,
+        starting_reconciled_usd=Decimal("100.00"),
+        ending_reconciled_usd=Decimal("99.90"),
+        fees=Decimal("1"),
+        realized_net_profit=Decimal("-0.10"),
+    )
+    payload = service._derive_first_autonomous_profit_status(evidence)
+    assert payload["completion_percent"] == 99.97
+    assert payload["status"] == "VERIFYING_NET_PROFIT"
+
+
+def test_first_profit_status_positive_net_is_100_percent() -> None:
+    evidence = _build_profit_evidence(
+        activation=SimpleNamespace(activation_id=uuid4(), dry_run_live_crypto_order_id=uuid4()),
+        buy_submitted=True,
+        buy_fill_reconciled=True,
+        autonomous_buy_provenance=True,
+        sell_submitted=True,
+        sell_fill_reconciled=True,
+        autonomous_sell_provenance=True,
+        starting_reconciled_usd=Decimal("100.00"),
+        ending_reconciled_usd=Decimal("101.00"),
+        fees=Decimal("0.10"),
+        realized_net_profit=Decimal("0.25"),
+    )
+    payload = service._derive_first_autonomous_profit_status(evidence)
+    assert payload["completion_percent"] == 100
+    assert payload["status"] == "FIRST_AUTONOMOUS_NET_PROFIT_COMPLETE"
+
+
+def test_first_profit_status_zero_or_negative_net_never_100() -> None:
+    for realized in (Decimal("0"), Decimal("-0.01")):
+        evidence = _build_profit_evidence(
+            activation=SimpleNamespace(activation_id=uuid4(), dry_run_live_crypto_order_id=uuid4()),
+            buy_submitted=True,
+            buy_fill_reconciled=True,
+            autonomous_buy_provenance=True,
+            sell_submitted=True,
+            sell_fill_reconciled=True,
+            autonomous_sell_provenance=True,
+            starting_reconciled_usd=Decimal("100.00"),
+            ending_reconciled_usd=Decimal("100.00"),
+            fees=Decimal("0.10"),
+            realized_net_profit=realized,
+        )
+        payload = service._derive_first_autonomous_profit_status(evidence)
+        assert payload["completion_percent"] != 100
+
+
+def test_first_profit_status_missing_autonomous_provenance_never_100() -> None:
+    evidence = _build_profit_evidence(
+        activation=SimpleNamespace(activation_id=uuid4(), dry_run_live_crypto_order_id=uuid4()),
+        buy_submitted=True,
+        buy_fill_reconciled=True,
+        autonomous_buy_provenance=False,
+        sell_submitted=True,
+        sell_fill_reconciled=True,
+        autonomous_sell_provenance=False,
+        starting_reconciled_usd=Decimal("100.00"),
+        ending_reconciled_usd=Decimal("101.00"),
+        fees=Decimal("0.10"),
+        realized_net_profit=Decimal("0.50"),
+    )
+    payload = service._derive_first_autonomous_profit_status(evidence)
+    assert payload["completion_percent"] != 100
+
+
+def test_first_profit_status_contains_read_only_invariants() -> None:
+    source = service.first_autonomous_profit_status.__code__.co_names
+    assert "commit" not in source
+    assert "create_order" not in source
+    assert "submit_alpaca_paper_order" not in source
