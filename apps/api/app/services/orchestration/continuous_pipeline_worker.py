@@ -305,6 +305,8 @@ async def _run_kraken_btc_autonomous_cycle_if_due(*, db: AsyncSession) -> tuple[
             strategy_interval=_AUTONOMOUS_CYCLE_INTERVAL,
             trigger=_AUTONOMOUS_CYCLE_TRIGGER,
             idempotency_seed=_build_kraken_btc_candle_idempotency_seed(candle=latest_candle),
+            candle_id=latest_candle.id,
+            candle_close_time=latest_candle.close_time,
         ),
     )
     logger.info(

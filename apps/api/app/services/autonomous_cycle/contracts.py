@@ -31,6 +31,9 @@ class AutonomousCycleRequest:
     idempotency_seed: str | None = None
     software_build_version: str | None = None
     forced_action: str | None = None
+    candle_id: uuid.UUID | None = None
+    candle_close_time: datetime | None = None
+    canonical_identity: dict[str, Any] | None = None
 
 
 @dataclass(frozen=True)

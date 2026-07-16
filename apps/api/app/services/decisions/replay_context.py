@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from decimal import Decimal
 from typing import Any
@@ -10,6 +11,19 @@ REPLAY_CONTEXT_SCHEMA_VERSION = "v1"
 
 REPLAY_CONTEXT_KEYS: tuple[str, ...] = (
     "schema_version",
+    "autonomous_mandate_id",
+    "autonomous_mandate_version",
+    "mandate_capital_campaign_row_id",
+    "mandate_paper_account_id",
+    "mandate_live_trading_profile_id",
+    "canonical_campaign_id",
+    "canonical_campaign_version",
+    "canonical_paper_account_id",
+    "canonical_live_trading_profile_id",
+    "identity_source",
+    "canonical_identity_present",
+    "mandate_identity_present",
+    "identity_mismatches",
     "strategy_identity",
     "strategy_version",
     "action",
@@ -43,6 +57,20 @@ REPLAY_CONTEXT_KEYS: tuple[str, ...] = (
     "unknown_fields",
 )
 
+
+@dataclass(frozen=True, slots=True)
+class ReplayIdentityProvenance:
+    autonomous_mandate_id: Any | None = None
+    autonomous_mandate_version: Any | None = None
+    mandate_capital_campaign_row_id: Any | None = None
+    mandate_paper_account_id: Any | None = None
+    mandate_live_trading_profile_id: Any | None = None
+    canonical_campaign_id: Any | None = None
+    canonical_campaign_version: Any | None = None
+    runtime_campaign_id: Any | None = None
+    canonical_paper_account_id: Any | None = None
+    canonical_live_trading_profile_id: Any | None = None
+
 _MINIMAL_REQUIRED_FIELDS: tuple[str, ...] = (
     "strategy_identity",
     "strategy_version",
@@ -65,9 +93,46 @@ def normalize_risk_verdict(value: Any) -> str:
     return UNKNOWN
 
 
-def build_canonical_replay_context(*, evidence: dict[str, Any]) -> dict[str, Any]:
+def build_canonical_replay_context(*, evidence: dict[str, Any], identity: ReplayIdentityProvenance | None = None) -> dict[str, Any]:
+    identity = identity or ReplayIdentityProvenance()
+    canonical_present = any(
+        value is not None
+        for value in (
+            identity.canonical_campaign_id,
+            identity.canonical_campaign_version,
+            identity.runtime_campaign_id,
+            identity.canonical_paper_account_id,
+            identity.canonical_live_trading_profile_id,
+        )
+    )
+    mandate_present = any(
+        value is not None
+        for value in (
+            identity.autonomous_mandate_id,
+            identity.autonomous_mandate_version,
+            identity.mandate_capital_campaign_row_id,
+            identity.mandate_paper_account_id,
+            identity.mandate_live_trading_profile_id,
+        )
+    )
+    mismatches = _resolve_identity_mismatches(identity=identity) if canonical_present and mandate_present else []
+    identity_source = _resolve_identity_source(canonical_present=canonical_present, mandate_present=mandate_present, mismatches=mismatches)
+
     values: dict[str, Any] = {
         "schema_version": REPLAY_CONTEXT_SCHEMA_VERSION,
+        "autonomous_mandate_id": _normalize_identifier(identity.autonomous_mandate_id),
+        "autonomous_mandate_version": _normalize_identifier(identity.autonomous_mandate_version),
+        "mandate_capital_campaign_row_id": _normalize_identifier(identity.mandate_capital_campaign_row_id),
+        "mandate_paper_account_id": _normalize_identifier(identity.mandate_paper_account_id),
+        "mandate_live_trading_profile_id": _normalize_identifier(identity.mandate_live_trading_profile_id),
+        "canonical_campaign_id": _normalize_identifier(identity.canonical_campaign_id),
+        "canonical_campaign_version": _normalize_identifier(identity.canonical_campaign_version),
+        "canonical_paper_account_id": _normalize_identifier(identity.canonical_paper_account_id),
+        "canonical_live_trading_profile_id": _normalize_identifier(identity.canonical_live_trading_profile_id),
+        "identity_source": identity_source,
+        "canonical_identity_present": canonical_present,
+        "mandate_identity_present": mandate_present,
+        "identity_mismatches": mismatches,
         "strategy_identity": _normalize_string(evidence.get("strategy_identity")),
         "strategy_version": _normalize_string(evidence.get("strategy_version")),
         "action": _normalize_string(evidence.get("action"), upper=True),
@@ -98,7 +163,24 @@ def build_canonical_replay_context(*, evidence: dict[str, Any]) -> dict[str, Any
         "actual_execution_price": _normalize_decimal(evidence.get("actual_execution_price")),
         "actual_execution_quantity": _normalize_decimal(evidence.get("actual_execution_quantity")),
     }
-    unknown_fields = sorted(key for key, value in values.items() if value == UNKNOWN and key != "schema_version")
+    if canonical_present:
+        values["paper_account_id"] = values["canonical_paper_account_id"]
+        values["live_trading_profile_id"] = values["canonical_live_trading_profile_id"]
+        values["capital_campaign_id"] = values["canonical_campaign_id"]
+        values["capital_campaign_version"] = values["canonical_campaign_version"]
+        values["runtime_campaign_id"] = _normalize_identifier(identity.runtime_campaign_id)
+    else:
+        values["paper_account_id"] = UNKNOWN
+        values["live_trading_profile_id"] = UNKNOWN
+        values["capital_campaign_id"] = UNKNOWN
+        values["capital_campaign_version"] = UNKNOWN
+        values["runtime_campaign_id"] = UNKNOWN
+
+    unknown_fields = sorted(
+        key
+        for key, value in values.items()
+        if value == UNKNOWN and key not in {"schema_version"}
+    )
     values["evidence_completeness"] = _resolve_evidence_completeness(values=values, unknown_fields=unknown_fields)
     values["unknown_fields"] = unknown_fields
     return values
@@ -107,6 +189,9 @@ def build_canonical_replay_context(*, evidence: dict[str, Any]) -> dict[str, Any
 def _resolve_evidence_completeness(*, values: dict[str, Any], unknown_fields: list[str]) -> str:
     if not unknown_fields:
         return "COMPLETE"
+
+    if values.get("identity_source") == UNKNOWN:
+        return "PARTIAL" if any(values.get(field) != UNKNOWN for field in _MINIMAL_REQUIRED_FIELDS) else "MINIMAL"
 
     minimal_known = any(values.get(field) != UNKNOWN for field in _MINIMAL_REQUIRED_FIELDS)
     if minimal_known:
@@ -160,3 +245,27 @@ def _normalize_datetime(value: Any) -> str:
     if not raw:
         return UNKNOWN
     return raw
+
+
+def _resolve_identity_source(*, canonical_present: bool, mandate_present: bool, mismatches: list[str]) -> str:
+    if canonical_present and mandate_present:
+        return "BOTH_VERIFIED_MATCH" if not mismatches else UNKNOWN
+    if canonical_present:
+        return "CANONICAL_CAMPAIGN"
+    if mandate_present:
+        return "AUTONOMOUS_MANDATE"
+    return UNKNOWN
+
+
+def _resolve_identity_mismatches(*, identity: ReplayIdentityProvenance) -> list[str]:
+    mismatches: list[str] = []
+    comparisons = (
+        ("canonical_paper_account_id", identity.canonical_paper_account_id, "mandate_paper_account_id", identity.mandate_paper_account_id),
+        ("canonical_live_trading_profile_id", identity.canonical_live_trading_profile_id, "mandate_live_trading_profile_id", identity.mandate_live_trading_profile_id),
+    )
+    for canonical_field, canonical_value, mandate_field, mandate_value in comparisons:
+        if canonical_value is None or mandate_value is None:
+            continue
+        if str(canonical_value).strip() != str(mandate_value).strip():
+            mismatches.append(f"{canonical_field}!={mandate_field}")
+    return sorted(mismatches)

@@ -1374,7 +1374,7 @@ async def test_worker_triggers_one_autonomous_cycle_for_latest_kraken_btc_candle
     monkeypatch.setattr(
         worker_module,
         "_load_latest_kraken_btc_15m_candle",
-        _async_return(SimpleNamespace(close_time=candle_close)),
+        _async_return(SimpleNamespace(id=uuid.uuid4(), asset_id=uuid.uuid4(), close_time=candle_close)),
     )
     monkeypatch.setattr(worker_module, "run_autonomous_preview_cycle", _capture_cycle)
 

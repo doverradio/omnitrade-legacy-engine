@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from app.services.decisions.replay_context import REPLAY_CONTEXT_KEYS, build_canonical_replay_context
+from app.services.decisions.replay_context import REPLAY_CONTEXT_KEYS, ReplayIdentityProvenance, build_canonical_replay_context
 
 
 def test_replay_context_schema_is_stable_and_unknowns_are_explicit() -> None:
@@ -16,12 +16,16 @@ def test_replay_context_schema_is_stable_and_unknowns_are_explicit() -> None:
             "signal_ids": ["sig-1"],
             "risk_event_ids": ["risk-1"],
             "trade_ids": [],
-        }
+        },
+        identity=ReplayIdentityProvenance(autonomous_mandate_id="mandate-1", autonomous_mandate_version="version-1"),
     )
 
     assert sorted(replay_context.keys()) == sorted(REPLAY_CONTEXT_KEYS)
     assert replay_context["confidence"] == "UNKNOWN"
     assert "confidence" in replay_context["unknown_fields"]
+    assert replay_context["identity_source"] == "AUTONOMOUS_MANDATE"
+    assert replay_context["canonical_campaign_id"] == "UNKNOWN"
+    assert replay_context["paper_account_id"] == "UNKNOWN"
     assert replay_context["evidence_completeness"] == "PARTIAL"
 
 
@@ -57,13 +61,59 @@ def test_replay_context_evidence_completeness_formula_is_deterministic() -> None
             "actual_execution_fee": "0.1",
             "actual_execution_price": "100.0",
             "actual_execution_quantity": "0.01",
-        }
+        },
+        identity=ReplayIdentityProvenance(
+            autonomous_mandate_id="mandate-1",
+            autonomous_mandate_version="version-1",
+            mandate_capital_campaign_row_id="campaign-row-1",
+            canonical_campaign_id="campaign-1",
+            canonical_campaign_version="1",
+            runtime_campaign_id="runtime-1",
+            canonical_paper_account_id="paper-1",
+            canonical_live_trading_profile_id="profile-1",
+            mandate_paper_account_id="paper-1",
+            mandate_live_trading_profile_id="profile-1",
+        ),
     )
     minimal = build_canonical_replay_context(evidence={})
 
     assert complete["evidence_completeness"] == "COMPLETE"
     assert complete["unknown_fields"] == []
     assert minimal["evidence_completeness"] == "MINIMAL"
+    assert complete["identity_source"] == "BOTH_VERIFIED_MATCH"
+
+
+def test_replay_context_conflicts_remain_visible_and_fail_closed() -> None:
+    replay_context = build_canonical_replay_context(
+        evidence={
+            "strategy_identity": "ma_crossover",
+            "strategy_version": "1.0.0",
+            "action": "buy",
+            "confidence": "0.7",
+            "product": "BTC-USD",
+            "timeframe": "15m",
+            "decision_timestamp": "2026-07-16T00:00:00+00:00",
+            "normalized_risk_verdict": "UNKNOWN",
+        },
+        identity=ReplayIdentityProvenance(
+            autonomous_mandate_id="mandate-1",
+            autonomous_mandate_version="version-1",
+            canonical_campaign_id="campaign-1",
+            canonical_campaign_version="1",
+            runtime_campaign_id="runtime-1",
+            canonical_paper_account_id="paper-a",
+            canonical_live_trading_profile_id="profile-a",
+            mandate_paper_account_id="paper-b",
+            mandate_live_trading_profile_id="profile-b",
+        ),
+    )
+
+    assert replay_context["identity_source"] == "UNKNOWN"
+    assert replay_context["identity_mismatches"] == [
+        "canonical_live_trading_profile_id!=mandate_live_trading_profile_id",
+        "canonical_paper_account_id!=mandate_paper_account_id",
+    ]
+    assert replay_context["evidence_completeness"] != "COMPLETE"
 
 
 def test_replay_context_mapper_has_no_execution_or_capital_side_effect_calls() -> None:

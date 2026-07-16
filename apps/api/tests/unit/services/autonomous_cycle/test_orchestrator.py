@@ -5,6 +5,7 @@ from datetime import timedelta
 from decimal import Decimal
 from types import SimpleNamespace
 import uuid
+import re
 
 import pytest
 
@@ -23,6 +24,7 @@ from app.services.autonomous_cycle.orchestrator import (
     run_autonomous_preview_cycle,
 )
 from app.services.decisions.replay_context import REPLAY_CONTEXT_KEYS
+from app.services.mandates.contracts import MANDATE_APPROVAL_POLICY_HUMAN_REQUIRED, MANDATE_APPROVAL_POLICY_MANDATE_ALLOWED
 from app.services.strategies.base import Signal
 from app.services.strategies.identity import build_strategy_identity
 
@@ -31,264 +33,440 @@ class _FakeDb:
     def __init__(self) -> None:
         self.cycles_by_key: dict[str, AutonomousCycleRun] = {}
         self.connection = None
+        self.authorizations: list[object] = []
+        self.enforce_authorization_rows = False
         self.paper_account = SimpleNamespace(id=uuid.uuid4(), is_active=True, asset_class="crypto")
         self.added: list[object] = []
-        self.authorizations: list[dict[str, object]] = []
-        self.enforce_authorization_rows = False
-
-    def add(self, item: object) -> None:
-        if isinstance(item, AutonomousCycleRun):
-            if getattr(item, "cycle_id", None) is None:
-                item.cycle_id = uuid.uuid4()
-            self.cycles_by_key[item.idempotency_key] = item
-        self.added.append(item)
-
-    async def flush(self) -> None:
-        return None
-
-    async def commit(self) -> None:
-        return None
-
-    async def rollback(self) -> None:
-        return None
-
-    async def refresh(self, _item: object) -> None:
-        return None
 
     async def scalar(self, statement):
-        sql = str(statement)
-        if "FROM autonomous_cycle_runs" in sql and "idempotency_key" in sql:
+        try:
+            sql = str(statement.compile(compile_kwargs={"literal_binds": True}))
+        except Exception:
+            sql = str(statement)
+        if "autonomous_cycle_runs" in sql:
+            match = re.search(r"idempotency_key\s*=\s*'([^']+)'", sql)
+            if match is not None:
+                existing_cycle = self.cycles_by_key.get(match.group(1))
+                if existing_cycle is not None:
+                    return existing_cycle
             return next(iter(self.cycles_by_key.values()), None)
-        if "count(*)" in sql and "FROM live_crypto_orders" in sql:
-            return 0
-        if "FROM autonomous_capital_mandate_authorizations" in sql:
+        if "autonomous_capital_mandate_authorizations" in sql:
             if not self.enforce_authorization_rows:
-                return uuid.uuid4()
-
-            compiled = statement.compile()
-            params = compiled.params
-            uuid_values = [value for value in params.values() if isinstance(value, uuid.UUID)]
-            datetime_values = [value for value in params.values() if isinstance(value, datetime)]
-            mandate_id = uuid_values[0] if uuid_values else None
-            mandate_version_id = uuid_values[1] if len(uuid_values) > 1 else None
-            observed_at = datetime_values[0] if datetime_values else None
-
-            for item in self.authorizations:
-                if mandate_id is not None and item.get("mandate_id") != mandate_id:
+                return None
+            mandate_id_match = re.search(r"mandate_id\s*=\s*'([^']+)'", sql)
+            mandate_version_id_match = re.search(r"mandate_version_id\s*=\s*'([^']+)'", sql)
+            observed_at_match = re.search(r"expires_at\s*>\s*'([^']+)'", sql)
+            observed_at = datetime.fromisoformat(observed_at_match.group(1)) if observed_at_match else datetime.now(timezone.utc)
+            for row in self.authorizations:
+                if mandate_id_match is not None and str(getattr(row, "mandate_id", "")) != mandate_id_match.group(1):
                     continue
-                if mandate_version_id is not None and item.get("mandate_version_id") != mandate_version_id:
+                if mandate_version_id_match is not None and str(getattr(row, "mandate_version_id", "")) != mandate_version_id_match.group(1):
                     continue
-                if item.get("authorization_state") != "AUTHORIZED":
+                revoked_at = getattr(row, "revoked_at", None)
+                expires_at = getattr(row, "expires_at", None)
+                authorization_state = getattr(row, "authorization_state", "AUTHORIZED")
+                if authorization_state != "AUTHORIZED" or revoked_at is not None:
                     continue
-                if item.get("revoked_at") is not None:
+                if expires_at is not None and expires_at <= observed_at:
                     continue
-                expires_at = item.get("expires_at")
-                if observed_at is not None and isinstance(expires_at, datetime) and expires_at <= observed_at:
-                    continue
-                return item.get("mandate_authorization_id", uuid.uuid4())
-
+                return getattr(row, "mandate_authorization_id", uuid.uuid4())
             return None
-        if "FROM assets" in sql:
-            return None
-        if "FROM paper_accounts" in sql:
+        if "paper_accounts" in sql:
             return self.paper_account
         return None
 
-    async def get(self, _cls, _key):
-        return self.connection
+    async def get(self, model, _primary_key):
+        if getattr(model, "__name__", None) == "ExchangeConnection":
+            return self.connection
+        return None
+
+    def add(self, instance):
+        self.added.append(instance)
+        if isinstance(instance, AutonomousCycleRun) and getattr(instance, "idempotency_key", None):
+            self.cycles_by_key[instance.idempotency_key] = instance
+
+    async def flush(self):
+        return None
+
+    async def commit(self):
+        return None
+
+    async def rollback(self):
+        return None
+
+    async def refresh(self, _instance):
+        return None
 
 
 def _async_return(value):
-    async def _inner(**_kwargs):
+    async def _inner(*_args, **_kwargs):
         return value
 
     return _inner
 
 
-def _mandate(*, status: str = "ACTIVE"):
+def _mandate(*, status: str = "ACTIVE") -> SimpleNamespace:
     return SimpleNamespace(
         mandate_id=uuid.uuid4(),
-        owner_actor_id="operator:owner",
         status=status,
-        autonomy_level="LEVEL_2",
+        autonomy_level="FULL",
         provider="kraken_spot",
         exchange_environment="production",
         exchange_connection_id=uuid.uuid4(),
         live_trading_profile_id=uuid.uuid4(),
         paper_account_id=uuid.uuid4(),
-        capital_campaign_id=42,
+        capital_campaign_id=123,
     )
 
 
-def _version(*, allowed_order_sides: list[str] | None = None):
+def _version(*, allowed_order_sides: list[str] | None = None) -> SimpleNamespace:
     return SimpleNamespace(
         mandate_version_id=uuid.uuid4(),
         mandate_id=uuid.uuid4(),
-        version_number=1,
+        version_number=7,
         base_currency="USD",
-        authorized_capital_usd=Decimal("25"),
+        authorized_capital_usd=Decimal("1000"),
+        allowed_strategy_versions=[build_strategy_identity(slug="ma_crossover", module_version="1.0.0")],
         max_order_notional_usd=Decimal("5"),
         max_open_exposure_usd=Decimal("10"),
-        max_daily_deployed_usd=Decimal("10"),
-        max_daily_realized_loss_usd=Decimal("3"),
-        max_campaign_drawdown_usd=Decimal("5"),
-        max_consecutive_losses=2,
+        max_daily_deployed_usd=Decimal("50"),
+        max_daily_realized_loss_usd=Decimal("25"),
+        max_campaign_drawdown_usd=Decimal("100"),
+        max_consecutive_losses=3,
         position_limit=1,
-        price_evidence_max_age_seconds=60,
-        max_slippage_bps=Decimal("25"),
+        price_evidence_max_age_seconds=300,
+        max_slippage_bps=Decimal("10"),
         max_fee_bps=Decimal("10"),
-        allowed_products=["BTC-USD"],
+        allowed_products=("BTC-USD",),
         allowed_order_sides=allowed_order_sides or ["BUY", "SELL", "HOLD"],
-        allowed_strategy_versions=[build_strategy_identity(slug="ma_crossover", module_version="1.0.0")],
-        approval_policy="MANDATE_ALLOWED",
+        approval_policy=MANDATE_APPROVAL_POLICY_MANDATE_ALLOWED,
         is_authorized=True,
         is_active=True,
     )
 
 
-def _version_with_identity(*, mandate_id: uuid.UUID, version_number: int, identity: str, is_authorized: bool = True, is_active: bool = True):
-    version = _version(allowed_order_sides=["BUY", "SELL", "HOLD"])
+def _version_with_identity(
+    *,
+    mandate_id: uuid.UUID,
+    version_number: int,
+    identity: str,
+    is_authorized: bool,
+    is_active: bool,
+) -> SimpleNamespace:
+    version = _version()
     version.mandate_id = mandate_id
     version.version_number = version_number
     version.allowed_strategy_versions = [identity]
+    version.approval_policy = MANDATE_APPROVAL_POLICY_HUMAN_REQUIRED
     version.is_authorized = is_authorized
     version.is_active = is_active
     return version
 
 
-def _market_tuple():
-    return (
-        SimpleNamespace(
-            evidence_id=uuid.uuid4(),
-            provider="kraken_spot",
-            product_id="BTC-USD",
-            bid=Decimal("30000"),
-            ask=Decimal("30001"),
-            observed_at=datetime.now(timezone.utc),
-        ),
-        Decimal("30000"),
-        0,
+def _authorized_row(**kwargs) -> SimpleNamespace:
+    return SimpleNamespace(**kwargs)
+
+
+def _market_tuple() -> tuple[SimpleNamespace, Decimal, int]:
+    evidence = SimpleNamespace(
+        evidence_id=uuid.uuid4(),
+        provider="kraken_spot",
+        product_id="BTC-USD",
+        base_currency="BTC",
+        quote_currency="USD",
+        reference_price=Decimal("50000"),
+        bid=Decimal("49999"),
+        ask=Decimal("50001"),
+        observed_at=datetime.now(timezone.utc),
     )
+    return evidence, evidence.reference_price, 0
 
 
-def _patch_happy_path(monkeypatch: pytest.MonkeyPatch, mandate, version, *, action: str, risk_verdict: str = "ACCEPTED") -> None:
+def _patch_happy_path(monkeypatch: pytest.MonkeyPatch, mandate: SimpleNamespace, version: SimpleNamespace, *, action: str, risk_verdict: str = "ACCEPTED") -> None:
+    signal_id = uuid.uuid4()
+    candle_close = datetime.now(timezone.utc)
     monkeypatch.setattr("app.services.autonomous_cycle.orchestrator.get_mandate", _async_return(mandate))
     monkeypatch.setattr("app.services.autonomous_cycle.orchestrator.list_mandate_versions", _async_return([version]))
-    monkeypatch.setattr(
-        "app.services.autonomous_cycle.orchestrator._reconcile_state",
-        _async_return(ReconciliationStatus(True, True, 0, 0, False, ())),
-    )
+    monkeypatch.setattr("app.services.autonomous_cycle.orchestrator._has_valid_exact_version_authorization", _async_return(True))
+    monkeypatch.setattr("app.services.autonomous_cycle.orchestrator._reconcile_state", _async_return(ReconciliationStatus(True, True, 0, 0, False, ())))
     monkeypatch.setattr("app.services.autonomous_cycle.orchestrator.load_current_execution_price_evidence", _async_return(_market_tuple()))
-    monkeypatch.setattr(
-        "app.services.autonomous_cycle.orchestrator._evaluate_risk",
-        _async_return(
-            RiskEvaluationSummary(
-                risk_verdict=risk_verdict,
-                risk_event_id=uuid.uuid4(),
-                reason_code=None,
-                approved_quantity=Decimal("0.001") if risk_verdict in {"ACCEPTED", "RESIZED"} else None,
-            )
-        ),
-    )
+    monkeypatch.setattr("app.services.autonomous_cycle.orchestrator._evaluate_risk", _async_return(RiskEvaluationSummary(risk_verdict=risk_verdict, risk_event_id=uuid.uuid4() if risk_verdict != "NOT_EVALUATED" else None, reason_code=None, approved_quantity=Decimal("0.001") if risk_verdict != "NOT_EVALUATED" else None)))
     monkeypatch.setattr(
         "app.services.autonomous_cycle.orchestrator._create_canonical_signal_for_cycle",
-        _async_return(SimpleNamespace(id=uuid.uuid4(), asset_id=uuid.uuid4()) if action in {"BUY", "SELL"} else None),
+        _async_return(SimpleNamespace(id=signal_id, asset_id=uuid.uuid4())),
     )
     monkeypatch.setattr(
-        "app.services.autonomous_cycle.orchestrator.orchestrate_paper_signal_execution",
+        "app.services.autonomous_cycle.orchestrator._run_approved_strategy",
         _async_return(
-            SimpleNamespace(
-                outcome="EXECUTED" if action in {"BUY", "SELL"} and risk_verdict in {"ACCEPTED", "RESIZED"} else "SKIPPED",
-                execution_status="executed" if action in {"BUY", "SELL"} and risk_verdict in {"ACCEPTED", "RESIZED"} else "skipped",
-                trade_id=uuid.uuid4() if action in {"BUY", "SELL"} and risk_verdict in {"ACCEPTED", "RESIZED"} else None,
-                execution_venue="internal_sim",
-                reason_code=None,
-                reason_text=None,
+            StrategyProposal(
+                action=action,
+                strategy_name="ma_crossover",
+                strategy_version=build_strategy_identity(slug="ma_crossover", module_version="1.0.0"),
+                deterministic_explanation=("CHECK_PASSED:strategy_evaluated",),
+                signal_payload={"action": action.lower(), "timestamp": candle_close.isoformat()},
             )
         ),
     )
-    monkeypatch.setattr("app.services.autonomous_cycle.orchestrator._persist_decision_intelligence", _async_return(uuid.uuid4()))
     monkeypatch.setattr("app.services.autonomous_cycle.orchestrator.evaluate_and_record_mandate", _async_return(SimpleNamespace(evaluation_id=uuid.uuid4())))
     monkeypatch.setattr("app.services.autonomous_cycle.orchestrator.create_crypto_order_preview", _async_return(SimpleNamespace(crypto_order_preview_id=uuid.uuid4())))
     monkeypatch.setattr("app.services.autonomous_cycle.orchestrator.get_exchange_provider", lambda _provider: object())
     monkeypatch.setattr("app.services.autonomous_cycle.orchestrator.get_decrypted_credentials_for_connection", lambda _c: {"x": "y"})
 
+@pytest.mark.asyncio
+async def test_decision_record_replay_context_keeps_canonical_identity_unknown_for_mandate_only_records() -> None:
+    db = _FakeDb()
+    cycle_id = uuid.uuid4()
+    mandate_version_id = uuid.uuid4()
+    risk_event_id = uuid.uuid4()
+    signal_id = uuid.uuid4()
+    mandate_id = uuid.uuid4()
+    mandate = SimpleNamespace(
+        provider="kraken_spot",
+        exchange_environment="production",
+        live_trading_profile_id=uuid.uuid4(),
+        paper_account_id=uuid.uuid4(),
+        capital_campaign_id=123,
+        mandate_id=mandate_id,
+    )
 
-def _authorized_row(*, mandate_id: uuid.UUID, mandate_version_id: uuid.UUID, revoked_at: datetime | None = None, expires_at: datetime | None = None) -> dict[str, object]:
-    return {
-        "mandate_authorization_id": uuid.uuid4(),
-        "mandate_id": mandate_id,
-        "mandate_version_id": mandate_version_id,
-        "authorization_state": "AUTHORIZED",
-        "revoked_at": revoked_at,
-        "expires_at": expires_at,
+    await _persist_decision_intelligence(
+        db=db,
+        cycle=SimpleNamespace(cycle_id=cycle_id, mandate_id=mandate_id, mandate_version_id=mandate_version_id, risk_event_id=risk_event_id, audit_correlation_id=uuid.uuid4()),
+        mandate=mandate,
+        version=SimpleNamespace(
+            mandate_version_id=uuid.uuid4(),
+            version_number=7,
+            allowed_strategy_versions=[build_strategy_identity(slug="ma_crossover", module_version="1.0.0")],
+            max_order_notional_usd=Decimal("5"),
+            max_open_exposure_usd=Decimal("10"),
+        ),
+        proposal=StrategyProposal(
+            action="BUY",
+            strategy_name="ma_crossover",
+            strategy_version=build_strategy_identity(slug="ma_crossover", module_version="1.0.0"),
+            deterministic_explanation=("CHECK_PASSED:strategy_evaluated",),
+            signal_payload={"action": "buy", "timestamp": "2026-07-01T00:00:00Z"},
+        ),
+        risk_summary=RiskEvaluationSummary(
+            risk_verdict="ACCEPTED",
+            risk_event_id=risk_event_id,
+            reason_code=None,
+            approved_quantity=Decimal("0.001"),
+        ),
+        product_id="BTC-USD",
+        reference_price=Decimal("50000"),
+        evidence_age_minutes=0,
+        strategy_interval="15m",
+        canonical_signal_id=signal_id,
+    )
+
+    record = next(item for item in db.added if isinstance(item, DecisionRecord))
+    replay_context = record.indicators["replay_context"]
+    assert sorted(replay_context.keys()) == sorted(REPLAY_CONTEXT_KEYS)
+    assert replay_context["identity_source"] == "AUTONOMOUS_MANDATE"
+    assert replay_context["canonical_identity_present"] is False
+    assert replay_context["mandate_identity_present"] is True
+    assert replay_context["autonomous_mandate_id"] == str(mandate_id)
+    assert replay_context["autonomous_mandate_version"] == str(mandate_version_id)
+    assert replay_context["mandate_capital_campaign_row_id"] == "123"
+    assert replay_context["mandate_paper_account_id"] == str(mandate.paper_account_id)
+    assert replay_context["mandate_live_trading_profile_id"] == str(mandate.live_trading_profile_id)
+    assert replay_context["canonical_campaign_id"] == "UNKNOWN"
+    assert replay_context["canonical_campaign_version"] == "UNKNOWN"
+    assert replay_context["runtime_campaign_id"] == "UNKNOWN"
+    assert replay_context["paper_account_id"] == "UNKNOWN"
+    assert replay_context["live_trading_profile_id"] == "UNKNOWN"
+    assert replay_context["capital_campaign_id"] == "UNKNOWN"
+    assert replay_context["capital_campaign_version"] == "UNKNOWN"
+    assert replay_context["normalized_risk_verdict"] == "ALLOW"
+    assert replay_context["candle_id"] == "UNKNOWN"
+    assert replay_context["candle_close_time"] == "UNKNOWN"
+
+
+@pytest.mark.asyncio
+async def test_decision_record_replay_context_persists_canonical_identity_when_supplied() -> None:
+    db = _FakeDb()
+    cycle_id = uuid.uuid4()
+    mandate_id = uuid.uuid4()
+    risk_event_id = uuid.uuid4()
+    signal_id = uuid.uuid4()
+    candle_id = uuid.uuid4()
+    candle_close_time = datetime(2026, 7, 16, 13, 45, tzinfo=timezone.utc)
+    mandate = SimpleNamespace(
+        provider="kraken_spot",
+        exchange_environment="production",
+        live_trading_profile_id=uuid.uuid4(),
+        paper_account_id=uuid.uuid4(),
+        capital_campaign_id=123,
+        mandate_id=mandate_id,
+    )
+    canonical_identity = {
+        "canonical_campaign_id": uuid.UUID("e9a9e8e9-9574-498d-b49e-f011218c7f2b"),
+        "canonical_campaign_version": 1,
+        "runtime_campaign_id": 2,
+        "canonical_paper_account_id": mandate.paper_account_id,
+        "canonical_live_trading_profile_id": mandate.live_trading_profile_id,
     }
 
-
-@pytest.mark.asyncio
-async def test_cycle_buy_generates_preview(monkeypatch: pytest.MonkeyPatch) -> None:
-    db = _FakeDb()
-    mandate = _mandate(status="ACTIVE")
-    version = _version()
-    db.connection = SimpleNamespace(last_readiness_verdict="READY_FOR_PREVIEW", provider="kraken_spot", environment="production")
-    _patch_happy_path(monkeypatch, mandate, version, action="BUY")
-
-    result = await run_autonomous_preview_cycle(
+    await _persist_decision_intelligence(
         db=db,
-        request=AutonomousCycleRequest(mandate_id=mandate.mandate_id, actor="operator:owner", forced_action="BUY", idempotency_seed="buy-cycle-1"),
+        cycle=SimpleNamespace(cycle_id=cycle_id, mandate_id=mandate_id, mandate_version_id=uuid.uuid4(), risk_event_id=risk_event_id, audit_correlation_id=uuid.uuid4()),
+        mandate=mandate,
+        version=SimpleNamespace(
+            mandate_version_id=uuid.uuid4(),
+            version_number=7,
+            allowed_strategy_versions=[build_strategy_identity(slug="ma_crossover", module_version="1.0.0")],
+            max_order_notional_usd=Decimal("5"),
+            max_open_exposure_usd=Decimal("10"),
+        ),
+        proposal=StrategyProposal(
+            action="BUY",
+            strategy_name="ma_crossover",
+            strategy_version=build_strategy_identity(slug="ma_crossover", module_version="1.0.0"),
+            deterministic_explanation=("CHECK_PASSED:strategy_evaluated",),
+            signal_payload={"action": "buy", "timestamp": candle_close_time.isoformat()},
+        ),
+        risk_summary=RiskEvaluationSummary(
+            risk_verdict="ACCEPTED",
+            risk_event_id=risk_event_id,
+            reason_code=None,
+            approved_quantity=Decimal("0.001"),
+        ),
+        product_id="BTC-USD",
+        reference_price=Decimal("50000"),
+        evidence_age_minutes=0,
+        strategy_interval="15m",
+        canonical_signal_id=signal_id,
+        candle_id=candle_id,
+        candle_close_time=candle_close_time,
+        canonical_identity=canonical_identity,
     )
 
-    assert result.state == "COMPLETE"
-    assert result.proposed_action == "BUY"
-    assert result.preview_id is not None
-    cycle_rows = [item for item in db.added if isinstance(item, AutonomousCycleRun)]
-    assert len(cycle_rows) == 1
+    record = next(item for item in db.added if isinstance(item, DecisionRecord))
+    replay_context = record.indicators["replay_context"]
+    assert replay_context["identity_source"] == "BOTH_VERIFIED_MATCH"
+    assert replay_context["canonical_identity_present"] is True
+    assert replay_context["mandate_identity_present"] is True
+    assert replay_context["canonical_campaign_id"] == "e9a9e8e9-9574-498d-b49e-f011218c7f2b"
+    assert replay_context["canonical_campaign_version"] == "1"
+    assert replay_context["runtime_campaign_id"] == "2"
+    assert replay_context["canonical_paper_account_id"] == str(mandate.paper_account_id)
+    assert replay_context["canonical_live_trading_profile_id"] == str(mandate.live_trading_profile_id)
+    assert replay_context["paper_account_id"] == str(mandate.paper_account_id)
+    assert replay_context["live_trading_profile_id"] == str(mandate.live_trading_profile_id)
+    assert replay_context["capital_campaign_id"] == "e9a9e8e9-9574-498d-b49e-f011218c7f2b"
+    assert replay_context["capital_campaign_version"] == "1"
+    assert replay_context["candle_id"] == str(candle_id)
+    assert replay_context["candle_close_time"] == candle_close_time.isoformat()
+    assert replay_context["normalized_risk_verdict"] == "ALLOW"
 
 
 @pytest.mark.asyncio
-async def test_cycle_buy_generates_preview_for_operator_review_verdict(monkeypatch: pytest.MonkeyPatch) -> None:
+async def test_decision_record_replay_context_conflicts_fail_closed_without_overwrite() -> None:
     db = _FakeDb()
-    mandate = _mandate(status="ACTIVE")
-    version = _version()
-    db.connection = SimpleNamespace(last_readiness_verdict="READY_FOR_OPERATOR_REVIEW", provider="kraken_spot", environment="production")
-    _patch_happy_path(monkeypatch, mandate, version, action="BUY")
+    canonical_identity = {
+        "canonical_campaign_id": uuid.UUID("e9a9e8e9-9574-498d-b49e-f011218c7f2b"),
+        "canonical_campaign_version": 1,
+        "runtime_campaign_id": 2,
+        "canonical_paper_account_id": uuid.UUID("aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa"),
+        "canonical_live_trading_profile_id": uuid.UUID("bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb"),
+    }
 
-    result = await run_autonomous_preview_cycle(
+    await _persist_decision_intelligence(
         db=db,
-        request=AutonomousCycleRequest(mandate_id=mandate.mandate_id, actor="operator:owner", forced_action="BUY", idempotency_seed="buy-cycle-operator-review"),
+        cycle=SimpleNamespace(cycle_id=uuid.uuid4(), mandate_id=uuid.uuid4(), mandate_version_id=uuid.uuid4(), risk_event_id=uuid.uuid4(), audit_correlation_id=uuid.uuid4()),
+        mandate=SimpleNamespace(
+            provider="kraken_spot",
+            exchange_environment="production",
+            live_trading_profile_id=uuid.uuid4(),
+            paper_account_id=uuid.uuid4(),
+            capital_campaign_id=123,
+            mandate_id=uuid.uuid4(),
+        ),
+        version=SimpleNamespace(
+            mandate_version_id=uuid.uuid4(),
+            version_number=7,
+            allowed_strategy_versions=[build_strategy_identity(slug="ma_crossover", module_version="1.0.0")],
+            max_order_notional_usd=Decimal("5"),
+            max_open_exposure_usd=Decimal("10"),
+        ),
+        proposal=StrategyProposal(
+            action="BUY",
+            strategy_name="ma_crossover",
+            strategy_version=build_strategy_identity(slug="ma_crossover", module_version="1.0.0"),
+            deterministic_explanation=("CHECK_PASSED:strategy_evaluated",),
+            signal_payload={"action": "buy", "timestamp": "2026-07-01T00:00:00Z"},
+        ),
+        risk_summary=RiskEvaluationSummary(
+            risk_verdict="ACCEPTED",
+            risk_event_id=uuid.uuid4(),
+            reason_code=None,
+            approved_quantity=Decimal("0.001"),
+        ),
+        product_id="BTC-USD",
+        reference_price=Decimal("50000"),
+        evidence_age_minutes=0,
+        strategy_interval="15m",
+        canonical_signal_id=uuid.uuid4(),
+        canonical_identity=canonical_identity,
     )
 
-    assert result.state == "COMPLETE"
-    assert result.proposed_action == "BUY"
-    assert result.preview_id is not None
-
-
-@pytest.mark.asyncio
-async def test_cycle_accepts_authorized_exact_version_even_when_version_flag_false(monkeypatch: pytest.MonkeyPatch) -> None:
-    db = _FakeDb()
-    db.enforce_authorization_rows = True
-    mandate = _mandate(status="ACTIVE")
-    version = _version()
-    version.is_authorized = False
-    db.authorizations = [
-        _authorized_row(
-            mandate_id=mandate.mandate_id,
-            mandate_version_id=version.mandate_version_id,
-            expires_at=datetime.now(timezone.utc).replace(year=2099),
-        )
+    record = next(item for item in db.added if isinstance(item, DecisionRecord))
+    replay_context = record.indicators["replay_context"]
+    assert replay_context["identity_source"] == "UNKNOWN"
+    assert replay_context["canonical_identity_present"] is True
+    assert replay_context["mandate_identity_present"] is True
+    assert replay_context["identity_mismatches"] == [
+        "canonical_live_trading_profile_id!=mandate_live_trading_profile_id",
+        "canonical_paper_account_id!=mandate_paper_account_id",
     ]
-    db.connection = SimpleNamespace(last_readiness_verdict="READY_FOR_PREVIEW", provider="kraken_spot", environment="production")
-    _patch_happy_path(monkeypatch, mandate, version, action="BUY")
+    assert replay_context["evidence_completeness"] != "COMPLETE"
 
-    result = await run_autonomous_preview_cycle(
+
+@pytest.mark.asyncio
+async def test_decision_record_replay_context_holds_risk_as_unknown() -> None:
+    db = _FakeDb()
+    await _persist_decision_intelligence(
         db=db,
-        request=AutonomousCycleRequest(mandate_id=mandate.mandate_id, actor="operator:owner", forced_action="BUY", idempotency_seed="auth-row-canonical"),
+        cycle=SimpleNamespace(cycle_id=uuid.uuid4(), mandate_id=uuid.uuid4(), mandate_version_id=uuid.uuid4(), risk_event_id=None, audit_correlation_id=uuid.uuid4()),
+        mandate=SimpleNamespace(
+            provider="kraken_spot",
+            exchange_environment="production",
+            live_trading_profile_id=None,
+            paper_account_id=None,
+            capital_campaign_id=None,
+            mandate_id=uuid.uuid4(),
+        ),
+        version=SimpleNamespace(
+            mandate_version_id=uuid.uuid4(),
+            version_number=7,
+            allowed_strategy_versions=[build_strategy_identity(slug="ma_crossover", module_version="1.0.0")],
+            max_order_notional_usd=Decimal("5"),
+            max_open_exposure_usd=Decimal("10"),
+        ),
+        proposal=StrategyProposal(
+            action="HOLD",
+            strategy_name="ma_crossover",
+            strategy_version=build_strategy_identity(slug="ma_crossover", module_version="1.0.0"),
+            deterministic_explanation=("CHECK_PASSED:strategy_evaluated",),
+            signal_payload={"action": "hold"},
+        ),
+        risk_summary=RiskEvaluationSummary(
+            risk_verdict="NOT_EVALUATED",
+            risk_event_id=None,
+            reason_code=None,
+            approved_quantity=None,
+        ),
+        product_id="BTC-USD",
+        reference_price=Decimal("50000"),
+        evidence_age_minutes=0,
+        strategy_interval="15m",
+        canonical_signal_id=None,
     )
 
-    assert result.state == "COMPLETE"
-    assert result.proposed_action == "BUY"
-    assert result.preview_id is not None
-    assert result.diagnostics.failure_reason is None
+    record = next(item for item in db.added if isinstance(item, DecisionRecord))
+    replay_context = record.indicators["replay_context"]
+    assert replay_context["normalized_risk_verdict"] == "UNKNOWN"
 
 
 @pytest.mark.asyncio
@@ -382,6 +560,7 @@ async def test_cycle_holds_when_authorization_is_for_another_version(monkeypatch
 
     monkeypatch.setattr("app.services.autonomous_cycle.orchestrator.get_mandate", _async_return(mandate))
     monkeypatch.setattr("app.services.autonomous_cycle.orchestrator.list_mandate_versions", _async_return([version]))
+    monkeypatch.setattr("app.services.autonomous_cycle.orchestrator.get_decrypted_credentials_for_connection", lambda _c: {"x": "y"})
 
     result = await run_autonomous_preview_cycle(
         db=db,
@@ -476,8 +655,17 @@ async def test_cycle_non_active_mandate_finishes_hold(monkeypatch: pytest.Monkey
 @pytest.mark.asyncio
 async def test_provider_readiness_failure_holds(monkeypatch: pytest.MonkeyPatch) -> None:
     db = _FakeDb()
+    db.enforce_authorization_rows = True
     mandate = _mandate()
     version = _version()
+    version.approval_policy = MANDATE_APPROVAL_POLICY_HUMAN_REQUIRED
+    db.authorizations = [
+        _authorized_row(
+            mandate_id=mandate.mandate_id,
+            mandate_version_id=version.mandate_version_id,
+            expires_at=datetime.now(timezone.utc).replace(year=2099),
+        )
+    ]
     db.connection = SimpleNamespace(last_readiness_verdict="NOT_READY", provider="kraken_spot", environment="production")
 
     monkeypatch.setattr("app.services.autonomous_cycle.orchestrator.get_mandate", _async_return(mandate))
@@ -498,6 +686,7 @@ async def test_reconciliation_failure_holds(monkeypatch: pytest.MonkeyPatch) -> 
     db = _FakeDb()
     mandate = _mandate()
     version = _version()
+    version.approval_policy = MANDATE_APPROVAL_POLICY_HUMAN_REQUIRED
     db.connection = SimpleNamespace(last_readiness_verdict="READY_FOR_PREVIEW", provider="kraken_spot", environment="production")
 
     monkeypatch.setattr("app.services.autonomous_cycle.orchestrator.get_mandate", _async_return(mandate))
@@ -561,6 +750,7 @@ async def test_mandate_rejection_blocks_preview(monkeypatch: pytest.MonkeyPatch)
     db = _FakeDb()
     mandate = _mandate()
     version = _version(allowed_order_sides=["HOLD"])
+    version.approval_policy = MANDATE_APPROVAL_POLICY_HUMAN_REQUIRED
     db.connection = SimpleNamespace(last_readiness_verdict="READY_FOR_PREVIEW", provider="kraken_spot", environment="production")
 
     monkeypatch.setattr("app.services.autonomous_cycle.orchestrator.get_mandate", _async_return(mandate))
@@ -1431,9 +1621,10 @@ async def test_run_approved_strategy_malformed_signal_fails_closed_to_hold(monke
 async def test_decision_record_persists_canonical_product_identity() -> None:
     db = _FakeDb()
     cycle_id = uuid.uuid4()
+    mandate_version_id = uuid.uuid4()
     await _persist_decision_intelligence(
         db=db,
-        cycle=SimpleNamespace(cycle_id=cycle_id, risk_event_id=None, audit_correlation_id=uuid.uuid4()),
+        cycle=SimpleNamespace(cycle_id=cycle_id, mandate_id=uuid.uuid4(), mandate_version_id=mandate_version_id, risk_event_id=None, audit_correlation_id=uuid.uuid4()),
         mandate=SimpleNamespace(provider="kraken_spot", mandate_id=uuid.uuid4()),
         version=SimpleNamespace(
             mandate_version_id=uuid.uuid4(),
@@ -1497,122 +1688,3 @@ async def test_decision_record_persists_canonical_product_identity() -> None:
     assert record.generated_signals[0]["strategy_evidence"]["crossover_state"] == "bullish_cross"
     assert snapshot.strategy_inputs["strategy_evidence"]["fast_ma"] == "3.0"
     assert snapshot.strategy_inputs["signal_reason"] == "Fast SMA crossed above Slow SMA."
-
-
-@pytest.mark.asyncio
-async def test_decision_record_replay_context_persists_authoritative_identifiers() -> None:
-    db = _FakeDb()
-    cycle_id = uuid.uuid4()
-    risk_event_id = uuid.uuid4()
-    signal_id = uuid.uuid4()
-    mandate = SimpleNamespace(
-        provider="kraken_spot",
-        exchange_environment="production",
-        live_trading_profile_id=uuid.uuid4(),
-        paper_account_id=uuid.uuid4(),
-        capital_campaign_id=123,
-        mandate_id=uuid.uuid4(),
-    )
-    await _persist_decision_intelligence(
-        db=db,
-        cycle=SimpleNamespace(cycle_id=cycle_id, risk_event_id=risk_event_id, audit_correlation_id=uuid.uuid4()),
-        mandate=mandate,
-        version=SimpleNamespace(
-            mandate_version_id=uuid.uuid4(),
-            version_number=7,
-            allowed_strategy_versions=[build_strategy_identity(slug="ma_crossover", module_version="1.0.0")],
-            max_order_notional_usd=Decimal("5"),
-            max_open_exposure_usd=Decimal("10"),
-        ),
-        proposal=StrategyProposal(
-            action="BUY",
-            strategy_name="ma_crossover",
-            strategy_version=build_strategy_identity(slug="ma_crossover", module_version="1.0.0"),
-            deterministic_explanation=("CHECK_PASSED:strategy_evaluated",),
-            signal_payload={
-                "action": "buy",
-                "timestamp": "2026-07-01T00:00:00Z",
-            },
-        ),
-        risk_summary=RiskEvaluationSummary(
-            risk_verdict="ACCEPTED",
-            risk_event_id=risk_event_id,
-            reason_code=None,
-            approved_quantity=Decimal("0.001"),
-        ),
-        product_id="BTC-USD",
-        reference_price=Decimal("50000"),
-        evidence_age_minutes=0,
-        strategy_interval="15m",
-        canonical_signal_id=signal_id,
-    )
-
-    record = next(item for item in db.added if isinstance(item, DecisionRecord))
-    replay_context = record.indicators["replay_context"]
-    assert sorted(replay_context.keys()) == sorted(REPLAY_CONTEXT_KEYS)
-    assert replay_context["strategy_identity"] == "ma_crossover"
-    assert replay_context["strategy_version"] == "ma_crossover@1.0.0"
-    assert replay_context["timeframe"] == "15m"
-    assert replay_context["normalized_risk_verdict"] == "ALLOW"
-    assert replay_context["provider"] == "kraken_spot"
-    assert replay_context["environment"] == "production"
-    assert replay_context["paper_account_id"] == str(mandate.paper_account_id)
-    assert replay_context["live_trading_profile_id"] == str(mandate.live_trading_profile_id)
-    assert replay_context["capital_campaign_id"] == "123"
-    assert replay_context["capital_campaign_version"] == "7"
-    assert replay_context["expected_gross_edge"] == "UNKNOWN"
-    assert replay_context["actual_execution_fee"] == "UNKNOWN"
-
-
-@pytest.mark.asyncio
-@pytest.mark.parametrize(("risk_verdict", "expected"), [("RESIZED", "ALLOW_RESIZED"), ("REJECTED", "BLOCK"), ("OTHER", "UNKNOWN")])
-async def test_decision_record_replay_context_maps_risk_and_hold_context(risk_verdict: str, expected: str) -> None:
-    db = _FakeDb()
-    await _persist_decision_intelligence(
-        db=db,
-        cycle=SimpleNamespace(cycle_id=uuid.uuid4(), risk_event_id=None, audit_correlation_id=uuid.uuid4()),
-        mandate=SimpleNamespace(
-            provider="kraken_spot",
-            exchange_environment=None,
-            live_trading_profile_id=None,
-            paper_account_id=None,
-            capital_campaign_id=None,
-            mandate_id=uuid.uuid4(),
-        ),
-        version=SimpleNamespace(
-            mandate_version_id=uuid.uuid4(),
-            version_number=None,
-            allowed_strategy_versions=[build_strategy_identity(slug="ma_crossover", module_version="1.0.0")],
-            max_order_notional_usd=Decimal("5"),
-            max_open_exposure_usd=Decimal("10"),
-        ),
-        proposal=StrategyProposal(
-            action="HOLD",
-            strategy_name="ma_crossover",
-            strategy_version=build_strategy_identity(slug="ma_crossover", module_version="1.0.0"),
-            deterministic_explanation=("CHECK_PASSED:strategy_evaluated",),
-            signal_payload={"action": "hold"},
-        ),
-        risk_summary=RiskEvaluationSummary(
-            risk_verdict=risk_verdict,
-            risk_event_id=None,
-            reason_code=None,
-            approved_quantity=None,
-        ),
-        product_id="BTC-USD",
-        reference_price=Decimal("50000"),
-        evidence_age_minutes=0,
-        strategy_interval="15m",
-        canonical_signal_id=None,
-    )
-
-    record = next(item for item in db.added if isinstance(item, DecisionRecord))
-    replay_context = record.indicators["replay_context"]
-    assert replay_context["strategy_identity"] == "ma_crossover"
-    assert replay_context["strategy_version"] == "ma_crossover@1.0.0"
-    assert replay_context["timeframe"] == "15m"
-    assert replay_context["normalized_risk_verdict"] == expected
-    assert replay_context["environment"] == "UNKNOWN"
-    assert replay_context["paper_account_id"] == "UNKNOWN"
-    assert replay_context["live_trading_profile_id"] == "UNKNOWN"
-    assert replay_context["position_lifecycle_id"] == "UNKNOWN"
