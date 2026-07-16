@@ -45,10 +45,14 @@ from app.services.autonomous_cycle.orchestrator import normalize_product_id
 from app.services.canonical_campaign_binding import (
     CanonicalProvingAccountTransitionRequest,
     CanonicalCampaignBindingRequest,
+    CanonicalCampaignStatusTransitionRequest,
     LegacyCampaignTransitionRequest,
     bind_canonical_campaign_runtime as _bind_canonical_campaign_runtime,
+    fetch_canonical_campaign_status_transition_audit as _fetch_canonical_campaign_status_transition_audit,
     inspect_canonical_proving_account_transition as _inspect_canonical_proving_account_transition,
+    inspect_canonical_campaign_status_transition as _inspect_canonical_campaign_status_transition,
     transition_canonical_proving_account as _transition_canonical_proving_account,
+    transition_canonical_campaign_status as _transition_canonical_campaign_status,
     fetch_legacy_campaign_transition_audit as _fetch_legacy_campaign_transition_audit,
     fetch_canonical_campaign_binding_audit as _fetch_canonical_campaign_binding_audit,
     inspect_canonical_campaign_binding as _inspect_canonical_campaign_binding,
@@ -3211,6 +3215,130 @@ async def fetch_canonical_campaign_binding_status(*, campaign_id: UUID, campaign
         actor=actor,
         confirm=confirm,
     )
+
+
+async def canonical_campaign_status_transition_readiness(
+    *,
+    campaign_id: UUID,
+    campaign_version: int,
+    runtime_campaign_id: int,
+    expected_current_status: str,
+    target_status: str,
+    paper_account_id: UUID,
+    live_trading_profile_id: UUID,
+    provider: str,
+    environment: str,
+    product_id: str,
+    actor: str,
+) -> dict[str, Any]:
+    async with AsyncSessionLocal() as db:
+        result = await _inspect_canonical_campaign_status_transition(
+            db=db,
+            request=CanonicalCampaignStatusTransitionRequest(
+                campaign_id=campaign_id,
+                campaign_version=campaign_version,
+                runtime_campaign_id=runtime_campaign_id,
+                expected_current_status=expected_current_status,
+                target_status=target_status,
+                paper_account_id=paper_account_id,
+                live_trading_profile_id=live_trading_profile_id,
+                provider=provider,
+                environment=environment,
+                product_id=product_id,
+                actor=actor,
+                idempotency_key=None,
+                confirm=False,
+            ),
+        )
+    return {
+        "ready": result.ready,
+        "blockers": result.blockers,
+        "checks": [{"code": item.code, "passed": item.passed, "detail": item.detail} for item in result.checks],
+        "snapshot": result.snapshot,
+    }
+
+
+async def canonical_campaign_status_transition_execute(
+    *,
+    campaign_id: UUID,
+    campaign_version: int,
+    runtime_campaign_id: int,
+    expected_current_status: str,
+    target_status: str,
+    paper_account_id: UUID,
+    live_trading_profile_id: UUID,
+    provider: str,
+    environment: str,
+    product_id: str,
+    actor: str,
+    idempotency_key: str,
+    confirm: bool,
+) -> dict[str, Any]:
+    async with AsyncSessionLocal() as db:
+        result = await _transition_canonical_campaign_status(
+            db=db,
+            request=CanonicalCampaignStatusTransitionRequest(
+                campaign_id=campaign_id,
+                campaign_version=campaign_version,
+                runtime_campaign_id=runtime_campaign_id,
+                expected_current_status=expected_current_status,
+                target_status=target_status,
+                paper_account_id=paper_account_id,
+                live_trading_profile_id=live_trading_profile_id,
+                provider=provider,
+                environment=environment,
+                product_id=product_id,
+                actor=actor,
+                idempotency_key=idempotency_key,
+                confirm=confirm,
+            ),
+        )
+    return {
+        "changed": result.changed,
+        "idempotent": result.idempotent,
+        "audit_created": result.audit_created,
+        "before": result.before,
+        "after": result.after,
+        "readiness": {
+            "ready": result.readiness.ready,
+            "blockers": result.readiness.blockers,
+            "checks": [{"code": item.code, "passed": item.passed, "detail": item.detail} for item in result.readiness.checks],
+            "snapshot": result.readiness.snapshot,
+        },
+    }
+
+
+async def canonical_campaign_status_transition_audit(
+    *,
+    campaign_id: UUID,
+    campaign_version: int,
+    runtime_campaign_id: int,
+    expected_current_status: str,
+    target_status: str,
+    paper_account_id: UUID,
+    live_trading_profile_id: UUID,
+    provider: str,
+    environment: str,
+    product_id: str,
+    actor: str,
+    limit: int = 20,
+) -> dict[str, Any]:
+    async with AsyncSessionLocal() as db:
+        return await _fetch_canonical_campaign_status_transition_audit(
+            db=db,
+            campaign_id=campaign_id,
+            campaign_version=campaign_version,
+            runtime_campaign_id=runtime_campaign_id,
+            expected_current_status=expected_current_status,
+            target_status=target_status,
+            paper_account_id=paper_account_id,
+            live_trading_profile_id=live_trading_profile_id,
+            provider=provider,
+            environment=environment,
+            product_id=product_id,
+            actor=actor,
+            limit=limit,
+        )
 
 
 async def fetch_canonical_campaign_binding_audit(*, campaign_id: UUID, limit: int = 20) -> dict[str, Any]:

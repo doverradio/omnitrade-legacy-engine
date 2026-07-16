@@ -425,6 +425,98 @@ def test_parse_exchange_refresh_and_proving_cap_transition_commands() -> None:
     assert execute.confirm is True
 
 
+def test_parse_canonical_campaign_status_transition_commands() -> None:
+    readiness = parse_args([
+        "canonical-campaign-status-transition-readiness",
+        "--campaign-id",
+        "e9a9e8e9-9574-498d-b49e-f011218c7f2b",
+        "--campaign-version",
+        "1",
+        "--runtime-campaign-id",
+        "2",
+        "--expected-current-status",
+        "DRAFT",
+        "--target-status",
+        "READY",
+        "--paper-account-id",
+        "905a408c-7d8e-4fc7-ad3b-9ff637005d73",
+        "--live-trading-profile-id",
+        "9da09ae9-475e-41e8-b2c2-717ba5acfa3d",
+        "--provider",
+        "kraken_spot",
+        "--environment",
+        "production",
+        "--product",
+        "BTC-USD",
+        "--actor",
+        "operator:human",
+        "--json",
+    ])
+    assert readiness.command == "canonical-campaign-status-transition-readiness"
+    assert readiness.runtime_campaign_id == 2
+
+    execute = parse_args([
+        "canonical-campaign-status-transition-execute",
+        "--campaign-id",
+        "e9a9e8e9-9574-498d-b49e-f011218c7f2b",
+        "--campaign-version",
+        "1",
+        "--runtime-campaign-id",
+        "2",
+        "--expected-current-status",
+        "DRAFT",
+        "--target-status",
+        "READY",
+        "--paper-account-id",
+        "905a408c-7d8e-4fc7-ad3b-9ff637005d73",
+        "--live-trading-profile-id",
+        "9da09ae9-475e-41e8-b2c2-717ba5acfa3d",
+        "--provider",
+        "kraken_spot",
+        "--environment",
+        "production",
+        "--product",
+        "BTC-USD",
+        "--actor",
+        "operator:human",
+        "--idempotency-key",
+        "status-1",
+        "--confirm",
+        "--json",
+    ])
+    assert execute.command == "canonical-campaign-status-transition-execute"
+    assert execute.idempotency_key == "status-1"
+    assert execute.confirm is True
+
+    audit = parse_args([
+        "canonical-campaign-status-transition-audit",
+        "--campaign-id",
+        "e9a9e8e9-9574-498d-b49e-f011218c7f2b",
+        "--campaign-version",
+        "1",
+        "--runtime-campaign-id",
+        "2",
+        "--expected-current-status",
+        "DRAFT",
+        "--target-status",
+        "READY",
+        "--paper-account-id",
+        "905a408c-7d8e-4fc7-ad3b-9ff637005d73",
+        "--live-trading-profile-id",
+        "9da09ae9-475e-41e8-b2c2-717ba5acfa3d",
+        "--provider",
+        "kraken_spot",
+        "--environment",
+        "production",
+        "--product",
+        "BTC-USD",
+        "--actor",
+        "operator:human",
+        "--json",
+    ])
+    assert audit.command == "canonical-campaign-status-transition-audit"
+
+
 def test_parse_first_autonomous_profit_status_command() -> None:
     args = parse_args([
         "first-autonomous-profit-status",
@@ -710,6 +802,123 @@ async def test_run_async_routes_exchange_refresh_and_proving_cap_transition(monk
     assert execute_code == 0
     assert execute_payload["changed"] is True
     assert "canonical-proving-cap-transition-execute" in execute_text
+
+
+@pytest.mark.asyncio
+async def test_run_async_routes_canonical_campaign_status_transition_commands(monkeypatch: pytest.MonkeyPatch) -> None:
+    readiness_args = parse_args([
+        "canonical-campaign-status-transition-readiness",
+        "--campaign-id",
+        "e9a9e8e9-9574-498d-b49e-f011218c7f2b",
+        "--campaign-version",
+        "1",
+        "--runtime-campaign-id",
+        "2",
+        "--expected-current-status",
+        "DRAFT",
+        "--target-status",
+        "READY",
+        "--paper-account-id",
+        "905a408c-7d8e-4fc7-ad3b-9ff637005d73",
+        "--live-trading-profile-id",
+        "9da09ae9-475e-41e8-b2c2-717ba5acfa3d",
+        "--provider",
+        "kraken_spot",
+        "--environment",
+        "production",
+        "--product",
+        "BTC-USD",
+        "--actor",
+        "operator:human",
+        "--json",
+    ])
+
+    async def _fake_readiness(**kwargs):
+        assert kwargs["runtime_campaign_id"] == 2
+        return {"ready": True, "command": "canonical-campaign-status-transition-readiness"}
+
+    monkeypatch.setattr(operator_main, "canonical_campaign_status_transition_readiness", _fake_readiness)
+    readiness_code, readiness_payload, readiness_text = await operator_main._run_async(readiness_args)
+    assert readiness_code == 0
+    assert readiness_payload["ready"] is True
+    assert "canonical-campaign-status-transition-readiness" in readiness_text
+
+    execute_args = parse_args([
+        "canonical-campaign-status-transition-execute",
+        "--campaign-id",
+        "e9a9e8e9-9574-498d-b49e-f011218c7f2b",
+        "--campaign-version",
+        "1",
+        "--runtime-campaign-id",
+        "2",
+        "--expected-current-status",
+        "DRAFT",
+        "--target-status",
+        "READY",
+        "--paper-account-id",
+        "905a408c-7d8e-4fc7-ad3b-9ff637005d73",
+        "--live-trading-profile-id",
+        "9da09ae9-475e-41e8-b2c2-717ba5acfa3d",
+        "--provider",
+        "kraken_spot",
+        "--environment",
+        "production",
+        "--product",
+        "BTC-USD",
+        "--actor",
+        "operator:human",
+        "--idempotency-key",
+        "status-1",
+        "--confirm",
+        "--json",
+    ])
+
+    async def _fake_execute(**kwargs):
+        assert kwargs["idempotency_key"] == "status-1"
+        return {"changed": True, "command": "canonical-campaign-status-transition-execute"}
+
+    monkeypatch.setattr(operator_main, "canonical_campaign_status_transition_execute", _fake_execute)
+    execute_code, execute_payload, execute_text = await operator_main._run_async(execute_args)
+    assert execute_code == 0
+    assert execute_payload["changed"] is True
+    assert "canonical-campaign-status-transition-execute" in execute_text
+
+    audit_args = parse_args([
+        "canonical-campaign-status-transition-audit",
+        "--campaign-id",
+        "e9a9e8e9-9574-498d-b49e-f011218c7f2b",
+        "--campaign-version",
+        "1",
+        "--runtime-campaign-id",
+        "2",
+        "--expected-current-status",
+        "DRAFT",
+        "--target-status",
+        "READY",
+        "--paper-account-id",
+        "905a408c-7d8e-4fc7-ad3b-9ff637005d73",
+        "--live-trading-profile-id",
+        "9da09ae9-475e-41e8-b2c2-717ba5acfa3d",
+        "--provider",
+        "kraken_spot",
+        "--environment",
+        "production",
+        "--product",
+        "BTC-USD",
+        "--actor",
+        "operator:human",
+        "--json",
+    ])
+
+    async def _fake_audit(**kwargs):
+        assert kwargs["target_status"] == "READY"
+        return {"audit": {"total": 1}, "command": "canonical-campaign-status-transition-audit"}
+
+    monkeypatch.setattr(operator_main, "canonical_campaign_status_transition_audit", _fake_audit)
+    audit_code, audit_payload, audit_text = await operator_main._run_async(audit_args)
+    assert audit_code == 0
+    assert audit_payload["audit"]["total"] == 1
+    assert "canonical-campaign-status-transition-audit" in audit_text
 
 
 @pytest.mark.asyncio

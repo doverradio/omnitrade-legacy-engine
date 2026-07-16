@@ -34,6 +34,9 @@ from app.operator_cli.service import (
     canonical_preview_package_history,
     canonical_preview_package_readiness,
     canonical_proving_activation_status,
+    canonical_campaign_status_transition_audit,
+    canonical_campaign_status_transition_execute,
+    canonical_campaign_status_transition_readiness,
     campaign_unattended_eligibility_audit,
     create_canonical_preview_package_bundle,
     activate_venue_commission_run,
@@ -305,6 +308,66 @@ def _build_parser() -> argparse.ArgumentParser:
     canonical_bind.add_argument("--actor", type=str, default="operator:human")
     canonical_bind.add_argument("--confirm", action="store_true")
     canonical_bind.add_argument("--json", action="store_true", dest="json_output")
+
+    canonical_status_transition_readiness = subparsers.add_parser(
+        "canonical-campaign-status-transition-readiness",
+        parents=[common],
+        help="Read-only readiness for canonical campaign status transition",
+        description="Read-only sanctioned readiness checks for canonical campaign DRAFT to READY status transition.",
+    )
+    canonical_status_transition_readiness.add_argument("--campaign-id", type=UUID, required=True)
+    canonical_status_transition_readiness.add_argument("--campaign-version", type=int, required=True)
+    canonical_status_transition_readiness.add_argument("--runtime-campaign-id", type=int, required=True)
+    canonical_status_transition_readiness.add_argument("--expected-current-status", type=str, required=True)
+    canonical_status_transition_readiness.add_argument("--target-status", type=str, required=True)
+    canonical_status_transition_readiness.add_argument("--paper-account-id", type=UUID, required=True)
+    canonical_status_transition_readiness.add_argument("--live-trading-profile-id", type=UUID, required=True)
+    canonical_status_transition_readiness.add_argument("--provider", type=str, required=True)
+    canonical_status_transition_readiness.add_argument("--environment", type=str, required=True)
+    canonical_status_transition_readiness.add_argument("--product", type=str, required=True)
+    canonical_status_transition_readiness.add_argument("--actor", type=str, required=True)
+    canonical_status_transition_readiness.add_argument("--json", action="store_true", dest="json_output")
+
+    canonical_status_transition_execute = subparsers.add_parser(
+        "canonical-campaign-status-transition-execute",
+        parents=[common],
+        help="Execute canonical campaign status transition",
+        description="Operator-confirmed sanctioned canonical campaign status transition.",
+    )
+    canonical_status_transition_execute.add_argument("--campaign-id", type=UUID, required=True)
+    canonical_status_transition_execute.add_argument("--campaign-version", type=int, required=True)
+    canonical_status_transition_execute.add_argument("--runtime-campaign-id", type=int, required=True)
+    canonical_status_transition_execute.add_argument("--expected-current-status", type=str, required=True)
+    canonical_status_transition_execute.add_argument("--target-status", type=str, required=True)
+    canonical_status_transition_execute.add_argument("--paper-account-id", type=UUID, required=True)
+    canonical_status_transition_execute.add_argument("--live-trading-profile-id", type=UUID, required=True)
+    canonical_status_transition_execute.add_argument("--provider", type=str, required=True)
+    canonical_status_transition_execute.add_argument("--environment", type=str, required=True)
+    canonical_status_transition_execute.add_argument("--product", type=str, required=True)
+    canonical_status_transition_execute.add_argument("--actor", type=str, required=True)
+    canonical_status_transition_execute.add_argument("--idempotency-key", type=str, required=True)
+    canonical_status_transition_execute.add_argument("--confirm", action="store_true")
+    canonical_status_transition_execute.add_argument("--json", action="store_true", dest="json_output")
+
+    canonical_status_transition_audit = subparsers.add_parser(
+        "canonical-campaign-status-transition-audit",
+        parents=[common],
+        help="Show canonical campaign status transition audit",
+        description="Read-only immutable audit and post-transition unattended eligibility for canonical status transition.",
+    )
+    canonical_status_transition_audit.add_argument("--campaign-id", type=UUID, required=True)
+    canonical_status_transition_audit.add_argument("--campaign-version", type=int, required=True)
+    canonical_status_transition_audit.add_argument("--runtime-campaign-id", type=int, required=True)
+    canonical_status_transition_audit.add_argument("--expected-current-status", type=str, required=True)
+    canonical_status_transition_audit.add_argument("--target-status", type=str, required=True)
+    canonical_status_transition_audit.add_argument("--paper-account-id", type=UUID, required=True)
+    canonical_status_transition_audit.add_argument("--live-trading-profile-id", type=UUID, required=True)
+    canonical_status_transition_audit.add_argument("--provider", type=str, required=True)
+    canonical_status_transition_audit.add_argument("--environment", type=str, required=True)
+    canonical_status_transition_audit.add_argument("--product", type=str, required=True)
+    canonical_status_transition_audit.add_argument("--actor", type=str, required=True)
+    canonical_status_transition_audit.add_argument("--limit", type=int, default=20)
+    canonical_status_transition_audit.add_argument("--json", action="store_true", dest="json_output")
 
     canonical_audit = subparsers.add_parser(
         "canonical-campaign-binding-audit",
@@ -964,6 +1027,57 @@ async def _run_async(args: argparse.Namespace) -> tuple[int, dict[str, Any], str
             product_id=args.product,
             actor=args.actor,
             confirm=bool(args.confirm),
+        )
+        return 0, payload, render_json(payload)
+
+    if args.command == "canonical-campaign-status-transition-readiness":
+        payload = await canonical_campaign_status_transition_readiness(
+            campaign_id=args.campaign_id,
+            campaign_version=args.campaign_version,
+            runtime_campaign_id=args.runtime_campaign_id,
+            expected_current_status=args.expected_current_status,
+            target_status=args.target_status,
+            paper_account_id=args.paper_account_id,
+            live_trading_profile_id=args.live_trading_profile_id,
+            provider=args.provider,
+            environment=args.environment,
+            product_id=args.product,
+            actor=args.actor,
+        )
+        return (0 if bool(payload.get("ready")) else 1), payload, render_json(payload)
+
+    if args.command == "canonical-campaign-status-transition-execute":
+        payload = await canonical_campaign_status_transition_execute(
+            campaign_id=args.campaign_id,
+            campaign_version=args.campaign_version,
+            runtime_campaign_id=args.runtime_campaign_id,
+            expected_current_status=args.expected_current_status,
+            target_status=args.target_status,
+            paper_account_id=args.paper_account_id,
+            live_trading_profile_id=args.live_trading_profile_id,
+            provider=args.provider,
+            environment=args.environment,
+            product_id=args.product,
+            actor=args.actor,
+            idempotency_key=args.idempotency_key,
+            confirm=bool(args.confirm),
+        )
+        return 0, payload, render_json(payload)
+
+    if args.command == "canonical-campaign-status-transition-audit":
+        payload = await canonical_campaign_status_transition_audit(
+            campaign_id=args.campaign_id,
+            campaign_version=args.campaign_version,
+            runtime_campaign_id=args.runtime_campaign_id,
+            expected_current_status=args.expected_current_status,
+            target_status=args.target_status,
+            paper_account_id=args.paper_account_id,
+            live_trading_profile_id=args.live_trading_profile_id,
+            provider=args.provider,
+            environment=args.environment,
+            product_id=args.product,
+            actor=args.actor,
+            limit=args.limit,
         )
         return 0, payload, render_json(payload)
 

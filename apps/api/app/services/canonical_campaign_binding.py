@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import hashlib
+import json
 from datetime import datetime, timezone
 from decimal import Decimal
 from typing import Any
@@ -23,6 +25,7 @@ from app.models.live_reconciliation_event import LiveReconciliationEvent
 from app.models.live_trading_profile import LiveTradingProfile
 from app.models.paper_account import PaperAccount
 from app.models.trade import Trade
+from app.services.capital_campaign_orchestration.service import _eligible_for_orchestration
 
 
 _TERMINAL_LIVE_ORDER_STATUSES = {"DRY_RUN_READY", "DRY_RUN_BLOCKED", "FILLED", "CANCELLED", "FAILED", "REJECTED", "EXPIRED", "COMPLETED"}
@@ -38,6 +41,9 @@ _ACCEPTED_CONNECTION_STATUSES = frozenset({"connected"})
 _ACCEPTED_ACCOUNT_STATUSES = frozenset({"active", "enabled", "ok", "normal"})
 _HOLDING_PRICE_KEYS = ("price_usd", "usd_price", "market_price_usd", "mark_price_usd", "price")
 _EQUITY_DELTA_TOLERANCE_USD = Decimal("0.01")
+_CANONICAL_STATUS_TRANSITION_ACTION = "capital_campaign.status_transition"
+_CANONICAL_STATUS_TRANSITION_ALLOWED = {("DRAFT", "READY")}
+_CANONICAL_STATUS_TRANSITION_PACKAGE_CONFLICT_STATES = {"READY", "AUTHORIZED", "ACTIVATED"}
 
 
 @dataclass(frozen=True, slots=True)
@@ -284,6 +290,545 @@ async def _latest_proving_transition_audit_for_update(*, db: AsyncSession, campa
         .with_for_update()
         .limit(1)
     )
+
+
+async def _latest_definition_version(*, db: AsyncSession, campaign_id: UUID) -> int | None:
+    value = await db.scalar(
+        select(func.max(CapitalCampaignDefinition.version))
+        .where(CapitalCampaignDefinition.campaign_id == campaign_id)
+    )
+    return None if value is None else int(value)
+
+
+async def _count_package_conflicts(*, db: AsyncSession, campaign_id: UUID, campaign_version: int) -> int:
+    value = await db.scalar(
+        select(func.count())
+        .select_from(CanonicalPreviewPackage)
+        .where(CanonicalPreviewPackage.campaign_id == campaign_id)
+        .where(CanonicalPreviewPackage.campaign_version == campaign_version)
+        .where(CanonicalPreviewPackage.package_state.in_(sorted(_CANONICAL_STATUS_TRANSITION_PACKAGE_CONFLICT_STATES)))
+    )
+    return int(value or 0)
+
+
+async def _count_open_btc_positions_for_campaign(*, db: AsyncSession, capital_campaign_id: int) -> int:
+    rows = list(
+        (
+            await db.execute(
+                select(
+                    LiveAccountingRecord.side,
+                    LiveAccountingRecord.filled_quantity,
+                )
+                .where(LiveAccountingRecord.capital_campaign_id == capital_campaign_id)
+                .where(func.upper(LiveAccountingRecord.symbol) == "BTC")
+                .where(LiveAccountingRecord.record_type.in_(["fill_accounting", "partial_fill_accounting"]))
+                .order_by(LiveAccountingRecord.recorded_at.asc(), LiveAccountingRecord.id.asc())
+            )
+        ).all()
+    )
+    if not rows:
+        return 0
+
+    net = Decimal("0")
+    for side, qty in rows:
+        quantity = Decimal(str(qty or 0))
+        side_normalized = str(side).lower()
+        if side_normalized == "buy":
+            net += quantity
+        elif side_normalized == "sell":
+            net -= quantity
+    return 1 if net > Decimal("0") else 0
+
+
+async def _find_status_transition_audit_by_idempotency_key_for_update(
+    *,
+    db: AsyncSession,
+    campaign_id: UUID,
+    idempotency_key: str,
+) -> AuditLog | None:
+    rows = list(
+        (
+            await db.execute(
+                select(AuditLog)
+                .where(AuditLog.entity_type == "capital_campaign")
+                .where(AuditLog.entity_id == campaign_id)
+                .where(AuditLog.action == _CANONICAL_STATUS_TRANSITION_ACTION)
+                .order_by(AuditLog.created_at.desc(), AuditLog.id.desc())
+                .with_for_update()
+                .limit(20)
+            )
+        ).scalars().all()
+    )
+    for row in rows:
+        after = row.after_state if isinstance(row.after_state, dict) else {}
+        if str((after or {}).get("idempotency_key") or "") == idempotency_key:
+            return row
+    return None
+
+
+def _build_canonical_status_transition_request_fingerprint(*, request: "CanonicalCampaignStatusTransitionRequest") -> str:
+    payload = {
+        "campaign_id": str(request.campaign_id),
+        "campaign_version": int(request.campaign_version),
+        "runtime_campaign_id": int(request.runtime_campaign_id),
+        "expected_current_status": request.expected_current_status.strip().upper(),
+        "target_status": request.target_status.strip().upper(),
+        "paper_account_id": str(request.paper_account_id),
+        "live_trading_profile_id": str(request.live_trading_profile_id),
+        "provider": request.provider.strip().lower(),
+        "environment": request.environment.strip().lower(),
+        "product_id": request.product_id.strip().upper(),
+        "actor": request.actor.strip(),
+    }
+    encoded = json.dumps(payload, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
+
+
+@dataclass(frozen=True, slots=True)
+class CanonicalCampaignStatusTransitionRequest:
+    campaign_id: UUID
+    campaign_version: int
+    runtime_campaign_id: int
+    expected_current_status: str
+    target_status: str
+    paper_account_id: UUID
+    live_trading_profile_id: UUID
+    provider: str
+    environment: str
+    product_id: str
+    actor: str
+    idempotency_key: str | None
+    confirm: bool
+
+
+@dataclass(frozen=True, slots=True)
+class CanonicalCampaignStatusTransitionReadinessResult:
+    ready: bool
+    blockers: list[str]
+    checks: list[BindingCheck]
+    snapshot: dict[str, Any]
+
+
+@dataclass(frozen=True, slots=True)
+class CanonicalCampaignStatusTransitionMutationResult:
+    changed: bool
+    idempotent: bool
+    audit_created: bool
+    before: dict[str, Any]
+    after: dict[str, Any]
+    readiness: CanonicalCampaignStatusTransitionReadinessResult
+
+
+async def inspect_canonical_campaign_status_transition(
+    *,
+    db: AsyncSession,
+    request: CanonicalCampaignStatusTransitionRequest,
+) -> CanonicalCampaignStatusTransitionReadinessResult:
+    definition = await _load_definition(db=db, campaign_id=request.campaign_id, version=request.campaign_version)
+    runtime = await db.scalar(
+        select(CapitalCampaign)
+        .where(CapitalCampaign.uuid == request.campaign_id)
+        .where(CapitalCampaign.id == request.runtime_campaign_id)
+        .limit(1)
+    )
+    return await _inspect_canonical_campaign_status_transition_locked(
+        db=db,
+        request=request,
+        definition=definition,
+        runtime=runtime,
+    )
+
+
+async def _inspect_canonical_campaign_status_transition_locked(
+    *,
+    db: AsyncSession,
+    request: CanonicalCampaignStatusTransitionRequest,
+    definition: CapitalCampaignDefinition | None,
+    runtime: CapitalCampaign | None,
+) -> CanonicalCampaignStatusTransitionReadinessResult:
+    provider = request.provider.strip().lower()
+    environment = _normalize_exchange_environment(request.environment)
+    product = request.product_id.strip().upper()
+    expected_status = request.expected_current_status.strip().upper()
+    target_status = request.target_status.strip().upper()
+
+    live_profile = await _load_live_profile(db=db, live_trading_profile_id=request.live_trading_profile_id)
+    connection = await _load_connection(db=db, provider=provider, environment=environment)
+
+    latest_version = await _latest_definition_version(db=db, campaign_id=request.campaign_id)
+
+    open_live_btc_order_count = 0
+    unresolved_reconciliation_count = 0
+    open_btc_position_count = 0
+    active_activation_count = 0
+    package_conflict_count = 0
+    if runtime is not None:
+        open_live_btc_order_count = await _count_open_live_orders_for_campaign(
+            db=db,
+            capital_campaign_id=runtime.id,
+            provider=provider,
+            environment=environment,
+            product_id=product,
+        )
+        unresolved_reconciliation_count = await _count_unresolved_reconciliation_events_for_campaign(
+            db=db,
+            capital_campaign_id=runtime.id,
+        )
+        open_btc_position_count = await _count_open_btc_positions_for_campaign(
+            db=db,
+            capital_campaign_id=runtime.id,
+        )
+
+    active_activation_count = await _count_active_proving_activations(
+        db=db,
+        campaign_id=request.campaign_id,
+        campaign_version=request.campaign_version,
+        live_trading_profile_id=request.live_trading_profile_id,
+        provider=provider,
+        environment=environment,
+        product_id=product,
+    )
+    package_conflict_count = await _count_package_conflicts(
+        db=db,
+        campaign_id=request.campaign_id,
+        campaign_version=request.campaign_version,
+    )
+
+    balances = connection.balances if connection is not None and isinstance(connection.balances, list) else []
+    usd_available = _balance_value(balances=balances, currency="USD", key="available")
+    settings = get_settings()
+    now = datetime.now(timezone.utc)
+    observed_at = None if connection is None else (connection.last_successful_sync_at or connection.last_verified_at or connection.updated_at)
+    age_seconds = None if observed_at is None else (now - observed_at.astimezone(timezone.utc)).total_seconds()
+
+    checks: list[BindingCheck] = []
+    checks.append(_check((expected_status, target_status) in _CANONICAL_STATUS_TRANSITION_ALLOWED, "supported_transition_only", f"expected_current_status={expected_status} target_status={target_status}"))
+    checks.append(_check(definition is not None, "canonical_definition_exists", f"campaign_version={request.campaign_version}"))
+    checks.append(_check(latest_version is not None and latest_version == request.campaign_version, "requested_version_is_latest", f"latest_version={latest_version}"))
+    checks.append(_check(runtime is not None, "runtime_campaign_exists", f"runtime_campaign_id={request.runtime_campaign_id}"))
+    if runtime is not None:
+        checks.append(_check(runtime.uuid == request.campaign_id, "runtime_uuid_linkage_matches", f"runtime_uuid={runtime.uuid}"))
+        checks.append(_check(runtime.definition_version == request.campaign_version, "runtime_definition_version_matches", f"runtime_definition_version={runtime.definition_version}"))
+        checks.append(_check(str(runtime.status).upper() == "DRAFT", "runtime_status_is_draft", f"runtime_status={runtime.status}"))
+        checks.append(_check(runtime.paper_account_id == request.paper_account_id, "dedicated_paper_account_matches", f"runtime_paper_account_id={runtime.paper_account_id}"))
+    if definition is not None:
+        checks.append(_check(str(definition.status).upper() == "DRAFT", "definition_status_is_draft", f"definition_status={definition.status}"))
+        checks.append(_check(int(definition.maximum_open_positions) == 1, "maximum_open_positions_equals_1", f"maximum_open_positions={definition.maximum_open_positions}"))
+        checks.append(_check(Decimal(str(definition.minimum_position_size)) == _PROVING_CAP_USD, "minimum_position_size_equals_5", f"minimum_position_size={definition.minimum_position_size}"))
+        checks.append(_check(Decimal(str(definition.maximum_position_size)) == _PROVING_CAP_USD, "maximum_position_size_equals_5", f"maximum_position_size={definition.maximum_position_size}"))
+        checks.append(_check(Decimal(str(definition.maximum_total_exposure)) == _PROVING_CAP_USD, "maximum_total_exposure_equals_5", f"maximum_total_exposure={definition.maximum_total_exposure}"))
+        allowed_instruments = {str(item or "").strip().upper() for item in (definition.allowed_instruments or [])}
+        allowed_venues = {str(item or "").strip().lower() for item in (definition.allowed_venues or [])}
+        checks.append(_check("BTC-USD" in allowed_instruments and product == "BTC-USD", "btc_usd_allowed", f"requested_product={product} allowed_instruments={sorted(allowed_instruments)}"))
+        checks.append(_check("kraken_spot" in allowed_venues and provider == "kraken_spot", "kraken_spot_allowed", f"requested_provider={provider} allowed_venues={sorted(allowed_venues)}"))
+        projected_campaign = type("ProjectedCampaign", (), {
+            "status": "READY",
+            "allowed_instruments": list(definition.allowed_instruments or []),
+            "allowed_venues": list(definition.allowed_venues or []),
+        })()
+        unattended_eligible_after = bool(_eligible_for_orchestration(campaign=projected_campaign))
+    else:
+        unattended_eligible_after = False
+
+    checks.append(_check(live_profile is not None, "live_profile_exists", f"live_trading_profile_id={request.live_trading_profile_id}"))
+    if live_profile is not None:
+        checks.append(_check(live_profile.paper_account_id == request.paper_account_id, "live_profile_points_to_same_paper_account", f"profile_paper_account_id={live_profile.paper_account_id}"))
+
+    checks.append(_check(connection is not None, "provider_connection_exists", f"provider={provider} environment={environment}"))
+    if connection is not None:
+        checks.append(_check(str(connection.status).strip().lower() == "connected", "provider_connection_connected_and_ready", f"connection_status={connection.status} readiness_verdict={connection.last_readiness_verdict}"))
+        checks.append(
+            _check(
+                connection.last_readiness_verdict in _PROVING_READINESS_VERDICT_ALLOWLIST,
+                "provider_connection_connected_and_ready",
+                f"connection_status={connection.status} readiness_verdict={connection.last_readiness_verdict}",
+            )
+        )
+        checks.append(
+            _check(
+                observed_at is not None and age_seconds is not None and age_seconds <= float(settings.canonical_proving_provider_evidence_max_age_seconds),
+                "provider_balance_evidence_fresh",
+                f"evidence_observed_at={None if observed_at is None else observed_at.isoformat()} age_seconds={age_seconds} max_age_seconds={settings.canonical_proving_provider_evidence_max_age_seconds}",
+            )
+        )
+
+    checks.append(_check(usd_available is not None and usd_available >= _PROVING_CAP_USD, "paper_liquid_cash_supports_exact_5", f"usd_available={usd_available}"))
+    checks.append(_check(open_live_btc_order_count == 0, "no_open_live_btc_order", f"open_live_btc_order_count={open_live_btc_order_count}"))
+    checks.append(_check(unresolved_reconciliation_count == 0, "no_unresolved_reconciliation", f"unresolved_reconciliation_count={unresolved_reconciliation_count}"))
+    checks.append(_check(open_btc_position_count == 0, "no_open_btc_position", f"open_btc_position_count={open_btc_position_count}"))
+    checks.append(_check(active_activation_count == 0, "no_active_proving_activation", f"active_proving_activation_count={active_activation_count}"))
+    checks.append(_check(package_conflict_count == 0, "no_ready_authorized_activated_package_conflict", f"package_conflict_count={package_conflict_count}"))
+    checks.append(_check(unattended_eligible_after, "unattended_would_become_eligible_after_transition", f"eligible_after_transition={unattended_eligible_after}"))
+    checks.append(_check(unattended_eligible_after and target_status != "DRAFT", "would_appear_in_unattended_candidate_list_after_transition", f"eligible_after_transition={unattended_eligible_after} target_status={target_status}"))
+
+    blockers = [item.code for item in checks if not item.passed]
+    snapshot = {
+        "campaign_id": str(request.campaign_id),
+        "campaign_version": request.campaign_version,
+        "runtime_campaign_id": request.runtime_campaign_id,
+        "expected_current_status": expected_status,
+        "target_status": target_status,
+        "definition_status": None if definition is None else str(definition.status),
+        "runtime_status": None if runtime is None else str(runtime.status),
+        "provider_evidence": {
+            "exchange_connection_id": None if connection is None else str(connection.exchange_connection_id),
+            "observed_at": None if observed_at is None else observed_at.isoformat(),
+            "age_seconds": age_seconds,
+            "max_age_seconds": settings.canonical_proving_provider_evidence_max_age_seconds,
+            "readiness_verdict": None if connection is None else connection.last_readiness_verdict,
+            "connection_status": None if connection is None else connection.status,
+        },
+        "unattended_after_transition": {
+            "eligible": unattended_eligible_after,
+            "would_appear_in_candidate_list": unattended_eligible_after and target_status != "DRAFT",
+        },
+        "gates": {
+            "open_live_btc_order_count": open_live_btc_order_count,
+            "unresolved_reconciliation_count": unresolved_reconciliation_count,
+            "open_btc_position_count": open_btc_position_count,
+            "active_proving_activation_count": active_activation_count,
+            "package_conflict_count": package_conflict_count,
+            "usd_available": None if usd_available is None else format(usd_available, "f"),
+        },
+    }
+    return CanonicalCampaignStatusTransitionReadinessResult(
+        ready=len(blockers) == 0,
+        blockers=sorted(set(blockers)),
+        checks=checks,
+        snapshot=snapshot,
+    )
+
+
+async def transition_canonical_campaign_status(
+    *,
+    db: AsyncSession,
+    request: CanonicalCampaignStatusTransitionRequest,
+) -> CanonicalCampaignStatusTransitionMutationResult:
+    actor = _canonical_actor(request.actor)
+    if not request.confirm:
+        raise PermissionError("confirm=true is required")
+    if request.idempotency_key is None or not request.idempotency_key.strip():
+        raise PermissionError("idempotency_key is required")
+    if _session_in_transaction(db):
+        return await _transition_canonical_campaign_status_without_begin(db=db, request=request)
+    async with db.begin():
+        return await _transition_canonical_campaign_status_without_begin(db=db, request=request)
+
+
+async def _transition_canonical_campaign_status_without_begin(
+    *,
+    db: AsyncSession,
+    request: CanonicalCampaignStatusTransitionRequest,
+) -> CanonicalCampaignStatusTransitionMutationResult:
+    actor = _canonical_actor(request.actor)
+    idempotency_key = str(request.idempotency_key or "").strip()
+    request_fingerprint = _build_canonical_status_transition_request_fingerprint(request=request)
+
+    existing_audit = await _find_status_transition_audit_by_idempotency_key_for_update(
+        db=db,
+        campaign_id=request.campaign_id,
+        idempotency_key=idempotency_key,
+    )
+    if existing_audit is not None:
+        after = existing_audit.after_state if isinstance(existing_audit.after_state, dict) else {}
+        previous_fingerprint = str((after or {}).get("request_fingerprint") or "")
+        if previous_fingerprint and previous_fingerprint != request_fingerprint:
+            raise PermissionError("conflicting retry blocked: idempotency key already used with different request")
+        before = existing_audit.before_state if isinstance(existing_audit.before_state, dict) else {}
+        replay_after = {
+            **(after or {}),
+            "idempotency_key": idempotency_key,
+            "request_fingerprint": previous_fingerprint or request_fingerprint,
+        }
+        definition = await _load_definition_for_update(db=db, campaign_id=request.campaign_id, version=request.campaign_version)
+        runtime = await db.scalar(
+            select(CapitalCampaign)
+            .where(CapitalCampaign.uuid == request.campaign_id)
+            .where(CapitalCampaign.id == request.runtime_campaign_id)
+            .with_for_update()
+            .limit(1)
+        )
+        readiness = await _inspect_canonical_campaign_status_transition_locked(
+            db=db,
+            request=request,
+            definition=definition,
+            runtime=runtime,
+        )
+        return CanonicalCampaignStatusTransitionMutationResult(
+            changed=False,
+            idempotent=True,
+            audit_created=False,
+            before=before,
+            after=replay_after,
+            readiness=readiness,
+        )
+
+    definition = await _load_definition_for_update(db=db, campaign_id=request.campaign_id, version=request.campaign_version)
+    runtime = await db.scalar(
+        select(CapitalCampaign)
+        .where(CapitalCampaign.uuid == request.campaign_id)
+        .where(CapitalCampaign.id == request.runtime_campaign_id)
+        .with_for_update()
+        .limit(1)
+    )
+    readiness = await _inspect_canonical_campaign_status_transition_locked(
+        db=db,
+        request=request,
+        definition=definition,
+        runtime=runtime,
+    )
+    if not readiness.ready:
+        raise PermissionError("canonical status transition prerequisites failed: " + ", ".join(readiness.blockers))
+    if definition is None or runtime is None:
+        raise LookupError("canonical status transition dependencies missing")
+
+    if str(definition.status).upper() != "DRAFT":
+        raise PermissionError("definition status drifted from DRAFT")
+    if str(runtime.status).upper() != "DRAFT":
+        raise PermissionError("runtime status drifted from DRAFT")
+
+    before = {
+        "campaign_id": str(request.campaign_id),
+        "campaign_version": request.campaign_version,
+        "runtime_campaign_id": request.runtime_campaign_id,
+        "definition_status": str(definition.status),
+        "runtime_status": str(runtime.status),
+    }
+
+    definition.status = "READY"
+    runtime.status = "READY"
+    definition.updated_at = datetime.now(timezone.utc)
+    runtime.updated_at = datetime.now(timezone.utc)
+    await db.flush()
+
+    provider_evidence = readiness.snapshot.get("provider_evidence") if isinstance(readiness.snapshot, dict) else {}
+    after = {
+        "campaign_id": str(request.campaign_id),
+        "campaign_version": request.campaign_version,
+        "runtime_campaign_id": request.runtime_campaign_id,
+        "expected_current_status": request.expected_current_status.strip().upper(),
+        "target_status": request.target_status.strip().upper(),
+        "definition_previous_status": before["definition_status"],
+        "runtime_previous_status": before["runtime_status"],
+        "definition_new_status": str(definition.status),
+        "runtime_new_status": str(runtime.status),
+        "actor": actor,
+        "idempotency_key": idempotency_key,
+        "request_fingerprint": request_fingerprint,
+        "provider_evidence_source_id": (provider_evidence or {}).get("exchange_connection_id"),
+        "provider_evidence_observed_at": (provider_evidence or {}).get("observed_at"),
+        "readiness_checked_at": datetime.now(timezone.utc).isoformat(),
+        "transition_verdict": "READY_COMMITTED",
+    }
+    db.add(
+        AuditLog(
+            actor=actor,
+            action=_CANONICAL_STATUS_TRANSITION_ACTION,
+            entity_type="capital_campaign",
+            entity_id=request.campaign_id,
+            before_state=before,
+            after_state=after,
+        )
+    )
+    return CanonicalCampaignStatusTransitionMutationResult(
+        changed=True,
+        idempotent=False,
+        audit_created=True,
+        before=before,
+        after=after,
+        readiness=readiness,
+    )
+
+
+async def fetch_canonical_campaign_status_transition_audit(
+    *,
+    db: AsyncSession,
+    campaign_id: UUID,
+    campaign_version: int,
+    runtime_campaign_id: int,
+    paper_account_id: UUID,
+    live_trading_profile_id: UUID,
+    provider: str,
+    environment: str,
+    product_id: str,
+    actor: str,
+    expected_current_status: str,
+    target_status: str,
+    limit: int = 20,
+) -> dict[str, Any]:
+    definition = await _load_definition(db=db, campaign_id=campaign_id, version=campaign_version)
+    runtime = await db.scalar(
+        select(CapitalCampaign)
+        .where(CapitalCampaign.uuid == campaign_id)
+        .where(CapitalCampaign.id == runtime_campaign_id)
+        .limit(1)
+    )
+    readiness = await _inspect_canonical_campaign_status_transition_locked(
+        db=db,
+        request=CanonicalCampaignStatusTransitionRequest(
+            campaign_id=campaign_id,
+            campaign_version=campaign_version,
+            runtime_campaign_id=runtime_campaign_id,
+            expected_current_status=expected_current_status,
+            target_status=target_status,
+            paper_account_id=paper_account_id,
+            live_trading_profile_id=live_trading_profile_id,
+            provider=provider,
+            environment=environment,
+            product_id=product_id,
+            actor=actor,
+            idempotency_key=None,
+            confirm=False,
+        ),
+        definition=definition,
+        runtime=runtime,
+    )
+    rows = list(
+        (
+            await db.execute(
+                select(AuditLog)
+                .where(AuditLog.entity_type == "capital_campaign")
+                .where(AuditLog.entity_id == campaign_id)
+                .where(AuditLog.action == _CANONICAL_STATUS_TRANSITION_ACTION)
+                .order_by(AuditLog.created_at.desc(), AuditLog.id.desc())
+                .limit(limit)
+            )
+        ).scalars().all()
+    )
+    definition_status = None if definition is None else str(definition.status)
+    runtime_status = None if runtime is None else str(runtime.status)
+    current_unattended_eligible = False
+    if definition is not None:
+        current_unattended_eligible = bool(_eligible_for_orchestration(campaign=definition))
+    return {
+        "campaign_id": str(campaign_id),
+        "campaign_version": campaign_version,
+        "runtime_campaign_id": runtime_campaign_id,
+        "definition_status": definition_status,
+        "runtime_status": runtime_status,
+        "unattended_eligibility": {
+            "eligible": current_unattended_eligible,
+            "appears_in_candidate_list": current_unattended_eligible and definition_status != "DRAFT",
+        },
+        "latest_readiness": {
+            "ready": readiness.ready,
+            "blockers": readiness.blockers,
+            "checks": [{"code": item.code, "passed": item.passed, "detail": item.detail} for item in readiness.checks],
+        },
+        "audit": {
+            "total": len(rows),
+            "items": [
+                {
+                    "actor": item.actor,
+                    "action": item.action,
+                    "before_state": item.before_state,
+                    "after_state": item.after_state,
+                    "created_at": item.created_at,
+                }
+                for item in rows
+            ],
+        },
+    }
 
 
 def _proposed_new_account_balances(

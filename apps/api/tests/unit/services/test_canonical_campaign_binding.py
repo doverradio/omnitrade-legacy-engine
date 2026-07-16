@@ -1779,3 +1779,491 @@ async def test_legacy_transition_concurrent_style_retries_resolve_to_single_audi
 
     assert sum(1 for item in [first, second] if item.changed) == 1
     assert sum(1 for item in db.added if getattr(item, "action", "") == "capital_campaign.transition_to_successor") == 1
+
+
+def _status_definition(*, campaign_id: UUID, version: int, status: str = "DRAFT") -> SimpleNamespace:
+    item = _definition(campaign_id=campaign_id, version=version)
+    item.status = status
+    item.allowed_instruments = ["BTC-USD"]
+    item.allowed_venues = ["kraken_spot"]
+    item.maximum_open_positions = 1
+    item.minimum_position_size = Decimal("5")
+    item.maximum_position_size = Decimal("5")
+    item.maximum_total_exposure = Decimal("5")
+    item.updated_at = datetime.now(timezone.utc)
+    return item
+
+
+def _status_runtime(*, campaign_id: UUID, runtime_campaign_id: int, paper_account_id: UUID, status: str = "DRAFT") -> SimpleNamespace:
+    item = _runtime(campaign_id=campaign_id, paper_account_id=paper_account_id)
+    item.id = runtime_campaign_id
+    item.status = status
+    return item
+
+
+def _status_connection() -> SimpleNamespace:
+    now = datetime.now(timezone.utc)
+    return SimpleNamespace(
+        exchange_connection_id=uuid4(),
+        provider="kraken_spot",
+        environment="production",
+        status="connected",
+        last_readiness_verdict="READY_FOR_OPERATOR_REVIEW",
+        last_successful_sync_at=now,
+        last_verified_at=now,
+        updated_at=now,
+        balances=[{"currency": "USD", "available": "25", "reserved": "0", "total": "25"}],
+    )
+
+
+def _status_request(
+    *,
+    campaign_id: UUID,
+    paper_account_id: UUID,
+    profile_id: UUID,
+    idempotency_key: str | None,
+    confirm: bool,
+    actor: str = "operator:human",
+    expected_current_status: str = "DRAFT",
+    target_status: str = "READY",
+) -> binding.CanonicalCampaignStatusTransitionRequest:
+    return binding.CanonicalCampaignStatusTransitionRequest(
+        campaign_id=campaign_id,
+        campaign_version=1,
+        runtime_campaign_id=2,
+        expected_current_status=expected_current_status,
+        target_status=target_status,
+        paper_account_id=paper_account_id,
+        live_trading_profile_id=profile_id,
+        provider="kraken_spot",
+        environment="production",
+        product_id="BTC-USD",
+        actor=actor,
+        idempotency_key=idempotency_key,
+        confirm=confirm,
+    )
+
+
+@pytest.mark.asyncio
+async def test_canonical_status_transition_execute_clean_draft_to_ready_succeeds(monkeypatch: pytest.MonkeyPatch) -> None:
+    campaign_id = UUID("e9a9e8e9-9574-498d-b49e-f011218c7f2b")
+    paper_account_id = UUID("905a408c-7d8e-4fc7-ad3b-9ff637005d73")
+    profile_id = UUID("9da09ae9-475e-41e8-b2c2-717ba5acfa3d")
+
+    db = _FakeDb()
+    definition = _status_definition(campaign_id=campaign_id, version=1)
+    runtime = _status_runtime(campaign_id=campaign_id, runtime_campaign_id=2, paper_account_id=paper_account_id)
+
+    monkeypatch.setattr(binding, "_load_definition_for_update", _async_return(definition))
+    monkeypatch.setattr(binding, "_load_live_profile", _async_return(_profile(profile_id, paper_account_id)))
+    monkeypatch.setattr(binding, "_load_connection", _async_return(_status_connection()))
+    monkeypatch.setattr(binding, "_latest_definition_version", _async_return(1))
+    monkeypatch.setattr(binding, "_count_open_live_orders_for_campaign", _async_return(0))
+    monkeypatch.setattr(binding, "_count_unresolved_reconciliation_events_for_campaign", _async_return(0))
+    monkeypatch.setattr(binding, "_count_open_btc_positions_for_campaign", _async_return(0))
+    monkeypatch.setattr(binding, "_count_active_proving_activations", _async_return(0))
+    monkeypatch.setattr(binding, "_count_package_conflicts", _async_return(0))
+    monkeypatch.setattr(binding, "_find_status_transition_audit_by_idempotency_key_for_update", _async_return(None))
+
+    async def _scalar(statement):
+        entity = statement.column_descriptions[0].get("entity")
+        if entity is not None and entity.__name__ == "CapitalCampaign":
+            return runtime
+        return None
+
+    monkeypatch.setattr(db, "scalar", _scalar)
+
+    result = await binding.transition_canonical_campaign_status(
+        db=db,
+        request=_status_request(
+            campaign_id=campaign_id,
+            paper_account_id=paper_account_id,
+            profile_id=profile_id,
+            idempotency_key="status-1",
+            confirm=True,
+        ),
+    )
+
+    assert result.changed is True
+    assert result.idempotent is False
+    assert definition.status == "READY"
+    assert runtime.status == "READY"
+    assert any(getattr(item, "action", "") == "capital_campaign.status_transition" for item in db.added)
+
+
+@pytest.mark.asyncio
+async def test_canonical_status_transition_readiness_is_read_only(monkeypatch: pytest.MonkeyPatch) -> None:
+    campaign_id = UUID("e9a9e8e9-9574-498d-b49e-f011218c7f2b")
+    paper_account_id = UUID("905a408c-7d8e-4fc7-ad3b-9ff637005d73")
+    profile_id = UUID("9da09ae9-475e-41e8-b2c2-717ba5acfa3d")
+
+    db = _FakeDb()
+    definition = _status_definition(campaign_id=campaign_id, version=1)
+    runtime = _status_runtime(campaign_id=campaign_id, runtime_campaign_id=2, paper_account_id=paper_account_id)
+
+    monkeypatch.setattr(binding, "_load_definition", _async_return(definition))
+    monkeypatch.setattr(binding, "_load_live_profile", _async_return(_profile(profile_id, paper_account_id)))
+    monkeypatch.setattr(binding, "_load_connection", _async_return(_status_connection()))
+    monkeypatch.setattr(binding, "_latest_definition_version", _async_return(1))
+    monkeypatch.setattr(binding, "_count_open_live_orders_for_campaign", _async_return(0))
+    monkeypatch.setattr(binding, "_count_unresolved_reconciliation_events_for_campaign", _async_return(0))
+    monkeypatch.setattr(binding, "_count_open_btc_positions_for_campaign", _async_return(0))
+    monkeypatch.setattr(binding, "_count_active_proving_activations", _async_return(0))
+    monkeypatch.setattr(binding, "_count_package_conflicts", _async_return(0))
+
+    async def _scalar(statement):
+        entity = statement.column_descriptions[0].get("entity")
+        if entity is not None and entity.__name__ == "CapitalCampaign":
+            return runtime
+        return None
+
+    monkeypatch.setattr(db, "scalar", _scalar)
+
+    readiness = await binding.inspect_canonical_campaign_status_transition(
+        db=db,
+        request=_status_request(
+            campaign_id=campaign_id,
+            paper_account_id=paper_account_id,
+            profile_id=profile_id,
+            idempotency_key=None,
+            confirm=False,
+        ),
+    )
+
+    assert readiness.ready is True
+    assert db.flushes == 0
+    assert db.added == []
+
+
+@pytest.mark.asyncio
+async def test_canonical_status_transition_execute_requires_confirm_actor_and_idempotency() -> None:
+    campaign_id = UUID("e9a9e8e9-9574-498d-b49e-f011218c7f2b")
+    paper_account_id = UUID("905a408c-7d8e-4fc7-ad3b-9ff637005d73")
+    profile_id = UUID("9da09ae9-475e-41e8-b2c2-717ba5acfa3d")
+    db = _FakeDb()
+
+    with pytest.raises(PermissionError, match="confirm=true"):
+        await binding.transition_canonical_campaign_status(
+            db=db,
+            request=_status_request(
+                campaign_id=campaign_id,
+                paper_account_id=paper_account_id,
+                profile_id=profile_id,
+                idempotency_key="x",
+                confirm=False,
+            ),
+        )
+    with pytest.raises(PermissionError, match="actor is required"):
+        await binding.transition_canonical_campaign_status(
+            db=db,
+            request=_status_request(
+                campaign_id=campaign_id,
+                paper_account_id=paper_account_id,
+                profile_id=profile_id,
+                idempotency_key="x",
+                confirm=True,
+                actor="  ",
+            ),
+        )
+    with pytest.raises(PermissionError, match="idempotency_key"):
+        await binding.transition_canonical_campaign_status(
+            db=db,
+            request=_status_request(
+                campaign_id=campaign_id,
+                paper_account_id=paper_account_id,
+                profile_id=profile_id,
+                idempotency_key="",
+                confirm=True,
+            ),
+        )
+
+
+@pytest.mark.asyncio
+async def test_canonical_status_transition_execute_detects_definition_and_runtime_status_drift(monkeypatch: pytest.MonkeyPatch) -> None:
+    campaign_id = UUID("e9a9e8e9-9574-498d-b49e-f011218c7f2b")
+    paper_account_id = UUID("905a408c-7d8e-4fc7-ad3b-9ff637005d73")
+    profile_id = UUID("9da09ae9-475e-41e8-b2c2-717ba5acfa3d")
+    db = _FakeDb()
+
+    definition = _status_definition(campaign_id=campaign_id, version=1, status="READY")
+    runtime = _status_runtime(campaign_id=campaign_id, runtime_campaign_id=2, paper_account_id=paper_account_id)
+
+    monkeypatch.setattr(binding, "_load_definition_for_update", _async_return(definition))
+    monkeypatch.setattr(binding, "_inspect_canonical_campaign_status_transition_locked", _async_return(binding.CanonicalCampaignStatusTransitionReadinessResult(ready=True, blockers=[], checks=[], snapshot={})))
+    monkeypatch.setattr(binding, "_find_status_transition_audit_by_idempotency_key_for_update", _async_return(None))
+
+    async def _scalar_definition_drift(statement):
+        entity = statement.column_descriptions[0].get("entity")
+        if entity is not None and entity.__name__ == "CapitalCampaign":
+            return runtime
+        return None
+
+    monkeypatch.setattr(db, "scalar", _scalar_definition_drift)
+    with pytest.raises(PermissionError, match="definition status drifted"):
+        await binding.transition_canonical_campaign_status(
+            db=db,
+            request=_status_request(
+                campaign_id=campaign_id,
+                paper_account_id=paper_account_id,
+                profile_id=profile_id,
+                idempotency_key="status-2",
+                confirm=True,
+            ),
+        )
+
+    definition.status = "DRAFT"
+    runtime.status = "READY"
+    with pytest.raises(PermissionError, match="runtime status drifted"):
+        await binding.transition_canonical_campaign_status(
+            db=db,
+            request=_status_request(
+                campaign_id=campaign_id,
+                paper_account_id=paper_account_id,
+                profile_id=profile_id,
+                idempotency_key="status-3",
+                confirm=True,
+            ),
+        )
+
+
+@pytest.mark.asyncio
+async def test_canonical_status_transition_execute_audit_failure_rolls_back_status_changes(monkeypatch: pytest.MonkeyPatch) -> None:
+    campaign_id = UUID("e9a9e8e9-9574-498d-b49e-f011218c7f2b")
+    paper_account_id = UUID("905a408c-7d8e-4fc7-ad3b-9ff637005d73")
+    profile_id = UUID("9da09ae9-475e-41e8-b2c2-717ba5acfa3d")
+
+    class _TxRollback:
+        def __init__(self, db, definition, runtime):
+            self._db = db
+            self._definition = definition
+            self._runtime = runtime
+            self._definition_before = definition.status
+            self._runtime_before = runtime.status
+
+        async def __aenter__(self):
+            self._db._in_transaction = True
+            return self
+
+        async def __aexit__(self, exc_type, exc, tb):
+            if exc_type is not None:
+                self._definition.status = self._definition_before
+                self._runtime.status = self._runtime_before
+            self._db._in_transaction = False
+            _ = exc, tb
+            return False
+
+    class _AuditFailDb(_FakeDb):
+        def __init__(self, definition, runtime) -> None:
+            super().__init__()
+            self._definition = definition
+            self._runtime = runtime
+
+        def begin(self):
+            self.begin_calls += 1
+            return _TxRollback(self, self._definition, self._runtime)
+
+        def add(self, obj) -> None:
+            if getattr(obj, "action", "") == "capital_campaign.status_transition":
+                raise RuntimeError("audit write failed")
+            self.added.append(obj)
+
+    definition = _status_definition(campaign_id=campaign_id, version=1)
+    runtime = _status_runtime(campaign_id=campaign_id, runtime_campaign_id=2, paper_account_id=paper_account_id)
+    db = _AuditFailDb(definition, runtime)
+
+    monkeypatch.setattr(binding, "_load_definition_for_update", _async_return(definition))
+    monkeypatch.setattr(binding, "_load_live_profile", _async_return(_profile(profile_id, paper_account_id)))
+    monkeypatch.setattr(binding, "_load_connection", _async_return(_status_connection()))
+    monkeypatch.setattr(binding, "_latest_definition_version", _async_return(1))
+    monkeypatch.setattr(binding, "_count_open_live_orders_for_campaign", _async_return(0))
+    monkeypatch.setattr(binding, "_count_unresolved_reconciliation_events_for_campaign", _async_return(0))
+    monkeypatch.setattr(binding, "_count_open_btc_positions_for_campaign", _async_return(0))
+    monkeypatch.setattr(binding, "_count_active_proving_activations", _async_return(0))
+    monkeypatch.setattr(binding, "_count_package_conflicts", _async_return(0))
+    monkeypatch.setattr(binding, "_find_status_transition_audit_by_idempotency_key_for_update", _async_return(None))
+
+    async def _scalar(statement):
+        entity = statement.column_descriptions[0].get("entity")
+        if entity is not None and entity.__name__ == "CapitalCampaign":
+            return runtime
+        return None
+
+    monkeypatch.setattr(db, "scalar", _scalar)
+
+    with pytest.raises(RuntimeError, match="audit write failed"):
+        await binding.transition_canonical_campaign_status(
+            db=db,
+            request=_status_request(
+                campaign_id=campaign_id,
+                paper_account_id=paper_account_id,
+                profile_id=profile_id,
+                idempotency_key="status-audit-fail",
+                confirm=True,
+            ),
+        )
+
+    assert definition.status == "DRAFT"
+    assert runtime.status == "DRAFT"
+
+
+@pytest.mark.asyncio
+async def test_canonical_status_transition_execute_idempotent_replay_and_conflicting_retry(monkeypatch: pytest.MonkeyPatch) -> None:
+    campaign_id = UUID("e9a9e8e9-9574-498d-b49e-f011218c7f2b")
+    paper_account_id = UUID("905a408c-7d8e-4fc7-ad3b-9ff637005d73")
+    profile_id = UUID("9da09ae9-475e-41e8-b2c2-717ba5acfa3d")
+
+    db = _FakeDb()
+    request = _status_request(
+        campaign_id=campaign_id,
+        paper_account_id=paper_account_id,
+        profile_id=profile_id,
+        idempotency_key="status-replay",
+        confirm=True,
+    )
+    fp = binding._build_canonical_status_transition_request_fingerprint(request=request)
+    audit = SimpleNamespace(
+        before_state={"definition_status": "DRAFT", "runtime_status": "DRAFT"},
+        after_state={
+            "idempotency_key": "status-replay",
+            "request_fingerprint": fp,
+            "definition_new_status": "READY",
+            "runtime_new_status": "READY",
+        },
+    )
+
+    definition = _status_definition(campaign_id=campaign_id, version=1)
+    runtime = _status_runtime(campaign_id=campaign_id, runtime_campaign_id=2, paper_account_id=paper_account_id)
+    monkeypatch.setattr(binding, "_load_definition_for_update", _async_return(definition))
+    monkeypatch.setattr(binding, "_inspect_canonical_campaign_status_transition_locked", _async_return(binding.CanonicalCampaignStatusTransitionReadinessResult(ready=True, blockers=[], checks=[], snapshot={})))
+    monkeypatch.setattr(binding, "_find_status_transition_audit_by_idempotency_key_for_update", _async_return(audit))
+
+    async def _scalar(statement):
+        entity = statement.column_descriptions[0].get("entity")
+        if entity is not None and entity.__name__ == "CapitalCampaign":
+            return runtime
+        return None
+
+    monkeypatch.setattr(db, "scalar", _scalar)
+
+    replay = await binding.transition_canonical_campaign_status(db=db, request=request)
+    assert replay.changed is False
+    assert replay.idempotent is True
+
+    conflicting = _status_request(
+        campaign_id=campaign_id,
+        paper_account_id=paper_account_id,
+        profile_id=profile_id,
+        idempotency_key="status-replay",
+        confirm=True,
+        target_status="PAUSED",
+    )
+    with pytest.raises(PermissionError, match="conflicting retry"):
+        await binding.transition_canonical_campaign_status(db=db, request=conflicting)
+
+
+@pytest.mark.asyncio
+async def test_canonical_status_transition_execute_unsafe_readiness_gate_rejects(monkeypatch: pytest.MonkeyPatch) -> None:
+    campaign_id = UUID("e9a9e8e9-9574-498d-b49e-f011218c7f2b")
+    paper_account_id = UUID("905a408c-7d8e-4fc7-ad3b-9ff637005d73")
+    profile_id = UUID("9da09ae9-475e-41e8-b2c2-717ba5acfa3d")
+    db = _FakeDb()
+
+    monkeypatch.setattr(binding, "_load_definition_for_update", _async_return(_status_definition(campaign_id=campaign_id, version=1)))
+    monkeypatch.setattr(binding, "_find_status_transition_audit_by_idempotency_key_for_update", _async_return(None))
+    monkeypatch.setattr(binding, "_inspect_canonical_campaign_status_transition_locked", _async_return(binding.CanonicalCampaignStatusTransitionReadinessResult(ready=False, blockers=["no_open_live_btc_order"], checks=[], snapshot={})))
+
+    async def _scalar(_statement):
+        return _status_runtime(campaign_id=campaign_id, runtime_campaign_id=2, paper_account_id=paper_account_id)
+
+    monkeypatch.setattr(db, "scalar", _scalar)
+
+    with pytest.raises(PermissionError, match="prerequisites failed"):
+        await binding.transition_canonical_campaign_status(
+            db=db,
+            request=_status_request(
+                campaign_id=campaign_id,
+                paper_account_id=paper_account_id,
+                profile_id=profile_id,
+                idempotency_key="status-blocked",
+                confirm=True,
+            ),
+        )
+
+
+def test_canonical_status_transition_has_no_package_auth_activation_order_or_capital_calls() -> None:
+    source = binding.transition_canonical_campaign_status.__code__.co_names
+    assert "create_canonical_preview_package" not in source
+    assert "authorize_canonical_preview_package" not in source
+    assert "activate_canonical_proving_campaign" not in source
+    assert "create_order" not in source
+    assert "submit_alpaca_paper_order" not in source
+    assert "execute_internal_crypto_fill" not in source
+
+
+@pytest.mark.asyncio
+async def test_canonical_status_transition_post_audit_reports_eligible(monkeypatch: pytest.MonkeyPatch) -> None:
+    campaign_id = UUID("e9a9e8e9-9574-498d-b49e-f011218c7f2b")
+    paper_account_id = UUID("905a408c-7d8e-4fc7-ad3b-9ff637005d73")
+    profile_id = UUID("9da09ae9-475e-41e8-b2c2-717ba5acfa3d")
+
+    class _Scalars:
+        def __init__(self, rows):
+            self._rows = rows
+
+        def all(self):
+            return self._rows
+
+    class _Result:
+        def __init__(self, rows):
+            self._rows = rows
+
+        def scalars(self):
+            return _Scalars(self._rows)
+
+    db = _FakeDb()
+    definition = _status_definition(campaign_id=campaign_id, version=1, status="READY")
+    runtime = _status_runtime(campaign_id=campaign_id, runtime_campaign_id=2, paper_account_id=paper_account_id, status="READY")
+    audit_row = SimpleNamespace(
+        actor="operator:human",
+        action="capital_campaign.status_transition",
+        before_state={"definition_status": "DRAFT", "runtime_status": "DRAFT"},
+        after_state={"definition_new_status": "READY", "runtime_new_status": "READY"},
+        created_at=datetime.now(timezone.utc),
+    )
+
+    monkeypatch.setattr(binding, "_load_definition", _async_return(definition))
+    monkeypatch.setattr(binding, "_inspect_canonical_campaign_status_transition_locked", _async_return(binding.CanonicalCampaignStatusTransitionReadinessResult(ready=True, blockers=[], checks=[], snapshot={})))
+
+    async def _scalar(statement):
+        entity = statement.column_descriptions[0].get("entity")
+        if entity is not None and entity.__name__ == "CapitalCampaign":
+            return runtime
+        return None
+
+    async def _execute(_statement):
+        return _Result([audit_row])
+
+    monkeypatch.setattr(db, "scalar", _scalar)
+    monkeypatch.setattr(db, "execute", _execute, raising=False)
+
+    payload = await binding.fetch_canonical_campaign_status_transition_audit(
+        db=db,
+        campaign_id=campaign_id,
+        campaign_version=1,
+        runtime_campaign_id=2,
+        expected_current_status="DRAFT",
+        target_status="READY",
+        paper_account_id=paper_account_id,
+        live_trading_profile_id=profile_id,
+        provider="kraken_spot",
+        environment="production",
+        product_id="BTC-USD",
+        actor="operator:human",
+        limit=5,
+    )
+
+    assert payload["definition_status"] == "READY"
+    assert payload["runtime_status"] == "READY"
+    assert payload["audit"]["total"] == 1
+    assert payload["unattended_eligibility"]["eligible"] is True
+    assert payload["unattended_eligibility"]["appears_in_candidate_list"] is True
