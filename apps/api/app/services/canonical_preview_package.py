@@ -354,8 +354,8 @@ async def create_canonical_preview_package(
     db: AsyncSession,
     request: CanonicalPreviewPackageCreateRequest,
 ) -> dict[str, Any]:
-    if request.max_proposed_order_amount > Decimal("5"):
-        raise ValueError("max proposed order amount exceeds canonical bound")
+    if request.max_proposed_order_amount != Decimal("5"):
+        raise ValueError("max proposed order amount must equal canonical bound of 5")
 
     existing = await _load_package_by_idempotency(db=db, idempotency_key=request.idempotency_key)
     if existing is not None:
@@ -428,7 +428,7 @@ async def create_canonical_preview_package(
         ]
         raise _preview_evidence_error(diagnostics=diagnostics)
 
-    if cycle.termination_stage == "hold_terminal" or proposed_action == "NO_ACTION" or decision_kind == "NO_ACTION":
+    if cycle.termination_stage in {"hold_terminal", "hold_no_package_created"} or proposed_action in {"NO_ACTION", "HOLD"} or decision_kind in {"NO_ACTION", "HOLD"}:
         hold_reason = str(selected_decision.get("reason") or cycle.failure_reason or "no_executable_opportunity")
         return {
             "idempotent": False,

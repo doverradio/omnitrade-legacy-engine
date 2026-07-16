@@ -218,7 +218,11 @@ async def run_campaign_orchestration_preview_for_candle(
             proposed_action=composition.get("proposed_action") or "NO_ACTION",
             mandate_verdict="NOT_APPLICABLE",
             risk_verdict=(composition.get("selected_decision") or {}).get("risk_verdict") or "NOT_APPLICABLE",
-            decision_record_id=None,
+            decision_record_id=(
+                UUID(str(composition.get("decision_record_id")))
+                if composition.get("decision_record_id")
+                else None
+            ),
             preview_id=None,
             mandate_evaluation_id=None,
             risk_event_id=None if not composition.get("risk_outputs") else next((UUID(value.get("risk_event_id")) for value in (composition.get("risk_outputs") or {}).values() if value.get("risk_event_id")), None),

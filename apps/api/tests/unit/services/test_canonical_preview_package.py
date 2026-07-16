@@ -123,8 +123,8 @@ def _cycle(*, proposed_action: str = "OPEN_POSITION_PROPOSED", termination_stage
             "authoritative_composition": {
                 "proposed_action": proposed_action,
                 "selected_decision": {
-                    "decision_kind": "BUY" if proposed_action == "OPEN_POSITION_PROPOSED" else "NO_ACTION",
-                    "reason": "no_qualifying_candidate" if proposed_action == "NO_ACTION" else None,
+                    "decision_kind": "BUY" if proposed_action == "OPEN_POSITION_PROPOSED" else "HOLD",
+                    "reason": "no_qualifying_candidate" if proposed_action in {"NO_ACTION", "HOLD"} else None,
                 },
             }
         },
@@ -185,7 +185,7 @@ async def test_create_canonical_preview_package_returns_hold_outcome_without_pac
     profile = _profile()
     runtime_campaign = _runtime_campaign(campaign_id=campaign_id)
     definition = _definition(campaign_id=campaign_id, campaign_version=1)
-    cycle = _cycle(proposed_action="NO_ACTION", termination_stage="hold_terminal")
+    cycle = _cycle(proposed_action="HOLD", termination_stage="hold_no_package_created")
     request = _create_request(campaign_id=campaign_id, profile=profile, idempotency_key="pkg-hold-1")
 
     monkeypatch.setattr(cpp, "_load_package_by_idempotency", _async_return(None))
@@ -211,7 +211,7 @@ async def test_create_canonical_preview_package_hold_uses_latest_fresh_cycle(mon
     runtime_campaign = _runtime_campaign(campaign_id=campaign_id)
     definition = _definition(campaign_id=campaign_id, campaign_version=1)
     old_cycle_id = uuid4()
-    fresh_cycle = _cycle(proposed_action="NO_ACTION", termination_stage="hold_terminal")
+    fresh_cycle = _cycle(proposed_action="HOLD", termination_stage="hold_no_package_created")
     request = _create_request(campaign_id=campaign_id, profile=profile, idempotency_key="pkg-hold-2")
     loaded_cycle_ids: list[str] = []
 
@@ -384,6 +384,26 @@ async def test_create_canonical_preview_package_non_executable_decision_reports_
         await cpp.create_canonical_preview_package(db=_FakeDb(), request=request)
 
     assert "canonical_action_not_executable" in str(exc_info.value)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("invalid_amount", [Decimal("4.99"), Decimal("5.01")])
+async def test_create_canonical_preview_package_rejects_non_exact_five_bound(invalid_amount: Decimal) -> None:
+    request = cpp.CanonicalPreviewPackageCreateRequest(
+        campaign_id=uuid4(),
+        campaign_version=1,
+        paper_account_id=uuid4(),
+        live_trading_profile_id=uuid4(),
+        provider="kraken_spot",
+        environment="production",
+        product="BTC-USD",
+        max_proposed_order_amount=invalid_amount,
+        actor="operator:human",
+        idempotency_key="pkg-invalid-bound",
+    )
+
+    with pytest.raises(ValueError, match="canonical bound of 5"):
+        await cpp.create_canonical_preview_package(db=_FakeDb(), request=request)
 
 
 @pytest.mark.asyncio

@@ -10,10 +10,12 @@ from sqlalchemy import desc, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.models.asset import Asset
+from app.models.canonical_preview_package import CanonicalPreviewPackage
 from app.models.capital_campaign import CapitalCampaign
 from app.models.candle import Candle
 from app.models.decision_record import DecisionRecord
 from app.models.paper_account import PaperAccount
+from app.models.strategy import Strategy
 from app.models.strategy_roster_proposal import StrategyRosterProposal
 from app.models.strategy_roster_proposal_outcome import StrategyRosterProposalOutcome
 from app.models.strategy_roster_run import StrategyRosterRun
@@ -59,6 +61,160 @@ def _product_symbol(value: str) -> str:
     return _normalize_symbol(value).split("-", 1)[0]
 
 
+def _trigger_to_instrument(trigger: str) -> str | None:
+    parts = [item.strip().lower() for item in trigger.split("_") if item.strip()]
+    if len(parts) < 3:
+        return None
+    product_token = parts[1].upper()
+    if not product_token:
+        return None
+    return f"{product_token}-USD"
+
+
+def _scoped_instruments_for_trigger(*, allowed_instruments: list[str], trigger: str) -> list[str]:
+    normalized_allowed = []
+    seen: set[str] = set()
+    for item in allowed_instruments:
+        normalized = _normalize_symbol(item)
+        if normalized in seen:
+            continue
+        seen.add(normalized)
+        normalized_allowed.append(normalized)
+    trigger_instrument = _trigger_to_instrument(trigger)
+    if trigger_instrument is not None and trigger_instrument in seen:
+        return [trigger_instrument]
+    return normalized_allowed
+
+
+def _extract_preferred_strategy_identity(metadata_evidence: dict[str, Any]) -> str | None:
+    candidates = [
+        metadata_evidence.get("canonical_strategy_identity"),
+        metadata_evidence.get("selected_strategy_identity"),
+        metadata_evidence.get("strategy_identity"),
+    ]
+    strategy_blob = metadata_evidence.get("strategy")
+    if isinstance(strategy_blob, dict):
+        candidates.extend(
+            [
+                strategy_blob.get("canonical_strategy_identity"),
+                strategy_blob.get("selected_strategy_identity"),
+                strategy_blob.get("strategy_identity"),
+            ]
+        )
+    for value in candidates:
+        text = str(value or "").strip()
+        if text:
+            return text
+    return None
+
+
+async def _load_campaign_strategy_authority(
+    *,
+    db: AsyncSession,
+    campaign_id: UUID,
+    campaign_version: int,
+    metadata_evidence: dict[str, Any],
+) -> dict[str, Any]:
+    preferred_identity = _extract_preferred_strategy_identity(metadata_evidence)
+    if preferred_identity:
+        return {
+            "authority_source": "campaign_metadata_evidence",
+            "preferred_strategy_identity": preferred_identity,
+        }
+
+    try:
+        package = await db.scalar(
+            select(CanonicalPreviewPackage)
+            .where(CanonicalPreviewPackage.campaign_id == campaign_id)
+            .where(CanonicalPreviewPackage.campaign_version == campaign_version)
+            .where(
+                CanonicalPreviewPackage.package_state.in_(
+                    ("READY", "AUTHORIZED", "DRY_RUN_PASSED", "ACTIVATED")
+                )
+            )
+            .order_by(desc(CanonicalPreviewPackage.updated_at), desc(CanonicalPreviewPackage.generated_at))
+            .limit(1)
+        )
+    except Exception:
+        package = None
+
+    if package is None:
+        return {"authority_source": "none", "preferred_strategy_identity": None}
+    if not all(hasattr(package, attr) for attr in ("package_id", "strategy_id", "parameter_set_id", "strategy_version")):
+        return {"authority_source": "none", "preferred_strategy_identity": None}
+
+    strategy_slug = None
+    try:
+        strategy = await db.scalar(select(Strategy).where(Strategy.id == package.strategy_id).limit(1))
+    except Exception:
+        strategy = None
+    if strategy is not None and hasattr(strategy, "slug"):
+        strategy_slug = str(strategy.slug)
+
+    return {
+        "authority_source": "canonical_preview_package_continuity_only",
+        "package_id": str(package.package_id),
+        "strategy_id": str(package.strategy_id),
+        "parameter_set_id": str(package.parameter_set_id),
+        "preferred_strategy_identity": None,
+        "historical_strategy_identity": (f"{strategy_slug}@{package.strategy_version}" if strategy_slug else None),
+    }
+
+
+def _primary_rejection_reason(*, rejected_candidates: list[dict[str, Any]], failed_closed: bool) -> str:
+    if not rejected_candidates:
+        return "no_qualifying_candidate"
+    if failed_closed:
+        priority = [
+            "risk_unavailable",
+            "strategy_evidence_unavailable",
+            "market_data_unavailable",
+            "stale_market_data",
+            "asset_mapping_unavailable",
+            "provider_product_unsupported",
+            "ambiguous_market_source",
+        ]
+    else:
+        priority = [
+            "position_below_minimum_order_size",
+            "allocation_below_minimum",
+            "non_positive_net_edge",
+        ]
+    for reason in priority:
+        if any(item.get("reason") == reason for item in rejected_candidates):
+            return reason
+    return str(rejected_candidates[0].get("reason") or "no_qualifying_candidate")
+
+
+def _split_strategy_identity(identity: str | None) -> tuple[str, str | None]:
+    raw = str(identity or "").strip()
+    if not raw:
+        return "", None
+    if "@" not in raw:
+        return raw, None
+    slug, version = raw.split("@", 1)
+    slug = slug.strip()
+    version = version.strip() or None
+    return slug, version
+
+
+def _strategy_identity_is_coherent(*, strategy_identity: str | None, strategy_version: str | None) -> bool:
+    identity_slug, identity_version = _split_strategy_identity(strategy_identity)
+    if not identity_slug:
+        return False
+    reported_version = str(strategy_version or "").strip()
+    if not reported_version:
+        return identity_version is None
+    reported_slug, reported_only_version = _split_strategy_identity(reported_version)
+    if reported_only_version is None:
+        # plain version string (for example: "1.0.0")
+        return identity_version is None or identity_version == reported_slug
+    # full identity string (for example: "ma_crossover@1.0.0")
+    if reported_slug and reported_slug != identity_slug:
+        return False
+    return identity_version is None or reported_only_version == identity_version
+
+
 async def _load_runtime_campaign(*, db: AsyncSession, runtime_campaign_uuid: UUID) -> CapitalCampaign | None:
     return await db.scalar(select(CapitalCampaign).where(CapitalCampaign.uuid == runtime_campaign_uuid).limit(1))
 
@@ -98,10 +254,19 @@ async def _load_latest_strategy_evidence(
     asset_id: UUID,
     product_id: str,
     interval: str,
+    preferred_strategy_identity: str | None = None,
 ) -> tuple[dict[str, Any] | None, str | None]:
     scorecards = await fetch_strategy_scorecards(db=db, provider="kraken_spot", product_id=product_id, interval=interval)
     if not scorecards:
         return None, "strategy_evidence_unavailable"
+
+    preferred_slug = None
+    if preferred_strategy_identity and "@" in preferred_strategy_identity:
+        preferred_slug = preferred_strategy_identity.split("@", 1)[0].strip()
+    if preferred_slug:
+        preferred_scorecards = [item for item in scorecards if str(item.strategy_slug).strip() == preferred_slug]
+        if preferred_scorecards:
+            scorecards = preferred_scorecards
 
     best_scorecard = max(
         scorecards,
@@ -118,6 +283,7 @@ async def _load_latest_strategy_evidence(
         .where(StrategyRosterProposal.asset_id == asset_id)
         .where(StrategyRosterProposal.product_id == product_id)
         .where(StrategyRosterProposal.interval == interval)
+        .where(StrategyRosterProposal.strategy_slug == preferred_slug if preferred_slug is not None else True)
         .order_by(StrategyRosterProposal.candle_close_time.desc(), StrategyRosterProposal.created_at.desc())
         .limit(1)
     )
@@ -153,6 +319,11 @@ async def _load_latest_strategy_evidence(
     if matching_support is None and decision_record.supporting_strategies:
         matching_support = decision_record.supporting_strategies[0]
     if matching_support is None:
+        return None, "strategy_evidence_unavailable"
+
+    if preferred_strategy_identity and proposal.strategy_identity != preferred_strategy_identity and str(
+        matching_support.get("strategy_identity") or matching_support.get("strategy_id") or ""
+    ).strip() != preferred_strategy_identity:
         return None, "strategy_evidence_unavailable"
 
     expected_value = None
@@ -536,7 +707,17 @@ async def compose_campaign_authoritative_cycle(
         }
         return CampaignAuthoritativeCycleResult(composition=composition, preview=None)
 
-    allowed_instruments = [_normalize_symbol(item) for item in campaign_definition.allowed_instruments]
+    strategy_authority = await _load_campaign_strategy_authority(
+        db=db,
+        campaign_id=campaign_definition.campaign_id,
+        campaign_version=campaign_definition.version,
+        metadata_evidence=dict(getattr(campaign_definition, "metadata_evidence", {}) or {}),
+    )
+
+    allowed_instruments = _scoped_instruments_for_trigger(
+        allowed_instruments=list(campaign_definition.allowed_instruments),
+        trigger=trigger,
+    )
     market_evidence: dict[str, Any] = {}
     strategy_evidence: dict[str, Any] = {}
     position_evidence: dict[str, Any] = {}
@@ -562,10 +743,80 @@ async def compose_campaign_authoritative_cycle(
             asset_id=asset.id,
             product_id=instrument,
             interval=candle.interval,
+            preferred_strategy_identity=strategy_authority.get("preferred_strategy_identity"),
         )
         if strategy is None:
             rejected_candidates.append({"instrument": instrument, "reason": strategy_reason or "strategy_evidence_unavailable", "market": market})
             strategy_evidence[instrument] = {"authority_class": "UNAVAILABLE", "reason": strategy_reason or "strategy_evidence_unavailable"}
+            continue
+        strategy_identity = str(strategy.get("strategy_identity") or "").strip()
+        strategy_version = str(strategy.get("strategy_version") or "").strip()
+        decision_record_id = str((strategy.get("source_identity") or {}).get("decision_record_id") or "").strip()
+        if not _strategy_identity_is_coherent(strategy_identity=strategy_identity, strategy_version=strategy_version):
+            rejected_candidates.append(
+                {
+                    "instrument": instrument,
+                    "reason": "strategy_identity_incoherent",
+                    "market": market,
+                    "strategy": strategy,
+                }
+            )
+            strategy_evidence[instrument] = {
+                "authority_class": "UNAVAILABLE",
+                "reason": "strategy_identity_incoherent",
+                "strategy_identity": strategy_identity,
+                "strategy_version": strategy_version,
+            }
+            continue
+        historical_identity = str(strategy_authority.get("historical_strategy_identity") or "").strip()
+        if historical_identity and historical_identity != strategy_identity:
+            rejected_candidates.append(
+                {
+                    "instrument": instrument,
+                    "reason": "strategy_continuity_conflict",
+                    "market": market,
+                    "strategy": strategy,
+                    "historical_strategy_identity": historical_identity,
+                    "strategy_identity": strategy_identity,
+                }
+            )
+            strategy_evidence[instrument] = {
+                "authority_class": "UNAVAILABLE",
+                "reason": "strategy_continuity_conflict",
+                "strategy_identity": strategy_identity,
+                "historical_strategy_identity": historical_identity,
+            }
+            continue
+        if not decision_record_id:
+            rejected_candidates.append(
+                {
+                    "instrument": instrument,
+                    "reason": "decision_record_linkage_missing",
+                    "market": market,
+                    "strategy": strategy,
+                }
+            )
+            strategy_evidence[instrument] = {
+                "authority_class": "UNAVAILABLE",
+                "reason": "decision_record_linkage_missing",
+                "strategy_identity": strategy_identity,
+                "strategy_version": strategy_version,
+            }
+            continue
+        action = str(strategy.get("action") or "").strip().upper()
+        if action in {"HOLD", "NO_ACTION", "NONE"}:
+            rejected_candidates.append(
+                {
+                    "instrument": instrument,
+                    "reason": "strategy_hold_signal",
+                    "market": market,
+                    "strategy": strategy,
+                    "decision_record_id": decision_record_id,
+                    "strategy_identity": strategy_identity,
+                    "strategy_version": strategy_version,
+                }
+            )
+            strategy_evidence[instrument] = strategy
             continue
         strategy_evidence[instrument] = strategy
 
@@ -598,22 +849,68 @@ async def compose_campaign_authoritative_cycle(
             continue
 
         risk_context = await resolve_execution_risk_context(db=db, paper_account=paper_account, asset=asset)
+        price = Decimal(str(candle_item.close))
+        campaign_capital_budget = Decimal(str(getattr(campaign_definition, "capital_budget", campaign_definition.remaining_unallocated_capital)))
+        requested_proving_amount = Decimal(str(getattr(campaign_definition, "minimum_position_size", Decimal("0"))))
+        enforce_requested_proving_amount = requested_proving_amount == Decimal("5")
+        paper_account_cash_balance = Decimal(str(getattr(paper_account, "current_cash_balance", getattr(paper_account, "starting_balance", "0"))))
+        runtime_available_authority = getattr(runtime_campaign, "available_authority", None)
+        if runtime_available_authority is None:
+            runtime_available_authority = getattr(runtime_campaign, "available_capital", None)
+        if runtime_available_authority is None and runtime_campaign.current_equity is not None:
+            runtime_available_authority = Decimal(str(runtime_campaign.current_equity))
+        runtime_available_authority_decimal = None
+        if runtime_available_authority is not None:
+            runtime_available_authority_decimal = Decimal(str(runtime_available_authority))
+        minimum_viable_amount = max(
+            Decimal(str(campaign_definition.minimum_position_size)),
+            Decimal(str(asset.min_order_notional or "0")),
+            requested_proving_amount,
+        )
+        proposed_allocation = None
         if position["position"] is not None and position["position"].get("closed_indicator") is False and position["position"].get("quantity") not in {None, "0", "0.0"}:
             side = "sell"
             quantity = Decimal(str(position["position"]["quantity"]))
         else:
             side = "buy"
-            proposed_allocation = min(
-                campaign_definition.remaining_unallocated_capital,
-                campaign_definition.maximum_position_size,
-                campaign_definition.maximum_total_exposure,
-            )
-            if runtime_campaign.current_equity is not None:
-                proposed_allocation = min(proposed_allocation, Decimal(runtime_campaign.current_equity))
-            if proposed_allocation < campaign_definition.minimum_position_size:
-                rejected_candidates.append({"instrument": instrument, "reason": "allocation_below_minimum", "market": market, "strategy": strategy, "position": position})
+            cap_terms = [campaign_definition.remaining_unallocated_capital, campaign_definition.maximum_position_size, campaign_definition.maximum_total_exposure, paper_account_cash_balance]
+            if enforce_requested_proving_amount:
+                cap_terms.append(requested_proving_amount)
+            if runtime_available_authority_decimal is not None:
+                cap_terms.append(runtime_available_authority_decimal)
+            proposed_allocation = min(cap_terms)
+            if proposed_allocation < minimum_viable_amount:
+                rejected_candidates.append(
+                    {
+                        "instrument": instrument,
+                        "reason": "position_below_minimum_order_size",
+                        "market": market,
+                        "strategy": strategy,
+                        "position": position,
+                        "strategy_identity": strategy_identity,
+                        "strategy_version": strategy_version,
+                        "decision_record_id": decision_record_id,
+                        "sizing_trace": {
+                            "campaign_capital_budget": format(campaign_capital_budget, "f"),
+                            "campaign_remaining_unallocated_capital": format(campaign_definition.remaining_unallocated_capital, "f"),
+                            "runtime_current_equity": format(Decimal(str(runtime_campaign.current_equity or "0")), "f"),
+                            "runtime_available_authority": None
+                            if runtime_available_authority_decimal is None
+                            else format(runtime_available_authority_decimal, "f"),
+                            "paper_account_cash": format(paper_account_cash_balance, "f"),
+                            "risk_account_equity": format(Decimal(str(risk_context.account_equity)), "f"),
+                            "requested_proving_amount": format(requested_proving_amount, "f"),
+                            "liquid_cash_cap": format(paper_account_cash_balance, "f"),
+                            "pre_risk_proposed_amount": format(proposed_allocation, "f"),
+                            "minimum_position_size": format(campaign_definition.minimum_position_size, "f"),
+                            "minimum_order_notional": format(Decimal(str(asset.min_order_notional or "0")), "f"),
+                            "minimum_viable_amount": format(minimum_viable_amount, "f"),
+                            "final_amount": "0",
+                        },
+                    }
+                )
                 continue
-            quantity = proposed_allocation / Decimal(str(candle_item.close))
+            quantity = proposed_allocation / price
 
         try:
             risk_result = evaluate_signal_risk(
@@ -674,6 +971,24 @@ async def compose_campaign_authoritative_cycle(
                 "policy_identity": risk_context.risk_policy_source,
                 "policy_version": None,
                 "evaluated_at": risk_context.evaluation_time.isoformat(),
+                "sizing_trace": {
+                    "campaign_capital_budget": format(campaign_capital_budget, "f"),
+                    "campaign_remaining_unallocated_capital": format(campaign_definition.remaining_unallocated_capital, "f"),
+                    "runtime_current_equity": format(Decimal(str(runtime_campaign.current_equity or "0")), "f"),
+                    "runtime_available_authority": None
+                    if runtime_available_authority_decimal is None
+                    else format(runtime_available_authority_decimal, "f"),
+                    "paper_account_cash": format(paper_account_cash_balance, "f"),
+                    "risk_account_equity": format(Decimal(str(risk_context.account_equity)), "f"),
+                    "requested_proving_amount": format(requested_proving_amount, "f"),
+                    "campaign_allocation": None if proposed_allocation is None else format(proposed_allocation, "f"),
+                    "liquid_cash_cap": format(paper_account_cash_balance, "f"),
+                    "position_size_percentage": format(Decimal(str(risk_context.max_position_size_pct)), "f"),
+                    "pre_risk_proposed_amount": format(quantity * price, "f"),
+                    "risk_resized_amount": format(risk_result.approved_quantity * price, "f"),
+                    "minimum_viable_amount": format(Decimal(str(asset.min_order_notional or "0")), "f"),
+                    "final_amount": format(risk_result.approved_quantity * price, "f"),
+                },
             }
             persist_result = await persist_risk_decision(
                 db=db,
@@ -702,6 +1017,24 @@ async def compose_campaign_authoritative_cycle(
                 "policy_identity": risk_context.risk_policy_source,
                 "policy_version": None,
                 "evaluated_at": now.isoformat(),
+                "sizing_trace": {
+                    "campaign_capital_budget": format(campaign_capital_budget, "f"),
+                    "campaign_remaining_unallocated_capital": format(campaign_definition.remaining_unallocated_capital, "f"),
+                    "runtime_current_equity": format(Decimal(str(runtime_campaign.current_equity or "0")), "f"),
+                    "runtime_available_authority": None
+                    if runtime_available_authority_decimal is None
+                    else format(runtime_available_authority_decimal, "f"),
+                    "paper_account_cash": format(paper_account_cash_balance, "f"),
+                    "risk_account_equity": format(Decimal(str(risk_context.account_equity)), "f"),
+                    "requested_proving_amount": format(requested_proving_amount, "f"),
+                    "campaign_allocation": None if proposed_allocation is None else format(proposed_allocation, "f"),
+                    "liquid_cash_cap": format(paper_account_cash_balance, "f"),
+                    "position_size_percentage": format(Decimal(str(risk_context.max_position_size_pct)), "f"),
+                    "pre_risk_proposed_amount": format(quantity * price, "f"),
+                    "risk_resized_amount": "0",
+                    "minimum_viable_amount": format(Decimal(str(asset.min_order_notional or "0")), "f"),
+                    "final_amount": "0",
+                },
             }
             rejected_candidates.append({"instrument": instrument, "reason": "risk_unavailable", "market": market, "strategy": strategy, "position": position, "risk": risk_summary})
             risk_outputs[instrument] = risk_summary
@@ -742,14 +1075,13 @@ async def compose_campaign_authoritative_cycle(
                 "risk_adjusted_score": format(expected_net_dollars * (Decimal(str(strategy.get("confidence") or "1")) if strategy.get("confidence") is not None else Decimal("1")), "f"),
                 "confidence": strategy.get("confidence"),
                 "sample_size": strategy.get("sample_size"),
+                "strategy_identity": strategy_identity,
+                "strategy_version": strategy_version,
+                "decision_record_id": decision_record_id,
                 "expected_fees": format(expected_fees, "f"),
                 "expected_slippage": format(expected_slippage, "f"),
                 "proposed_allocation": format(
-                    min(
-                        campaign_definition.remaining_unallocated_capital,
-                        campaign_definition.maximum_position_size,
-                        campaign_definition.maximum_total_exposure,
-                    ),
+                    proposed_allocation if proposed_allocation is not None else Decimal("0"),
                     "f",
                 ),
                 "maximum_risk_approved_allocation": risk_summary.get("approved_quantity"),
@@ -768,18 +1100,41 @@ async def compose_campaign_authoritative_cycle(
         item["rank"] = index
 
     selected = candidate_rows[0] if candidate_rows else None
-    critical_rejections = {"risk_unavailable", "strategy_evidence_unavailable", "market_data_unavailable", "stale_market_data", "asset_mapping_unavailable", "provider_product_unsupported", "ambiguous_market_source"}
+    critical_rejections = {
+        "risk_unavailable",
+        "strategy_evidence_unavailable",
+        "strategy_identity_incoherent",
+        "strategy_continuity_conflict",
+        "decision_record_linkage_missing",
+        "market_data_unavailable",
+        "stale_market_data",
+        "asset_mapping_unavailable",
+        "provider_product_unsupported",
+        "ambiguous_market_source",
+    }
     failed_closed = bool(rejected_candidates) and not candidate_rows and any(item.get("reason") in critical_rejections for item in rejected_candidates)
     if selected is None:
         if failed_closed:
-            first_reason = next((item.get("reason") for item in rejected_candidates if item.get("reason") in critical_rejections), "no_qualifying_candidate")
+            first_reason = _primary_rejection_reason(rejected_candidates=rejected_candidates, failed_closed=True)
             selected_decision = {"decision_kind": "MANUAL_REVIEW_REQUIRED", "reason": first_reason}
         else:
-            selected_decision = {"decision_kind": "NO_ACTION", "reason": "no_qualifying_candidate"}
+            hold_reason = _primary_rejection_reason(rejected_candidates=rejected_candidates, failed_closed=False)
+            hold_lineage = next((item for item in rejected_candidates if item.get("decision_record_id")), None)
+            selected_decision = {
+                "decision_kind": "HOLD",
+                "reason": hold_reason,
+                "decision_record_id": None if hold_lineage is None else hold_lineage.get("decision_record_id"),
+                "strategy_identity": None if hold_lineage is None else hold_lineage.get("strategy_identity"),
+                "strategy_version": None if hold_lineage is None else hold_lineage.get("strategy_version"),
+                "sizing_trace": None if hold_lineage is None else hold_lineage.get("sizing_trace"),
+            }
     else:
         selected_decision = {
             "decision_kind": selected["decision_kind"],
             "instrument": selected["instrument"],
+            "decision_record_id": selected.get("decision_record_id"),
+            "strategy_identity": selected.get("strategy_identity"),
+            "strategy_version": selected.get("strategy_version"),
             "why_this_asset": f"best risk-adjusted net economics among authoritative candidates: {selected['expected_net_dollars']}",
             "why_not_other_assets": [item["instrument"] for item in candidate_rows[1:]],
             "why_not_cash": "selected candidate exceeds cash baseline" if Decimal(str(selected["expected_net_dollars"])) > Decimal("0") else "cash baseline preferred",
@@ -796,6 +1151,7 @@ async def compose_campaign_authoritative_cycle(
                 "maximum_total_exposure": format(campaign_definition.maximum_total_exposure, "f"),
                 "remaining_unallocated_capital": format(campaign_definition.remaining_unallocated_capital, "f"),
             },
+            "sizing_trace": selected["risk_evidence"].get("sizing_trace"),
         }
 
     composition = {
@@ -804,9 +1160,10 @@ async def compose_campaign_authoritative_cycle(
         "execution_mode": "preview",
         "execution_submitted": False,
         "provider_order_id": None,
+        "decision_record_id": selected_decision.get("decision_record_id"),
         "failed_closed": failed_closed,
-        "termination_stage": "failed_closed" if failed_closed else ("preview_generated" if selected is not None else "hold_terminal"),
-        "proposed_action": "FAILED_CLOSED" if failed_closed else (selected["decision_kind"] if selected is not None else "NO_ACTION"),
+        "termination_stage": "failed_closed" if failed_closed else ("preview_generated" if selected is not None else "hold_no_package_created"),
+        "proposed_action": "FAILED_CLOSED" if failed_closed else (selected["decision_kind"] if selected is not None else "HOLD"),
         "failure_reason": None if selected is not None and not failed_closed else (selected_decision.get("reason") if selected is None else None),
         "selected_decision": selected_decision,
         "eligible_candidates": candidate_rows,
@@ -819,10 +1176,13 @@ async def compose_campaign_authoritative_cycle(
             "position": position_evidence,
             "risk": risk_outputs,
             "authority_class": "AUTHORITATIVE",
+            "strategy_authority": strategy_authority,
         },
         "deterministic_explanation": [
             f"trigger={trigger}",
             f"campaign_version={campaign_definition.version}",
+            f"scoped_instruments={','.join(allowed_instruments)}",
+            f"strategy_authority_source={strategy_authority.get('authority_source')}",
             f"candidates={len(candidate_rows)}",
             f"rejected={len(rejected_candidates)}",
         ],
