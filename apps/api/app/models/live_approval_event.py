@@ -31,7 +31,7 @@ class LiveApprovalEvent(Base):
             name="ck_live_approval_events_event_type",
         ),
         CheckConstraint(
-            "checkpoint_type IN ('first_live_enablement','material_control_change')",
+            "checkpoint_type IN ('first_live_enablement','material_control_change','bounded_proving_entry')",
             name="ck_live_approval_events_checkpoint_type",
         ),
         CheckConstraint(

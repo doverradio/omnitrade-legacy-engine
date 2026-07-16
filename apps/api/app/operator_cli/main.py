@@ -22,7 +22,13 @@ from app.operator_cli.formatting import (
     render_venue_commission_text,
 )
 from app.operator_cli.service import (
+    activate_canonical_proving_campaign_bundle,
     bind_canonical_campaign_runtime,
+    authorize_canonical_preview_package_bundle,
+    canonical_preview_package_history,
+    canonical_preview_package_readiness,
+    canonical_proving_activation_status,
+    create_canonical_preview_package_bundle,
     activate_venue_commission_run,
     fetch_canonical_campaign_binding_audit,
     fetch_canonical_campaign_binding_status,
@@ -43,8 +49,12 @@ from app.operator_cli.service import (
     fetch_risk_ledger_diagnosis,
     fetch_watch_status,
     inspect_legacy_campaign_transition,
+    pause_canonical_proving_activation_bundle,
     rollback_legacy_campaign_transition,
+    revoke_canonical_proving_activation_bundle,
     revoke_venue_commission_run,
+    show_canonical_preview_package_bundle,
+    dry_run_canonical_preview_package_bundle,
     start_venue_commission_run,
     transition_legacy_campaign_to_canonical_successor,
 )
@@ -407,6 +417,130 @@ def _build_parser() -> argparse.ArgumentParser:
     campaign_history.add_argument("--limit", type=int, default=20)
     campaign_history.add_argument("--json", action="store_true", dest="json_output")
 
+    package_create = subparsers.add_parser(
+        "canonical-preview-package-create",
+        parents=[common],
+        help="Create immutable canonical preview package with strict identity chain",
+        description="Creates one canonical preview package and linked crypto order preview evidence.",
+    )
+    package_create.add_argument("--campaign-id", type=UUID, required=True)
+    package_create.add_argument("--campaign-version", type=int, required=True)
+    package_create.add_argument("--paper-account-id", type=UUID, required=True)
+    package_create.add_argument("--live-trading-profile-id", type=UUID, required=True)
+    package_create.add_argument("--provider", type=str, required=True)
+    package_create.add_argument("--environment", type=str, required=True)
+    package_create.add_argument("--product", type=str, required=True)
+    package_create.add_argument("--max-proposed-order-amount", type=Decimal, default=Decimal("5"))
+    package_create.add_argument("--actor", type=str, default="operator:human")
+    package_create.add_argument("--idempotency-key", type=str, required=True)
+    package_create.add_argument("--json", action="store_true", dest="json_output")
+
+    package_show = subparsers.add_parser(
+        "canonical-preview-package-show",
+        parents=[common],
+        help="Show one canonical preview package",
+        description="Reads one immutable canonical preview package and readiness checks.",
+    )
+    package_show.add_argument("--package-id", type=UUID, required=True)
+    package_show.add_argument("--json", action="store_true", dest="json_output")
+
+    package_readiness = subparsers.add_parser(
+        "canonical-preview-package-readiness",
+        parents=[common],
+        help="Run readiness checks for one canonical preview package",
+        description="Read-only readiness checks for a canonical preview package.",
+    )
+    package_readiness.add_argument("--package-id", type=UUID, required=True)
+    package_readiness.add_argument("--json", action="store_true", dest="json_output")
+
+    package_history = subparsers.add_parser(
+        "canonical-preview-package-history",
+        parents=[common],
+        help="Show canonical preview package history for a campaign",
+        description="Read-only package history, newest first.",
+    )
+    package_history.add_argument("--campaign-id", type=UUID, required=True)
+    package_history.add_argument("--campaign-version", type=int, default=None)
+    package_history.add_argument("--limit", type=int, default=20)
+    package_history.add_argument("--json", action="store_true", dest="json_output")
+
+    package_authorize = subparsers.add_parser(
+        "canonical-preview-package-authorize",
+        parents=[common],
+        help="Record campaign-scoped approval bound to canonical preview package",
+        description="Writes first-live approval with strict package identity scope and no leverage boundary.",
+    )
+    package_authorize.add_argument("--package-id", type=UUID, required=True)
+    package_authorize.add_argument("--actor", type=str, default="operator:human")
+    package_authorize.add_argument("--approver-role", type=str, default="operator")
+    package_authorize.add_argument("--rationale", type=str, required=True)
+    package_authorize.add_argument("--expires-at", type=str, required=True)
+    package_authorize.add_argument("--max-order-usd", type=Decimal, default=Decimal("5"))
+    package_authorize.add_argument("--max-total-deployed-campaign-capital-usd", type=Decimal, default=Decimal("5"))
+    package_authorize.add_argument("--no-leverage", action="store_true")
+    package_authorize.add_argument("--idempotency-key", type=str, required=True)
+    package_authorize.add_argument("--json", action="store_true", dest="json_output")
+
+    package_dry_run = subparsers.add_parser(
+        "canonical-preview-package-dry-run",
+        parents=[common],
+        help="Execute dry-run from canonical package and approval evidence",
+        description="Runs live crypto dry-run using package-bound preview and approval identities.",
+    )
+    package_dry_run.add_argument("--package-id", type=UUID, required=True)
+    package_dry_run.add_argument("--approval-event-id", type=UUID, required=True)
+    package_dry_run.add_argument("--operator-identity", type=str, default="operator:human")
+    package_dry_run.add_argument("--idempotency-token", type=str, required=True)
+    package_dry_run.add_argument("--json", action="store_true", dest="json_output")
+
+    proving_activate = subparsers.add_parser(
+        "canonical-proving-activate",
+        parents=[common],
+        help="Bounded proving activation for one canonical campaign",
+        description="Activates proving campaign status only after package, approval, and dry-run evidence pass checks.",
+    )
+    proving_activate.add_argument("--package-id", type=UUID, required=True)
+    proving_activate.add_argument("--approval-event-id", type=UUID, required=True)
+    proving_activate.add_argument("--dry-run-live-crypto-order-id", type=UUID, required=True)
+    proving_activate.add_argument("--actor", type=str, default="operator:human")
+    proving_activate.add_argument("--expires-at", type=str, required=True)
+    proving_activate.add_argument("--idempotency-key", type=str, required=True)
+    proving_activate.add_argument("--confirm", action="store_true")
+    proving_activate.add_argument("--json", action="store_true", dest="json_output")
+
+    proving_status = subparsers.add_parser(
+        "canonical-proving-activation-status",
+        parents=[common],
+        help="Show latest canonical proving activation status",
+        description="Read-only status for bounded canonical proving activation.",
+    )
+    proving_status.add_argument("--package-id", type=UUID, required=True)
+    proving_status.add_argument("--json", action="store_true", dest="json_output")
+
+    proving_pause = subparsers.add_parser(
+        "canonical-proving-pause",
+        parents=[common],
+        help="Pause an active canonical proving activation",
+        description="Idempotently pauses a canonical proving activation without deleting history.",
+    )
+    proving_pause.add_argument("--package-id", type=UUID, required=True)
+    proving_pause.add_argument("--actor", type=str, default="operator:human")
+    proving_pause.add_argument("--reason", type=str, required=True)
+    proving_pause.add_argument("--idempotency-key", type=str, required=True)
+    proving_pause.add_argument("--json", action="store_true", dest="json_output")
+
+    proving_revoke = subparsers.add_parser(
+        "canonical-proving-revoke",
+        parents=[common],
+        help="Revoke an active canonical proving activation",
+        description="Idempotently revokes a canonical proving activation without deleting history.",
+    )
+    proving_revoke.add_argument("--package-id", type=UUID, required=True)
+    proving_revoke.add_argument("--actor", type=str, default="operator:human")
+    proving_revoke.add_argument("--reason", type=str, required=True)
+    proving_revoke.add_argument("--idempotency-key", type=str, required=True)
+    proving_revoke.add_argument("--json", action="store_true", dest="json_output")
+
     return parser
 
 
@@ -417,6 +551,16 @@ def _resolve_preview_idempotency_seed(args: argparse.Namespace) -> str | None:
     if explicit_seed:
         return explicit_seed
     return uuid4().hex
+
+
+def _parse_iso_datetime(value: str) -> datetime:
+    raw = value.strip()
+    if raw.endswith("Z"):
+        raw = f"{raw[:-1]}+00:00"
+    parsed = datetime.fromisoformat(raw)
+    if parsed.tzinfo is None:
+        return parsed.replace(tzinfo=timezone.utc)
+    return parsed.astimezone(timezone.utc)
 
 
 async def _run_async(args: argparse.Namespace) -> tuple[int, dict[str, Any], str]:
@@ -452,6 +596,95 @@ async def _run_async(args: argparse.Namespace) -> tuple[int, dict[str, Any], str
 
     if args.command == "campaign-orchestration-history":
         payload = await fetch_campaign_orchestration_history(campaign_id=args.campaign_id, version=args.version, limit=args.limit)
+        return 0, payload, render_json(payload)
+
+    if args.command == "canonical-preview-package-create":
+        payload = await create_canonical_preview_package_bundle(
+            campaign_id=args.campaign_id,
+            campaign_version=args.campaign_version,
+            paper_account_id=args.paper_account_id,
+            live_trading_profile_id=args.live_trading_profile_id,
+            provider=args.provider,
+            environment=args.environment,
+            product_id=args.product,
+            max_proposed_order_amount=args.max_proposed_order_amount,
+            actor=args.actor,
+            idempotency_key=args.idempotency_key,
+        )
+        return (0 if bool((payload.get("readiness") or {}).get("ready")) else 1), payload, render_json(payload)
+
+    if args.command == "canonical-preview-package-show":
+        payload = await show_canonical_preview_package_bundle(package_id=args.package_id)
+        return 0, payload, render_json(payload)
+
+    if args.command == "canonical-preview-package-readiness":
+        payload = await canonical_preview_package_readiness(package_id=args.package_id)
+        return (0 if bool((payload.get("readiness") or {}).get("ready")) else 1), payload, render_json(payload)
+
+    if args.command == "canonical-preview-package-history":
+        payload = await canonical_preview_package_history(
+            campaign_id=args.campaign_id,
+            campaign_version=args.campaign_version,
+            limit=args.limit,
+        )
+        return 0, payload, render_json(payload)
+
+    if args.command == "canonical-preview-package-authorize":
+        payload = await authorize_canonical_preview_package_bundle(
+            package_id=args.package_id,
+            actor=args.actor,
+            approver_role=args.approver_role,
+            rationale=args.rationale,
+            expires_at=_parse_iso_datetime(args.expires_at),
+            max_order_usd=args.max_order_usd,
+            max_total_deployed_campaign_capital_usd=args.max_total_deployed_campaign_capital_usd,
+            no_leverage=bool(args.no_leverage),
+            idempotency_key=args.idempotency_key,
+        )
+        return 0, payload, render_json(payload)
+
+    if args.command == "canonical-preview-package-dry-run":
+        payload = await dry_run_canonical_preview_package_bundle(
+            package_id=args.package_id,
+            approval_event_id=args.approval_event_id,
+            operator_identity=args.operator_identity,
+            idempotency_token=args.idempotency_token,
+        )
+        status = str(payload.get("dry_run_status") or "")
+        return (0 if status == "DRY_RUN_READY" else 1), payload, render_json(payload)
+
+    if args.command == "canonical-proving-activate":
+        payload = await activate_canonical_proving_campaign_bundle(
+            package_id=args.package_id,
+            approval_event_id=args.approval_event_id,
+            dry_run_live_crypto_order_id=args.dry_run_live_crypto_order_id,
+            actor=args.actor,
+            expires_at=_parse_iso_datetime(args.expires_at),
+            idempotency_key=args.idempotency_key,
+            confirm=bool(args.confirm),
+        )
+        return 0, payload, render_json(payload)
+
+    if args.command == "canonical-proving-activation-status":
+        payload = await canonical_proving_activation_status(package_id=args.package_id)
+        return 0, payload, render_json(payload)
+
+    if args.command == "canonical-proving-pause":
+        payload = await pause_canonical_proving_activation_bundle(
+            package_id=args.package_id,
+            actor=args.actor,
+            reason=args.reason,
+            idempotency_key=args.idempotency_key,
+        )
+        return 0, payload, render_json(payload)
+
+    if args.command == "canonical-proving-revoke":
+        payload = await revoke_canonical_proving_activation_bundle(
+            package_id=args.package_id,
+            actor=args.actor,
+            reason=args.reason,
+            idempotency_key=args.idempotency_key,
+        )
         return 0, payload, render_json(payload)
 
     if args.command == "preview-show":

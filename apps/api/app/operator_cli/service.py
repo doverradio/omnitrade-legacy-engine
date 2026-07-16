@@ -46,6 +46,23 @@ from app.services.canonical_campaign_binding import (
     rollback_legacy_campaign_transition as _rollback_legacy_campaign_transition,
     transition_legacy_campaign_to_canonical_successor as _transition_legacy_campaign_to_canonical_successor,
 )
+from app.services.canonical_preview_package import (
+    CanonicalPreviewPackageActivationRequest,
+    CanonicalPreviewPackageAuthorizeRequest,
+    CanonicalPreviewPackageCreateRequest,
+    CanonicalPreviewPackageDryRunRequest,
+    CanonicalPreviewPackagePauseRequest,
+    CanonicalPreviewPackageRevokeRequest,
+    activate_canonical_proving_campaign,
+    authorize_canonical_preview_package,
+    create_canonical_preview_package,
+    get_canonical_preview_package,
+    get_canonical_proving_activation_status,
+    list_canonical_preview_package_history,
+    pause_canonical_proving_activation,
+    revoke_canonical_proving_activation,
+    run_dry_run_for_canonical_preview_package,
+)
 from app.services.capital_campaign_orchestration import (
     fetch_campaign_orchestration_history as _fetch_campaign_orchestration_history,
     fetch_campaign_orchestration_readiness as _fetch_campaign_orchestration_readiness,
@@ -2042,6 +2059,172 @@ async def fetch_canonical_campaign_binding_status(*, campaign_id: UUID, campaign
 async def fetch_canonical_campaign_binding_audit(*, campaign_id: UUID, limit: int = 20) -> dict[str, Any]:
     async with AsyncSessionLocal() as db:
         return await _fetch_canonical_campaign_binding_audit(db=db, campaign_id=campaign_id, limit=limit)
+
+
+async def create_canonical_preview_package_bundle(
+    *,
+    campaign_id: UUID,
+    campaign_version: int,
+    paper_account_id: UUID,
+    live_trading_profile_id: UUID,
+    provider: str,
+    environment: str,
+    product_id: str,
+    max_proposed_order_amount: Decimal,
+    actor: str,
+    idempotency_key: str,
+) -> dict[str, Any]:
+    async with AsyncSessionLocal() as db:
+        payload = await create_canonical_preview_package(
+            db=db,
+            request=CanonicalPreviewPackageCreateRequest(
+                campaign_id=campaign_id,
+                campaign_version=campaign_version,
+                paper_account_id=paper_account_id,
+                live_trading_profile_id=live_trading_profile_id,
+                provider=provider,
+                environment=environment,
+                product=product_id,
+                max_proposed_order_amount=max_proposed_order_amount,
+                actor=actor,
+                idempotency_key=idempotency_key,
+            ),
+        )
+    return payload
+
+
+async def show_canonical_preview_package_bundle(*, package_id: UUID) -> dict[str, Any]:
+    async with AsyncSessionLocal() as db:
+        return await get_canonical_preview_package(db=db, package_id=package_id)
+
+
+async def canonical_preview_package_readiness(*, package_id: UUID) -> dict[str, Any]:
+    payload = await show_canonical_preview_package_bundle(package_id=package_id)
+    return {
+        "package_id": str(package_id),
+        "readiness": payload.get("readiness"),
+    }
+
+
+async def canonical_preview_package_history(
+    *,
+    campaign_id: UUID,
+    campaign_version: int | None,
+    limit: int,
+) -> dict[str, Any]:
+    async with AsyncSessionLocal() as db:
+        return await list_canonical_preview_package_history(
+            db=db,
+            campaign_id=campaign_id,
+            campaign_version=campaign_version,
+            limit=limit,
+        )
+
+
+async def authorize_canonical_preview_package_bundle(
+    *,
+    package_id: UUID,
+    actor: str,
+    approver_role: str,
+    rationale: str,
+    expires_at: datetime,
+    max_order_usd: Decimal,
+    max_total_deployed_campaign_capital_usd: Decimal,
+    no_leverage: bool,
+    idempotency_key: str,
+) -> dict[str, Any]:
+    async with AsyncSessionLocal() as db:
+        return await authorize_canonical_preview_package(
+            db=db,
+            request=CanonicalPreviewPackageAuthorizeRequest(
+                package_id=package_id,
+                actor=actor,
+                approver_role=approver_role,
+                rationale=rationale,
+                expires_at=expires_at,
+                max_order_usd=max_order_usd,
+                max_total_deployed_campaign_capital_usd=max_total_deployed_campaign_capital_usd,
+                no_leverage=no_leverage,
+                idempotency_key=idempotency_key,
+            ),
+        )
+
+
+async def dry_run_canonical_preview_package_bundle(
+    *,
+    package_id: UUID,
+    approval_event_id: UUID,
+    operator_identity: str,
+    idempotency_token: str,
+) -> dict[str, Any]:
+    async with AsyncSessionLocal() as db:
+        return await run_dry_run_for_canonical_preview_package(
+            db=db,
+            request=CanonicalPreviewPackageDryRunRequest(
+                package_id=package_id,
+                approval_event_id=approval_event_id,
+                operator_identity=operator_identity,
+                idempotency_token=idempotency_token,
+            ),
+        )
+
+
+async def activate_canonical_proving_campaign_bundle(
+    *,
+    package_id: UUID,
+    approval_event_id: UUID,
+    dry_run_live_crypto_order_id: UUID,
+    actor: str,
+    expires_at: datetime,
+    idempotency_key: str,
+    confirm: bool,
+) -> dict[str, Any]:
+    if not confirm:
+        raise PermissionError("confirmation required for canonical proving activation")
+
+    async with AsyncSessionLocal() as db:
+        return await activate_canonical_proving_campaign(
+            db=db,
+            request=CanonicalPreviewPackageActivationRequest(
+                package_id=package_id,
+                approval_event_id=approval_event_id,
+                dry_run_live_crypto_order_id=dry_run_live_crypto_order_id,
+                actor=actor,
+                expires_at=expires_at,
+                idempotency_key=idempotency_key,
+            ),
+        )
+
+
+async def canonical_proving_activation_status(*, package_id: UUID) -> dict[str, Any]:
+    async with AsyncSessionLocal() as db:
+        return await get_canonical_proving_activation_status(db=db, package_id=package_id)
+
+
+async def pause_canonical_proving_activation_bundle(*, package_id: UUID, actor: str, reason: str, idempotency_key: str) -> dict[str, Any]:
+    async with AsyncSessionLocal() as db:
+        return await pause_canonical_proving_activation(
+            db=db,
+            request=CanonicalPreviewPackagePauseRequest(
+                package_id=package_id,
+                actor=actor,
+                reason=reason,
+                idempotency_key=idempotency_key,
+            ),
+        )
+
+
+async def revoke_canonical_proving_activation_bundle(*, package_id: UUID, actor: str, reason: str, idempotency_key: str) -> dict[str, Any]:
+    async with AsyncSessionLocal() as db:
+        return await revoke_canonical_proving_activation(
+            db=db,
+            request=CanonicalPreviewPackageRevokeRequest(
+                package_id=package_id,
+                actor=actor,
+                reason=reason,
+                idempotency_key=idempotency_key,
+            ),
+        )
 
 
 async def inspect_legacy_campaign_transition(

@@ -13,6 +13,8 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.config import get_settings
 from app.models.asset import Asset
 from app.models.capital_campaign import CapitalCampaign
+from app.models.canonical_preview_package import CanonicalPreviewPackage
+from app.models.canonical_proving_activation import CanonicalProvingActivation
 from app.models.crypto_order_preview import CryptoOrderPreview
 from app.models.exchange_connection import ExchangeConnection
 from app.models.audit_log import AuditLog
@@ -250,6 +252,24 @@ async def _load_active_campaign_for_account(*, db: AsyncSession, paper_account_i
     )
 
 
+async def _load_canonical_proving_activation_for_scope(
+    *,
+    db: AsyncSession,
+    paper_account_id: uuid.UUID,
+    provider: str,
+    environment: str,
+    product: str,
+) -> CanonicalProvingActivation | None:
+    return await db.scalar(
+        select(CanonicalProvingActivation)
+        .where(CanonicalProvingActivation.paper_account_id == paper_account_id)
+        .where(CanonicalProvingActivation.provider == provider)
+        .where(CanonicalProvingActivation.environment == environment)
+        .where(CanonicalProvingActivation.product == product)
+        .limit(1)
+    )
+
+
 async def _load_preview_decision_identity(*, db: AsyncSession, preview_id: uuid.UUID) -> dict[str, str] | None:
     preview = await db.scalar(
         select(CryptoOrderPreview)
@@ -368,6 +388,7 @@ async def _validate_campaign_scoped_submission_authority(
     preview: CryptoOrderPreview,
     connection: ExchangeConnection,
     requested_quote_size: Decimal,
+    side: str | None = None,
 ) -> None:
     approval_event = await db.scalar(
         select(LiveApprovalEvent)
@@ -439,6 +460,42 @@ async def _validate_campaign_scoped_submission_authority(
     )
     if environment_scope != preview_environment:
         raise PermissionError("approval environment mismatch")
+
+    if str(side or "").upper() == "BUY":
+        canonical_package_id = str(approval_scope.get("canonical_preview_package_id") or "").strip()
+        if canonical_package_id:
+            canonical_activation = await db.scalar(
+                select(CanonicalProvingActivation)
+                .where(CanonicalProvingActivation.package_id == uuid.UUID(canonical_package_id))
+                .limit(1)
+            )
+            if canonical_activation is None:
+                raise PermissionError("canonical proving activation missing")
+            if canonical_activation.activation_state != "ACTIVE":
+                raise PermissionError("canonical proving activation is not active")
+            if canonical_activation.expires_at <= _utcnow():
+                raise PermissionError("canonical proving activation expired")
+            canonical_package = await db.scalar(
+                select(CanonicalPreviewPackage)
+                .where(CanonicalPreviewPackage.package_id == canonical_activation.package_id)
+                .limit(1)
+            )
+            if canonical_package is None:
+                raise PermissionError("canonical proving package evidence missing")
+            if canonical_package.package_state != "ACTIVATED":
+                raise PermissionError("canonical proving package not activated")
+            if canonical_package.paper_account_id != profile.paper_account_id:
+                raise PermissionError("canonical proving package paper account mismatch")
+            if canonical_package.provider != provider:
+                raise PermissionError("canonical proving package provider mismatch")
+            if canonical_package.environment != preview_environment:
+                raise PermissionError("canonical proving package environment mismatch")
+            if canonical_package.product != preview.product_id:
+                raise PermissionError("canonical proving package product mismatch")
+            if canonical_package.approval_event_id is None:
+                raise PermissionError("canonical proving approval missing")
+            if canonical_package.dry_run_live_crypto_order_id is None:
+                raise PermissionError("canonical proving dry run missing")
 
     campaign = await _load_active_campaign_for_account(db=db, paper_account_id=profile.paper_account_id)
     if campaign is None:
@@ -842,7 +899,12 @@ async def _evaluate_live_preflight_guards(
         max_age_seconds=settings.live_crypto_price_max_age_seconds,
     )
 
-    approval_gate = await evaluate_live_approval_gate(
+    canonical_approval_gate = await evaluate_live_approval_gate(
+        db=db,
+        live_trading_profile_id=profile.id,
+        checkpoint_type="bounded_proving_entry",
+    )
+    approval_gate = canonical_approval_gate if canonical_approval_gate.allowed else await evaluate_live_approval_gate(
         db=db,
         live_trading_profile_id=profile.id,
         checkpoint_type="first_live_enablement",
@@ -860,6 +922,46 @@ async def _evaluate_live_preflight_guards(
         raise PermissionError("approval environment does not match preview environment")
     if approval_event is not None and _approval_provider(approval_event) != _effective_live_provider(profile=profile, preview=preview, connection=connection):
         raise PermissionError("approval provider does not match preview provider")
+
+    if canonical_approval_gate.allowed:
+        approval_event = await db.scalar(
+            select(LiveApprovalEvent)
+            .where(LiveApprovalEvent.id == canonical_approval_gate.matched_approval_event_id)
+            .limit(1)
+        )
+        canonical_package_id = str(((approval_event.approval_scope if approval_event is not None and isinstance(approval_event.approval_scope, dict) else {}) or {}).get("canonical_preview_package_id") or "")
+        if not canonical_package_id:
+            raise PermissionError("canonical proving approval scope missing")
+        canonical_activation = await db.scalar(
+            select(CanonicalProvingActivation)
+            .where(CanonicalProvingActivation.package_id == uuid.UUID(canonical_package_id))
+            .limit(1)
+        )
+        if canonical_activation is None:
+            raise PermissionError("canonical proving activation missing")
+        if canonical_activation.activation_state != "ACTIVE":
+            raise PermissionError("canonical proving activation is not active")
+        if canonical_activation.expires_at <= now:
+            raise PermissionError("canonical proving activation expired")
+        canonical_package = await db.scalar(
+            select(CanonicalPreviewPackage).where(CanonicalPreviewPackage.package_id == canonical_activation.package_id).limit(1)
+        )
+        if canonical_package is None:
+            raise PermissionError("canonical proving package evidence missing")
+        if canonical_package.package_state != "ACTIVATED":
+            raise PermissionError("canonical proving package not activated")
+        if canonical_package.paper_account_id != profile.paper_account_id:
+            raise PermissionError("canonical proving package paper account mismatch")
+        if canonical_package.provider != _effective_live_provider(profile=profile, preview=preview, connection=connection):
+            raise PermissionError("canonical proving package provider mismatch")
+        if canonical_package.environment != preview_environment:
+            raise PermissionError("canonical proving package environment mismatch")
+        if canonical_package.product != preview.product_id:
+            raise PermissionError("canonical proving package product mismatch")
+        if canonical_package.approval_event_id is None:
+            raise PermissionError("canonical proving approval missing")
+        if canonical_package.dry_run_live_crypto_order_id is None:
+            raise PermissionError("canonical proving dry run missing")
 
     if require_submission_enabled and approval_event is not None:
         approval_scope = approval_event.approval_scope if isinstance(approval_event.approval_scope, dict) else {}
@@ -1731,6 +1833,7 @@ class LiveCryptoOrderService:
             preview=preview,
             connection=connection,
             requested_quote_size=live_order.requested_quote_size,
+            side=live_order.side,
         )
 
         prepared_preview_id = str(live_order.safe_provider_response.get("crypto_order_preview_id") or "")

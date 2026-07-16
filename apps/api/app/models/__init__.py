@@ -22,6 +22,8 @@ from app.models.backtest import Backtest
 from app.models.backtest_trade import BacktestTrade
 from app.models.capital_campaign import CapitalCampaign
 from app.models.capital_campaign_definition import CapitalCampaignDefinition
+from app.models.canonical_preview_package import CanonicalPreviewPackage
+from app.models.canonical_proving_activation import CanonicalProvingActivation
 from app.models.capital_campaign_profit_cycle import CapitalCampaignProfitCycle
 from app.models.capital_campaign_profit_policy import CapitalCampaignProfitPolicy
 from app.models.candle import Candle
@@ -96,6 +98,8 @@ __all__ = [
 	"BacktestTrade",
 	"CapitalCampaign",
 	"CapitalCampaignDefinition",
+	"CanonicalPreviewPackage",
+	"CanonicalProvingActivation",
 	"CapitalCampaignProfitCycle",
 	"CapitalCampaignProfitPolicy",
 	"Candle",

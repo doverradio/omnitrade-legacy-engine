@@ -5,7 +5,7 @@ from datetime import datetime
 from decimal import Decimal
 from typing import Any
 
-from sqlalchemy import DateTime, Index, Integer, Numeric, Text, UniqueConstraint, text
+from sqlalchemy import DateTime, ForeignKey, Index, Integer, Numeric, Text, UniqueConstraint, text
 from sqlalchemy.dialects.postgresql import JSONB, UUID
 from sqlalchemy.orm import Mapped, mapped_column
 
@@ -43,6 +43,7 @@ class CryptoOrderPreview(Base):
     decision_record_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), nullable=True)
     validation_run_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), nullable=True)
     strategy_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), nullable=True)
+    parameter_set_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), ForeignKey("parameter_sets.id", ondelete="RESTRICT"), nullable=True)
     strategy_name: Mapped[str | None] = mapped_column(Text, nullable=True)
     preview_id: Mapped[str | None] = mapped_column(Text, nullable=True)
     estimated_average_price: Mapped[Decimal | None] = mapped_column(Numeric, nullable=True)

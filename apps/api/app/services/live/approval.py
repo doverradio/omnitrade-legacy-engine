@@ -182,57 +182,56 @@ async def record_live_approval_checkpoint(
         "renewal_condition": request.renewal_condition,
     }
 
-    async with db.begin():
-        existing_sequence = await db.scalar(
-            select(func.max(LiveApprovalEvent.sequence_number))
-            .where(LiveApprovalEvent.live_trading_profile_id == request.live_trading_profile_id)
-        )
-        sequence_number = int(existing_sequence or 0) + 1
+    existing_sequence = await db.scalar(
+        select(func.max(LiveApprovalEvent.sequence_number))
+        .where(LiveApprovalEvent.live_trading_profile_id == request.live_trading_profile_id)
+    )
+    sequence_number = int(existing_sequence or 0) + 1
 
-        approval_event = LiveApprovalEvent(
-            idempotency_key=idempotency_key,
-            event_hash=build_live_approval_event_hash(
-                live_trading_profile_id=request.live_trading_profile_id,
-                sequence_number=sequence_number,
-                event_type="approval_granted",
-                checkpoint_type=request.checkpoint_type,
-                approver_id=request.approver_id,
-                approval_state="approved",
-                recorded_at=recorded_at,
-                payload=payload,
-            ),
+    approval_event = LiveApprovalEvent(
+        idempotency_key=idempotency_key,
+        event_hash=build_live_approval_event_hash(
             live_trading_profile_id=request.live_trading_profile_id,
             sequence_number=sequence_number,
             event_type="approval_granted",
             checkpoint_type=request.checkpoint_type,
-            approval_state="approved",
             approver_id=request.approver_id,
-            approver_role=request.approver_role,
-            rationale=request.rationale,
-            approval_scope=request.approval_scope,
-            expires_at=request.expires_at,
-            renewal_condition=request.renewal_condition,
-            event_payload=payload,
-            provenance={
-                "requested_by": request.requested_by,
-                "recorded_at": recorded_at.isoformat(),
-                **request.provenance_metadata,
-            },
-            immutable_contract_version="v1",
+            approval_state="approved",
             recorded_at=recorded_at,
-        )
-        db.add(approval_event)
+            payload=payload,
+        ),
+        live_trading_profile_id=request.live_trading_profile_id,
+        sequence_number=sequence_number,
+        event_type="approval_granted",
+        checkpoint_type=request.checkpoint_type,
+        approval_state="approved",
+        approver_id=request.approver_id,
+        approver_role=request.approver_role,
+        rationale=request.rationale,
+        approval_scope=request.approval_scope,
+        expires_at=request.expires_at,
+        renewal_condition=request.renewal_condition,
+        event_payload=payload,
+        provenance={
+            "requested_by": request.requested_by,
+            "recorded_at": recorded_at.isoformat(),
+            **request.provenance_metadata,
+        },
+        immutable_contract_version="v1",
+        recorded_at=recorded_at,
+    )
+    db.add(approval_event)
 
-        profile.approval_state = "approved"
-        profile.human_approval_recorded = True
-        profile.lifecycle_state = next_state
+    profile.approval_state = "approved"
+    profile.human_approval_recorded = True
+    profile.lifecycle_state = next_state
 
-        if request.checkpoint_type == "first_live_enablement":
-            # Approval for first live enablement permits transitioning to enabled under explicit checkpoint.
-            profile.operating_mode = "live"
-            profile.lifecycle_state = "enabled"
+    if request.checkpoint_type == "first_live_enablement":
+        # Approval for first live enablement permits transitioning to enabled under explicit checkpoint.
+        profile.operating_mode = "live"
+        profile.lifecycle_state = "enabled"
 
-        await db.flush()
+    await db.flush()
 
     return LiveApprovalCheckpointResult(
         approval_event_id=approval_event.id,
@@ -328,53 +327,52 @@ async def _record_approval_state_change(
         "rationale": request.rationale,
     }
 
-    async with db.begin():
-        existing_sequence = await db.scalar(
-            select(func.max(LiveApprovalEvent.sequence_number))
-            .where(LiveApprovalEvent.live_trading_profile_id == request.live_trading_profile_id)
-        )
-        sequence_number = int(existing_sequence or 0) + 1
+    existing_sequence = await db.scalar(
+        select(func.max(LiveApprovalEvent.sequence_number))
+        .where(LiveApprovalEvent.live_trading_profile_id == request.live_trading_profile_id)
+    )
+    sequence_number = int(existing_sequence or 0) + 1
 
-        approval_event = LiveApprovalEvent(
-            idempotency_key=idempotency_key,
-            event_hash=build_live_approval_event_hash(
-                live_trading_profile_id=request.live_trading_profile_id,
-                sequence_number=sequence_number,
-                event_type=event_type,
-                checkpoint_type=request.checkpoint_type,
-                approver_id=request.approver_id,
-                approval_state=approval_state,
-                recorded_at=recorded_at,
-                payload=payload,
-            ),
+    approval_event = LiveApprovalEvent(
+        idempotency_key=idempotency_key,
+        event_hash=build_live_approval_event_hash(
             live_trading_profile_id=request.live_trading_profile_id,
             sequence_number=sequence_number,
             event_type=event_type,
             checkpoint_type=request.checkpoint_type,
-            approval_state=approval_state,
             approver_id=request.approver_id,
-            approver_role=request.approver_role,
-            rationale=request.rationale,
-            approval_scope=request.approval_scope,
-            expires_at=None,
-            renewal_condition=None,
-            event_payload=payload,
-            provenance={
-                "requested_by": request.requested_by,
-                "recorded_at": recorded_at.isoformat(),
-                **request.provenance_metadata,
-            },
-            immutable_contract_version="v1",
+            approval_state=approval_state,
             recorded_at=recorded_at,
-        )
-        db.add(approval_event)
+            payload=payload,
+        ),
+        live_trading_profile_id=request.live_trading_profile_id,
+        sequence_number=sequence_number,
+        event_type=event_type,
+        checkpoint_type=request.checkpoint_type,
+        approval_state=approval_state,
+        approver_id=request.approver_id,
+        approver_role=request.approver_role,
+        rationale=request.rationale,
+        approval_scope=request.approval_scope,
+        expires_at=None,
+        renewal_condition=None,
+        event_payload=payload,
+        provenance={
+            "requested_by": request.requested_by,
+            "recorded_at": recorded_at.isoformat(),
+            **request.provenance_metadata,
+        },
+        immutable_contract_version="v1",
+        recorded_at=recorded_at,
+    )
+    db.add(approval_event)
 
-        profile.approval_state = "revoked" if approval_state == "revoked" else "pending"
-        profile.human_approval_recorded = False
-        profile.lifecycle_state = "suspended"
-        profile.operating_mode = "paper"
+    profile.approval_state = "revoked" if approval_state == "revoked" else "pending"
+    profile.human_approval_recorded = False
+    profile.lifecycle_state = "suspended"
+    profile.operating_mode = "paper"
 
-        await db.flush()
+    await db.flush()
 
     return LiveApprovalCheckpointResult(
         approval_event_id=approval_event.id,

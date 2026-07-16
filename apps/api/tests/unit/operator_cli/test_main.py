@@ -258,6 +258,128 @@ def test_parse_rejects_nonexistent_canonical_campaign_binding_status_command() -
         ])
 
 
+def test_parse_canonical_preview_package_commands() -> None:
+    create_args = parse_args([
+        "canonical-preview-package-create",
+        "--campaign-id",
+        "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa",
+        "--campaign-version",
+        "1",
+        "--paper-account-id",
+        "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb",
+        "--live-trading-profile-id",
+        "cccccccc-cccc-cccc-cccc-cccccccccccc",
+        "--provider",
+        "kraken_spot",
+        "--environment",
+        "production",
+        "--product",
+        "BTC-USD",
+        "--idempotency-key",
+        "pkg-1",
+        "--json",
+    ])
+    assert create_args.command == "canonical-preview-package-create"
+    assert create_args.json_output is True
+
+    show_args = parse_args([
+        "canonical-preview-package-show",
+        "--package-id",
+        "dddddddd-dddd-dddd-dddd-dddddddddddd",
+    ])
+    assert show_args.command == "canonical-preview-package-show"
+
+    readiness_args = parse_args([
+        "canonical-preview-package-readiness",
+        "--package-id",
+        "dddddddd-dddd-dddd-dddd-dddddddddddd",
+    ])
+    assert readiness_args.command == "canonical-preview-package-readiness"
+
+    history_args = parse_args([
+        "canonical-preview-package-history",
+        "--campaign-id",
+        "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa",
+        "--campaign-version",
+        "1",
+        "--limit",
+        "5",
+    ])
+    assert history_args.command == "canonical-preview-package-history"
+    assert history_args.limit == 5
+
+
+def test_parse_canonical_package_authorize_dry_run_and_activate() -> None:
+    authorize_args = parse_args([
+        "canonical-preview-package-authorize",
+        "--package-id",
+        "dddddddd-dddd-dddd-dddd-dddddddddddd",
+        "--rationale",
+        "bounded proving",
+        "--expires-at",
+        "2026-01-01T00:00:00Z",
+        "--idempotency-key",
+        "auth-1",
+        "--no-leverage",
+    ])
+    assert authorize_args.command == "canonical-preview-package-authorize"
+    assert authorize_args.no_leverage is True
+
+    dry_run_args = parse_args([
+        "canonical-preview-package-dry-run",
+        "--package-id",
+        "dddddddd-dddd-dddd-dddd-dddddddddddd",
+        "--approval-event-id",
+        "eeeeeeee-eeee-eeee-eeee-eeeeeeeeeeee",
+        "--idempotency-token",
+        "dry-1",
+    ])
+    assert dry_run_args.command == "canonical-preview-package-dry-run"
+
+    activate_args = parse_args([
+        "canonical-proving-activate",
+        "--package-id",
+        "dddddddd-dddd-dddd-dddd-dddddddddddd",
+        "--approval-event-id",
+        "eeeeeeee-eeee-eeee-eeee-eeeeeeeeeeee",
+        "--dry-run-live-crypto-order-id",
+        "ffffffff-ffff-ffff-ffff-ffffffffffff",
+        "--expires-at",
+        "2026-01-01T00:30:00Z",
+        "--idempotency-key",
+        "act-1",
+        "--confirm",
+    ])
+    assert activate_args.command == "canonical-proving-activate"
+    assert activate_args.confirm is True
+
+
+def test_parse_canonical_proving_pause_and_revoke() -> None:
+    pause_args = parse_args([
+        "canonical-proving-pause",
+        "--package-id",
+        "dddddddd-dddd-dddd-dddd-dddddddddddd",
+        "--reason",
+        "safety intervention",
+        "--idempotency-key",
+        "pause-1",
+    ])
+    assert pause_args.command == "canonical-proving-pause"
+    assert pause_args.reason == "safety intervention"
+
+    revoke_args = parse_args([
+        "canonical-proving-revoke",
+        "--package-id",
+        "dddddddd-dddd-dddd-dddd-dddddddddddd",
+        "--reason",
+        "authority revoked",
+        "--idempotency-key",
+        "revoke-1",
+    ])
+    assert revoke_args.command == "canonical-proving-revoke"
+    assert revoke_args.reason == "authority revoked"
+
+
 def test_parse_legacy_campaign_transition_commands() -> None:
     readiness = parse_args([
         "legacy-campaign-transition-readiness",

@@ -527,6 +527,7 @@ async def _submit_order(
         preview=preview,
         connection=connection,
         requested_quote_size=requested_quote_size,
+        side=side,
     )
 
     provider = get_exchange_provider(run.provider, environment=run.environment)
