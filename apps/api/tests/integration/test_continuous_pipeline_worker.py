@@ -615,6 +615,43 @@ async def test_automatic_ready_package_path_never_calls_authorize_activate_dryru
 
 
 @pytest.mark.asyncio
+async def test_automatic_ready_package_hold_termination_logs_skip_reason(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    import app.services.orchestration.continuous_pipeline_worker as worker_module
+
+    cycle = _automatic_cycle(
+        termination_stage="hold_no_package_created",
+        proposed_action="HOLD",
+        decision_kind="HOLD",
+    )
+
+    create_calls = {"count": 0}
+
+    async def _fake_create(*, db, request):
+        create_calls["count"] += 1
+        return {
+            "idempotent": False,
+            "package": {"package_id": str(uuid.uuid4()), "package_state": "READY"},
+            "readiness": {"ready": True, "package_state": "READY"},
+        }
+
+    caplog.set_level(logging.INFO)
+    monkeypatch.setattr(worker_module, "_load_cycle_by_id", _async_return(cycle))
+    monkeypatch.setattr(worker_module, "create_canonical_preview_package", _fake_create)
+
+    await worker_module._attempt_automatic_ready_package_creation(
+        db=object(),
+        orchestration_payload=_automatic_payload(cycle),
+    )
+
+    assert create_calls["count"] == 0
+    assert "automatic_ready_package_skipped" in caplog.text
+    assert "reason=termination_stage_hold_no_package_created" in caplog.text
+
+
+@pytest.mark.asyncio
 async def test_new_buy_signal_reaches_orchestrator(monkeypatch: pytest.MonkeyPatch) -> None:
     db = _FakeDB()
     asset = _asset()

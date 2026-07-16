@@ -205,6 +205,89 @@ def _primary_rejection_reason(*, rejected_candidates: list[dict[str, Any]], fail
     return str(rejected_candidates[0].get("reason") or "no_qualifying_candidate")
 
 
+def _preview_strategy_inputs_from_authoritative_evidence(*, strategy_evidence: dict[str, Any], allowed_instruments: list[str]) -> list[StrategyEvidenceInput]:
+    items: list[StrategyEvidenceInput] = []
+    seen: set[str] = set()
+    for instrument in allowed_instruments:
+        evidence = strategy_evidence.get(instrument)
+        if not isinstance(evidence, dict):
+            continue
+        if str(evidence.get("authority_class") or "").strip().upper() != "AUTHORITATIVE":
+            continue
+        normalized = _normalize_symbol(instrument)
+        if normalized in seen:
+            continue
+        seen.add(normalized)
+        confidence = Decimal(str(evidence.get("confidence") or "0"))
+        expected_gross_edge = Decimal(str(evidence.get("profitable_after_fees_performance") or evidence.get("expected_value") or "0"))
+        items.append(
+            StrategyEvidenceInput(
+                instrument=normalized,
+                authority_class="AUTHORITATIVE",
+                confidence=confidence,
+                expected_gross_edge=expected_gross_edge,
+                expected_fees=Decimal("0"),
+                expected_slippage=Decimal("0"),
+            )
+        )
+    return items
+
+
+def _preview_lifecycle_inputs_from_authoritative_evidence(*, position_evidence: dict[str, Any], allowed_instruments: list[str]) -> list[LifecycleEvidenceInput]:
+    items: list[LifecycleEvidenceInput] = []
+    seen: set[str] = set()
+    for instrument in allowed_instruments:
+        evidence = position_evidence.get(instrument)
+        if not isinstance(evidence, dict):
+            continue
+        if str(evidence.get("authority_class") or "").strip().upper() not in {"AUTHORITATIVE", "STALE"}:
+            continue
+        lifecycle = evidence.get("lifecycle") if isinstance(evidence.get("lifecycle"), dict) else {}
+        position = evidence.get("position") if isinstance(evidence.get("position"), dict) else {}
+        normalized = _normalize_symbol(instrument)
+        if normalized in seen:
+            continue
+        seen.add(normalized)
+        items.append(
+            LifecycleEvidenceInput(
+                instrument=normalized,
+                authority_class="AUTHORITATIVE",
+                lifecycle_state=str(lifecycle.get("lifecycle_state") or "OPEN"),
+                recommendation=str(lifecycle.get("recommendation") or "HOLD_FOR_PROFIT"),
+                market_data_stale=bool(lifecycle.get("market_data_stale", False)),
+                dust_indicator=bool(position.get("dust_indicator", False)),
+                closed_indicator=bool(position.get("closed_indicator", False)),
+                expected_net_realized_pnl_if_sold_now=None,
+            )
+        )
+    return items
+
+
+def _preview_risk_inputs_from_authoritative_evidence(*, risk_outputs: dict[str, Any], allowed_instruments: list[str]) -> list[RiskPreviewInput]:
+    items: list[RiskPreviewInput] = []
+    seen: set[str] = set()
+    for instrument in allowed_instruments:
+        evidence = risk_outputs.get(instrument)
+        if not isinstance(evidence, dict):
+            continue
+        if str(evidence.get("authority_class") or "").strip().upper() != "AUTHORITATIVE":
+            continue
+        normalized = _normalize_symbol(instrument)
+        if normalized in seen:
+            continue
+        seen.add(normalized)
+        items.append(
+            RiskPreviewInput(
+                instrument=normalized,
+                authority_class="AUTHORITATIVE",
+                verdict=str(evidence.get("verdict") or "VETO"),
+                reason=None if evidence.get("reason") is None else str(evidence.get("reason")),
+                max_allocation=Decimal(str(evidence.get("approved_quantity") or "0")),
+            )
+        )
+    return items
+
+
 def _split_strategy_identity(identity: str | None) -> tuple[str, str | None]:
     raw = str(identity or "").strip()
     if not raw:
@@ -1315,44 +1398,26 @@ async def compose_campaign_authoritative_cycle(
         "decision_evidence": selected_decision,
         "candidate_instruments": allowed_instruments,
     }
+    preview_strategy_inputs = _preview_strategy_inputs_from_authoritative_evidence(
+        strategy_evidence=strategy_evidence,
+        allowed_instruments=allowed_instruments,
+    )
+    preview_lifecycle_inputs = _preview_lifecycle_inputs_from_authoritative_evidence(
+        position_evidence=position_evidence,
+        allowed_instruments=allowed_instruments,
+    )
+    preview_risk_inputs = _preview_risk_inputs_from_authoritative_evidence(
+        risk_outputs=risk_outputs,
+        allowed_instruments=allowed_instruments,
+    )
+
     preview = build_campaign_preview(
         campaign=campaign_definition,
         request=CapitalCampaignPreviewRequest(
             candidate_instruments=allowed_instruments,
-            strategy_evidence=[
-                StrategyEvidenceInput(
-                    instrument=item["instrument"],
-                    authority_class="AUTHORITATIVE",
-                    confidence=Decimal(str(item["confidence"] or "0")) if item.get("confidence") is not None else Decimal("0"),
-                    expected_gross_edge=Decimal(str(item["strategy_evidence"].get("profitable_after_fees_performance") or "0")),
-                    expected_fees=Decimal("0"),
-                    expected_slippage=Decimal("0"),
-                )
-                for item in candidate_rows
-            ],
-            lifecycle_snapshots=[
-                LifecycleEvidenceInput(
-                    instrument=item["instrument"],
-                    authority_class="AUTHORITATIVE",
-                    lifecycle_state=item["position_evidence"]["lifecycle"]["lifecycle_state"] if item["position_evidence"].get("lifecycle") else "OPEN",
-                    recommendation=item["position_evidence"]["lifecycle"]["recommendation"] if item["position_evidence"].get("lifecycle") else "HOLD_FOR_PROFIT",
-                    market_data_stale=item["position_evidence"]["lifecycle"]["market_data_stale"] if item["position_evidence"].get("lifecycle") else False,
-                    dust_indicator=item["position_evidence"]["position"]["dust_indicator"] if item["position_evidence"].get("position") else False,
-                    closed_indicator=item["position_evidence"]["position"]["closed_indicator"] if item["position_evidence"].get("position") else False,
-                    expected_net_realized_pnl_if_sold_now=None,
-                )
-                for item in candidate_rows
-            ],
-            risk_preview=[
-                RiskPreviewInput(
-                    instrument=item["instrument"],
-                    authority_class="AUTHORITATIVE",
-                    verdict=item["risk_evidence"]["verdict"],
-                    reason=item["risk_evidence"]["reason"],
-                    max_allocation=Decimal(str(item["maximum_risk_approved_allocation"] or "0")),
-                )
-                for item in candidate_rows
-            ],
+            strategy_evidence=preview_strategy_inputs,
+            lifecycle_snapshots=preview_lifecycle_inputs,
+            risk_preview=preview_risk_inputs,
         ),
         now=now,
     )

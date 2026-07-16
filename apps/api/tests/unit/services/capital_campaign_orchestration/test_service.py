@@ -758,16 +758,176 @@ async def test_authoritative_liquid_cash_cap_wins_over_campaign_and_equity(monke
     monkeypatch.setattr("app.services.capital_campaign_orchestration.authoritative._load_market_evidence", _async_return(({"authority_class": "AUTHORITATIVE", "reason": "market data resolved from canonical asset and candle tables", "freshness": "fresh", "close_price": "100"}, asset, candle)))
     monkeypatch.setattr("app.services.capital_campaign_orchestration.authoritative._load_latest_strategy_evidence", _async_return((strategy, None)))
     monkeypatch.setattr("app.services.capital_campaign_orchestration.authoritative._load_position_evidence", _async_return(position))
+
+
+@pytest.mark.asyncio
+async def test_authoritative_hold_preserves_strategy_evidence_in_preview_serialization(monkeypatch: pytest.MonkeyPatch) -> None:
+    from app.services.capital_campaign_orchestration.authoritative import compose_campaign_authoritative_cycle
+
+    campaign = SimpleNamespace(
+        campaign_id=UUID("aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa"),
+        version=1,
+        runtime_campaign_uuid=UUID("bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb"),
+        allowed_instruments=["BTC-USD"],
+        remaining_unallocated_capital=Decimal("25"),
+        maximum_position_size=Decimal("10"),
+        minimum_position_size=Decimal("2"),
+        maximum_total_exposure=Decimal("20"),
+        metadata_evidence={"canonical_strategy_identity": "ma_crossover@1.0.0"},
+    )
+    runtime_campaign = SimpleNamespace(
+        id=17,
+        paper_account_id=UUID("12345678-1234-1234-1234-1234567890ab"),
+        exchange="kraken_spot",
+        current_equity=Decimal("25"),
+        status="READY",
+    )
+    paper_account = SimpleNamespace(id=runtime_campaign.paper_account_id, starting_balance=Decimal("25"))
+    candle = SimpleNamespace(
+        asset_id=UUID("dddddddd-dddd-dddd-dddd-dddddddddddd"),
+        close=Decimal("100"),
+        close_time=datetime(2026, 7, 15, 0, 15, tzinfo=timezone.utc),
+        interval="15m",
+        open_time=datetime(2026, 7, 15, 0, 0, tzinfo=timezone.utc),
+    )
+    asset = SimpleNamespace(
+        id=UUID("eeeeeeee-eeee-eeee-eeee-eeeeeeeeeeee"),
+        exchange="kraken_spot",
+        base_currency="USD",
+        min_order_notional=Decimal("5"),
+        qty_step_size=None,
+        supports_fractional=True,
+    )
+    market = {
+        "authority_class": "AUTHORITATIVE",
+        "reason": "market data resolved from canonical asset and candle tables",
+        "freshness": "fresh",
+        "close_price": "100",
+    }
+    strategy = {
+        "authority_class": "AUTHORITATIVE",
+        "strategy_identity": "ma_crossover@1.0.0",
+        "strategy_version": "1.0.0",
+        "action": "HOLD",
+        "confidence": "0.8",
+        "sample_size": 12,
+        "profitable_after_fees_performance": "4.2",
+        "expected_value": "4.2",
+        "evidence_timestamp": "2026-07-15T00:15:00+00:00",
+        "source_identity": {"decision_record_id": "280390e3-180c-4247-8d82-56ab51f463cf"},
+    }
+
+    captured: dict[str, object] = {}
+
+    class _Db:
+        async def scalar(self, _statement):
+            return paper_account
+
+    def _capture_preview(*, campaign, request, now):
+        captured["strategy_evidence"] = request.strategy_evidence
+        captured["lifecycle_snapshots"] = request.lifecycle_snapshots
+        captured["risk_preview"] = request.risk_preview
+        return SimpleNamespace(model_dump=lambda **_dump_kwargs: {"no_action": True, "preview": "stub"})
+
+    monkeypatch.setattr("app.services.capital_campaign_orchestration.authoritative._load_runtime_campaign", _async_return(runtime_campaign))
+    monkeypatch.setattr("app.services.capital_campaign_orchestration.authoritative._load_market_evidence", _async_return((market, asset, candle)))
+    monkeypatch.setattr("app.services.capital_campaign_orchestration.authoritative._load_latest_strategy_evidence", _async_return((strategy, None)))
+    monkeypatch.setattr("app.services.capital_campaign_orchestration.authoritative.build_campaign_preview", _capture_preview)
+
+    result = await compose_campaign_authoritative_cycle(
+        db=_Db(),
+        campaign_definition=campaign,
+        trigger="kraken_btc_15m_candle_close",
+        candle=candle,
+    )
+
+    assert result.composition["selected_decision"]["decision_kind"] == "HOLD"
+    assert result.composition["selected_decision"]["reason"] == "strategy_hold_signal"
+    assert result.composition["selected_decision"]["decision_record_id"] == "280390e3-180c-4247-8d82-56ab51f463cf"
+    assert result.composition["termination_stage"] == "hold_no_package_created"
+    assert result.composition["authoritative_evidence"]["strategy_authority"]["authority_source"] == "campaign_metadata_evidence"
+    strategy_inputs = captured["strategy_evidence"]
+    assert len(strategy_inputs) == 1
+    assert strategy_inputs[0].instrument == "BTC-USD"
+    assert strategy_inputs[0].authority_class == "AUTHORITATIVE"
+
+
+@pytest.mark.asyncio
+async def test_authoritative_rejected_candidate_preserves_strategy_evidence(monkeypatch: pytest.MonkeyPatch) -> None:
+    from app.services.capital_campaign_orchestration.authoritative import compose_campaign_authoritative_cycle
+
+    campaign = SimpleNamespace(
+        campaign_id=UUID("aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa"),
+        version=1,
+        runtime_campaign_uuid=UUID("bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb"),
+        allowed_instruments=["BTC-USD"],
+        remaining_unallocated_capital=Decimal("1"),
+        maximum_position_size=Decimal("10"),
+        minimum_position_size=Decimal("5"),
+        maximum_total_exposure=Decimal("20"),
+        metadata_evidence={"canonical_strategy_identity": "ma_crossover@1.0.0"},
+    )
+    runtime_campaign = SimpleNamespace(
+        id=17,
+        paper_account_id=UUID("12345678-1234-1234-1234-1234567890ab"),
+        exchange="kraken_spot",
+        current_equity=Decimal("1"),
+        status="READY",
+    )
+    paper_account = SimpleNamespace(id=runtime_campaign.paper_account_id, starting_balance=Decimal("1"), current_cash_balance=Decimal("1"))
+    candle = SimpleNamespace(
+        asset_id=UUID("dddddddd-dddd-dddd-dddd-dddddddddddd"),
+        close=Decimal("100"),
+        close_time=datetime(2026, 7, 15, 0, 15, tzinfo=timezone.utc),
+        interval="15m",
+        open_time=datetime(2026, 7, 15, 0, 0, tzinfo=timezone.utc),
+    )
+    asset = SimpleNamespace(
+        id=UUID("eeeeeeee-eeee-eeee-eeee-eeeeeeeeeeee"),
+        exchange="kraken_spot",
+        base_currency="USD",
+        min_order_notional=Decimal("5"),
+        qty_step_size=None,
+        supports_fractional=True,
+    )
+    strategy = {
+        "authority_class": "AUTHORITATIVE",
+        "strategy_identity": "ma_crossover@1.0.0",
+        "strategy_version": "1.0.0",
+        "action": "BUY",
+        "confidence": "0.8",
+        "sample_size": 12,
+        "profitable_after_fees_performance": "4.2",
+        "expected_value": "4.2",
+        "evidence_timestamp": "2026-07-15T00:15:00+00:00",
+        "source_identity": {"decision_record_id": "280390e3-180c-4247-8d82-56ab51f463cf"},
+    }
+    position = {"authority_class": "AUTHORITATIVE", "position": None, "lifecycle": None, "profitability": None}
+
+    captured: dict[str, object] = {}
+
+    class _Db:
+        async def scalar(self, _statement):
+            return paper_account
+
+    def _capture_preview(*, campaign, request, now):
+        captured["strategy_evidence"] = request.strategy_evidence
+        return SimpleNamespace(model_dump=lambda **_dump_kwargs: {"no_action": True, "preview": "stub"})
+
+    monkeypatch.setattr("app.services.capital_campaign_orchestration.authoritative._load_runtime_campaign", _async_return(runtime_campaign))
+    monkeypatch.setattr("app.services.capital_campaign_orchestration.authoritative._load_market_evidence", _async_return(({"authority_class": "AUTHORITATIVE", "reason": "market data resolved from canonical asset and candle tables", "freshness": "fresh", "close_price": "100"}, asset, candle)))
+    monkeypatch.setattr("app.services.capital_campaign_orchestration.authoritative._load_latest_strategy_evidence", _async_return((strategy, None)))
+    monkeypatch.setattr("app.services.capital_campaign_orchestration.authoritative._load_position_evidence", _async_return(position))
     monkeypatch.setattr(
         "app.services.capital_campaign_orchestration.authoritative.resolve_execution_risk_context",
         _async_return(
             SimpleNamespace(
-                account_equity=Decimal("500"),
-                start_of_day_equity=Decimal("500"),
-                current_equity=Decimal("500"),
-                max_position_size_pct=Decimal("1"),
+                account_equity=Decimal("1"),
+                start_of_day_equity=Decimal("1"),
+                current_equity=Decimal("1"),
+                max_position_size_pct=Decimal("0.10"),
                 max_daily_loss_pct=Decimal("0.03"),
-                high_water_mark_equity=Decimal("500"),
+                high_water_mark_equity=Decimal("1"),
                 max_drawdown_pct=Decimal("0.10"),
                 consecutive_losses_on_pair=0,
                 cooldown_after_losses=3,
@@ -786,16 +946,20 @@ async def test_authoritative_liquid_cash_cap_wins_over_campaign_and_equity(monke
             )
         ),
     )
-    monkeypatch.setattr("app.services.capital_campaign_orchestration.authoritative.evaluate_signal_risk", lambda **_kwargs: RiskEvaluationResult(action=RiskDecisionAction.APPROVE, reason_code=None, approved_quantity=Decimal("0.05"), steps=[]))
-    monkeypatch.setattr("app.services.capital_campaign_orchestration.authoritative.persist_risk_decision", _async_return(SimpleNamespace(risk_event_id=UUID("ffffffff-ffff-ffff-ffff-ffffffffffff"))))
-    monkeypatch.setattr("app.services.capital_campaign_orchestration.authoritative.build_campaign_preview", lambda **_kwargs: SimpleNamespace(model_dump=lambda **_dump_kwargs: {"no_action": False, "preview": "stub"}))
+    monkeypatch.setattr("app.services.capital_campaign_orchestration.authoritative.build_campaign_preview", _capture_preview)
 
-    result = await compose_campaign_authoritative_cycle(db=_Db(), campaign_definition=campaign, trigger="kraken_btc_15m_candle_close", candle=candle)
-    assert result.composition["selected_decision"]["decision_kind"] == "OPEN_POSITION_PROPOSED"
-    trace = result.composition["selected_decision"]["sizing_trace"]
-    assert trace["liquid_cash_cap"] == "23.7205"
-    assert trace["campaign_allocation"] == "5"
-    assert trace["runtime_available_authority"] == "500"
+    result = await compose_campaign_authoritative_cycle(
+        db=_Db(),
+        campaign_definition=campaign,
+        trigger="kraken_btc_15m_candle_close",
+        candle=candle,
+    )
+
+    assert result.composition["selected_decision"]["decision_kind"] == "HOLD"
+    assert result.composition["selected_decision"]["reason"] == "position_below_minimum_order_size"
+    strategy_inputs = captured["strategy_evidence"]
+    assert len(strategy_inputs) == 1
+    assert strategy_inputs[0].instrument == "BTC-USD"
 
 
 @pytest.mark.asyncio
