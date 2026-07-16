@@ -2090,6 +2090,7 @@ async def create_canonical_preview_package_bundle(
                 idempotency_key=idempotency_key,
             ),
         )
+        await db.commit()
     return payload
 
 
@@ -2134,7 +2135,7 @@ async def authorize_canonical_preview_package_bundle(
     idempotency_key: str,
 ) -> dict[str, Any]:
     async with AsyncSessionLocal() as db:
-        return await authorize_canonical_preview_package(
+        payload = await authorize_canonical_preview_package(
             db=db,
             request=CanonicalPreviewPackageAuthorizeRequest(
                 package_id=package_id,
@@ -2148,6 +2149,8 @@ async def authorize_canonical_preview_package_bundle(
                 idempotency_key=idempotency_key,
             ),
         )
+        await db.commit()
+        return payload
 
 
 async def dry_run_canonical_preview_package_bundle(
@@ -2158,7 +2161,7 @@ async def dry_run_canonical_preview_package_bundle(
     idempotency_token: str,
 ) -> dict[str, Any]:
     async with AsyncSessionLocal() as db:
-        return await run_dry_run_for_canonical_preview_package(
+        payload = await run_dry_run_for_canonical_preview_package(
             db=db,
             request=CanonicalPreviewPackageDryRunRequest(
                 package_id=package_id,
@@ -2167,6 +2170,8 @@ async def dry_run_canonical_preview_package_bundle(
                 idempotency_token=idempotency_token,
             ),
         )
+        await db.commit()
+        return payload
 
 
 async def activate_canonical_proving_campaign_bundle(
@@ -2183,7 +2188,7 @@ async def activate_canonical_proving_campaign_bundle(
         raise PermissionError("confirmation required for canonical proving activation")
 
     async with AsyncSessionLocal() as db:
-        return await activate_canonical_proving_campaign(
+        payload = await activate_canonical_proving_campaign(
             db=db,
             request=CanonicalPreviewPackageActivationRequest(
                 package_id=package_id,
@@ -2194,6 +2199,8 @@ async def activate_canonical_proving_campaign_bundle(
                 idempotency_key=idempotency_key,
             ),
         )
+        await db.commit()
+        return payload
 
 
 async def canonical_proving_activation_status(*, package_id: UUID) -> dict[str, Any]:
@@ -2203,7 +2210,7 @@ async def canonical_proving_activation_status(*, package_id: UUID) -> dict[str, 
 
 async def pause_canonical_proving_activation_bundle(*, package_id: UUID, actor: str, reason: str, idempotency_key: str) -> dict[str, Any]:
     async with AsyncSessionLocal() as db:
-        return await pause_canonical_proving_activation(
+        payload = await pause_canonical_proving_activation(
             db=db,
             request=CanonicalPreviewPackagePauseRequest(
                 package_id=package_id,
@@ -2212,11 +2219,13 @@ async def pause_canonical_proving_activation_bundle(*, package_id: UUID, actor: 
                 idempotency_key=idempotency_key,
             ),
         )
+        await db.commit()
+        return payload
 
 
 async def revoke_canonical_proving_activation_bundle(*, package_id: UUID, actor: str, reason: str, idempotency_key: str) -> dict[str, Any]:
     async with AsyncSessionLocal() as db:
-        return await revoke_canonical_proving_activation(
+        payload = await revoke_canonical_proving_activation(
             db=db,
             request=CanonicalPreviewPackageRevokeRequest(
                 package_id=package_id,
@@ -2225,6 +2234,8 @@ async def revoke_canonical_proving_activation_bundle(*, package_id: UUID, actor:
                 idempotency_key=idempotency_key,
             ),
         )
+        await db.commit()
+        return payload
 
 
 async def inspect_legacy_campaign_transition(

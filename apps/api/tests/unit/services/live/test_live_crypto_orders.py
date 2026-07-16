@@ -402,8 +402,11 @@ async def test_dry_run_never_calls_coinbase_create_order(monkeypatch: pytest.Mon
             live_crypto_confirmation_challenge_minutes=1,
         ),
     )
-    async def _approval_gate(**_kwargs):
-        return SimpleNamespace(allowed=True, reason=None)
+    async def _approval_gate(**kwargs):
+        checkpoint_type = kwargs.get("checkpoint_type")
+        if checkpoint_type == "bounded_proving_entry":
+            return SimpleNamespace(allowed=False, reason="approval_checkpoint_missing", matched_approval_event_id=None)
+        return SimpleNamespace(allowed=True, reason=None, matched_approval_event_id=uuid.uuid4())
 
     async def _submission_guard(**_kwargs):
         return SimpleNamespace(allowed=True, reason=None)
@@ -772,7 +775,10 @@ async def test_prepare_confirmation_allows_preview_one_second_before_expiration(
         ),
     )
     monkeypatch.setattr(service, "_utcnow", lambda: now)
-    async def _approval_gate(**_kwargs):
+    async def _approval_gate(**kwargs):
+        checkpoint_type = kwargs.get("checkpoint_type")
+        if checkpoint_type == "bounded_proving_entry":
+            return SimpleNamespace(allowed=False, reason="approval_checkpoint_missing", matched_approval_event_id=None)
         return SimpleNamespace(allowed=True, reason=None, matched_approval_event_id=uuid.uuid4())
 
     async def _submission_guard(**_kwargs):
@@ -1074,7 +1080,10 @@ async def test_prepare_confirmation_reuses_existing_live_order_for_repeated_requ
     )
     monkeypatch.setattr(service, "_utcnow", lambda: now)
 
-    async def _approval_gate(**_kwargs):
+    async def _approval_gate(**kwargs):
+        checkpoint_type = kwargs.get("checkpoint_type")
+        if checkpoint_type == "bounded_proving_entry":
+            return SimpleNamespace(allowed=False, reason="approval_checkpoint_missing", matched_approval_event_id=None)
         return SimpleNamespace(allowed=True, reason=None, matched_approval_event_id=uuid.uuid4())
 
     async def _submission_guard(**_kwargs):

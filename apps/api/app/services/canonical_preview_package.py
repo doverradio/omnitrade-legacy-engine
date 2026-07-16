@@ -11,6 +11,7 @@ from typing import Any
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.models.autonomous_cycle_run import AutonomousCycleRun
 from app.models.capital_campaign import CapitalCampaign
 from app.models.capital_campaign_definition import CapitalCampaignDefinition
 from app.models.audit_log import AuditLog
@@ -25,6 +26,7 @@ from app.models.parameter_set import ParameterSet
 from app.models.paper_account import PaperAccount
 from app.models.risk_event import RiskEvent
 from app.models.strategy import Strategy
+from app.services.capital_campaign_orchestration.service import run_campaign_orchestration_preview_for_candle
 from app.services.live.approval import record_live_approval_checkpoint
 from app.services.live.contracts import LiveApprovalCheckpointRequest
 
@@ -42,6 +44,20 @@ _PACKAGE_STATES = {
 }
 
 _ACTIVATION_STATES = {"ACTIVE", "PAUSED", "REVOKED", "EXPIRED", "INVALIDATED", "COMPLETED"}
+
+_EXECUTABLE_ACTIONS = {"OPEN_POSITION_PROPOSED", "CLOSE_POSITION_PROPOSED"}
+
+
+def _diagnostic(*, code: str, stage: str, detail: str | None = None) -> dict[str, str]:
+    payload = {"code": code, "stage": stage}
+    if detail:
+        payload["detail"] = detail
+    return payload
+
+
+def _preview_evidence_error(*, diagnostics: list[dict[str, str]]) -> LookupError:
+    compact = ",".join(item["code"] for item in diagnostics)
+    return LookupError(f"preview evidence incomplete: {compact}; diagnostics={json.dumps(diagnostics, sort_keys=True)}")
 
 
 @dataclass(frozen=True, slots=True)
@@ -189,8 +205,9 @@ async def _load_preview_for_package(
     *,
     db: AsyncSession,
     request: CanonicalPreviewPackageCreateRequest,
+    observed_after: datetime | None = None,
 ) -> CryptoOrderPreview | None:
-    result = await db.execute(
+    statement = (
         select(CryptoOrderPreview)
         .where(CryptoOrderPreview.provider == request.provider)
         .where(CryptoOrderPreview.environment == request.environment)
@@ -199,6 +216,9 @@ async def _load_preview_for_package(
         .order_by(CryptoOrderPreview.created_at.desc(), CryptoOrderPreview.crypto_order_preview_id.desc())
         .limit(1)
     )
+    if observed_after is not None:
+        statement = statement.where(CryptoOrderPreview.created_at >= observed_after)
+    result = await db.execute(statement)
     return result.scalars().first()
 
 
@@ -208,6 +228,10 @@ async def _load_decision_record(*, db: AsyncSession, decision_record_id: uuid.UU
 
 async def _load_risk_event(*, db: AsyncSession, risk_event_id: uuid.UUID) -> RiskEvent | None:
     return await db.scalar(select(RiskEvent).where(RiskEvent.id == risk_event_id).limit(1))
+
+
+async def _load_campaign_cycle(*, db: AsyncSession, cycle_id: uuid.UUID) -> AutonomousCycleRun | None:
+    return await db.scalar(select(AutonomousCycleRun).where(AutonomousCycleRun.cycle_id == cycle_id).limit(1))
 
 
 def _record_audit_entry(*, actor: str, action: str, entity_id: uuid.UUID, after_state: dict[str, Any]) -> AuditLog:
@@ -341,37 +365,153 @@ async def create_canonical_preview_package(
 
     profile = await _load_profile(db=db, live_trading_profile_id=request.live_trading_profile_id)
     if profile is None:
-        raise LookupError("live trading profile not found")
+        raise _preview_evidence_error(
+            diagnostics=[_diagnostic(code="canonical_live_trading_profile_missing", stage="profile_resolution")]
+        )
     if profile.paper_account_id != request.paper_account_id:
-        raise PermissionError("live trading profile paper account mismatch")
+        raise _preview_evidence_error(
+            diagnostics=[
+                _diagnostic(
+                    code="canonical_paper_account_missing",
+                    stage="profile_resolution",
+                    detail="live_trading_profile_paper_account_mismatch",
+                )
+            ]
+        )
 
     runtime_campaign = await _load_runtime_campaign(db=db, campaign_id=request.campaign_id)
     if runtime_campaign is None:
-        raise LookupError("capital campaign not found")
+        raise _preview_evidence_error(
+            diagnostics=[_diagnostic(code="canonical_runtime_campaign_missing", stage="campaign_resolution")]
+        )
 
     definition = await _load_campaign_definition(db=db, campaign_id=request.campaign_id, campaign_version=request.campaign_version)
     if definition is None:
-        raise LookupError("capital campaign definition not found")
+        raise _preview_evidence_error(
+            diagnostics=[_diagnostic(code="canonical_campaign_definition_missing", stage="campaign_resolution")]
+        )
 
-    preview = await _load_preview_for_package(db=db, request=request)
+    orchestration = await run_campaign_orchestration_preview_for_candle(
+        db=db,
+        campaign_id=request.campaign_id,
+        version=request.campaign_version,
+        allow_draft_preview=True,
+    )
+    cycles = orchestration.get("cycles") or []
+    if not cycles:
+        raise _preview_evidence_error(
+            diagnostics=[_diagnostic(code="canonical_orchestration_cycle_missing", stage="canonical_orchestration")]
+        )
+
+    latest_cycle_summary = cycles[-1]
+    cycle_id_raw = latest_cycle_summary.get("cycle_id")
+    if cycle_id_raw is None:
+        raise _preview_evidence_error(
+            diagnostics=[_diagnostic(code="canonical_orchestration_cycle_missing", stage="canonical_orchestration", detail="cycle_id_missing")]
+        )
+    cycle = await _load_campaign_cycle(db=db, cycle_id=uuid.UUID(str(cycle_id_raw)))
+    if cycle is None:
+        raise _preview_evidence_error(
+            diagnostics=[_diagnostic(code="canonical_orchestration_cycle_missing", stage="canonical_orchestration", detail="cycle_row_missing")]
+        )
+
+    cycle_context = cycle.cycle_context if isinstance(cycle.cycle_context, dict) else {}
+    composition = cycle_context.get("authoritative_composition") if isinstance(cycle_context.get("authoritative_composition"), dict) else {}
+    proposed_action = str(composition.get("proposed_action") or cycle.proposed_action or "").strip().upper()
+    selected_decision = composition.get("selected_decision") if isinstance(composition.get("selected_decision"), dict) else {}
+    decision_kind = str(selected_decision.get("decision_kind") or "").strip().upper()
+
+    if cycle.failure_reason == "runtime_campaign_or_paper_account_unavailable":
+        diagnostics = [
+            _diagnostic(code="canonical_runtime_campaign_missing", stage="canonical_orchestration"),
+            _diagnostic(code="canonical_paper_account_missing", stage="canonical_orchestration"),
+        ]
+        raise _preview_evidence_error(diagnostics=diagnostics)
+
+    if cycle.termination_stage == "hold_terminal" or proposed_action == "NO_ACTION" or decision_kind == "NO_ACTION":
+        hold_reason = str(selected_decision.get("reason") or cycle.failure_reason or "no_executable_opportunity")
+        return {
+            "idempotent": False,
+            "outcome_code": "HOLD_NO_PACKAGE_CREATED",
+            "reason_code": "canonical_action_hold",
+            "reason_detail": hold_reason,
+            "stage": "canonical_orchestration",
+            "package": None,
+            "campaign_cycle": {
+                "cycle_id": str(cycle.cycle_id),
+                "state": cycle.state,
+                "termination_stage": cycle.termination_stage,
+                "failure_reason": cycle.failure_reason,
+            },
+            "diagnostics": [
+                _diagnostic(code="canonical_action_hold", stage="canonical_orchestration", detail=hold_reason),
+            ],
+        }
+
+    if proposed_action and proposed_action not in _EXECUTABLE_ACTIONS:
+        raise _preview_evidence_error(
+            diagnostics=[
+                _diagnostic(
+                    code="canonical_action_not_executable",
+                    stage="canonical_orchestration",
+                    detail=f"proposed_action={proposed_action}",
+                )
+            ]
+        )
+
+    preview = await _load_preview_for_package(db=db, request=request, observed_after=cycle.started_at)
     if preview is None:
-        raise LookupError("crypto order preview not found for package scope")
+        raise _preview_evidence_error(
+            diagnostics=[_diagnostic(code="canonical_crypto_order_preview_id_missing", stage="preview_resolution")]
+        )
 
-    if preview.decision_record_id is None or preview.risk_event_id is None or preview.strategy_id is None:
-        raise LookupError("preview evidence incomplete")
+    diagnostics: list[dict[str, str]] = []
+    if preview.decision_record_id is None:
+        diagnostics.append(_diagnostic(code="canonical_decision_record_id_missing", stage="preview_resolution"))
+    if preview.risk_event_id is None:
+        diagnostics.append(_diagnostic(code="canonical_risk_event_id_missing", stage="preview_resolution"))
+    if preview.strategy_id is None:
+        diagnostics.append(_diagnostic(code="canonical_strategy_id_missing", stage="preview_resolution"))
+    if preview.parameter_set_id is None:
+        diagnostics.append(_diagnostic(code="canonical_parameter_set_id_missing", stage="preview_resolution"))
+    if preview.expires_at is None:
+        diagnostics.append(_diagnostic(code="canonical_preview_expiration_missing", stage="preview_resolution"))
+    elif preview.expires_at <= _utcnow():
+        diagnostics.append(_diagnostic(code="canonical_price_evidence_stale", stage="preview_resolution"))
+    if preview.created_at is None:
+        diagnostics.append(_diagnostic(code="canonical_price_evidence_missing", stage="preview_resolution"))
+    if preview.requested_amount is None:
+        diagnostics.append(_diagnostic(code="canonical_risk_approved_amount_missing", stage="preview_resolution"))
+    if not str(preview.provider or "").strip() or not str(preview.environment or "").strip():
+        diagnostics.append(_diagnostic(code="canonical_provider_identity_missing", stage="preview_resolution"))
+    if not str(preview.product_id or "").strip():
+        diagnostics.append(_diagnostic(code="canonical_asset_identity_missing", stage="preview_resolution"))
+    if diagnostics:
+        raise _preview_evidence_error(diagnostics=diagnostics)
 
     decision = await _load_decision_record(db=db, decision_record_id=preview.decision_record_id)
     if decision is None:
-        raise LookupError("decision record not found")
+        raise _preview_evidence_error(
+            diagnostics=[_diagnostic(code="canonical_decision_record_id_missing", stage="decision_resolution")]
+        )
 
     risk_event = await _load_risk_event(db=db, risk_event_id=preview.risk_event_id)
     if risk_event is None:
-        raise LookupError("risk event not found")
+        raise _preview_evidence_error(
+            diagnostics=[_diagnostic(code="canonical_risk_event_id_missing", stage="risk_resolution")]
+        )
 
     strategy = await db.scalar(select(Strategy).where(Strategy.id == preview.strategy_id).limit(1))
     parameter_set = await db.scalar(select(ParameterSet).where(ParameterSet.id == preview.parameter_set_id).limit(1)) if preview.parameter_set_id is not None else None
     if strategy is None or parameter_set is None:
-        raise LookupError("strategy or parameter set not found")
+        diagnostics = []
+        if strategy is None:
+            diagnostics.append(_diagnostic(code="canonical_strategy_id_missing", stage="strategy_resolution"))
+            diagnostics.append(_diagnostic(code="canonical_strategy_version_missing", stage="strategy_resolution"))
+        if parameter_set is None:
+            diagnostics.append(_diagnostic(code="canonical_parameter_set_id_missing", stage="strategy_resolution"))
+            diagnostics.append(_diagnostic(code="canonical_parameter_set_version_missing", stage="strategy_resolution"))
+        raise _preview_evidence_error(diagnostics=diagnostics)
 
     package = CanonicalPreviewPackage(
         campaign_id=definition.campaign_id,

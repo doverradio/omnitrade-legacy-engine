@@ -249,7 +249,10 @@ def _risk_unavailable(**_kwargs):
 
 
 def _patch_common_success(monkeypatch: pytest.MonkeyPatch) -> None:
-    async def _approval_gate(**_kwargs):
+    async def _approval_gate(**kwargs):
+        checkpoint_type = kwargs.get("checkpoint_type")
+        if checkpoint_type == "bounded_proving_entry":
+            return SimpleNamespace(allowed=False, reason="approval_checkpoint_missing", matched_approval_event_id=None)
         return SimpleNamespace(allowed=True, reason=None, matched_approval_event_id=_APPROVAL_EVENT_ID)
 
     async def _submission_guard(**_kwargs):
