@@ -324,6 +324,62 @@ def test_parse_canonical_paper_cash_causality_audit_rejects_malformed_uuid() -> 
         ])
 
 
+def test_parse_canonical_proving_account_transition_commands() -> None:
+    preview = parse_args([
+        "canonical-proving-account-transition-preview",
+        "--campaign-id",
+        "e9a9e8e9-9574-498d-b49e-f011218c7f2b",
+        "--campaign-version",
+        "1",
+        "--runtime-campaign-id",
+        "2",
+        "--old-paper-account-id",
+        "905a408c-7d8e-4fc7-ad3b-9ff637005d73",
+        "--live-trading-profile-id",
+        "9da09ae9-475e-41e8-b2c2-717ba5acfa3d",
+        "--provider",
+        "kraken_spot",
+        "--environment",
+        "production",
+        "--product",
+        "BTC-USD",
+        "--actor",
+        "operator:human",
+        "--json",
+    ])
+    assert preview.command == "canonical-proving-account-transition-preview"
+    assert preview.runtime_campaign_id == 2
+
+    execute = parse_args([
+        "canonical-proving-account-transition-execute",
+        "--campaign-id",
+        "e9a9e8e9-9574-498d-b49e-f011218c7f2b",
+        "--campaign-version",
+        "1",
+        "--runtime-campaign-id",
+        "2",
+        "--old-paper-account-id",
+        "905a408c-7d8e-4fc7-ad3b-9ff637005d73",
+        "--live-trading-profile-id",
+        "9da09ae9-475e-41e8-b2c2-717ba5acfa3d",
+        "--provider",
+        "kraken_spot",
+        "--environment",
+        "production",
+        "--product",
+        "BTC-USD",
+        "--actor",
+        "operator:human",
+        "--idempotency-key",
+        "transition-1",
+        "--confirm",
+        "--json",
+    ])
+    assert execute.command == "canonical-proving-account-transition-execute"
+    assert execute.idempotency_key == "transition-1"
+    assert execute.confirm is True
+
+
 def test_parse_canonical_campaign_authority_audit_rejects_malformed_uuid() -> None:
     with pytest.raises(SystemExit):
         parse_args([
@@ -415,6 +471,83 @@ async def test_run_async_routes_canonical_paper_cash_causality_audit(monkeypatch
     assert code == 0
     assert payload["ok"] is True
     assert "canonical-paper-cash-causality-audit" in text
+
+
+@pytest.mark.asyncio
+async def test_run_async_routes_canonical_proving_account_transition_preview(monkeypatch: pytest.MonkeyPatch) -> None:
+    args = parse_args([
+        "canonical-proving-account-transition-preview",
+        "--campaign-id",
+        "e9a9e8e9-9574-498d-b49e-f011218c7f2b",
+        "--campaign-version",
+        "1",
+        "--runtime-campaign-id",
+        "2",
+        "--old-paper-account-id",
+        "905a408c-7d8e-4fc7-ad3b-9ff637005d73",
+        "--live-trading-profile-id",
+        "9da09ae9-475e-41e8-b2c2-717ba5acfa3d",
+        "--provider",
+        "kraken_spot",
+        "--environment",
+        "production",
+        "--product",
+        "BTC-USD",
+        "--actor",
+        "operator:human",
+        "--json",
+    ])
+
+    async def _fake_preview(**kwargs):
+        assert kwargs["runtime_campaign_id"] == 2
+        return {"ok": True, "command": "canonical-proving-account-transition-preview"}
+
+    monkeypatch.setattr(operator_main, "canonical_proving_account_transition_preview", _fake_preview)
+    code, payload, text = await operator_main._run_async(args)
+
+    assert code == 0
+    assert payload["ok"] is True
+    assert "canonical-proving-account-transition-preview" in text
+
+
+@pytest.mark.asyncio
+async def test_run_async_routes_canonical_proving_account_transition_execute(monkeypatch: pytest.MonkeyPatch) -> None:
+    args = parse_args([
+        "canonical-proving-account-transition-execute",
+        "--campaign-id",
+        "e9a9e8e9-9574-498d-b49e-f011218c7f2b",
+        "--campaign-version",
+        "1",
+        "--runtime-campaign-id",
+        "2",
+        "--old-paper-account-id",
+        "905a408c-7d8e-4fc7-ad3b-9ff637005d73",
+        "--live-trading-profile-id",
+        "9da09ae9-475e-41e8-b2c2-717ba5acfa3d",
+        "--provider",
+        "kraken_spot",
+        "--environment",
+        "production",
+        "--product",
+        "BTC-USD",
+        "--actor",
+        "operator:human",
+        "--idempotency-key",
+        "transition-1",
+        "--confirm",
+        "--json",
+    ])
+
+    async def _fake_execute(**kwargs):
+        assert kwargs["idempotency_key"] == "transition-1"
+        return {"ok": True, "command": "canonical-proving-account-transition-execute"}
+
+    monkeypatch.setattr(operator_main, "canonical_proving_account_transition_execute", _fake_execute)
+    code, payload, text = await operator_main._run_async(args)
+
+    assert code == 0
+    assert payload["ok"] is True
+    assert "canonical-proving-account-transition-execute" in text
 
 
 def test_parse_rejects_nonexistent_canonical_campaign_binding_status_command() -> None:

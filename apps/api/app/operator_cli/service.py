@@ -36,9 +36,12 @@ from app.models.strategy_roster_proposal_outcome import StrategyRosterProposalOu
 from app.models.strategy_roster_run import StrategyRosterRun
 from app.services.autonomous_cycle import AutonomousCycleRequest, run_autonomous_preview_cycle
 from app.services.canonical_campaign_binding import (
+    CanonicalProvingAccountTransitionRequest,
     CanonicalCampaignBindingRequest,
     LegacyCampaignTransitionRequest,
     bind_canonical_campaign_runtime as _bind_canonical_campaign_runtime,
+    inspect_canonical_proving_account_transition as _inspect_canonical_proving_account_transition,
+    transition_canonical_proving_account as _transition_canonical_proving_account,
     fetch_legacy_campaign_transition_audit as _fetch_legacy_campaign_transition_audit,
     fetch_canonical_campaign_binding_audit as _fetch_canonical_campaign_binding_audit,
     inspect_canonical_campaign_binding as _inspect_canonical_campaign_binding,
@@ -2428,3 +2431,91 @@ async def rollback_legacy_campaign_transition(
 async def fetch_legacy_campaign_transition_audit(*, legacy_campaign_id: UUID, limit: int = 20) -> dict[str, Any]:
     async with AsyncSessionLocal() as db:
         return await _fetch_legacy_campaign_transition_audit(db=db, legacy_campaign_id=legacy_campaign_id, limit=limit)
+
+
+async def canonical_proving_account_transition_preview(
+    *,
+    campaign_id: UUID,
+    campaign_version: int,
+    runtime_campaign_id: int,
+    old_paper_account_id: UUID,
+    live_trading_profile_id: UUID,
+    provider: str,
+    environment: str,
+    product_id: str,
+    actor: str,
+    confirm: bool,
+) -> dict[str, Any]:
+    async with AsyncSessionLocal() as db:
+        result = await _inspect_canonical_proving_account_transition(
+            db=db,
+            request=CanonicalProvingAccountTransitionRequest(
+                campaign_id=campaign_id,
+                campaign_version=campaign_version,
+                runtime_campaign_id=runtime_campaign_id,
+                old_paper_account_id=old_paper_account_id,
+                live_trading_profile_id=live_trading_profile_id,
+                provider=provider,
+                environment=environment,
+                product_id=product_id,
+                actor=actor,
+                confirm=confirm,
+                idempotency_key=None,
+            ),
+        )
+    return {
+        "ready": result.ready,
+        "blockers": result.blockers,
+        "checks": [{"code": item.code, "passed": item.passed, "detail": item.detail} for item in result.checks],
+        "snapshot": result.snapshot,
+    }
+
+
+async def canonical_proving_account_transition_execute(
+    *,
+    campaign_id: UUID,
+    campaign_version: int,
+    runtime_campaign_id: int,
+    old_paper_account_id: UUID,
+    live_trading_profile_id: UUID,
+    provider: str,
+    environment: str,
+    product_id: str,
+    actor: str,
+    confirm: bool,
+    idempotency_key: str,
+    expected_evidence_source_id: str | None = None,
+    expected_evidence_observed_at: str | None = None,
+) -> dict[str, Any]:
+    async with AsyncSessionLocal() as db:
+        result = await _transition_canonical_proving_account(
+            db=db,
+            request=CanonicalProvingAccountTransitionRequest(
+                campaign_id=campaign_id,
+                campaign_version=campaign_version,
+                runtime_campaign_id=runtime_campaign_id,
+                old_paper_account_id=old_paper_account_id,
+                live_trading_profile_id=live_trading_profile_id,
+                provider=provider,
+                environment=environment,
+                product_id=product_id,
+                actor=actor,
+                confirm=confirm,
+                idempotency_key=idempotency_key,
+                expected_evidence_source_id=expected_evidence_source_id,
+                expected_evidence_observed_at=expected_evidence_observed_at,
+            ),
+        )
+    return {
+        "changed": result.changed,
+        "idempotent": result.idempotent,
+        "audit_created": result.audit_created,
+        "before": result.before,
+        "after": result.after,
+        "readiness": {
+            "ready": result.readiness.ready,
+            "blockers": result.readiness.blockers,
+            "checks": [{"code": item.code, "passed": item.passed, "detail": item.detail} for item in result.readiness.checks],
+            "snapshot": result.readiness.snapshot,
+        },
+    }

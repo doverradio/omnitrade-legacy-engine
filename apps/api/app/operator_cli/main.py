@@ -27,6 +27,8 @@ from app.operator_cli.service import (
     authorize_canonical_preview_package_bundle,
     canonical_campaign_authority_audit,
     canonical_paper_cash_causality_audit,
+    canonical_proving_account_transition_execute,
+    canonical_proving_account_transition_preview,
     canonical_preview_package_history,
     canonical_preview_package_readiness,
     canonical_proving_activation_status,
@@ -92,6 +94,8 @@ def _build_parser() -> argparse.ArgumentParser:
             "  ./operator canonical-campaign-bind --campaign-id <campaign_uuid> --campaign-version 1 --paper-account-id <paper_uuid> --live-trading-profile-id <profile_uuid> --provider kraken_spot --environment production --product BTC-USD --actor operator:human --confirm --json\n"
             "  ./operator canonical-campaign-authority-audit --campaign-id <campaign_uuid> --campaign-version 1 --cycle-id <cycle_uuid> --paper-account-id <paper_uuid> --live-trading-profile-id <profile_uuid> --provider kraken_spot --environment production --product BTC-USD --json\n"
             "  ./operator canonical-paper-cash-causality-audit --campaign-id <campaign_uuid> --campaign-version 1 --runtime-campaign-id <runtime_id> --paper-account-id <paper_uuid> --live-trading-profile-id <profile_uuid> --provider kraken_spot --environment production --product BTC-USD --json\n"
+            "  ./operator canonical-proving-account-transition-preview --campaign-id <campaign_uuid> --campaign-version 1 --runtime-campaign-id 2 --old-paper-account-id <paper_uuid> --live-trading-profile-id <profile_uuid> --provider kraken_spot --environment production --product BTC-USD --actor operator:human --json\n"
+            "  ./operator canonical-proving-account-transition-execute --campaign-id <campaign_uuid> --campaign-version 1 --runtime-campaign-id 2 --old-paper-account-id <paper_uuid> --live-trading-profile-id <profile_uuid> --provider kraken_spot --environment production --product BTC-USD --actor operator:human --idempotency-key prove-acct-1 --confirm --json\n"
             "  ./operator legacy-campaign-transition-readiness --legacy-campaign-id <legacy_uuid> --canonical-campaign-id <canonical_uuid> --canonical-campaign-version 1 --paper-account-id <paper_uuid> --live-trading-profile-id <profile_uuid> --provider kraken_spot --environment production --product BTC-USD --json\n"
             "  ./operator legacy-campaign-transition-execute --legacy-campaign-id <legacy_uuid> --canonical-campaign-id <canonical_uuid> --canonical-campaign-version 1 --paper-account-id <paper_uuid> --live-trading-profile-id <profile_uuid> --provider kraken_spot --environment production --product BTC-USD --actor operator:human --confirm --json\n"
             "  ./operator legacy-campaign-transition-audit --legacy-campaign-id <legacy_uuid> --json\n"
@@ -338,6 +342,45 @@ def _build_parser() -> argparse.ArgumentParser:
     paper_cash_causality.add_argument("--environment", type=str, required=True)
     paper_cash_causality.add_argument("--product", type=str, required=True)
     paper_cash_causality.add_argument("--json", action="store_true", dest="json_output")
+
+    proving_account_preview = subparsers.add_parser(
+        "canonical-proving-account-transition-preview",
+        parents=[common],
+        help="Read-only preview for dedicated canonical proving paper-account transition",
+        description="Read-only preview for dedicated canonical proving account transition.",
+    )
+    proving_account_preview.add_argument("--campaign-id", type=UUID, required=True)
+    proving_account_preview.add_argument("--campaign-version", type=int, required=True)
+    proving_account_preview.add_argument("--runtime-campaign-id", type=int, required=True)
+    proving_account_preview.add_argument("--old-paper-account-id", type=UUID, required=True)
+    proving_account_preview.add_argument("--live-trading-profile-id", type=UUID, required=True)
+    proving_account_preview.add_argument("--provider", type=str, required=True)
+    proving_account_preview.add_argument("--environment", type=str, required=True)
+    proving_account_preview.add_argument("--product", type=str, required=True)
+    proving_account_preview.add_argument("--actor", type=str, required=True)
+    proving_account_preview.add_argument("--confirm", action="store_true")
+    proving_account_preview.add_argument("--json", action="store_true", dest="json_output")
+
+    proving_account_execute = subparsers.add_parser(
+        "canonical-proving-account-transition-execute",
+        parents=[common],
+        help="Execute dedicated canonical proving paper-account transition",
+        description="Operator-confirmed dedicated canonical proving account transition.",
+    )
+    proving_account_execute.add_argument("--campaign-id", type=UUID, required=True)
+    proving_account_execute.add_argument("--campaign-version", type=int, required=True)
+    proving_account_execute.add_argument("--runtime-campaign-id", type=int, required=True)
+    proving_account_execute.add_argument("--old-paper-account-id", type=UUID, required=True)
+    proving_account_execute.add_argument("--live-trading-profile-id", type=UUID, required=True)
+    proving_account_execute.add_argument("--provider", type=str, required=True)
+    proving_account_execute.add_argument("--environment", type=str, required=True)
+    proving_account_execute.add_argument("--product", type=str, required=True)
+    proving_account_execute.add_argument("--actor", type=str, required=True)
+    proving_account_execute.add_argument("--idempotency-key", type=str, required=True)
+    proving_account_execute.add_argument("--expected-evidence-source-id", type=str, default=None)
+    proving_account_execute.add_argument("--expected-evidence-observed-at", type=str, default=None)
+    proving_account_execute.add_argument("--confirm", action="store_true")
+    proving_account_execute.add_argument("--json", action="store_true", dest="json_output")
 
     legacy_transition_readiness = subparsers.add_parser(
         "legacy-campaign-transition-readiness",
@@ -883,6 +926,39 @@ async def _run_async(args: argparse.Namespace) -> tuple[int, dict[str, Any], str
             provider=args.provider,
             environment=args.environment,
             product_id=args.product,
+        )
+        return 0, payload, render_json(payload)
+
+    if args.command == "canonical-proving-account-transition-preview":
+        payload = await canonical_proving_account_transition_preview(
+            campaign_id=args.campaign_id,
+            campaign_version=args.campaign_version,
+            runtime_campaign_id=args.runtime_campaign_id,
+            old_paper_account_id=args.old_paper_account_id,
+            live_trading_profile_id=args.live_trading_profile_id,
+            provider=args.provider,
+            environment=args.environment,
+            product_id=args.product,
+            actor=args.actor,
+            confirm=bool(args.confirm),
+        )
+        return 0, payload, render_json(payload)
+
+    if args.command == "canonical-proving-account-transition-execute":
+        payload = await canonical_proving_account_transition_execute(
+            campaign_id=args.campaign_id,
+            campaign_version=args.campaign_version,
+            runtime_campaign_id=args.runtime_campaign_id,
+            old_paper_account_id=args.old_paper_account_id,
+            live_trading_profile_id=args.live_trading_profile_id,
+            provider=args.provider,
+            environment=args.environment,
+            product_id=args.product,
+            actor=args.actor,
+            confirm=bool(args.confirm),
+            idempotency_key=args.idempotency_key,
+            expected_evidence_source_id=args.expected_evidence_source_id,
+            expected_evidence_observed_at=args.expected_evidence_observed_at,
         )
         return 0, payload, render_json(payload)
 

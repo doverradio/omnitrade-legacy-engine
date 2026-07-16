@@ -84,6 +84,10 @@ class Settings(BaseSettings):
         default=60,
         validation_alias="LIVE_CRYPTO_READINESS_MAX_AGE_SECONDS",
     )
+    canonical_proving_provider_evidence_max_age_seconds: int = Field(
+        default=120,
+        validation_alias="CANONICAL_PROVING_PROVIDER_EVIDENCE_MAX_AGE_SECONDS",
+    )
     live_crypto_price_max_age_seconds: int = Field(
         default=30,
         validation_alias="LIVE_CRYPTO_PRICE_MAX_AGE_SECONDS",
