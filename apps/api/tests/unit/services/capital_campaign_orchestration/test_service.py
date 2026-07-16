@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from decimal import Decimal
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 from uuid import UUID
 
@@ -1061,3 +1061,131 @@ async def test_latest_strategy_evidence_conflicting_generated_signals_fail_close
 
     assert evidence is None
     assert reason == "strategy_identity_incoherent"
+
+
+@pytest.mark.asyncio
+async def test_market_evidence_15m_freshness_boundaries(monkeypatch: pytest.MonkeyPatch) -> None:
+    from app.services.capital_campaign_orchestration.authoritative import _load_market_evidence
+
+    asset = SimpleNamespace(id=UUID("eeeeeeee-eeee-eeee-eeee-eeeeeeeeeeee"), symbol="BTC", exchange="kraken_spot", base_currency="USD", asset_class="crypto", is_active=True)
+    close_time = datetime(2026, 7, 16, 16, 30, tzinfo=timezone.utc)
+    candle = SimpleNamespace(id=101, interval="15m", close=Decimal("100"), close_time=close_time, open_time=close_time.replace(minute=15))
+
+    class _Result:
+        def __init__(self, rows):
+            self._rows = rows
+
+        def scalars(self):
+            return SimpleNamespace(all=lambda: list(self._rows))
+
+    class _Db:
+        async def execute(self, _statement):
+            return _Result([asset])
+
+    async def _load_closed(**_kwargs):
+        return candle
+
+    monkeypatch.setattr("app.services.capital_campaign_orchestration.authoritative._load_latest_closed_candle", _load_closed)
+
+    payload_15, _, _ = await _load_market_evidence(db=_Db(), symbol="BTC-USD", exchange="kraken_spot", candle_interval="15m", now=close_time + timedelta(minutes=15))
+    assert payload_15["freshness_verdict"] == "fresh"
+
+    payload_18, _, _ = await _load_market_evidence(db=_Db(), symbol="BTC-USD", exchange="kraken_spot", candle_interval="15m", now=close_time + timedelta(minutes=18))
+    assert payload_18["freshness_verdict"] == "fresh"
+
+    payload_20, _, _ = await _load_market_evidence(db=_Db(), symbol="BTC-USD", exchange="kraken_spot", candle_interval="15m", now=close_time + timedelta(minutes=20))
+    assert payload_20["freshness_verdict"] == "fresh"
+    assert payload_20["maximum_age_minutes"] == 20
+
+    payload_21, _, _ = await _load_market_evidence(db=_Db(), symbol="BTC-USD", exchange="kraken_spot", candle_interval="15m", now=close_time + timedelta(minutes=20, seconds=1))
+    assert payload_21["reason"] == "stale_market_data"
+    assert payload_21["freshness_verdict"] == "stale"
+
+
+@pytest.mark.asyncio
+async def test_market_evidence_future_candle_fails_closed(monkeypatch: pytest.MonkeyPatch) -> None:
+    from app.services.capital_campaign_orchestration.authoritative import _load_market_evidence
+
+    asset = SimpleNamespace(id=UUID("eeeeeeee-eeee-eeee-eeee-eeeeeeeeeeee"), symbol="BTC", exchange="kraken_spot", base_currency="USD", asset_class="crypto", is_active=True)
+    now = datetime(2026, 7, 16, 16, 48, tzinfo=timezone.utc)
+    candle = SimpleNamespace(id=102, interval="15m", close=Decimal("100"), close_time=now + timedelta(minutes=1), open_time=now)
+
+    class _Result:
+        def __init__(self, rows):
+            self._rows = rows
+
+        def scalars(self):
+            return SimpleNamespace(all=lambda: list(self._rows))
+
+    class _Db:
+        async def execute(self, _statement):
+            return _Result([asset])
+
+    async def _load_closed(**_kwargs):
+        return candle
+
+    monkeypatch.setattr("app.services.capital_campaign_orchestration.authoritative._load_latest_closed_candle", _load_closed)
+
+    payload, _, _ = await _load_market_evidence(db=_Db(), symbol="BTC-USD", exchange="kraken_spot", candle_interval="15m", now=now)
+    assert payload["reason"] == "stale_market_data"
+    assert payload["freshness_verdict"] == "fail_closed_future_timestamp"
+
+
+@pytest.mark.asyncio
+async def test_market_evidence_incomplete_current_candle_rejected(monkeypatch: pytest.MonkeyPatch) -> None:
+    from app.services.capital_campaign_orchestration.authoritative import _load_market_evidence
+
+    asset = SimpleNamespace(id=UUID("eeeeeeee-eeee-eeee-eeee-eeeeeeeeeeee"), symbol="BTC", exchange="kraken_spot", base_currency="USD", asset_class="crypto", is_active=True)
+    now = datetime(2026, 7, 16, 16, 48, tzinfo=timezone.utc)
+
+    class _Result:
+        def __init__(self, rows):
+            self._rows = rows
+
+        def scalars(self):
+            return SimpleNamespace(all=lambda: list(self._rows))
+
+    class _Db:
+        async def execute(self, _statement):
+            return _Result([asset])
+
+    async def _no_closed(**_kwargs):
+        return None
+
+    monkeypatch.setattr("app.services.capital_campaign_orchestration.authoritative._load_latest_closed_candle", _no_closed)
+
+    payload, _, candle = await _load_market_evidence(db=_Db(), symbol="BTC-USD", exchange="kraken_spot", candle_interval="15m", now=now)
+    assert candle is None
+    assert payload["reason"] == "market_data_unavailable"
+
+
+@pytest.mark.asyncio
+async def test_market_evidence_unrelated_interval_uses_safe_rule(monkeypatch: pytest.MonkeyPatch) -> None:
+    from app.services.capital_campaign_orchestration.authoritative import _load_market_evidence
+
+    asset = SimpleNamespace(id=UUID("eeeeeeee-eeee-eeee-eeee-eeeeeeeeeeee"), symbol="BTC", exchange="kraken_spot", base_currency="USD", asset_class="crypto", is_active=True)
+    close_time = datetime(2026, 7, 16, 16, 0, tzinfo=timezone.utc)
+    candle = SimpleNamespace(id=103, interval="1m", close=Decimal("100"), close_time=close_time, open_time=close_time - timedelta(minutes=1))
+
+    class _Result:
+        def __init__(self, rows):
+            self._rows = rows
+
+        def scalars(self):
+            return SimpleNamespace(all=lambda: list(self._rows))
+
+    class _Db:
+        async def execute(self, _statement):
+            return _Result([asset])
+
+    async def _load_closed(**_kwargs):
+        return candle
+
+    monkeypatch.setattr("app.services.capital_campaign_orchestration.authoritative._load_latest_closed_candle", _load_closed)
+
+    payload_fresh, _, _ = await _load_market_evidence(db=_Db(), symbol="BTC-USD", exchange="kraken_spot", candle_interval="1m", now=close_time + timedelta(minutes=1))
+    assert payload_fresh["freshness_verdict"] == "fresh"
+
+    payload_stale, _, _ = await _load_market_evidence(db=_Db(), symbol="BTC-USD", exchange="kraken_spot", candle_interval="1m", now=close_time + timedelta(minutes=2, seconds=1))
+    assert payload_stale["reason"] == "stale_market_data"
+    assert payload_stale["freshness_verdict"] == "stale"

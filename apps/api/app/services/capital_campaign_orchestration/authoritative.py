@@ -50,7 +50,26 @@ class CampaignAuthoritativeCycleResult:
     preview: Any | None
 
 
-_SUPPORTED_FRESHNESS_MINUTES = 15
+_DEFAULT_INGESTION_GRACE_MINUTES = 5
+_INTERVAL_INGESTION_GRACE_MINUTES = {
+    "15m": _DEFAULT_INGESTION_GRACE_MINUTES,
+}
+
+
+def _interval_minutes(interval: str | None) -> int | None:
+    value = str(interval or "").strip().lower()
+    if not value:
+        return None
+    if value.endswith("m"):
+        raw = value[:-1]
+        return int(raw) if raw.isdigit() and int(raw) > 0 else None
+    if value.endswith("h"):
+        raw = value[:-1]
+        return int(raw) * 60 if raw.isdigit() and int(raw) > 0 else None
+    if value.endswith("d"):
+        raw = value[:-1]
+        return int(raw) * 1440 if raw.isdigit() and int(raw) > 0 else None
+    return None
 
 
 def _normalize_symbol(value: str) -> str:
@@ -636,17 +655,48 @@ async def _load_market_evidence(
             None,
         )
 
-    freshness_seconds = int((now - candle.close_time.astimezone(timezone.utc)).total_seconds())
-    if freshness_seconds < 0:
-        freshness_seconds = abs(freshness_seconds)
+    close_time_utc = candle.close_time.astimezone(timezone.utc)
+    freshness_seconds = int((now - close_time_utc).total_seconds())
     freshness_minutes = freshness_seconds // 60
-    if freshness_minutes > _SUPPORTED_FRESHNESS_MINUTES:
+    candle_interval_minutes = _interval_minutes(candle.interval)
+    ingestion_grace_minutes = _INTERVAL_INGESTION_GRACE_MINUTES.get(str(candle.interval or "").strip().lower(), 0)
+    if candle_interval_minutes is None:
+        return (
+            {
+                "authority_class": "UNAVAILABLE",
+                "source_type": "candle_table",
+                "source_identity": {"asset_id": str(asset.id), "candle_id": candle.id, "interval": candle.interval},
+                "observed_at": close_time_utc.isoformat(),
+                "freshness": "unavailable",
+                "availability": "unavailable",
+                "reason": "stale_market_data",
+                "asset_id": str(asset.id),
+                "provider": asset.exchange,
+                "product": symbol,
+                "latest_closed_candle_id": candle.id,
+                "interval": candle.interval,
+                "close_price": format(Decimal(candle.close), "f"),
+                "close_timestamp": close_time_utc.isoformat(),
+                "evaluation_timestamp": now.isoformat(),
+                "freshness_seconds": freshness_seconds,
+                "freshness_minutes": freshness_minutes,
+                "candle_interval_minutes": None,
+                "ingestion_grace_minutes": None,
+                "maximum_age_minutes": None,
+                "freshness_verdict": "fail_closed_interval_unparseable",
+            },
+            asset,
+            candle,
+        )
+
+    maximum_age_minutes = candle_interval_minutes + ingestion_grace_minutes
+    if freshness_seconds < 0:
         return (
             {
                 "authority_class": "STALE",
                 "source_type": "candle_table",
                 "source_identity": {"asset_id": str(asset.id), "candle_id": candle.id, "interval": candle.interval},
-                "observed_at": candle.close_time.astimezone(timezone.utc).isoformat(),
+                "observed_at": close_time_utc.isoformat(),
                 "freshness": "stale",
                 "availability": "available",
                 "reason": "stale_market_data",
@@ -656,9 +706,43 @@ async def _load_market_evidence(
                 "latest_closed_candle_id": candle.id,
                 "interval": candle.interval,
                 "close_price": format(Decimal(candle.close), "f"),
-                "close_timestamp": candle.close_time.astimezone(timezone.utc).isoformat(),
+                "close_timestamp": close_time_utc.isoformat(),
+                "evaluation_timestamp": now.isoformat(),
                 "freshness_seconds": freshness_seconds,
                 "freshness_minutes": freshness_minutes,
+                "candle_interval_minutes": candle_interval_minutes,
+                "ingestion_grace_minutes": ingestion_grace_minutes,
+                "maximum_age_minutes": maximum_age_minutes,
+                "freshness_verdict": "fail_closed_future_timestamp",
+            },
+            asset,
+            candle,
+        )
+
+    if freshness_seconds > (maximum_age_minutes * 60):
+        return (
+            {
+                "authority_class": "STALE",
+                "source_type": "candle_table",
+                "source_identity": {"asset_id": str(asset.id), "candle_id": candle.id, "interval": candle.interval},
+                "observed_at": close_time_utc.isoformat(),
+                "freshness": "stale",
+                "availability": "available",
+                "reason": "stale_market_data",
+                "asset_id": str(asset.id),
+                "provider": asset.exchange,
+                "product": symbol,
+                "latest_closed_candle_id": candle.id,
+                "interval": candle.interval,
+                "close_price": format(Decimal(candle.close), "f"),
+                "close_timestamp": close_time_utc.isoformat(),
+                "evaluation_timestamp": now.isoformat(),
+                "freshness_seconds": freshness_seconds,
+                "freshness_minutes": freshness_minutes,
+                "candle_interval_minutes": candle_interval_minutes,
+                "ingestion_grace_minutes": ingestion_grace_minutes,
+                "maximum_age_minutes": maximum_age_minutes,
+                "freshness_verdict": "stale",
             },
             asset,
             candle,
@@ -679,9 +763,14 @@ async def _load_market_evidence(
             "latest_closed_candle_id": candle.id,
             "interval": candle.interval,
             "close_price": format(Decimal(candle.close), "f"),
-            "close_timestamp": candle.close_time.astimezone(timezone.utc).isoformat(),
+            "close_timestamp": close_time_utc.isoformat(),
+            "evaluation_timestamp": now.isoformat(),
             "freshness_seconds": freshness_seconds,
             "freshness_minutes": freshness_minutes,
+            "candle_interval_minutes": candle_interval_minutes,
+            "ingestion_grace_minutes": ingestion_grace_minutes,
+            "maximum_age_minutes": maximum_age_minutes,
+            "freshness_verdict": "fresh",
         },
         asset,
         candle,
