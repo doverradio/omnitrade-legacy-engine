@@ -22,6 +22,7 @@ from app.services.autonomous_cycle.orchestrator import (
     _run_approved_strategy,
     run_autonomous_preview_cycle,
 )
+from app.services.decisions.replay_context import REPLAY_CONTEXT_KEYS
 from app.services.strategies.base import Signal
 from app.services.strategies.identity import build_strategy_identity
 
@@ -1496,3 +1497,122 @@ async def test_decision_record_persists_canonical_product_identity() -> None:
     assert record.generated_signals[0]["strategy_evidence"]["crossover_state"] == "bullish_cross"
     assert snapshot.strategy_inputs["strategy_evidence"]["fast_ma"] == "3.0"
     assert snapshot.strategy_inputs["signal_reason"] == "Fast SMA crossed above Slow SMA."
+
+
+@pytest.mark.asyncio
+async def test_decision_record_replay_context_persists_authoritative_identifiers() -> None:
+    db = _FakeDb()
+    cycle_id = uuid.uuid4()
+    risk_event_id = uuid.uuid4()
+    signal_id = uuid.uuid4()
+    mandate = SimpleNamespace(
+        provider="kraken_spot",
+        exchange_environment="production",
+        live_trading_profile_id=uuid.uuid4(),
+        paper_account_id=uuid.uuid4(),
+        capital_campaign_id=123,
+        mandate_id=uuid.uuid4(),
+    )
+    await _persist_decision_intelligence(
+        db=db,
+        cycle=SimpleNamespace(cycle_id=cycle_id, risk_event_id=risk_event_id, audit_correlation_id=uuid.uuid4()),
+        mandate=mandate,
+        version=SimpleNamespace(
+            mandate_version_id=uuid.uuid4(),
+            version_number=7,
+            allowed_strategy_versions=[build_strategy_identity(slug="ma_crossover", module_version="1.0.0")],
+            max_order_notional_usd=Decimal("5"),
+            max_open_exposure_usd=Decimal("10"),
+        ),
+        proposal=StrategyProposal(
+            action="BUY",
+            strategy_name="ma_crossover",
+            strategy_version=build_strategy_identity(slug="ma_crossover", module_version="1.0.0"),
+            deterministic_explanation=("CHECK_PASSED:strategy_evaluated",),
+            signal_payload={
+                "action": "buy",
+                "timestamp": "2026-07-01T00:00:00Z",
+            },
+        ),
+        risk_summary=RiskEvaluationSummary(
+            risk_verdict="ACCEPTED",
+            risk_event_id=risk_event_id,
+            reason_code=None,
+            approved_quantity=Decimal("0.001"),
+        ),
+        product_id="BTC-USD",
+        reference_price=Decimal("50000"),
+        evidence_age_minutes=0,
+        strategy_interval="15m",
+        canonical_signal_id=signal_id,
+    )
+
+    record = next(item for item in db.added if isinstance(item, DecisionRecord))
+    replay_context = record.indicators["replay_context"]
+    assert sorted(replay_context.keys()) == sorted(REPLAY_CONTEXT_KEYS)
+    assert replay_context["strategy_identity"] == "ma_crossover"
+    assert replay_context["strategy_version"] == "ma_crossover@1.0.0"
+    assert replay_context["timeframe"] == "15m"
+    assert replay_context["normalized_risk_verdict"] == "ALLOW"
+    assert replay_context["provider"] == "kraken_spot"
+    assert replay_context["environment"] == "production"
+    assert replay_context["paper_account_id"] == str(mandate.paper_account_id)
+    assert replay_context["live_trading_profile_id"] == str(mandate.live_trading_profile_id)
+    assert replay_context["capital_campaign_id"] == "123"
+    assert replay_context["capital_campaign_version"] == "7"
+    assert replay_context["expected_gross_edge"] == "UNKNOWN"
+    assert replay_context["actual_execution_fee"] == "UNKNOWN"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(("risk_verdict", "expected"), [("RESIZED", "ALLOW_RESIZED"), ("REJECTED", "BLOCK"), ("OTHER", "UNKNOWN")])
+async def test_decision_record_replay_context_maps_risk_and_hold_context(risk_verdict: str, expected: str) -> None:
+    db = _FakeDb()
+    await _persist_decision_intelligence(
+        db=db,
+        cycle=SimpleNamespace(cycle_id=uuid.uuid4(), risk_event_id=None, audit_correlation_id=uuid.uuid4()),
+        mandate=SimpleNamespace(
+            provider="kraken_spot",
+            exchange_environment=None,
+            live_trading_profile_id=None,
+            paper_account_id=None,
+            capital_campaign_id=None,
+            mandate_id=uuid.uuid4(),
+        ),
+        version=SimpleNamespace(
+            mandate_version_id=uuid.uuid4(),
+            version_number=None,
+            allowed_strategy_versions=[build_strategy_identity(slug="ma_crossover", module_version="1.0.0")],
+            max_order_notional_usd=Decimal("5"),
+            max_open_exposure_usd=Decimal("10"),
+        ),
+        proposal=StrategyProposal(
+            action="HOLD",
+            strategy_name="ma_crossover",
+            strategy_version=build_strategy_identity(slug="ma_crossover", module_version="1.0.0"),
+            deterministic_explanation=("CHECK_PASSED:strategy_evaluated",),
+            signal_payload={"action": "hold"},
+        ),
+        risk_summary=RiskEvaluationSummary(
+            risk_verdict=risk_verdict,
+            risk_event_id=None,
+            reason_code=None,
+            approved_quantity=None,
+        ),
+        product_id="BTC-USD",
+        reference_price=Decimal("50000"),
+        evidence_age_minutes=0,
+        strategy_interval="15m",
+        canonical_signal_id=None,
+    )
+
+    record = next(item for item in db.added if isinstance(item, DecisionRecord))
+    replay_context = record.indicators["replay_context"]
+    assert replay_context["strategy_identity"] == "ma_crossover"
+    assert replay_context["strategy_version"] == "ma_crossover@1.0.0"
+    assert replay_context["timeframe"] == "15m"
+    assert replay_context["normalized_risk_verdict"] == expected
+    assert replay_context["environment"] == "UNKNOWN"
+    assert replay_context["paper_account_id"] == "UNKNOWN"
+    assert replay_context["live_trading_profile_id"] == "UNKNOWN"
+    assert replay_context["position_lifecycle_id"] == "UNKNOWN"

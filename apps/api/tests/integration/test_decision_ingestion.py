@@ -13,8 +13,10 @@ from app.models.decision_snapshot import DecisionSnapshot
 from app.models.model_output import ModelOutput
 from app.models.risk_event import RiskEvent
 from app.models.signal import Signal
+from app.models.strategy import Strategy
 from app.models.trade import Trade
 from app.services.decisions.ingestion import build_signal_idempotency_key, ingest_decision_records
+from app.services.decisions.replay_context import REPLAY_CONTEXT_KEYS
 
 
 class _ScalarResult:
@@ -49,11 +51,13 @@ class _FakeSession:
         model_outputs: list[ModelOutput],
         risk_events: list[RiskEvent],
         trades: list[Trade],
+        strategies: list[Strategy] | None = None,
     ) -> None:
         self.signals = signals
         self.model_outputs = model_outputs
         self.risk_events = risk_events
         self.trades = trades
+        self.strategies = strategies or []
 
         self.decision_records: list[DecisionRecord] = []
         self.decision_snapshots: list[DecisionSnapshot] = []
@@ -70,6 +74,13 @@ class _FakeSession:
             for item in self.decision_records:
                 if item.idempotency_key == key:
                     return item.decision_id
+            return None
+
+        if "FROM strategies" in sql:
+            strategy_id = params.get("id_1")
+            for item in self.strategies:
+                if item.id == strategy_id:
+                    return item
             return None
 
         return None
@@ -102,6 +113,11 @@ class _FakeSession:
             signal_id = params.get("signal_id_1")
             rows = [item for item in self.trades if item.signal_id == signal_id]
             rows.sort(key=lambda item: (item.executed_at, item.id))
+            return _ExecuteResult(rows)
+
+        if "FROM strategies" in sql:
+            strategy_id = params.get("id_1")
+            rows = [item for item in self.strategies if item.id == strategy_id]
             return _ExecuteResult(rows)
 
         return _ExecuteResult([])
@@ -195,9 +211,22 @@ def _build_signal(*, action: str, status: str) -> Signal:
     )
 
 
+def _build_strategy(*, strategy_id: uuid.UUID, slug: str = "ma_crossover", module_version: str = "1.0.0") -> Strategy:
+    return Strategy(
+        id=strategy_id,
+        name="MA Crossover",
+        slug=slug,
+        description=None,
+        module_version=module_version,
+        is_active=True,
+        created_at=datetime(2026, 7, 6, tzinfo=timezone.utc),
+    )
+
+
 @pytest.mark.asyncio
 async def test_duplicate_ingestion_produces_no_duplicate_decision_records() -> None:
     signal = _build_signal(action="buy", status="executed")
+    strategy = _build_strategy(strategy_id=signal.strategy_id)
     model_output = ModelOutput(
         id=uuid.uuid4(),
         model_name="signal_scorer",
@@ -237,6 +266,7 @@ async def test_duplicate_ingestion_produces_no_duplicate_decision_records() -> N
         model_outputs=[model_output],
         risk_events=[risk_event],
         trades=[trade],
+        strategies=[strategy],
     )
 
     first = await ingest_decision_records(db=session)
@@ -252,7 +282,8 @@ async def test_duplicate_ingestion_produces_no_duplicate_decision_records() -> N
 @pytest.mark.asyncio
 async def test_repeated_ingestion_is_idempotent_and_stable() -> None:
     signal = _build_signal(action="hold", status="generated")
-    session = _FakeSession(signals=[signal], model_outputs=[], risk_events=[], trades=[])
+    strategy = _build_strategy(strategy_id=signal.strategy_id)
+    session = _FakeSession(signals=[signal], model_outputs=[], risk_events=[], trades=[], strategies=[strategy])
 
     await ingest_decision_records(db=session)
     first_record = session.decision_records[0]
@@ -270,6 +301,7 @@ async def test_repeated_ingestion_is_idempotent_and_stable() -> None:
 @pytest.mark.asyncio
 async def test_provenance_links_remain_stable_across_runs() -> None:
     signal = _build_signal(action="sell", status="risk_rejected")
+    strategy = _build_strategy(strategy_id=signal.strategy_id)
     risk_event = RiskEvent(
         id=uuid.uuid4(),
         paper_account_id=uuid.uuid4(),
@@ -279,7 +311,7 @@ async def test_provenance_links_remain_stable_across_runs() -> None:
         detail={"reason_code": "max_drawdown_breached"},
         created_at=signal.signal_time + timedelta(seconds=1),
     )
-    session = _FakeSession(signals=[signal], model_outputs=[], risk_events=[risk_event], trades=[])
+    session = _FakeSession(signals=[signal], model_outputs=[], risk_events=[risk_event], trades=[], strategies=[strategy])
 
     await ingest_decision_records(db=session)
     provenance_first = copy.deepcopy(session.decision_records[0].field_provenance)
@@ -298,6 +330,7 @@ async def test_provenance_links_remain_stable_across_runs() -> None:
 @pytest.mark.asyncio
 async def test_ingestion_does_not_mutate_source_tables() -> None:
     signal = _build_signal(action="buy", status="risk_approved")
+    strategy = _build_strategy(strategy_id=signal.strategy_id)
     model_output = ModelOutput(
         id=uuid.uuid4(),
         model_name="explainer",
@@ -314,6 +347,7 @@ async def test_ingestion_does_not_mutate_source_tables() -> None:
         model_outputs=[model_output],
         risk_events=[],
         trades=[],
+        strategies=[strategy],
     )
 
     source_before = _serialize_source_state(session)
@@ -323,3 +357,76 @@ async def test_ingestion_does_not_mutate_source_tables() -> None:
     source_after = _serialize_source_state(session)
 
     assert source_after == source_before
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("action_taken", "expected"),
+    [
+        ("approved", "ALLOW"),
+        ("resized", "ALLOW_RESIZED"),
+        ("blocked", "BLOCK"),
+        ("mystery", "UNKNOWN"),
+    ],
+)
+async def test_replay_context_normalizes_risk_verdict(action_taken: str, expected: str) -> None:
+    signal = _build_signal(action="buy", status="generated")
+    strategy = _build_strategy(strategy_id=signal.strategy_id)
+    risk_event = RiskEvent(
+        id=uuid.uuid4(),
+        paper_account_id=uuid.uuid4(),
+        related_signal_id=signal.id,
+        event_type="risk_gate",
+        action_taken=action_taken,
+        detail={"reason_code": None},
+        created_at=signal.signal_time,
+    )
+    session = _FakeSession(signals=[signal], model_outputs=[], risk_events=[risk_event], trades=[], strategies=[strategy])
+
+    await ingest_decision_records(db=session)
+
+    replay_context = session.decision_records[0].indicators["replay_context"]
+    assert replay_context["normalized_risk_verdict"] == expected
+
+
+@pytest.mark.asyncio
+async def test_replay_context_uses_strategy_identity_version_and_unknown_expected_fields() -> None:
+    signal = _build_signal(action="buy", status="executed")
+    strategy = _build_strategy(strategy_id=signal.strategy_id, slug="ma_crossover", module_version="2.1.0")
+    trade = Trade(
+        id=uuid.uuid4(),
+        paper_account_id=uuid.uuid4(),
+        signal_id=signal.id,
+        asset_id=signal.asset_id,
+        side="buy",
+        quantity=Decimal("0.005"),
+        price=Decimal("25000"),
+        fee=Decimal("0.10"),
+        is_paper=True,
+        execution_venue="internal_sim",
+        executed_at=signal.signal_time,
+        created_at=signal.signal_time,
+    )
+    session = _FakeSession(
+        signals=[signal],
+        model_outputs=[],
+        risk_events=[],
+        trades=[trade],
+        strategies=[strategy],
+    )
+
+    await ingest_decision_records(db=session)
+
+    replay_context = session.decision_records[0].indicators["replay_context"]
+    assert sorted(replay_context.keys()) == sorted(REPLAY_CONTEXT_KEYS)
+    assert replay_context["strategy_identity"] == "ma_crossover"
+    assert replay_context["strategy_version"] == "2.1.0"
+    assert replay_context["timeframe"] == "UNKNOWN"
+    assert replay_context["expected_gross_edge"] == "UNKNOWN"
+    assert replay_context["expected_fees"] == "UNKNOWN"
+    assert replay_context["expected_slippage"] == "UNKNOWN"
+    assert replay_context["expected_net_edge"] == "UNKNOWN"
+    assert replay_context["actual_execution_fee"] == "0.10"
+    assert replay_context["actual_execution_price"] == "25000"
+    assert replay_context["actual_execution_quantity"] == "0.005"
+    assert "live_trading_profile_id" in replay_context["unknown_fields"]

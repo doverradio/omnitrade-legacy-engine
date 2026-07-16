@@ -31,6 +31,7 @@ from app.models.signal import Signal
 from app.models.strategy import Strategy
 from app.services.crypto_order_previews.service import create_crypto_order_preview
 from app.services.decisions.ingestion import DECISION_ENGINE_VERSION
+from app.services.decisions.replay_context import build_canonical_replay_context
 from app.services.execution_price_evidence import load_current_execution_price_evidence
 from app.services.exchange_connections.readiness import supports_autonomous_preview
 from app.services.exchange_connections.providers.registry import get_exchange_provider
@@ -1199,6 +1200,44 @@ async def _persist_decision_intelligence(
     trade_accepted = risk_summary.risk_verdict in {"ACCEPTED", "RESIZED"}
     signal_payload = proposal.signal_payload or {}
     signal_indicators = signal_payload.get("indicators") if isinstance(signal_payload, dict) else {}
+    indicators_payload = signal_indicators if isinstance(signal_indicators, dict) else {}
+    replay_context = build_canonical_replay_context(
+        evidence={
+            "strategy_identity": proposal.strategy_name,
+            "strategy_version": proposal.strategy_version,
+            "action": proposal.action,
+            "confidence": None,
+            "product": normalize_product_id(product_id),
+            "timeframe": strategy_interval,
+            "provider": mandate.provider,
+            "environment": getattr(mandate, "exchange_environment", None),
+            "paper_account_id": getattr(mandate, "paper_account_id", None),
+            "live_trading_profile_id": getattr(mandate, "live_trading_profile_id", None),
+            "capital_campaign_id": getattr(mandate, "capital_campaign_id", None),
+            "capital_campaign_version": getattr(version, "version_number", None),
+            "runtime_campaign_id": None,
+            "position_lifecycle_id": None,
+            "signal_ids": [canonical_signal_id] if canonical_signal_id is not None else [],
+            "risk_event_ids": [cycle.risk_event_id] if cycle.risk_event_id is not None else [],
+            "trade_ids": [],
+            "candle_id": signal_payload.get("candle_id") if isinstance(signal_payload, dict) else None,
+            "candle_close_time": signal_payload.get("candle_close_time") if isinstance(signal_payload, dict) else None,
+            "decision_timestamp": datetime.now(timezone.utc),
+            "market_data_timestamp": signal_payload.get("timestamp") if isinstance(signal_payload, dict) else None,
+            "normalized_risk_verdict": risk_summary.risk_verdict,
+            "expected_gross_edge": signal_payload.get("expected_gross_edge") if isinstance(signal_payload, dict) else None,
+            "expected_fees": signal_payload.get("expected_fees") if isinstance(signal_payload, dict) else None,
+            "expected_slippage": signal_payload.get("expected_slippage") if isinstance(signal_payload, dict) else None,
+            "expected_net_edge": signal_payload.get("expected_net_edge") if isinstance(signal_payload, dict) else None,
+            "actual_execution_fee": None,
+            "actual_execution_price": None,
+            "actual_execution_quantity": None,
+        }
+    )
+    indicators_payload = {
+        **indicators_payload,
+        "replay_context": replay_context,
+    }
     record = DecisionRecord(
         idempotency_key=idempotency_key,
         source_lineage={
@@ -1221,7 +1260,7 @@ async def _persist_decision_intelligence(
         asset={"product_id": normalize_product_id(product_id), "provider": mandate.provider},
         timeframe=strategy_interval,
         market_regime={"state": "unknown", "source": "autonomous_cycle_preview"},
-        indicators=signal_indicators if isinstance(signal_indicators, dict) else {},
+        indicators=indicators_payload,
         generated_signals=[
             {
                 "action": proposal.action,

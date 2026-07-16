@@ -15,6 +15,7 @@ from app.models.decision_snapshot import DecisionSnapshot
 from app.models.model_output import ModelOutput
 from app.models.risk_event import RiskEvent
 from app.models.signal import Signal
+from app.models.strategy import Strategy
 from app.models.trade import Trade
 from app.services.decisions.contracts import (
     DecisionProvenanceContract,
@@ -26,6 +27,7 @@ from app.services.decisions.provenance import (
     DECISION_SNAPSHOT_PROVENANCE_MAPPING,
     validate_provenance_mappings,
 )
+from app.services.decisions.replay_context import UNKNOWN, build_canonical_replay_context, normalize_risk_verdict
 
 
 DECISION_ENGINE_VERSION = "v1"
@@ -69,6 +71,7 @@ async def ingest_decision_records(
         model_outputs = await _load_model_outputs(db=db, signal_id=signal.id)
         risk_events = await _load_risk_events(db=db, signal_id=signal.id)
         trades = await _load_trades(db=db, signal_id=signal.id)
+        strategy = await _load_strategy(db=db, strategy_id=signal.strategy_id)
 
         provenance = DecisionProvenanceContract(
             signals=[signal.id],
@@ -82,6 +85,7 @@ async def ingest_decision_records(
             model_outputs=model_outputs,
             risk_events=risk_events,
             trades=trades,
+            strategy=strategy,
         )
         decision_snapshot_contract = _compose_decision_snapshot(
             signal=signal,
@@ -200,12 +204,21 @@ async def _load_trades(*, db: AsyncSession, signal_id: uuid.UUID) -> list[Trade]
     return list(result.scalars().all())
 
 
+async def _load_strategy(*, db: AsyncSession, strategy_id: uuid.UUID) -> Strategy | None:
+    return await db.scalar(
+        select(Strategy)
+        .where(Strategy.id == strategy_id)
+        .limit(1)
+    )
+
+
 def _compose_decision_record(
     *,
     signal: Signal,
     model_outputs: list[ModelOutput],
     risk_events: list[RiskEvent],
     trades: list[Trade],
+    strategy: Strategy | None,
 ) -> DecisionRecordContract:
     decision_state = _resolve_decision_state(signal=signal, risk_events=risk_events, trades=trades)
     trade_accepted = decision_state in {"approved", "resized"}
@@ -267,6 +280,42 @@ def _compose_decision_record(
     if model_outputs:
         indicators = dict(model_outputs[0].input_summary)
 
+    supporting_strategy_evidence = [item.get("evidence") for item in supporting if isinstance(item.get("evidence"), dict)]
+    replay_context = build_canonical_replay_context(
+        evidence={
+            "strategy_identity": _resolve_strategy_identity(signal=signal, strategy=strategy),
+            "strategy_version": _resolve_strategy_version(strategy=strategy),
+            "action": signal.action,
+            "confidence": signal.ai_confidence,
+            "product": None,
+            "timeframe": UNKNOWN,
+            "provider": latest_trade.execution_venue if latest_trade is not None else None,
+            "environment": None,
+            "paper_account_id": _resolve_paper_account_id(risk_events=risk_events, trades=trades),
+            "live_trading_profile_id": None,
+            "capital_campaign_id": None,
+            "capital_campaign_version": None,
+            "runtime_campaign_id": None,
+            "position_lifecycle_id": None,
+            "signal_ids": [signal.id],
+            "risk_event_ids": [item.id for item in risk_events],
+            "trade_ids": [item.id for item in trades],
+            "candle_id": None,
+            "candle_close_time": None,
+            "decision_timestamp": signal.signal_time,
+            "market_data_timestamp": signal.signal_time,
+            "normalized_risk_verdict": _resolve_risk_verdict(risk_events=risk_events),
+            "expected_gross_edge": _resolve_expected_value(supporting_strategies=supporting_strategy_evidence, key="expected_gross_edge"),
+            "expected_fees": _resolve_expected_value(supporting_strategies=supporting_strategy_evidence, key="expected_fees"),
+            "expected_slippage": _resolve_expected_value(supporting_strategies=supporting_strategy_evidence, key="expected_slippage"),
+            "expected_net_edge": _resolve_expected_net_edge(supporting_strategies=supporting_strategy_evidence),
+            "actual_execution_fee": latest_trade.fee if latest_trade is not None else None,
+            "actual_execution_price": latest_trade.price if latest_trade is not None else None,
+            "actual_execution_quantity": latest_trade.quantity if latest_trade is not None else None,
+        }
+    )
+    indicators["replay_context"] = replay_context
+
     confidence_calibration: dict[str, Any] | None = None
     if signal.ai_confidence is not None:
         confidence_calibration = {
@@ -278,7 +327,7 @@ def _compose_decision_record(
         version=DECISION_ENGINE_VERSION,
         timestamp=signal.signal_time,
         asset={"asset_id": str(signal.asset_id)},
-        timeframe="unknown",
+        timeframe=UNKNOWN,
         market_regime={
             "regime_tag": signal.regime_tag,
             "confidence": _decimal_to_str(signal.ai_confidence),
@@ -314,6 +363,64 @@ def _compose_decision_record(
         review_status="unreviewed",
         human_notes=None,
     )
+
+
+def _resolve_strategy_identity(*, signal: Signal, strategy: Strategy | None) -> str:
+    if strategy is None:
+        return str(signal.strategy_id)
+    slug = str(strategy.slug or "").strip()
+    if slug:
+        return slug
+    name = str(strategy.name or "").strip()
+    if name:
+        return name
+    return str(signal.strategy_id)
+
+
+def _resolve_strategy_version(*, strategy: Strategy | None) -> str | None:
+    if strategy is None:
+        return None
+    raw = str(strategy.module_version or "").strip()
+    return raw or None
+
+
+def _resolve_paper_account_id(*, risk_events: list[RiskEvent], trades: list[Trade]) -> uuid.UUID | None:
+    if trades:
+        return trades[-1].paper_account_id
+    if risk_events:
+        return risk_events[-1].paper_account_id
+    return None
+
+
+def _resolve_risk_verdict(*, risk_events: list[RiskEvent]) -> str:
+    if not risk_events:
+        return UNKNOWN
+    return normalize_risk_verdict(risk_events[-1].action_taken)
+
+
+def _resolve_expected_value(*, supporting_strategies: list[dict[str, Any]], key: str) -> Any:
+    for evidence in supporting_strategies:
+        if key in evidence and evidence.get(key) is not None:
+            return evidence.get(key)
+    return None
+
+
+def _resolve_expected_net_edge(*, supporting_strategies: list[dict[str, Any]]) -> Any:
+    for evidence in supporting_strategies:
+        net = evidence.get("expected_net_edge")
+        if net is not None:
+            return net
+
+        gross = evidence.get("expected_gross_edge")
+        fees = evidence.get("expected_fees")
+        slippage = evidence.get("expected_slippage")
+        if gross is None or fees is None or slippage is None:
+            continue
+        try:
+            return Decimal(str(gross)) - Decimal(str(fees)) - Decimal(str(slippage))
+        except Exception:
+            continue
+    return None
 
 
 def _compose_decision_snapshot(
