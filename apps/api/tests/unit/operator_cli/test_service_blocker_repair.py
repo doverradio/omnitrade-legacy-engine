@@ -125,6 +125,97 @@ class _SessionContext:
         return False
 
 
+class _ScalarResult:
+    def __init__(self, values):
+        self._values = values
+
+    def all(self):
+        return list(self._values)
+
+
+class _ExecuteResult:
+    def __init__(self, values):
+        self._values = values
+
+    def scalars(self):
+        return _ScalarResult(self._values)
+
+
+class _GatherDb:
+    def __init__(self) -> None:
+        now = datetime.now(timezone.utc)
+        self.now = now
+        self.campaign_id = uuid4()
+        self.paper_account_id = uuid4()
+        self.profile_id = uuid4()
+        self.saw_btc_symbol_filter = False
+
+    async def scalar(self, statement):
+        sql = str(statement)
+        compiled = str(statement.compile(compile_kwargs={"literal_binds": True}))
+
+        if "FROM exchange_connections" in sql:
+            return SimpleNamespace(status="connected", last_readiness_verdict="READY_FOR_OPERATOR_REVIEW", last_successful_sync_at=self.now, total_equity_usd=Decimal("62.10"))
+        if "FROM capital_campaigns" in sql and "capital_campaign_definitions" not in sql:
+            return SimpleNamespace(id=2, uuid=self.campaign_id, definition_version=1, paper_account_id=self.paper_account_id, realized_profit=Decimal("0"), fees=Decimal("0"), starting_capital=Decimal("100"), current_equity=Decimal("100"))
+        if "FROM capital_campaign_definitions" in sql:
+            return SimpleNamespace(maximum_open_positions=1, minimum_position_size=Decimal("5"), maximum_position_size=Decimal("5"), maximum_total_exposure=Decimal("5"))
+        if "FROM assets" in sql:
+            self.saw_btc_symbol_filter = "'BTC'" in compiled
+            return SimpleNamespace(id=uuid4())
+        if "FROM candles" in sql and "SELECT candles.created_at" not in sql:
+            return SimpleNamespace(close_time=self.now - timedelta(minutes=18), interval="15m")
+        if "SELECT candles.created_at" in sql:
+            return self.now - timedelta(minutes=5)
+        if "FROM autonomous_cycle_runs" in sql:
+            return SimpleNamespace(
+                cycle_id=uuid4(),
+                state="COMPLETE",
+                termination_stage="hold_no_package_created",
+                proposed_action="HOLD",
+                failure_reason=None,
+                cycle_context={
+                    "authoritative_composition": {
+                        "selected_decision": {
+                            "decision_record_id": str(uuid4()),
+                            "strategy_identity": "ma_crossover@1.0.0",
+                            "strategy_version": "ma_crossover@1.0.0",
+                        }
+                    }
+                },
+            )
+        if "FROM canonical_preview_packages" in sql:
+            return None
+        if "FROM canonical_proving_activations" in sql:
+            return None
+        if "count(*)" in sql:
+            return 0
+        return None
+
+    async def get(self, model, key):
+        name = getattr(model, "__name__", "")
+        if name == "PaperAccount":
+            return SimpleNamespace(id=key, is_active=True, current_cash_balance=Decimal("23.7205"))
+        if name == "LiveTradingProfile":
+            return SimpleNamespace(id=key, paper_account_id=self.paper_account_id)
+        return None
+
+    async def execute(self, _statement):
+        return _ExecuteResult([])
+
+
+class _GatherSessionContext:
+    def __init__(self, db: _GatherDb) -> None:
+        self._db = db
+
+    async def __aenter__(self):
+        return self._db
+
+    async def __aexit__(self, exc_type, exc, tb):
+        _ = exc_type, exc, tb
+        return False
+
+
 @pytest.mark.asyncio
 async def test_refresh_provider_balance_evidence_success(monkeypatch: pytest.MonkeyPatch) -> None:
     db = _FakeDb()
@@ -589,3 +680,26 @@ def test_first_profit_status_contains_read_only_invariants() -> None:
     assert "commit" not in source
     assert "create_order" not in source
     assert "submit_alpaca_paper_order" not in source
+
+
+@pytest.mark.asyncio
+async def test_first_profit_status_real_gather_path_resolves_btc_symbol_without_nameerror(monkeypatch: pytest.MonkeyPatch) -> None:
+    db = _GatherDb()
+    monkeypatch.setattr(service, "AsyncSessionLocal", lambda: _GatherSessionContext(db))
+
+    payload = await service.first_autonomous_profit_status(
+        campaign_id=db.campaign_id,
+        campaign_version=1,
+        runtime_campaign_id=2,
+        paper_account_id=db.paper_account_id,
+        live_trading_profile_id=db.profile_id,
+        provider="kraken_spot",
+        environment="production",
+        product_id="BTC-USD",
+    )
+
+    assert db.saw_btc_symbol_filter is True
+    assert payload["completion_percent"] == 99.6
+    assert payload["status"] == "WAITING_FOR_EXECUTABLE_SIGNAL"
+    assert payload["invariants"]["read_only"] is True
+    assert payload["invariants"]["no_provider_order_submission"] is True

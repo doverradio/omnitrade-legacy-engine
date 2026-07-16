@@ -41,6 +41,7 @@ from app.models.strategy_roster_proposal import StrategyRosterProposal
 from app.models.strategy_roster_proposal_outcome import StrategyRosterProposalOutcome
 from app.models.strategy_roster_run import StrategyRosterRun
 from app.services.autonomous_cycle import AutonomousCycleRequest, run_autonomous_preview_cycle
+from app.services.autonomous_cycle.orchestrator import normalize_product_id
 from app.services.canonical_campaign_binding import (
     CanonicalProvingAccountTransitionRequest,
     CanonicalCampaignBindingRequest,
@@ -114,6 +115,11 @@ _FIRST_PROFIT_STAGE_ANCHORS: dict[int, float] = {
     9: 99.97,
     10: 100.0,
 }
+
+
+def _product_symbol(value: str) -> str:
+    normalized = normalize_product_id(value)
+    return normalized.split("-", 1)[0] if "-" in normalized else normalized
 
 
 def _interval_minutes(interval: str | None) -> int | None:
