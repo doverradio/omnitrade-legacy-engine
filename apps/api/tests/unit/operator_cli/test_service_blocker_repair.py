@@ -516,11 +516,35 @@ def test_first_profit_status_hold_reports_waiting_for_executable_signal() -> Non
     payload = service._derive_first_autonomous_profit_status(_build_profit_evidence())
     assert payload["status"] == "WAITING_FOR_EXECUTABLE_SIGNAL"
     assert payload["completion_percent"] == 99.6
+    assert payload["blocking_gate"] == "READY_PACKAGE_NOT_YET_CREATED"
 
 
 def test_first_profit_status_hold_is_not_blocked() -> None:
     payload = service._derive_first_autonomous_profit_status(_build_profit_evidence())
     assert payload["status"] != "BLOCKED"
+
+
+def test_first_profit_status_blocking_gate_never_uses_passed_checkpoint() -> None:
+    payload = service._derive_first_autonomous_profit_status(_build_profit_evidence())
+    candidate = next((item for item in payload["checkpoints"] if item["name"] == payload["blocking_gate"]), None)
+    if candidate is not None:
+        assert candidate["state"] != "PASSED"
+    else:
+        assert payload["blocking_gate"] == "READY_PACKAGE_NOT_YET_CREATED"
+
+
+def test_first_profit_status_pre_activation_buy_checks_not_failed() -> None:
+    payload = service._derive_first_autonomous_profit_status(_build_profit_evidence())
+    buy_submitted = next(item for item in payload["checkpoints"] if item["name"] == "live_buy_order_submitted")
+    buy_fill = next(item for item in payload["checkpoints"] if item["name"] == "live_buy_fill_reconciled")
+    assert buy_submitted["state"] in {"NOT_APPLICABLE", "WAITING"}
+    assert buy_fill["state"] in {"NOT_APPLICABLE", "WAITING"}
+
+
+def test_first_profit_status_completed_checkpoint_count_excludes_not_applicable() -> None:
+    payload = service._derive_first_autonomous_profit_status(_build_profit_evidence())
+    completed = sum(1 for item in payload["checkpoints"] if item["state"] in {"PASSED", "COMPLETED_HISTORICALLY"})
+    assert payload["completed_checkpoint_count"] == completed
 
 
 def test_first_profit_status_stale_market_data() -> None:

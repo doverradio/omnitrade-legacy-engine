@@ -325,6 +325,16 @@ def _derive_first_autonomous_profit_status(evidence: dict[str, Any]) -> dict[str
         (9, "LIVE_SELL_RECONCILED", stage_9_complete),
         (10, "POSITIVE_NET_PROFIT_CONFIRMED", stage_10_complete),
     ]
+    stage_blocking_gate_map = {
+        3: "READY_PACKAGE_NOT_YET_CREATED",
+        4: "PACKAGE_NOT_AUTHORIZED",
+        5: "DRY_RUN_NOT_PASSED",
+        6: "BOUNDED_ACTIVATION_MISSING",
+        7: "LIVE_BUY_NOT_RECONCILED",
+        8: "POSITION_MANAGEMENT_EVIDENCE_MISSING",
+        9: "LIVE_SELL_NOT_RECONCILED",
+        10: "POSITIVE_NET_PROFIT_NOT_CONFIRMED",
+    }
 
     highest_contiguous_stage = 0
     for stage_number, _, completed in stage_rows:
@@ -368,8 +378,8 @@ def _derive_first_autonomous_profit_status(evidence: dict[str, Any]) -> dict[str
         ("exact_package_authorization_exists", exact_package_authorization, _checkpoint_state(passed=approval_event is not None, not_applicable=hold_no_package_expected and not package_historically_advanced, completed_historically=exact_package_authorization and approval_event is None, waiting=stage_3_complete and not exact_package_authorization)),
         ("production_dry_run_passed", dry_run_passed, _checkpoint_state(passed=bool(evidence.get("dry_run_passed")), not_applicable=hold_no_package_expected and not package_historically_advanced, completed_historically=dry_run_passed and not bool(evidence.get("dry_run_passed")), waiting=stage_4_complete and not dry_run_passed)),
         ("bounded_proving_activation_exists", bounded_activation_exists, _checkpoint_state(passed=activation is not None, not_applicable=hold_no_package_expected and not package_historically_advanced, completed_historically=bounded_activation_exists and activation is None, waiting=stage_5_complete and not bounded_activation_exists)),
-        ("live_buy_order_submitted", autonomous_buy_submitted, _checkpoint_state(passed=autonomous_buy_submitted, waiting=stage_6_complete and not autonomous_buy_submitted)),
-        ("live_buy_fill_reconciled", autonomous_buy_fill_reconciled, _checkpoint_state(passed=autonomous_buy_fill_reconciled, waiting=autonomous_buy_submitted and not autonomous_buy_fill_reconciled)),
+        ("live_buy_order_submitted", autonomous_buy_submitted, _checkpoint_state(passed=autonomous_buy_submitted, waiting=stage_6_complete and not autonomous_buy_submitted, not_applicable=not stage_6_complete)),
+        ("live_buy_fill_reconciled", autonomous_buy_fill_reconciled, _checkpoint_state(passed=autonomous_buy_fill_reconciled, waiting=autonomous_buy_submitted and not autonomous_buy_fill_reconciled, not_applicable=not stage_6_complete)),
         ("open_live_btc_position_exists", position_open, _checkpoint_state(passed=position_open, completed_historically=position_managed_historically and not position_open, waiting=stage_7_complete and not position_managed_historically, not_applicable=not stage_7_complete)),
         ("live_sell_order_submitted", autonomous_sell_submitted, _checkpoint_state(passed=autonomous_sell_submitted, waiting=stage_8_complete and not autonomous_sell_submitted, not_applicable=not stage_8_complete)),
         ("live_sell_fill_reconciled", autonomous_sell_fill_reconciled, _checkpoint_state(passed=autonomous_sell_fill_reconciled, waiting=autonomous_sell_submitted and not autonomous_sell_fill_reconciled, not_applicable=not stage_8_complete)),
@@ -377,7 +387,7 @@ def _derive_first_autonomous_profit_status(evidence: dict[str, Any]) -> dict[str
         ("ending_usd_exceeds_starting_usd", ending_usd_exceeds_starting_usd, _checkpoint_state(passed=ending_usd_exceeds_starting_usd, waiting=stage_9_complete and fees_known and not ending_usd_exceeds_starting_usd, not_applicable=not stage_9_complete)),
     ]
 
-    completed_checkpoint_count = sum(1 for _, _, state in checkpoint_rows if state in {"PASSED", "COMPLETED_HISTORICALLY", "NOT_APPLICABLE"})
+    completed_checkpoint_count = sum(1 for _, _, state in checkpoint_rows if state in {"PASSED", "COMPLETED_HISTORICALLY"})
     total_checkpoint_count = len(checkpoint_rows)
 
     first_profit_complete = stage_10_complete
@@ -436,7 +446,7 @@ def _derive_first_autonomous_profit_status(evidence: dict[str, Any]) -> dict[str
         blocking_gate = "ending_usd_exceeds_starting_usd"
     elif latest_cycle_outcome == "HOLD":
         status = "WAITING_FOR_EXECUTABLE_SIGNAL"
-        blocking_gate = "latest_cycle_truthful_terminal"
+        blocking_gate = stage_blocking_gate_map.get(highest_contiguous_stage + 1, "READY_PACKAGE_NOT_YET_CREATED")
     else:
         status = "BLOCKED"
         blocking_gate = next((name for name, passed, _ in checkpoint_rows if not passed and name != "ready_package_progress_distinguishable"), "missing_safety_evidence")
