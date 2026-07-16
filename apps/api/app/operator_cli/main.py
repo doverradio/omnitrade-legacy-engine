@@ -25,6 +25,7 @@ from app.operator_cli.service import (
     activate_canonical_proving_campaign_bundle,
     bind_canonical_campaign_runtime,
     authorize_canonical_preview_package_bundle,
+    canonical_campaign_authority_audit,
     canonical_preview_package_history,
     canonical_preview_package_readiness,
     canonical_proving_activation_status,
@@ -88,6 +89,7 @@ def _build_parser() -> argparse.ArgumentParser:
             "  ./operator venue-commission-revoke --commissioning-run-id <run_uuid> --confirm --json\n"
             "  ./operator canonical-campaign-readiness --campaign-id <campaign_uuid> --campaign-version 1 --paper-account-id <paper_uuid> --live-trading-profile-id <profile_uuid> --provider kraken_spot --environment production --product BTC-USD --json\n"
             "  ./operator canonical-campaign-bind --campaign-id <campaign_uuid> --campaign-version 1 --paper-account-id <paper_uuid> --live-trading-profile-id <profile_uuid> --provider kraken_spot --environment production --product BTC-USD --actor operator:human --confirm --json\n"
+            "  ./operator canonical-campaign-authority-audit --campaign-id <campaign_uuid> --campaign-version 1 --cycle-id <cycle_uuid> --paper-account-id <paper_uuid> --live-trading-profile-id <profile_uuid> --provider kraken_spot --environment production --product BTC-USD --json\n"
             "  ./operator legacy-campaign-transition-readiness --legacy-campaign-id <legacy_uuid> --canonical-campaign-id <canonical_uuid> --canonical-campaign-version 1 --paper-account-id <paper_uuid> --live-trading-profile-id <profile_uuid> --provider kraken_spot --environment production --product BTC-USD --json\n"
             "  ./operator legacy-campaign-transition-execute --legacy-campaign-id <legacy_uuid> --canonical-campaign-id <canonical_uuid> --canonical-campaign-version 1 --paper-account-id <paper_uuid> --live-trading-profile-id <profile_uuid> --provider kraken_spot --environment production --product BTC-USD --actor operator:human --confirm --json\n"
             "  ./operator legacy-campaign-transition-audit --legacy-campaign-id <legacy_uuid> --json\n"
@@ -302,6 +304,22 @@ def _build_parser() -> argparse.ArgumentParser:
     canonical_audit.add_argument("--campaign-id", type=UUID, required=True)
     canonical_audit.add_argument("--limit", type=int, default=20)
     canonical_audit.add_argument("--json", action="store_true", dest="json_output")
+
+    canonical_authority = subparsers.add_parser(
+        "canonical-campaign-authority-audit",
+        parents=[common],
+        help="Read-only authority and identity audit for one canonical campaign and cycle",
+        description="Read-only canonical campaign authority audit using exact identities.",
+    )
+    canonical_authority.add_argument("--campaign-id", type=UUID, required=True)
+    canonical_authority.add_argument("--campaign-version", type=int, required=True)
+    canonical_authority.add_argument("--cycle-id", type=UUID, required=True)
+    canonical_authority.add_argument("--paper-account-id", type=UUID, required=True)
+    canonical_authority.add_argument("--live-trading-profile-id", type=UUID, required=True)
+    canonical_authority.add_argument("--provider", type=str, required=True)
+    canonical_authority.add_argument("--environment", type=str, required=True)
+    canonical_authority.add_argument("--product", type=str, required=True)
+    canonical_authority.add_argument("--json", action="store_true", dest="json_output")
 
     legacy_transition_readiness = subparsers.add_parser(
         "legacy-campaign-transition-readiness",
@@ -822,6 +840,19 @@ async def _run_async(args: argparse.Namespace) -> tuple[int, dict[str, Any], str
 
     if args.command == "canonical-campaign-binding-audit":
         payload = await fetch_canonical_campaign_binding_audit(campaign_id=args.campaign_id, limit=args.limit)
+        return 0, payload, render_json(payload)
+
+    if args.command == "canonical-campaign-authority-audit":
+        payload = await canonical_campaign_authority_audit(
+            campaign_id=args.campaign_id,
+            campaign_version=args.campaign_version,
+            cycle_id=args.cycle_id,
+            paper_account_id=args.paper_account_id,
+            live_trading_profile_id=args.live_trading_profile_id,
+            provider=args.provider,
+            environment=args.environment,
+            product_id=args.product,
+        )
         return 0, payload, render_json(payload)
 
     if args.command == "legacy-campaign-transition-readiness":

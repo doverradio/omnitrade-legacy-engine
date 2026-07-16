@@ -242,18 +242,33 @@ async def test_canonical_read_only_bundle_wrappers_do_not_commit(monkeypatch: py
     async def _fake_activation_status(**_kwargs):
         return {"activated": False}
 
+    async def _fake_authority_audit(**_kwargs):
+        return {"command": "canonical-campaign-authority-audit", "ok": True}
+
     monkeypatch.setattr(service, "get_canonical_preview_package", _fake_show)
     monkeypatch.setattr(service, "list_canonical_preview_package_history", _fake_history)
     monkeypatch.setattr(service, "get_canonical_proving_activation_status", _fake_activation_status)
+    monkeypatch.setattr(service, "run_canonical_campaign_authority_audit", _fake_authority_audit)
 
     show_payload = await service.show_canonical_preview_package_bundle(package_id=uuid4())
     readiness_payload = await service.canonical_preview_package_readiness(package_id=uuid4())
     history_payload = await service.canonical_preview_package_history(campaign_id=uuid4(), campaign_version=1, limit=5)
     status_payload = await service.canonical_proving_activation_status(package_id=uuid4())
+    authority_payload = await service.canonical_campaign_authority_audit(
+        campaign_id=uuid4(),
+        campaign_version=1,
+        cycle_id=uuid4(),
+        paper_account_id=uuid4(),
+        live_trading_profile_id=uuid4(),
+        provider="kraken_spot",
+        environment="production",
+        product_id="BTC-USD",
+    )
 
     assert show_payload["readiness"]["ready"] is True
     assert readiness_payload["readiness"]["ready"] is True
     assert history_payload["count"] == 0
     assert status_payload["activated"] is False
+    assert authority_payload["ok"] is True
     assert db.commits == 0
     assert db.rollbacks == 0

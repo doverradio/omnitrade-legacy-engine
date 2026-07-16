@@ -249,6 +249,90 @@ def test_parse_canonical_campaign_binding_commands() -> None:
     assert audit.json_output is True
 
 
+def test_parse_canonical_campaign_authority_audit_command() -> None:
+    args = parse_args([
+        "canonical-campaign-authority-audit",
+        "--campaign-id",
+        "e9a9e8e9-9574-498d-b49e-f011218c7f2b",
+        "--campaign-version",
+        "1",
+        "--cycle-id",
+        "ce8c5594-c39e-4634-945c-66ef0395a7c3",
+        "--paper-account-id",
+        "905a408c-7d8e-4fc7-ad3b-9ff637005d73",
+        "--live-trading-profile-id",
+        "9da09ae9-475e-41e8-b2c2-717ba5acfa3d",
+        "--provider",
+        "kraken_spot",
+        "--environment",
+        "production",
+        "--product",
+        "BTC-USD",
+        "--json",
+    ])
+    assert args.command == "canonical-campaign-authority-audit"
+    assert args.campaign_version == 1
+    assert args.json_output is True
+
+
+def test_parse_canonical_campaign_authority_audit_rejects_malformed_uuid() -> None:
+    with pytest.raises(SystemExit):
+        parse_args([
+            "canonical-campaign-authority-audit",
+            "--campaign-id",
+            "not-a-uuid",
+            "--campaign-version",
+            "1",
+            "--cycle-id",
+            "ce8c5594-c39e-4634-945c-66ef0395a7c3",
+            "--paper-account-id",
+            "905a408c-7d8e-4fc7-ad3b-9ff637005d73",
+            "--live-trading-profile-id",
+            "9da09ae9-475e-41e8-b2c2-717ba5acfa3d",
+            "--provider",
+            "kraken_spot",
+            "--environment",
+            "production",
+            "--product",
+            "BTC-USD",
+        ])
+
+
+@pytest.mark.asyncio
+async def test_run_async_routes_canonical_campaign_authority_audit(monkeypatch: pytest.MonkeyPatch) -> None:
+    args = parse_args([
+        "canonical-campaign-authority-audit",
+        "--campaign-id",
+        "e9a9e8e9-9574-498d-b49e-f011218c7f2b",
+        "--campaign-version",
+        "1",
+        "--cycle-id",
+        "ce8c5594-c39e-4634-945c-66ef0395a7c3",
+        "--paper-account-id",
+        "905a408c-7d8e-4fc7-ad3b-9ff637005d73",
+        "--live-trading-profile-id",
+        "9da09ae9-475e-41e8-b2c2-717ba5acfa3d",
+        "--provider",
+        "kraken_spot",
+        "--environment",
+        "production",
+        "--product",
+        "BTC-USD",
+        "--json",
+    ])
+
+    async def _fake_audit(**kwargs):
+        assert str(kwargs["cycle_id"]) == "ce8c5594-c39e-4634-945c-66ef0395a7c3"
+        return {"ok": True, "command": "canonical-campaign-authority-audit"}
+
+    monkeypatch.setattr(operator_main, "canonical_campaign_authority_audit", _fake_audit)
+    code, payload, text = await operator_main._run_async(args)
+
+    assert code == 0
+    assert payload["ok"] is True
+    assert "canonical-campaign-authority-audit" in text
+
+
 def test_parse_rejects_nonexistent_canonical_campaign_binding_status_command() -> None:
     with pytest.raises(SystemExit):
         parse_args([

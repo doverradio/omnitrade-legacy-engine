@@ -63,6 +63,10 @@ from app.services.canonical_preview_package import (
     revoke_canonical_proving_activation,
     run_dry_run_for_canonical_preview_package,
 )
+from app.services.canonical_campaign_authority_audit import (
+    CanonicalCampaignAuthorityAuditRequest,
+    run_canonical_campaign_authority_audit,
+)
 from app.services.capital_campaign_orchestration import (
     fetch_campaign_orchestration_history as _fetch_campaign_orchestration_history,
     fetch_campaign_orchestration_readiness as _fetch_campaign_orchestration_readiness,
@@ -2059,6 +2063,33 @@ async def fetch_canonical_campaign_binding_status(*, campaign_id: UUID, campaign
 async def fetch_canonical_campaign_binding_audit(*, campaign_id: UUID, limit: int = 20) -> dict[str, Any]:
     async with AsyncSessionLocal() as db:
         return await _fetch_canonical_campaign_binding_audit(db=db, campaign_id=campaign_id, limit=limit)
+
+
+async def canonical_campaign_authority_audit(
+    *,
+    campaign_id: UUID,
+    campaign_version: int,
+    cycle_id: UUID,
+    paper_account_id: UUID,
+    live_trading_profile_id: UUID,
+    provider: str,
+    environment: str,
+    product_id: str,
+) -> dict[str, Any]:
+    async with AsyncSessionLocal() as db:
+        return await run_canonical_campaign_authority_audit(
+            db=db,
+            request=CanonicalCampaignAuthorityAuditRequest(
+                campaign_id=campaign_id,
+                campaign_version=campaign_version,
+                cycle_id=cycle_id,
+                paper_account_id=paper_account_id,
+                live_trading_profile_id=live_trading_profile_id,
+                provider=provider,
+                environment=environment,
+                product=product_id,
+            ),
+        )
 
 
 async def create_canonical_preview_package_bundle(
