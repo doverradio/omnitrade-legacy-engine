@@ -39,6 +39,19 @@ class _FakeDb:
         return None
 
 
+class _CampaignSelectionDb:
+    def __init__(self, campaigns) -> None:
+        self._campaigns = list(campaigns)
+
+    async def execute(self, _statement):
+        rows = list(self._campaigns)
+        return SimpleNamespace(
+            scalars=lambda: SimpleNamespace(
+                all=lambda: rows,
+            )
+        )
+
+
 def _paper_account():
     return SimpleNamespace(id=uuid4(), starting_balance=Decimal("25"), is_active=True, asset_class="crypto")
 
@@ -82,6 +95,20 @@ def _asset():
 
 def _campaign(account_id):
     return SimpleNamespace(id=1, uuid=uuid4(), paper_account_id=account_id, created_at=datetime.now(timezone.utc))
+
+
+def _campaign_selection_row(*, campaign_id=None, account_id, exchange="kraken_spot", status="READY", pinned=True, definition_version=1, created_at=None, row_id=1):
+    campaign_uuid = campaign_id or uuid4()
+    return SimpleNamespace(
+        id=row_id,
+        uuid=campaign_uuid,
+        paper_account_id=account_id,
+        exchange=exchange,
+        status=status,
+        definition_campaign_id=campaign_uuid if pinned else None,
+        definition_version=definition_version if pinned else None,
+        created_at=created_at or datetime.now(timezone.utc),
+    )
 
 
 def _preview(connection_id):
@@ -616,6 +643,89 @@ async def test_environment_separation_for_asset_and_campaign(monkeypatch: pytest
     sandbox_asset = next(item for item in sandbox.items if item.key == "asset")
     assert production_asset.ready is False
     assert sandbox_asset.ready is True
+
+
+@pytest.mark.asyncio
+async def test_campaign_selection_prefers_ready_definition_pinned_over_archived_legacy() -> None:
+    account_id = uuid4()
+    archived_legacy = _campaign_selection_row(account_id=account_id, status="ARCHIVED", pinned=False, row_id=1)
+    ready_pinned = _campaign_selection_row(account_id=account_id, status="READY", pinned=True, row_id=2)
+    db = _CampaignSelectionDb([archived_legacy, ready_pinned])
+
+    selected = await service._load_campaign_for_account_exchange(db=db, paper_account_id=account_id, exchange="kraken_spot")
+
+    assert selected is not None
+    assert selected.id == ready_pinned.id
+
+
+@pytest.mark.asyncio
+async def test_campaign_selection_returns_none_when_only_archived_exists() -> None:
+    account_id = uuid4()
+    archived = _campaign_selection_row(account_id=account_id, status="ARCHIVED", pinned=True, row_id=1)
+    db = _CampaignSelectionDb([archived])
+
+    selected = await service._load_campaign_for_account_exchange(db=db, paper_account_id=account_id, exchange="kraken_spot")
+
+    assert selected is None
+
+
+@pytest.mark.asyncio
+async def test_campaign_selection_fails_closed_on_multiple_ready_equal_candidates() -> None:
+    account_id = uuid4()
+    first = _campaign_selection_row(account_id=account_id, status="READY", pinned=True, row_id=1)
+    second = _campaign_selection_row(account_id=account_id, status="READY", pinned=True, row_id=2)
+    db = _CampaignSelectionDb([first, second])
+
+    selected = await service._load_campaign_for_account_exchange(db=db, paper_account_id=account_id, exchange="kraken_spot")
+
+    assert selected is None
+
+
+@pytest.mark.asyncio
+async def test_campaign_selection_prefers_definition_pinned_over_unbound_ready() -> None:
+    account_id = uuid4()
+    unbound_ready = _campaign_selection_row(account_id=account_id, status="READY", pinned=False, row_id=1)
+    pinned_ready = _campaign_selection_row(account_id=account_id, status="READY", pinned=True, row_id=2)
+    db = _CampaignSelectionDb([unbound_ready, pinned_ready])
+
+    selected = await service._load_campaign_for_account_exchange(db=db, paper_account_id=account_id, exchange="kraken_spot")
+
+    assert selected is not None
+    assert selected.id == pinned_ready.id
+
+
+@pytest.mark.asyncio
+async def test_campaign_selection_rejects_wrong_account_campaigns() -> None:
+    target_account = uuid4()
+    other_account = uuid4()
+    wrong_account_campaign = _campaign_selection_row(account_id=other_account, status="READY", pinned=True, row_id=1)
+    db = _CampaignSelectionDb([wrong_account_campaign])
+
+    selected = await service._load_campaign_for_account_exchange(db=db, paper_account_id=target_account, exchange="kraken_spot")
+
+    assert selected is None
+
+
+@pytest.mark.asyncio
+async def test_campaign_selection_is_deterministic_across_input_order() -> None:
+    account_id = uuid4()
+    ready_pinned = _campaign_selection_row(account_id=account_id, status="READY", pinned=True, row_id=11)
+    draft_pinned = _campaign_selection_row(account_id=account_id, status="DRAFT", pinned=True, row_id=22)
+
+    selected_a = await service._load_campaign_for_account_exchange(
+        db=_CampaignSelectionDb([ready_pinned, draft_pinned]),
+        paper_account_id=account_id,
+        exchange="kraken_spot",
+    )
+    selected_b = await service._load_campaign_for_account_exchange(
+        db=_CampaignSelectionDb([draft_pinned, ready_pinned]),
+        paper_account_id=account_id,
+        exchange="kraken_spot",
+    )
+
+    assert selected_a is not None
+    assert selected_b is not None
+    assert selected_a.id == selected_b.id == ready_pinned.id
 
 
 @pytest.mark.asyncio

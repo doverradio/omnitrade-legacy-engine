@@ -41,6 +41,12 @@ from app.services.live.registration import register_live_account
 
 DEFAULT_PRODUCTION_CRYPTO_PAPER_ACCOUNT_ID = UUID("905a408c-7d8e-4fc7-ad3b-9ff637005d73")
 _READY_CONNECTION_VERDICTS = {"READY_FOR_PREVIEW", "READY_FOR_DRY_RUN", "READY_FOR_OPERATOR_REVIEW", "INITIALIZED_BUT_UNFUNDED"}
+_CAMPAIGN_SELECTION_STATUS_PRIORITY: dict[str, int] = {
+    "RUNNING": 40,
+    "READY": 30,
+    "PAUSED": 20,
+    "DRAFT": 10,
+}
 
 
 def _annotate_failure_stage(exc: Exception, *, stage: str) -> None:
@@ -463,13 +469,55 @@ async def _load_campaign_for_account(*, db: AsyncSession, paper_account_id: UUID
     raise RuntimeError("_load_campaign_for_account requires explicit exchange label")
 
 
+def _campaign_is_definition_pinned(campaign: CapitalCampaign) -> bool:
+    if campaign.definition_campaign_id is None or campaign.definition_version is None:
+        return False
+    return campaign.definition_campaign_id == campaign.uuid
+
+
+def _campaign_selection_rank(campaign: CapitalCampaign) -> tuple[int, int]:
+    pinned = 1 if _campaign_is_definition_pinned(campaign) else 0
+    status_priority = _CAMPAIGN_SELECTION_STATUS_PRIORITY.get(str(campaign.status or "").upper(), 0)
+    return pinned, status_priority
+
+
 async def _load_campaign_for_account_exchange(*, db: AsyncSession, paper_account_id: UUID | None, exchange: str) -> CapitalCampaign | None:
     if paper_account_id is None:
         return None
+    if hasattr(db, "execute"):
+        rows = (
+            (
+                await db.execute(
+                    select(CapitalCampaign)
+                    .where(CapitalCampaign.paper_account_id == paper_account_id)
+                    .where(CapitalCampaign.exchange == exchange)
+                    .where(CapitalCampaign.status != "ARCHIVED")
+                    .order_by(CapitalCampaign.created_at.desc(), CapitalCampaign.id.desc())
+                )
+            )
+            .scalars()
+            .all()
+        )
+        candidates = [
+            item
+            for item in rows
+            if item.paper_account_id == paper_account_id and item.exchange == exchange and str(item.status or "").upper() != "ARCHIVED"
+        ]
+        if not candidates:
+            return None
+
+        best_rank = max(_campaign_selection_rank(item) for item in candidates)
+        top = [item for item in candidates if _campaign_selection_rank(item) == best_rank]
+        if len(top) != 1:
+            # Multiple equally valid candidates are ambiguous; fail closed.
+            return None
+        return top[0]
+
     return await db.scalar(
         select(CapitalCampaign)
         .where(CapitalCampaign.paper_account_id == paper_account_id)
         .where(CapitalCampaign.exchange == exchange)
+        .where(CapitalCampaign.status != "ARCHIVED")
         .order_by(CapitalCampaign.created_at.desc(), CapitalCampaign.id.desc())
         .limit(1)
     )

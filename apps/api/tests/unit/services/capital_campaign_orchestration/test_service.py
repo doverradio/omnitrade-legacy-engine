@@ -168,6 +168,67 @@ async def test_campaign_readiness_blocks_legacy_compounding_policy_without_polic
 
 
 @pytest.mark.asyncio
+async def test_campaign_snapshot_recognizes_legacy_top_level_commissioned_metadata() -> None:
+    definition = SimpleNamespace(
+        campaign_id=UUID("aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa"),
+        version=1,
+        status="READY",
+        owner_identity="operator:human",
+        capital_budget=Decimal("25"),
+        remaining_unallocated_capital=Decimal("25"),
+        maximum_position_size=Decimal("5"),
+        maximum_total_exposure=Decimal("5"),
+        allowed_instruments=["BTC-USD"],
+        allowed_venues=["kraken_spot"],
+        compounding_policy={"policy_type": "REINVEST_ALL_NET_PROFIT"},
+        metadata_evidence={
+            "state": "READY",
+            "authority_metadata": {"commissioned_by": "operator:eric"},
+        },
+    )
+    runtime = SimpleNamespace(id=7, exchange="kraken_spot", paper_account_id=None, updated_at=datetime.now(timezone.utc), uuid=definition.campaign_id)
+
+    payload = await fetch_campaign_orchestration_readiness(
+        db=_OrchestrationReadOnlyDb(definition=definition, runtime=runtime, asset=None),
+        campaign_id=definition.campaign_id,
+        version=definition.version,
+    )
+
+    snapshot = payload["items"][0]["campaign_snapshot"]
+    assert snapshot["commissioned_metadata_present"] is True
+    assert snapshot["commissioned_metadata_shape"] == "legacy_top_level_commissioned_fields"
+
+
+@pytest.mark.asyncio
+async def test_campaign_snapshot_does_not_treat_unrelated_metadata_as_commissioned() -> None:
+    definition = SimpleNamespace(
+        campaign_id=UUID("aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa"),
+        version=1,
+        status="READY",
+        owner_identity="operator:human",
+        capital_budget=Decimal("25"),
+        remaining_unallocated_capital=Decimal("25"),
+        maximum_position_size=Decimal("5"),
+        maximum_total_exposure=Decimal("5"),
+        allowed_instruments=["BTC-USD"],
+        allowed_venues=["kraken_spot"],
+        compounding_policy={"policy_type": "REINVEST_ALL_NET_PROFIT"},
+        metadata_evidence={"dedicated_proving_account": {"paper_account_id": "x"}},
+    )
+    runtime = SimpleNamespace(id=7, exchange="kraken_spot", paper_account_id=None, updated_at=datetime.now(timezone.utc), uuid=definition.campaign_id)
+
+    payload = await fetch_campaign_orchestration_readiness(
+        db=_OrchestrationReadOnlyDb(definition=definition, runtime=runtime, asset=None),
+        campaign_id=definition.campaign_id,
+        version=definition.version,
+    )
+
+    snapshot = payload["items"][0]["campaign_snapshot"]
+    assert snapshot["commissioned_metadata_present"] is False
+    assert snapshot["commissioned_metadata_shape"] is None
+
+
+@pytest.mark.asyncio
 async def test_campaign_status_and_history_surface_legacy_policy_blocker_without_validation_failure() -> None:
     campaign_id = UUID("aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa")
     definition = SimpleNamespace(

@@ -22,6 +22,18 @@ from app.schemas.capital_campaign_domain import (
 )
 
 _COMMISSIONED_STATE_KEY = "commissioned_seed_campaign"
+_LEGACY_COMMISSIONED_METADATA_KEYS = {
+    "state",
+    "authority_metadata",
+    "evidence_metadata",
+    "transition_history",
+    "seen_idempotency_keys",
+    "commissioning",
+    "entry_execution",
+    "ownership_reconciliation",
+    "exit_recommendation",
+    "operator_control",
+}
 _CONTROL_ACTION_ALLOWED_SOURCE_STATES: dict[str, set[str]] = {
     "acknowledge": {"RECONCILIATION_REQUIRED", "MANUAL_REVIEW_REQUIRED", "ACTIVE_POSITION", "BUY_RECONCILIATION_PENDING", "SELL_RECONCILIATION_PENDING"},
     "pause": {"READY", "COMMISSIONED", "BUY_PENDING", "BUY_SUBMITTED", "BUY_RECONCILIATION_PENDING", "ACTIVE_POSITION", "SELL_EVALUATION"},
@@ -39,6 +51,9 @@ def _read_commissioned_blob(*, definition: CapitalCampaignDefinition) -> dict[st
     blob = metadata.get(_COMMISSIONED_STATE_KEY)
     if isinstance(blob, dict):
         return blob
+    # Backward compatibility for legacy commissioned metadata written at top-level.
+    if any(key in metadata for key in _LEGACY_COMMISSIONED_METADATA_KEYS):
+        return {key: metadata.get(key) for key in _LEGACY_COMMISSIONED_METADATA_KEYS if key in metadata}
     return {}
 
 
@@ -318,8 +333,11 @@ async def get_commissioned_control_plane_status(
 
     blockers: list[str] = []
     warnings: list[str] = []
+    has_commissioned_metadata = bool(blob)
     ownership_blockers = ownership.get("blockers") if isinstance(ownership.get("blockers"), list) else []
     blockers.extend(str(item) for item in ownership_blockers)
+    if not has_commissioned_metadata and str(definition.status or "").upper() == "READY" and str(runtime.status or "").upper() == "READY":
+        blockers.append("commissioned_state_metadata_missing_for_ready_campaign")
     if state in {"RECONCILIATION_REQUIRED", "MANUAL_REVIEW_REQUIRED", "FAILED_CLOSED"}:
         blockers.append(f"state:{state}")
     if not production_eligible:

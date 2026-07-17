@@ -346,3 +346,73 @@ async def test_control_plane_status_renders_audit_rows_in_deterministic_order(mo
     assert result.audit_summary["latest"][0]["action"] == "newer_action"
     audit_events = [item for item in result.campaign_timeline if item.get("kind") == "audit"]
     assert [item["action"] for item in audit_events] == ["older_action", "newer_action"]
+
+
+@pytest.mark.asyncio
+async def test_control_plane_status_supports_legacy_top_level_commissioned_metadata(monkeypatch: pytest.MonkeyPatch) -> None:
+    campaign_id = uuid4()
+    definition = _definition(campaign_id, version=1)
+    definition.metadata_evidence = {
+        "state": "READY",
+        "commissioning": {
+            "commissioning_identity": "legacy-identity",
+            "commissioned_by": "operator:legacy",
+            "authority_classification": "OPERATOR_COMMISSIONED",
+            "strategy_signal_classification": "NOT_REQUIRED_FOR_COMMISSIONED_ENTRY",
+        },
+    }
+    runtime = SimpleNamespace(uuid=campaign_id, status="READY")
+
+    async def _load_def_runtime(**_kwargs):
+        return definition, runtime
+
+    async def _load_decision(**_kwargs):
+        return None
+
+    async def _load_risk(**_kwargs):
+        return None
+
+    async def _load_audit(**_kwargs):
+        return []
+
+    monkeypatch.setattr(control_plane, "_load_definition_and_runtime", _load_def_runtime)
+    monkeypatch.setattr(control_plane, "_load_decision_summary", _load_decision)
+    monkeypatch.setattr(control_plane, "_load_risk_summary", _load_risk)
+    monkeypatch.setattr(control_plane, "_load_audit_rows", _load_audit)
+
+    result = await control_plane.get_commissioned_control_plane_status(db=_FakeDb(), campaign_id=campaign_id, version=1)
+
+    assert result.state == "READY"
+    assert result.commissioning_status["commissioning_identity"] == "legacy-identity"
+    assert "commissioned_state_metadata_missing_for_ready_campaign" not in result.blockers
+
+
+@pytest.mark.asyncio
+async def test_control_plane_status_fails_closed_when_ready_without_commissioned_metadata(monkeypatch: pytest.MonkeyPatch) -> None:
+    campaign_id = uuid4()
+    definition = _definition(campaign_id, version=1)
+    definition.metadata_evidence = {"dedicated_proving_account": {"paper_account_id": "abc"}}
+    runtime = SimpleNamespace(uuid=campaign_id, status="READY")
+    definition.status = "READY"
+
+    async def _load_def_runtime(**_kwargs):
+        return definition, runtime
+
+    async def _load_decision(**_kwargs):
+        return None
+
+    async def _load_risk(**_kwargs):
+        return None
+
+    async def _load_audit(**_kwargs):
+        return []
+
+    monkeypatch.setattr(control_plane, "_load_definition_and_runtime", _load_def_runtime)
+    monkeypatch.setattr(control_plane, "_load_decision_summary", _load_decision)
+    monkeypatch.setattr(control_plane, "_load_risk_summary", _load_risk)
+    monkeypatch.setattr(control_plane, "_load_audit_rows", _load_audit)
+
+    result = await control_plane.get_commissioned_control_plane_status(db=_FakeDb(), campaign_id=campaign_id, version=1)
+
+    assert result.state == "DRAFT"
+    assert "commissioned_state_metadata_missing_for_ready_campaign" in result.blockers

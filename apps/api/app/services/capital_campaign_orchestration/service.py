@@ -25,6 +25,19 @@ _READINESS_ELIGIBLE_STATUSES = {"DRAFT", "READY", "ACTIVE", "PAUSED"}
 _SUPPORTED_TRIGGER_PROVIDER = "kraken_spot"
 _SUPPORTED_TRIGGER_PRODUCT = "BTC-USD"
 _SUPPORTED_TRIGGER_INTERVAL = "15m"
+_COMMISSIONED_BLOB_KEY = "commissioned_seed_campaign"
+_LEGACY_COMMISSIONED_METADATA_KEYS = {
+    "state",
+    "authority_metadata",
+    "evidence_metadata",
+    "transition_history",
+    "seen_idempotency_keys",
+    "commissioning",
+    "entry_execution",
+    "ownership_reconciliation",
+    "exit_recommendation",
+    "operator_control",
+}
 
 
 def _assess_compounding_policy(raw_policy: Any) -> dict[str, Any]:
@@ -66,6 +79,17 @@ def _assess_compounding_policy(raw_policy: Any) -> dict[str, Any]:
     }
 
 
+def _commissioned_metadata_shape(metadata: Any) -> tuple[bool, str | None]:
+    if not isinstance(metadata, dict):
+        return False, None
+    nested = metadata.get(_COMMISSIONED_BLOB_KEY)
+    if isinstance(nested, dict):
+        return True, "nested_commissioned_seed_campaign"
+    if any(key in metadata for key in _LEGACY_COMMISSIONED_METADATA_KEYS):
+        return True, "legacy_top_level_commissioned_fields"
+    return False, None
+
+
 async def _load_runtime_for_definition(*, db: AsyncSession, campaign_id: UUID) -> CapitalCampaign | None:
     return await db.scalar(
         select(CapitalCampaign)
@@ -87,6 +111,7 @@ async def _load_btc_asset_for_provider(*, db: AsyncSession) -> Asset | None:
 
 
 def _build_campaign_snapshot(*, definition: CapitalCampaignDefinition, runtime: CapitalCampaign | None, asset: Asset | None, policy_assessment: dict[str, Any]) -> dict[str, Any]:
+    commissioned_metadata_present, commissioned_metadata_shape = _commissioned_metadata_shape(definition.metadata_evidence)
     return {
         "campaign_id": str(definition.campaign_id),
         "version": definition.version,
@@ -101,7 +126,8 @@ def _build_campaign_snapshot(*, definition: CapitalCampaignDefinition, runtime: 
         "maximum_total_exposure": format(Decimal(str(definition.maximum_total_exposure)), "f"),
         "allowed_venues": list(definition.allowed_venues or []),
         "allowed_instruments": list(definition.allowed_instruments or []),
-        "commissioned_metadata_present": isinstance((definition.metadata_evidence or {}).get("commissioned_seed_campaign"), dict),
+        "commissioned_metadata_present": commissioned_metadata_present,
+        "commissioned_metadata_shape": commissioned_metadata_shape,
         "linked_asset": None
         if asset is None
         else {
