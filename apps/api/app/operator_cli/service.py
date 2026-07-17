@@ -94,7 +94,12 @@ from app.services.capital_campaign_orchestration import (
 )
 from app.services.capital_campaign_orchestration.service import _eligible_for_orchestration
 from app.services.capital_campaign_domain.service import list_campaign_definitions as _list_campaign_definitions
+from app.services.capital_campaign_domain.commissioned_control_plane import (
+    get_commissioned_control_plane_status as _get_commissioned_control_plane_status,
+    mutate_commissioned_control_plane as _mutate_commissioned_control_plane,
+)
 from app.services.exchange_connections import refresh_exchange_balances as _refresh_exchange_balances
+from app.schemas.capital_campaign_domain import CommissionedControlPlaneMutationRequest
 from app.services.paper.accounting import build_account_snapshot
 from app.services.risk import risk_monitor
 from app.services.risk.equity_evidence import resolve_equity_risk_evidence
@@ -3573,6 +3578,34 @@ async def fetch_campaign_orchestration_status(*, campaign_id: UUID, version: int
 async def fetch_campaign_orchestration_history(*, campaign_id: UUID, version: int | None, limit: int) -> dict[str, Any]:
     async with AsyncSessionLocal() as db:
         return await _fetch_campaign_orchestration_history(db=db, campaign_id=campaign_id, version=version, limit=limit)
+
+
+async def fetch_commissioned_control_plane_status(*, campaign_id: UUID, version: int) -> dict[str, Any]:
+    async with AsyncSessionLocal() as db:
+        result = await _get_commissioned_control_plane_status(db=db, campaign_id=campaign_id, version=version)
+        return result.model_dump(mode="json")
+
+
+async def mutate_commissioned_control_plane_action(
+    *,
+    campaign_id: UUID,
+    version: int,
+    actor: str,
+    action: str,
+    idempotency_key: str,
+    reason: str | None,
+) -> dict[str, Any]:
+    request = CommissionedControlPlaneMutationRequest(
+        campaign_id=campaign_id,
+        version=version,
+        actor=actor,
+        action=action,
+        idempotency_key=idempotency_key,
+        reason=reason,
+    )
+    async with AsyncSessionLocal() as db:
+        result = await _mutate_commissioned_control_plane(db=db, request=request)
+        return result.model_dump(mode="json")
 
 
 async def fetch_candle_readiness(

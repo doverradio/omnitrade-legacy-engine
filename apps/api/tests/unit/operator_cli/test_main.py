@@ -181,6 +181,195 @@ def test_parse_campaign_orchestration_commands() -> None:
     assert history.limit == 5
 
 
+def test_parse_commissioned_control_plane_commands() -> None:
+    status_args = parse_args([
+        "commissioned-control-plane-status",
+        "--campaign-id",
+        "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa",
+        "--version",
+        "3",
+        "--json",
+    ])
+    assert status_args.command == "commissioned-control-plane-status"
+    assert status_args.version == 3
+    assert status_args.json_output is True
+
+    action_args = parse_args([
+        "commissioned-control-plane-action",
+        "--campaign-id",
+        "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa",
+        "--version",
+        "3",
+        "--action",
+        "pause",
+        "--idempotency-key",
+        "control-idem-1",
+        "--reason",
+        "manual check",
+    ])
+    assert action_args.command == "commissioned-control-plane-action"
+    assert action_args.action == "pause"
+    assert action_args.idempotency_key == "control-idem-1"
+
+
+@pytest.mark.asyncio
+async def test_run_commissioned_control_plane_status_command_uses_shared_service(monkeypatch: pytest.MonkeyPatch) -> None:
+    expected_payload = {
+        "campaign_id": "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa",
+        "version": 3,
+        "state": "ACTIVE_POSITION",
+        "readiness": {"available": False},
+        "preview": {"preview_identity_hash": "preview-1", "preview_expires_at": "2026-07-20T00:00:00+00:00"},
+        "commissioning_status": {"commissioning_identity": "commission-1"},
+        "lifecycle_recommendation": {"recommendation_type": "HOLD_FOR_PROFIT"},
+        "active_position_summary": {"ownership_proven": True},
+        "reconciliation_status": {
+            "buy_reconciliation": {"status": "reconciled"},
+            "sell_reconciliation": {"status": "not_applicable_recommendation_only"},
+        },
+        "decision_record_summary": {"entry": {"decision_id": "dec-1"}},
+        "risk_engine_summary": {"entry": {"risk_event_id": "risk-1"}},
+        "audit_summary": {"count": 1},
+        "pending_operator_actions": ["pause", "cancel", "acknowledge"],
+        "campaign_timeline": [],
+        "campaign_history": {},
+        "dry_run_status": {"status": "DRY_RUN_READY"},
+        "future_production_activation_eligibility": {"eligible": True},
+        "blockers": [],
+        "warnings": [],
+        "read_only": True,
+        "no_execution": True,
+        "generated_at": "2026-07-14T12:00:00+00:00",
+    }
+
+    async def _status_stub(**_kwargs):
+        return expected_payload
+
+    monkeypatch.setattr(operator_main, "fetch_commissioned_control_plane_status", _status_stub)
+
+    args = parse_args([
+        "commissioned-control-plane-status",
+        "--campaign-id",
+        "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa",
+        "--version",
+        "3",
+        "--json",
+    ])
+    code, payload, rendered = await operator_main._run_async(args)
+
+    assert code == 0
+    assert payload == expected_payload
+    assert "\"campaign_id\": \"aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa\"" in rendered
+    assert "\"no_execution\": true" in rendered
+
+
+@pytest.mark.asyncio
+async def test_run_commissioned_control_plane_action_command_uses_shared_service(monkeypatch: pytest.MonkeyPatch) -> None:
+    expected_payload = {
+        "campaign_id": "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa",
+        "version": 3,
+        "action": "pause",
+        "accepted": True,
+        "replayed": False,
+        "state": "ACTIVE_POSITION",
+        "operator_control": {"paused": True, "cancelled": False},
+        "pending_operator_actions": ["resume", "cancel", "acknowledge"],
+        "no_execution": True,
+        "updated_at": "2026-07-14T12:01:00+00:00",
+        "blockers": [],
+    }
+
+    observed: dict[str, str] = {}
+
+    async def _action_stub(**kwargs):
+        observed.update({
+            "action": kwargs["action"],
+            "idempotency_key": kwargs["idempotency_key"],
+            "actor": kwargs["actor"],
+        })
+        return expected_payload
+
+    monkeypatch.setattr(operator_main, "mutate_commissioned_control_plane_action", _action_stub)
+
+    args = parse_args([
+        "commissioned-control-plane-action",
+        "--campaign-id",
+        "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa",
+        "--version",
+        "3",
+        "--action",
+        "pause",
+        "--idempotency-key",
+        "ctrl-idem-1",
+        "--actor",
+        "operator:human",
+        "--json",
+    ])
+    code, payload, rendered = await operator_main._run_async(args)
+
+    assert code == 0
+    assert payload == expected_payload
+    assert observed == {
+        "action": "pause",
+        "idempotency_key": "ctrl-idem-1",
+        "actor": "operator:human",
+    }
+    assert "\"accepted\": true" in rendered
+
+
+@pytest.mark.asyncio
+async def test_rest_cli_control_plane_payload_semantics_equivalent(monkeypatch: pytest.MonkeyPatch) -> None:
+    shared_payload = {
+        "campaign_id": "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa",
+        "version": 3,
+        "state": "ACTIVE_POSITION",
+        "readiness": {"available": False},
+        "preview": {"preview_identity_hash": "preview-1", "preview_expires_at": "2026-07-20T00:00:00+00:00"},
+        "commissioning_status": {"commissioning_identity": "commission-1"},
+        "lifecycle_recommendation": {"recommendation_type": "HOLD_FOR_PROFIT"},
+        "active_position_summary": {"ownership_proven": True},
+        "reconciliation_status": {
+            "buy_reconciliation": {"status": "reconciled"},
+            "sell_reconciliation": {"status": "not_applicable_recommendation_only"},
+        },
+        "decision_record_summary": {"entry": {"decision_id": "dec-1"}},
+        "risk_engine_summary": {"entry": {"risk_event_id": "risk-1"}},
+        "audit_summary": {"count": 1},
+        "pending_operator_actions": ["pause", "cancel", "acknowledge"],
+        "campaign_timeline": [],
+        "campaign_history": {},
+        "dry_run_status": {"status": "DRY_RUN_READY"},
+        "future_production_activation_eligibility": {"eligible": True},
+        "blockers": [],
+        "warnings": [],
+        "read_only": True,
+        "no_execution": True,
+        "generated_at": "2026-07-14T12:00:00+00:00",
+    }
+
+    async def _status_stub(**_kwargs):
+        return shared_payload
+
+    monkeypatch.setattr(operator_main, "fetch_commissioned_control_plane_status", _status_stub)
+    args = parse_args([
+        "commissioned-control-plane-status",
+        "--campaign-id",
+        "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa",
+        "--version",
+        "3",
+        "--json",
+    ])
+    _, cli_payload, _ = await operator_main._run_async(args)
+
+    assert cli_payload["campaign_id"] == shared_payload["campaign_id"]
+    assert cli_payload["version"] == shared_payload["version"]
+    assert cli_payload["state"] == shared_payload["state"]
+    assert cli_payload["preview"]["preview_identity_hash"] == shared_payload["preview"]["preview_identity_hash"]
+    assert cli_payload["reconciliation_status"]["buy_reconciliation"]["status"] == shared_payload["reconciliation_status"]["buy_reconciliation"]["status"]
+    assert cli_payload["reconciliation_status"]["sell_reconciliation"]["status"] == shared_payload["reconciliation_status"]["sell_reconciliation"]["status"]
+    assert cli_payload["no_execution"] is True
+
+
 def test_parse_execution_forensics_command_selectors() -> None:
     latest = parse_args([
         "execution-forensics",

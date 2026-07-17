@@ -6,12 +6,15 @@ from uuid import UUID
 
 from fastapi.testclient import TestClient
 
+from app.core.errors import InvalidRequestError
 from app.db.session import get_db
 from app.main import create_app
 from app.schemas.capital_campaign_domain import (
     CampaignAccountingState,
     CampaignCompoundingPolicy,
     CampaignProfitDistributionPolicy,
+    CommissionedControlPlaneMutationResponse,
+    CommissionedControlPlaneStatusResponse,
     CapitalCampaignDefinitionListResponse,
     CapitalCampaignDefinitionResponse,
     CapitalCampaignPreviewResponse,
@@ -112,6 +115,53 @@ def _client() -> TestClient:
     return TestClient(app)
 
 
+def _commissioned_status_response() -> CommissionedControlPlaneStatusResponse:
+    return CommissionedControlPlaneStatusResponse(
+        campaign_id=UUID("11111111-1111-1111-1111-111111111111"),
+        version=1,
+        state="ACTIVE_POSITION",
+        readiness={"available": False},
+        preview={"available": False, "preview_identity_hash": "preview-1", "preview_expires_at": "2026-07-20T00:00:00+00:00"},
+        commissioning_status={"commissioning_identity": "seed-1"},
+        lifecycle_recommendation={"recommendation_type": "HOLD_FOR_PROFIT"},
+        active_position_summary={"ownership_proven": True},
+        reconciliation_status={
+            "campaign_state": "ACTIVE_POSITION",
+            "buy_reconciliation": {"status": "reconciled"},
+            "sell_reconciliation": {"status": "not_applicable_recommendation_only"},
+        },
+        decision_record_summary={},
+        risk_engine_summary={},
+        audit_summary={"count": 1},
+        pending_operator_actions=["pause", "cancel", "acknowledge"],
+        campaign_timeline=[],
+        campaign_history={},
+        dry_run_status={"has_live_order": False},
+        future_production_activation_eligibility={"eligible": True},
+        blockers=[],
+        warnings=[],
+        read_only=True,
+        no_execution=True,
+        generated_at=datetime(2026, 7, 14, tzinfo=timezone.utc),
+    )
+
+
+def _commissioned_action_response() -> CommissionedControlPlaneMutationResponse:
+    return CommissionedControlPlaneMutationResponse(
+        campaign_id=UUID("11111111-1111-1111-1111-111111111111"),
+        version=1,
+        action="pause",
+        accepted=True,
+        replayed=False,
+        state="ACTIVE_POSITION",
+        operator_control={"paused": True, "cancelled": False},
+        pending_operator_actions=["resume", "cancel", "acknowledge"],
+        no_execution=True,
+        updated_at=datetime(2026, 7, 14, tzinfo=timezone.utc),
+        blockers=[],
+    )
+
+
 def test_domain_routes_shape(monkeypatch) -> None:
     async def _create_stub(*_args, **_kwargs):
         return _campaign_response()
@@ -125,10 +175,18 @@ def test_domain_routes_shape(monkeypatch) -> None:
     async def _preview_stub(*_args, **_kwargs):
         return _preview_response()
 
+    async def _commissioned_status_stub(*_args, **_kwargs):
+        return _commissioned_status_response()
+
+    async def _commissioned_action_stub(*_args, **_kwargs):
+        return _commissioned_action_response()
+
     monkeypatch.setattr("app.api.routes.capital_campaigns.create_campaign_draft", _create_stub)
     monkeypatch.setattr("app.api.routes.capital_campaigns.get_campaign_definition", _get_stub)
     monkeypatch.setattr("app.api.routes.capital_campaigns.list_campaign_definitions", _list_stub)
     monkeypatch.setattr("app.api.routes.capital_campaigns.preview_campaign_definition", _preview_stub)
+    monkeypatch.setattr("app.api.routes.capital_campaigns.get_commissioned_control_plane_status", _commissioned_status_stub)
+    monkeypatch.setattr("app.api.routes.capital_campaigns.mutate_commissioned_control_plane", _commissioned_action_stub)
 
     with _client() as client:
         created = client.post(
@@ -200,6 +258,114 @@ def test_domain_routes_shape(monkeypatch) -> None:
             },
         )
         assert explain.status_code == 200
+
+        commissioned_status = client.get(
+            "/capital-campaigns/domain/11111111-1111-1111-1111-111111111111/commissioned/control-plane/status?version=1"
+        )
+        assert commissioned_status.status_code == 200
+        assert commissioned_status.json()["no_execution"] is True
+        assert commissioned_status.json()["preview"]["preview_identity_hash"] == "preview-1"
+        assert commissioned_status.json()["preview"]["preview_expires_at"] == "2026-07-20T00:00:00+00:00"
+        assert commissioned_status.json()["reconciliation_status"]["buy_reconciliation"]["status"] == "reconciled"
+        assert commissioned_status.json()["reconciliation_status"]["sell_reconciliation"]["status"] == "not_applicable_recommendation_only"
+        assert commissioned_status.json()["blockers"] == []
+        assert commissioned_status.json()["warnings"] == []
+
+        commissioned_action = client.post(
+            "/capital-campaigns/domain/11111111-1111-1111-1111-111111111111/commissioned/control-plane/actions",
+            json={
+                "campaign_id": "11111111-1111-1111-1111-111111111111",
+                "version": 1,
+                "actor": "operator:human",
+                "action": "pause",
+                "idempotency_key": "ctrl-idem-1",
+                "reason": "manual risk check",
+            },
+        )
+        assert commissioned_action.status_code == 200
+        assert commissioned_action.json()["accepted"] is True
+
+
+def test_commissioned_control_plane_action_rejects_campaign_id_mismatch() -> None:
+    with _client() as client:
+        response = client.post(
+            "/capital-campaigns/domain/11111111-1111-1111-1111-111111111111/commissioned/control-plane/actions",
+            json={
+                "campaign_id": "22222222-2222-2222-2222-222222222222",
+                "version": 1,
+                "actor": "operator:human",
+                "action": "pause",
+                "idempotency_key": "ctrl-idem-2",
+                "reason": "manual risk check",
+            },
+        )
+    assert response.status_code == 400
+
+
+def test_commissioned_control_plane_action_idempotency_replay(monkeypatch) -> None:
+    calls = {"count": 0}
+
+    async def _mutation_stub(*_args, **_kwargs):
+        calls["count"] += 1
+        replayed = calls["count"] > 1
+        return CommissionedControlPlaneMutationResponse(
+            campaign_id=UUID("11111111-1111-1111-1111-111111111111"),
+            version=1,
+            action="pause",
+            accepted=True,
+            replayed=replayed,
+            state="ACTIVE_POSITION",
+            operator_control={"paused": True, "cancelled": False},
+            pending_operator_actions=["resume", "cancel", "acknowledge"],
+            no_execution=True,
+            updated_at=datetime(2026, 7, 14, tzinfo=timezone.utc),
+            blockers=[],
+        )
+
+    monkeypatch.setattr("app.api.routes.capital_campaigns.mutate_commissioned_control_plane", _mutation_stub)
+
+    body = {
+        "campaign_id": "11111111-1111-1111-1111-111111111111",
+        "version": 1,
+        "actor": "operator:human",
+        "action": "pause",
+        "idempotency_key": "ctrl-idem-replay",
+        "reason": "manual risk check",
+    }
+
+    with _client() as client:
+        first = client.post("/capital-campaigns/domain/11111111-1111-1111-1111-111111111111/commissioned/control-plane/actions", json=body)
+        second = client.post("/capital-campaigns/domain/11111111-1111-1111-1111-111111111111/commissioned/control-plane/actions", json=body)
+
+    assert first.status_code == 200
+    assert first.json()["replayed"] is False
+    assert second.status_code == 200
+    assert second.json()["replayed"] is True
+
+
+def test_commissioned_control_plane_action_changed_intent_same_key_fails_closed(monkeypatch) -> None:
+    async def _mutation_stub(*_args, **_kwargs):
+        raise InvalidRequestError(
+            message="Changed-intent idempotency key reuse is not allowed",
+            details={"idempotency_key": "ctrl-idem-replay"},
+        )
+
+    monkeypatch.setattr("app.api.routes.capital_campaigns.mutate_commissioned_control_plane", _mutation_stub)
+
+    with _client() as client:
+        response = client.post(
+            "/capital-campaigns/domain/11111111-1111-1111-1111-111111111111/commissioned/control-plane/actions",
+            json={
+                "campaign_id": "11111111-1111-1111-1111-111111111111",
+                "version": 1,
+                "actor": "operator:human",
+                "action": "resume",
+                "idempotency_key": "ctrl-idem-replay",
+                "reason": "changed intent",
+            },
+        )
+
+    assert response.status_code == 400
 
 
 def test_domain_routes_reject_invalid_campaign_id() -> None:

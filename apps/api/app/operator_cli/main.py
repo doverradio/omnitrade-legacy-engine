@@ -51,6 +51,8 @@ from app.operator_cli.service import (
     fetch_campaign_orchestration_preview,
     fetch_campaign_orchestration_readiness,
     fetch_campaign_orchestration_status,
+    fetch_commissioned_control_plane_status,
+    mutate_commissioned_control_plane_action,
     execute_preview_cycle,
     fetch_venue_commission_readiness,
     fetch_venue_commission_status,
@@ -603,6 +605,30 @@ def _build_parser() -> argparse.ArgumentParser:
     campaign_history.add_argument("--limit", type=int, default=20)
     campaign_history.add_argument("--json", action="store_true", dest="json_output")
 
+    commissioned_status = subparsers.add_parser(
+        "commissioned-control-plane-status",
+        parents=[common],
+        help="Show commissioned campaign control-plane status",
+        description="Read-only commissioned control-plane view with lifecycle, risk, reconciliation, and pending actions.",
+    )
+    commissioned_status.add_argument("--campaign-id", type=UUID, required=True)
+    commissioned_status.add_argument("--version", type=int, required=True)
+    commissioned_status.add_argument("--json", action="store_true", dest="json_output")
+
+    commissioned_action = subparsers.add_parser(
+        "commissioned-control-plane-action",
+        parents=[common],
+        help="Apply commissioned operator control action",
+        description="Mutates operator control metadata only (acknowledge/cancel/pause/resume) with no trade execution.",
+    )
+    commissioned_action.add_argument("--campaign-id", type=UUID, required=True)
+    commissioned_action.add_argument("--version", type=int, required=True)
+    commissioned_action.add_argument("--actor", type=str, default="operator:human")
+    commissioned_action.add_argument("--action", type=str, required=True, choices=["acknowledge", "cancel", "pause", "resume"])
+    commissioned_action.add_argument("--idempotency-key", type=str, required=True)
+    commissioned_action.add_argument("--reason", type=str, default=None)
+    commissioned_action.add_argument("--json", action="store_true", dest="json_output")
+
     package_create = subparsers.add_parser(
         "canonical-preview-package-create",
         parents=[common],
@@ -846,6 +872,21 @@ async def _run_async(args: argparse.Namespace) -> tuple[int, dict[str, Any], str
     if args.command == "campaign-orchestration-history":
         payload = await fetch_campaign_orchestration_history(campaign_id=args.campaign_id, version=args.version, limit=args.limit)
         return 0, payload, render_json(payload)
+
+    if args.command == "commissioned-control-plane-status":
+        payload = await fetch_commissioned_control_plane_status(campaign_id=args.campaign_id, version=args.version)
+        return 0, payload, render_json(payload)
+
+    if args.command == "commissioned-control-plane-action":
+        payload = await mutate_commissioned_control_plane_action(
+            campaign_id=args.campaign_id,
+            version=args.version,
+            actor=args.actor,
+            action=args.action,
+            idempotency_key=args.idempotency_key,
+            reason=args.reason,
+        )
+        return (0 if bool(payload.get("accepted", False)) else 1), payload, render_json(payload)
 
     if args.command == "canonical-preview-package-create":
         payload = await create_canonical_preview_package_bundle(

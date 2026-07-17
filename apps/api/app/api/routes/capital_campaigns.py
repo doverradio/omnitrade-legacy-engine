@@ -26,11 +26,21 @@ from app.schemas.capital_campaign_profit import (
 from app.schemas.capital_campaign_domain import (
     CapitalCampaignDefinitionListResponse,
     CapitalCampaignDefinitionResponse,
+    CommissionedControlPlaneMutationRequest,
+    CommissionedControlPlaneMutationResponse,
+    CommissionedControlPlaneStatusResponse,
     CapitalCampaignDraftCreateRequest,
     CapitalCampaignPreviewRequest,
     CapitalCampaignPreviewResponse,
 )
-from app.services.capital_campaign_domain import create_campaign_draft, get_campaign_definition, list_campaign_definitions, preview_campaign_definition
+from app.services.capital_campaign_domain import (
+    create_campaign_draft,
+    get_campaign_definition,
+    get_commissioned_control_plane_status,
+    list_campaign_definitions,
+    mutate_commissioned_control_plane,
+    preview_campaign_definition,
+)
 from app.services.capital_campaign_orchestration import (
     fetch_campaign_orchestration_history,
     fetch_campaign_orchestration_readiness,
@@ -188,6 +198,47 @@ async def get_capital_campaign_domain_orchestration_history(
     except ValueError:
         raise InvalidRequestError(message="Invalid campaign_id", details={"campaign_id": campaign_id})
     return await fetch_campaign_orchestration_history(db=db, campaign_id=parsed_campaign_id, version=version, limit=limit)
+
+
+@router.get(
+    "/domain/{campaign_id}/commissioned/control-plane/status",
+    response_model=CommissionedControlPlaneStatusResponse,
+)
+async def get_capital_campaign_domain_commissioned_control_plane_status(
+    campaign_id: str,
+    version: int = Query(...),
+    db: AsyncSession = Depends(get_db),
+) -> CommissionedControlPlaneStatusResponse:
+    try:
+        parsed_campaign_id = uuid.UUID(campaign_id)
+    except ValueError:
+        raise InvalidRequestError(message="Invalid campaign_id", details={"campaign_id": campaign_id})
+    return await get_commissioned_control_plane_status(
+        db=db,
+        campaign_id=parsed_campaign_id,
+        version=version,
+    )
+
+
+@router.post(
+    "/domain/{campaign_id}/commissioned/control-plane/actions",
+    response_model=CommissionedControlPlaneMutationResponse,
+)
+async def post_capital_campaign_domain_commissioned_control_plane_action(
+    campaign_id: str,
+    request: CommissionedControlPlaneMutationRequest,
+    db: AsyncSession = Depends(get_db),
+) -> CommissionedControlPlaneMutationResponse:
+    try:
+        parsed_campaign_id = uuid.UUID(campaign_id)
+    except ValueError:
+        raise InvalidRequestError(message="Invalid campaign_id", details={"campaign_id": campaign_id})
+    if request.campaign_id != parsed_campaign_id:
+        raise InvalidRequestError(
+            message="campaign_id mismatch between path and body",
+            details={"path_campaign_id": campaign_id, "body_campaign_id": str(request.campaign_id)},
+        )
+    return await mutate_commissioned_control_plane(db=db, request=request)
 
 
 @router.get("", response_model=CapitalCampaignListResponse)
