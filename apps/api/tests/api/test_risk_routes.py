@@ -173,6 +173,41 @@ def test_enable_and_disable_kill_switch_require_confirm_and_write_audit() -> Non
     assert fake_session.audit_logs[1].action == "risk.kill_switch.disable"
 
 
+def test_disable_global_kill_switch_is_idempotent_initializer_with_audit() -> None:
+    fake_session = _FakeSession()
+
+    with create_test_client(fake_session) as client:
+        first = client.post(
+            "/risk/kill-switch/disable",
+            json={
+                "scope": "global",
+                "reason": "initialize safe disarmed state",
+                "confirm": True,
+                "actor": "user:risk-admin",
+            },
+        )
+        second = client.post(
+            "/risk/kill-switch/disable",
+            json={
+                "scope": "global",
+                "reason": "repeat initialize safe disarmed state",
+                "confirm": True,
+                "actor": "user:risk-admin",
+            },
+        )
+
+    assert first.status_code == 200
+    assert second.status_code == 200
+    assert first.json()["engaged"] is False
+    assert second.json()["engaged"] is False
+    assert len(fake_session.kill_switches) == 1
+    assert fake_session.kill_switches[0].scope == "global"
+    assert fake_session.kill_switches[0].engaged is False
+    assert fake_session.kill_switches[0].rearm_required is False
+    assert len(fake_session.audit_logs) == 2
+    assert all(item.action == "risk.kill_switch.disable" for item in fake_session.audit_logs)
+
+
 def test_get_risk_rules_returns_defaults() -> None:
     fake_session = _FakeSession()
 

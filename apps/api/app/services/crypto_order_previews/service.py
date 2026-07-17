@@ -177,6 +177,14 @@ async def _get_global_kill_switch(db: AsyncSession) -> bool:
     return bool(row.engaged)
 
 
+async def _get_global_kill_switch_rearm_required(db: AsyncSession) -> bool:
+    statement = select(RiskKillSwitch).where(RiskKillSwitch.scope == "global", RiskKillSwitch.paper_account_id.is_(None))
+    row = await db.scalar(statement)
+    if row is None:
+        raise ServiceUnavailableError(message="Global risk kill switch state is unavailable", details={"scope": "global"})
+    return bool(row.rearm_required)
+
+
 async def _load_exchange_connection(db: AsyncSession, exchange_connection_id: uuid.UUID) -> ExchangeConnection:
     connection = await db.scalar(
         select(ExchangeConnection).where(ExchangeConnection.exchange_connection_id == exchange_connection_id)
@@ -672,6 +680,7 @@ async def create_crypto_order_preview(
         )
 
     global_kill_switch_engaged = await _get_global_kill_switch(db)
+    global_kill_switch_rearm_required = await _get_global_kill_switch_rearm_required(db)
     rules = await get_risk_rules(db=db, account_id=None)
     risk_eval = evaluate_signal_risk(
         request=RiskEvaluationRequest(
@@ -690,8 +699,11 @@ async def create_crypto_order_preview(
             max_daily_loss_pct=Decimal(rules.rules["max_daily_loss_pct"]),
             high_water_mark_equity=available_quote_balance,
             max_drawdown_pct=Decimal(rules.rules["max_drawdown_pct"]),
+            global_kill_switch_engaged_state=global_kill_switch_engaged,
+            global_kill_switch_rearm_required=global_kill_switch_rearm_required,
+            global_kill_switch_rearmed_by_human=(not global_kill_switch_rearm_required),
             global_kill_switch_state_observed=True,
-            account_kill_switch_state_observed=True,
+            account_kill_switch_state_observed=False,
             evaluation_time=datetime.now(timezone.utc),
             actor=actor,
         ),

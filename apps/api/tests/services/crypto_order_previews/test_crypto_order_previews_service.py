@@ -165,12 +165,16 @@ async def test_create_buy_preview_success(monkeypatch: pytest.MonkeyPatch) -> No
     async def _global_kill_switch(*_args, **_kwargs):
         return False
 
+    async def _global_kill_switch_rearm_required(*_args, **_kwargs):
+        return False
+
     async def _risk_rules(**_kwargs):
         return SimpleNamespace(rules={"max_daily_loss_pct": Decimal("0.05"), "max_drawdown_pct": Decimal("0.10")})
 
     captured: dict[str, object] = {}
 
     def _evaluate_signal_risk(*_args, **_kwargs):
+        captured["request"] = _kwargs.get("request")
         captured["reference_price"] = _kwargs.get("reference_price")
         return SimpleNamespace(
             action=service.RiskDecisionAction.APPROVE,
@@ -183,6 +187,7 @@ async def test_create_buy_preview_success(monkeypatch: pytest.MonkeyPatch) -> No
     monkeypatch.setattr(service, "_load_asset_and_price", _load_asset_and_price)
     monkeypatch.setattr(service, "_load_execution_price_evidence", _load_execution_price_evidence)
     monkeypatch.setattr(service, "_get_global_kill_switch", _global_kill_switch)
+    monkeypatch.setattr(service, "_get_global_kill_switch_rearm_required", _global_kill_switch_rearm_required)
     monkeypatch.setattr(service, "get_risk_rules", _risk_rules)
     monkeypatch.setattr(service, "evaluate_signal_risk", _evaluate_signal_risk)
     monkeypatch.setattr(service, "get_decrypted_credentials_for_connection", lambda _connection: {"api_key": "key", "api_secret": "secret", "passphrase": "pass"})
@@ -213,6 +218,12 @@ async def test_create_buy_preview_success(monkeypatch: pytest.MonkeyPatch) -> No
     decision = next(item for item in db.added if isinstance(item, DecisionRecord))
     snapshot = next(item for item in db.added if isinstance(item, DecisionSnapshot))
     risk_event = next(item for item in db.added if isinstance(item, RiskEvent))
+    risk_request = captured["request"]
+    assert risk_request.global_kill_switch_state_observed is True
+    assert risk_request.global_kill_switch_engaged_state is False
+    assert risk_request.global_kill_switch_rearm_required is False
+    assert risk_request.global_kill_switch_rearmed_by_human is True
+    assert risk_request.account_kill_switch_state_observed is False
     assert captured["reference_price"] == Decimal("10005.00")
     assert stored.exchange_response_summary["price_evidence"]["evidence_id"] == str(evidence.evidence_id)
     assert stored.exchange_response_summary["price_evidence"]["quote_currency"] == "USD"
@@ -442,6 +453,9 @@ async def test_preview_redacts_sensitive_exchange_response_summary(monkeypatch: 
     async def _global_kill_switch(*_args, **_kwargs):
         return False
 
+    async def _global_kill_switch_rearm_required(*_args, **_kwargs):
+        return False
+
     async def _risk_rules(**_kwargs):
         return SimpleNamespace(rules={"max_daily_loss_pct": Decimal("0.05"), "max_drawdown_pct": Decimal("0.10")})
 
@@ -457,6 +471,7 @@ async def test_preview_redacts_sensitive_exchange_response_summary(monkeypatch: 
     monkeypatch.setattr(service, "_load_asset_and_price", _load_asset_and_price)
     monkeypatch.setattr(service, "_load_execution_price_evidence", _load_execution_price_evidence)
     monkeypatch.setattr(service, "_get_global_kill_switch", _global_kill_switch)
+    monkeypatch.setattr(service, "_get_global_kill_switch_rearm_required", _global_kill_switch_rearm_required)
     monkeypatch.setattr(service, "get_risk_rules", _risk_rules)
     monkeypatch.setattr(service, "evaluate_signal_risk", _evaluate_signal_risk)
     monkeypatch.setattr(service, "get_decrypted_credentials_for_connection", lambda _connection: {"api_key": "key", "api_secret": "secret", "passphrase": "pass"})
@@ -576,6 +591,9 @@ async def test_create_preview_rejected_persists_decision_and_risk_event(monkeypa
     async def _global_kill_switch(*_args, **_kwargs):
         return False
 
+    async def _global_kill_switch_rearm_required(*_args, **_kwargs):
+        return False
+
     async def _risk_rules(**_kwargs):
         return SimpleNamespace(rules={"max_daily_loss_pct": Decimal("0.05"), "max_drawdown_pct": Decimal("0.10")})
 
@@ -594,6 +612,7 @@ async def test_create_preview_rejected_persists_decision_and_risk_event(monkeypa
     monkeypatch.setattr(service, "_load_asset_and_price", _load_asset_and_price)
     monkeypatch.setattr(service, "_load_execution_price_evidence", _load_execution_price_evidence)
     monkeypatch.setattr(service, "_get_global_kill_switch", _global_kill_switch)
+    monkeypatch.setattr(service, "_get_global_kill_switch_rearm_required", _global_kill_switch_rearm_required)
     monkeypatch.setattr(service, "get_risk_rules", _risk_rules)
     monkeypatch.setattr(service, "evaluate_signal_risk", _evaluate_signal_risk)
     monkeypatch.setattr(service, "get_decrypted_credentials_for_connection", lambda _connection: {"api_key": "key", "api_secret": "secret", "passphrase": "pass"})
