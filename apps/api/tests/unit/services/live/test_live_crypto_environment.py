@@ -729,6 +729,208 @@ async def test_campaign_selection_is_deterministic_across_input_order() -> None:
 
 
 @pytest.mark.asyncio
+async def test_account_resolution_prefers_single_profile_bound_account_when_configured_default_differs(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    configured_default = uuid4()
+    profile_bound = uuid4()
+
+    configured_account = _paper_account()
+    configured_account.id = configured_default
+    profile_account = _paper_account()
+    profile_account.id = profile_bound
+
+    async def _load_selected(*, db, paper_account_id):
+        _ = db
+        if paper_account_id == configured_default:
+            return configured_account
+        if paper_account_id == profile_bound:
+            return profile_account
+        return None
+
+    async def _profile_candidates(*, db, provider, environment):
+        _ = db
+        assert provider == "kraken_spot"
+        assert environment == "production"
+        return [profile_bound]
+
+    monkeypatch.setattr(service, "_load_selected_crypto_paper_account", _load_selected)
+    monkeypatch.setattr(service, "_load_live_profile_account_candidates", _profile_candidates)
+    monkeypatch.setattr(
+        service,
+        "get_settings",
+        lambda: SimpleNamespace(default_production_crypto_paper_account_id=configured_default),
+    )
+
+    resolved = await service._resolve_paper_account_for_context(
+        db=SimpleNamespace(execute=object()),
+        provider="kraken_spot",
+        environment="production",
+        requested_paper_account_id=None,
+    )
+
+    assert resolved is not None
+    assert resolved.id == profile_bound
+
+
+@pytest.mark.asyncio
+async def test_account_resolution_fails_closed_on_multiple_profile_bound_accounts(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    first = uuid4()
+    second = uuid4()
+    first_account = _paper_account()
+    first_account.id = first
+    second_account = _paper_account()
+    second_account.id = second
+
+    async def _load_selected(*, db, paper_account_id):
+        _ = db
+        if paper_account_id == first:
+            return first_account
+        if paper_account_id == second:
+            return second_account
+        return None
+
+    async def _profile_candidates(*, db, provider, environment):
+        _ = db, provider, environment
+        return [first, second]
+
+    monkeypatch.setattr(service, "_load_selected_crypto_paper_account", _load_selected)
+    monkeypatch.setattr(service, "_load_live_profile_account_candidates", _profile_candidates)
+    monkeypatch.setattr(
+        service,
+        "get_settings",
+        lambda: SimpleNamespace(default_production_crypto_paper_account_id=None),
+    )
+
+    resolved = await service._resolve_paper_account_for_context(
+        db=SimpleNamespace(execute=object()),
+        provider="kraken_spot",
+        environment="production",
+        requested_paper_account_id=None,
+    )
+
+    assert resolved is None
+
+
+@pytest.mark.asyncio
+async def test_account_resolution_uses_configured_default_when_no_profile_exists(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    configured_default = uuid4()
+    configured_account = _paper_account()
+    configured_account.id = configured_default
+
+    async def _load_selected(*, db, paper_account_id):
+        _ = db
+        if paper_account_id == configured_default:
+            return configured_account
+        return None
+
+    async def _profile_candidates(*, db, provider, environment):
+        _ = db, provider, environment
+        return []
+
+    monkeypatch.setattr(service, "_load_selected_crypto_paper_account", _load_selected)
+    monkeypatch.setattr(service, "_load_live_profile_account_candidates", _profile_candidates)
+    monkeypatch.setattr(
+        service,
+        "get_settings",
+        lambda: SimpleNamespace(default_production_crypto_paper_account_id=configured_default),
+    )
+
+    resolved = await service._resolve_paper_account_for_context(
+        db=SimpleNamespace(execute=object()),
+        provider="kraken_spot",
+        environment="production",
+        requested_paper_account_id=None,
+    )
+
+    assert resolved is not None
+    assert resolved.id == configured_default
+
+
+@pytest.mark.asyncio
+async def test_account_resolution_respects_requested_account_even_when_context_has_profiles(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    requested = uuid4()
+    requested_account = _paper_account()
+    requested_account.id = requested
+
+    async def _load_selected(*, db, paper_account_id):
+        _ = db
+        if paper_account_id == requested:
+            return requested_account
+        return None
+
+    async def _profile_candidates(*, db, provider, environment):
+        _ = db, provider, environment
+        return [uuid4(), uuid4()]
+
+    monkeypatch.setattr(service, "_load_selected_crypto_paper_account", _load_selected)
+    monkeypatch.setattr(service, "_load_live_profile_account_candidates", _profile_candidates)
+    monkeypatch.setattr(
+        service,
+        "get_settings",
+        lambda: SimpleNamespace(default_production_crypto_paper_account_id=None),
+    )
+
+    resolved = await service._resolve_paper_account_for_context(
+        db=SimpleNamespace(execute=object()),
+        provider="kraken_spot",
+        environment="production",
+        requested_paper_account_id=requested,
+    )
+
+    assert resolved is not None
+    assert resolved.id == requested
+
+
+@pytest.mark.asyncio
+async def test_account_resolution_uses_context_specific_provider_environment_candidates(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    chosen = uuid4()
+    chosen_account = _paper_account()
+    chosen_account.id = chosen
+    seen_calls: list[tuple[str, str]] = []
+
+    async def _load_selected(*, db, paper_account_id):
+        _ = db
+        if paper_account_id == chosen:
+            return chosen_account
+        return None
+
+    async def _profile_candidates(*, db, provider, environment):
+        _ = db
+        seen_calls.append((provider, environment))
+        if provider == "kraken_spot" and environment == "production":
+            return [chosen]
+        return []
+
+    monkeypatch.setattr(service, "_load_selected_crypto_paper_account", _load_selected)
+    monkeypatch.setattr(service, "_load_live_profile_account_candidates", _profile_candidates)
+    monkeypatch.setattr(
+        service,
+        "get_settings",
+        lambda: SimpleNamespace(default_production_crypto_paper_account_id=None),
+    )
+
+    resolved = await service._resolve_paper_account_for_context(
+        db=SimpleNamespace(execute=object()),
+        provider="kraken_spot",
+        environment="production",
+        requested_paper_account_id=None,
+    )
+
+    assert resolved is not None
+    assert resolved.id == chosen
+    assert seen_calls == [("kraken_spot", "production")]
+
+
+@pytest.mark.asyncio
 async def test_environment_separation_for_connection(monkeypatch: pytest.MonkeyPatch) -> None:
     db = _FakeDb()
     db.paper_account = _paper_account()

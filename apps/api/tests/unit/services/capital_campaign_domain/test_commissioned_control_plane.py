@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from datetime import datetime, timezone
 import asyncio
+from decimal import Decimal
 from types import SimpleNamespace
 from uuid import uuid4
 
@@ -416,3 +417,157 @@ async def test_control_plane_status_fails_closed_when_ready_without_commissioned
 
     assert result.state == "DRAFT"
     assert "commissioned_state_metadata_missing_for_ready_campaign" in result.blockers
+
+
+@pytest.mark.asyncio
+async def test_control_plane_ready_state_is_not_activation_eligible_without_commissioned_execution_state(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    campaign_id = uuid4()
+    definition = _definition(campaign_id, version=1)
+    definition.metadata_evidence["commissioned_seed_campaign"]["state"] = "READY"
+    runtime = SimpleNamespace(uuid=campaign_id, status="READY")
+    definition.status = "READY"
+
+    async def _load_def_runtime(**_kwargs):
+        return definition, runtime
+
+    async def _load_decision(**_kwargs):
+        return None
+
+    async def _load_risk(**_kwargs):
+        return None
+
+    async def _load_audit(**_kwargs):
+        return []
+
+    monkeypatch.setattr(control_plane, "_load_definition_and_runtime", _load_def_runtime)
+    monkeypatch.setattr(control_plane, "_load_decision_summary", _load_decision)
+    monkeypatch.setattr(control_plane, "_load_risk_summary", _load_risk)
+    monkeypatch.setattr(control_plane, "_load_audit_rows", _load_audit)
+
+    result = await control_plane.get_commissioned_control_plane_status(db=_FakeDb(), campaign_id=campaign_id, version=1)
+
+    assert result.state == "READY"
+    assert result.future_production_activation_eligibility["eligible"] is False
+
+
+@pytest.mark.asyncio
+async def test_governed_backfill_writes_ready_commissioned_metadata_and_preserves_existing_keys(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    campaign_id = uuid4()
+    definition = _definition(campaign_id, version=1)
+    definition.status = "READY"
+    definition.metadata_evidence = {
+        "dedicated_proving_account": {"paper_account_id": "8e76a2fa-ae85-45c6-95d1-798cce8f8cc9"}
+    }
+    runtime = SimpleNamespace(uuid=campaign_id, status="READY")
+    db = _FakeDb()
+
+    async def _load_for_update(**_kwargs):
+        return definition, runtime
+
+    monkeypatch.setattr(control_plane, "_load_definition_and_runtime_for_update", _load_for_update)
+
+    response = await control_plane.backfill_commissioned_ready_metadata(
+        db=db,
+        campaign_id=campaign_id,
+        version=1,
+        actor="operator:eric",
+        idempotency_key="bf-1",
+        commissioning_identity="commissioned:kraken:campaign:e9a9",
+        commissioned_by="operator:eric",
+        authority_classification="OPERATOR_COMMISSIONED",
+        strategy_signal_classification="NOT_REQUIRED_FOR_COMMISSIONED_ENTRY",
+        provider="kraken_spot",
+        environment="production",
+        instrument="BTC-USD",
+        paper_account_id=uuid4(),
+        asset_id=uuid4(),
+        capital_budget=Decimal("25"),
+        maximum_position_size=Decimal("5"),
+        maximum_total_exposure=Decimal("5"),
+    )
+
+    blob = definition.metadata_evidence["commissioned_seed_campaign"]
+    assert response["replayed"] is False
+    assert response["state"] == "READY"
+    assert blob["state"] == "READY"
+    assert blob["commissioning"]["commissioning_identity"] == "commissioned:kraken:campaign:e9a9"
+    assert blob["commissioning"]["provider"] == "kraken_spot"
+    assert blob["authority_metadata"]["campaign_type"] == "COMMISSIONED_AUTONOMOUS_SEED"
+    assert "dedicated_proving_account" in response["preserved_metadata_keys"]
+    assert db.flush_calls == 1
+    assert db.commit_calls == 1
+    assert any(getattr(item, "action", "") == "commissioned_seed_campaign.metadata_backfill" for item in db.added)
+
+
+@pytest.mark.asyncio
+async def test_governed_backfill_is_idempotent_and_replays_exact_intent(monkeypatch: pytest.MonkeyPatch) -> None:
+    campaign_id = uuid4()
+    definition = _definition(campaign_id, version=1)
+    definition.status = "READY"
+    definition.metadata_evidence = {}
+    runtime = SimpleNamespace(uuid=campaign_id, status="READY")
+    db = _FakeDb()
+
+    async def _load_for_update(**_kwargs):
+        return definition, runtime
+
+    monkeypatch.setattr(control_plane, "_load_definition_and_runtime_for_update", _load_for_update)
+
+    first = await control_plane.backfill_commissioned_ready_metadata(
+        db=db,
+        campaign_id=campaign_id,
+        version=1,
+        actor="operator:eric",
+        idempotency_key="bf-idem-1",
+        commissioning_identity="commissioned:kraken:campaign:e9a9",
+    )
+    second = await control_plane.backfill_commissioned_ready_metadata(
+        db=db,
+        campaign_id=campaign_id,
+        version=1,
+        actor="operator:eric",
+        idempotency_key="bf-idem-1",
+        commissioning_identity="commissioned:kraken:campaign:e9a9",
+    )
+
+    assert first["replayed"] is False
+    assert second["replayed"] is True
+    assert db.flush_calls == 1
+    assert db.commit_calls == 1
+
+
+@pytest.mark.asyncio
+async def test_governed_backfill_rejects_changed_intent_idempotency_reuse(monkeypatch: pytest.MonkeyPatch) -> None:
+    campaign_id = uuid4()
+    definition = _definition(campaign_id, version=1)
+    definition.status = "READY"
+    definition.metadata_evidence = {}
+    runtime = SimpleNamespace(uuid=campaign_id, status="READY")
+    db = _FakeDb()
+
+    async def _load_for_update(**_kwargs):
+        return definition, runtime
+
+    monkeypatch.setattr(control_plane, "_load_definition_and_runtime_for_update", _load_for_update)
+
+    await control_plane.backfill_commissioned_ready_metadata(
+        db=db,
+        campaign_id=campaign_id,
+        version=1,
+        actor="operator:eric",
+        idempotency_key="bf-idem-shared",
+        commissioning_identity="commissioned:kraken:campaign:e9a9",
+    )
+    with pytest.raises(InvalidRequestError):
+        await control_plane.backfill_commissioned_ready_metadata(
+            db=db,
+            campaign_id=campaign_id,
+            version=1,
+            actor="operator:eric",
+            idempotency_key="bf-idem-shared",
+            commissioning_identity="commissioned:kraken:campaign:DIFFERENT",
+        )

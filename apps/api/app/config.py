@@ -2,6 +2,7 @@ from functools import lru_cache
 import json
 from decimal import Decimal
 from pathlib import Path
+from uuid import UUID
 
 from pydantic import AliasChoices, Field, SecretStr
 from pydantic_settings import BaseSettings, SettingsConfigDict
@@ -51,6 +52,10 @@ class Settings(BaseSettings):
     live_crypto_order_submission_enabled: bool = Field(
         default=False,
         validation_alias="LIVE_CRYPTO_ORDER_SUBMISSION_ENABLED",
+    )
+    default_production_crypto_paper_account_id: UUID | None = Field(
+        default=None,
+        validation_alias="DEFAULT_PRODUCTION_CRYPTO_PAPER_ACCOUNT_ID",
     )
     live_crypto_dry_run_enabled: bool = Field(
         default=True,

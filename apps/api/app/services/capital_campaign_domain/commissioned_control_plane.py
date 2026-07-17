@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from datetime import datetime, timezone
+from decimal import Decimal
 from typing import Any
 from uuid import UUID
 
@@ -22,6 +23,7 @@ from app.schemas.capital_campaign_domain import (
 )
 
 _COMMISSIONED_STATE_KEY = "commissioned_seed_campaign"
+_METADATA_BACKFILL_AUDIT_ACTION = "commissioned_seed_campaign.metadata_backfill"
 _LEGACY_COMMISSIONED_METADATA_KEYS = {
     "state",
     "authority_metadata",
@@ -62,6 +64,45 @@ def _write_commissioned_blob(*, definition: CapitalCampaignDefinition, blob: dic
     metadata[_COMMISSIONED_STATE_KEY] = blob
     definition.metadata_evidence = metadata
     definition.updated_at = _utcnow()
+
+
+def _backfill_signature(
+    *,
+    campaign_id: UUID,
+    version: int,
+    actor: str,
+    commissioning_identity: str,
+    commissioned_by: str,
+    authority_classification: str,
+    strategy_signal_classification: str,
+    provider: str | None,
+    environment: str | None,
+    instrument: str | None,
+    paper_account_id: str | None,
+    asset_id: str | None,
+    capital_budget: str | None,
+    maximum_position_size: str | None,
+    maximum_total_exposure: str | None,
+    commissioned_until: str | None,
+) -> dict[str, Any]:
+    return {
+        "campaign_id": str(campaign_id),
+        "version": int(version),
+        "actor": actor,
+        "commissioning_identity": commissioning_identity,
+        "commissioned_by": commissioned_by,
+        "authority_classification": authority_classification,
+        "strategy_signal_classification": strategy_signal_classification,
+        "provider": provider,
+        "environment": environment,
+        "instrument": instrument,
+        "paper_account_id": paper_account_id,
+        "asset_id": asset_id,
+        "capital_budget": capital_budget,
+        "maximum_position_size": maximum_position_size,
+        "maximum_total_exposure": maximum_total_exposure,
+        "commissioned_until": commissioned_until,
+    }
 
 
 async def _load_definition_and_runtime_for_update(
@@ -325,8 +366,10 @@ async def get_commissioned_control_plane_status(
         "reason": "preview payload is not persisted in commissioned metadata",
     }
 
+    commissioning_identity = str(commissioning.get("commissioning_identity") or "").strip()
     production_eligible = (
-        state in {"READY", "COMMISSIONED", "BUY_RECONCILIATION_PENDING", "ACTIVE_POSITION"}
+        state in {"COMMISSIONED", "BUY_RECONCILIATION_PENDING", "ACTIVE_POSITION"}
+        and bool(commissioning_identity)
         and not bool(operator_control.get("paused", False))
         and not bool(operator_control.get("cancelled", False))
     )
@@ -410,7 +453,7 @@ async def get_commissioned_control_plane_status(
             "reason": (
                 "eligible"
                 if production_eligible
-                else "blocked_by_pause_or_cancel_or_state"
+                else "blocked_by_missing_commissioning_or_pause_or_cancel_or_state"
             ),
         },
         blockers=blockers,
@@ -552,3 +595,234 @@ async def mutate_commissioned_control_plane(
     await db.flush()
     await db.commit()
     return response
+
+
+async def backfill_commissioned_ready_metadata(
+    *,
+    db: AsyncSession,
+    campaign_id: UUID,
+    version: int,
+    actor: str,
+    idempotency_key: str,
+    commissioning_identity: str,
+    commissioned_by: str | None = None,
+    authority_classification: str = "OPERATOR_COMMISSIONED",
+    strategy_signal_classification: str = "NOT_REQUIRED_FOR_COMMISSIONED_ENTRY",
+    provider: str | None = None,
+    environment: str | None = None,
+    instrument: str | None = None,
+    paper_account_id: UUID | None = None,
+    asset_id: UUID | None = None,
+    capital_budget: Decimal | None = None,
+    maximum_position_size: Decimal | None = None,
+    maximum_total_exposure: Decimal | None = None,
+    commissioned_until: datetime | None = None,
+) -> dict[str, Any]:
+    actor_value = str(actor or "").strip()
+    if not actor_value:
+        raise InvalidRequestError(message="actor is required", details={"actor": actor})
+    idempotency_value = str(idempotency_key or "").strip()
+    if not idempotency_value:
+        raise InvalidRequestError(message="idempotency_key is required", details={"idempotency_key": idempotency_key})
+    commissioning_identity_value = str(commissioning_identity or "").strip()
+    if not commissioning_identity_value:
+        raise InvalidRequestError(
+            message="commissioning_identity is required",
+            details={"commissioning_identity": commissioning_identity},
+        )
+
+    definition, runtime = await _load_definition_and_runtime_for_update(
+        db=db,
+        campaign_id=campaign_id,
+        version=version,
+    )
+    definition_status = str(definition.status or "").upper()
+    runtime_status = str(runtime.status or "").upper()
+    if definition_status != "READY" or runtime_status != "READY":
+        raise InvalidRequestError(
+            message="Governed commissioned metadata backfill requires READY runtime and definition",
+            details={
+                "definition_status": definition.status,
+                "runtime_status": runtime.status,
+            },
+        )
+
+    blob = _read_commissioned_blob(definition=definition)
+    current_state = str(blob.get("state") or "DRAFT")
+    if current_state not in {"DRAFT", "READY"}:
+        raise InvalidRequestError(
+            message="Governed commissioned metadata backfill requires DRAFT or READY commissioned state",
+            details={"current_state": current_state},
+        )
+
+    commissioning_actor = str(commissioned_by or actor_value).strip()
+    signature = _backfill_signature(
+        campaign_id=campaign_id,
+        version=version,
+        actor=actor_value,
+        commissioning_identity=commissioning_identity_value,
+        commissioned_by=commissioning_actor,
+        authority_classification=str(authority_classification),
+        strategy_signal_classification=str(strategy_signal_classification),
+        provider=None if provider is None else str(provider),
+        environment=None if environment is None else str(environment),
+        instrument=None if instrument is None else str(instrument),
+        paper_account_id=None if paper_account_id is None else str(paper_account_id),
+        asset_id=None if asset_id is None else str(asset_id),
+        capital_budget=None if capital_budget is None else format(capital_budget, "f"),
+        maximum_position_size=None if maximum_position_size is None else format(maximum_position_size, "f"),
+        maximum_total_exposure=None if maximum_total_exposure is None else format(maximum_total_exposure, "f"),
+        commissioned_until=None if commissioned_until is None else commissioned_until.isoformat(),
+    )
+
+    backfill_store = blob.get("metadata_backfill") if isinstance(blob.get("metadata_backfill"), dict) else {}
+    seen = backfill_store.get("seen_idempotency_keys") if isinstance(backfill_store.get("seen_idempotency_keys"), dict) else {}
+    replay = seen.get(idempotency_value) if isinstance(seen.get(idempotency_value), dict) else None
+    if replay is not None:
+        replay_signature = replay.get("request_signature") if isinstance(replay.get("request_signature"), dict) else None
+        if replay_signature != signature:
+            raise InvalidRequestError(
+                message="Changed-intent idempotency key reuse is not allowed",
+                details={
+                    "idempotency_key": idempotency_value,
+                    "stored_request_signature": replay_signature,
+                    "received_request_signature": signature,
+                },
+            )
+        replay_response = replay.get("response") if isinstance(replay.get("response"), dict) else {}
+        replay_payload = dict(replay_response)
+        replay_payload["replayed"] = True
+        return replay_payload
+
+    now = _utcnow()
+    transition_history = blob.get("transition_history") if isinstance(blob.get("transition_history"), list) else []
+    if current_state == "DRAFT":
+        transition_history = [
+            *transition_history,
+            {
+                "previous_state": "DRAFT",
+                "current_state": "READY",
+                "actor": actor_value,
+                "reason": "governed_ready_runtime_definition_backfill",
+                "idempotency_key": idempotency_value,
+                "transitioned_at": now.isoformat(),
+                "synthetic": True,
+            },
+        ]
+
+    authority_metadata = blob.get("authority_metadata") if isinstance(blob.get("authority_metadata"), dict) else {}
+    if not authority_metadata:
+        max_notional = maximum_position_size
+        if max_notional is None:
+            try:
+                max_notional = Decimal(str(getattr(definition, "maximum_position_size", "0")))
+            except Exception:
+                max_notional = Decimal("0")
+        authority_metadata = {
+            "campaign_type": "COMMISSIONED_AUTONOMOUS_SEED",
+            "entry_authority": "OPERATOR_COMMISSIONED",
+            "lifecycle_authority": "OMNITRADE_AUTONOMOUS",
+            "maximum_entry_notional": format(max_notional, "f"),
+            "repeat_entry_allowed": False,
+            "commissioned_by": commissioning_actor,
+            "commissioned_at": now.isoformat(),
+        }
+
+    commissioning = blob.get("commissioning") if isinstance(blob.get("commissioning"), dict) else {}
+    commissioning_updates: dict[str, Any] = {
+        "commissioning_identity": commissioning_identity_value,
+        "commissioned_by": commissioning_actor,
+        "authority_classification": str(authority_classification),
+        "strategy_signal_classification": str(strategy_signal_classification),
+        "campaign_definition_version": version,
+        "idempotency_key": idempotency_value,
+        "backfill_source": "governed_ready_runtime_definition_backfill",
+        "backfill_recorded_at": now.isoformat(),
+    }
+    if commissioned_until is not None:
+        commissioning_updates["commissioned_until"] = commissioned_until.isoformat()
+    if provider is not None:
+        commissioning_updates["provider"] = str(provider)
+    if environment is not None:
+        commissioning_updates["environment"] = str(environment)
+    if instrument is not None:
+        commissioning_updates["instrument"] = str(instrument)
+    if paper_account_id is not None:
+        commissioning_updates["paper_account_id"] = str(paper_account_id)
+    if asset_id is not None:
+        commissioning_updates["asset_id"] = str(asset_id)
+    if capital_budget is not None:
+        commissioning_updates["capital_budget"] = format(capital_budget, "f")
+    if maximum_position_size is not None:
+        commissioning_updates["maximum_position_size"] = format(maximum_position_size, "f")
+    if maximum_total_exposure is not None:
+        commissioning_updates["maximum_total_exposure"] = format(maximum_total_exposure, "f")
+
+    commissioning = {**commissioning, **commissioning_updates}
+    state_value = "READY"
+
+    seen_updated = {
+        **seen,
+        idempotency_value: {
+            "request_signature": signature,
+        },
+    }
+
+    existing_metadata = dict(definition.metadata_evidence or {})
+    preserved_keys = sorted([key for key in existing_metadata.keys() if key != _COMMISSIONED_STATE_KEY])
+
+    updated_blob = {
+        **blob,
+        "state": state_value,
+        "authority_metadata": authority_metadata,
+        "transition_history": transition_history,
+        "commissioning": commissioning,
+        "updated_at": now.isoformat(),
+        "metadata_backfill": {
+            **backfill_store,
+            "seen_idempotency_keys": seen_updated,
+            "last_idempotency_key": idempotency_value,
+            "last_actor": actor_value,
+            "last_updated_at": now.isoformat(),
+        },
+    }
+
+    _write_commissioned_blob(definition=definition, blob=updated_blob)
+    response_payload = {
+        "campaign_id": str(campaign_id),
+        "version": version,
+        "state": state_value,
+        "replayed": False,
+        "metadata_written": {
+            "commissioned_seed_campaign.state": state_value,
+            "commissioning_identity": commissioning_identity_value,
+            "commissioned_by": commissioning_actor,
+            "authority_classification": str(authority_classification),
+            "strategy_signal_classification": str(strategy_signal_classification),
+            "commissioned_until": None if commissioned_until is None else commissioned_until.isoformat(),
+        },
+        "preserved_metadata_keys": preserved_keys,
+        "audit_action": _METADATA_BACKFILL_AUDIT_ACTION,
+    }
+    seen_updated[idempotency_value]["response"] = response_payload
+    updated_blob["metadata_backfill"]["seen_idempotency_keys"] = seen_updated
+    _write_commissioned_blob(definition=definition, blob=updated_blob)
+
+    db.add(
+        AuditLog(
+            actor=actor_value,
+            action=_METADATA_BACKFILL_AUDIT_ACTION,
+            entity_type="capital_campaign",
+            entity_id=campaign_id,
+            before_state={
+                "commissioned_seed_campaign": blob,
+            },
+            after_state={
+                "commissioned_seed_campaign": updated_blob,
+                "governed_backfill": True,
+            },
+        )
+    )
+    await db.flush()
+    await db.commit()
+    return response_payload

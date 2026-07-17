@@ -321,7 +321,7 @@ class LiveCryptoEnvironmentReadiness:
 class InitializeLiveCryptoEnvironmentRequest:
     actor: str
     provider: str = "coinbase_advanced"
-    paper_account_id: UUID = DEFAULT_PRODUCTION_CRYPTO_PAPER_ACCOUNT_ID
+    paper_account_id: UUID | None = None
     exchange_environment: str = "production"
     exchange_connection_name: str | None = None
     exchange_api_key_name: str | None = None
@@ -411,6 +411,81 @@ async def _load_selected_crypto_paper_account(*, db: AsyncSession, paper_account
     if not bool(paper_account.is_active):
         raise ValueError(f"Selected paper account is inactive: {paper_account_id}")
     return paper_account
+
+
+async def _load_live_profile_account_candidates(*, db: AsyncSession, provider: str, environment: str) -> list[UUID]:
+    if not hasattr(db, "execute"):
+        return []
+    rows = (
+        (
+            await db.execute(
+                select(LiveTradingProfile)
+                .order_by(LiveTradingProfile.created_at.desc())
+            )
+        )
+        .scalars()
+        .all()
+    )
+    candidates: list[UUID] = []
+    for profile in rows:
+        if not _profile_matches_context(profile, provider=provider, environment=environment):
+            continue
+        if not isinstance(profile.paper_account_id, UUID):
+            continue
+        if profile.paper_account_id not in candidates:
+            candidates.append(profile.paper_account_id)
+    return candidates
+
+
+async def _resolve_paper_account_for_context(
+    *,
+    db: AsyncSession,
+    provider: str,
+    environment: str,
+    requested_paper_account_id: UUID | None,
+) -> PaperAccount | None:
+    if requested_paper_account_id is not None:
+        return await _load_selected_crypto_paper_account(db=db, paper_account_id=requested_paper_account_id)
+
+    if not hasattr(db, "execute"):
+        return await _load_selected_crypto_paper_account(db=db, paper_account_id=DEFAULT_PRODUCTION_CRYPTO_PAPER_ACCOUNT_ID)
+
+    settings = get_settings()
+    configured_default = (
+        getattr(settings, "default_production_crypto_paper_account_id", None)
+        if environment == "production"
+        else None
+    )
+    configured_account: PaperAccount | None = None
+    if configured_default is not None:
+        configured_account = await _load_selected_crypto_paper_account(db=db, paper_account_id=configured_default)
+
+    profile_candidates = await _load_live_profile_account_candidates(
+        db=db,
+        provider=provider,
+        environment=environment,
+    )
+    active_profile_candidates: list[PaperAccount] = []
+    for account_id in profile_candidates:
+        account = await _load_selected_crypto_paper_account(db=db, paper_account_id=account_id)
+        if account is not None:
+            active_profile_candidates.append(account)
+
+    if configured_account is not None:
+        for candidate in active_profile_candidates:
+            if candidate.id == configured_account.id:
+                return configured_account
+
+    if len(active_profile_candidates) == 1:
+        return active_profile_candidates[0]
+    if len(active_profile_candidates) > 1:
+        # Multiple equally valid account bindings are ambiguous; fail closed.
+        return None
+
+    if configured_account is not None:
+        return configured_account
+
+    return await _load_selected_crypto_paper_account(db=db, paper_account_id=DEFAULT_PRODUCTION_CRYPTO_PAPER_ACCOUNT_ID)
 
 
 async def _load_live_profile_for_account(*, db: AsyncSession, paper_account_id: UUID | None, provider: str, environment: str) -> LiveTradingProfile | None:
@@ -650,7 +725,7 @@ async def inspect_live_crypto_environment(
     db: AsyncSession,
     provider: str = "coinbase_advanced",
     exchange_environment: str = "production",
-    paper_account_id: UUID = DEFAULT_PRODUCTION_CRYPTO_PAPER_ACCOUNT_ID,
+    paper_account_id: UUID | None = None,
 ) -> LiveCryptoEnvironmentReadiness:
     now = datetime.now(timezone.utc)
     exchange_environment = _normalize_exchange_environment(exchange_environment)
@@ -659,7 +734,12 @@ async def inspect_live_crypto_environment(
         connection = await _load_coinbase_connection(db=db, environment=exchange_environment)
     else:
         connection = await _load_exchange_connection_for_provider(db=db, provider=provider, environment=exchange_environment)
-    paper_account = await _load_selected_crypto_paper_account(db=db, paper_account_id=paper_account_id)
+    paper_account = await _resolve_paper_account_for_context(
+        db=db,
+        provider=provider,
+        environment=exchange_environment,
+        requested_paper_account_id=paper_account_id,
+    )
     profile = await _load_live_profile_for_account(
         db=db,
         paper_account_id=paper_account.id if paper_account is not None else None,
@@ -871,11 +951,23 @@ async def initialize_live_crypto_environment(
         connection_name = request.exchange_connection_name or _default_connection_name(provider=request.provider, environment=exchange_environment)
 
         stage = "inspect_initial_environment"
+        selected_paper_account = await _resolve_paper_account_for_context(
+            db=db,
+            provider=request.provider,
+            environment=exchange_environment,
+            requested_paper_account_id=request.paper_account_id,
+        )
+        if selected_paper_account is None:
+            stage = "resolve_paper_account_context"
+            raise ValueError(
+                f"Unable to resolve a canonical {request.provider} {exchange_environment} crypto paper account; context is ambiguous"
+            )
+
         initial = await inspect_live_crypto_environment(
             db=db,
             provider=request.provider,
             exchange_environment=exchange_environment,
-            paper_account_id=request.paper_account_id,
+            paper_account_id=selected_paper_account.id,
         )
 
         created_exchange = False
@@ -909,7 +1001,7 @@ async def initialize_live_crypto_environment(
             db=db,
             provider=request.provider,
             exchange_environment=exchange_environment,
-            paper_account_id=request.paper_account_id,
+            paper_account_id=selected_paper_account.id,
         )
         if refreshed_readiness.exchange_connection_id is not None:
             stage = "refresh_exchange_balances"
@@ -959,7 +1051,7 @@ async def initialize_live_crypto_environment(
             db=db,
             provider=request.provider,
             exchange_environment=exchange_environment,
-            paper_account_id=request.paper_account_id,
+            paper_account_id=selected_paper_account.id,
         )
         if current.paper_account_id is None:
             stage = "validate_active_crypto_paper_account"
@@ -995,11 +1087,11 @@ async def initialize_live_crypto_environment(
             db=db,
             provider=request.provider,
             exchange_environment=exchange_environment,
-            paper_account_id=request.paper_account_id,
+            paper_account_id=selected_paper_account.id,
         )
         if current.capital_campaign_id is None:
             stage = "load_campaign_paper_account"
-            paper_account = await _load_selected_crypto_paper_account(db=db, paper_account_id=request.paper_account_id)
+            paper_account = await _load_selected_crypto_paper_account(db=db, paper_account_id=selected_paper_account.id)
             if paper_account is None:
                 stage = "validate_campaign_paper_account"
                 raise ValueError("Active crypto paper account is required for campaign initialization")
@@ -1034,7 +1126,7 @@ async def initialize_live_crypto_environment(
             db=db,
             provider=request.provider,
             exchange_environment=exchange_environment,
-            paper_account_id=request.paper_account_id,
+            paper_account_id=selected_paper_account.id,
         )
         return InitializeLiveCryptoEnvironmentResult(
             created_exchange_connection=created_exchange,
