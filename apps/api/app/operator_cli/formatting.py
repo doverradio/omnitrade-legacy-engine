@@ -1088,6 +1088,64 @@ def render_venue_commission_text(payload: dict[str, Any], options: RenderOptions
     return "\n".join(lines)
 
 
+def render_canonical_proving_commission_status_text(payload: dict[str, Any], options: RenderOptions) -> str:
+    commission = payload.get("commissioning_status") if isinstance(payload.get("commissioning_status"), dict) else {}
+    control_plane = payload.get("commissioned_control_plane") if isinstance(payload.get("commissioned_control_plane"), dict) else {}
+    live_order = payload.get("live_order") if isinstance(payload.get("live_order"), dict) else {}
+
+    lines = _frame_header("CANONICAL PROVING COMMISSION STATUS", options)
+    lines.extend(
+        _section(
+            "Identity",
+            [
+                ("Campaign", _fmt(payload.get("campaign_id"))),
+                ("Version", _fmt(payload.get("campaign_version"))),
+                ("Provider", _fmt(payload.get("provider"))),
+                ("Environment", _fmt(payload.get("environment"))),
+                ("Product", _fmt(payload.get("product"))),
+            ],
+            options,
+        )
+    )
+    lines.extend(
+        _section(
+            "Commissioning",
+            [
+                ("State", _fmt(commission.get("state"))),
+                ("Entry authority", _fmt((commission.get("authority") or {}).get("entry_authority"))),
+                ("Entry reason", _fmt((commission.get("authority") or {}).get("entry_reason"))),
+                ("Read-only", "yes" if bool(payload.get("read_only")) else "no"),
+                ("No execution", "yes" if bool(payload.get("no_execution")) else "no"),
+            ],
+            options,
+        )
+    )
+    lines.extend(
+        _section(
+            "Control Plane",
+            [
+                ("State", _fmt(control_plane.get("state"))),
+                ("Pending actions", str(len(control_plane.get("pending_operator_actions") or []))),
+                ("Blockers", str(len(control_plane.get("blockers") or []))),
+                ("Warnings", str(len(control_plane.get("warnings") or []))),
+            ],
+            options,
+        )
+    )
+    lines.extend(
+        _section(
+            "Live Order",
+            [
+                ("Order ID", _fmt(live_order.get("live_crypto_order_id"))),
+                ("Status", _fmt(live_order.get("status"))),
+                ("Provider order", _fmt(live_order.get("provider_order_id"))),
+            ],
+            options,
+        )
+    )
+    return "\n".join(lines)
+
+
 def render_buy_opportunity_diagnostic_text(payload: dict[str, Any], options: RenderOptions) -> str:
     totals = payload.get("totals") or {}
     summary = payload.get("summary") or {}

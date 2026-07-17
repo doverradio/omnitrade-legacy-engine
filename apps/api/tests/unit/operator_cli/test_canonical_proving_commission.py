@@ -1,13 +1,18 @@
 from __future__ import annotations
 
+import json
+from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
+from enum import Enum
 from types import SimpleNamespace
 from uuid import uuid4
 
 import pytest
+from pydantic import BaseModel
 
 import app.operator_cli.service as service
+from app.schemas.capital_campaign_domain import CommissionedControlPlaneStatusResponse
 
 
 def _async_return(value):
@@ -537,3 +542,204 @@ async def test_canonical_proving_commission_propagates_execution_blockers(monkey
             confirm=True,
             idempotency_key="root-6",
         )
+
+
+class _StatusEnum(Enum):
+    READY = "READY"
+
+
+@dataclass
+class _DataclassEvidence:
+    evidence_id: str
+    observed_at: datetime
+
+
+class _NestedEvidenceModel(BaseModel):
+    marker: str
+    created_at: datetime
+    amount: Decimal
+
+
+def test_to_json_compatible_serializes_nested_non_native_values() -> None:
+    class _FakeColumn:
+        def __init__(self, name: str) -> None:
+            self.name = name
+
+    class _FakeOrmRow:
+        __table__ = SimpleNamespace(columns=[_FakeColumn("row_id"), _FakeColumn("created_at"), _FakeColumn("amount")])
+
+        def __init__(self) -> None:
+            self.row_id = uuid4()
+            self.created_at = datetime(2026, 7, 17, tzinfo=timezone.utc)
+            self.amount = Decimal("5.25")
+
+    payload = {
+        "uuid": uuid4(),
+        "decimal": Decimal("5"),
+        "datetime": datetime(2026, 7, 17, 12, 0, tzinfo=timezone.utc),
+        "enum": _StatusEnum.READY,
+        "dataclass": _DataclassEvidence(evidence_id="ev-1", observed_at=datetime(2026, 7, 17, tzinfo=timezone.utc)),
+        "pydantic": _NestedEvidenceModel(marker="nested", created_at=datetime(2026, 7, 17, tzinfo=timezone.utc), amount=Decimal("1.5")),
+        "orm_row": _FakeOrmRow(),
+        "list": [uuid4(), Decimal("3.14"), _StatusEnum.READY],
+    }
+
+    serialized = service._to_json_compatible(payload)
+
+    assert isinstance(serialized["uuid"], str)
+    assert serialized["decimal"] == "5"
+    assert serialized["enum"] == "READY"
+    assert serialized["dataclass"]["evidence_id"] == "ev-1"
+    assert serialized["pydantic"]["amount"] == "1.5"
+    assert serialized["orm_row"]["amount"] == "5.25"
+    assert serialized["list"][1] == "3.14"
+    json.dumps(serialized)
+
+
+@pytest.mark.asyncio
+async def test_canonical_proving_commission_status_serializes_commissioned_control_plane(monkeypatch: pytest.MonkeyPatch) -> None:
+    state = _State()
+
+    class _ControlPlaneNested(BaseModel):
+        nested_id: str
+        nested_amount: Decimal
+
+    class _ControlPlaneEnum(Enum):
+        OPEN = "open"
+
+    status_model = CommissionedControlPlaneStatusResponse(
+        campaign_id=state.campaign_id,
+        version=1,
+        state="READY",
+        readiness={
+            "uuid_value": uuid4(),
+            "decimal_value": Decimal("5"),
+            "datetime_value": datetime(2026, 7, 17, tzinfo=timezone.utc),
+            "enum_value": _ControlPlaneEnum.OPEN,
+            "nested_model": _ControlPlaneNested(nested_id="n-1", nested_amount=Decimal("2.5")),
+        },
+        generated_at=datetime(2026, 7, 17, tzinfo=timezone.utc),
+    )
+
+    async def _load_definition(**_kwargs):
+        return state.definition
+
+    async def _load_package(**_kwargs):
+        return state.package
+
+    async def _load_approval(**_kwargs):
+        return state.approval
+
+    async def _load_activation(**_kwargs):
+        return state.activation
+
+    async def _load_preview(**_kwargs):
+        return state.preview
+
+    async def _load_package_payload(**_kwargs):
+        return {
+            "package": {
+                "package_id": state.package.package_id,
+                "proposed_order_amount": Decimal("5"),
+                "generated_at": datetime(2026, 7, 17, tzinfo=timezone.utc),
+            }
+        }
+
+    async def _status(**_kwargs):
+        return status_model
+
+    monkeypatch.setattr(service, "AsyncSessionLocal", lambda: _SessionContext(_FakeDb(state)))
+    monkeypatch.setattr(service, "_load_campaign_definition_by_identity", _load_definition)
+    monkeypatch.setattr(service, "_load_latest_forced_canonical_package", _load_package)
+    monkeypatch.setattr(service, "_load_latest_approval_for_package", _load_approval)
+    monkeypatch.setattr(service, "_load_activation_for_package", _load_activation)
+    monkeypatch.setattr(service, "_load_preview_for_package_row", _load_preview)
+    monkeypatch.setattr(service, "get_canonical_preview_package", _load_package_payload)
+    monkeypatch.setattr(service, "_get_commissioned_control_plane_status", _status)
+
+    payload = await service.canonical_proving_commission_status(
+        campaign_id=state.campaign_id,
+        campaign_version=1,
+        paper_account_id=state.paper_account_id,
+        live_trading_profile_id=state.profile_id,
+        provider="kraken_spot",
+        environment="production",
+        product="BTC-USD",
+    )
+
+    assert isinstance(payload["commissioned_control_plane"], dict)
+    readiness = payload["commissioned_control_plane"]["readiness"]
+    assert isinstance(readiness["uuid_value"], str)
+    assert readiness["decimal_value"] == "5"
+    assert readiness["enum_value"] == "open"
+    assert readiness["nested_model"]["nested_amount"] == "2.5"
+    json.dumps(payload)
+
+
+@pytest.mark.asyncio
+async def test_canonical_proving_commission_status_is_read_only(monkeypatch: pytest.MonkeyPatch) -> None:
+    state = _State()
+
+    class _TrackingDb(_FakeDb):
+        def __init__(self, state: _State) -> None:
+            super().__init__(state)
+            self.commit_calls = 0
+            self.flush_calls = 0
+
+        async def commit(self) -> None:
+            self.commit_calls += 1
+
+        async def flush(self) -> None:
+            self.flush_calls += 1
+
+    db = _TrackingDb(state)
+
+    async def _load_definition(**_kwargs):
+        return state.definition
+
+    async def _load_package(**_kwargs):
+        return state.package
+
+    async def _load_approval(**_kwargs):
+        return state.approval
+
+    async def _load_activation(**_kwargs):
+        return state.activation
+
+    async def _load_preview(**_kwargs):
+        return state.preview
+
+    async def _status(**_kwargs):
+        return CommissionedControlPlaneStatusResponse(
+            campaign_id=state.campaign_id,
+            version=1,
+            state="READY",
+            generated_at=datetime(2026, 7, 17, tzinfo=timezone.utc),
+        )
+
+    async def _load_package_payload(**_kwargs):
+        return {"package": {"package_id": state.package.package_id}}
+
+    monkeypatch.setattr(service, "AsyncSessionLocal", lambda: _SessionContext(db))
+    monkeypatch.setattr(service, "_load_campaign_definition_by_identity", _load_definition)
+    monkeypatch.setattr(service, "_load_latest_forced_canonical_package", _load_package)
+    monkeypatch.setattr(service, "_load_latest_approval_for_package", _load_approval)
+    monkeypatch.setattr(service, "_load_activation_for_package", _load_activation)
+    monkeypatch.setattr(service, "_load_preview_for_package_row", _load_preview)
+    monkeypatch.setattr(service, "_get_commissioned_control_plane_status", _status)
+    monkeypatch.setattr(service, "get_canonical_preview_package", _load_package_payload)
+
+    payload = await service.canonical_proving_commission_status(
+        campaign_id=state.campaign_id,
+        campaign_version=1,
+        paper_account_id=state.paper_account_id,
+        live_trading_profile_id=state.profile_id,
+        provider="kraken_spot",
+        environment="production",
+        product="BTC-USD",
+    )
+
+    assert payload["read_only"] is True
+    assert payload["no_execution"] is True
+    assert db.commit_calls == 0
+    assert db.flush_calls == 0

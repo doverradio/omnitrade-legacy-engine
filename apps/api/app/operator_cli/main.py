@@ -10,6 +10,7 @@ from uuid import UUID, uuid4
 
 from app.operator_cli.formatting import (
     render_buy_opportunity_diagnostic_text,
+    render_canonical_proving_commission_status_text,
     render_hold_decision_diagnostic_text,
     render_candles_text,
     render_execution_forensics_text,
@@ -1035,7 +1036,8 @@ async def _run_async(args: argparse.Namespace) -> tuple[int, dict[str, Any], str
             environment=args.environment,
             product=args.product,
         )
-        return 0, payload, render_json(payload)
+        text = render_json(payload) if args.json_output else render_canonical_proving_commission_status_text(payload, options)
+        return 0, payload, text
 
     if args.command == "canonical-proving-pause":
         payload = await pause_canonical_proving_activation_bundle(

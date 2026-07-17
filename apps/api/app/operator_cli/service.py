@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 from collections import Counter
+from dataclasses import asdict, is_dataclass
+from enum import Enum
 import hashlib
 import json
 import re
@@ -12,6 +14,7 @@ from typing import Any
 from uuid import UUID
 import uuid
 
+from pydantic import BaseModel
 from sqlalchemy import desc, func, select
 
 from app.config import get_settings
@@ -248,6 +251,39 @@ def _serialize_decimal_str(value: Decimal | None) -> str | None:
     if value is None:
         return None
     return format(value, "f")
+
+
+def _to_json_compatible(value: Any) -> Any:
+    if value is None or isinstance(value, (str, int, float, bool)):
+        return value
+    if isinstance(value, Decimal):
+        return format(value, "f")
+    if isinstance(value, UUID):
+        return str(value)
+    if isinstance(value, datetime):
+        if value.tzinfo is None:
+            return value.replace(tzinfo=timezone.utc).isoformat()
+        return value.astimezone(timezone.utc).isoformat()
+    if isinstance(value, Enum):
+        return _to_json_compatible(value.value)
+    if isinstance(value, BaseModel):
+        return _to_json_compatible(value.model_dump(mode="json"))
+    if is_dataclass(value):
+        return _to_json_compatible(asdict(value))
+    if isinstance(value, dict):
+        return {str(key): _to_json_compatible(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple, set)):
+        return [_to_json_compatible(item) for item in value]
+
+    table = getattr(value, "__table__", None)
+    columns = getattr(table, "columns", None)
+    if columns is not None:
+        return {
+            str(column.name): _to_json_compatible(getattr(value, column.name, None))
+            for column in columns
+        }
+
+    raise TypeError(f"Object of type {type(value).__name__} is not JSON serializable")
 
 
 def _normalize_instrument(value: str) -> str:
@@ -5712,7 +5748,7 @@ async def canonical_proving_commission_status(
                 .where(LiveCryptoOrder.live_crypto_order_id == live_crypto_order_id)
                 .limit(1)
             )
-        return {
+        payload = {
             "campaign_id": str(campaign_id),
             "campaign_version": campaign_version,
             "paper_account_id": str(paper_account_id),
@@ -5744,6 +5780,7 @@ async def canonical_proving_commission_status(
             "read_only": True,
             "no_execution": True,
         }
+        return _to_json_compatible(payload)
 
 
 async def inspect_legacy_campaign_transition(

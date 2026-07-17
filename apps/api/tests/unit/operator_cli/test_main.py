@@ -1593,6 +1593,66 @@ async def test_run_canonical_proving_commission_status_command_uses_shared_servi
     assert '"no_execution": true' in rendered
 
 
+@pytest.mark.asyncio
+async def test_run_canonical_proving_commission_status_command_renders_human_output(monkeypatch: pytest.MonkeyPatch) -> None:
+    expected_payload = {
+        "campaign_id": "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa",
+        "campaign_version": 1,
+        "provider": "kraken_spot",
+        "environment": "production",
+        "product": "BTC-USD",
+        "read_only": True,
+        "no_execution": True,
+        "commissioning_status": {
+            "state": "ACTIVE_POSITION",
+            "authority": {
+                "entry_authority": "OPERATOR_COMMISSIONED",
+                "entry_reason": "INITIAL_PROVING_ENTRY",
+            },
+        },
+        "commissioned_control_plane": {
+            "state": "ACTIVE_POSITION",
+            "pending_operator_actions": [],
+            "blockers": [],
+            "warnings": [],
+        },
+        "live_order": {
+            "live_crypto_order_id": "11111111-1111-1111-1111-111111111111",
+            "status": "FILLED",
+            "provider_order_id": "provider-1",
+        },
+    }
+
+    async def _stub(**_kwargs):
+        return expected_payload
+
+    monkeypatch.setattr(operator_main, "canonical_proving_commission_status", _stub)
+
+    args = parse_args([
+        "canonical-proving-commission-status",
+        "--campaign-id",
+        "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa",
+        "--campaign-version",
+        "1",
+        "--paper-account-id",
+        "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb",
+        "--live-trading-profile-id",
+        "cccccccc-cccc-cccc-cccc-cccccccccccc",
+        "--provider",
+        "kraken_spot",
+        "--environment",
+        "production",
+        "--product",
+        "BTC-USD",
+    ])
+    code, payload, rendered = await operator_main._run_async(args)
+
+    assert code == 0
+    assert payload == expected_payload
+    assert "CANONICAL PROVING COMMISSION STATUS" in rendered
+    assert "No execution" in rendered
+
+
 def test_parse_legacy_campaign_transition_commands() -> None:
     readiness = parse_args([
         "legacy-campaign-transition-readiness",
