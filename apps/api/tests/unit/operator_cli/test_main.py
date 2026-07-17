@@ -1361,12 +1361,15 @@ def test_parse_canonical_preview_package_commands() -> None:
         "production",
         "--product",
         "BTC-USD",
+        "--commissioning-entry-mode",
+        "initial_proving_entry",
         "--idempotency-key",
         "pkg-1",
         "--json",
     ])
     assert create_args.command == "canonical-preview-package-create"
     assert create_args.json_output is True
+    assert create_args.commissioning_entry_mode == "initial_proving_entry"
 
     show_args = parse_args([
         "canonical-preview-package-show",

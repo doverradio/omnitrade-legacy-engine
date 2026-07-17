@@ -46,6 +46,7 @@ _PACKAGE_STATES = {
 _ACTIVATION_STATES = {"ACTIVE", "PAUSED", "REVOKED", "EXPIRED", "INVALIDATED", "COMPLETED"}
 
 _EXECUTABLE_ACTIONS = {"OPEN_POSITION_PROPOSED", "CLOSE_POSITION_PROPOSED"}
+_FORCED_COMMISSIONING_MODE = "initial_proving_entry"
 
 
 def _diagnostic(*, code: str, stage: str, detail: str | None = None) -> dict[str, str]:
@@ -72,6 +73,7 @@ class CanonicalPreviewPackageCreateRequest:
     max_proposed_order_amount: Decimal
     actor: str
     idempotency_key: str
+    commissioning_entry_mode: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -155,11 +157,58 @@ def _input_fingerprint(request: CanonicalPreviewPackageCreateRequest) -> str:
             "environment": request.environment,
             "product": request.product,
             "max_proposed_order_amount": _serialize_decimal(request.max_proposed_order_amount),
+            "commissioning_entry_mode": request.commissioning_entry_mode,
         },
         sort_keys=True,
         separators=(",", ":"),
     )
     return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
+def _commissioned_blob(definition: CapitalCampaignDefinition | None) -> dict[str, Any]:
+    if definition is None:
+        return {}
+    metadata = dict(getattr(definition, "metadata_evidence", {}) or {})
+    blob = metadata.get("commissioned_seed_campaign")
+    return blob if isinstance(blob, dict) else {}
+
+
+def _is_forced_commissioning_mode(request: CanonicalPreviewPackageCreateRequest) -> bool:
+    value = str(request.commissioning_entry_mode or "").strip().lower()
+    return value == _FORCED_COMMISSIONING_MODE
+
+
+def _forced_commissioning_guard_blocker(
+    *,
+    request: CanonicalPreviewPackageCreateRequest,
+    definition: CapitalCampaignDefinition,
+    runtime_campaign: CapitalCampaign,
+    prior_packages: int,
+) -> str | None:
+    if not _is_forced_commissioning_mode(request):
+        return None
+
+    if str(definition.status or "").upper() != "READY" or str(runtime_campaign.status or "").upper() != "READY":
+        return "commissioning_mode_requires_ready_definition_and_runtime"
+
+    blob = _commissioned_blob(definition)
+    state = str(blob.get("state") or "").strip().upper()
+    if state != "READY":
+        return "commissioning_mode_requires_commissioned_ready_state"
+
+    commissioning = blob.get("commissioning") if isinstance(blob.get("commissioning"), dict) else {}
+    authority = str(commissioning.get("authority_classification") or "").strip().upper()
+    if authority and authority != "OPERATOR_COMMISSIONED":
+        return "commissioning_mode_requires_operator_commissioned_authority"
+
+    entry_execution = blob.get("entry_execution") if isinstance(blob.get("entry_execution"), dict) else {}
+    if entry_execution:
+        return "commissioning_mode_applies_only_to_initial_proving_entry"
+
+    if prior_packages > 0:
+        return "commissioning_mode_applies_only_to_first_canonical_package"
+
+    return None
 
 
 async def _load_package(*, db: AsyncSession, package_id: uuid.UUID) -> CanonicalPreviewPackage | None:
@@ -246,6 +295,7 @@ def _record_audit_entry(*, actor: str, action: str, entity_id: uuid.UUID, after_
 
 
 def _package_payload(package: CanonicalPreviewPackage) -> dict[str, Any]:
+    market_identity = package.market_evidence_identity if isinstance(package.market_evidence_identity, dict) else {}
     return {
         "package_id": str(package.package_id),
         "campaign_id": str(package.campaign_id),
@@ -267,6 +317,10 @@ def _package_payload(package: CanonicalPreviewPackage) -> dict[str, Any]:
         "risk_event_id": str(package.risk_event_id),
         "crypto_order_preview_id": str(package.crypto_order_preview_id),
         "market_evidence_identity": package.market_evidence_identity,
+        "entry_authority": market_identity.get("entry_authority"),
+        "entry_reason": market_identity.get("entry_reason"),
+        "strategy_override_scope": market_identity.get("strategy_override_scope"),
+        "requested_quote_size": market_identity.get("requested_quote_size"),
         "market_evidence_observed_at": package.market_evidence_observed_at.isoformat() if package.market_evidence_observed_at else None,
         "preview_expires_at": package.preview_expires_at.isoformat(),
         "package_state": package.package_state,
@@ -356,6 +410,9 @@ async def create_canonical_preview_package(
 ) -> dict[str, Any]:
     if request.max_proposed_order_amount != Decimal("5"):
         raise ValueError("max proposed order amount must equal canonical bound of 5")
+    mode_value = str(request.commissioning_entry_mode or "").strip().lower()
+    if mode_value and mode_value != _FORCED_COMMISSIONING_MODE:
+        raise ValueError(f"unsupported commissioning_entry_mode: {request.commissioning_entry_mode}")
 
     existing = await _load_package_by_idempotency(db=db, idempotency_key=request.idempotency_key)
     if existing is not None:
@@ -389,6 +446,20 @@ async def create_canonical_preview_package(
     if definition is None:
         raise _preview_evidence_error(
             diagnostics=[_diagnostic(code="canonical_campaign_definition_missing", stage="campaign_resolution")]
+        )
+
+    prior_packages = await db.scalar(
+        select(func.count(CanonicalPreviewPackage.package_id)).where(CanonicalPreviewPackage.campaign_id == request.campaign_id)
+    )
+    forced_blocker = _forced_commissioning_guard_blocker(
+        request=request,
+        definition=definition,
+        runtime_campaign=runtime_campaign,
+        prior_packages=int(prior_packages or 0),
+    )
+    if forced_blocker is not None:
+        raise _preview_evidence_error(
+            diagnostics=[_diagnostic(code=forced_blocker, stage="commissioning_mode")]
         )
 
     orchestration = await run_campaign_orchestration_preview_for_candle(
@@ -428,25 +499,35 @@ async def create_canonical_preview_package(
         ]
         raise _preview_evidence_error(diagnostics=diagnostics)
 
-    if cycle.termination_stage in {"hold_terminal", "hold_no_package_created"} or proposed_action in {"NO_ACTION", "HOLD"} or decision_kind in {"NO_ACTION", "HOLD"}:
+    is_hold_cycle = (
+        cycle.termination_stage in {"hold_terminal", "hold_no_package_created"}
+        or proposed_action in {"NO_ACTION", "HOLD"}
+        or decision_kind in {"NO_ACTION", "HOLD"}
+    )
+    if is_hold_cycle:
         hold_reason = str(selected_decision.get("reason") or cycle.failure_reason or "no_executable_opportunity")
-        return {
-            "idempotent": False,
-            "outcome_code": "HOLD_NO_PACKAGE_CREATED",
-            "reason_code": "canonical_action_hold",
-            "reason_detail": hold_reason,
-            "stage": "canonical_orchestration",
-            "package": None,
-            "campaign_cycle": {
-                "cycle_id": str(cycle.cycle_id),
-                "state": cycle.state,
-                "termination_stage": cycle.termination_stage,
-                "failure_reason": cycle.failure_reason,
-            },
-            "diagnostics": [
-                _diagnostic(code="canonical_action_hold", stage="canonical_orchestration", detail=hold_reason),
-            ],
-        }
+        can_force_commissioning_entry = _is_forced_commissioning_mode(request) and hold_reason == "strategy_hold_signal"
+        if not can_force_commissioning_entry:
+            return {
+                "idempotent": False,
+                "outcome_code": "HOLD_NO_PACKAGE_CREATED",
+                "reason_code": "canonical_action_hold",
+                "reason_detail": hold_reason,
+                "stage": "canonical_orchestration",
+                "package": None,
+                "campaign_cycle": {
+                    "cycle_id": str(cycle.cycle_id),
+                    "state": cycle.state,
+                    "termination_stage": cycle.termination_stage,
+                    "failure_reason": cycle.failure_reason,
+                },
+                "diagnostics": [
+                    _diagnostic(code="canonical_action_hold", stage="canonical_orchestration", detail=hold_reason),
+                ],
+            }
+
+        # Initial operator-commissioned proving entry can bypass strategy HOLD only.
+        proposed_action = "OPEN_POSITION_PROPOSED"
 
     if proposed_action and proposed_action not in _EXECUTABLE_ACTIONS:
         raise _preview_evidence_error(
@@ -537,6 +618,10 @@ async def create_canonical_preview_package(
             "environment": preview.environment,
             "product": preview.product_id,
             "exchange_connection_id": str(preview.exchange_connection_id),
+            "entry_authority": "OPERATOR_COMMISSIONED" if _is_forced_commissioning_mode(request) else "AUTONOMOUS_STRATEGY",
+            "entry_reason": "INITIAL_PROVING_ENTRY" if _is_forced_commissioning_mode(request) else "AUTONOMOUS_SELECTION",
+            "strategy_override_scope": "COMMISSIONING_ENTRY_ONLY" if _is_forced_commissioning_mode(request) else "NONE",
+            "requested_quote_size": _serialize_decimal(request.max_proposed_order_amount),
         },
         market_evidence_observed_at=preview.created_at,
         preview_expires_at=preview.expires_at,

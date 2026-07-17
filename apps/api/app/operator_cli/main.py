@@ -643,6 +643,12 @@ def _build_parser() -> argparse.ArgumentParser:
     package_create.add_argument("--environment", type=str, required=True)
     package_create.add_argument("--product", type=str, required=True)
     package_create.add_argument("--max-proposed-order-amount", type=Decimal, default=Decimal("5"))
+    package_create.add_argument(
+        "--commissioning-entry-mode",
+        type=str,
+        choices=["initial_proving_entry"],
+        default=None,
+    )
     package_create.add_argument("--actor", type=str, default="operator:human")
     package_create.add_argument("--idempotency-key", type=str, required=True)
     package_create.add_argument("--json", action="store_true", dest="json_output")
@@ -898,6 +904,7 @@ async def _run_async(args: argparse.Namespace) -> tuple[int, dict[str, Any], str
             environment=args.environment,
             product_id=args.product,
             max_proposed_order_amount=args.max_proposed_order_amount,
+            commissioning_entry_mode=args.commissioning_entry_mode,
             actor=args.actor,
             idempotency_key=args.idempotency_key,
         )

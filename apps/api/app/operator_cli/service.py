@@ -4726,6 +4726,7 @@ async def create_canonical_preview_package_bundle(
     environment: str,
     product_id: str,
     max_proposed_order_amount: Decimal,
+    commissioning_entry_mode: str | None,
     actor: str,
     idempotency_key: str,
 ) -> dict[str, Any]:
@@ -4741,6 +4742,7 @@ async def create_canonical_preview_package_bundle(
                 environment=environment,
                 product=product_id,
                 max_proposed_order_amount=max_proposed_order_amount,
+                commissioning_entry_mode=commissioning_entry_mode,
                 actor=actor,
                 idempotency_key=idempotency_key,
             ),
