@@ -363,10 +363,9 @@ async def enable_kill_switch(
             "account_id must be null for global scope",
             details={"field": "account_id"},
         )
-    if account_id is not None:
-        await _get_account_or_404(db, account_id)
-
     async with db.begin():
+        if account_id is not None:
+            await _get_account_or_404(db, account_id)
         switch = await _get_or_create_kill_switch(db, scope=scope, account_id=account_id)
         before_state = {
             "engaged": bool(switch.engaged),
@@ -434,10 +433,9 @@ async def disable_kill_switch(
             "account_id must be null for global scope",
             details={"field": "account_id"},
         )
-    if account_id is not None:
-        await _get_account_or_404(db, account_id)
-
     async with db.begin():
+        if account_id is not None:
+            await _get_account_or_404(db, account_id)
         switch = await _get_or_create_kill_switch(db, scope=scope, account_id=account_id)
         before_state = {
             "engaged": bool(switch.engaged),
