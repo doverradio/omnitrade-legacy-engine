@@ -7,7 +7,8 @@ from uuid import UUID
 
 import pytest
 
-from app.services.capital_campaign_orchestration.service import build_campaign_orchestration_idempotency_key, fetch_campaign_orchestration_readiness
+from app.models.audit_log import AuditLog
+from app.services.capital_campaign_orchestration.service import build_campaign_orchestration_idempotency_key, fetch_campaign_orchestration_history, fetch_campaign_orchestration_readiness, fetch_campaign_orchestration_status
 from app.services.risk import RiskDecisionAction, RiskEvaluationResult
 
 
@@ -17,6 +18,34 @@ class _FakeDb:
 
     async def execute(self, _statement):
         raise AssertionError("unexpected execute call in readiness test")
+
+
+class _OrchestrationReadOnlyDb:
+    def __init__(self, *, definition, runtime=None, asset=None, cycles=None) -> None:
+        self.definition = definition
+        self.runtime = runtime
+        self.asset = asset
+        self.cycles = cycles or []
+
+    async def scalar(self, statement):
+        sql = str(statement)
+        if "FROM capital_campaign_definitions" in sql:
+            return self.definition
+        if "FROM capital_campaigns" in sql:
+            return self.runtime
+        if "FROM assets" in sql:
+            return self.asset
+        if "FROM autonomous_cycle_runs" in sql:
+            return self.cycles[0] if self.cycles else None
+        return None
+
+    async def execute(self, statement):
+        sql = str(statement)
+        if "FROM capital_campaign_definitions" in sql:
+            return SimpleNamespace(scalars=lambda: SimpleNamespace(all=lambda: [self.definition]))
+        if "FROM autonomous_cycle_runs" in sql:
+            return SimpleNamespace(scalars=lambda: SimpleNamespace(all=lambda: list(self.cycles)))
+        raise AssertionError(f"unexpected execute call: {sql}")
 
 
 def _async_return(value):
@@ -86,21 +115,126 @@ async def test_campaign_readiness_accepts_draft_preview(monkeypatch: pytest.Monk
         campaign_id=UUID("aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa"),
         version=1,
         status="DRAFT",
+        owner_identity="operator:human",
+        capital_budget=Decimal("25"),
+        remaining_unallocated_capital=Decimal("25"),
+        maximum_position_size=Decimal("5"),
+        maximum_total_exposure=Decimal("5"),
         allowed_instruments=["BTC-USD"],
         allowed_venues=["kraken_spot"],
+        compounding_policy={"policy_type": "FIXED_CAPITAL"},
+        metadata_evidence={},
     )
+    runtime = SimpleNamespace(id=1, exchange="kraken_spot", paper_account_id=None, updated_at=datetime.now(timezone.utc), uuid=campaign.campaign_id)
 
-    async def _get_campaign_definition(**_kwargs):
-        return campaign
-
-    monkeypatch.setattr(
-        "app.services.capital_campaign_orchestration.service.get_campaign_definition",
-        _get_campaign_definition,
+    payload = await fetch_campaign_orchestration_readiness(
+        db=_OrchestrationReadOnlyDb(definition=campaign, runtime=runtime, asset=None),
+        campaign_id=campaign.campaign_id,
+        version=campaign.version,
     )
-
-    payload = await fetch_campaign_orchestration_readiness(db=_FakeDb(), campaign_id=campaign.campaign_id, version=campaign.version)
     assert payload["items"][0]["ready"] is True
     assert payload["items"][0]["allows_draft_preview"] is True
+
+
+@pytest.mark.asyncio
+async def test_campaign_readiness_blocks_legacy_compounding_policy_without_policy_type() -> None:
+    definition = SimpleNamespace(
+        campaign_id=UUID("aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa"),
+        version=1,
+        status="READY",
+        owner_identity="operator:human",
+        capital_budget=Decimal("25"),
+        remaining_unallocated_capital=Decimal("25"),
+        maximum_position_size=Decimal("5"),
+        maximum_total_exposure=Decimal("5"),
+        allowed_instruments=["BTC-USD"],
+        allowed_venues=["kraken_spot"],
+        compounding_policy={},
+        metadata_evidence={"commissioned_seed_campaign": {"state": "READY"}},
+    )
+    runtime = SimpleNamespace(id=7, exchange="kraken_spot", paper_account_id=UUID("bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb"), updated_at=datetime.now(timezone.utc), uuid=definition.campaign_id)
+    asset = SimpleNamespace(id=UUID("cccccccc-cccc-cccc-cccc-cccccccccccc"), symbol="BTC", exchange="kraken_spot", created_at=datetime.now(timezone.utc))
+
+    payload = await fetch_campaign_orchestration_readiness(
+        db=_OrchestrationReadOnlyDb(definition=definition, runtime=runtime, asset=asset),
+        campaign_id=definition.campaign_id,
+        version=definition.version,
+    )
+
+    item = payload["items"][0]
+    assert item["ready"] is False
+    assert item["blockers"] == ["compounding_policy_missing_policy_type"]
+    assert item["campaign_snapshot"]["compounding_policy_compatibility"]["status"] == "legacy_missing_policy_type"
+
+
+@pytest.mark.asyncio
+async def test_campaign_status_and_history_surface_legacy_policy_blocker_without_validation_failure() -> None:
+    campaign_id = UUID("aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa")
+    definition = SimpleNamespace(
+        campaign_id=campaign_id,
+        version=1,
+        status="READY",
+        owner_identity="operator:human",
+        capital_budget=Decimal("25"),
+        remaining_unallocated_capital=Decimal("25"),
+        maximum_position_size=Decimal("5"),
+        maximum_total_exposure=Decimal("5"),
+        allowed_instruments=["BTC-USD"],
+        allowed_venues=["kraken_spot"],
+        compounding_policy={},
+        metadata_evidence={"commissioned_seed_campaign": {"state": "READY"}},
+        created_at=datetime.now(timezone.utc),
+    )
+    runtime = SimpleNamespace(id=7, exchange="kraken_spot", paper_account_id=UUID("bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb"), updated_at=datetime.now(timezone.utc), uuid=campaign_id)
+    asset = SimpleNamespace(id=UUID("cccccccc-cccc-cccc-cccc-cccccccccccc"), symbol="BTC", exchange="kraken_spot", created_at=datetime.now(timezone.utc))
+    cycle = SimpleNamespace(
+        cycle_id=UUID("dddddddd-dddd-dddd-dddd-dddddddddddd"),
+        state="FAILED_CLOSED",
+        cycle_kind="campaign",
+        capital_campaign_id=campaign_id,
+        capital_campaign_version=1,
+        started_at=datetime(2026, 7, 16, 12, 0, tzinfo=timezone.utc),
+        completed_at=datetime(2026, 7, 16, 12, 1, tzinfo=timezone.utc),
+        termination_stage="policy_validation",
+        failure_reason="legacy_compounding_policy_payload",
+        deterministic_explanation=[],
+        cycle_context={},
+    )
+    db = _OrchestrationReadOnlyDb(definition=definition, runtime=runtime, asset=asset, cycles=[cycle])
+
+    status_payload = await fetch_campaign_orchestration_status(db=db, campaign_id=campaign_id, version=1)
+    history_payload = await fetch_campaign_orchestration_history(db=db, campaign_id=campaign_id, version=1, limit=50)
+
+    assert status_payload["ready"] is False
+    assert status_payload["blockers"] == ["compounding_policy_missing_policy_type"]
+    assert status_payload["campaign_snapshot"]["paper_account_id"] == str(runtime.paper_account_id)
+    assert history_payload["blockers"] == ["compounding_policy_missing_policy_type"]
+    assert history_payload["items"][0]["failure_reason"] == "legacy_compounding_policy_payload"
+
+
+@pytest.mark.asyncio
+async def test_campaign_status_rejects_malformed_compounding_policy_payload_fail_closed() -> None:
+    definition = SimpleNamespace(
+        campaign_id=UUID("aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa"),
+        version=1,
+        status="READY",
+        owner_identity="operator:human",
+        capital_budget=Decimal("25"),
+        remaining_unallocated_capital=Decimal("25"),
+        maximum_position_size=Decimal("5"),
+        maximum_total_exposure=Decimal("5"),
+        allowed_instruments=["BTC-USD"],
+        allowed_venues=["kraken_spot"],
+        compounding_policy="not-a-dict",
+        metadata_evidence={},
+        created_at=datetime.now(timezone.utc),
+    )
+    db = _OrchestrationReadOnlyDb(definition=definition, runtime=None, asset=None, cycles=[])
+
+    payload = await fetch_campaign_orchestration_status(db=db, campaign_id=definition.campaign_id, version=1)
+
+    assert payload["ready"] is False
+    assert payload["blockers"] == ["compounding_policy_invalid_payload"]
 
 
 @pytest.mark.asyncio

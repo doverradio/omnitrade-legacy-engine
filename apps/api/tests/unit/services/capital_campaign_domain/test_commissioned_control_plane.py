@@ -8,6 +8,7 @@ from uuid import uuid4
 import pytest
 
 from app.core.errors import InvalidRequestError
+from app.models.audit_log import AuditLog
 from app.schemas.capital_campaign_domain import CommissionedControlPlaneMutationRequest
 from app.services.capital_campaign_domain import commissioned_control_plane as control_plane
 
@@ -294,3 +295,54 @@ async def test_control_plane_mutation_requires_non_empty_actor(monkeypatch: pyte
 
     assert db.flush_calls == 0
     assert db.commit_calls == 0
+
+
+@pytest.mark.asyncio
+async def test_control_plane_status_renders_audit_rows_in_deterministic_order(monkeypatch: pytest.MonkeyPatch) -> None:
+    campaign_id = uuid4()
+    definition = _definition(campaign_id, version=1)
+    runtime = SimpleNamespace(uuid=campaign_id)
+
+    async def _load_def_runtime(**_kwargs):
+        return definition, runtime
+
+    async def _load_decision(**_kwargs):
+        return None
+
+    async def _load_risk(**_kwargs):
+        return None
+
+    older = AuditLog(
+        id=1,
+        actor="operator:older",
+        action="older_action",
+        entity_type="capital_campaign",
+        entity_id=campaign_id,
+        before_state=None,
+        after_state=None,
+        created_at=datetime(2026, 7, 14, 11, 0, tzinfo=timezone.utc),
+    )
+    newer = AuditLog(
+        id=2,
+        actor="operator:newer",
+        action="newer_action",
+        entity_type="capital_campaign",
+        entity_id=campaign_id,
+        before_state=None,
+        after_state=None,
+        created_at=datetime(2026, 7, 14, 12, 0, tzinfo=timezone.utc),
+    )
+
+    async def _load_audit(**_kwargs):
+        return [newer, older]
+
+    monkeypatch.setattr(control_plane, "_load_definition_and_runtime", _load_def_runtime)
+    monkeypatch.setattr(control_plane, "_load_decision_summary", _load_decision)
+    monkeypatch.setattr(control_plane, "_load_risk_summary", _load_risk)
+    monkeypatch.setattr(control_plane, "_load_audit_rows", _load_audit)
+
+    result = await control_plane.get_commissioned_control_plane_status(db=_FakeDb(), campaign_id=campaign_id, version=1)
+
+    assert result.audit_summary["latest"][0]["action"] == "newer_action"
+    audit_events = [item for item in result.campaign_timeline if item.get("kind") == "audit"]
+    assert [item["action"] for item in audit_events] == ["older_action", "newer_action"]

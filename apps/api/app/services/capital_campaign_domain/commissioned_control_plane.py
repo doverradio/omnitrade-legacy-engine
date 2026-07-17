@@ -158,7 +158,7 @@ async def _load_audit_rows(*, db: AsyncSession, campaign_id: UUID, limit: int) -
         select(AuditLog)
         .where(AuditLog.entity_type == "capital_campaign")
         .where(AuditLog.entity_id == campaign_id)
-        .order_by(AuditLog.timestamp.desc())
+        .order_by(AuditLog.created_at.desc(), AuditLog.id.desc())
         .limit(limit)
     )
     return list(rows)
@@ -271,7 +271,7 @@ async def get_commissioned_control_plane_status(
         "count": len(audit_rows),
         "latest": [
             {
-                "timestamp": item.timestamp,
+                "timestamp": item.created_at,
                 "action": item.action,
                 "actor": item.actor,
             }
@@ -284,7 +284,7 @@ async def get_commissioned_control_plane_status(
     for item in audit_rows:
         timeline.append(
             {
-                "timestamp": item.timestamp.isoformat() if item.timestamp is not None else None,
+                "timestamp": item.created_at.isoformat() if item.created_at is not None else None,
                 "action": item.action,
                 "actor": item.actor,
                 "kind": "audit",

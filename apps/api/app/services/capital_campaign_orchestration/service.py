@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 from datetime import datetime, timezone
+from decimal import Decimal
 from typing import Any
 from uuid import UUID, uuid4
 
@@ -11,8 +12,10 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.models.asset import Asset
 from app.models.autonomous_cycle_run import AutonomousCycleRun
+from app.models.capital_campaign import CapitalCampaign
+from app.models.capital_campaign_definition import CapitalCampaignDefinition
 from app.models.candle import Candle
-from app.schemas.capital_campaign_domain import CapitalCampaignPreviewRequest
+from app.schemas.capital_campaign_domain import CampaignCompoundingPolicy, CapitalCampaignPreviewRequest
 from app.services.capital_campaign_domain.service import get_campaign_definition, list_campaign_definitions, preview_campaign_definition
 from app.services.capital_campaign_orchestration.authoritative import compose_campaign_authoritative_cycle
 
@@ -22,6 +25,147 @@ _READINESS_ELIGIBLE_STATUSES = {"DRAFT", "READY", "ACTIVE", "PAUSED"}
 _SUPPORTED_TRIGGER_PROVIDER = "kraken_spot"
 _SUPPORTED_TRIGGER_PRODUCT = "BTC-USD"
 _SUPPORTED_TRIGGER_INTERVAL = "15m"
+
+
+def _assess_compounding_policy(raw_policy: Any) -> dict[str, Any]:
+    if not isinstance(raw_policy, dict):
+        return {
+            "valid": False,
+            "status": "invalid_payload",
+            "policy_type": None,
+            "blockers": ["compounding_policy_invalid_payload"],
+            "warnings": [],
+        }
+
+    if not str(raw_policy.get("policy_type") or "").strip():
+        return {
+            "valid": False,
+            "status": "legacy_missing_policy_type",
+            "policy_type": None,
+            "blockers": ["compounding_policy_missing_policy_type"],
+            "warnings": ["legacy_compounding_policy_payload"],
+        }
+
+    try:
+        policy = CampaignCompoundingPolicy.model_validate(raw_policy)
+    except Exception:
+        return {
+            "valid": False,
+            "status": "invalid_payload",
+            "policy_type": None,
+            "blockers": ["compounding_policy_invalid_payload"],
+            "warnings": [],
+        }
+
+    return {
+        "valid": True,
+        "status": "valid",
+        "policy_type": policy.policy_type,
+        "blockers": [],
+        "warnings": [],
+    }
+
+
+async def _load_runtime_for_definition(*, db: AsyncSession, campaign_id: UUID) -> CapitalCampaign | None:
+    return await db.scalar(
+        select(CapitalCampaign)
+        .where(CapitalCampaign.uuid == campaign_id)
+        .order_by(desc(CapitalCampaign.updated_at), desc(CapitalCampaign.id))
+        .limit(1)
+    )
+
+
+async def _load_btc_asset_for_provider(*, db: AsyncSession) -> Asset | None:
+    asset = await db.scalar(
+        select(Asset)
+        .where(Asset.exchange == _SUPPORTED_TRIGGER_PROVIDER)
+        .where(Asset.symbol.in_(["BTC", "XBT", "XXBT"]))
+        .order_by(desc(Asset.created_at), desc(Asset.id))
+        .limit(1)
+    )
+    return asset
+
+
+def _build_campaign_snapshot(*, definition: CapitalCampaignDefinition, runtime: CapitalCampaign | None, asset: Asset | None, policy_assessment: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "campaign_id": str(definition.campaign_id),
+        "version": definition.version,
+        "status": definition.status,
+        "owner_identity": definition.owner_identity,
+        "exchange": None if runtime is None else runtime.exchange,
+        "paper_account_id": None if runtime is None or runtime.paper_account_id is None else str(runtime.paper_account_id),
+        "runtime_campaign_id": None if runtime is None else runtime.id,
+        "capital_budget": format(Decimal(str(definition.capital_budget)), "f"),
+        "remaining_unallocated_capital": format(Decimal(str(definition.remaining_unallocated_capital)), "f"),
+        "maximum_position_size": format(Decimal(str(definition.maximum_position_size)), "f"),
+        "maximum_total_exposure": format(Decimal(str(definition.maximum_total_exposure)), "f"),
+        "allowed_venues": list(definition.allowed_venues or []),
+        "allowed_instruments": list(definition.allowed_instruments or []),
+        "commissioned_metadata_present": isinstance((definition.metadata_evidence or {}).get("commissioned_seed_campaign"), dict),
+        "linked_asset": None
+        if asset is None
+        else {
+            "asset_id": str(asset.id),
+            "symbol": asset.symbol,
+            "exchange": asset.exchange,
+        },
+        "compounding_policy_compatibility": {
+            "status": policy_assessment["status"],
+            "policy_type": policy_assessment["policy_type"],
+            "blockers": list(policy_assessment["blockers"]),
+            "warnings": list(policy_assessment["warnings"]),
+        },
+    }
+
+
+def _orchestration_ready(*, definition: CapitalCampaignDefinition, policy_assessment: dict[str, Any]) -> bool:
+    if not policy_assessment["valid"]:
+        return False
+    allowed_instruments = {value.strip().upper() for value in definition.allowed_instruments or []}
+    allowed_venues = {value.strip().lower() for value in definition.allowed_venues or []}
+    return (
+        definition.status in _READINESS_ELIGIBLE_STATUSES
+        and _SUPPORTED_TRIGGER_PRODUCT in allowed_instruments
+        and _SUPPORTED_TRIGGER_PROVIDER in allowed_venues
+    )
+
+
+async def _load_orchestration_definition(*, db: AsyncSession, campaign_id: UUID, version: int | None) -> tuple[CapitalCampaignDefinition, CapitalCampaign | None, Asset | None, dict[str, Any]]:
+    definition_stmt = select(CapitalCampaignDefinition).where(CapitalCampaignDefinition.campaign_id == campaign_id)
+    if version is not None:
+        definition_stmt = definition_stmt.where(CapitalCampaignDefinition.version == version)
+    definition = await db.scalar(
+        definition_stmt.order_by(desc(CapitalCampaignDefinition.version), desc(CapitalCampaignDefinition.created_at)).limit(1)
+    )
+    if definition is None:
+        raise LookupError("capital campaign definition not found")
+
+    runtime = await _load_runtime_for_definition(db=db, campaign_id=definition.campaign_id)
+    asset = await _load_btc_asset_for_provider(db=db)
+    policy_assessment = _assess_compounding_policy(definition.compounding_policy)
+    return definition, runtime, asset, policy_assessment
+
+
+async def _list_orchestration_definitions(*, db: AsyncSession) -> list[tuple[CapitalCampaignDefinition, CapitalCampaign | None, Asset | None, dict[str, Any]]]:
+    rows = list(
+        (
+            await db.execute(
+                select(CapitalCampaignDefinition)
+                .order_by(desc(CapitalCampaignDefinition.campaign_id), desc(CapitalCampaignDefinition.version), desc(CapitalCampaignDefinition.created_at))
+            )
+        ).scalars().all()
+    )
+    latest_by_campaign: dict[UUID, CapitalCampaignDefinition] = {}
+    for item in rows:
+        latest_by_campaign.setdefault(item.campaign_id, item)
+
+    asset = await _load_btc_asset_for_provider(db=db)
+    result: list[tuple[CapitalCampaignDefinition, CapitalCampaign | None, Asset | None, dict[str, Any]]] = []
+    for definition in latest_by_campaign.values():
+        runtime = await _load_runtime_for_definition(db=db, campaign_id=definition.campaign_id)
+        policy_assessment = _assess_compounding_policy(definition.compounding_policy)
+        result.append((definition, runtime, asset, policy_assessment))
+    return result
 
 
 def build_campaign_orchestration_idempotency_key(
@@ -110,25 +254,33 @@ def _eligible_for_orchestration(*, campaign) -> bool:
 
 async def fetch_campaign_orchestration_readiness(*, db: AsyncSession, campaign_id: UUID | None, version: int | None) -> dict[str, Any]:
     if campaign_id is None:
-        campaigns = await list_campaign_definitions(db=db, campaign_id=None, status=None, latest_only=True)
-        items = campaigns.items
+        campaigns = await _list_orchestration_definitions(db=db)
     else:
-        items = [await get_campaign_definition(db=db, campaign_id=campaign_id, version=version)]
+        campaigns = [await _load_orchestration_definition(db=db, campaign_id=campaign_id, version=version)]
 
     readiness_items: list[dict[str, Any]] = []
-    for item in items:
+    for definition, runtime, asset, policy_assessment in campaigns:
+        ready = _orchestration_ready(definition=definition, policy_assessment=policy_assessment)
         readiness_items.append(
             {
-                "campaign_id": item.campaign_id,
-                "version": item.version,
-                "status": item.status,
-                "ready": _eligible_for_orchestration(campaign=item),
-                "allows_draft_preview": item.status == "DRAFT",
+                "campaign_id": definition.campaign_id,
+                "version": definition.version,
+                "status": definition.status,
+                "ready": ready,
+                "allows_draft_preview": definition.status == "DRAFT",
                 "supported_trigger": {
                     "provider": _SUPPORTED_TRIGGER_PROVIDER,
                     "product_id": _SUPPORTED_TRIGGER_PRODUCT,
                     "interval": _SUPPORTED_TRIGGER_INTERVAL,
                 },
+                "blockers": list(policy_assessment["blockers"]),
+                "warnings": list(policy_assessment["warnings"]),
+                "campaign_snapshot": _build_campaign_snapshot(
+                    definition=definition,
+                    runtime=runtime,
+                    asset=asset,
+                    policy_assessment=policy_assessment,
+                ),
             }
         )
 
@@ -247,7 +399,7 @@ async def run_campaign_orchestration_preview_for_candle(
 
 
 async def fetch_campaign_orchestration_status(*, db: AsyncSession, campaign_id: UUID, version: int | None) -> dict[str, Any]:
-    definition = await get_campaign_definition(db=db, campaign_id=campaign_id, version=version)
+    definition, runtime, asset, policy_assessment = await _load_orchestration_definition(db=db, campaign_id=campaign_id, version=version)
     cycle = await db.scalar(
         select(AutonomousCycleRun)
         .where(AutonomousCycleRun.cycle_kind == _CAMPAIGN_CYCLE_KIND)
@@ -255,11 +407,26 @@ async def fetch_campaign_orchestration_status(*, db: AsyncSession, campaign_id: 
         .order_by(desc(AutonomousCycleRun.started_at), desc(AutonomousCycleRun.cycle_id))
         .limit(1)
     )
-    return {"mode": "campaign_orchestration_status", "campaign_id": definition.campaign_id, "version": definition.version, "status": definition.status, "ready": definition.status in _READINESS_ELIGIBLE_STATUSES, "latest_cycle": _campaign_cycle_summary(cycle)}
+    return {
+        "mode": "campaign_orchestration_status",
+        "campaign_id": definition.campaign_id,
+        "version": definition.version,
+        "status": definition.status,
+        "ready": _orchestration_ready(definition=definition, policy_assessment=policy_assessment),
+        "blockers": list(policy_assessment["blockers"]),
+        "warnings": list(policy_assessment["warnings"]),
+        "campaign_snapshot": _build_campaign_snapshot(
+            definition=definition,
+            runtime=runtime,
+            asset=asset,
+            policy_assessment=policy_assessment,
+        ),
+        "latest_cycle": _campaign_cycle_summary(cycle),
+    }
 
 
 async def fetch_campaign_orchestration_history(*, db: AsyncSession, campaign_id: UUID, version: int | None, limit: int = 20) -> dict[str, Any]:
-    definition = await get_campaign_definition(db=db, campaign_id=campaign_id, version=version)
+    definition, runtime, asset, policy_assessment = await _load_orchestration_definition(db=db, campaign_id=campaign_id, version=version)
     cycles = list(
         (
             await db.execute(
@@ -271,4 +438,18 @@ async def fetch_campaign_orchestration_history(*, db: AsyncSession, campaign_id:
             )
         ).scalars().all()
     )
-    return {"mode": "campaign_orchestration_history", "campaign_id": definition.campaign_id, "version": definition.version, "count": len(cycles), "items": [_campaign_cycle_summary(item) for item in cycles]}
+    return {
+        "mode": "campaign_orchestration_history",
+        "campaign_id": definition.campaign_id,
+        "version": definition.version,
+        "count": len(cycles),
+        "blockers": list(policy_assessment["blockers"]),
+        "warnings": list(policy_assessment["warnings"]),
+        "campaign_snapshot": _build_campaign_snapshot(
+            definition=definition,
+            runtime=runtime,
+            asset=asset,
+            policy_assessment=policy_assessment,
+        ),
+        "items": [_campaign_cycle_summary(item) for item in cycles],
+    }
