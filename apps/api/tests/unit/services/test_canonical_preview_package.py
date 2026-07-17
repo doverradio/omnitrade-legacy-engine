@@ -105,10 +105,18 @@ def _preview(*, package_id: UUID, requested_amount: Decimal = Decimal("3")) -> S
     )
 
 
-def _approval_event(*, package_id: UUID, expires_at: datetime | None = None) -> SimpleNamespace:
+def _approval_event(
+    *,
+    package_id: UUID,
+    expires_at: datetime | None = None,
+    approval_state: str = "approved",
+    live_trading_profile_id: UUID | None = None,
+) -> SimpleNamespace:
     return SimpleNamespace(
         id=uuid4(),
-        approval_state="approved",
+        live_trading_profile_id=live_trading_profile_id or uuid4(),
+        sequence_number=1,
+        approval_state=approval_state,
         checkpoint_type="bounded_proving_entry",
         approval_scope={"canonical_preview_package_id": str(package_id)},
         expires_at=expires_at,
@@ -748,7 +756,19 @@ async def test_forced_commissioning_reissues_expired_unused_first_package(monkey
             "commissioning": {"authority_classification": "OPERATOR_COMMISSIONED"},
         }
     }
-    prior = _forced_prior_package(campaign_id=campaign_id, profile=profile, expired=True)
+    prior_approval = _approval_event(
+        package_id=uuid4(),
+        approval_state="approved",
+        expires_at=datetime.now(timezone.utc) - timedelta(minutes=1),
+        live_trading_profile_id=profile.id,
+    )
+    prior = _forced_prior_package(
+        campaign_id=campaign_id,
+        profile=profile,
+        expired=True,
+        approval_event_id=prior_approval.id,
+    )
+    prior_approval.approval_scope["canonical_preview_package_id"] = str(prior.package_id)
     preview = _preview(package_id=uuid4(), requested_amount=Decimal("5"))
     strategy = SimpleNamespace(id=preview.strategy_id, module_version="strategy-v9")
     parameter_set = SimpleNamespace(id=preview.parameter_set_id, label="ps-v3")
@@ -775,6 +795,8 @@ async def test_forced_commissioning_reissues_expired_unused_first_package(monkey
     monkeypatch.setattr(cpp, "_load_risk_event", _async_return(SimpleNamespace(id=preview.risk_event_id)))
     monkeypatch.setattr(cpp, "_load_activation", _async_return(None))
     monkeypatch.setattr(cpp, "_load_live_order_for_preview", _async_return(None))
+    monkeypatch.setattr(cpp, "_load_approval_event_by_id", _async_return(prior_approval))
+    monkeypatch.setattr(cpp, "_load_latest_package_scoped_approval_event", _async_return(prior_approval))
 
     db = _FakeDb(scalar_values=[1, strategy, parameter_set], execute_rows=[prior])
     result = await cpp.create_canonical_preview_package(db=db, request=request)
@@ -783,6 +805,7 @@ async def test_forced_commissioning_reissues_expired_unused_first_package(monkey
     assert prior.superseded_at is not None
     assert prior.invalidated_reason == "expired_unused_initial_proving_entry_reissued"
     assert prior.market_evidence_identity["replacement_package_id"] == result["package"]["package_id"]
+    assert prior.market_evidence_identity["expired_approval_event_id"] == str(prior_approval.id)
     assert result["package"]["entry_authority"] == "OPERATOR_COMMISSIONED"
     assert result["package"]["entry_reason"] == "INITIAL_PROVING_ENTRY"
     assert result["package"]["strategy_override_scope"] == "COMMISSIONING_ENTRY_ONLY"
@@ -797,6 +820,7 @@ async def test_forced_commissioning_reissues_expired_unused_first_package(monkey
     assert all(not isinstance(item, cpp.LiveCryptoOrder) for item in db.added)
     supersession_audits = [item for item in db.added if isinstance(item, cpp.AuditLog) and item.action == "canonical_preview_package_superseded_for_reissue"]
     assert len(supersession_audits) == 1
+    assert supersession_audits[0].after_state["expired_approval_event_id"] == str(prior_approval.id)
 
 
 @pytest.mark.asyncio
@@ -838,20 +862,145 @@ async def test_forced_commissioning_active_unexpired_first_package_cannot_duplic
 
 
 @pytest.mark.asyncio
+async def test_forced_commissioning_unexpired_approved_package_cannot_be_superseded(monkeypatch: pytest.MonkeyPatch) -> None:
+    campaign_id = uuid4()
+    profile = _profile()
+    runtime_campaign = SimpleNamespace(uuid=campaign_id, status="READY")
+    definition = _definition(campaign_id=campaign_id, campaign_version=1)
+    definition.status = "READY"
+    definition.deployed_capital = Decimal("0")
+    definition.metadata_evidence = {
+        "commissioned_seed_campaign": {
+            "state": "READY",
+            "commissioning": {"authority_classification": "OPERATOR_COMMISSIONED"},
+        }
+    }
+    approval = _approval_event(
+        package_id=uuid4(),
+        approval_state="approved",
+        expires_at=datetime.now(timezone.utc) + timedelta(minutes=5),
+        live_trading_profile_id=profile.id,
+    )
+    prior = _forced_prior_package(
+        campaign_id=campaign_id,
+        profile=profile,
+        expired=True,
+        approval_event_id=approval.id,
+    )
+    approval.approval_scope["canonical_preview_package_id"] = str(prior.package_id)
+
+    request = _create_request(
+        campaign_id=campaign_id,
+        profile=profile,
+        idempotency_key="pkg-forced-unexpired-approved",
+        commissioning_entry_mode="initial_proving_entry",
+    )
+
+    monkeypatch.setattr(cpp, "_load_package_by_idempotency", _async_return(None))
+    monkeypatch.setattr(cpp, "_load_profile", _async_return(profile))
+    monkeypatch.setattr(cpp, "_load_runtime_campaign", _async_return(runtime_campaign))
+    monkeypatch.setattr(cpp, "_load_campaign_definition", _async_return(definition))
+    monkeypatch.setattr(cpp, "_load_activation", _async_return(None))
+    monkeypatch.setattr(cpp, "_load_live_order_for_preview", _async_return(None))
+    monkeypatch.setattr(cpp, "_load_approval_event_by_id", _async_return(approval))
+    monkeypatch.setattr(cpp, "_load_latest_package_scoped_approval_event", _async_return(approval))
+
+    with pytest.raises(LookupError) as exc_info:
+        await cpp.create_canonical_preview_package(
+            db=_FakeDb(scalar_values=[1], execute_rows=[prior]),
+            request=request,
+        )
+
+    assert "commissioning_mode_reissue_blocked_by_approved_package" in str(exc_info.value)
+
+
+@pytest.mark.asyncio
+async def test_forced_commissioning_revoked_approved_package_can_be_superseded(monkeypatch: pytest.MonkeyPatch) -> None:
+    campaign_id = uuid4()
+    profile = _profile()
+    runtime_campaign = SimpleNamespace(uuid=campaign_id, status="READY")
+    definition = _definition(campaign_id=campaign_id, campaign_version=1)
+    definition.status = "READY"
+    definition.deployed_capital = Decimal("0")
+    definition.metadata_evidence = {
+        "commissioned_seed_campaign": {
+            "state": "READY",
+            "commissioning": {"authority_classification": "OPERATOR_COMMISSIONED"},
+        }
+    }
+    granted = _approval_event(
+        package_id=uuid4(),
+        approval_state="approved",
+        expires_at=datetime.now(timezone.utc) + timedelta(minutes=5),
+        live_trading_profile_id=profile.id,
+    )
+    prior = _forced_prior_package(
+        campaign_id=campaign_id,
+        profile=profile,
+        expired=True,
+        approval_event_id=granted.id,
+    )
+    granted.approval_scope["canonical_preview_package_id"] = str(prior.package_id)
+    revoked = _approval_event(
+        package_id=prior.package_id,
+        approval_state="revoked",
+        expires_at=None,
+        live_trading_profile_id=profile.id,
+    )
+    revoked.sequence_number = 2
+
+    preview = _preview(package_id=uuid4(), requested_amount=Decimal("5"))
+    strategy = SimpleNamespace(id=preview.strategy_id, module_version="strategy-v9")
+    parameter_set = SimpleNamespace(id=preview.parameter_set_id, label="ps-v3")
+    cycle = _cycle(proposed_action="HOLD", termination_stage="hold_no_package_created")
+    cycle.cycle_context["authoritative_composition"]["selected_decision"] = {
+        "decision_kind": "HOLD",
+        "reason": "strategy_hold_signal",
+    }
+    request = _create_request(
+        campaign_id=campaign_id,
+        profile=profile,
+        idempotency_key="pkg-forced-revoked-approved",
+        commissioning_entry_mode="initial_proving_entry",
+    )
+
+    monkeypatch.setattr(cpp, "_load_package_by_idempotency", _async_return(None))
+    monkeypatch.setattr(cpp, "_load_profile", _async_return(profile))
+    monkeypatch.setattr(cpp, "_load_runtime_campaign", _async_return(runtime_campaign))
+    monkeypatch.setattr(cpp, "_load_campaign_definition", _async_return(definition))
+    monkeypatch.setattr(cpp, "run_campaign_orchestration_preview_for_candle", _async_return({"cycles": [{"cycle_id": str(cycle.cycle_id)}]}))
+    monkeypatch.setattr(cpp, "_load_campaign_cycle", _async_return(cycle))
+    monkeypatch.setattr(cpp, "_load_preview_for_package", _async_return(preview))
+    monkeypatch.setattr(cpp, "_load_decision_record", _async_return(SimpleNamespace(decision_id=preview.decision_record_id)))
+    monkeypatch.setattr(cpp, "_load_risk_event", _async_return(SimpleNamespace(id=preview.risk_event_id)))
+    monkeypatch.setattr(cpp, "_load_activation", _async_return(None))
+    monkeypatch.setattr(cpp, "_load_live_order_for_preview", _async_return(None))
+    monkeypatch.setattr(cpp, "_load_approval_event_by_id", _async_return(granted))
+    monkeypatch.setattr(cpp, "_load_latest_package_scoped_approval_event", _async_return(revoked))
+
+    result = await cpp.create_canonical_preview_package(
+        db=_FakeDb(scalar_values=[1, strategy, parameter_set], execute_rows=[prior]),
+        request=request,
+    )
+
+    assert result["package"]["market_evidence_identity"]["reissued_from_package_id"] == str(prior.package_id)
+    assert prior.package_state == "SUPERSEDED"
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize(
-    ("approval_event_id", "dry_run_id", "activation", "order", "expected_code"),
+    ("dry_run_id", "activation", "order", "expected_code"),
     [
-        (uuid4(), None, None, None, "commissioning_mode_reissue_blocked_by_approved_package"),
-        (None, uuid4(), None, None, "commissioning_mode_reissue_blocked_by_dry_run_package"),
-        (None, None, SimpleNamespace(package_id=uuid4()), None, "commissioning_mode_reissue_blocked_by_activation"),
-        (None, None, None, SimpleNamespace(provider_order_id=None, submitted_at=datetime.now(timezone.utc), filled_at=None), "commissioning_mode_reissue_blocked_by_submitted_order"),
-        (None, None, None, SimpleNamespace(provider_order_id="prov-1", submitted_at=None, filled_at=None), "commissioning_mode_reissue_blocked_by_provider_order_link"),
-        (None, None, None, SimpleNamespace(provider_order_id=None, submitted_at=None, filled_at=datetime.now(timezone.utc)), "commissioning_mode_reissue_blocked_by_filled_order"),
+        (uuid4(), None, None, "commissioning_mode_reissue_blocked_by_dry_run_package"),
+        (None, SimpleNamespace(package_id=uuid4()), None, "commissioning_mode_reissue_blocked_by_activation"),
+        (None, None, SimpleNamespace(provider_order_id=None, submitted_at=datetime.now(timezone.utc), filled_at=None), "commissioning_mode_reissue_blocked_by_submitted_order"),
+        (None, None, SimpleNamespace(provider_order_id="prov-1", submitted_at=None, filled_at=None), "commissioning_mode_reissue_blocked_by_provider_order_link"),
+        (None, None, SimpleNamespace(provider_order_id=None, submitted_at=None, filled_at=datetime.now(timezone.utc)), "commissioning_mode_reissue_blocked_by_filled_order"),
+        (None, None, SimpleNamespace(provider_order_id=None, submitted_at=None, filled_at=None, provider_status="RECONCILIATION_REQUIRED"), "commissioning_mode_reissue_blocked_by_order_link"),
     ],
 )
 async def test_forced_commissioning_reissue_blockers(
     monkeypatch: pytest.MonkeyPatch,
-    approval_event_id: UUID | None,
     dry_run_id: UUID | None,
     activation: object | None,
     order: object | None,
@@ -873,7 +1022,6 @@ async def test_forced_commissioning_reissue_blockers(
         campaign_id=campaign_id,
         profile=profile,
         expired=True,
-        approval_event_id=approval_event_id,
         dry_run_live_crypto_order_id=dry_run_id,
     )
     request = _create_request(
@@ -897,6 +1045,57 @@ async def test_forced_commissioning_reissue_blockers(
         )
 
     assert expected_code in str(exc_info.value)
+
+
+@pytest.mark.asyncio
+async def test_forced_commissioning_reissue_blocked_by_deployed_capital(monkeypatch: pytest.MonkeyPatch) -> None:
+    campaign_id = uuid4()
+    profile = _profile()
+    runtime_campaign = SimpleNamespace(uuid=campaign_id, status="READY")
+    definition = _definition(campaign_id=campaign_id, campaign_version=1)
+    definition.status = "READY"
+    definition.deployed_capital = Decimal("0.01")
+    definition.metadata_evidence = {
+        "commissioned_seed_campaign": {
+            "state": "READY",
+            "commissioning": {"authority_classification": "OPERATOR_COMMISSIONED"},
+        }
+    }
+    approval = _approval_event(
+        package_id=uuid4(),
+        approval_state="approved",
+        expires_at=datetime.now(timezone.utc) - timedelta(minutes=1),
+        live_trading_profile_id=profile.id,
+    )
+    prior = _forced_prior_package(
+        campaign_id=campaign_id,
+        profile=profile,
+        expired=True,
+        approval_event_id=approval.id,
+    )
+    approval.approval_scope["canonical_preview_package_id"] = str(prior.package_id)
+
+    request = _create_request(
+        campaign_id=campaign_id,
+        profile=profile,
+        idempotency_key="pkg-forced-deployed-capital",
+        commissioning_entry_mode="initial_proving_entry",
+    )
+
+    monkeypatch.setattr(cpp, "_load_package_by_idempotency", _async_return(None))
+    monkeypatch.setattr(cpp, "_load_profile", _async_return(profile))
+    monkeypatch.setattr(cpp, "_load_runtime_campaign", _async_return(runtime_campaign))
+    monkeypatch.setattr(cpp, "_load_campaign_definition", _async_return(definition))
+    monkeypatch.setattr(cpp, "_load_approval_event_by_id", _async_return(approval))
+    monkeypatch.setattr(cpp, "_load_latest_package_scoped_approval_event", _async_return(approval))
+
+    with pytest.raises(LookupError) as exc_info:
+        await cpp.create_canonical_preview_package(
+            db=_FakeDb(scalar_values=[1], execute_rows=[prior]),
+            request=request,
+        )
+
+    assert "commissioning_mode_reissue_blocked_by_deployed_capital" in str(exc_info.value)
 
 
 @pytest.mark.asyncio

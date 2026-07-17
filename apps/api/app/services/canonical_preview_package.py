@@ -272,10 +272,54 @@ async def _maybe_supersede_forced_commissioning_package(
         return prior_packages, None
 
     prior = nonterminal[0]
+    now = _utcnow()
     if prior.approval_event_id is not None:
-        raise _preview_evidence_error(
-            diagnostics=[_diagnostic(code="commissioning_mode_reissue_blocked_by_approved_package", stage="commissioning_mode")]
+        initial_approval = await _load_approval_event_by_id(db=db, approval_event_id=prior.approval_event_id)
+        if initial_approval is None:
+            raise _preview_evidence_error(
+                diagnostics=[
+                    _diagnostic(
+                        code="commissioning_mode_reissue_blocked_by_unknown_approval_state",
+                        stage="commissioning_mode",
+                    )
+                ]
+            )
+
+        latest_scoped_approval = await _load_latest_package_scoped_approval_event(
+            db=db,
+            live_trading_profile_id=prior.live_trading_profile_id,
+            package_id=prior.package_id,
         )
+        effective_approval = latest_scoped_approval or initial_approval
+
+        approval_scope = (
+            effective_approval.approval_scope if isinstance(effective_approval.approval_scope, dict) else {}
+        )
+        if str(approval_scope.get("canonical_preview_package_id") or "") != str(prior.package_id):
+            raise _preview_evidence_error(
+                diagnostics=[
+                    _diagnostic(
+                        code="commissioning_mode_reissue_blocked_by_approval_scope_mismatch",
+                        stage="commissioning_mode",
+                    )
+                ]
+            )
+
+        approval_state = str(effective_approval.approval_state or "").strip().lower()
+        approval_expired = (
+            approval_state == "expired"
+            or (
+                approval_state == "approved"
+                and effective_approval.expires_at is not None
+                and effective_approval.expires_at <= now
+            )
+        )
+        approval_revoked = approval_state == "revoked"
+
+        if not (approval_expired or approval_revoked):
+            raise _preview_evidence_error(
+                diagnostics=[_diagnostic(code="commissioning_mode_reissue_blocked_by_approved_package", stage="commissioning_mode")]
+            )
     if prior.dry_run_live_crypto_order_id is not None:
         raise _preview_evidence_error(
             diagnostics=[_diagnostic(code="commissioning_mode_reissue_blocked_by_dry_run_package", stage="commissioning_mode")]
@@ -299,7 +343,6 @@ async def _maybe_supersede_forced_commissioning_package(
             code = "commissioning_mode_reissue_blocked_by_order_link"
         raise _preview_evidence_error(diagnostics=[_diagnostic(code=code, stage="commissioning_mode")])
 
-    now = _utcnow()
     if prior.preview_expires_at > now:
         return prior_packages, None
 
@@ -318,6 +361,7 @@ async def _maybe_supersede_forced_commissioning_package(
     prior.invalidated_reason = _FORCED_REISSUE_RATIONALE
     identity = dict(prior.market_evidence_identity or {})
     identity["replacement_package_id"] = str(replacement_package_id)
+    identity["expired_approval_event_id"] = _serialize_uuid(prior.approval_event_id)
     identity["superseded_by_actor"] = request.actor
     identity["supersession_rationale"] = _FORCED_REISSUE_RATIONALE
     identity["supersession_audit_correlation_id"] = str(correlation_id)
@@ -335,6 +379,7 @@ async def _maybe_supersede_forced_commissioning_package(
                 "package_state": prior.package_state,
                 "superseded_at": prior.superseded_at.isoformat(),
                 "invalidated_reason": prior.invalidated_reason,
+                "expired_approval_event_id": _serialize_uuid(prior.approval_event_id),
                 "replacement_package_id": str(replacement_package_id),
                 "actor": request.actor,
                 "rationale": _FORCED_REISSUE_RATIONALE,
@@ -390,6 +435,28 @@ async def _load_live_order_for_preview(*, db: AsyncSession, preview_id: uuid.UUI
         select(LiveCryptoOrder)
         .where(LiveCryptoOrder.crypto_order_preview_id == preview_id)
         .order_by(LiveCryptoOrder.created_at.desc(), LiveCryptoOrder.live_crypto_order_id.desc())
+        .limit(1)
+    )
+
+
+async def _load_approval_event_by_id(*, db: AsyncSession, approval_event_id: uuid.UUID) -> LiveApprovalEvent | None:
+    return await db.scalar(
+        select(LiveApprovalEvent).where(LiveApprovalEvent.id == approval_event_id).limit(1)
+    )
+
+
+async def _load_latest_package_scoped_approval_event(
+    *,
+    db: AsyncSession,
+    live_trading_profile_id: uuid.UUID,
+    package_id: uuid.UUID,
+) -> LiveApprovalEvent | None:
+    return await db.scalar(
+        select(LiveApprovalEvent)
+        .where(LiveApprovalEvent.live_trading_profile_id == live_trading_profile_id)
+        .where(LiveApprovalEvent.checkpoint_type == "bounded_proving_entry")
+        .where(LiveApprovalEvent.approval_scope["canonical_preview_package_id"].astext == str(package_id))
+        .order_by(LiveApprovalEvent.sequence_number.desc())
         .limit(1)
     )
 
