@@ -51,6 +51,8 @@ _ACTIVATION_STATES = {"ACTIVE", "PAUSED", "REVOKED", "EXPIRED", "INVALIDATED", "
 
 _EXECUTABLE_ACTIONS = {"OPEN_POSITION_PROPOSED", "CLOSE_POSITION_PROPOSED"}
 _FORCED_COMMISSIONING_MODE = "initial_proving_entry"
+_TERMINAL_PACKAGE_STATES = {"EXPIRED", "INVALIDATED", "SUPERSEDED", "COMPLETED", "FAILED_CLOSED"}
+_FORCED_REISSUE_RATIONALE = "expired_unused_initial_proving_entry_reissued"
 
 
 def _diagnostic(*, code: str, stage: str, detail: str | None = None) -> dict[str, str]:
@@ -134,6 +136,14 @@ class CanonicalPreviewPackageReadinessResult:
     checks: list[dict[str, Any]]
 
 
+@dataclass(frozen=True, slots=True)
+class ForcedSupersessionContext:
+    reissued_from_package_id: uuid.UUID
+    replacement_package_id: uuid.UUID
+    audit_correlation_id: uuid.UUID
+    rationale: str
+
+
 def _utcnow() -> datetime:
     return datetime.now(timezone.utc)
 
@@ -215,6 +225,132 @@ def _forced_commissioning_guard_blocker(
     return None
 
 
+def _is_forced_initial_proving_package(package: CanonicalPreviewPackage) -> bool:
+    identity = package.market_evidence_identity if isinstance(package.market_evidence_identity, dict) else {}
+    return (
+        str(identity.get("entry_authority") or "").strip().upper() == "OPERATOR_COMMISSIONED"
+        and str(identity.get("entry_reason") or "").strip().upper() == "INITIAL_PROVING_ENTRY"
+        and str(identity.get("strategy_override_scope") or "").strip().upper() == "COMMISSIONING_ENTRY_ONLY"
+    )
+
+
+def _is_terminal_package_state(package: CanonicalPreviewPackage) -> bool:
+    return str(package.package_state or "").strip().upper() in _TERMINAL_PACKAGE_STATES
+
+
+async def _maybe_supersede_forced_commissioning_package(
+    *,
+    db: AsyncSession,
+    request: CanonicalPreviewPackageCreateRequest,
+    definition: CapitalCampaignDefinition,
+    prior_packages: int,
+) -> tuple[int, ForcedSupersessionContext | None]:
+    if not _is_forced_commissioning_mode(request) or prior_packages <= 0:
+        return prior_packages, None
+
+    all_campaign_packages = await _load_campaign_packages(db=db, campaign_id=request.campaign_id)
+    forced_packages = [item for item in all_campaign_packages if _is_forced_initial_proving_package(item)]
+    if not forced_packages:
+        return prior_packages, None
+
+    if _decimal(definition.deployed_capital) > Decimal("0"):
+        raise _preview_evidence_error(
+            diagnostics=[
+                _diagnostic(
+                    code="commissioning_mode_reissue_blocked_by_deployed_capital",
+                    stage="commissioning_mode",
+                )
+            ]
+        )
+
+    nonterminal = [item for item in forced_packages if not _is_terminal_package_state(item)]
+    if len(nonterminal) > 1:
+        raise _preview_evidence_error(
+            diagnostics=[_diagnostic(code="commissioning_mode_multiple_nonterminal_packages", stage="commissioning_mode")]
+        )
+    if not nonterminal:
+        return prior_packages, None
+
+    prior = nonterminal[0]
+    if prior.approval_event_id is not None:
+        raise _preview_evidence_error(
+            diagnostics=[_diagnostic(code="commissioning_mode_reissue_blocked_by_approved_package", stage="commissioning_mode")]
+        )
+    if prior.dry_run_live_crypto_order_id is not None:
+        raise _preview_evidence_error(
+            diagnostics=[_diagnostic(code="commissioning_mode_reissue_blocked_by_dry_run_package", stage="commissioning_mode")]
+        )
+
+    activation = await _load_activation(db=db, package_id=prior.package_id)
+    if activation is not None:
+        raise _preview_evidence_error(
+            diagnostics=[_diagnostic(code="commissioning_mode_reissue_blocked_by_activation", stage="commissioning_mode")]
+        )
+
+    linked_order = await _load_live_order_for_preview(db=db, preview_id=prior.crypto_order_preview_id)
+    if linked_order is not None:
+        if linked_order.filled_at is not None:
+            code = "commissioning_mode_reissue_blocked_by_filled_order"
+        elif linked_order.provider_order_id is not None:
+            code = "commissioning_mode_reissue_blocked_by_provider_order_link"
+        elif linked_order.submitted_at is not None:
+            code = "commissioning_mode_reissue_blocked_by_submitted_order"
+        else:
+            code = "commissioning_mode_reissue_blocked_by_order_link"
+        raise _preview_evidence_error(diagnostics=[_diagnostic(code=code, stage="commissioning_mode")])
+
+    now = _utcnow()
+    if prior.preview_expires_at > now:
+        return prior_packages, None
+
+    replacement_package_id = uuid.uuid4()
+    correlation_id = uuid.uuid4()
+    before_state = {
+        "package_state": prior.package_state,
+        "approval_event_id": _serialize_uuid(prior.approval_event_id),
+        "dry_run_live_crypto_order_id": _serialize_uuid(prior.dry_run_live_crypto_order_id),
+        "preview_expires_at": prior.preview_expires_at.isoformat(),
+        "crypto_order_preview_id": str(prior.crypto_order_preview_id),
+    }
+
+    prior.package_state = "SUPERSEDED"
+    prior.superseded_at = now
+    prior.invalidated_reason = _FORCED_REISSUE_RATIONALE
+    identity = dict(prior.market_evidence_identity or {})
+    identity["replacement_package_id"] = str(replacement_package_id)
+    identity["superseded_by_actor"] = request.actor
+    identity["supersession_rationale"] = _FORCED_REISSUE_RATIONALE
+    identity["supersession_audit_correlation_id"] = str(correlation_id)
+    prior.market_evidence_identity = identity
+    await db.flush()
+
+    db.add(
+        AuditLog(
+            actor=request.actor,
+            action="canonical_preview_package_superseded_for_reissue",
+            entity_type="canonical_preview_package",
+            entity_id=prior.package_id,
+            before_state=before_state,
+            after_state={
+                "package_state": prior.package_state,
+                "superseded_at": prior.superseded_at.isoformat(),
+                "invalidated_reason": prior.invalidated_reason,
+                "replacement_package_id": str(replacement_package_id),
+                "actor": request.actor,
+                "rationale": _FORCED_REISSUE_RATIONALE,
+                "audit_correlation_id": str(correlation_id),
+            },
+        )
+    )
+
+    return 0, ForcedSupersessionContext(
+        reissued_from_package_id=prior.package_id,
+        replacement_package_id=replacement_package_id,
+        audit_correlation_id=correlation_id,
+        rationale=_FORCED_REISSUE_RATIONALE,
+    )
+
+
 async def _load_package(*, db: AsyncSession, package_id: uuid.UUID) -> CanonicalPreviewPackage | None:
     return await db.scalar(select(CanonicalPreviewPackage).where(CanonicalPreviewPackage.package_id == package_id).limit(1))
 
@@ -229,9 +365,32 @@ async def _load_package_by_idempotency(*, db: AsyncSession, idempotency_key: str
     )
 
 
+async def _load_campaign_packages(*, db: AsyncSession, campaign_id: uuid.UUID) -> list[CanonicalPreviewPackage]:
+    return list(
+        (
+            await db.execute(
+                select(CanonicalPreviewPackage)
+                .where(CanonicalPreviewPackage.campaign_id == campaign_id)
+                .order_by(CanonicalPreviewPackage.generated_at.desc(), CanonicalPreviewPackage.package_id.desc())
+            )
+        )
+        .scalars()
+        .all()
+    )
+
+
 async def _load_activation(*, db: AsyncSession, package_id: uuid.UUID) -> CanonicalProvingActivation | None:
     return await db.scalar(
         select(CanonicalProvingActivation).where(CanonicalProvingActivation.package_id == package_id).limit(1)
+    )
+
+
+async def _load_live_order_for_preview(*, db: AsyncSession, preview_id: uuid.UUID) -> LiveCryptoOrder | None:
+    return await db.scalar(
+        select(LiveCryptoOrder)
+        .where(LiveCryptoOrder.crypto_order_preview_id == preview_id)
+        .order_by(LiveCryptoOrder.created_at.desc(), LiveCryptoOrder.live_crypto_order_id.desc())
+        .limit(1)
     )
 
 
@@ -652,11 +811,17 @@ async def create_canonical_preview_package(
     prior_packages = await db.scalar(
         select(func.count(CanonicalPreviewPackage.package_id)).where(CanonicalPreviewPackage.campaign_id == request.campaign_id)
     )
+    effective_prior_packages, supersession_context = await _maybe_supersede_forced_commissioning_package(
+        db=db,
+        request=request,
+        definition=definition,
+        prior_packages=int(prior_packages or 0),
+    )
     forced_blocker = _forced_commissioning_guard_blocker(
         request=request,
         definition=definition,
         runtime_campaign=runtime_campaign,
-        prior_packages=int(prior_packages or 0),
+        prior_packages=effective_prior_packages,
     )
     if forced_blocker is not None:
         raise _preview_evidence_error(
@@ -805,7 +970,12 @@ async def create_canonical_preview_package(
             diagnostics.append(_diagnostic(code="canonical_parameter_set_version_missing", stage="strategy_resolution"))
         raise _preview_evidence_error(diagnostics=diagnostics)
 
+    package_identity_kwargs: dict[str, Any] = {}
+    if supersession_context is not None:
+        package_identity_kwargs["package_id"] = supersession_context.replacement_package_id
+
     package = CanonicalPreviewPackage(
+        **package_identity_kwargs,
         campaign_id=definition.campaign_id,
         campaign_version=definition.version,
         runtime_campaign_id=runtime_campaign.uuid,
@@ -833,6 +1003,13 @@ async def create_canonical_preview_package(
             "entry_reason": "INITIAL_PROVING_ENTRY" if _is_forced_commissioning_mode(request) else "AUTONOMOUS_SELECTION",
             "strategy_override_scope": "COMMISSIONING_ENTRY_ONLY" if _is_forced_commissioning_mode(request) else "NONE",
             "requested_quote_size": _serialize_decimal(request.max_proposed_order_amount),
+            "reissued_from_package_id": (
+                str(supersession_context.reissued_from_package_id) if supersession_context is not None else None
+            ),
+            "supersession_audit_correlation_id": (
+                str(supersession_context.audit_correlation_id) if supersession_context is not None else None
+            ),
+            "supersession_rationale": supersession_context.rationale if supersession_context is not None else None,
         },
         market_evidence_observed_at=preview.created_at,
         preview_expires_at=preview.expires_at,
