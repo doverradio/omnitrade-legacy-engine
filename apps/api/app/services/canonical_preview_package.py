@@ -26,9 +26,13 @@ from app.models.parameter_set import ParameterSet
 from app.models.paper_account import PaperAccount
 from app.models.risk_event import RiskEvent
 from app.models.strategy import Strategy
+from app.models.exchange_connection import ExchangeConnection
 from app.services.capital_campaign_orchestration.service import run_campaign_orchestration_preview_for_candle
+from app.services.crypto_order_previews.service import create_crypto_order_preview
+from app.schemas.crypto_order_previews import CryptoOrderPreviewCreateRequest
 from app.services.live.approval import record_live_approval_checkpoint
 from app.services.live.contracts import LiveApprovalCheckpointRequest
+from app.services.strategies.identity import parse_strategy_identity
 
 _PACKAGE_STATES = {
     "CREATED",
@@ -271,6 +275,203 @@ async def _load_preview_for_package(
     return result.scalars().first()
 
 
+async def _load_preview_by_id(*, db: AsyncSession, preview_id: uuid.UUID) -> CryptoOrderPreview | None:
+    return await db.scalar(
+        select(CryptoOrderPreview)
+        .where(CryptoOrderPreview.crypto_order_preview_id == preview_id)
+        .limit(1)
+    )
+
+
+async def _load_exchange_connection_for_scope(
+    *,
+    db: AsyncSession,
+    provider: str,
+    environment: str,
+) -> ExchangeConnection | None:
+    return await db.scalar(
+        select(ExchangeConnection)
+        .where(ExchangeConnection.provider == provider)
+        .where(ExchangeConnection.environment == environment)
+        .order_by(ExchangeConnection.created_at.desc(), ExchangeConnection.exchange_connection_id.desc())
+        .limit(1)
+    )
+
+
+def _profile_provider_environment(profile: LiveTradingProfile) -> tuple[str | None, str | None]:
+    provenance_raw = getattr(profile, "provenance_metadata", None)
+    provenance = provenance_raw if isinstance(provenance_raw, dict) else {}
+    provider = str(provenance.get("provider") or "").strip().lower() or None
+    environment = str(provenance.get("exchange_environment") or provenance.get("environment") or "").strip().lower() or None
+    return provider, environment
+
+
+def _selected_decision_record_id(selected_decision: dict[str, Any]) -> uuid.UUID | None:
+    direct = str(selected_decision.get("decision_record_id") or "").strip()
+    if direct:
+        try:
+            return uuid.UUID(direct)
+        except ValueError:
+            return None
+    source_identity = selected_decision.get("source_identity") if isinstance(selected_decision.get("source_identity"), dict) else {}
+    nested = str(source_identity.get("decision_record_id") or "").strip()
+    if not nested:
+        return None
+    try:
+        return uuid.UUID(nested)
+    except ValueError:
+        return None
+
+
+def _selected_strategy_identity(*, selected_decision: dict[str, Any], composition: dict[str, Any]) -> str | None:
+    source_identity = selected_decision.get("source_identity") if isinstance(selected_decision.get("source_identity"), dict) else {}
+    candidates = [
+        selected_decision.get("strategy_identity"),
+        source_identity.get("strategy_identity"),
+        composition.get("strategy_identity"),
+    ]
+    for candidate in candidates:
+        raw = str(candidate or "").strip()
+        if raw and parse_strategy_identity(raw) is not None:
+            return raw
+    return None
+
+
+async def _resolve_strategy_and_parameter_binding(
+    *,
+    db: AsyncSession,
+    strategy_identity: str,
+) -> tuple[Strategy | None, ParameterSet | None]:
+    parsed = parse_strategy_identity(strategy_identity)
+    if parsed is None:
+        return None, None
+    slug, module_version = parsed
+    strategy = await db.scalar(
+        select(Strategy)
+        .where(Strategy.slug == slug)
+        .where(Strategy.module_version == module_version)
+        .where(Strategy.is_active.is_(True))
+        .limit(1)
+    )
+    if strategy is None:
+        return None, None
+    parameter_set = await db.scalar(
+        select(ParameterSet)
+        .where(ParameterSet.strategy_id == strategy.id)
+        .order_by(ParameterSet.created_at.desc())
+        .limit(1)
+    )
+    return strategy, parameter_set
+
+
+async def _create_forced_commissioning_preview(
+    *,
+    db: AsyncSession,
+    request: CanonicalPreviewPackageCreateRequest,
+    profile: LiveTradingProfile,
+    composition: dict[str, Any],
+    selected_decision: dict[str, Any],
+) -> CryptoOrderPreview:
+    profile_provider, profile_environment = _profile_provider_environment(profile)
+    normalized_provider = request.provider.strip().lower()
+    normalized_environment = request.environment.strip().lower()
+    if profile_provider and profile_provider != normalized_provider:
+        raise _preview_evidence_error(
+            diagnostics=[
+                _diagnostic(
+                    code="canonical_profile_provider_mismatch",
+                    stage="preview_resolution",
+                    detail=f"profile_provider={profile_provider}",
+                )
+            ]
+        )
+    if profile_environment and profile_environment != normalized_environment:
+        raise _preview_evidence_error(
+            diagnostics=[
+                _diagnostic(
+                    code="canonical_profile_environment_mismatch",
+                    stage="preview_resolution",
+                    detail=f"profile_environment={profile_environment}",
+                )
+            ]
+        )
+
+    connection = await _load_exchange_connection_for_scope(
+        db=db,
+        provider=request.provider,
+        environment=request.environment,
+    )
+    if connection is None:
+        raise _preview_evidence_error(
+            diagnostics=[_diagnostic(code="canonical_exchange_connection_missing", stage="preview_resolution")]
+        )
+
+    decision_record_id = _selected_decision_record_id(selected_decision)
+    if decision_record_id is None:
+        raise _preview_evidence_error(
+            diagnostics=[_diagnostic(code="canonical_decision_record_id_missing", stage="preview_resolution")]
+        )
+
+    strategy_identity = _selected_strategy_identity(selected_decision=selected_decision, composition=composition)
+    if not strategy_identity:
+        raise _preview_evidence_error(
+            diagnostics=[_diagnostic(code="canonical_strategy_version_missing", stage="preview_resolution")]
+        )
+
+    strategy, parameter_set = await _resolve_strategy_and_parameter_binding(
+        db=db,
+        strategy_identity=strategy_identity,
+    )
+    if strategy is None:
+        raise _preview_evidence_error(
+            diagnostics=[_diagnostic(code="canonical_strategy_id_missing", stage="preview_resolution")]
+        )
+    if parameter_set is None:
+        raise _preview_evidence_error(
+            diagnostics=[_diagnostic(code="canonical_parameter_set_id_missing", stage="preview_resolution")]
+        )
+
+    preview_response = await create_crypto_order_preview(
+        db=db,
+        request=CryptoOrderPreviewCreateRequest(
+            exchange_connection_id=connection.exchange_connection_id,
+            environment=request.environment,
+            product_id=request.product,
+            side="BUY",
+            order_type="MARKET",
+            quote_size=request.max_proposed_order_amount,
+            requested_amount_currency="USD",
+            decision_record_id=decision_record_id,
+            strategy_id=strategy.id,
+            strategy_name=strategy.slug,
+            generated_by="system_recommendation",
+            client_request_id=f"canonical-forced-preview:{request.idempotency_key}",
+        ),
+        actor=request.actor,
+    )
+
+    preview = await _load_preview_by_id(db=db, preview_id=preview_response.crypto_order_preview_id)
+    if preview is None:
+        raise _preview_evidence_error(
+            diagnostics=[_diagnostic(code="canonical_crypto_order_preview_id_missing", stage="preview_resolution")]
+        )
+    if str(preview.status or "").upper() != "PREVIEW_READY":
+        raise _preview_evidence_error(
+            diagnostics=[
+                _diagnostic(
+                    code="canonical_crypto_order_preview_not_ready",
+                    stage="preview_resolution",
+                    detail=str(preview.status),
+                )
+            ]
+        )
+    if preview.parameter_set_id is None:
+        preview.parameter_set_id = parameter_set.id
+        await db.flush()
+
+    return preview
+
+
 async def _load_decision_record(*, db: AsyncSession, decision_record_id: uuid.UUID) -> DecisionRecord | None:
     return await db.scalar(select(DecisionRecord).where(DecisionRecord.decision_id == decision_record_id).limit(1))
 
@@ -491,6 +692,7 @@ async def create_canonical_preview_package(
     proposed_action = str(composition.get("proposed_action") or cycle.proposed_action or "").strip().upper()
     selected_decision = composition.get("selected_decision") if isinstance(composition.get("selected_decision"), dict) else {}
     decision_kind = str(selected_decision.get("decision_kind") or "").strip().upper()
+    forced_hold_bypass_active = False
 
     if cycle.failure_reason == "runtime_campaign_or_paper_account_unavailable":
         diagnostics = [
@@ -528,6 +730,7 @@ async def create_canonical_preview_package(
 
         # Initial operator-commissioned proving entry can bypass strategy HOLD only.
         proposed_action = "OPEN_POSITION_PROPOSED"
+        forced_hold_bypass_active = True
 
     if proposed_action and proposed_action not in _EXECUTABLE_ACTIONS:
         raise _preview_evidence_error(
@@ -541,6 +744,14 @@ async def create_canonical_preview_package(
         )
 
     preview = await _load_preview_for_package(db=db, request=request, observed_after=cycle.started_at)
+    if preview is None and forced_hold_bypass_active:
+        preview = await _create_forced_commissioning_preview(
+            db=db,
+            request=request,
+            profile=profile,
+            composition=composition,
+            selected_decision=selected_decision,
+        )
     if preview is None:
         raise _preview_evidence_error(
             diagnostics=[_diagnostic(code="canonical_crypto_order_preview_id_missing", stage="preview_resolution")]

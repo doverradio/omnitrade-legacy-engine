@@ -626,6 +626,232 @@ async def test_forced_commissioning_package_creation_has_zero_provider_submissio
 
 
 @pytest.mark.asyncio
+async def test_forced_commissioning_mode_creates_preview_when_missing(monkeypatch: pytest.MonkeyPatch) -> None:
+    campaign_id = uuid4()
+    package_id = uuid4()
+    profile = _profile()
+    runtime_campaign = SimpleNamespace(uuid=campaign_id, status="READY")
+    definition = _definition(campaign_id=campaign_id, campaign_version=1)
+    definition.status = "READY"
+    definition.metadata_evidence = {
+        "commissioned_seed_campaign": {
+            "state": "READY",
+            "commissioning": {"authority_classification": "OPERATOR_COMMISSIONED"},
+        }
+    }
+    preview = _preview(package_id=package_id)
+    strategy = SimpleNamespace(id=preview.strategy_id, module_version="strategy-v9")
+    parameter_set = SimpleNamespace(id=preview.parameter_set_id, label="ps-v3")
+    cycle = _cycle(proposed_action="HOLD", termination_stage="hold_no_package_created")
+    cycle.cycle_context["authoritative_composition"]["selected_decision"] = {
+        "decision_kind": "HOLD",
+        "reason": "strategy_hold_signal",
+        "decision_record_id": str(preview.decision_record_id),
+        "strategy_identity": "ma_crossover@1.0.0",
+    }
+    request = _create_request(
+        campaign_id=campaign_id,
+        profile=profile,
+        idempotency_key="pkg-forced-create-preview",
+        commissioning_entry_mode="initial_proving_entry",
+    )
+
+    created = {"count": 0}
+
+    async def _fake_create_forced_preview(**_kwargs):
+        created["count"] += 1
+        return preview
+
+    monkeypatch.setattr(cpp, "_load_package_by_idempotency", _async_return(None))
+    monkeypatch.setattr(cpp, "_load_profile", _async_return(profile))
+    monkeypatch.setattr(cpp, "_load_runtime_campaign", _async_return(runtime_campaign))
+    monkeypatch.setattr(cpp, "_load_campaign_definition", _async_return(definition))
+    monkeypatch.setattr(cpp, "run_campaign_orchestration_preview_for_candle", _async_return({"cycles": [{"cycle_id": str(cycle.cycle_id)}]}))
+    monkeypatch.setattr(cpp, "_load_campaign_cycle", _async_return(cycle))
+    monkeypatch.setattr(cpp, "_load_preview_for_package", _async_return(None))
+    monkeypatch.setattr(cpp, "_create_forced_commissioning_preview", _fake_create_forced_preview)
+    monkeypatch.setattr(cpp, "_load_decision_record", _async_return(SimpleNamespace(decision_id=preview.decision_record_id)))
+    monkeypatch.setattr(cpp, "_load_risk_event", _async_return(SimpleNamespace(id=preview.risk_event_id)))
+
+    db = _FakeDb(scalar_values=[0, strategy, parameter_set])
+    result = await cpp.create_canonical_preview_package(db=db, request=request)
+
+    assert created["count"] == 1
+    assert result["package"]["crypto_order_preview_id"] == str(preview.crypto_order_preview_id)
+    assert result["package"]["provider"] == "kraken_spot"
+    assert result["package"]["environment"] == "production"
+    assert result["package"]["product"] == "BTC-USD"
+    assert result["package"]["paper_account_id"] == str(profile.paper_account_id)
+    assert result["package"]["live_trading_profile_id"] == str(profile.id)
+
+
+@pytest.mark.asyncio
+async def test_create_forced_commissioning_preview_reuses_create_crypto_order_preview(monkeypatch: pytest.MonkeyPatch) -> None:
+    campaign_id = uuid4()
+    profile = SimpleNamespace(
+        id=uuid4(),
+        paper_account_id=uuid4(),
+        provenance_metadata={"provider": "kraken_spot", "exchange_environment": "production"},
+    )
+    decision_id = uuid4()
+    strategy = SimpleNamespace(id=uuid4(), slug="ma_crossover")
+    parameter_set = SimpleNamespace(id=uuid4())
+    preview_id = uuid4()
+    preview = _preview(package_id=preview_id)
+    preview.status = "PREVIEW_READY"
+    preview.parameter_set_id = None
+    composition = {"strategy_identity": "ma_crossover@1.0.0"}
+    selected_decision = {
+        "decision_record_id": str(decision_id),
+        "strategy_identity": "ma_crossover@1.0.0",
+    }
+    request = _create_request(
+        campaign_id=campaign_id,
+        profile=profile,
+        idempotency_key="pkg-forced-preview-helper",
+        commissioning_entry_mode="initial_proving_entry",
+    )
+
+    captured: dict[str, object] = {}
+
+    async def _fake_create_crypto_order_preview(*, db, request, actor):
+        captured["exchange_connection_id"] = request.exchange_connection_id
+        captured["environment"] = request.environment
+        captured["product_id"] = request.product_id
+        captured["side"] = request.side
+        captured["quote_size"] = request.quote_size
+        captured["decision_record_id"] = request.decision_record_id
+        captured["strategy_id"] = request.strategy_id
+        captured["client_request_id"] = request.client_request_id
+        captured["actor"] = actor
+        return SimpleNamespace(crypto_order_preview_id=preview_id)
+
+    monkeypatch.setattr(
+        cpp,
+        "_load_exchange_connection_for_scope",
+        _async_return(SimpleNamespace(exchange_connection_id=uuid4())),
+    )
+    monkeypatch.setattr(
+        cpp,
+        "_resolve_strategy_and_parameter_binding",
+        _async_return((strategy, parameter_set)),
+    )
+    monkeypatch.setattr(cpp, "create_crypto_order_preview", _fake_create_crypto_order_preview)
+    monkeypatch.setattr(cpp, "_load_preview_by_id", _async_return(preview))
+
+    db = _FakeDb()
+    resolved = await cpp._create_forced_commissioning_preview(
+        db=db,
+        request=request,
+        profile=profile,
+        composition=composition,
+        selected_decision=selected_decision,
+    )
+
+    assert captured["environment"] == "production"
+    assert captured["product_id"] == "BTC-USD"
+    assert captured["side"] == "BUY"
+    assert captured["quote_size"] == Decimal("5")
+    assert captured["decision_record_id"] == decision_id
+    assert captured["strategy_id"] == strategy.id
+    assert captured["actor"] == "operator:human"
+    assert str(captured["client_request_id"]).startswith("canonical-forced-preview:")
+    assert resolved.crypto_order_preview_id == preview_id
+    assert preview.parameter_set_id == parameter_set.id
+
+
+@pytest.mark.asyncio
+async def test_create_forced_commissioning_preview_not_ready_fails_closed(monkeypatch: pytest.MonkeyPatch) -> None:
+    profile = SimpleNamespace(
+        id=uuid4(),
+        paper_account_id=uuid4(),
+        provenance_metadata={"provider": "kraken_spot", "exchange_environment": "production"},
+    )
+    request = _create_request(
+        campaign_id=uuid4(),
+        profile=profile,
+        idempotency_key="pkg-forced-preview-not-ready",
+        commissioning_entry_mode="initial_proving_entry",
+    )
+    preview = _preview(package_id=uuid4())
+    preview.status = "PREVIEW_FAILED"
+
+    monkeypatch.setattr(cpp, "_load_exchange_connection_for_scope", _async_return(SimpleNamespace(exchange_connection_id=uuid4())))
+    monkeypatch.setattr(cpp, "_resolve_strategy_and_parameter_binding", _async_return((SimpleNamespace(id=uuid4(), slug="ma"), SimpleNamespace(id=uuid4()))))
+    monkeypatch.setattr(cpp, "create_crypto_order_preview", _async_return(SimpleNamespace(crypto_order_preview_id=preview.crypto_order_preview_id)))
+    monkeypatch.setattr(cpp, "_load_preview_by_id", _async_return(preview))
+
+    with pytest.raises(LookupError) as exc_info:
+        await cpp._create_forced_commissioning_preview(
+            db=_FakeDb(),
+            request=request,
+            profile=profile,
+            composition={"strategy_identity": "ma_crossover@1.0.0"},
+            selected_decision={"decision_record_id": str(uuid4()), "strategy_identity": "ma_crossover@1.0.0"},
+        )
+
+    assert "canonical_crypto_order_preview_not_ready" in str(exc_info.value)
+
+
+@pytest.mark.asyncio
+async def test_forced_commissioning_idempotent_retry_does_not_recreate_preview(monkeypatch: pytest.MonkeyPatch) -> None:
+    campaign_id = uuid4()
+    profile = _profile()
+    request = _create_request(
+        campaign_id=campaign_id,
+        profile=profile,
+        idempotency_key="pkg-forced-idempotent-preview-retry",
+        commissioning_entry_mode="initial_proving_entry",
+    )
+    existing = SimpleNamespace(
+        package_id=uuid4(),
+        campaign_id=campaign_id,
+        campaign_version=1,
+        runtime_campaign_id=campaign_id,
+        paper_account_id=profile.paper_account_id,
+        live_trading_profile_id=profile.id,
+        provider="kraken_spot",
+        environment="production",
+        product="BTC-USD",
+        side="BUY",
+        proposed_order_amount=Decimal("5"),
+        risk_approved_amount=Decimal("5"),
+        strategy_id=uuid4(),
+        strategy_version="v1",
+        parameter_set_id=uuid4(),
+        parameter_set_version="baseline",
+        decision_record_id=uuid4(),
+        risk_event_id=uuid4(),
+        crypto_order_preview_id=uuid4(),
+        market_evidence_identity={},
+        market_evidence_observed_at=datetime.now(timezone.utc),
+        preview_expires_at=datetime.now(timezone.utc) + timedelta(minutes=10),
+        package_state="READY",
+        generated_at=datetime.now(timezone.utc),
+        idempotency_key=request.idempotency_key,
+        input_fingerprint=cpp._input_fingerprint(request),
+        approval_event_id=None,
+        dry_run_live_crypto_order_id=None,
+        superseded_at=None,
+        invalidated_reason=None,
+    )
+
+    recreate_calls = {"count": 0}
+
+    async def _should_not_run(**_kwargs):
+        recreate_calls["count"] += 1
+        raise AssertionError("forced preview creation must not run during idempotent replay")
+
+    monkeypatch.setattr(cpp, "_load_package_by_idempotency", _async_return(existing))
+    monkeypatch.setattr(cpp, "_create_forced_commissioning_preview", _should_not_run)
+
+    result = await cpp.create_canonical_preview_package(db=_FakeDb(), request=request)
+
+    assert result["idempotent"] is True
+    assert recreate_calls["count"] == 0
+
+
+@pytest.mark.asyncio
 async def test_create_canonical_preview_package_executable_candidate_links_all_ids(monkeypatch: pytest.MonkeyPatch) -> None:
     campaign_id = uuid4()
     package_id = uuid4()
