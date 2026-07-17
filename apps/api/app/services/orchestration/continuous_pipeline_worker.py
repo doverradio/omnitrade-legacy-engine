@@ -1303,6 +1303,9 @@ async def run_orchestration_cycle(
 
 
 async def run_forever() -> None:
+    started_at = datetime.now(timezone.utc)
+    run_id = uuid.uuid4().hex
+
     setup_logging()
     config = WorkerConfig.from_env()
 
@@ -1316,8 +1319,8 @@ async def run_forever() -> None:
                     entity_id=None,
                     before_state=None,
                     after_state={
-                        "started_at": _STARTED_AT.isoformat(),
-                        "run_id": _RUN_ID,
+                        "started_at": started_at.isoformat(),
+                        "run_id": run_id,
                     },
                 )
             )
@@ -1334,8 +1337,8 @@ async def run_forever() -> None:
                         entity_id=None,
                         before_state=None,
                         after_state={
-                            "started_at": _STARTED_AT.isoformat(),
-                            "run_id": _RUN_ID,
+                            "started_at": started_at.isoformat(),
+                            "run_id": run_id,
                         },
                     )
                 )

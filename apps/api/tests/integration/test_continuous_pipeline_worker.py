@@ -1720,3 +1720,164 @@ async def test_run_forever_initializes_kraken_client_and_passes_it_to_cycle(monk
     cycle_kwargs = captured["cycle_kwargs"]
     assert cycle_kwargs["client"] == "binance-client"
     assert cycle_kwargs["kraken_client"] == "kraken-client"
+
+
+@pytest.mark.asyncio
+async def test_run_forever_persists_startup_event_with_initialized_timestamp(monkeypatch: pytest.MonkeyPatch) -> None:
+    import app.services.orchestration.continuous_pipeline_worker as worker_module
+
+    class _BootAuditSession:
+        def __init__(self, *, fail_commit: bool = False) -> None:
+            self.fail_commit = fail_commit
+            self.added: list[object] = []
+
+        def add(self, obj: object) -> None:
+            self.added.append(obj)
+
+        async def commit(self) -> None:
+            if self.fail_commit:
+                raise RuntimeError("boot-commit-failed")
+
+    class _SessionContext:
+        def __init__(self, session: object) -> None:
+            self.session = session
+
+        async def __aenter__(self):
+            return self.session
+
+        async def __aexit__(self, exc_type, exc, tb):
+            return None
+
+    class _FakeHTTPClient:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exc_type, exc, tb):
+            return None
+
+    async def _fake_run_orchestration_cycle(_db, **_kwargs):
+        return SimpleNamespace(
+            ingestion_assets_ok=1,
+            signals_created=0,
+            execution_candidates=0,
+            executions_attempted=0,
+            executions_rejected=0,
+            executions_failed=0,
+            executions_skipped=0,
+            decisions_inserted=0,
+            research_cycles_started=0,
+            intelligence_snapshots_captured=0,
+        )
+
+    async def _fake_sleep(_seconds: float) -> None:
+        raise RuntimeError("stop-loop")
+
+    boot_session = _BootAuditSession()
+    sessions = [boot_session, object()]
+
+    def _fake_async_session_local():
+        return _SessionContext(sessions.pop(0))
+
+    monkeypatch.setattr(worker_module, "setup_logging", lambda: None)
+    monkeypatch.setattr(worker_module.WorkerConfig, "from_env", staticmethod(_config))
+    monkeypatch.setattr(worker_module, "AsyncSessionLocal", _fake_async_session_local)
+    monkeypatch.setattr(worker_module, "AsyncHTTPClient", _FakeHTTPClient)
+    monkeypatch.setattr(worker_module, "BinanceUSClient", lambda _http_client: object())
+    monkeypatch.setattr(worker_module, "KrakenSpotClient", lambda _http_client: object())
+    monkeypatch.setattr(worker_module, "run_orchestration_cycle", _fake_run_orchestration_cycle)
+    monkeypatch.setattr(worker_module.asyncio, "sleep", _fake_sleep)
+
+    with pytest.raises(RuntimeError, match="stop-loop"):
+        await worker_module.run_forever()
+
+    assert len(boot_session.added) == 1
+    startup_event = boot_session.added[0]
+    assert startup_event.action == worker_module._WORKER_BOOT_ACTION
+    payload = startup_event.after_state
+    started_at = datetime.fromisoformat(payload["started_at"])
+    assert started_at.tzinfo is not None
+    assert isinstance(payload["run_id"], str)
+    assert payload["run_id"]
+
+
+@pytest.mark.asyncio
+async def test_run_forever_persists_startup_failure_event_without_timestamp_nameerror(monkeypatch: pytest.MonkeyPatch) -> None:
+    import app.services.orchestration.continuous_pipeline_worker as worker_module
+
+    class _BootAuditSession:
+        def __init__(self, *, fail_commit: bool = False) -> None:
+            self.fail_commit = fail_commit
+            self.added: list[object] = []
+
+        def add(self, obj: object) -> None:
+            self.added.append(obj)
+
+        async def commit(self) -> None:
+            if self.fail_commit:
+                raise RuntimeError("boot-commit-failed")
+
+    class _SessionContext:
+        def __init__(self, session: object) -> None:
+            self.session = session
+
+        async def __aenter__(self):
+            return self.session
+
+        async def __aexit__(self, exc_type, exc, tb):
+            return None
+
+    class _FakeHTTPClient:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exc_type, exc, tb):
+            return None
+
+    async def _fake_run_orchestration_cycle(_db, **_kwargs):
+        return SimpleNamespace(
+            ingestion_assets_ok=1,
+            signals_created=0,
+            execution_candidates=0,
+            executions_attempted=0,
+            executions_rejected=0,
+            executions_failed=0,
+            executions_skipped=0,
+            decisions_inserted=0,
+            research_cycles_started=0,
+            intelligence_snapshots_captured=0,
+        )
+
+    async def _fake_sleep(_seconds: float) -> None:
+        raise RuntimeError("stop-loop")
+
+    boot_session = _BootAuditSession(fail_commit=True)
+    boot_failed_session = _BootAuditSession()
+    sessions = [boot_session, boot_failed_session, object()]
+
+    def _fake_async_session_local():
+        return _SessionContext(sessions.pop(0))
+
+    monkeypatch.setattr(worker_module, "setup_logging", lambda: None)
+    monkeypatch.setattr(worker_module.WorkerConfig, "from_env", staticmethod(_config))
+    monkeypatch.setattr(worker_module, "AsyncSessionLocal", _fake_async_session_local)
+    monkeypatch.setattr(worker_module, "AsyncHTTPClient", _FakeHTTPClient)
+    monkeypatch.setattr(worker_module, "BinanceUSClient", lambda _http_client: object())
+    monkeypatch.setattr(worker_module, "KrakenSpotClient", lambda _http_client: object())
+    monkeypatch.setattr(worker_module, "run_orchestration_cycle", _fake_run_orchestration_cycle)
+    monkeypatch.setattr(worker_module.asyncio, "sleep", _fake_sleep)
+
+    with pytest.raises(RuntimeError, match="stop-loop"):
+        await worker_module.run_forever()
+
+    assert len(boot_session.added) == 1
+    assert len(boot_failed_session.added) == 1
+
+    startup_payload = boot_session.added[0].after_state
+    startup_failed_event = boot_failed_session.added[0]
+    assert startup_failed_event.action == worker_module._WORKER_BOOT_FAILED_ACTION
+    failure_payload = startup_failed_event.after_state
+
+    assert failure_payload["run_id"] == startup_payload["run_id"]
+    assert failure_payload["started_at"] == startup_payload["started_at"]
+    started_at = datetime.fromisoformat(failure_payload["started_at"])
+    assert started_at.tzinfo is not None
