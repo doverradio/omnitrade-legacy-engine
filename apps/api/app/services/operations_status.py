@@ -272,6 +272,8 @@ async def build_operations_status(*, db: AsyncSession) -> OperationalStatusRespo
     last_signal_at = await _max_timestamp(db=db, sql="SELECT MAX(signal_time) FROM signals")
     last_trade_at = await _max_timestamp(db=db, sql="SELECT MAX(executed_at) FROM trades WHERE is_paper = true")
     last_ingestion_at = get_last_successful_ingestion_at()
+    last_full_pipeline_at = await _load_last_successful_full_pipeline_at(db=db) or get_last_successful_full_pipeline_at()
+    orchestrator_heartbeat_at = last_full_pipeline_at or last_ingestion_at
 
     day_start = datetime(now.year, now.month, now.day, tzinfo=timezone.utc)
     signals_today = await _count(
@@ -285,7 +287,7 @@ async def build_operations_status(*, db: AsyncSession) -> OperationalStatusRespo
         params={"day_start": day_start},
     )
 
-    orchestrator_state, orchestrator_detail = _resolve_orchestrator_state(now=now, last_ingestion_at=last_ingestion_at)
+    orchestrator_state, orchestrator_detail = _resolve_orchestrator_state(now=now, last_ingestion_at=orchestrator_heartbeat_at)
     if orchestrator_state == "red":
         alerts.append(
             OperationalAlertResponse(

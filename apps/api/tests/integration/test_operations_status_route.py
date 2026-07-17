@@ -179,6 +179,14 @@ class _ResearchFailureStatusSession(_DurableCountsSession):
         return await super().execute(statement, params=params)
 
 
+class _FullPipelineHeartbeatSession(_DurableCountsSession):
+    async def execute(self, statement, params=None):
+        sql = str(statement)
+        if "FROM audit_log" in sql and "action = 'orchestration_worker_full_pipeline_completed'" in sql:
+            return _ResultWithScalar({"completed_at": datetime.now(timezone.utc)})
+        return await super().execute(statement, params=params)
+
+
 def test_operations_status_surfaces_research_failure_visibility(monkeypatch) -> None:
     app = create_app()
     fake_db = _ResearchFailureStatusSession()
@@ -203,6 +211,30 @@ def test_operations_status_surfaces_research_failure_visibility(monkeypatch) -> 
     assert payload["research_status"]["last_cycle_reason"] == "research_cycle_exception:RuntimeError"
     assert payload["research_status"]["recent_failure_count"] == 2
     assert any(item["code"] == "research_cycle_failures" for item in payload["alerts"])
+
+
+def test_operations_status_uses_durable_full_pipeline_heartbeat_for_orchestrator(monkeypatch) -> None:
+    app = create_app()
+    fake_db = _FullPipelineHeartbeatSession()
+
+    async def _read(operation, *, operation_name):
+        _ = operation_name
+        return await operation(fake_db)
+
+    async def _paper_equity_stub(*_args, **_kwargs):
+        return Decimal("25")
+
+    monkeypatch.setattr("app.api.routes.operations.run_read_with_retry", _read)
+    monkeypatch.setattr("app.services.operations_status._get_paper_equity", _paper_equity_stub)
+    monkeypatch.setattr("app.services.operations_status.get_last_successful_ingestion_at", lambda: None)
+
+    with TestClient(app) as client:
+        response = client.get("/operations/status")
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["system_health"]["orchestrator"]["state"] == "green"
+    assert payload["system_health"]["orchestrator"]["detail"] == "Heartbeat active"
 
 
 def test_operations_status_surfaces_research_disabled_state(monkeypatch) -> None:
