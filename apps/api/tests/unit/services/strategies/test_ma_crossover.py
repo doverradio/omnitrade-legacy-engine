@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
+from decimal import Decimal
 
 from app.services.strategies.base import StrategyContext
 from app.services.strategies.ma_crossover import MovingAverageCrossoverStrategy
@@ -44,6 +45,66 @@ def test_ma_crossover_buy_signal() -> None:
     assert signal.indicators["selection_explanations"]["sell"].startswith("SELL not selected because")
     assert signal.indicators["selection_explanations"]["hold"].startswith("HOLD not selected because")
 
+    trace = signal.indicators["strategy_rule_trace"]
+    assert trace["selected_action"] == "BUY"
+    assert trace["buy_condition_passed"] is True
+    assert trace["sell_condition_passed"] is False
+    assert trace["bullish_crossover_detected"] is True
+    assert trace["bearish_crossover_detected"] is False
+
+
+def test_ma_crossover_strategy_rule_trace_schema_is_consistent() -> None:
+    strategy = MovingAverageCrossoverStrategy()
+
+    buy = strategy.generate_signal(build_context([5, 4, 3, 2, 2, 7]))
+    sell = strategy.generate_signal(build_context([1, 3, 6, 6, 6, 0]))
+    hold = strategy.generate_signal(build_context([1, 2, 3, 4, 5, 6]))
+
+    expected_keys = {
+        "fast_period",
+        "slow_period",
+        "previous_fast_ma",
+        "previous_slow_ma",
+        "current_fast_ma",
+        "current_slow_ma",
+        "previous_spread",
+        "current_spread",
+        "bullish_crossover_detected",
+        "bearish_crossover_detected",
+        "buy_condition_passed",
+        "sell_condition_passed",
+        "selected_action",
+        "distance_to_bullish_crossover",
+        "candle_id",
+        "candle_close_time",
+    }
+
+    assert set(buy.indicators["strategy_rule_trace"].keys()) == expected_keys
+    assert set(sell.indicators["strategy_rule_trace"].keys()) == expected_keys
+    assert set(hold.indicators["strategy_rule_trace"].keys()) == expected_keys
+
+
+def test_ma_crossover_strategy_rule_trace_matches_strategy_values() -> None:
+    strategy = MovingAverageCrossoverStrategy()
+    closes = [5, 4, 3, 2, 2, 7]
+
+    signal = strategy.generate_signal(build_context(closes))
+    trace = signal.indicators["strategy_rule_trace"]
+
+    decimal_closes = [Decimal(str(value)) for value in closes]
+    expected_previous_fast = sum(decimal_closes[:-1][-3:], start=Decimal("0")) / Decimal("3")
+    expected_previous_slow = sum(decimal_closes[:-1][-5:], start=Decimal("0")) / Decimal("5")
+    expected_current_fast = sum(decimal_closes[-3:], start=Decimal("0")) / Decimal("3")
+    expected_current_slow = sum(decimal_closes[-5:], start=Decimal("0")) / Decimal("5")
+
+    assert trace["previous_fast_ma"] == format(expected_previous_fast, "f")
+    assert trace["previous_slow_ma"] == format(expected_previous_slow, "f")
+    assert trace["current_fast_ma"] == format(expected_current_fast, "f")
+    assert trace["current_slow_ma"] == format(expected_current_slow, "f")
+    assert trace["previous_spread"] == format(expected_previous_fast - expected_previous_slow, "f")
+    assert trace["current_spread"] == format(expected_current_fast - expected_current_slow, "f")
+    assert trace["distance_to_bullish_crossover"] == "0"
+
 
 def test_ma_crossover_sell_signal() -> None:
     strategy = MovingAverageCrossoverStrategy()
@@ -52,6 +113,10 @@ def test_ma_crossover_sell_signal() -> None:
 
     assert signal.action == "sell"
     assert signal.reason == "Fast SMA crossed below Slow SMA."
+    trace = signal.indicators["strategy_rule_trace"]
+    assert trace["selected_action"] == "SELL"
+    assert trace["buy_condition_passed"] is False
+    assert trace["sell_condition_passed"] is True
 
 
 def test_ma_crossover_hold_signal() -> None:
@@ -61,6 +126,10 @@ def test_ma_crossover_hold_signal() -> None:
 
     assert signal.action == "hold"
     assert signal.reason == "No crossover detected."
+    trace = signal.indicators["strategy_rule_trace"]
+    assert trace["selected_action"] == "HOLD"
+    assert trace["buy_condition_passed"] is False
+    assert trace["sell_condition_passed"] is False
 
 
 def test_ma_crossover_insufficient_history() -> None:
@@ -125,3 +194,11 @@ def test_ma_crossover_nan_values_do_not_crash() -> None:
 
     assert signal.action == "hold"
     assert signal.reason == "Invalid candle data."
+
+
+def test_ma_crossover_trading_actions_unchanged() -> None:
+    strategy = MovingAverageCrossoverStrategy()
+
+    assert strategy.generate_signal(build_context([5, 4, 3, 2, 2, 7])).action == "buy"
+    assert strategy.generate_signal(build_context([1, 3, 6, 6, 6, 0])).action == "sell"
+    assert strategy.generate_signal(build_context([1, 2, 3, 4, 5, 6])).action == "hold"

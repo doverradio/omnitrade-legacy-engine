@@ -58,7 +58,14 @@ class _SessionContext:
         return False
 
 
-def _cycle(*, proposed_action: str, reason: str, decision_kind: str, expected_net: str | None = None):
+def _cycle(
+    *,
+    proposed_action: str,
+    reason: str,
+    decision_kind: str,
+    expected_net: str | None = None,
+    strategy_rule_trace: dict[str, object] | None = None,
+):
     started_at = datetime.now(timezone.utc) - timedelta(hours=1)
     cycle_id = uuid4()
     instrument = "BTC-USD"
@@ -68,6 +75,16 @@ def _cycle(*, proposed_action: str, reason: str, decision_kind: str, expected_ne
         "expected_net_dollars": expected_net,
         "risk": {"verdict": "ALLOW"},
     }
+    if strategy_rule_trace is not None:
+        rejected_row["strategy"] = {
+            "decision_record": {
+                "generated_signals": [
+                    {
+                        "strategy_rule_trace": strategy_rule_trace,
+                    }
+                ]
+            }
+        }
     context = {
         "supported_trigger": {"product_id": instrument},
         "candle": {
@@ -118,6 +135,24 @@ async def test_hold_decision_diagnostic_reports_hold_details_and_summary(monkeyp
             reason="non_positive_net_edge",
             decision_kind="HOLD",
             expected_net="-2.50",
+            strategy_rule_trace={
+                "fast_period": "10",
+                "slow_period": "50",
+                "previous_fast_ma": "9.5",
+                "previous_slow_ma": "9.7",
+                "current_fast_ma": "9.6",
+                "current_slow_ma": "9.7",
+                "previous_spread": "-0.2",
+                "current_spread": "-0.1",
+                "bullish_crossover_detected": False,
+                "bearish_crossover_detected": False,
+                "buy_condition_passed": False,
+                "sell_condition_passed": False,
+                "selected_action": "HOLD",
+                "distance_to_bullish_crossover": "0.1",
+                "candle_id": "candle-1",
+                "candle_close_time": (started_at := datetime.now(timezone.utc)).isoformat(),
+            },
         ),
         _cycle(
             proposed_action="OPEN_POSITION_PROPOSED",
@@ -140,7 +175,14 @@ async def test_hold_decision_diagnostic_reports_hold_details_and_summary(monkeyp
     hold = payload["hold_decisions"][0]
     assert hold["hold_reason"] == "non_positive_net_edge"
     assert hold["candle_id"] == "candle-1"
-    assert hold["first_unmet_buy_condition"] == "decision_kind_open_position"
+    assert hold["first_unmet_buy_condition"] == "current_spread_positive_for_buy"
+    assert hold["distance_to_buy"] == {
+        "condition": "current_spread_positive_for_buy",
+        "distance": "0.1",
+        "unit": "points",
+    }
+    assert "strategy_buy_rule_trace" not in hold["missing_evidence"]
+    assert "strategy_sell_rule_trace" not in hold["missing_evidence"]
     assert payload["summary"]["most_common_hold_reason"] == "non_positive_net_edge"
 
 
@@ -160,6 +202,29 @@ async def test_hold_decision_diagnostic_missing_campaign_identity(monkeypatch: p
     assert payload["canonical_proving_campaign"] is None
     assert payload["totals"]["hold_decisions"] == 0
     assert payload["summary"]["most_common_hold_reason"] == "none"
+
+
+@pytest.mark.asyncio
+async def test_hold_decision_diagnostic_missing_trace_is_explicit(monkeypatch: pytest.MonkeyPatch) -> None:
+    campaign_id = uuid4()
+    cycles = [
+        _cycle(
+            proposed_action="HOLD",
+            reason="non_positive_net_edge",
+            decision_kind="HOLD",
+            expected_net="-1.00",
+            strategy_rule_trace=None,
+        )
+    ]
+
+    db = _FakeDb(cycles=cycles, campaign_id=campaign_id, campaign_version=1)
+    monkeypatch.setattr(service, "AsyncSessionLocal", lambda: _SessionContext(db))
+
+    payload = await service.hold_decision_diagnostic()
+
+    hold = payload["hold_decisions"][0]
+    assert "strategy_buy_rule_trace" in hold["missing_evidence"]
+    assert "strategy_sell_rule_trace" in hold["missing_evidence"]
 
 
 def test_hold_decision_diagnostic_is_read_only() -> None:

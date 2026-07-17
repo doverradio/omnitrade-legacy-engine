@@ -1024,6 +1024,46 @@ def _distance_to_requirement(*, condition: dict[str, Any]) -> dict[str, Any] | N
     return None
 
 
+def _is_unknown_trace_value(value: Any) -> bool:
+    if value is None:
+        return True
+    return str(value).strip().upper() == "UNKNOWN"
+
+
+def _extract_strategy_rule_trace(*, selected: dict[str, Any], eligible: dict[str, Any] | None, rejected: dict[str, Any] | None) -> dict[str, Any] | None:
+    direct = selected.get("strategy_rule_trace") if isinstance(selected.get("strategy_rule_trace"), dict) else None
+    if direct is not None:
+        return direct
+
+    for candidate in (eligible, rejected):
+        if not isinstance(candidate, dict):
+            continue
+        strategy = candidate.get("strategy") if isinstance(candidate.get("strategy"), dict) else {}
+        direct_strategy = strategy.get("strategy_rule_trace") if isinstance(strategy.get("strategy_rule_trace"), dict) else None
+        if direct_strategy is not None:
+            return direct_strategy
+
+        decision_record = strategy.get("decision_record") if isinstance(strategy.get("decision_record"), dict) else {}
+        generated_signals = decision_record.get("generated_signals") if isinstance(decision_record.get("generated_signals"), list) else []
+        for signal in generated_signals:
+            if not isinstance(signal, dict):
+                continue
+            direct_signal = signal.get("strategy_rule_trace") if isinstance(signal.get("strategy_rule_trace"), dict) else None
+            if direct_signal is not None:
+                return direct_signal
+            strategy_evidence = signal.get("strategy_evidence") if isinstance(signal.get("strategy_evidence"), dict) else {}
+            nested = strategy_evidence.get("strategy_rule_trace") if isinstance(strategy_evidence.get("strategy_rule_trace"), dict) else None
+            if nested is not None:
+                return nested
+
+        indicators = decision_record.get("indicators") if isinstance(decision_record.get("indicators"), dict) else {}
+        nested_indicators = indicators.get("strategy_rule_trace") if isinstance(indicators.get("strategy_rule_trace"), dict) else None
+        if nested_indicators is not None:
+            return nested_indicators
+
+    return None
+
+
 async def hold_decision_diagnostic() -> dict[str, Any]:
     now = datetime.now(timezone.utc)
     window_start = now - timedelta(hours=24)
@@ -1094,10 +1134,95 @@ async def hold_decision_diagnostic() -> dict[str, Any]:
         instrument = str(selected.get("instrument") or product or "").strip() or None
         candle_id, candle_close_time = _extract_candle_fields(context=context, composition=composition, instrument=instrument)
         eligible_candidate, rejected_candidate = _extract_candidate(composition=composition, instrument=instrument)
+        strategy_rule_trace = _extract_strategy_rule_trace(selected=selected, eligible=eligible_candidate, rejected=rejected_candidate)
 
         buy_conditions: list[dict[str, Any]] = []
         sell_conditions: list[dict[str, Any]] = []
         missing_evidence: list[str] = []
+
+        trace_distance_to_buy = None
+        if strategy_rule_trace is not None:
+            trace_previous_spread = strategy_rule_trace.get("previous_spread")
+            trace_current_spread = strategy_rule_trace.get("current_spread")
+            trace_buy_passed = strategy_rule_trace.get("buy_condition_passed")
+            trace_sell_passed = strategy_rule_trace.get("sell_condition_passed")
+
+            trace_prev_spread_decimal = None if _is_unknown_trace_value(trace_previous_spread) else _decimal_or_none(trace_previous_spread)
+            trace_curr_spread_decimal = None if _is_unknown_trace_value(trace_current_spread) else _decimal_or_none(trace_current_spread)
+
+            buy_conditions.append(
+                _condition_row(
+                    name="previous_spread_non_positive_for_buy",
+                    actual=trace_previous_spread,
+                    required="<= 0",
+                    passed=trace_prev_spread_decimal is not None and trace_prev_spread_decimal <= Decimal("0"),
+                )
+            )
+            buy_conditions.append(
+                _condition_row(
+                    name="current_spread_positive_for_buy",
+                    actual=trace_current_spread,
+                    required="> 0",
+                    passed=trace_curr_spread_decimal is not None and trace_curr_spread_decimal > Decimal("0"),
+                )
+            )
+            buy_conditions.append(
+                _condition_row(
+                    name="buy_condition_passed",
+                    actual=trace_buy_passed,
+                    required=True,
+                    passed=trace_buy_passed is True,
+                )
+            )
+
+            sell_conditions.append(
+                _condition_row(
+                    name="previous_spread_non_negative_for_sell",
+                    actual=trace_previous_spread,
+                    required=">= 0",
+                    passed=trace_prev_spread_decimal is not None and trace_prev_spread_decimal >= Decimal("0"),
+                )
+            )
+            sell_conditions.append(
+                _condition_row(
+                    name="current_spread_negative_for_sell",
+                    actual=trace_current_spread,
+                    required="< 0",
+                    passed=trace_curr_spread_decimal is not None and trace_curr_spread_decimal < Decimal("0"),
+                )
+            )
+            sell_conditions.append(
+                _condition_row(
+                    name="sell_condition_passed",
+                    actual=trace_sell_passed,
+                    required=True,
+                    passed=trace_sell_passed is True,
+                )
+            )
+
+            if candle_id is None and not _is_unknown_trace_value(strategy_rule_trace.get("candle_id")):
+                candle_id = str(strategy_rule_trace.get("candle_id"))
+            if candle_close_time is None and not _is_unknown_trace_value(strategy_rule_trace.get("candle_close_time")):
+                candle_close_time = str(strategy_rule_trace.get("candle_close_time"))
+
+            if _is_unknown_trace_value(trace_previous_spread):
+                missing_evidence.append("strategy_rule_trace.previous_spread")
+            if _is_unknown_trace_value(trace_current_spread):
+                missing_evidence.append("strategy_rule_trace.current_spread")
+            if _is_unknown_trace_value(trace_buy_passed):
+                missing_evidence.append("strategy_rule_trace.buy_condition_passed")
+            if _is_unknown_trace_value(trace_sell_passed):
+                missing_evidence.append("strategy_rule_trace.sell_condition_passed")
+
+            trace_distance_raw = strategy_rule_trace.get("distance_to_bullish_crossover")
+            if _is_unknown_trace_value(trace_distance_raw):
+                missing_evidence.append("strategy_rule_trace.distance_to_bullish_crossover")
+            else:
+                trace_distance_to_buy = {
+                    "condition": "current_spread_positive_for_buy",
+                    "distance": str(trace_distance_raw),
+                    "unit": "points",
+                }
 
         decision_kind = str(selected.get("decision_kind") or "").strip() or None
         buy_conditions.append(
@@ -1217,16 +1342,19 @@ async def hold_decision_diagnostic() -> dict[str, Any]:
         if candle_close_time is None:
             missing_evidence.append("candle_close_time")
 
-        # Strategy-level BUY/SELL rule traces (e.g., MA crossover thresholds) are not persisted in campaign cycle records.
-        missing_evidence.append("strategy_buy_rule_trace")
-        missing_evidence.append("strategy_sell_rule_trace")
+        if strategy_rule_trace is None:
+            missing_evidence.append("strategy_buy_rule_trace")
+            missing_evidence.append("strategy_sell_rule_trace")
 
         first_unmet_buy_condition = next((item for item in buy_conditions if not bool(item.get("pass"))), None)
         first_unmet_name = None if first_unmet_buy_condition is None else str(first_unmet_buy_condition.get("condition"))
         if first_unmet_name:
             unmet_buy_counter[first_unmet_name] += 1
 
-        distance_to_buy = None if first_unmet_buy_condition is None else _distance_to_requirement(condition=first_unmet_buy_condition)
+        if trace_distance_to_buy is not None:
+            distance_to_buy = trace_distance_to_buy
+        else:
+            distance_to_buy = None if first_unmet_buy_condition is None else _distance_to_requirement(condition=first_unmet_buy_condition)
 
         hold_rows.append(
             {

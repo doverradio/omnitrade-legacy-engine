@@ -1288,6 +1288,7 @@ async def _persist_decision_intelligence(
                 "strategy_version": proposal.strategy_version,
                 "signal_reason": signal_payload.get("reason") if isinstance(signal_payload, dict) else None,
                 "signal_generated": signal_payload.get("action") if isinstance(signal_payload, dict) else None,
+                "strategy_rule_trace": signal_indicators.get("strategy_rule_trace") if isinstance(signal_indicators, dict) else None,
                 "strategy_evidence": signal_indicators if isinstance(signal_indicators, dict) else {},
                 "timeline": signal_payload.get("timeline") if isinstance(signal_payload, dict) else None,
             }
