@@ -1679,6 +1679,10 @@ async def test_authorize_canonical_preview_package_records_bounded_proving_check
     assert result["package_id"] == str(package_id)
     assert result["checkpoint_type"] == "bounded_proving_entry"
     assert result["approval_scope"]["canonical_preview_package_id"] == str(package_id)
+    assert result["approval_scope"]["campaign_id"] == str(package.campaign_id)
+    assert result["approval_scope"]["capital_campaign_id"] == str(package.runtime_campaign_id)
+    assert result["approval_scope"]["campaign_version"] == str(package.campaign_version)
+    assert result["approval_scope"]["capital_campaign_version"] == str(package.campaign_version)
     assert captured["request"].checkpoint_type == "bounded_proving_entry"
     assert db.flush_calls == 1
 

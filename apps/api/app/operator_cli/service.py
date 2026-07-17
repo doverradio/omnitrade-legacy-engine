@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 from collections import Counter
+import hashlib
+import json
 import re
 from datetime import datetime, timezone
 from datetime import timedelta
@@ -17,6 +19,8 @@ from app.db.session import AsyncSessionLocal
 from app.models.audit_log import AuditLog
 from app.models.asset import Asset
 from app.models.autonomous_capital_mandate import AutonomousCapitalMandate
+from app.models.autonomous_capital_mandate_authorization import AutonomousCapitalMandateAuthorization
+from app.models.autonomous_capital_mandate_version import AutonomousCapitalMandateVersion
 from app.models.autonomous_cycle_run import AutonomousCycleRun
 from app.models.candle import Candle
 from app.models.capital_campaign import CapitalCampaign
@@ -95,11 +99,28 @@ from app.services.capital_campaign_orchestration import (
 from app.services.capital_campaign_orchestration.service import _eligible_for_orchestration
 from app.services.capital_campaign_domain.service import list_campaign_definitions as _list_campaign_definitions
 from app.services.capital_campaign_domain.commissioned_control_plane import (
+    backfill_commissioned_ready_metadata,
     get_commissioned_control_plane_status as _get_commissioned_control_plane_status,
     mutate_commissioned_control_plane as _mutate_commissioned_control_plane,
 )
+from app.services.capital_campaign_domain.commissioned_entry_execution import (
+    commission_commissioned_campaign,
+    execute_commissioned_entry,
+    reconcile_commissioned_buy_ownership,
+)
+from app.services.capital_campaign_domain.commissioned_readiness_preview import (
+    generate_commissioned_campaign_preview,
+)
 from app.services.exchange_connections import refresh_exchange_balances as _refresh_exchange_balances
-from app.schemas.capital_campaign_domain import CommissionedControlPlaneMutationRequest
+from app.schemas.capital_campaign_domain import (
+    CommissionedCampaignCommissionRequest,
+    CommissionedControlPlaneMutationRequest,
+    CommissionedEntryExecutionRequest,
+    CommissionedOwnershipReconciliationRequest,
+    CommissionedReadinessRequest,
+)
+from app.schemas.live_crypto_orders import LiveCryptoOrderPrepareRequest
+from app.services.live_crypto_orders import LiveCryptoOrderService
 from app.services.paper.accounting import build_account_snapshot
 from app.services.risk import risk_monitor
 from app.services.risk.equity_evidence import resolve_equity_risk_evidence
@@ -153,6 +174,15 @@ _BUY_CONFIDENCE_BY_AGGRESSION_MODE: dict[str, Decimal] = {
     "MAXIMUM_GOVERNED": Decimal("0.45"),
 }
 _READY_PACKAGE_STATES = {"READY", "AUTHORIZED", "DRY_RUN_PASSED", "ACTIVATED"}
+_COMMISSIONED_SUBMISSION_MAY_HAVE_OCCURRED = {
+    "BUY_PENDING",
+    "BUY_SUBMITTED",
+    "BUY_RECONCILIATION_PENDING",
+    "RECONCILIATION_REQUIRED",
+    "ACTIVE_POSITION",
+}
+_COMMISSIONED_RECONCILIATION_STATES = {"BUY_RECONCILIATION_PENDING", "RECONCILIATION_REQUIRED", "ACTIVE_POSITION"}
+_PROVING_REFRESH_GRACE_SECONDS = 90
 
 
 def _uuid_from_value(value: Any) -> UUID | None:
@@ -189,6 +219,332 @@ def _decision_action(decision: DecisionRecord | None) -> str | None:
     if decision.trade_accepted:
         return "BUY"
     return None
+
+
+def _commission_phase_idempotency_key(*, root_idempotency_key: str, phase: str, scope: str | None = None) -> str:
+    payload = {"root_idempotency_key": root_idempotency_key, "phase": phase, "scope": scope or ""}
+    return hashlib.sha256(json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")).hexdigest()
+
+
+def _commissioning_identity(*, campaign_id: UUID, version: int, root_idempotency_key: str) -> str:
+    payload = {
+        "campaign_id": str(campaign_id),
+        "version": version,
+        "root_idempotency_key": root_idempotency_key,
+        "authority": "OPERATOR_COMMISSIONED",
+    }
+    return hashlib.sha256(json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")).hexdigest()
+
+
+def _commissioned_blob_from_definition(definition: CapitalCampaignDefinition | None) -> dict[str, Any]:
+    metadata = getattr(definition, "metadata_evidence", {}) if definition is not None else {}
+    if not isinstance(metadata, dict):
+        return {}
+    blob = metadata.get("commissioned_seed_campaign")
+    return blob if isinstance(blob, dict) else {}
+
+
+def _serialize_decimal_str(value: Decimal | None) -> str | None:
+    if value is None:
+        return None
+    return format(value, "f")
+
+
+def _normalize_instrument(value: str) -> str:
+    return value.strip().upper().replace("/", "-")
+
+
+def _canonical_package_is_forced(package: CanonicalPreviewPackage) -> bool:
+    identity = package.market_evidence_identity if isinstance(package.market_evidence_identity, dict) else {}
+    return (
+        str(identity.get("entry_authority") or "").strip().upper() == "OPERATOR_COMMISSIONED"
+        and str(identity.get("entry_reason") or "").strip().upper() == "INITIAL_PROVING_ENTRY"
+        and str(identity.get("strategy_override_scope") or "").strip().upper() == "COMMISSIONING_ENTRY_ONLY"
+    )
+
+
+def _preview_reference_price(preview: CryptoOrderPreview) -> Decimal:
+    for candidate in (
+        getattr(preview, "estimated_average_price", None),
+        getattr(preview, "best_ask", None),
+        getattr(preview, "best_bid", None),
+    ):
+        if candidate is not None and Decimal(str(candidate)) > Decimal("0"):
+            return Decimal(str(candidate))
+    if getattr(preview, "estimated_total_value", None) is not None and getattr(preview, "estimated_base_size", None) is not None:
+        base_size = Decimal(str(preview.estimated_base_size))
+        if base_size > Decimal("0"):
+            return Decimal(str(preview.estimated_total_value)) / base_size
+    raise ValueError("reference price unavailable from canonical preview")
+
+
+def _extract_available_quote_balance(connection: ExchangeConnection) -> Decimal:
+    for item in getattr(connection, "balances", []) or []:
+        if str(item.get("currency") or "").upper() != "USD":
+            continue
+        return Decimal(str(item.get("available") or "0"))
+    return Decimal("0")
+
+
+def _approval_is_active(approval_event: LiveApprovalEvent | None, *, now: datetime) -> bool:
+    if approval_event is None:
+        return False
+    if str(approval_event.approval_state or "").strip().lower() != "approved":
+        return False
+    return approval_event.expires_at is None or approval_event.expires_at > now
+
+
+def _activation_is_active(activation: CanonicalProvingActivation | None, *, now: datetime) -> bool:
+    if activation is None:
+        return False
+    if str(activation.activation_state or "").strip().upper() != "ACTIVE":
+        return False
+    return activation.expires_at > now
+
+
+async def _load_latest_forced_canonical_package(*, db, campaign_id: UUID) -> CanonicalPreviewPackage | None:
+    rows = list(
+        (
+            await db.execute(
+                select(CanonicalPreviewPackage)
+                .where(CanonicalPreviewPackage.campaign_id == campaign_id)
+                .order_by(CanonicalPreviewPackage.generated_at.desc(), CanonicalPreviewPackage.package_id.desc())
+            )
+        ).scalars().all()
+    )
+    for item in rows:
+        if _canonical_package_is_forced(item):
+            return item
+    return None
+
+
+async def _load_latest_approval_for_package(*, db, package: CanonicalPreviewPackage | None) -> LiveApprovalEvent | None:
+    if package is None or package.approval_event_id is None:
+        return None
+    return await db.scalar(
+        select(LiveApprovalEvent).where(LiveApprovalEvent.id == package.approval_event_id).limit(1)
+    )
+
+
+async def _load_activation_for_package(*, db, package: CanonicalPreviewPackage | None) -> CanonicalProvingActivation | None:
+    if package is None:
+        return None
+    return await db.scalar(
+        select(CanonicalProvingActivation).where(CanonicalProvingActivation.package_id == package.package_id).limit(1)
+    )
+
+
+async def _load_preview_for_package_row(*, db, package: CanonicalPreviewPackage | None) -> CryptoOrderPreview | None:
+    if package is None:
+        return None
+    return await db.scalar(
+        select(CryptoOrderPreview)
+        .where(CryptoOrderPreview.crypto_order_preview_id == package.crypto_order_preview_id)
+        .limit(1)
+    )
+
+
+async def _load_runtime_campaign_by_identity(*, db, campaign_id: UUID) -> CapitalCampaign | None:
+    return await db.scalar(select(CapitalCampaign).where(CapitalCampaign.uuid == campaign_id).limit(1))
+
+
+async def _load_campaign_definition_by_identity(*, db, campaign_id: UUID, version: int) -> CapitalCampaignDefinition | None:
+    return await db.scalar(
+        select(CapitalCampaignDefinition)
+        .where(CapitalCampaignDefinition.campaign_id == campaign_id)
+        .where(CapitalCampaignDefinition.version == version)
+        .limit(1)
+    )
+
+
+async def _load_paper_account_by_id(*, db, paper_account_id: UUID) -> PaperAccount | None:
+    return await db.scalar(select(PaperAccount).where(PaperAccount.id == paper_account_id).limit(1))
+
+
+async def _load_profile_by_id(*, db, live_trading_profile_id: UUID) -> LiveTradingProfile | None:
+    return await db.scalar(select(LiveTradingProfile).where(LiveTradingProfile.id == live_trading_profile_id).limit(1))
+
+
+async def _load_exchange_connection_by_id(*, db, exchange_connection_id: UUID) -> ExchangeConnection | None:
+    return await db.scalar(
+        select(ExchangeConnection)
+        .where(ExchangeConnection.exchange_connection_id == exchange_connection_id)
+        .limit(1)
+    )
+
+
+async def _load_active_mandate_for_commissioning(
+    *,
+    db,
+    runtime_campaign_id: int,
+    live_trading_profile_id: UUID,
+    paper_account_id: UUID,
+    provider: str,
+    environment: str,
+) -> AutonomousCapitalMandate | None:
+    rows = list(
+        (
+            await db.execute(
+                select(AutonomousCapitalMandate)
+                .where(AutonomousCapitalMandate.live_trading_profile_id == live_trading_profile_id)
+                .where(AutonomousCapitalMandate.provider == provider)
+                .where(AutonomousCapitalMandate.exchange_environment == environment)
+                .order_by(AutonomousCapitalMandate.activated_at.desc(), AutonomousCapitalMandate.authorized_at.desc(), AutonomousCapitalMandate.created_at.desc())
+            )
+        ).scalars().all()
+    )
+    for mandate in rows:
+        if str(mandate.status or "").upper() not in {"ACTIVE", "AUTHORIZED"}:
+            continue
+        if mandate.capital_campaign_id not in {None, runtime_campaign_id}:
+            continue
+        if mandate.paper_account_id not in {None, paper_account_id}:
+            continue
+        return mandate
+    return None
+
+
+async def _load_authorized_mandate_version(*, db, mandate_id: UUID) -> AutonomousCapitalMandateVersion | None:
+    authorized = await db.scalar(
+        select(AutonomousCapitalMandateAuthorization)
+        .where(AutonomousCapitalMandateAuthorization.mandate_id == mandate_id)
+        .where(AutonomousCapitalMandateAuthorization.authorization_state == "AUTHORIZED")
+        .where(AutonomousCapitalMandateAuthorization.revoked_at.is_(None))
+        .order_by(AutonomousCapitalMandateAuthorization.recorded_at.desc())
+        .limit(1)
+    )
+    if authorized is not None:
+        version = await db.scalar(
+            select(AutonomousCapitalMandateVersion)
+            .where(AutonomousCapitalMandateVersion.mandate_version_id == authorized.mandate_version_id)
+            .limit(1)
+        )
+        if version is not None:
+            return version
+    return await db.scalar(
+        select(AutonomousCapitalMandateVersion)
+        .where(AutonomousCapitalMandateVersion.mandate_id == mandate_id)
+        .order_by(AutonomousCapitalMandateVersion.version_number.desc())
+        .limit(1)
+    )
+
+
+async def _load_asset_for_product_symbol(*, db, product: str, provider: str) -> Asset | None:
+    base_symbol = _normalize_instrument(product).split("-", 1)[0]
+    return await db.scalar(
+        select(Asset)
+        .where(Asset.symbol == base_symbol)
+        .where(Asset.exchange == provider)
+        .where(Asset.asset_class == "crypto")
+        .where(Asset.is_active.is_(True))
+        .order_by(Asset.created_at.desc())
+        .limit(1)
+    )
+
+
+def _package_requires_refresh(
+    *,
+    package: CanonicalPreviewPackage | None,
+    preview: CryptoOrderPreview | None,
+    approval_event: LiveApprovalEvent | None,
+    activation: CanonicalProvingActivation | None,
+    now: datetime,
+) -> bool:
+    if package is None or preview is None:
+        return True
+    if package.preview_expires_at <= now + timedelta(seconds=_PROVING_REFRESH_GRACE_SECONDS):
+        return True
+    if package.package_state in _TERMINAL_PACKAGE_STATES:
+        return True
+    if package.package_state == "ACTIVATED":
+        return not _activation_is_active(activation, now=now)
+    if package.package_state == "DRY_RUN_PASSED":
+        return not _approval_is_active(approval_event, now=now)
+    if package.package_state == "AUTHORIZED":
+        return not _approval_is_active(approval_event, now=now)
+    return False
+
+
+def _commissioning_status_summary(*, blob: dict[str, Any]) -> dict[str, Any]:
+    ownership = blob.get("ownership_reconciliation") if isinstance(blob.get("ownership_reconciliation"), dict) else {}
+    authority_metadata = blob.get("authority_metadata") if isinstance(blob.get("authority_metadata"), dict) else {}
+    return {
+        "state": str(blob.get("state") or "DRAFT"),
+        "commissioning": blob.get("commissioning") if isinstance(blob.get("commissioning"), dict) else {},
+        "entry_execution": blob.get("entry_execution") if isinstance(blob.get("entry_execution"), dict) else {},
+        "ownership_reconciliation": ownership,
+        "autonomous_lifecycle_owner": (
+            str(blob.get("state") or "").upper() == "ACTIVE_POSITION"
+            and bool(ownership.get("position_identity"))
+            and str(authority_metadata.get("lifecycle_authority") or "").strip().upper() == "OMNITRADE_AUTONOMOUS"
+        ),
+    }
+
+
+def _build_commissioned_readiness_request(
+    *,
+    campaign_id: UUID,
+    version: int,
+    live_trading_profile_id: UUID,
+    paper_account_id: UUID,
+    provider: str,
+    environment: str,
+    product: str,
+    requested_quote_amount: Decimal,
+    idempotency_key: str,
+    approval_event: LiveApprovalEvent,
+    definition: CapitalCampaignDefinition,
+    connection: ExchangeConnection,
+    preview: CryptoOrderPreview,
+    mandate: AutonomousCapitalMandate,
+    mandate_version: AutonomousCapitalMandateVersion,
+) -> CommissionedReadinessRequest:
+    observed_at = getattr(connection, "last_verified_at", None) or preview.created_at
+    balance_observed_at = getattr(connection, "last_successful_sync_at", None) or observed_at
+    heartbeat_observed_at = getattr(connection, "last_heartbeat_at", None) or observed_at
+    price_observed_at = preview.created_at
+    reference_price = _preview_reference_price(preview)
+    estimated_fee = Decimal(str(getattr(preview, "estimated_fee", None) or "0.01"))
+    estimated_slippage = Decimal(str(getattr(preview, "estimated_slippage", None) or "0.01"))
+    return CommissionedReadinessRequest(
+        campaign_id=campaign_id,
+        version=version,
+        provider=provider,
+        environment=environment,
+        instrument=product,
+        requested_quote_amount=requested_quote_amount,
+        quote_currency="USD",
+        idempotency_key=idempotency_key,
+        live_trading_profile_id=live_trading_profile_id,
+        account_id=paper_account_id,
+        mandate_id=mandate.mandate_id,
+        mandate_version_id=mandate_version.mandate_version_id,
+        expected_mandate_version_number=mandate_version.version_number,
+        expected_risk_policy_id=definition.risk_policy_id,
+        expected_risk_policy_version=definition.risk_policy_version,
+        approval_checkpoint_type="bounded_proving_entry",
+        authorization_expires_at=approval_event.expires_at,
+        provider_capability_evidence={"supported": bool(connection.credentials_valid), "observed_at": observed_at.isoformat(), "source": "exchange_connection"},
+        connectivity_evidence={"reachable": str(connection.status or "").lower() == "connected", "observed_at": heartbeat_observed_at.isoformat(), "source": "exchange_connection"},
+        balance_evidence={"available_quote_balance": _serialize_decimal_str(_extract_available_quote_balance(connection)), "observed_at": balance_observed_at.isoformat(), "source": "exchange_connection"},
+        market_data_evidence={"observed_at": price_observed_at.isoformat(), "max_age_seconds": get_settings().live_crypto_price_max_age_seconds, "source": "canonical_preview"},
+        price_evidence={"reference_price": _serialize_decimal_str(reference_price), "observed_at": price_observed_at.isoformat(), "max_age_seconds": get_settings().live_crypto_price_max_age_seconds, "source": "canonical_preview"},
+        minimum_order_evidence={
+            "minimum_quote_amount": _serialize_decimal_str(Decimal("5")),
+            "minimum_base_quantity": _serialize_decimal_str(Decimal(str(mandate_version.entry_policy.get("minimum_base_quantity") or getattr(mandate_version, "min_base_quantity", None) or Decimal("0.00000001")))),
+            "observed_at": observed_at.isoformat(),
+            "source": "mandate_version",
+        },
+        fee_slippage_evidence={
+            "estimated_entry_fee": _serialize_decimal_str(estimated_fee),
+            "estimated_future_exit_fee": _serialize_decimal_str(estimated_fee),
+            "estimated_slippage": _serialize_decimal_str(estimated_slippage),
+            "source": "canonical_preview",
+        },
+        runtime_readiness_evidence={"ready": True, "observed_at": observed_at.isoformat(), "source": "canonical_preview_commission_command"},
+        reconciliation_evidence={},
+        manual_review_evidence={"required": False},
+    )
 
 
 def _strategy_identity(decision: DecisionRecord | None) -> tuple[str | None, str | None]:
@@ -4893,6 +5249,501 @@ async def revoke_canonical_proving_activation_bundle(*, package_id: UUID, actor:
         )
         await db.commit()
         return payload
+
+
+async def canonical_proving_commission_bundle(
+    *,
+    campaign_id: UUID,
+    campaign_version: int,
+    paper_account_id: UUID,
+    live_trading_profile_id: UUID,
+    provider: str,
+    environment: str,
+    product: str,
+    amount_usd: Decimal,
+    actor: str,
+    approver_role: str,
+    rationale: str,
+    no_leverage: bool,
+    confirm: bool,
+    idempotency_key: str,
+) -> dict[str, Any]:
+    if amount_usd != Decimal("5"):
+        raise PermissionError("commissioned proving requires exact amount_usd=5")
+    if not no_leverage:
+        raise PermissionError("commissioned proving requires no_leverage=true")
+    if not confirm:
+        raise PermissionError("confirm=true is required for commissioned proving")
+    root_idempotency_key = str(idempotency_key or "").strip()
+    if not root_idempotency_key:
+        raise PermissionError("idempotency_key is required")
+
+    async with AsyncSessionLocal() as db:
+        now = datetime.now(timezone.utc)
+        definition = await _load_campaign_definition_by_identity(db=db, campaign_id=campaign_id, version=campaign_version)
+        runtime = await _load_runtime_campaign_by_identity(db=db, campaign_id=campaign_id)
+        paper_account = await _load_paper_account_by_id(db=db, paper_account_id=paper_account_id)
+        profile = await _load_profile_by_id(db=db, live_trading_profile_id=live_trading_profile_id)
+        if definition is None or runtime is None or paper_account is None or profile is None:
+            raise LookupError("commissioned proving identity chain incomplete")
+        if runtime.id is None:
+            raise LookupError("runtime capital campaign id unavailable")
+
+        commissioned_blob = _commissioned_blob_from_definition(definition)
+        commissioned_state = str(commissioned_blob.get("state") or "DRAFT")
+        entry_execution = commissioned_blob.get("entry_execution") if isinstance(commissioned_blob.get("entry_execution"), dict) else {}
+        ownership = commissioned_blob.get("ownership_reconciliation") if isinstance(commissioned_blob.get("ownership_reconciliation"), dict) else {}
+
+        if commissioned_state == "ACTIVE_POSITION" and ownership.get("position_identity"):
+            status_payload = await canonical_proving_commission_status(
+                campaign_id=campaign_id,
+                campaign_version=campaign_version,
+                paper_account_id=paper_account_id,
+                live_trading_profile_id=live_trading_profile_id,
+                provider=provider,
+                environment=environment,
+                product=product,
+            )
+            return {"replayed": True, "status": status_payload, "current_state": "ACTIVE_POSITION", "autonomous_lifecycle_owner": True}
+
+        package: CanonicalPreviewPackage | None = None
+        preview: CryptoOrderPreview | None = None
+        approval_event: LiveApprovalEvent | None = None
+        activation: CanonicalProvingActivation | None = None
+
+        if commissioned_state not in _COMMISSIONED_SUBMISSION_MAY_HAVE_OCCURRED:
+            attempted_refresh_scopes: set[str] = set()
+            while True:
+                package = await _load_latest_forced_canonical_package(db=db, campaign_id=campaign_id)
+                preview = await _load_preview_for_package_row(db=db, package=package)
+                approval_event = await _load_latest_approval_for_package(db=db, package=package)
+                activation = await _load_activation_for_package(db=db, package=package)
+
+                if _package_requires_refresh(package=package, preview=preview, approval_event=approval_event, activation=activation, now=now):
+                    refresh_scope = "initial" if package is None else str(package.package_id)
+                    if refresh_scope in attempted_refresh_scopes:
+                        raise PermissionError("unable to obtain a fresh canonical proving package")
+                    attempted_refresh_scopes.add(refresh_scope)
+                    created = await create_canonical_preview_package(
+                        db=db,
+                        request=CanonicalPreviewPackageCreateRequest(
+                            campaign_id=campaign_id,
+                            campaign_version=campaign_version,
+                            paper_account_id=paper_account_id,
+                            live_trading_profile_id=live_trading_profile_id,
+                            provider=provider,
+                            environment=environment,
+                            product=product,
+                            max_proposed_order_amount=amount_usd,
+                            actor=actor,
+                            idempotency_key=_commission_phase_idempotency_key(
+                                root_idempotency_key=root_idempotency_key,
+                                phase="canonical_package_create",
+                                scope=refresh_scope,
+                            ),
+                            commissioning_entry_mode="initial_proving_entry",
+                        ),
+                    )
+                    await db.commit()
+                    package = await _load_latest_forced_canonical_package(db=db, campaign_id=campaign_id)
+                    preview = await _load_preview_for_package_row(db=db, package=package)
+                    approval_event = await _load_latest_approval_for_package(db=db, package=package)
+                    activation = await _load_activation_for_package(db=db, package=package)
+                    if not created.get("package"):
+                        raise PermissionError("forced canonical package creation did not yield a package")
+
+                if package is None or preview is None:
+                    raise PermissionError("canonical proving package evidence unavailable")
+
+                if package.package_state == "READY":
+                    expires_at = package.preview_expires_at - timedelta(seconds=30)
+                    if expires_at <= now:
+                        package = None
+                        continue
+                    await authorize_canonical_preview_package(
+                        db=db,
+                        request=CanonicalPreviewPackageAuthorizeRequest(
+                            package_id=package.package_id,
+                            actor=actor,
+                            approver_role=approver_role,
+                            rationale=rationale,
+                            expires_at=expires_at,
+                            max_order_usd=amount_usd,
+                            max_total_deployed_campaign_capital_usd=amount_usd,
+                            no_leverage=True,
+                            idempotency_key=_commission_phase_idempotency_key(
+                                root_idempotency_key=root_idempotency_key,
+                                phase="canonical_package_authorize",
+                                scope=str(package.package_id),
+                            ),
+                        ),
+                    )
+                    await db.commit()
+                    approval_event = await _load_latest_approval_for_package(db=db, package=package)
+                    continue
+
+                if package.package_state == "AUTHORIZED":
+                    if not _approval_is_active(approval_event, now=now):
+                        package = None
+                        continue
+                    await run_dry_run_for_canonical_preview_package(
+                        db=db,
+                        request=CanonicalPreviewPackageDryRunRequest(
+                            package_id=package.package_id,
+                            approval_event_id=approval_event.id,
+                            operator_identity=actor,
+                            idempotency_token=_commission_phase_idempotency_key(
+                                root_idempotency_key=root_idempotency_key,
+                                phase="canonical_package_dry_run",
+                                scope=str(package.package_id),
+                            ),
+                        ),
+                    )
+                    await db.commit()
+                    package = await db.scalar(
+                        select(CanonicalPreviewPackage)
+                        .where(CanonicalPreviewPackage.package_id == package.package_id)
+                        .limit(1)
+                    )
+                    continue
+
+                if package.package_state == "DRY_RUN_PASSED":
+                    if not _approval_is_active(approval_event, now=now):
+                        package = None
+                        continue
+                    activated = await activate_canonical_proving_campaign(
+                        db=db,
+                        request=CanonicalPreviewPackageActivationRequest(
+                            package_id=package.package_id,
+                            approval_event_id=approval_event.id,
+                            dry_run_live_crypto_order_id=package.dry_run_live_crypto_order_id,
+                            actor=actor,
+                            expires_at=approval_event.expires_at,
+                            idempotency_key=_commission_phase_idempotency_key(
+                                root_idempotency_key=root_idempotency_key,
+                                phase="canonical_proving_activate",
+                                scope=str(package.package_id),
+                            ),
+                        ),
+                    )
+                    await db.commit()
+                    activation_payload = activated.get("activation") if isinstance(activated.get("activation"), dict) else {}
+                    activation = await _load_activation_for_package(db=db, package=package)
+                    if not activation_payload:
+                        raise PermissionError("canonical proving activation missing after activation")
+                    continue
+
+                if package.package_state == "ACTIVATED":
+                    if not _activation_is_active(activation, now=now):
+                        raise PermissionError("activated proving package expired before submission; manual recovery required")
+                    break
+
+                raise PermissionError(f"unsupported canonical proving package state: {package.package_state}")
+
+        package = package or await _load_latest_forced_canonical_package(db=db, campaign_id=campaign_id)
+        preview = preview or await _load_preview_for_package_row(db=db, package=package)
+        approval_event = approval_event or await _load_latest_approval_for_package(db=db, package=package)
+        activation = activation or await _load_activation_for_package(db=db, package=package)
+        if package is None or preview is None or approval_event is None:
+            raise PermissionError("canonical proving chain is incomplete")
+
+        connection = await _load_exchange_connection_by_id(db=db, exchange_connection_id=preview.exchange_connection_id)
+        mandate = await _load_active_mandate_for_commissioning(
+            db=db,
+            runtime_campaign_id=runtime.id,
+            live_trading_profile_id=live_trading_profile_id,
+            paper_account_id=paper_account_id,
+            provider=provider,
+            environment=environment,
+        )
+        if connection is None or mandate is None:
+            raise PermissionError("commissioned proving mandate or exchange connection evidence missing")
+        mandate_version = await _load_authorized_mandate_version(db=db, mandate_id=mandate.mandate_id)
+        asset = await _load_asset_for_product_symbol(db=db, product=product, provider=provider)
+        if mandate_version is None or asset is None:
+            raise PermissionError("commissioned proving asset or mandate version evidence missing")
+
+        readiness_request = _build_commissioned_readiness_request(
+            campaign_id=campaign_id,
+            version=campaign_version,
+            live_trading_profile_id=live_trading_profile_id,
+            paper_account_id=paper_account_id,
+            provider=provider,
+            environment=environment,
+            product=product,
+            requested_quote_amount=amount_usd,
+            idempotency_key=_commission_phase_idempotency_key(
+                root_idempotency_key=root_idempotency_key,
+                phase="commissioned_readiness",
+                scope=str(package.package_id),
+            ),
+            approval_event=approval_event,
+            definition=definition,
+            connection=connection,
+            preview=preview,
+            mandate=mandate,
+            mandate_version=mandate_version,
+        )
+
+        preview_response = await generate_commissioned_campaign_preview(db=db, request=readiness_request)
+        if commissioned_state in {"DRAFT", "READY"}:
+            await backfill_commissioned_ready_metadata(
+                db=db,
+                campaign_id=campaign_id,
+                version=campaign_version,
+                actor=actor,
+                idempotency_key=_commission_phase_idempotency_key(
+                    root_idempotency_key=root_idempotency_key,
+                    phase="commissioned_ready_backfill",
+                    scope=str(package.package_id),
+                ),
+                commissioning_identity=_commissioning_identity(
+                    campaign_id=campaign_id,
+                    version=campaign_version,
+                    root_idempotency_key=root_idempotency_key,
+                ),
+                commissioned_by=actor,
+                provider=provider,
+                environment=environment,
+                instrument=product,
+                paper_account_id=paper_account_id,
+                capital_budget=amount_usd,
+                maximum_position_size=amount_usd,
+                maximum_total_exposure=amount_usd,
+                commissioned_until=activation.expires_at if activation is not None else approval_event.expires_at,
+            )
+            commissioned_state = "READY"
+
+        if commissioned_state == "READY":
+            await commission_commissioned_campaign(
+                db=db,
+                request=CommissionedCampaignCommissionRequest(
+                    campaign_id=campaign_id,
+                    version=campaign_version,
+                    actor=actor,
+                    commissioning_reason=rationale,
+                    preview_identity_hash=preview_response.preview_identity_hash,
+                    requested_quote_amount=amount_usd,
+                    idempotency_key=_commission_phase_idempotency_key(
+                        root_idempotency_key=root_idempotency_key,
+                        phase="commissioned_campaign_commission",
+                        scope=str(package.package_id),
+                    ),
+                    authorization_expires_at=approval_event.expires_at,
+                    commissioned_until=activation.expires_at if activation is not None else approval_event.expires_at,
+                    readiness_request=readiness_request,
+                ),
+            )
+            commissioned_state = "COMMISSIONED"
+
+        current_definition = await _load_campaign_definition_by_identity(db=db, campaign_id=campaign_id, version=campaign_version)
+        current_blob = _commissioned_blob_from_definition(current_definition)
+        current_state = str(current_blob.get("state") or commissioned_state)
+        current_entry_execution = current_blob.get("entry_execution") if isinstance(current_blob.get("entry_execution"), dict) else {}
+        live_crypto_order_id = _uuid_from_value(current_entry_execution.get("live_crypto_order_id"))
+        confirmation_challenge_id: UUID | None = None
+
+        if current_state == "BUY_PENDING" and live_crypto_order_id is not None:
+            live_order = await db.scalar(
+                select(LiveCryptoOrder)
+                .where(LiveCryptoOrder.live_crypto_order_id == live_crypto_order_id)
+                .limit(1)
+            )
+            if live_order is None or live_order.operator_confirmation_id is None:
+                raise PermissionError("BUY_PENDING resume requires persisted live order confirmation identity")
+            policy = await resolve_effective_risk_policy(db=db, paper_account_id=paper_account_id)
+            execution_response = await execute_commissioned_entry(
+                db=db,
+                request=CommissionedEntryExecutionRequest(
+                    campaign_id=campaign_id,
+                    version=campaign_version,
+                    actor=actor,
+                    idempotency_key=_commission_phase_idempotency_key(
+                        root_idempotency_key=root_idempotency_key,
+                        phase="commissioned_entry_execute",
+                        scope=str(package.package_id),
+                    ),
+                    readiness_request=readiness_request,
+                    expected_preview_identity_hash=preview_response.preview_identity_hash,
+                    live_crypto_order_id=live_crypto_order_id,
+                    confirmation_challenge_id=live_order.operator_confirmation_id,
+                    confirmation_phrase="BUY BTC",
+                    submit_idempotency_token=_commission_phase_idempotency_key(
+                        root_idempotency_key=root_idempotency_key,
+                        phase="live_submit",
+                        scope=str(live_crypto_order_id),
+                    ),
+                    risk_signal_id=package.crypto_order_preview_id,
+                    paper_account_id=paper_account_id,
+                    asset_id=asset.id,
+                    requested_base_quantity=preview_response.estimated_base_quantity,
+                    reference_price=preview_response.reference_price,
+                    account_equity=paper_account.current_cash_balance,
+                    max_position_size_pct=policy.max_position_size_pct,
+                    min_order_notional=asset.min_order_notional,
+                    qty_step_size=asset.qty_step_size,
+                    supports_fractional=asset.supports_fractional,
+                ),
+            )
+            current_state = execution_response.current_state
+        elif current_state not in _COMMISSIONED_RECONCILIATION_STATES:
+            prepare_response = await LiveCryptoOrderService().prepare_confirmation(
+                db=db,
+                request=LiveCryptoOrderPrepareRequest(
+                    live_trading_profile_id=live_trading_profile_id,
+                    crypto_order_preview_id=package.crypto_order_preview_id,
+                    operator_identity=actor,
+                    idempotency_token=_commission_phase_idempotency_key(
+                        root_idempotency_key=root_idempotency_key,
+                        phase="live_prepare_confirmation",
+                        scope=str(package.package_id),
+                    ),
+                ),
+            )
+            live_crypto_order_id = prepare_response.live_crypto_order.live_crypto_order_id
+            confirmation_challenge_id = prepare_response.confirmation_challenge_id
+            policy = await resolve_effective_risk_policy(db=db, paper_account_id=paper_account_id)
+            execution_response = await execute_commissioned_entry(
+                db=db,
+                request=CommissionedEntryExecutionRequest(
+                    campaign_id=campaign_id,
+                    version=campaign_version,
+                    actor=actor,
+                    idempotency_key=_commission_phase_idempotency_key(
+                        root_idempotency_key=root_idempotency_key,
+                        phase="commissioned_entry_execute",
+                        scope=str(package.package_id),
+                    ),
+                    readiness_request=readiness_request,
+                    expected_preview_identity_hash=preview_response.preview_identity_hash,
+                    live_crypto_order_id=live_crypto_order_id,
+                    confirmation_challenge_id=confirmation_challenge_id,
+                    confirmation_phrase=prepare_response.confirmation_phrase_required,
+                    submit_idempotency_token=_commission_phase_idempotency_key(
+                        root_idempotency_key=root_idempotency_key,
+                        phase="live_submit",
+                        scope=str(live_crypto_order_id),
+                    ),
+                    risk_signal_id=package.crypto_order_preview_id,
+                    paper_account_id=paper_account_id,
+                    asset_id=asset.id,
+                    requested_base_quantity=preview_response.estimated_base_quantity,
+                    reference_price=preview_response.reference_price,
+                    account_equity=paper_account.current_cash_balance,
+                    max_position_size_pct=policy.max_position_size_pct,
+                    min_order_notional=asset.min_order_notional,
+                    qty_step_size=asset.qty_step_size,
+                    supports_fractional=asset.supports_fractional,
+                ),
+            )
+            current_state = execution_response.current_state
+            live_crypto_order_id = execution_response.live_crypto_order_id or live_crypto_order_id
+
+        reconcile_payload = None
+        current_definition = await _load_campaign_definition_by_identity(db=db, campaign_id=campaign_id, version=campaign_version)
+        current_blob = _commissioned_blob_from_definition(current_definition)
+        current_state = str(current_blob.get("state") or current_state)
+        current_entry_execution = current_blob.get("entry_execution") if isinstance(current_blob.get("entry_execution"), dict) else {}
+        live_crypto_order_id = live_crypto_order_id or _uuid_from_value(current_entry_execution.get("live_crypto_order_id"))
+        if live_crypto_order_id is not None and current_state in {"BUY_RECONCILIATION_PENDING", "RECONCILIATION_REQUIRED"}:
+            reconcile_payload = await reconcile_commissioned_buy_ownership(
+                db=db,
+                request=CommissionedOwnershipReconciliationRequest(
+                    campaign_id=campaign_id,
+                    version=campaign_version,
+                    actor=actor,
+                    idempotency_key=_commission_phase_idempotency_key(
+                        root_idempotency_key=root_idempotency_key,
+                        phase="commissioned_buy_reconcile",
+                        scope=str(live_crypto_order_id),
+                    ),
+                    live_crypto_order_id=live_crypto_order_id,
+                ),
+            )
+            current_state = reconcile_payload.current_state
+
+        status_payload = await canonical_proving_commission_status(
+            campaign_id=campaign_id,
+            campaign_version=campaign_version,
+            paper_account_id=paper_account_id,
+            live_trading_profile_id=live_trading_profile_id,
+            provider=provider,
+            environment=environment,
+            product=product,
+        )
+        return {
+            "campaign_id": str(campaign_id),
+            "campaign_version": campaign_version,
+            "package_id": None if package is None else str(package.package_id),
+            "approval_event_id": None if approval_event is None else str(approval_event.id),
+            "activation_id": None if activation is None else str(activation.activation_id),
+            "live_crypto_order_id": None if live_crypto_order_id is None else str(live_crypto_order_id),
+            "current_state": current_state,
+            "autonomous_lifecycle_owner": bool((status_payload.get("commissioning_status") or {}).get("autonomous_lifecycle_owner", False)),
+            "status": status_payload,
+            "reconciliation": None if reconcile_payload is None else reconcile_payload.model_dump(mode="json"),
+        }
+
+
+async def canonical_proving_commission_status(
+    *,
+    campaign_id: UUID,
+    campaign_version: int,
+    paper_account_id: UUID,
+    live_trading_profile_id: UUID,
+    provider: str,
+    environment: str,
+    product: str,
+) -> dict[str, Any]:
+    async with AsyncSessionLocal() as db:
+        definition = await _load_campaign_definition_by_identity(db=db, campaign_id=campaign_id, version=campaign_version)
+        package = await _load_latest_forced_canonical_package(db=db, campaign_id=campaign_id)
+        approval_event = await _load_latest_approval_for_package(db=db, package=package)
+        activation = await _load_activation_for_package(db=db, package=package)
+        preview = await _load_preview_for_package_row(db=db, package=package)
+        commissioned_status = await _get_commissioned_control_plane_status(db=db, campaign_id=campaign_id, version=campaign_version)
+        commissioned_blob = _commissioned_blob_from_definition(definition)
+        chain_summary = _commissioning_status_summary(blob=commissioned_blob)
+        live_crypto_order_id = _uuid_from_value((chain_summary.get("entry_execution") or {}).get("live_crypto_order_id"))
+        live_order = None
+        if live_crypto_order_id is not None:
+            live_order = await db.scalar(
+                select(LiveCryptoOrder)
+                .where(LiveCryptoOrder.live_crypto_order_id == live_crypto_order_id)
+                .limit(1)
+            )
+        return {
+            "campaign_id": str(campaign_id),
+            "campaign_version": campaign_version,
+            "paper_account_id": str(paper_account_id),
+            "live_trading_profile_id": str(live_trading_profile_id),
+            "provider": provider,
+            "environment": environment,
+            "product": product,
+            "package": None if package is None else (await get_canonical_preview_package(db=db, package_id=package.package_id)).get("package"),
+            "approval_event_id": None if approval_event is None else str(approval_event.id),
+            "activation": None if activation is None else {
+                "activation_id": str(activation.activation_id),
+                "activation_state": activation.activation_state,
+                "expires_at": activation.expires_at.isoformat(),
+            },
+            "preview": None if preview is None else {
+                "crypto_order_preview_id": str(preview.crypto_order_preview_id),
+                "expires_at": preview.expires_at.isoformat(),
+                "requested_amount": _serialize_decimal_str(Decimal(str(preview.requested_amount))),
+            },
+            "commissioned_control_plane": commissioned_status,
+            "commissioning_status": chain_summary,
+            "live_order": None if live_order is None else {
+                "live_crypto_order_id": str(live_order.live_crypto_order_id),
+                "status": live_order.status,
+                "provider_order_id": live_order.provider_order_id,
+                "submitted_at": None if live_order.submitted_at is None else live_order.submitted_at.isoformat(),
+                "filled_at": None if live_order.filled_at is None else live_order.filled_at.isoformat(),
+            },
+            "read_only": True,
+            "no_execution": True,
+        }
 
 
 async def inspect_legacy_campaign_transition(

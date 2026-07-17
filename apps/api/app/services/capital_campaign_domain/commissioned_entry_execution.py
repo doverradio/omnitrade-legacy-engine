@@ -711,28 +711,6 @@ async def execute_commissioned_entry(
 ) -> CommissionedEntryExecutionResponse:
     lock = _get_lock(campaign_id=request.campaign_id, version=request.version)
     async with lock:
-        readiness = await assess_commissioned_campaign_readiness(db=db, request=request.readiness_request)
-        preview = await generate_commissioned_campaign_preview(db=db, request=request.readiness_request)
-
-        if readiness.readiness_verdict != "READY":
-            raise InvalidRequestError(
-                message="Commissioned entry requires READY readiness verdict",
-                details={"blockers": list(readiness.blockers)},
-            )
-        if preview.preview_identity_hash != request.expected_preview_identity_hash:
-            raise InvalidRequestError(
-                message="Preview identity mismatch",
-                details={
-                    "expected_preview_identity_hash": request.expected_preview_identity_hash,
-                    "actual_preview_identity_hash": preview.preview_identity_hash,
-                },
-            )
-        if preview.stale_after is None or preview.stale_after <= _utcnow():
-            raise InvalidRequestError(
-                message="Preview is expired or stale",
-                details={"stale_after": preview.stale_after},
-            )
-
         definition, _runtime = await _load_definition_and_runtime_for_update(
             db=db,
             campaign_id=request.campaign_id,
@@ -780,6 +758,36 @@ async def execute_commissioned_entry(
                 },
             )
 
+        commissioned_state = str(blob.get("state") or "DRAFT")
+        resume_from_buy_pending = (
+            commissioned_state == "BUY_PENDING"
+            and existing_key == economic_idempotency_key
+            and _optional_uuid(entry_execution.get("live_crypto_order_id")) is not None
+        )
+
+        if not resume_from_buy_pending:
+            readiness = await assess_commissioned_campaign_readiness(db=db, request=request.readiness_request)
+            preview = await generate_commissioned_campaign_preview(db=db, request=request.readiness_request)
+
+            if readiness.readiness_verdict != "READY":
+                raise InvalidRequestError(
+                    message="Commissioned entry requires READY readiness verdict",
+                    details={"blockers": list(readiness.blockers)},
+                )
+            if preview.preview_identity_hash != request.expected_preview_identity_hash:
+                raise InvalidRequestError(
+                    message="Preview identity mismatch",
+                    details={
+                        "expected_preview_identity_hash": request.expected_preview_identity_hash,
+                        "actual_preview_identity_hash": preview.preview_identity_hash,
+                    },
+                )
+            if preview.stale_after is None or preview.stale_after <= _utcnow():
+                raise InvalidRequestError(
+                    message="Preview is expired or stale",
+                    details={"stale_after": preview.stale_after},
+                )
+
         if entry_execution.get("terminal") is True:
             return CommissionedEntryExecutionResponse(
                 campaign_id=request.campaign_id,
@@ -802,122 +810,143 @@ async def execute_commissioned_entry(
                 blockers=[],
             )
 
-        commissioned_state = str(blob.get("state") or "DRAFT")
-        if commissioned_state != "COMMISSIONED":
+        if commissioned_state != "COMMISSIONED" and not resume_from_buy_pending:
             raise InvalidRequestError(
                 message="Entry execution requires COMMISSIONED state",
                 details={"current_state": commissioned_state},
             )
 
-        buy_pending_transition = await transition_commissioned_campaign_state(
-            db=db,
-            campaign_id=request.campaign_id,
-            version=request.version,
-            request=CommissionedCampaignTransitionRequest(
-                target_state="BUY_PENDING",
-                actor=request.actor,
-                reason="commissioned_entry_pre_submission",
-                idempotency_key=f"{request.idempotency_key}:buy_pending",
-                expected_current_state="COMMISSIONED",
-            ),
-        )
-
-        risk_result = evaluate_signal_risk(
-            request=_build_risk_request(request),
-            reference_price=request.reference_price,
-            context=RiskEvaluationContext(
-                global_kill_switch_engaged=False,
-                account_trading_paused=False,
-                asset_in_no_trade_zone=False,
-                pair_in_cooldown=False,
-                would_breach_daily_loss=False,
-                would_breach_drawdown=False,
-                has_computable_stop_loss=True,
-                bypass_sizing_rule=False,
-            ),
-        )
-        persisted_risk = await persist_risk_decision(
-            db=db,
-            request=RiskDecisionPersistenceRequest(
-                paper_account_id=request.paper_account_id,
-                signal_id=request.risk_signal_id,
-                actor=request.actor,
-                evaluation_result=risk_result,
-            ),
-        )
-        if risk_result.action == RiskDecisionAction.REJECT:
-            await transition_commissioned_campaign_state(
+        if resume_from_buy_pending:
+            expected_live_crypto_order_id = _optional_uuid(entry_execution.get("live_crypto_order_id"))
+            if expected_live_crypto_order_id != request.live_crypto_order_id:
+                raise InvalidRequestError(
+                    message="BUY_PENDING execution requires matching live order identity",
+                    details={
+                        "expected_live_crypto_order_id": None if expected_live_crypto_order_id is None else str(expected_live_crypto_order_id),
+                        "received_live_crypto_order_id": str(request.live_crypto_order_id),
+                    },
+                )
+            persisted_risk_event_id = _optional_uuid(entry_execution.get("risk_event_id"))
+            decision_record_id = _optional_uuid(entry_execution.get("decision_record_id"))
+            if persisted_risk_event_id is None or decision_record_id is None:
+                raise InvalidRequestError(
+                    message="BUY_PENDING execution missing persisted identities",
+                    details={"entry_execution": entry_execution},
+                )
+            persisted_risk = type("_PersistedRisk", (), {"risk_event_id": persisted_risk_event_id})()
+            risk_action_value = str(entry_execution.get("risk_action") or "approve")
+            buy_pending_transition = type("_Transition", (), {"current_state": "BUY_PENDING"})()
+        else:
+            buy_pending_transition = await transition_commissioned_campaign_state(
                 db=db,
                 campaign_id=request.campaign_id,
                 version=request.version,
                 request=CommissionedCampaignTransitionRequest(
-                    target_state="VETOED",
+                    target_state="BUY_PENDING",
                     actor=request.actor,
-                    reason="risk_engine_veto",
-                    idempotency_key=f"{request.idempotency_key}:vetoed",
-                    expected_current_state="BUY_PENDING",
+                    reason="commissioned_entry_pre_submission",
+                    idempotency_key=f"{request.idempotency_key}:buy_pending",
+                    expected_current_state="COMMISSIONED",
                 ),
             )
-            return CommissionedEntryExecutionResponse(
-                campaign_id=request.campaign_id,
-                version=request.version,
-                previous_state=buy_pending_transition.current_state,
-                current_state="VETOED",
-                replayed=False,
-                vetoed=True,
-                risk_event_id=persisted_risk.risk_event_id,
-                risk_action=risk_result.action.value,
-                decision_record_id=None,
-                live_crypto_order_id=None,
-                provider_order_id=None,
-                provider_submission_classification="vetoed",
-                commissioning_identity=commissioning_identity,
+
+            risk_result = evaluate_signal_risk(
+                request=_build_risk_request(request),
+                reference_price=request.reference_price,
+                context=RiskEvaluationContext(
+                    global_kill_switch_engaged=False,
+                    account_trading_paused=False,
+                    asset_in_no_trade_zone=False,
+                    pair_in_cooldown=False,
+                    would_breach_daily_loss=False,
+                    would_breach_drawdown=False,
+                    has_computable_stop_loss=True,
+                    bypass_sizing_rule=False,
+                ),
+            )
+            persisted_risk = await persist_risk_decision(
+                db=db,
+                request=RiskDecisionPersistenceRequest(
+                    paper_account_id=request.paper_account_id,
+                    signal_id=request.risk_signal_id,
+                    actor=request.actor,
+                    evaluation_result=risk_result,
+                ),
+            )
+            if risk_result.action == RiskDecisionAction.REJECT:
+                await transition_commissioned_campaign_state(
+                    db=db,
+                    campaign_id=request.campaign_id,
+                    version=request.version,
+                    request=CommissionedCampaignTransitionRequest(
+                        target_state="VETOED",
+                        actor=request.actor,
+                        reason="risk_engine_veto",
+                        idempotency_key=f"{request.idempotency_key}:vetoed",
+                        expected_current_state="BUY_PENDING",
+                    ),
+                )
+                return CommissionedEntryExecutionResponse(
+                    campaign_id=request.campaign_id,
+                    version=request.version,
+                    previous_state=buy_pending_transition.current_state,
+                    current_state="VETOED",
+                    replayed=False,
+                    vetoed=True,
+                    risk_event_id=persisted_risk.risk_event_id,
+                    risk_action=risk_result.action.value,
+                    decision_record_id=None,
+                    live_crypto_order_id=None,
+                    provider_order_id=None,
+                    provider_submission_classification="vetoed",
+                    commissioning_identity=commissioning_identity,
+                    economic_idempotency_key=economic_idempotency_key,
+                    authority_classification=_AUTHORITY_CLASSIFICATION,
+                    strategy_signal_classification=_STRATEGY_CLASSIFICATION,
+                    no_position_ownership_created=True,
+                    blockers=["risk_engine_veto"],
+                )
+
+            decision_record_id = await _create_commissioned_decision_record(
+                db=db,
+                request=request,
                 economic_idempotency_key=economic_idempotency_key,
-                authority_classification=_AUTHORITY_CLASSIFICATION,
-                strategy_signal_classification=_STRATEGY_CLASSIFICATION,
-                no_position_ownership_created=True,
-                blockers=["risk_engine_veto"],
+                risk_action=risk_result.action.value,
+                risk_event_id=persisted_risk.risk_event_id,
             )
 
-        decision_record_id = await _create_commissioned_decision_record(
-            db=db,
-            request=request,
-            economic_idempotency_key=economic_idempotency_key,
-            risk_action=risk_result.action.value,
-            risk_event_id=persisted_risk.risk_event_id,
-        )
-
-        definition_after_pending, _runtime_after_pending = await _load_definition_and_runtime_for_update(
-            db=db,
-            campaign_id=request.campaign_id,
-            version=request.version,
-        )
-        blob_after_pending = _read_commissioned_blob(definition=definition_after_pending)
-        blob_after_pending["entry_execution"] = {
-            "economic_idempotency_key": economic_idempotency_key,
-            "risk_event_id": str(persisted_risk.risk_event_id),
-            "risk_action": risk_result.action.value,
-            "decision_record_id": str(decision_record_id),
-            "pre_submission_recorded_at": _utcnow().isoformat(),
-            "live_crypto_order_id": str(request.live_crypto_order_id),
-            "terminal": False,
-            "authority_classification": _AUTHORITY_CLASSIFICATION,
-            "strategy_signal_classification": _STRATEGY_CLASSIFICATION,
-        }
-        _write_commissioned_blob(definition=definition_after_pending, blob=blob_after_pending)
-        await _persist_entry_audit(
-            db=db,
-            actor=request.actor,
-            campaign_id=request.campaign_id,
-            action="commissioned_seed_campaign.entry_pre_submission",
-            before_state={"state": "BUY_PENDING"},
-            after_state={
+            definition_after_pending, _runtime_after_pending = await _load_definition_and_runtime_for_update(
+                db=db,
+                campaign_id=request.campaign_id,
+                version=request.version,
+            )
+            blob_after_pending = _read_commissioned_blob(definition=definition_after_pending)
+            blob_after_pending["entry_execution"] = {
                 "economic_idempotency_key": economic_idempotency_key,
+                "risk_event_id": str(persisted_risk.risk_event_id),
+                "risk_action": risk_result.action.value,
                 "decision_record_id": str(decision_record_id),
-            },
-        )
-        await db.flush()
-        await db.commit()
+                "pre_submission_recorded_at": _utcnow().isoformat(),
+                "live_crypto_order_id": str(request.live_crypto_order_id),
+                "terminal": False,
+                "authority_classification": _AUTHORITY_CLASSIFICATION,
+                "strategy_signal_classification": _STRATEGY_CLASSIFICATION,
+            }
+            _write_commissioned_blob(definition=definition_after_pending, blob=blob_after_pending)
+            await _persist_entry_audit(
+                db=db,
+                actor=request.actor,
+                campaign_id=request.campaign_id,
+                action="commissioned_seed_campaign.entry_pre_submission",
+                before_state={"state": "BUY_PENDING"},
+                after_state={
+                    "economic_idempotency_key": economic_idempotency_key,
+                    "decision_record_id": str(decision_record_id),
+                },
+            )
+            await db.flush()
+            await db.commit()
+            risk_action_value = risk_result.action.value
 
         live_service = LiveCryptoOrderService()
         submit_response = None
@@ -1003,7 +1032,7 @@ async def execute_commissioned_entry(
             {
                 "economic_idempotency_key": economic_idempotency_key,
                 "risk_event_id": str(persisted_risk.risk_event_id),
-                "risk_action": risk_result.action.value,
+                "risk_action": risk_action_value,
                 "decision_record_id": str(decision_record_id),
                 "live_crypto_order_id": str(request.live_crypto_order_id),
                 "provider_order_id": provider_order_id,
@@ -1043,7 +1072,7 @@ async def execute_commissioned_entry(
             replayed=False,
             vetoed=False,
             risk_event_id=persisted_risk.risk_event_id,
-            risk_action=risk_result.action.value,
+            risk_action=risk_action_value,
             decision_record_id=decision_record_id,
             live_crypto_order_id=request.live_crypto_order_id,
             provider_order_id=provider_order_id,

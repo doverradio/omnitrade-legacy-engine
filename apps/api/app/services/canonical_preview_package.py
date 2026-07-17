@@ -1131,6 +1131,8 @@ async def authorize_canonical_preview_package(
         "canonical_preview_package_id": str(package.package_id),
         "campaign_id": str(package.campaign_id),
         "campaign_version": str(package.campaign_version),
+        "capital_campaign_id": str(package.runtime_campaign_id),
+        "capital_campaign_version": str(package.campaign_version),
         "paper_account_id": str(package.paper_account_id),
         "live_trading_profile_id": str(package.live_trading_profile_id),
         "provider": package.provider,

@@ -1442,6 +1442,56 @@ def test_parse_canonical_package_authorize_dry_run_and_activate() -> None:
     assert activate_args.command == "canonical-proving-activate"
     assert activate_args.confirm is True
 
+    commission_args = parse_args([
+        "canonical-proving-commission",
+        "--campaign-id",
+        "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa",
+        "--campaign-version",
+        "1",
+        "--paper-account-id",
+        "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb",
+        "--live-trading-profile-id",
+        "cccccccc-cccc-cccc-cccc-cccccccccccc",
+        "--provider",
+        "kraken_spot",
+        "--environment",
+        "production",
+        "--product",
+        "BTC-USD",
+        "--rationale",
+        "bounded proving",
+        "--idempotency-key",
+        "commission-1",
+        "--no-leverage",
+        "--confirm",
+        "--json",
+    ])
+    assert commission_args.command == "canonical-proving-commission"
+    assert commission_args.confirm is True
+    assert commission_args.no_leverage is True
+    assert commission_args.json_output is True
+
+    status_args = parse_args([
+        "canonical-proving-commission-status",
+        "--campaign-id",
+        "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa",
+        "--campaign-version",
+        "1",
+        "--paper-account-id",
+        "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb",
+        "--live-trading-profile-id",
+        "cccccccc-cccc-cccc-cccc-cccccccccccc",
+        "--provider",
+        "kraken_spot",
+        "--environment",
+        "production",
+        "--product",
+        "BTC-USD",
+        "--json",
+    ])
+    assert status_args.command == "canonical-proving-commission-status"
+    assert status_args.json_output is True
+
 
 def test_parse_canonical_proving_pause_and_revoke() -> None:
     pause_args = parse_args([
@@ -1467,6 +1517,80 @@ def test_parse_canonical_proving_pause_and_revoke() -> None:
     ])
     assert revoke_args.command == "canonical-proving-revoke"
     assert revoke_args.reason == "authority revoked"
+
+
+@pytest.mark.asyncio
+async def test_run_canonical_proving_commission_command_uses_shared_service(monkeypatch: pytest.MonkeyPatch) -> None:
+    expected_payload = {"current_state": "ACTIVE_POSITION", "autonomous_lifecycle_owner": True}
+
+    async def _stub(**_kwargs):
+        return expected_payload
+
+    monkeypatch.setattr(operator_main, "canonical_proving_commission_bundle", _stub)
+
+    args = parse_args([
+        "canonical-proving-commission",
+        "--campaign-id",
+        "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa",
+        "--campaign-version",
+        "1",
+        "--paper-account-id",
+        "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb",
+        "--live-trading-profile-id",
+        "cccccccc-cccc-cccc-cccc-cccccccccccc",
+        "--provider",
+        "kraken_spot",
+        "--environment",
+        "production",
+        "--product",
+        "BTC-USD",
+        "--rationale",
+        "bounded proving",
+        "--idempotency-key",
+        "commission-1",
+        "--no-leverage",
+        "--confirm",
+        "--json",
+    ])
+    code, payload, rendered = await operator_main._run_async(args)
+
+    assert code == 0
+    assert payload == expected_payload
+    assert '"current_state": "ACTIVE_POSITION"' in rendered
+
+
+@pytest.mark.asyncio
+async def test_run_canonical_proving_commission_status_command_uses_shared_service(monkeypatch: pytest.MonkeyPatch) -> None:
+    expected_payload = {"read_only": True, "no_execution": True, "commissioning_status": {"state": "ACTIVE_POSITION"}}
+
+    async def _stub(**_kwargs):
+        return expected_payload
+
+    monkeypatch.setattr(operator_main, "canonical_proving_commission_status", _stub)
+
+    args = parse_args([
+        "canonical-proving-commission-status",
+        "--campaign-id",
+        "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa",
+        "--campaign-version",
+        "1",
+        "--paper-account-id",
+        "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb",
+        "--live-trading-profile-id",
+        "cccccccc-cccc-cccc-cccc-cccccccccccc",
+        "--provider",
+        "kraken_spot",
+        "--environment",
+        "production",
+        "--product",
+        "BTC-USD",
+        "--json",
+    ])
+    code, payload, rendered = await operator_main._run_async(args)
+
+    assert code == 0
+    assert payload == expected_payload
+    assert '"no_execution": true' in rendered
 
 
 def test_parse_legacy_campaign_transition_commands() -> None:

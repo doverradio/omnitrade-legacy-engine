@@ -550,6 +550,60 @@ async def test_repeated_execute_replays_without_second_submission(monkeypatch: p
 
 
 @pytest.mark.asyncio
+async def test_execute_resumes_from_buy_pending_without_second_pre_submission(monkeypatch: pytest.MonkeyPatch) -> None:
+    campaign_id = uuid4()
+    readiness_request = _readiness_request(campaign_id, 1)
+    live_crypto_order_id = uuid4()
+    definition = _definition(campaign_id, 1, state="BUY_PENDING")
+    definition.metadata_evidence["commissioned_seed_campaign"]["commissioning"] = {
+        "commissioning_identity": "commissioning-1",
+        "preview_identity_hash": "preview-hash-1",
+        "commissioned_until": (_now() + timedelta(minutes=10)).isoformat(),
+    }
+    definition.metadata_evidence["commissioned_seed_campaign"]["entry_execution"] = {
+        "economic_idempotency_key": cee._build_economic_idempotency_key(
+            request=_execution_request(campaign_id, 1, readiness_request),
+            commissioning_identity="commissioning-1",
+        ),
+        "risk_event_id": str(uuid4()),
+        "risk_action": "approve",
+        "decision_record_id": str(uuid4()),
+        "live_crypto_order_id": str(live_crypto_order_id),
+        "terminal": False,
+    }
+    runtime = _runtime(campaign_id, 1)
+    transitions = _TransitionRecorder(definition)
+    submit_calls = {"count": 0}
+
+    monkeypatch.setattr(cee, "assess_commissioned_campaign_readiness", lambda **_kwargs: (_ for _ in ()).throw(AssertionError("readiness must not rerun on BUY_PENDING resume")))
+    monkeypatch.setattr(cee, "generate_commissioned_campaign_preview", lambda **_kwargs: (_ for _ in ()).throw(AssertionError("preview must not rerun on BUY_PENDING resume")))
+    monkeypatch.setattr(cee, "_load_definition_and_runtime_for_update", lambda **_kwargs: asyncio.sleep(0, result=(definition, runtime)))
+    monkeypatch.setattr(cee, "transition_commissioned_campaign_state", transitions)
+
+    async def _submit(self, *, db, request):
+        _ = (db, request)
+        submit_calls["count"] += 1
+        return SimpleNamespace(
+            live_crypto_order=SimpleNamespace(status="ACKNOWLEDGED", provider_order_id="provider-1"),
+            provider_create_order_responded=True,
+            provider_reconciliation_status="PENDING",
+            safe_provider_response={},
+            order_submitted=True,
+        )
+
+    monkeypatch.setattr(cee.LiveCryptoOrderService, "submit", _submit)
+
+    request = _execution_request(campaign_id, 1, readiness_request)
+    request = request.model_copy(update={"live_crypto_order_id": live_crypto_order_id})
+    response = await cee.execute_commissioned_entry(db=_FakeDb(), request=request)
+
+    assert response.current_state == "BUY_RECONCILIATION_PENDING"
+    assert response.risk_action == "approve"
+    assert submit_calls["count"] == 1
+    assert "BUY_SUBMITTED" in transitions.calls
+
+
+@pytest.mark.asyncio
 async def test_concurrent_execute_attempts_submit_once(monkeypatch: pytest.MonkeyPatch) -> None:
     campaign_id = uuid4()
     readiness_request = _readiness_request(campaign_id, 1)

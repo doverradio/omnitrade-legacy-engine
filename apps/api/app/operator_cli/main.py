@@ -37,6 +37,8 @@ from app.operator_cli.service import (
     canonical_proving_cap_transition_preview,
     canonical_preview_package_history,
     canonical_preview_package_readiness,
+    canonical_proving_commission_bundle,
+    canonical_proving_commission_status,
     canonical_proving_activation_status,
     canonical_campaign_status_transition_audit,
     canonical_campaign_status_transition_execute,
@@ -735,6 +737,43 @@ def _build_parser() -> argparse.ArgumentParser:
     proving_status.add_argument("--package-id", type=UUID, required=True)
     proving_status.add_argument("--json", action="store_true", dest="json_output")
 
+    proving_commission = subparsers.add_parser(
+        "canonical-proving-commission",
+        parents=[common],
+        help="Complete governed commissioned proving from canonical package chain to ACTIVE_POSITION",
+        description="Creates or refreshes canonical proving evidence if needed, then commissions, submits one bounded BUY, reconciles ownership, and hands off to autonomous lifecycle management.",
+    )
+    proving_commission.add_argument("--campaign-id", type=UUID, required=True)
+    proving_commission.add_argument("--campaign-version", type=int, required=True)
+    proving_commission.add_argument("--paper-account-id", type=UUID, required=True)
+    proving_commission.add_argument("--live-trading-profile-id", type=UUID, required=True)
+    proving_commission.add_argument("--provider", type=str, required=True)
+    proving_commission.add_argument("--environment", type=str, required=True)
+    proving_commission.add_argument("--product", type=str, required=True)
+    proving_commission.add_argument("--amount-usd", type=Decimal, default=Decimal("5"))
+    proving_commission.add_argument("--actor", type=str, default="operator:human")
+    proving_commission.add_argument("--approver-role", type=str, default="operator")
+    proving_commission.add_argument("--rationale", type=str, required=True)
+    proving_commission.add_argument("--no-leverage", action="store_true")
+    proving_commission.add_argument("--confirm", action="store_true")
+    proving_commission.add_argument("--idempotency-key", type=str, required=True)
+    proving_commission.add_argument("--json", action="store_true", dest="json_output")
+
+    proving_commission_status = subparsers.add_parser(
+        "canonical-proving-commission-status",
+        parents=[common],
+        help="Show read-only commissioned proving chain status",
+        description="Inspects canonical package, proving activation, commissioned state, live order, and autonomous lifecycle handoff status without executing anything.",
+    )
+    proving_commission_status.add_argument("--campaign-id", type=UUID, required=True)
+    proving_commission_status.add_argument("--campaign-version", type=int, required=True)
+    proving_commission_status.add_argument("--paper-account-id", type=UUID, required=True)
+    proving_commission_status.add_argument("--live-trading-profile-id", type=UUID, required=True)
+    proving_commission_status.add_argument("--provider", type=str, required=True)
+    proving_commission_status.add_argument("--environment", type=str, required=True)
+    proving_commission_status.add_argument("--product", type=str, required=True)
+    proving_commission_status.add_argument("--json", action="store_true", dest="json_output")
+
     proving_pause = subparsers.add_parser(
         "canonical-proving-pause",
         parents=[common],
@@ -964,6 +1003,38 @@ async def _run_async(args: argparse.Namespace) -> tuple[int, dict[str, Any], str
 
     if args.command == "canonical-proving-activation-status":
         payload = await canonical_proving_activation_status(package_id=args.package_id)
+        return 0, payload, render_json(payload)
+
+    if args.command == "canonical-proving-commission":
+        payload = await canonical_proving_commission_bundle(
+            campaign_id=args.campaign_id,
+            campaign_version=args.campaign_version,
+            paper_account_id=args.paper_account_id,
+            live_trading_profile_id=args.live_trading_profile_id,
+            provider=args.provider,
+            environment=args.environment,
+            product=args.product,
+            amount_usd=args.amount_usd,
+            actor=args.actor,
+            approver_role=args.approver_role,
+            rationale=args.rationale,
+            no_leverage=bool(args.no_leverage),
+            confirm=bool(args.confirm),
+            idempotency_key=args.idempotency_key,
+        )
+        current_state = str(payload.get("current_state") or "")
+        return (0 if current_state == "ACTIVE_POSITION" else 1), payload, render_json(payload)
+
+    if args.command == "canonical-proving-commission-status":
+        payload = await canonical_proving_commission_status(
+            campaign_id=args.campaign_id,
+            campaign_version=args.campaign_version,
+            paper_account_id=args.paper_account_id,
+            live_trading_profile_id=args.live_trading_profile_id,
+            provider=args.provider,
+            environment=args.environment,
+            product=args.product,
+        )
         return 0, payload, render_json(payload)
 
     if args.command == "canonical-proving-pause":
