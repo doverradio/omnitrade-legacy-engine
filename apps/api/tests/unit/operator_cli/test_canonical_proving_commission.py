@@ -141,6 +141,8 @@ class _State:
         self.profile = SimpleNamespace(id=self.profile_id, paper_account_id=self.paper_account_id)
         self.connection = SimpleNamespace(
             exchange_connection_id=self.preview.exchange_connection_id,
+            provider="kraken_spot",
+            environment="production",
             credentials_valid=True,
             status="connected",
             last_verified_at=now,
@@ -148,8 +150,23 @@ class _State:
             last_heartbeat_at=now,
             balances=[{"currency": "USD", "available": "25"}],
         )
-        self.mandate = SimpleNamespace(mandate_id=uuid4())
-        self.mandate_version = SimpleNamespace(mandate_version_id=uuid4(), version_number=7, entry_policy={})
+        self.mandate = SimpleNamespace(
+            mandate_id=uuid4(),
+            status="ACTIVE",
+            provider="kraken_spot",
+            exchange_environment="production",
+            live_trading_profile_id=self.profile_id,
+            paper_account_id=self.paper_account_id,
+            capital_campaign_id=self.runtime_id,
+        )
+        self.mandate_version = SimpleNamespace(
+            mandate_version_id=uuid4(),
+            mandate_id=self.mandate.mandate_id,
+            version_number=7,
+            is_authorized=True,
+            is_active=True,
+            entry_policy={},
+        )
         self.asset = SimpleNamespace(id=uuid4(), min_order_notional=Decimal("5"), qty_step_size=Decimal("0.00000001"), supports_fractional=True)
         self.live_order = None
         self.create_calls = 0
@@ -542,6 +559,251 @@ async def test_canonical_proving_commission_propagates_execution_blockers(monkey
             confirm=True,
             idempotency_key="root-6",
         )
+
+
+@pytest.mark.asyncio
+async def test_canonical_proving_commission_blocks_when_mandate_missing_with_precise_reason(monkeypatch: pytest.MonkeyPatch) -> None:
+    state = _State()
+    _install_common_monkeypatches(monkeypatch, state)
+
+    async def _missing_mandate(**_kwargs):
+        return None
+
+    async def _diagnose(**_kwargs):
+        return "mandate missing"
+
+    monkeypatch.setattr(service, "_load_active_mandate_for_commissioning", _missing_mandate)
+    monkeypatch.setattr(service, "_diagnose_mandate_resolution_failure", _diagnose)
+
+    with pytest.raises(PermissionError, match="mandate missing"):
+        await service.canonical_proving_commission_bundle(
+            campaign_id=state.campaign_id,
+            campaign_version=1,
+            paper_account_id=state.paper_account_id,
+            live_trading_profile_id=state.profile_id,
+            provider="kraken_spot",
+            environment="production",
+            product="BTC-USD",
+            amount_usd=Decimal("5"),
+            actor="operator:human",
+            approver_role="operator",
+            rationale="bounded proving",
+            no_leverage=True,
+            confirm=True,
+            idempotency_key="root-mandate-missing",
+        )
+
+    assert state.execute_calls == 0
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "mandate_version,expected_error",
+    [
+        (None, "mandate version missing"),
+        (SimpleNamespace(mandate_id=uuid4(), is_authorized=True, is_active=True, mandate_version_id=uuid4(), version_number=7, entry_policy={}), "mandate identity mismatch"),
+        (SimpleNamespace(is_authorized=False, is_active=True, mandate_version_id=uuid4(), version_number=7, entry_policy={}), "mandate not authorized or inactive"),
+        (SimpleNamespace(is_authorized=True, is_active=False, mandate_version_id=uuid4(), version_number=7, entry_policy={}), "mandate not authorized or inactive"),
+    ],
+)
+async def test_canonical_proving_commission_blocks_for_mandate_version_errors(
+    monkeypatch: pytest.MonkeyPatch,
+    mandate_version: object,
+    expected_error: str,
+) -> None:
+    state = _State()
+    _install_common_monkeypatches(monkeypatch, state)
+
+    async def _version(**_kwargs):
+        if mandate_version is None:
+            return None
+        version = mandate_version
+        if getattr(version, "mandate_id", None) is None:
+            setattr(version, "mandate_id", state.mandate.mandate_id)
+        return version
+
+    monkeypatch.setattr(service, "_load_authorized_mandate_version", _version)
+
+    with pytest.raises(PermissionError, match=expected_error):
+        await service.canonical_proving_commission_bundle(
+            campaign_id=state.campaign_id,
+            campaign_version=1,
+            paper_account_id=state.paper_account_id,
+            live_trading_profile_id=state.profile_id,
+            provider="kraken_spot",
+            environment="production",
+            product="BTC-USD",
+            amount_usd=Decimal("5"),
+            actor="operator:human",
+            approver_role="operator",
+            rationale="bounded proving",
+            no_leverage=True,
+            confirm=True,
+            idempotency_key="root-mandate-version",
+        )
+
+    assert state.execute_calls == 0
+
+
+@pytest.mark.asyncio
+async def test_canonical_proving_commission_blocks_when_exchange_connection_missing(monkeypatch: pytest.MonkeyPatch) -> None:
+    state = _State()
+    _install_common_monkeypatches(monkeypatch, state)
+
+    async def _missing_connection(**_kwargs):
+        return None, "exchange connection missing"
+
+    monkeypatch.setattr(service, "_resolve_exchange_connection_for_commissioning", _missing_connection)
+
+    with pytest.raises(PermissionError, match="exchange connection missing"):
+        await service.canonical_proving_commission_bundle(
+            campaign_id=state.campaign_id,
+            campaign_version=1,
+            paper_account_id=state.paper_account_id,
+            live_trading_profile_id=state.profile_id,
+            provider="kraken_spot",
+            environment="production",
+            product="BTC-USD",
+            amount_usd=Decimal("5"),
+            actor="operator:human",
+            approver_role="operator",
+            rationale="bounded proving",
+            no_leverage=True,
+            confirm=True,
+            idempotency_key="root-connection-missing",
+        )
+
+    assert state.execute_calls == 0
+
+
+@pytest.mark.asyncio
+async def test_canonical_proving_commission_blocks_provider_environment_mismatch(monkeypatch: pytest.MonkeyPatch) -> None:
+    state = _State()
+    _install_common_monkeypatches(monkeypatch, state)
+
+    async def _mismatch_connection(**_kwargs):
+        return None, "provider/environment mismatch"
+
+    monkeypatch.setattr(service, "_resolve_exchange_connection_for_commissioning", _mismatch_connection)
+
+    with pytest.raises(PermissionError, match="provider/environment mismatch"):
+        await service.canonical_proving_commission_bundle(
+            campaign_id=state.campaign_id,
+            campaign_version=1,
+            paper_account_id=state.paper_account_id,
+            live_trading_profile_id=state.profile_id,
+            provider="kraken_spot",
+            environment="production",
+            product="BTC-USD",
+            amount_usd=Decimal("5"),
+            actor="operator:human",
+            approver_role="operator",
+            rationale="bounded proving",
+            no_leverage=True,
+            confirm=True,
+            idempotency_key="root-provider-env-mismatch",
+        )
+
+    assert state.execute_calls == 0
+
+
+@pytest.mark.asyncio
+async def test_canonical_proving_commission_blocks_campaign_profile_account_mismatch(monkeypatch: pytest.MonkeyPatch) -> None:
+    state = _State()
+    state.profile.paper_account_id = uuid4()
+    _install_common_monkeypatches(monkeypatch, state)
+
+    with pytest.raises(PermissionError, match="campaign/profile/account mismatch"):
+        await service.canonical_proving_commission_bundle(
+            campaign_id=state.campaign_id,
+            campaign_version=1,
+            paper_account_id=state.paper_account_id,
+            live_trading_profile_id=state.profile_id,
+            provider="kraken_spot",
+            environment="production",
+            product="BTC-USD",
+            amount_usd=Decimal("5"),
+            actor="operator:human",
+            approver_role="operator",
+            rationale="bounded proving",
+            no_leverage=True,
+            confirm=True,
+            idempotency_key="root-account-mismatch",
+        )
+
+    assert state.execute_calls == 0
+
+
+@pytest.mark.asyncio
+async def test_canonical_proving_commission_resolves_valid_mandate_and_connection_and_reaches_next_stage_without_submission(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    state = _State()
+    _install_common_monkeypatches(monkeypatch, state)
+
+    readiness_calls = 0
+
+    async def _preview_stage(**_kwargs):
+        nonlocal readiness_calls
+        readiness_calls += 1
+        raise PermissionError("test-stop-after-readiness")
+
+    monkeypatch.setattr(service, "generate_commissioned_campaign_preview", _preview_stage)
+
+    with pytest.raises(PermissionError, match="test-stop-after-readiness"):
+        await service.canonical_proving_commission_bundle(
+            campaign_id=state.campaign_id,
+            campaign_version=1,
+            paper_account_id=state.paper_account_id,
+            live_trading_profile_id=state.profile_id,
+            provider="kraken_spot",
+            environment="production",
+            product="BTC-USD",
+            amount_usd=Decimal("5"),
+            actor="operator:human",
+            approver_role="operator",
+            rationale="bounded proving",
+            no_leverage=True,
+            confirm=True,
+            idempotency_key="root-evidence-valid",
+        )
+
+    assert readiness_calls == 1
+    assert state.execute_calls == 0
+
+
+@pytest.mark.asyncio
+async def test_canonical_proving_commission_same_root_idempotency_key_retries_without_submission_on_missing_evidence(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    state = _State()
+    _install_common_monkeypatches(monkeypatch, state)
+
+    async def _missing_connection(**_kwargs):
+        return None, "exchange connection missing"
+
+    monkeypatch.setattr(service, "_resolve_exchange_connection_for_commissioning", _missing_connection)
+
+    for _ in range(2):
+        with pytest.raises(PermissionError, match="exchange connection missing"):
+            await service.canonical_proving_commission_bundle(
+                campaign_id=state.campaign_id,
+                campaign_version=1,
+                paper_account_id=state.paper_account_id,
+                live_trading_profile_id=state.profile_id,
+                provider="kraken_spot",
+                environment="production",
+                product="BTC-USD",
+                amount_usd=Decimal("5"),
+                actor="operator:human",
+                approver_role="operator",
+                rationale="bounded proving",
+                no_leverage=True,
+                confirm=True,
+                idempotency_key="same-root-idempotency",
+            )
+
+    assert state.execute_calls == 0
 
 
 class _StatusEnum(Enum):

@@ -418,13 +418,15 @@ async def _load_active_mandate_for_commissioning(
     provider: str,
     environment: str,
 ) -> AutonomousCapitalMandate | None:
+    normalized_provider = provider.strip().lower()
+    normalized_environment = environment.strip().lower()
     rows = list(
         (
             await db.execute(
                 select(AutonomousCapitalMandate)
                 .where(AutonomousCapitalMandate.live_trading_profile_id == live_trading_profile_id)
-                .where(AutonomousCapitalMandate.provider == provider)
-                .where(AutonomousCapitalMandate.exchange_environment == environment)
+                .where(func.lower(AutonomousCapitalMandate.provider) == normalized_provider)
+                .where(func.lower(AutonomousCapitalMandate.exchange_environment) == normalized_environment)
                 .order_by(AutonomousCapitalMandate.activated_at.desc(), AutonomousCapitalMandate.authorized_at.desc(), AutonomousCapitalMandate.created_at.desc())
             )
         ).scalars().all()
@@ -438,6 +440,90 @@ async def _load_active_mandate_for_commissioning(
             continue
         return mandate
     return None
+
+
+async def _diagnose_mandate_resolution_failure(
+    *,
+    db,
+    runtime_campaign_id: int,
+    live_trading_profile_id: UUID,
+    paper_account_id: UUID,
+    provider: str,
+    environment: str,
+) -> str:
+    profile_rows = list(
+        (
+            await db.execute(
+                select(AutonomousCapitalMandate)
+                .where(AutonomousCapitalMandate.live_trading_profile_id == live_trading_profile_id)
+                .order_by(AutonomousCapitalMandate.activated_at.desc(), AutonomousCapitalMandate.authorized_at.desc(), AutonomousCapitalMandate.created_at.desc())
+            )
+        ).scalars().all()
+    )
+    if not profile_rows:
+        return "mandate missing"
+
+    normalized_provider = provider.strip().lower()
+    normalized_environment = environment.strip().lower()
+    scoped_rows = [
+        row
+        for row in profile_rows
+        if str(getattr(row, "provider", "")).strip().lower() == normalized_provider
+        and str(getattr(row, "exchange_environment", "")).strip().lower() == normalized_environment
+    ]
+    if not scoped_rows:
+        return "provider/environment mismatch"
+
+    active_rows = [row for row in scoped_rows if str(getattr(row, "status", "")).strip().upper() in {"ACTIVE", "AUTHORIZED"}]
+    if not active_rows:
+        return "mandate not authorized or inactive"
+
+    identity_rows = [
+        row
+        for row in active_rows
+        if getattr(row, "capital_campaign_id", None) in {None, runtime_campaign_id}
+        and getattr(row, "paper_account_id", None) in {None, paper_account_id}
+    ]
+    if not identity_rows:
+        return "campaign/profile/account mismatch"
+
+    return "mandate missing"
+
+
+async def _resolve_exchange_connection_for_commissioning(
+    *,
+    db,
+    preview_exchange_connection_id: UUID,
+    provider: str,
+    environment: str,
+) -> tuple[ExchangeConnection | None, str | None]:
+    normalized_provider = provider.strip().lower()
+    normalized_environment = environment.strip().lower()
+
+    by_preview = await _load_exchange_connection_by_id(db=db, exchange_connection_id=preview_exchange_connection_id)
+    if by_preview is not None:
+        matches_provider = str(getattr(by_preview, "provider", "")).strip().lower() == normalized_provider
+        matches_environment = str(getattr(by_preview, "environment", "")).strip().lower() == normalized_environment
+        if not (matches_provider and matches_environment):
+            return None, "provider/environment mismatch"
+        return by_preview, None
+
+    scoped = list(
+        (
+            await db.execute(
+                select(ExchangeConnection)
+                .where(func.lower(ExchangeConnection.provider) == normalized_provider)
+                .where(func.lower(ExchangeConnection.environment) == normalized_environment)
+                .order_by(ExchangeConnection.created_at.desc(), ExchangeConnection.exchange_connection_id.desc())
+                .limit(2)
+            )
+        ).scalars().all()
+    )
+    if not scoped:
+        return None, "exchange connection missing"
+    if len(scoped) > 1:
+        return None, "exchange connection identity mismatch"
+    return scoped[0], None
 
 
 async def _load_authorized_mandate_version(*, db, mandate_id: UUID) -> AutonomousCapitalMandateVersion | None:
@@ -5324,6 +5410,8 @@ async def canonical_proving_commission_bundle(
             raise LookupError("commissioned proving identity chain incomplete")
         if runtime.id is None:
             raise LookupError("runtime capital campaign id unavailable")
+        if getattr(profile, "paper_account_id", None) != paper_account_id:
+            raise PermissionError("campaign/profile/account mismatch")
 
         commissioned_blob = _commissioned_blob_from_definition(definition)
         commissioned_state = str(commissioned_blob.get("state") or "DRAFT")
@@ -5483,7 +5571,14 @@ async def canonical_proving_commission_bundle(
         if package is None or preview is None or approval_event is None:
             raise PermissionError("canonical proving chain is incomplete")
 
-        connection = await _load_exchange_connection_by_id(db=db, exchange_connection_id=preview.exchange_connection_id)
+        connection, connection_error = await _resolve_exchange_connection_for_commissioning(
+            db=db,
+            preview_exchange_connection_id=preview.exchange_connection_id,
+            provider=provider,
+            environment=environment,
+        )
+        if connection is None:
+            raise PermissionError(connection_error or "exchange connection missing")
         mandate = await _load_active_mandate_for_commissioning(
             db=db,
             runtime_campaign_id=runtime.id,
@@ -5492,12 +5587,34 @@ async def canonical_proving_commission_bundle(
             provider=provider,
             environment=environment,
         )
-        if connection is None or mandate is None:
-            raise PermissionError("commissioned proving mandate or exchange connection evidence missing")
+        if mandate is None:
+            mandate_error = await _diagnose_mandate_resolution_failure(
+                db=db,
+                runtime_campaign_id=runtime.id,
+                live_trading_profile_id=live_trading_profile_id,
+                paper_account_id=paper_account_id,
+                provider=provider,
+                environment=environment,
+            )
+            raise PermissionError(mandate_error)
+        if str(getattr(mandate, "provider", "")).strip().lower() != provider.strip().lower() or str(getattr(mandate, "exchange_environment", "")).strip().lower() != environment.strip().lower():
+            raise PermissionError("provider/environment mismatch")
+        if getattr(mandate, "capital_campaign_id", None) not in {None, runtime.id} or getattr(mandate, "paper_account_id", None) not in {None, paper_account_id}:
+            raise PermissionError("campaign/profile/account mismatch")
+
         mandate_version = await _load_authorized_mandate_version(db=db, mandate_id=mandate.mandate_id)
+        if mandate_version is None:
+            raise PermissionError("mandate version missing")
+        if getattr(mandate_version, "mandate_id", None) != mandate.mandate_id:
+            raise PermissionError("mandate identity mismatch")
+        if not bool(getattr(mandate_version, "is_authorized", False)):
+            raise PermissionError("mandate not authorized or inactive")
+        if not bool(getattr(mandate_version, "is_active", False)):
+            raise PermissionError("mandate not authorized or inactive")
+
         asset = await _load_asset_for_product_symbol(db=db, product=product, provider=provider)
-        if mandate_version is None or asset is None:
-            raise PermissionError("commissioned proving asset or mandate version evidence missing")
+        if asset is None:
+            raise PermissionError("commissioned proving asset evidence missing")
 
         readiness_request = _build_commissioned_readiness_request(
             campaign_id=campaign_id,
