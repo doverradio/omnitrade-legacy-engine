@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import json
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
@@ -625,6 +626,436 @@ async def test_canonical_proving_commission_same_key_after_activation_stage_keep
     assert first["current_state"] == "ACTIVE_POSITION"
     assert second["replayed"] is True
     assert state.live_order.live_crypto_order_id == first_live_order_id
+    assert state.execute_calls == 1
+
+
+@pytest.mark.asyncio
+async def test_canonical_proving_commission_hanging_latest_approval_lookup_times_out_before_submission(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    state = _State()
+    _install_common_monkeypatches(monkeypatch, state)
+
+    async def _hang_approval(**_kwargs):
+        await asyncio.Event().wait()
+
+    monkeypatch.setattr(service, "_commission_db_timeout_seconds", lambda: 1)
+    monkeypatch.setattr(service, "_load_latest_approval_for_package", _hang_approval)
+
+    with pytest.raises(PermissionError, match="database_connection_timeout"):
+        await service.canonical_proving_commission_bundle(
+            campaign_id=state.campaign_id,
+            campaign_version=1,
+            paper_account_id=state.paper_account_id,
+            live_trading_profile_id=state.profile_id,
+            provider="kraken_spot",
+            environment="production",
+            product="BTC-USD",
+            amount_usd=Decimal("5"),
+            actor="operator:human",
+            approver_role="operator",
+            rationale="bounded proving",
+            no_leverage=True,
+            confirm=True,
+            idempotency_key="root-timeout-approval",
+        )
+
+    assert state.execute_calls == 0
+
+
+@pytest.mark.asyncio
+async def test_canonical_proving_commission_hanging_package_create_times_out_before_any_order(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Reproduces the production hang: create_canonical_preview_package() runs the full
+    campaign-orchestration/decision/risk composition pipeline and, before this fix, had no
+    bounded timeout anywhere in the call chain -- unlike the identity lookups and approval
+    lookups, which were already wrapped. A brand-new campaign with no existing package hits
+    this exact stage first, before any live order can exist, matching the observed symptom
+    of a silently-frozen process with zero live_crypto_orders rows created."""
+    state = _State()
+    _install_common_monkeypatches(monkeypatch, state)
+
+    async def _load_package_none(**_kwargs):
+        return None
+
+    async def _hang_create(**_kwargs):
+        await asyncio.Event().wait()
+
+    monkeypatch.setattr(service, "_commission_db_timeout_seconds", lambda: 1)
+    monkeypatch.setattr(service, "_load_latest_forced_canonical_package", _load_package_none)
+    monkeypatch.setattr(service, "create_canonical_preview_package", _hang_create)
+
+    with pytest.raises(PermissionError, match="database_connection_timeout"):
+        await service.canonical_proving_commission_bundle(
+            campaign_id=state.campaign_id,
+            campaign_version=1,
+            paper_account_id=state.paper_account_id,
+            live_trading_profile_id=state.profile_id,
+            provider="kraken_spot",
+            environment="production",
+            product="BTC-USD",
+            amount_usd=Decimal("5"),
+            actor="operator:human",
+            approver_role="operator",
+            rationale="bounded proving",
+            no_leverage=True,
+            confirm=True,
+            idempotency_key="root-timeout-package-create",
+        )
+
+    assert state.create_calls == 0
+    assert state.execute_calls == 0
+
+
+@pytest.mark.asyncio
+async def test_canonical_proving_commission_emits_stderr_progress_without_touching_stdout(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Proves the observability requirement: the command must never again produce zero output
+    for its entire runtime. Progress must land on stderr, and must never appear on stdout,
+    since --json callers require byte-for-byte valid JSON on stdout."""
+    state = _State()
+    _install_common_monkeypatches(monkeypatch, state)
+
+    payload = await service.canonical_proving_commission_bundle(
+        campaign_id=state.campaign_id,
+        campaign_version=1,
+        paper_account_id=state.paper_account_id,
+        live_trading_profile_id=state.profile_id,
+        provider="kraken_spot",
+        environment="production",
+        product="BTC-USD",
+        amount_usd=Decimal("5"),
+        actor="operator:human",
+        approver_role="operator",
+        rationale="bounded proving",
+        no_leverage=True,
+        confirm=True,
+        idempotency_key="root-progress-1",
+    )
+
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert "[canonical-proving-commission]" in captured.err
+    assert "stage=db_session_acquired" in captured.err
+    assert "stage=provider_submission_boundary" in captured.err
+    assert "stage=finalizing_commission_result" in captured.err
+    # The bundle's own return value must still be valid, unpolluted JSON-serializable data.
+    json.dumps(payload)
+    assert payload["current_state"] == "ACTIVE_POSITION"
+
+
+@pytest.mark.asyncio
+async def test_canonical_proving_commission_hanging_campaign_lookup_times_out_deterministically(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    state = _State()
+    _install_common_monkeypatches(monkeypatch, state)
+
+    async def _hang_definition(**_kwargs):
+        await asyncio.Event().wait()
+
+    monkeypatch.setattr(service, "_commission_db_timeout_seconds", lambda: 1)
+    monkeypatch.setattr(service, "_load_campaign_definition_by_identity", _hang_definition)
+
+    with pytest.raises(PermissionError, match="database_connection_timeout"):
+        await service.canonical_proving_commission_bundle(
+            campaign_id=state.campaign_id,
+            campaign_version=1,
+            paper_account_id=state.paper_account_id,
+            live_trading_profile_id=state.profile_id,
+            provider="kraken_spot",
+            environment="production",
+            product="BTC-USD",
+            amount_usd=Decimal("5"),
+            actor="operator:human",
+            approver_role="operator",
+            rationale="bounded proving",
+            no_leverage=True,
+            confirm=True,
+            idempotency_key="root-timeout-campaign",
+        )
+
+    assert state.execute_calls == 0
+
+
+@pytest.mark.asyncio
+async def test_canonical_proving_commission_hanging_latest_forced_package_lookup_times_out_and_recovers(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Reproduces the CONFIRMED production hang exactly: the Ctrl+C traceback showed execution
+    inside _load_latest_forced_canonical_package(), a plain unlocked SELECT called at the top of
+    every loop iteration. Verifies: correct stage identification, clean exit with no order/
+    submission created, and that an idempotent retry with the same key succeeds once the stall
+    clears -- proving deterministic recovery rather than a permanently poisoned state."""
+    state = _State()
+    _install_common_monkeypatches(monkeypatch, state)
+
+    gate = {"hang": True}
+    real_lookup = state.package
+
+    async def _hang_then_recover(**_kwargs):
+        if gate["hang"]:
+            await asyncio.Event().wait()
+        return real_lookup
+
+    monkeypatch.setattr(service, "_commission_db_timeout_seconds", lambda: 1)
+    monkeypatch.setattr(service, "_load_latest_forced_canonical_package", _hang_then_recover)
+
+    with pytest.raises(PermissionError, match=r"database_connection_timeout stage=latest_forced_package_lookup"):
+        await service.canonical_proving_commission_bundle(
+            campaign_id=state.campaign_id,
+            campaign_version=1,
+            paper_account_id=state.paper_account_id,
+            live_trading_profile_id=state.profile_id,
+            provider="kraken_spot",
+            environment="production",
+            product="BTC-USD",
+            amount_usd=Decimal("5"),
+            actor="operator:human",
+            approver_role="operator",
+            rationale="bounded proving",
+            no_leverage=True,
+            confirm=True,
+            idempotency_key="root-timeout-forced-package-lookup",
+        )
+
+    # Fails closed: no live order was ever prepared or submitted while stuck.
+    assert state.prepare_calls == 0
+    assert state.execute_calls == 0
+    assert state.create_calls == 0
+
+    # Deterministic recovery: the exact same idempotency key succeeds once the stall clears.
+    gate["hang"] = False
+    payload = await service.canonical_proving_commission_bundle(
+        campaign_id=state.campaign_id,
+        campaign_version=1,
+        paper_account_id=state.paper_account_id,
+        live_trading_profile_id=state.profile_id,
+        provider="kraken_spot",
+        environment="production",
+        product="BTC-USD",
+        amount_usd=Decimal("5"),
+        actor="operator:human",
+        approver_role="operator",
+        rationale="bounded proving",
+        no_leverage=True,
+        confirm=True,
+        idempotency_key="root-timeout-forced-package-lookup",
+    )
+    assert payload["current_state"] == "ACTIVE_POSITION"
+    assert state.execute_calls == 1
+
+
+@pytest.mark.asyncio
+async def test_canonical_proving_commission_timeout_releases_session_resources(monkeypatch: pytest.MonkeyPatch) -> None:
+    state = _State()
+    _install_common_monkeypatches(monkeypatch, state)
+
+    class _TrackingSessionContext(_SessionContext):
+        def __init__(self, db: _FakeDb, tracker: dict[str, int]) -> None:
+            super().__init__(db)
+            self._tracker = tracker
+
+        async def __aexit__(self, exc_type, exc, tb) -> bool:
+            self._tracker["exits"] += 1
+            return await super().__aexit__(exc_type, exc, tb)
+
+    tracker = {"exits": 0}
+    monkeypatch.setattr(service, "AsyncSessionLocal", lambda: _TrackingSessionContext(_FakeDb(state), tracker))
+
+    async def _hang_definition(**_kwargs):
+        await asyncio.Event().wait()
+
+    monkeypatch.setattr(service, "_commission_db_timeout_seconds", lambda: 1)
+    monkeypatch.setattr(service, "_load_campaign_definition_by_identity", _hang_definition)
+
+    with pytest.raises(PermissionError, match="database_connection_timeout"):
+        await service.canonical_proving_commission_bundle(
+            campaign_id=state.campaign_id,
+            campaign_version=1,
+            paper_account_id=state.paper_account_id,
+            live_trading_profile_id=state.profile_id,
+            provider="kraken_spot",
+            environment="production",
+            product="BTC-USD",
+            amount_usd=Decimal("5"),
+            actor="operator:human",
+            approver_role="operator",
+            rationale="bounded proving",
+            no_leverage=True,
+            confirm=True,
+            idempotency_key="root-timeout-release",
+        )
+
+    assert tracker["exits"] == 1
+
+
+@pytest.mark.asyncio
+async def test_canonical_proving_commission_same_key_succeeds_after_database_recovery(monkeypatch: pytest.MonkeyPatch) -> None:
+    state = _State()
+    _install_common_monkeypatches(monkeypatch, state)
+
+    gate = {"hang": True}
+
+    async def _approval_gate(**_kwargs):
+        if gate["hang"]:
+            await asyncio.Event().wait()
+        return state.approval
+
+    monkeypatch.setattr(service, "_commission_db_timeout_seconds", lambda: 1)
+    monkeypatch.setattr(service, "_load_latest_approval_for_package", _approval_gate)
+
+    with pytest.raises(PermissionError, match="database_connection_timeout"):
+        await service.canonical_proving_commission_bundle(
+            campaign_id=state.campaign_id,
+            campaign_version=1,
+            paper_account_id=state.paper_account_id,
+            live_trading_profile_id=state.profile_id,
+            provider="kraken_spot",
+            environment="production",
+            product="BTC-USD",
+            amount_usd=Decimal("5"),
+            actor="operator:human",
+            approver_role="operator",
+            rationale="bounded proving",
+            no_leverage=True,
+            confirm=True,
+            idempotency_key="one-shot-initial-proving-entry-e9a9-v1",
+        )
+
+    gate["hang"] = False
+    payload = await service.canonical_proving_commission_bundle(
+        campaign_id=state.campaign_id,
+        campaign_version=1,
+        paper_account_id=state.paper_account_id,
+        live_trading_profile_id=state.profile_id,
+        provider="kraken_spot",
+        environment="production",
+        product="BTC-USD",
+        amount_usd=Decimal("5"),
+        actor="operator:human",
+        approver_role="operator",
+        rationale="bounded proving",
+        no_leverage=True,
+        confirm=True,
+        idempotency_key="one-shot-initial-proving-entry-e9a9-v1",
+    )
+
+    assert payload["current_state"] == "ACTIVE_POSITION"
+    assert state.create_calls == 0
+    assert state.dry_run_calls == 1
+
+
+@pytest.mark.asyncio
+async def test_canonical_proving_commission_authorized_with_existing_dry_run_resumes_to_reactivation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    state = _State()
+    state.package.package_state = "AUTHORIZED"
+    state.package.approval_event_id = state.approval.id
+    state.package.dry_run_live_crypto_order_id = uuid4()
+    _install_common_monkeypatches(monkeypatch, state)
+
+    payload = await service.canonical_proving_commission_bundle(
+        campaign_id=state.campaign_id,
+        campaign_version=1,
+        paper_account_id=state.paper_account_id,
+        live_trading_profile_id=state.profile_id,
+        provider="kraken_spot",
+        environment="production",
+        product="BTC-USD",
+        amount_usd=Decimal("5"),
+        actor="operator:human",
+        approver_role="operator",
+        rationale="bounded proving",
+        no_leverage=True,
+        confirm=True,
+        idempotency_key="root-authorized-existing-dry-run",
+    )
+
+    assert payload["current_state"] == "ACTIVE_POSITION"
+    assert state.create_calls == 0
+    assert state.dry_run_calls == 0
+    assert state.activate_calls >= 1
+
+
+@pytest.mark.asyncio
+async def test_canonical_proving_commission_hanging_buy_pending_order_reload_times_out_and_recovers(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Found during the diff-only safety review: resuming a campaign that is already
+    BUY_PENDING (e.g. after a prior interrupted attempt) reloads the persisted LiveCryptoOrder
+    via a bare db.scalar() before calling execute_commissioned_entry() again -- this was the
+    one remaining unbounded database await before Kraken (re)submission. Verifies: correct
+    stage identification, clean exit with no re-submission while stuck, and deterministic
+    recovery once the stall clears."""
+    state = _State()
+    state.package.package_state = "ACTIVATED"
+    state.package.approval_event_id = state.approval.id
+    state.package.dry_run_live_crypto_order_id = uuid4()
+    state.live_order = SimpleNamespace(live_crypto_order_id=uuid4(), operator_confirmation_id=uuid4())
+    state.definition.metadata_evidence["commissioned_seed_campaign"] = {
+        "state": "BUY_PENDING",
+        "entry_execution": {"live_crypto_order_id": str(state.live_order.live_crypto_order_id)},
+    }
+    _install_common_monkeypatches(monkeypatch, state)
+
+    gate = {"hang": True}
+    real_live_order = state.live_order
+
+    class _HangingBuyPendingDb(_FakeDb):
+        async def scalar(self, statement):
+            sql = str(statement)
+            if "FROM live_crypto_orders" in sql and gate["hang"]:
+                await asyncio.Event().wait()
+            return await super().scalar(statement)
+
+    monkeypatch.setattr(service, "AsyncSessionLocal", lambda: _SessionContext(_HangingBuyPendingDb(state)))
+    monkeypatch.setattr(service, "_commission_db_timeout_seconds", lambda: 1)
+
+    with pytest.raises(PermissionError, match=r"database_connection_timeout stage=buy_pending_order_reload"):
+        await service.canonical_proving_commission_bundle(
+            campaign_id=state.campaign_id,
+            campaign_version=1,
+            paper_account_id=state.paper_account_id,
+            live_trading_profile_id=state.profile_id,
+            provider="kraken_spot",
+            environment="production",
+            product="BTC-USD",
+            amount_usd=Decimal("5"),
+            actor="operator:human",
+            approver_role="operator",
+            rationale="bounded proving",
+            no_leverage=True,
+            confirm=True,
+            idempotency_key="root-timeout-buy-pending-reload",
+        )
+
+    # Fails closed: no re-submission attempted while the reload was stuck.
+    assert state.execute_calls == 0
+    assert state.live_order is real_live_order
+
+    # Deterministic recovery: the exact same idempotency key succeeds once the stall clears.
+    gate["hang"] = False
+    payload = await service.canonical_proving_commission_bundle(
+        campaign_id=state.campaign_id,
+        campaign_version=1,
+        paper_account_id=state.paper_account_id,
+        live_trading_profile_id=state.profile_id,
+        provider="kraken_spot",
+        environment="production",
+        product="BTC-USD",
+        amount_usd=Decimal("5"),
+        actor="operator:human",
+        approver_role="operator",
+        rationale="bounded proving",
+        no_leverage=True,
+        confirm=True,
+        idempotency_key="root-timeout-buy-pending-reload",
+    )
+    assert payload["current_state"] == "ACTIVE_POSITION"
     assert state.execute_calls == 1
 
 

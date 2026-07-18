@@ -1,11 +1,14 @@
 from __future__ import annotations
 
+import asyncio
 from collections import Counter
 from dataclasses import asdict, is_dataclass
 from enum import Enum
 import hashlib
 import json
+import logging
 import re
+import sys
 from datetime import datetime, timezone
 from datetime import timedelta
 from decimal import Decimal
@@ -130,6 +133,8 @@ from app.services.risk.equity_evidence import resolve_equity_risk_evidence
 from app.services.risk.risk_context import resolve_effective_risk_policy
 from app.services.strategy_outcomes import fetch_strategy_scorecards
 
+logger = logging.getLogger(__name__)
+
 
 _EXECUTION_FORENSICS_MAX_SINCE_CYCLES = 200
 _PROVING_CAP_TARGET_USD = Decimal("5")
@@ -186,6 +191,49 @@ _COMMISSIONED_SUBMISSION_MAY_HAVE_OCCURRED = {
 }
 _COMMISSIONED_RECONCILIATION_STATES = {"BUY_RECONCILIATION_PENDING", "RECONCILIATION_REQUIRED", "ACTIVE_POSITION"}
 _PROVING_REFRESH_GRACE_SECONDS = 90
+
+
+def _commission_db_timeout_seconds() -> int:
+    return max(1, int(get_settings().operator_db_timeout_seconds))
+
+
+_commission_stage_sequence_by_key: dict[str, int] = {}
+
+
+def _log_commission_stage(*, stage: str, status: str, root_idempotency_key: str, **extra: Any) -> None:
+    """Structured log plus unconditional stderr progress line for one canonical-proving-commission
+    stage transition. Always writes to stderr directly (not only via `logging`) so operators see
+    forward progress even when no logging handler is configured -- the failure mode this exists to
+    prevent is the command appearing frozen with zero visible output for its entire runtime.
+    Never touches stdout: --json callers must get byte-for-byte the same stdout as before."""
+    sequence = _commission_stage_sequence_by_key.get(root_idempotency_key, 0) + 1
+    _commission_stage_sequence_by_key[root_idempotency_key] = sequence
+    detail = " ".join(f"{key}={value}" for key, value in extra.items())
+    suffix = f" {detail}" if detail else ""
+    logger.info(
+        "canonical_proving_commission_stage seq=%s stage=%s status=%s root_idempotency_key=%s%s",
+        sequence,
+        stage,
+        status,
+        root_idempotency_key,
+        suffix,
+    )
+    print(
+        f"[canonical-proving-commission] [{sequence}] stage={stage} status={status} root_idempotency_key={root_idempotency_key}{suffix}",
+        file=sys.stderr,
+        flush=True,
+    )
+
+
+async def _await_db_operation(*, stage: str, root_idempotency_key: str, operation, **extra: Any):
+    _log_commission_stage(stage=stage, status="started", root_idempotency_key=root_idempotency_key, **extra)
+    try:
+        result = await asyncio.wait_for(operation, timeout=_commission_db_timeout_seconds())
+    except asyncio.TimeoutError as exc:
+        _log_commission_stage(stage=stage, status="timeout", root_idempotency_key=root_idempotency_key, **extra)
+        raise PermissionError(f"database_connection_timeout stage={stage}") from exc
+    _log_commission_stage(stage=stage, status="completed", root_idempotency_key=root_idempotency_key, **extra)
+    return result
 
 
 def _uuid_from_value(value: Any) -> UUID | None:
@@ -5400,11 +5448,28 @@ async def canonical_proving_commission_bundle(
         raise PermissionError("idempotency_key is required")
 
     async with AsyncSessionLocal() as db:
+        _log_commission_stage(stage="db_session_acquired", status="completed", root_idempotency_key=root_idempotency_key)
         now = datetime.now(timezone.utc)
-        definition = await _load_campaign_definition_by_identity(db=db, campaign_id=campaign_id, version=campaign_version)
-        runtime = await _load_runtime_campaign_by_identity(db=db, campaign_id=campaign_id)
-        paper_account = await _load_paper_account_by_id(db=db, paper_account_id=paper_account_id)
-        profile = await _load_profile_by_id(db=db, live_trading_profile_id=live_trading_profile_id)
+        definition = await _await_db_operation(
+            stage="campaign_definition_lookup",
+            root_idempotency_key=root_idempotency_key,
+            operation=_load_campaign_definition_by_identity(db=db, campaign_id=campaign_id, version=campaign_version),
+        )
+        runtime = await _await_db_operation(
+            stage="runtime_campaign_lookup",
+            root_idempotency_key=root_idempotency_key,
+            operation=_load_runtime_campaign_by_identity(db=db, campaign_id=campaign_id),
+        )
+        paper_account = await _await_db_operation(
+            stage="paper_account_lookup",
+            root_idempotency_key=root_idempotency_key,
+            operation=_load_paper_account_by_id(db=db, paper_account_id=paper_account_id),
+        )
+        profile = await _await_db_operation(
+            stage="profile_lookup",
+            root_idempotency_key=root_idempotency_key,
+            operation=_load_profile_by_id(db=db, live_trading_profile_id=live_trading_profile_id),
+        )
         if definition is None or runtime is None or paper_account is None or profile is None:
             raise LookupError("commissioned proving identity chain incomplete")
         if runtime.id is None:
@@ -5418,14 +5483,18 @@ async def canonical_proving_commission_bundle(
         ownership = commissioned_blob.get("ownership_reconciliation") if isinstance(commissioned_blob.get("ownership_reconciliation"), dict) else {}
 
         if commissioned_state == "ACTIVE_POSITION" and ownership.get("position_identity"):
-            status_payload = await canonical_proving_commission_status(
-                campaign_id=campaign_id,
-                campaign_version=campaign_version,
-                paper_account_id=paper_account_id,
-                live_trading_profile_id=live_trading_profile_id,
-                provider=provider,
-                environment=environment,
-                product=product,
+            status_payload = await _await_db_operation(
+                stage="active_position_status_replay",
+                root_idempotency_key=root_idempotency_key,
+                operation=canonical_proving_commission_status(
+                    campaign_id=campaign_id,
+                    campaign_version=campaign_version,
+                    paper_account_id=paper_account_id,
+                    live_trading_profile_id=live_trading_profile_id,
+                    provider=provider,
+                    environment=environment,
+                    product=product,
+                ),
             )
             return {"replayed": True, "status": status_payload, "current_state": "ACTIVE_POSITION", "autonomous_lifecycle_owner": True}
 
@@ -5437,41 +5506,81 @@ async def canonical_proving_commission_bundle(
         if commissioned_state not in _COMMISSIONED_SUBMISSION_MAY_HAVE_OCCURRED:
             attempted_refresh_scopes: set[str] = set()
             while True:
-                package = await _load_latest_forced_canonical_package(db=db, campaign_id=campaign_id)
-                preview = await _load_preview_for_package_row(db=db, package=package)
-                approval_event = await _load_latest_approval_for_package(db=db, package=package)
-                activation = await _load_activation_for_package(db=db, package=package)
+                package = await _await_db_operation(
+                    stage="latest_forced_package_lookup",
+                    root_idempotency_key=root_idempotency_key,
+                    operation=_load_latest_forced_canonical_package(db=db, campaign_id=campaign_id),
+                )
+                preview = await _await_db_operation(
+                    stage="preview_lookup",
+                    root_idempotency_key=root_idempotency_key,
+                    operation=_load_preview_for_package_row(db=db, package=package),
+                )
+                approval_event = await _await_db_operation(
+                    stage="latest_approval_lookup",
+                    root_idempotency_key=root_idempotency_key,
+                    operation=_load_latest_approval_for_package(db=db, package=package),
+                )
+                activation = await _await_db_operation(
+                    stage="activation_lookup",
+                    root_idempotency_key=root_idempotency_key,
+                    operation=_load_activation_for_package(db=db, package=package),
+                )
 
                 if _package_requires_refresh(package=package, preview=preview, approval_event=approval_event, activation=activation, now=now):
                     refresh_scope = "initial" if package is None else str(package.package_id)
                     if refresh_scope in attempted_refresh_scopes:
                         raise PermissionError("unable to obtain a fresh canonical proving package")
                     attempted_refresh_scopes.add(refresh_scope)
-                    created = await create_canonical_preview_package(
-                        db=db,
-                        request=CanonicalPreviewPackageCreateRequest(
-                            campaign_id=campaign_id,
-                            campaign_version=campaign_version,
-                            paper_account_id=paper_account_id,
-                            live_trading_profile_id=live_trading_profile_id,
-                            provider=provider,
-                            environment=environment,
-                            product=product,
-                            max_proposed_order_amount=amount_usd,
-                            actor=actor,
-                            idempotency_key=_commission_phase_idempotency_key(
-                                root_idempotency_key=root_idempotency_key,
-                                phase="canonical_package_create",
-                                scope=refresh_scope,
+                    created = await _await_db_operation(
+                        stage="canonical_package_create",
+                        root_idempotency_key=root_idempotency_key,
+                        operation=create_canonical_preview_package(
+                            db=db,
+                            request=CanonicalPreviewPackageCreateRequest(
+                                campaign_id=campaign_id,
+                                campaign_version=campaign_version,
+                                paper_account_id=paper_account_id,
+                                live_trading_profile_id=live_trading_profile_id,
+                                provider=provider,
+                                environment=environment,
+                                product=product,
+                                max_proposed_order_amount=amount_usd,
+                                actor=actor,
+                                idempotency_key=_commission_phase_idempotency_key(
+                                    root_idempotency_key=root_idempotency_key,
+                                    phase="canonical_package_create",
+                                    scope=refresh_scope,
+                                ),
+                                commissioning_entry_mode="initial_proving_entry",
                             ),
-                            commissioning_entry_mode="initial_proving_entry",
                         ),
                     )
-                    await db.commit()
-                    package = await _load_latest_forced_canonical_package(db=db, campaign_id=campaign_id)
-                    preview = await _load_preview_for_package_row(db=db, package=package)
-                    approval_event = await _load_latest_approval_for_package(db=db, package=package)
-                    activation = await _load_activation_for_package(db=db, package=package)
+                    await _await_db_operation(
+                        stage="package_state_commit",
+                        root_idempotency_key=root_idempotency_key,
+                        operation=db.commit(),
+                    )
+                    package = await _await_db_operation(
+                        stage="latest_forced_package_lookup",
+                        root_idempotency_key=root_idempotency_key,
+                        operation=_load_latest_forced_canonical_package(db=db, campaign_id=campaign_id),
+                    )
+                    preview = await _await_db_operation(
+                    stage="preview_lookup",
+                    root_idempotency_key=root_idempotency_key,
+                    operation=_load_preview_for_package_row(db=db, package=package),
+                )
+                    approval_event = await _await_db_operation(
+                        stage="latest_approval_lookup",
+                        root_idempotency_key=root_idempotency_key,
+                        operation=_load_latest_approval_for_package(db=db, package=package),
+                    )
+                    activation = await _await_db_operation(
+                    stage="activation_lookup",
+                    root_idempotency_key=root_idempotency_key,
+                    operation=_load_activation_for_package(db=db, package=package),
+                )
                     if not created.get("package"):
                         raise PermissionError("forced canonical package creation did not yield a package")
 
@@ -5483,33 +5592,160 @@ async def canonical_proving_commission_bundle(
                     if expires_at <= now:
                         package = None
                         continue
-                    await authorize_canonical_preview_package(
-                        db=db,
-                        request=CanonicalPreviewPackageAuthorizeRequest(
-                            package_id=package.package_id,
-                            actor=actor,
-                            approver_role=approver_role,
-                            rationale=rationale,
-                            expires_at=expires_at,
-                            max_order_usd=amount_usd,
-                            max_total_deployed_campaign_capital_usd=amount_usd,
-                            no_leverage=True,
-                            idempotency_key=_commission_phase_idempotency_key(
-                                root_idempotency_key=root_idempotency_key,
-                                phase="canonical_package_authorize",
-                                scope=str(package.package_id),
+                    _log_commission_stage(stage="approval_renewal", status="started", root_idempotency_key=root_idempotency_key, package_id=package.package_id)
+                    await _await_db_operation(
+                        stage="canonical_package_authorize",
+                        root_idempotency_key=root_idempotency_key,
+                        operation=authorize_canonical_preview_package(
+                            db=db,
+                            request=CanonicalPreviewPackageAuthorizeRequest(
+                                package_id=package.package_id,
+                                actor=actor,
+                                approver_role=approver_role,
+                                rationale=rationale,
+                                expires_at=expires_at,
+                                max_order_usd=amount_usd,
+                                max_total_deployed_campaign_capital_usd=amount_usd,
+                                no_leverage=True,
+                                idempotency_key=_commission_phase_idempotency_key(
+                                    root_idempotency_key=root_idempotency_key,
+                                    phase="canonical_package_authorize",
+                                    scope=str(package.package_id),
+                                ),
                             ),
                         ),
                     )
-                    await db.commit()
-                    approval_event = await _load_latest_approval_for_package(db=db, package=package)
+                    await _await_db_operation(
+                        stage="package_state_commit",
+                        root_idempotency_key=root_idempotency_key,
+                        operation=db.commit(),
+                    )
+                    approval_event = await _await_db_operation(
+                        stage="latest_approval_lookup",
+                        root_idempotency_key=root_idempotency_key,
+                        operation=_load_latest_approval_for_package(db=db, package=package),
+                    )
+                    _log_commission_stage(stage="approval_renewal", status="completed", root_idempotency_key=root_idempotency_key, package_id=package.package_id)
                     continue
 
                 if package.package_state == "AUTHORIZED":
                     if not _approval_is_active(approval_event, now=now):
                         if package.dry_run_live_crypto_order_id is not None:
                             renewed_approval_expires_at = now + timedelta(minutes=5)
-                            await authorize_canonical_preview_package(
+                            await _await_db_operation(
+                                stage="canonical_package_authorize",
+                                root_idempotency_key=root_idempotency_key,
+                                operation=authorize_canonical_preview_package(
+                                    db=db,
+                                    request=CanonicalPreviewPackageAuthorizeRequest(
+                                        package_id=package.package_id,
+                                        actor=actor,
+                                        approver_role=approver_role,
+                                        rationale=rationale,
+                                        expires_at=renewed_approval_expires_at,
+                                        max_order_usd=amount_usd,
+                                        max_total_deployed_campaign_capital_usd=amount_usd,
+                                        no_leverage=True,
+                                        idempotency_key=_commission_phase_idempotency_key(
+                                            root_idempotency_key=root_idempotency_key,
+                                            phase="canonical_package_authorize",
+                                            scope=str(package.package_id),
+                                        ),
+                                    ),
+                                ),
+                            )
+                            await _await_db_operation(
+                                stage="package_state_commit",
+                                root_idempotency_key=root_idempotency_key,
+                                operation=db.commit(),
+                            )
+                            approval_event = await _await_db_operation(
+                                stage="latest_approval_lookup",
+                                root_idempotency_key=root_idempotency_key,
+                                operation=_load_latest_approval_for_package(db=db, package=package),
+                            )
+                            continue
+                        package = None
+                        continue
+                    if package.dry_run_live_crypto_order_id is not None:
+                        _log_commission_stage(stage="reactivation", status="started", root_idempotency_key=root_idempotency_key, package_id=package.package_id)
+                        activated = await _await_db_operation(
+                            stage="canonical_proving_activate",
+                            root_idempotency_key=root_idempotency_key,
+                            operation=activate_canonical_proving_campaign(
+                                db=db,
+                                request=CanonicalPreviewPackageActivationRequest(
+                                    package_id=package.package_id,
+                                    approval_event_id=approval_event.id,
+                                    dry_run_live_crypto_order_id=package.dry_run_live_crypto_order_id,
+                                    actor=actor,
+                                    expires_at=approval_event.expires_at,
+                                    idempotency_key=_commission_phase_idempotency_key(
+                                        root_idempotency_key=root_idempotency_key,
+                                        phase="canonical_proving_activate",
+                                        scope=str(package.package_id),
+                                    ),
+                                ),
+                            ),
+                        )
+                        await _await_db_operation(
+                            stage="package_state_commit",
+                            root_idempotency_key=root_idempotency_key,
+                            operation=db.commit(),
+                        )
+                        activation_payload = activated.get("activation") if isinstance(activated.get("activation"), dict) else {}
+                        activation = await _await_db_operation(
+                            stage="activation_lookup",
+                            root_idempotency_key=root_idempotency_key,
+                            operation=_load_activation_for_package(db=db, package=package),
+                        )
+                        if not activation_payload:
+                            raise PermissionError("canonical proving activation missing after activation")
+                        _log_commission_stage(stage="reactivation", status="completed", root_idempotency_key=root_idempotency_key, package_id=package.package_id)
+                        continue
+                    await _await_db_operation(
+                        stage="canonical_package_dry_run",
+                        root_idempotency_key=root_idempotency_key,
+                        operation=run_dry_run_for_canonical_preview_package(
+                            db=db,
+                            request=CanonicalPreviewPackageDryRunRequest(
+                                package_id=package.package_id,
+                                approval_event_id=approval_event.id,
+                                operator_identity=actor,
+                                idempotency_token=_commission_phase_idempotency_key(
+                                    root_idempotency_key=root_idempotency_key,
+                                    phase="canonical_package_dry_run",
+                                    scope=str(package.package_id),
+                                ),
+                            ),
+                        ),
+                    )
+                    await _await_db_operation(
+                        stage="package_state_commit",
+                        root_idempotency_key=root_idempotency_key,
+                        operation=db.commit(),
+                    )
+                    package = await _await_db_operation(
+                        stage="package_reload_after_dry_run",
+                        root_idempotency_key=root_idempotency_key,
+                        operation=db.scalar(
+                            select(CanonicalPreviewPackage)
+                            .where(CanonicalPreviewPackage.package_id == package.package_id)
+                            .limit(1)
+                        ),
+                    )
+                    continue
+
+                if package.package_state == "DRY_RUN_PASSED":
+                    if package.dry_run_live_crypto_order_id is None:
+                        raise PermissionError("canonical proving dry-run evidence missing")
+                    if not _approval_is_active(approval_event, now=now):
+                        renewed_approval_expires_at = now + timedelta(minutes=5)
+                        _log_commission_stage(stage="approval_renewal", status="started", root_idempotency_key=root_idempotency_key, package_id=package.package_id)
+                        await _await_db_operation(
+                            stage="canonical_package_authorize",
+                            root_idempotency_key=root_idempotency_key,
+                            operation=authorize_canonical_preview_package(
                                 db=db,
                                 request=CanonicalPreviewPackageAuthorizeRequest(
                                     package_id=package.package_id,
@@ -5526,14 +5762,25 @@ async def canonical_proving_commission_bundle(
                                         scope=str(package.package_id),
                                     ),
                                 ),
-                            )
-                            await db.commit()
-                            approval_event = await _load_latest_approval_for_package(db=db, package=package)
-                            continue
-                        package = None
+                            ),
+                        )
+                        await _await_db_operation(
+                            stage="package_state_commit",
+                            root_idempotency_key=root_idempotency_key,
+                            operation=db.commit(),
+                        )
+                        approval_event = await _await_db_operation(
+                            stage="latest_approval_lookup",
+                            root_idempotency_key=root_idempotency_key,
+                            operation=_load_latest_approval_for_package(db=db, package=package),
+                        )
+                        _log_commission_stage(stage="approval_renewal", status="completed", root_idempotency_key=root_idempotency_key, package_id=package.package_id)
                         continue
-                    if package.dry_run_live_crypto_order_id is not None:
-                        activated = await activate_canonical_proving_campaign(
+                    _log_commission_stage(stage="reactivation", status="started", root_idempotency_key=root_idempotency_key, package_id=package.package_id)
+                    activated = await _await_db_operation(
+                        stage="canonical_proving_activate",
+                        root_idempotency_key=root_idempotency_key,
+                        operation=activate_canonical_proving_campaign(
                             db=db,
                             request=CanonicalPreviewPackageActivationRequest(
                                 package_id=package.package_id,
@@ -5547,80 +5794,22 @@ async def canonical_proving_commission_bundle(
                                     scope=str(package.package_id),
                                 ),
                             ),
-                        )
-                        await db.commit()
-                        activation_payload = activated.get("activation") if isinstance(activated.get("activation"), dict) else {}
-                        activation = await _load_activation_for_package(db=db, package=package)
-                        if not activation_payload:
-                            raise PermissionError("canonical proving activation missing after activation")
-                        continue
-                    await run_dry_run_for_canonical_preview_package(
-                        db=db,
-                        request=CanonicalPreviewPackageDryRunRequest(
-                            package_id=package.package_id,
-                            approval_event_id=approval_event.id,
-                            operator_identity=actor,
-                            idempotency_token=_commission_phase_idempotency_key(
-                                root_idempotency_key=root_idempotency_key,
-                                phase="canonical_package_dry_run",
-                                scope=str(package.package_id),
-                            ),
                         ),
                     )
-                    await db.commit()
-                    package = await db.scalar(
-                        select(CanonicalPreviewPackage)
-                        .where(CanonicalPreviewPackage.package_id == package.package_id)
-                        .limit(1)
+                    await _await_db_operation(
+                        stage="package_state_commit",
+                        root_idempotency_key=root_idempotency_key,
+                        operation=db.commit(),
                     )
-                    continue
-
-                if package.package_state == "DRY_RUN_PASSED":
-                    if package.dry_run_live_crypto_order_id is None:
-                        raise PermissionError("canonical proving dry-run evidence missing")
-                    if not _approval_is_active(approval_event, now=now):
-                        renewed_approval_expires_at = now + timedelta(minutes=5)
-                        await authorize_canonical_preview_package(
-                            db=db,
-                            request=CanonicalPreviewPackageAuthorizeRequest(
-                                package_id=package.package_id,
-                                actor=actor,
-                                approver_role=approver_role,
-                                rationale=rationale,
-                                expires_at=renewed_approval_expires_at,
-                                max_order_usd=amount_usd,
-                                max_total_deployed_campaign_capital_usd=amount_usd,
-                                no_leverage=True,
-                                idempotency_key=_commission_phase_idempotency_key(
-                                    root_idempotency_key=root_idempotency_key,
-                                    phase="canonical_package_authorize",
-                                    scope=str(package.package_id),
-                                ),
-                            ),
-                        )
-                        await db.commit()
-                        approval_event = await _load_latest_approval_for_package(db=db, package=package)
-                        continue
-                    activated = await activate_canonical_proving_campaign(
-                        db=db,
-                        request=CanonicalPreviewPackageActivationRequest(
-                            package_id=package.package_id,
-                            approval_event_id=approval_event.id,
-                            dry_run_live_crypto_order_id=package.dry_run_live_crypto_order_id,
-                            actor=actor,
-                            expires_at=approval_event.expires_at,
-                            idempotency_key=_commission_phase_idempotency_key(
-                                root_idempotency_key=root_idempotency_key,
-                                phase="canonical_proving_activate",
-                                scope=str(package.package_id),
-                            ),
-                        ),
-                    )
-                    await db.commit()
                     activation_payload = activated.get("activation") if isinstance(activated.get("activation"), dict) else {}
-                    activation = await _load_activation_for_package(db=db, package=package)
+                    activation = await _await_db_operation(
+                        stage="activation_lookup",
+                        root_idempotency_key=root_idempotency_key,
+                        operation=_load_activation_for_package(db=db, package=package),
+                    )
                     if not activation_payload:
                         raise PermissionError("canonical proving activation missing after activation")
+                    _log_commission_stage(stage="reactivation", status="completed", root_idempotency_key=root_idempotency_key, package_id=package.package_id)
                     continue
 
                 if package.package_state == "ACTIVATED":
@@ -5628,84 +5817,141 @@ async def canonical_proving_commission_bundle(
                         if package.dry_run_live_crypto_order_id is None:
                             raise PermissionError("activated proving package missing dry-run evidence; manual recovery required")
                         renewed_approval_expires_at = now + timedelta(minutes=5)
-                        await authorize_canonical_preview_package(
-                            db=db,
-                            request=CanonicalPreviewPackageAuthorizeRequest(
-                                package_id=package.package_id,
-                                actor=actor,
-                                approver_role=approver_role,
-                                rationale=rationale,
-                                expires_at=renewed_approval_expires_at,
-                                max_order_usd=amount_usd,
-                                max_total_deployed_campaign_capital_usd=amount_usd,
-                                no_leverage=True,
-                                idempotency_key=_commission_phase_idempotency_key(
-                                    root_idempotency_key=root_idempotency_key,
-                                    phase="canonical_package_authorize",
-                                    scope=str(package.package_id),
+                        _log_commission_stage(stage="approval_renewal", status="started", root_idempotency_key=root_idempotency_key, package_id=package.package_id)
+                        await _await_db_operation(
+                            stage="canonical_package_authorize",
+                            root_idempotency_key=root_idempotency_key,
+                            operation=authorize_canonical_preview_package(
+                                db=db,
+                                request=CanonicalPreviewPackageAuthorizeRequest(
+                                    package_id=package.package_id,
+                                    actor=actor,
+                                    approver_role=approver_role,
+                                    rationale=rationale,
+                                    expires_at=renewed_approval_expires_at,
+                                    max_order_usd=amount_usd,
+                                    max_total_deployed_campaign_capital_usd=amount_usd,
+                                    no_leverage=True,
+                                    idempotency_key=_commission_phase_idempotency_key(
+                                        root_idempotency_key=root_idempotency_key,
+                                        phase="canonical_package_authorize",
+                                        scope=str(package.package_id),
+                                    ),
                                 ),
                             ),
                         )
-                        await db.commit()
-                        approval_event = await _load_latest_approval_for_package(db=db, package=package)
+                        await _await_db_operation(
+                            stage="package_state_commit",
+                            root_idempotency_key=root_idempotency_key,
+                            operation=db.commit(),
+                        )
+                        approval_event = await _await_db_operation(
+                            stage="latest_approval_lookup",
+                            root_idempotency_key=root_idempotency_key,
+                            operation=_load_latest_approval_for_package(db=db, package=package),
+                        )
                         if approval_event is None:
                             raise PermissionError("renewed approval missing for activated proving package")
-                        activated = await activate_canonical_proving_campaign(
-                            db=db,
-                            request=CanonicalPreviewPackageActivationRequest(
-                                package_id=package.package_id,
-                                approval_event_id=approval_event.id,
-                                dry_run_live_crypto_order_id=package.dry_run_live_crypto_order_id,
-                                actor=actor,
-                                expires_at=approval_event.expires_at,
-                                idempotency_key=_commission_phase_idempotency_key(
-                                    root_idempotency_key=root_idempotency_key,
-                                    phase="canonical_proving_activate",
-                                    scope=str(package.package_id),
+                        _log_commission_stage(stage="approval_renewal", status="completed", root_idempotency_key=root_idempotency_key, package_id=package.package_id)
+                        _log_commission_stage(stage="reactivation", status="started", root_idempotency_key=root_idempotency_key, package_id=package.package_id)
+                        activated = await _await_db_operation(
+                            stage="canonical_proving_activate",
+                            root_idempotency_key=root_idempotency_key,
+                            operation=activate_canonical_proving_campaign(
+                                db=db,
+                                request=CanonicalPreviewPackageActivationRequest(
+                                    package_id=package.package_id,
+                                    approval_event_id=approval_event.id,
+                                    dry_run_live_crypto_order_id=package.dry_run_live_crypto_order_id,
+                                    actor=actor,
+                                    expires_at=approval_event.expires_at,
+                                    idempotency_key=_commission_phase_idempotency_key(
+                                        root_idempotency_key=root_idempotency_key,
+                                        phase="canonical_proving_activate",
+                                        scope=str(package.package_id),
+                                    ),
                                 ),
                             ),
                         )
-                        await db.commit()
+                        await _await_db_operation(
+                            stage="package_state_commit",
+                            root_idempotency_key=root_idempotency_key,
+                            operation=db.commit(),
+                        )
                         activation_payload = activated.get("activation") if isinstance(activated.get("activation"), dict) else {}
-                        activation = await _load_activation_for_package(db=db, package=package)
+                        activation = await _await_db_operation(
+                            stage="activation_lookup",
+                            root_idempotency_key=root_idempotency_key,
+                            operation=_load_activation_for_package(db=db, package=package),
+                        )
                         if not activation_payload:
                             raise PermissionError("canonical proving activation missing after renewal")
+                        _log_commission_stage(stage="reactivation", status="completed", root_idempotency_key=root_idempotency_key, package_id=package.package_id)
                         continue
                     break
 
                 raise PermissionError(f"unsupported canonical proving package state: {package.package_state}")
 
-        package = package or await _load_latest_forced_canonical_package(db=db, campaign_id=campaign_id)
-        preview = preview or await _load_preview_for_package_row(db=db, package=package)
-        approval_event = approval_event or await _load_latest_approval_for_package(db=db, package=package)
-        activation = activation or await _load_activation_for_package(db=db, package=package)
+        package = package or await _await_db_operation(
+            stage="latest_forced_package_lookup",
+            root_idempotency_key=root_idempotency_key,
+            operation=_load_latest_forced_canonical_package(db=db, campaign_id=campaign_id),
+        )
+        preview = preview or await _await_db_operation(
+            stage="preview_lookup",
+            root_idempotency_key=root_idempotency_key,
+            operation=_load_preview_for_package_row(db=db, package=package),
+        )
+        approval_event = approval_event or await _await_db_operation(
+            stage="latest_approval_lookup",
+            root_idempotency_key=root_idempotency_key,
+            operation=_load_latest_approval_for_package(db=db, package=package),
+        )
+        activation = activation or await _await_db_operation(
+            stage="activation_lookup",
+            root_idempotency_key=root_idempotency_key,
+            operation=_load_activation_for_package(db=db, package=package),
+        )
         if package is None or preview is None or approval_event is None:
             raise PermissionError("canonical proving chain is incomplete")
 
-        connection, connection_error = await _resolve_exchange_connection_for_commissioning(
-            db=db,
-            preview_exchange_connection_id=preview.exchange_connection_id,
-            provider=provider,
-            environment=environment,
+        _log_commission_stage(stage="mandate_and_readiness_resolution", status="started", root_idempotency_key=root_idempotency_key)
+        connection, connection_error = await _await_db_operation(
+            stage="exchange_connection_resolution",
+            root_idempotency_key=root_idempotency_key,
+            operation=_resolve_exchange_connection_for_commissioning(
+                db=db,
+                preview_exchange_connection_id=preview.exchange_connection_id,
+                provider=provider,
+                environment=environment,
+            ),
         )
         if connection is None:
             raise PermissionError(connection_error or "exchange connection missing")
-        mandate = await _load_active_mandate_for_commissioning(
-            db=db,
-            runtime_campaign_id=runtime.id,
-            live_trading_profile_id=live_trading_profile_id,
-            paper_account_id=paper_account_id,
-            provider=provider,
-            environment=environment,
-        )
-        if mandate is None:
-            mandate_error = await _diagnose_mandate_resolution_failure(
+        mandate = await _await_db_operation(
+            stage="mandate_lookup",
+            root_idempotency_key=root_idempotency_key,
+            operation=_load_active_mandate_for_commissioning(
                 db=db,
                 runtime_campaign_id=runtime.id,
                 live_trading_profile_id=live_trading_profile_id,
                 paper_account_id=paper_account_id,
                 provider=provider,
                 environment=environment,
+            ),
+        )
+        if mandate is None:
+            mandate_error = await _await_db_operation(
+                stage="mandate_resolution_diagnosis",
+                root_idempotency_key=root_idempotency_key,
+                operation=_diagnose_mandate_resolution_failure(
+                    db=db,
+                    runtime_campaign_id=runtime.id,
+                    live_trading_profile_id=live_trading_profile_id,
+                    paper_account_id=paper_account_id,
+                    provider=provider,
+                    environment=environment,
+                ),
             )
             raise PermissionError(mandate_error)
         if str(getattr(mandate, "provider", "")).strip().lower() != provider.strip().lower() or str(getattr(mandate, "exchange_environment", "")).strip().lower() != environment.strip().lower():
@@ -5713,7 +5959,11 @@ async def canonical_proving_commission_bundle(
         if getattr(mandate, "capital_campaign_id", None) not in {None, runtime.id} or getattr(mandate, "paper_account_id", None) not in {None, paper_account_id}:
             raise PermissionError("campaign/profile/account mismatch")
 
-        mandate_version = await _load_authorized_mandate_version(db=db, mandate_id=mandate.mandate_id)
+        mandate_version = await _await_db_operation(
+            stage="mandate_version_lookup",
+            root_idempotency_key=root_idempotency_key,
+            operation=_load_authorized_mandate_version(db=db, mandate_id=mandate.mandate_id),
+        )
         if mandate_version is None:
             raise PermissionError("mandate version missing")
         if getattr(mandate_version, "mandate_id", None) != mandate.mandate_id:
@@ -5723,7 +5973,11 @@ async def canonical_proving_commission_bundle(
         if not bool(getattr(mandate_version, "is_active", False)):
             raise PermissionError("mandate not authorized or inactive")
 
-        asset = await _load_asset_for_product_symbol(db=db, product=product, provider=provider)
+        asset = await _await_db_operation(
+            stage="asset_lookup",
+            root_idempotency_key=root_idempotency_key,
+            operation=_load_asset_for_product_symbol(db=db, product=product, provider=provider),
+        )
         if asset is None:
             raise PermissionError("commissioned proving asset evidence missing")
 
@@ -5749,58 +6003,75 @@ async def canonical_proving_commission_bundle(
             mandate_version=mandate_version,
         )
 
-        preview_response = await generate_commissioned_campaign_preview(db=db, request=readiness_request)
+        _log_commission_stage(stage="mandate_and_readiness_resolution", status="completed", root_idempotency_key=root_idempotency_key)
+        preview_response = await _await_db_operation(
+            stage="commissioned_readiness_preview",
+            root_idempotency_key=root_idempotency_key,
+            operation=generate_commissioned_campaign_preview(db=db, request=readiness_request),
+        )
         if commissioned_state in {"DRAFT", "READY"}:
-            await backfill_commissioned_ready_metadata(
-                db=db,
-                campaign_id=campaign_id,
-                version=campaign_version,
-                actor=actor,
-                idempotency_key=_commission_phase_idempotency_key(
-                    root_idempotency_key=root_idempotency_key,
-                    phase="commissioned_ready_backfill",
-                    scope=str(package.package_id),
-                ),
-                commissioning_identity=_commissioning_identity(
+            await _await_db_operation(
+                stage="commissioned_ready_backfill",
+                root_idempotency_key=root_idempotency_key,
+                operation=backfill_commissioned_ready_metadata(
+                    db=db,
                     campaign_id=campaign_id,
                     version=campaign_version,
-                    root_idempotency_key=root_idempotency_key,
+                    actor=actor,
+                    idempotency_key=_commission_phase_idempotency_key(
+                        root_idempotency_key=root_idempotency_key,
+                        phase="commissioned_ready_backfill",
+                        scope=str(package.package_id),
+                    ),
+                    commissioning_identity=_commissioning_identity(
+                        campaign_id=campaign_id,
+                        version=campaign_version,
+                        root_idempotency_key=root_idempotency_key,
+                    ),
+                    commissioned_by=actor,
+                    provider=provider,
+                    environment=environment,
+                    instrument=product,
+                    paper_account_id=paper_account_id,
+                    capital_budget=amount_usd,
+                    maximum_position_size=amount_usd,
+                    maximum_total_exposure=amount_usd,
+                    commissioned_until=activation.expires_at if activation is not None else approval_event.expires_at,
                 ),
-                commissioned_by=actor,
-                provider=provider,
-                environment=environment,
-                instrument=product,
-                paper_account_id=paper_account_id,
-                capital_budget=amount_usd,
-                maximum_position_size=amount_usd,
-                maximum_total_exposure=amount_usd,
-                commissioned_until=activation.expires_at if activation is not None else approval_event.expires_at,
             )
             commissioned_state = "READY"
 
         if commissioned_state == "READY":
-            await commission_commissioned_campaign(
-                db=db,
-                request=CommissionedCampaignCommissionRequest(
-                    campaign_id=campaign_id,
-                    version=campaign_version,
-                    actor=actor,
-                    commissioning_reason=rationale,
-                    preview_identity_hash=preview_response.preview_identity_hash,
-                    requested_quote_amount=amount_usd,
-                    idempotency_key=_commission_phase_idempotency_key(
-                        root_idempotency_key=root_idempotency_key,
-                        phase="commissioned_campaign_commission",
-                        scope=str(package.package_id),
+            await _await_db_operation(
+                stage="commissioned_campaign_commission",
+                root_idempotency_key=root_idempotency_key,
+                operation=commission_commissioned_campaign(
+                    db=db,
+                    request=CommissionedCampaignCommissionRequest(
+                        campaign_id=campaign_id,
+                        version=campaign_version,
+                        actor=actor,
+                        commissioning_reason=rationale,
+                        preview_identity_hash=preview_response.preview_identity_hash,
+                        requested_quote_amount=amount_usd,
+                        idempotency_key=_commission_phase_idempotency_key(
+                            root_idempotency_key=root_idempotency_key,
+                            phase="commissioned_campaign_commission",
+                            scope=str(package.package_id),
+                        ),
+                        authorization_expires_at=approval_event.expires_at,
+                        commissioned_until=activation.expires_at if activation is not None else approval_event.expires_at,
+                        readiness_request=readiness_request,
                     ),
-                    authorization_expires_at=approval_event.expires_at,
-                    commissioned_until=activation.expires_at if activation is not None else approval_event.expires_at,
-                    readiness_request=readiness_request,
                 ),
             )
             commissioned_state = "COMMISSIONED"
 
-        current_definition = await _load_campaign_definition_by_identity(db=db, campaign_id=campaign_id, version=campaign_version)
+        current_definition = await _await_db_operation(
+            stage="current_definition_reload_pre_submission",
+            root_idempotency_key=root_idempotency_key,
+            operation=_load_campaign_definition_by_identity(db=db, campaign_id=campaign_id, version=campaign_version),
+        )
         current_blob = _commissioned_blob_from_definition(current_definition)
         current_state = str(current_blob.get("state") or commissioned_state)
         current_entry_execution = current_blob.get("entry_execution") if isinstance(current_blob.get("entry_execution"), dict) else {}
@@ -5808,10 +6079,15 @@ async def canonical_proving_commission_bundle(
         confirmation_challenge_id: UUID | None = None
 
         if current_state == "BUY_PENDING" and live_crypto_order_id is not None:
-            live_order = await db.scalar(
-                select(LiveCryptoOrder)
-                .where(LiveCryptoOrder.live_crypto_order_id == live_crypto_order_id)
-                .limit(1)
+            _log_commission_stage(stage="provider_submission_boundary", status="started", root_idempotency_key=root_idempotency_key)
+            live_order = await _await_db_operation(
+                stage="buy_pending_order_reload",
+                root_idempotency_key=root_idempotency_key,
+                operation=db.scalar(
+                    select(LiveCryptoOrder)
+                    .where(LiveCryptoOrder.live_crypto_order_id == live_crypto_order_id)
+                    .limit(1)
+                ),
             )
             if live_order is None or live_order.operator_confirmation_id is None:
                 raise PermissionError("BUY_PENDING resume requires persisted live order confirmation identity")
@@ -5850,7 +6126,9 @@ async def canonical_proving_commission_bundle(
                 ),
             )
             current_state = execution_response.current_state
+            _log_commission_stage(stage="provider_submission_boundary", status="completed", root_idempotency_key=root_idempotency_key)
         elif current_state not in _COMMISSIONED_RECONCILIATION_STATES:
+            _log_commission_stage(stage="live_order_preparation", status="started", root_idempotency_key=root_idempotency_key)
             prepare_response = await LiveCryptoOrderService().prepare_confirmation(
                 db=db,
                 request=LiveCryptoOrderPrepareRequest(
@@ -5864,9 +6142,11 @@ async def canonical_proving_commission_bundle(
                     ),
                 ),
             )
+            _log_commission_stage(stage="live_order_preparation", status="completed", root_idempotency_key=root_idempotency_key)
             live_crypto_order_id = prepare_response.live_crypto_order.live_crypto_order_id
             confirmation_challenge_id = prepare_response.confirmation_challenge_id
             policy = await resolve_effective_risk_policy(db=db, paper_account_id=paper_account_id)
+            _log_commission_stage(stage="provider_submission_boundary", status="started", root_idempotency_key=root_idempotency_key)
             execution_response = await execute_commissioned_entry(
                 db=db,
                 request=CommissionedEntryExecutionRequest(
@@ -5902,6 +6182,7 @@ async def canonical_proving_commission_bundle(
             )
             current_state = execution_response.current_state
             live_crypto_order_id = execution_response.live_crypto_order_id or live_crypto_order_id
+            _log_commission_stage(stage="provider_submission_boundary", status="completed", root_idempotency_key=root_idempotency_key)
 
         reconcile_payload = None
         current_definition = await _load_campaign_definition_by_identity(db=db, campaign_id=campaign_id, version=campaign_version)
@@ -5926,6 +6207,7 @@ async def canonical_proving_commission_bundle(
             )
             current_state = reconcile_payload.current_state
 
+        _log_commission_stage(stage="finalizing_commission_result", status="started", root_idempotency_key=root_idempotency_key)
         status_payload = await canonical_proving_commission_status(
             campaign_id=campaign_id,
             campaign_version=campaign_version,
@@ -5935,6 +6217,7 @@ async def canonical_proving_commission_bundle(
             environment=environment,
             product=product,
         )
+        _log_commission_stage(stage="finalizing_commission_result", status="completed", root_idempotency_key=root_idempotency_key, current_state=current_state)
         return {
             "campaign_id": str(campaign_id),
             "campaign_version": campaign_version,
@@ -5961,10 +6244,22 @@ async def canonical_proving_commission_status(
 ) -> dict[str, Any]:
     async with AsyncSessionLocal() as db:
         definition = await _load_campaign_definition_by_identity(db=db, campaign_id=campaign_id, version=campaign_version)
-        package = await _load_latest_forced_canonical_package(db=db, campaign_id=campaign_id)
+        package = await _await_db_operation(
+            stage="latest_forced_package_lookup",
+            root_idempotency_key=f"status:{campaign_id}",
+            operation=_load_latest_forced_canonical_package(db=db, campaign_id=campaign_id),
+        )
         approval_event = await _load_latest_approval_for_package(db=db, package=package)
-        activation = await _load_activation_for_package(db=db, package=package)
-        preview = await _load_preview_for_package_row(db=db, package=package)
+        activation = await _await_db_operation(
+            stage="activation_lookup",
+            root_idempotency_key=f"status:{campaign_id}",
+            operation=_load_activation_for_package(db=db, package=package),
+        )
+        preview = await _await_db_operation(
+            stage="preview_lookup",
+            root_idempotency_key=f"status:{campaign_id}",
+            operation=_load_preview_for_package_row(db=db, package=package),
+        )
         commissioned_status = await _get_commissioned_control_plane_status(db=db, campaign_id=campaign_id, version=campaign_version)
         commissioned_blob = _commissioned_blob_from_definition(definition)
         chain_summary = _commissioning_status_summary(blob=commissioned_blob)
