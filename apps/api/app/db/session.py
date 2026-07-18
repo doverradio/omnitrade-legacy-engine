@@ -8,11 +8,6 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_asyn
 
 from app.core.errors import ServiceUnavailableError
 from app.config import get_settings
-from app.db.tracing import (  # TEMPORARY diagnostic instrumentation
-    describe_transaction_state,
-    instrument_session_calls,
-    new_correlation_id,
-)
 
 settings = get_settings()
 logger = logging.getLogger(__name__)
@@ -43,16 +38,11 @@ async def join_or_begin_transaction(db: AsyncSession) -> AsyncIterator[None]:
     Persistence helpers that may be called either standalone or nested inside
     a caller-owned transaction must use this instead of `db.begin()` directly.
     """
-    logger.info("[TRACE] entering _join_or_begin_transaction | %s", describe_transaction_state(db))
     in_transaction = getattr(db, "in_transaction", None)
     if callable(in_transaction) and in_transaction():
-        logger.info("[TRACE] _join_or_begin_transaction taking JOIN branch | %s", describe_transaction_state(db))
         yield
         return
-    logger.info("[TRACE] _join_or_begin_transaction taking BEGIN branch | %s", describe_transaction_state(db))
-    logger.info("[TRACE] immediately BEFORE db.begin() | %s", describe_transaction_state(db))
     async with db.begin():
-        logger.info("[TRACE] immediately AFTER db.begin() | %s", describe_transaction_state(db))
         yield
 
 _RETRYABLE_DB_ERROR_SUBSTRINGS = (
@@ -142,19 +132,8 @@ async def run_read_with_retry(
 
 async def get_db() -> AsyncGenerator[AsyncSession, None]:
     async with AsyncSessionLocal() as session:
-        # TEMPORARY diagnostic instrumentation for the live reconciliation
-        # transaction investigation. Logging only; remove once one complete
-        # production trace of the InvalidRequestError has been captured.
-        session._trace_correlation_id = new_correlation_id()
-        instrument_session_calls(session)
-        logger.info("[TRACE] get_db() yielded session | %s", describe_transaction_state(session))
         try:
             yield session
         except Exception:
-            logger.info(
-                "[TRACE] get_db() caught exception, invalidating session | %s",
-                describe_transaction_state(session),
-            )
             await _invalidate_session(session)
             raise
-        logger.info("[TRACE] get_db() normal exit | %s", describe_transaction_state(session))

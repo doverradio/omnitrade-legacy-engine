@@ -9,7 +9,6 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.db.session import join_or_begin_transaction
-from app.db.tracing import trace_calls  # TEMPORARY diagnostic instrumentation
 from app.models.live_accounting_record import LiveAccountingRecord
 from app.models.live_approval_event import LiveApprovalEvent
 from app.models.live_audit_evidence_record import LiveAuditEvidenceRecord
@@ -75,7 +74,6 @@ def build_live_provenance_integrity_hash(
     return hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
 
-@trace_calls("record_live_audit_evidence")  # TEMPORARY diagnostic instrumentation
 async def record_live_audit_evidence(
     *,
     db: AsyncSession,

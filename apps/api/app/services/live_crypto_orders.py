@@ -11,7 +11,6 @@ from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import get_settings
-from app.db.tracing import trace_calls  # TEMPORARY diagnostic instrumentation
 from app.models.asset import Asset
 from app.models.capital_campaign import CapitalCampaign
 from app.models.canonical_preview_package import CanonicalPreviewPackage
@@ -2125,7 +2124,6 @@ class LiveCryptoOrderService:
 
         return self._existing_submit_response(live_order=live_order)
 
-    @trace_calls("LiveCryptoOrderService.reconcile")  # TEMPORARY diagnostic instrumentation
     async def reconcile(
         self,
         *,

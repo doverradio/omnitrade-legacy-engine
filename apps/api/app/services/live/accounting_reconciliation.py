@@ -11,7 +11,6 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import get_settings
 from app.db.session import join_or_begin_transaction as _join_or_begin_transaction
-from app.db.tracing import trace_calls  # TEMPORARY diagnostic instrumentation
 from app.models.capital_campaign import CapitalCampaign
 from app.models.live_accounting_record import LiveAccountingRecord
 from app.models.live_execution_event import LiveExecutionEvent
@@ -133,7 +132,6 @@ def _event_is_stale(*, now: datetime, observed_at: datetime | None, max_age_seco
     return (now - observed_at).total_seconds() > max_age_seconds
 
 
-@trace_calls("_resolve_campaign_for_live_order")  # TEMPORARY diagnostic instrumentation
 async def _resolve_campaign_for_live_order(
     *,
     db: AsyncSession,
@@ -177,7 +175,6 @@ async def _resolve_campaign_for_live_order(
     return campaign, "verified"
 
 
-@trace_calls("_ensure_execution_source")  # TEMPORARY diagnostic instrumentation
 async def _ensure_execution_source(
     *,
     db: AsyncSession,
@@ -244,7 +241,6 @@ async def _ensure_execution_source(
     return event
 
 
-@trace_calls("reconcile_live_order_and_fills")  # TEMPORARY diagnostic instrumentation
 async def reconcile_live_order_and_fills(
     *,
     db: AsyncSession,
@@ -803,7 +799,6 @@ def build_live_reconciliation_event_hash(
     return hashlib.sha256(blob.encode("utf-8")).hexdigest()
 
 
-@trace_calls("record_live_order_reconciliation")  # TEMPORARY diagnostic instrumentation
 async def record_live_order_reconciliation(
     *,
     db: AsyncSession,
@@ -926,7 +921,6 @@ async def record_live_order_reconciliation(
     )
 
 
-@trace_calls("record_live_fill_reconciliation")  # TEMPORARY diagnostic instrumentation
 async def record_live_fill_reconciliation(
     *,
     db: AsyncSession,
