@@ -564,6 +564,8 @@ async def test_conformance_22_lookup_open_closed_and_fills_normalization(monkeyp
     client = KrakenSpotClient()
 
     async def _private(*, path, payload, **_kwargs):
+        if path == "/private/QueryOrders":
+            return {"error": [], "result": {}}
         if path == "/private/OpenOrders":
             return {
                 "error": [],
@@ -646,6 +648,78 @@ async def test_conformance_22_lookup_open_closed_and_fills_normalization(monkeyp
     assert fills[0].provider_fill_id == "123"
     assert fills[0].fee is not None
     assert fills[0].fee.currency == "USD"
+
+
+@pytest.mark.asyncio
+async def test_lookup_known_txid_uses_query_orders_and_accepts_rest_pair_format(monkeypatch: pytest.MonkeyPatch) -> None:
+    client = KrakenSpotClient()
+    paths: list[str] = []
+
+    async def _private(*, path, payload, **_kwargs):
+        paths.append(path)
+        assert path == "/private/QueryOrders"
+        assert payload == {"txid": "OAXUZJ-7WRL5-NPFWYA", "trades": "true"}
+        return {
+            "error": [],
+            "result": {
+                "OAXUZJ-7WRL5-NPFWYA": {
+                    "status": "closed",
+                    "cl_ord_id": "60fd004d-c15b-5b01-a863-05a84379bb60",
+                    "opentm": 1784351307.0,
+                    "closetm": 1784351308.0,
+                    "vol": "0.00007817",
+                    "vol_exec": "0.00007817",
+                    "descr": {"pair": "XBTUSD", "type": "buy"},
+                }
+            },
+        }
+
+    monkeypatch.setattr(client, "_private_request", _private)
+    order = await client.lookup_order(
+        credentials={"api_key": "k", "api_secret": "s"},
+        environment="production",
+        provider_order_id="OAXUZJ-7WRL5-NPFWYA",
+        client_order_id="60fd004d-c15b-5b01-a863-05a84379bb60",
+        product_id="BTC-USD",
+    )
+
+    assert order is not None
+    assert order.status == "FILLED"
+    assert order.provider_order_id == "OAXUZJ-7WRL5-NPFWYA"
+    assert paths == ["/private/QueryOrders"]
+
+
+@pytest.mark.asyncio
+async def test_known_order_fill_lookup_queries_exact_trade_ids_and_preserves_fees(monkeypatch: pytest.MonkeyPatch) -> None:
+    client = KrakenSpotClient()
+    paths: list[str] = []
+
+    async def _private(*, path, payload, **_kwargs):
+        paths.append(path)
+        if path == "/private/QueryOrders":
+            return {"error": [], "result": {"ORDER-1": {"trades": ["TRADE-1", "TRADE-2"]}}}
+        if path == "/private/QueryTrades":
+            assert payload["txid"] == "TRADE-1,TRADE-2"
+            return {
+                "error": [],
+                "result": {
+                    "TRADE-1": {"ordertxid": "ORDER-1", "pair": "XBTUSD", "time": 1710000021.0, "price": "60000", "vol": "0.00004", "fee": "0.005"},
+                    "TRADE-2": {"ordertxid": "ORDER-1", "pair": "XBTUSD", "time": 1710000022.0, "price": "65000", "vol": "0.00004", "fee": "0.006"},
+                },
+            }
+        raise AssertionError(f"unexpected private path {path}")
+
+    monkeypatch.setattr(client, "_private_request", _private)
+    fills = await client.list_fills(
+        credentials={"api_key": "k", "api_secret": "s"},
+        environment="production",
+        provider_order_id="ORDER-1",
+    )
+
+    assert [fill.provider_fill_id for fill in fills] == ["TRADE-1", "TRADE-2"]
+    assert sum((fill.size for fill in fills), Decimal("0")) == Decimal("0.00008")
+    assert sum((fill.fee.amount for fill in fills if fill.fee is not None), Decimal("0")) == Decimal("0.011")
+    assert paths == ["/private/QueryOrders", "/private/QueryTrades"]
 
 
 def test_conformance_23_coinbase_behavior_unchanged() -> None:

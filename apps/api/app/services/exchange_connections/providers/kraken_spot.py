@@ -73,6 +73,21 @@ def _parse_kraken_timestamp(payload: dict[str, Any]) -> datetime | None:
     return None
 
 
+def _kraken_pair_key(value: str) -> str:
+    key = "".join(character for character in value.upper() if character.isalnum())
+    if key.startswith("BTC"):
+        key = f"XBT{key[3:]}"
+    if key.startswith("XXBT"):
+        key = f"XBT{key[4:]}"
+    if key.endswith("ZUSD"):
+        key = f"{key[:-4]}USD"
+    return key
+
+
+def _kraken_pair_matches(*, actual: str, expected: str | None) -> bool:
+    return expected is None or _kraken_pair_key(actual) == _kraken_pair_key(expected)
+
+
 def _strip_kraken_asset_suffix(asset: str) -> str:
     if "." in asset:
         return asset.split(".", 1)[0]
@@ -1281,6 +1296,50 @@ class KrakenSpotClient:
         if product_id is not None:
             normalized_product, normalized_pair = _normalize_intent_product(product_id)
 
+        if provider_order_id is not None:
+            exact_payload = await self._private_request(
+                path="/private/QueryOrders",
+                environment=environment,
+                credentials=credentials,
+                payload={"txid": provider_order_id, "trades": "true"},
+            )
+            exact_rows = exact_payload.get("result") if isinstance(exact_payload.get("result"), dict) else {}
+            exact_row = exact_rows.get(provider_order_id) if isinstance(exact_rows, dict) else None
+            if isinstance(exact_row, dict):
+                exact_client_order_id = str(exact_row.get("cl_ord_id") or "")
+                descr = exact_row.get("descr") if isinstance(exact_row.get("descr"), dict) else {}
+                pair = str(descr.get("pair") or "")
+                if not _kraken_pair_matches(actual=pair, expected=normalized_pair):
+                    return None
+                raw_status = str(exact_row.get("status") or "").lower()
+                vol = _to_decimal(exact_row.get("vol"))
+                vol_exec = _to_decimal(exact_row.get("vol_exec"))
+                if raw_status in {"canceled", "expired"}:
+                    status = "CANCELLED"
+                elif raw_status == "closed" and vol > Decimal("0") and vol_exec >= vol:
+                    status = "FILLED"
+                elif vol_exec > Decimal("0") and raw_status in {"closed", "canceled", "expired"}:
+                    status = "PARTIALLY_FILLED"
+                elif raw_status == "closed":
+                    status = "CLOSED"
+                elif raw_status in {"pending", "open"}:
+                    status = raw_status.upper()
+                else:
+                    status = raw_status.upper() if raw_status else "UNKNOWN"
+                close_timestamp = _parse_kraken_timestamp(
+                    {"closetm": exact_row.get("closetm"), "time": exact_row.get("time")}
+                )
+                return ExchangeProviderOrder(
+                    provider_order_id=provider_order_id,
+                    client_order_id=exact_client_order_id or client_order_id,
+                    product_id=normalized_product,
+                    side=str(descr.get("type") or "").upper() or None,
+                    status=status,
+                    submitted_at=close_timestamp or _parse_kraken_timestamp(exact_row),
+                    acknowledged_at=_parse_kraken_timestamp(exact_row),
+                    raw=_redact_sensitive(exact_row),
+                )
+
         open_payload = await self._private_request(
             path="/private/OpenOrders",
             environment=environment,
@@ -1297,7 +1356,7 @@ class KrakenSpotClient:
                 if client_order_id is not None and str(row.get("cl_ord_id") or "") != client_order_id:
                     continue
                 pair = str((row.get("descr") or {}).get("pair") or "") if isinstance(row.get("descr"), dict) else ""
-                if normalized_pair is not None and pair.replace("-", "/").upper() != normalized_pair.upper():
+                if not _kraken_pair_matches(actual=pair, expected=normalized_pair):
                     continue
                 status = str(row.get("status") or "open").upper()
                 return ExchangeProviderOrder(
@@ -1331,7 +1390,7 @@ class KrakenSpotClient:
             if client_order_id is not None and str(row.get("cl_ord_id") or "") != client_order_id:
                 continue
             pair = str((row.get("descr") or {}).get("pair") or "") if isinstance(row.get("descr"), dict) else ""
-            if normalized_pair is not None and pair.replace("-", "/").upper() != normalized_pair.upper():
+            if not _kraken_pair_matches(actual=pair, expected=normalized_pair):
                 continue
             raw_status = str(row.get("status") or "").lower()
             vol = _to_decimal(row.get("vol"))
@@ -1369,13 +1428,31 @@ class KrakenSpotClient:
         environment: str,
         provider_order_id: str,
     ) -> list[ExchangeProviderFill]:
-        payload = await self._private_request(
-            path="/private/TradesHistory",
+        order_payload = await self._private_request(
+            path="/private/QueryOrders",
             environment=environment,
             credentials=credentials,
-            payload={"trades": "false", "without_count": "true"},
+            payload={"txid": provider_order_id, "trades": "true"},
         )
-        rows = (payload.get("result") or {}).get("trades") if isinstance(payload.get("result"), dict) else {}
+        order_rows = order_payload.get("result") if isinstance(order_payload.get("result"), dict) else {}
+        order_row = order_rows.get(provider_order_id) if isinstance(order_rows, dict) else None
+        trade_ids = order_row.get("trades") if isinstance(order_row, dict) and isinstance(order_row.get("trades"), list) else []
+        if trade_ids:
+            payload = await self._private_request(
+                path="/private/QueryTrades",
+                environment=environment,
+                credentials=credentials,
+                payload={"txid": ",".join(str(item) for item in trade_ids), "trades": "false"},
+            )
+            rows = payload.get("result") if isinstance(payload.get("result"), dict) else {}
+        else:
+            payload = await self._private_request(
+                path="/private/TradesHistory",
+                environment=environment,
+                credentials=credentials,
+                payload={"trades": "false", "without_count": "true"},
+            )
+            rows = (payload.get("result") or {}).get("trades") if isinstance(payload.get("result"), dict) else {}
         if not isinstance(rows, dict):
             return []
 

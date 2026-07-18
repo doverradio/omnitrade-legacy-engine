@@ -391,11 +391,19 @@ async def test_canonical_reconciliation_discovers_provider_order_and_persists_fi
                 "fills": [
                     {
                         "trade_id": "fill-1",
-                        "price": "100000.00",
-                        "size": "0.00005",
-                        "commission": "0.01",
+                        "price": "90000.00",
+                        "size": "0.00002",
+                        "commission": "0.004",
                         "commission_currency": "USD",
                         "created_at": "2026-07-10T12:00:01Z",
+                    },
+                    {
+                        "trade_id": "fill-2",
+                        "price": "110000.00",
+                        "size": "0.00003",
+                        "commission": "0.006",
+                        "commission_currency": "USD",
+                        "created_at": "2026-07-10T12:00:02Z",
                     }
                 ]
             }, {}
@@ -412,9 +420,13 @@ async def test_canonical_reconciliation_discovers_provider_order_and_persists_fi
     )
 
     assert outcome["provider_order_id"] == "provider-order-1"
-    assert isinstance(outcome["provider_fill_observed"], bool)
-    assert len(session.reconciliation_events) >= 2
-    assert len(session.accounting_records) >= 2
+    assert outcome["provider_fill_observed"] is True
+    assert outcome["reconciliation_status"] == "FILLED"
+    assert outcome["filled_quantity"] == "0.00005"
+    assert outcome["provider_fees"] == "0.010"
+    assert outcome["safe_provider_response"]["weighted_average_fill_price"] == "102000.00"
+    assert len(session.reconciliation_events) >= 3
+    assert len(session.accounting_records) == 4
 
 
 @pytest.mark.asyncio
@@ -498,7 +510,7 @@ async def test_canonical_reconciliation_marks_unresolved_when_balance_materially
     async def _load_exchange_connection(*_args, **_kwargs):
         return type("Conn", (), {
             "exchange_connection_id": live_order.exchange_connection_id,
-            "balances": [{"currency": "USD", "available": "95.00"}],
+                "balances": [{"currency": "USD", "available": "95.10"}],
             "last_verified_at": "2026-07-10T12:00:05+00:00",
             "last_successful_sync_at": "2026-07-10T12:00:05+00:00",
             "last_heartbeat_at": "2026-07-10T12:00:05+00:00",

@@ -2141,6 +2141,7 @@ class LiveCryptoOrderService:
             live_crypto_order_id=live_crypto_order_id,
             operator_identity=request.operator_identity,
         )
+        await _commit_if_supported(db=db)
         if hasattr(db, "refresh"):
             await db.refresh(live_order)
 

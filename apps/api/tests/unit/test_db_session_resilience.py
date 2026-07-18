@@ -1,12 +1,16 @@
 from __future__ import annotations
 
 from collections.abc import Callable
+import importlib
 from typing import Any
+from types import SimpleNamespace
 
 import pytest
 
 from app.core.errors import ServiceUnavailableError
+import app.config as config_module
 from app.db import session as session_module
+import sqlalchemy.ext.asyncio as sa_async
 
 
 class _FakeConnection:
@@ -123,3 +127,42 @@ async def test_run_read_with_retry_does_not_retry_non_retryable_error(monkeypatc
 
     assert attempts["count"] == 1
     assert sessions[0].rollback_calls == 0
+
+
+def test_engine_uses_bounded_asyncpg_timeouts(monkeypatch: pytest.MonkeyPatch) -> None:
+    captured: dict[str, Any] = {}
+
+    class _FakeEngine:
+        async def dispose(self) -> None:
+            return None
+
+    fake_settings = SimpleNamespace(
+        database_url="postgresql+asyncpg://postgres:postgres@localhost:5432/omnitrade",
+        database_pool_recycle_seconds=1800,
+        database_pool_size=10,
+        database_max_overflow=20,
+        database_pool_timeout_seconds=30,
+        database_connect_timeout_seconds=5,
+        database_command_timeout_seconds=10,
+    )
+
+    def _fake_create_async_engine(url: str, **kwargs: Any) -> _FakeEngine:
+        captured["url"] = url
+        captured["kwargs"] = kwargs
+        return _FakeEngine()
+
+    monkeypatch.setattr(config_module, "get_settings", lambda: fake_settings)
+    monkeypatch.setattr(sa_async, "create_async_engine", _fake_create_async_engine)
+    monkeypatch.setattr(sa_async, "async_sessionmaker", lambda *args, **kwargs: "SESSION_FACTORY")
+
+    reloaded = importlib.reload(session_module)
+
+    assert captured["url"] == fake_settings.database_url
+    assert captured["kwargs"]["pool_pre_ping"] is True
+    assert captured["kwargs"]["pool_timeout"] == fake_settings.database_pool_timeout_seconds
+    assert captured["kwargs"]["connect_args"]["timeout"] == fake_settings.database_connect_timeout_seconds
+    assert captured["kwargs"]["connect_args"]["command_timeout"] == fake_settings.database_command_timeout_seconds
+    assert reloaded.AsyncSessionLocal == "SESSION_FACTORY"
+
+    monkeypatch.undo()
+    importlib.reload(session_module)

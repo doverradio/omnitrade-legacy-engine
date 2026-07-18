@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 import uuid
+from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from decimal import Decimal
 
@@ -27,6 +28,16 @@ from app.services.live.contracts import (
     LiveOrderReconciliationRequest,
     LiveReconciliationResult,
 )
+
+
+@asynccontextmanager
+async def _join_or_begin_transaction(db: AsyncSession):
+    in_transaction = getattr(db, "in_transaction", None)
+    if callable(in_transaction) and in_transaction():
+        yield
+        return
+    async with db.begin():
+        yield
 
 
 def build_live_reconciliation_idempotency_key(
@@ -249,7 +260,6 @@ async def reconcile_live_order_and_fills(
     live_order = await db.scalar(
         select(LiveCryptoOrder)
         .where(LiveCryptoOrder.live_crypto_order_id == live_crypto_order_id)
-        .with_for_update()
         .limit(1)
     )
     if live_order is None:
@@ -371,6 +381,38 @@ async def reconcile_live_order_and_fills(
         await db.flush()
         return {"reconciliation_status": live_order.status, "provider_status": live_order.provider_status, "provider_order_id": live_order.provider_order_id, "provider_fill_observed": False, "safe_provider_response": {"reason": "provider_order_not_found"}}
 
+    if provider_order.client_order_id and provider_order.client_order_id != provider_client_order_id:
+        live_order.status = "RECONCILIATION_REQUIRED"
+        live_order.failure_code = "provider_client_order_id_conflict"
+        live_order.failure_reason = json.dumps(
+            {"expected": provider_client_order_id, "observed": provider_order.client_order_id}
+        )
+        await record_live_order_reconciliation(
+            db=db,
+            request=LiveOrderReconciliationRequest(
+                live_trading_profile_id=profile.id,
+                source_execution_event_id=source_event.id,
+                provider_name=live_order.provider,
+                provider_order_id=provider_order.provider_order_id,
+                client_order_id=live_order.client_order_id,
+                reconciliation_status="conflict",
+                live_crypto_order_id=live_order.live_crypto_order_id,
+                capital_campaign_id=None if campaign is None else campaign.id,
+                provider_recorded_at=provider_order.submitted_at,
+                requested_by=operator_identity,
+                provenance_metadata={"reason": "provider_client_order_id_conflict"},
+                idempotency_key=f"lco-reconcile:{live_order.live_crypto_order_id}:provider-client-id-conflict",
+            ),
+        )
+        await db.flush()
+        return {
+            "reconciliation_status": live_order.status,
+            "provider_status": provider_order.status,
+            "provider_order_id": live_order.provider_order_id,
+            "provider_fill_observed": False,
+            "safe_provider_response": {"reason": "provider_client_order_id_conflict"},
+        }
+
     discovered_provider_order_id = provider_order.provider_order_id
     if discovered_provider_order_id and live_order.provider_order_id and live_order.provider_order_id != discovered_provider_order_id:
         await record_live_order_reconciliation(
@@ -460,6 +502,14 @@ async def reconcile_live_order_and_fills(
                         raw=item,
                     )
                 )
+        valid_fill_quantity = sum(
+            (_decimal(fill.size) for fill in fills if fill.provider_fill_id is not None and _decimal(fill.size) > Decimal("0")),
+            Decimal("0"),
+        )
+        provider_order_quantity_raw = provider_order.raw.get("vol") if isinstance(provider_order.raw, dict) else None
+        provider_order_quantity = _decimal(provider_order_quantity_raw) if provider_order_quantity_raw is not None else Decimal("0")
+        order_fill_quantity = provider_order_quantity if provider_order_quantity > Decimal("0") else valid_fill_quantity
+        cumulative = Decimal("0")
         for index, fill in enumerate(fills):
             provider_fill_id = fill.provider_fill_id
             if provider_fill_id is None:
@@ -470,7 +520,7 @@ async def reconcile_live_order_and_fills(
             price = _decimal(fill.price)
             fee = _decimal("0") if fill.fee is None else _decimal(fill.fee.amount)
             fee_currency = "USD" if fill.fee is None else str(fill.fee.currency)
-            cumulative = size
+            cumulative += size
             fill_time = fill.occurred_at
 
             result = await record_live_fill_reconciliation(
@@ -486,7 +536,7 @@ async def reconcile_live_order_and_fills(
                     side=live_order.side.lower(),
                     fill_quantity=format(size, "f"),
                     cumulative_filled_quantity=format(cumulative, "f"),
-                    order_quantity=format(live_order.requested_quote_size, "f"),
+                    order_quantity=format(order_fill_quantity, "f"),
                     fill_price=format(price, "f"),
                     fee_amount=format(fee, "f"),
                     fee_currency=fee_currency,
@@ -514,6 +564,8 @@ async def reconcile_live_order_and_fills(
     total_quote_notional = sum((_decimal(row.gross_notional) for row in fill_rows), Decimal("0"))
     total_fees_by_currency: dict[str, Decimal] = {}
     for row in accounting_rows:
+        if row.record_type != "fee_attribution":
+            continue
         total_fees_by_currency[row.fee_currency] = total_fees_by_currency.get(row.fee_currency, Decimal("0")) + _decimal(row.fee_amount)
 
     weighted_average_fill_price: Decimal | None = None
@@ -577,7 +629,7 @@ async def reconcile_live_order_and_fills(
     if normalized_status in {"filled", "canceled", "rejected"}:
         if normalized_status == "filled" and total_filled_quantity > Decimal("0"):
             live_order.status = "FILLED"
-            live_order.filled_at = live_order.filled_at or _utcnow()
+            live_order.filled_at = live_order.filled_at or provider_recorded_at or _utcnow()
         elif normalized_status == "canceled" and total_filled_quantity > Decimal("0"):
             live_order.status = "PARTIALLY_FILLED"
             live_order.cancelled_at = live_order.cancelled_at or _utcnow()
@@ -586,13 +638,16 @@ async def reconcile_live_order_and_fills(
             live_order.cancelled_at = live_order.cancelled_at or _utcnow()
         else:
             live_order.status = "REJECTED"
+    elif normalized_status == "partially_filled":
+        live_order.status = "PARTIALLY_FILLED" if total_filled_quantity > Decimal("0") else "RECONCILIATION_REQUIRED"
     elif normalized_status == "unknown":
         live_order.status = "UNKNOWN"
     else:
         live_order.status = "ACKNOWLEDGED"
 
     if balance_mismatch_state in {"missing", "stale", "material_mismatch"}:
-        live_order.status = "RECONCILIATION_REQUIRED"
+        if balance_mismatch_state == "material_mismatch":
+            live_order.status = "RECONCILIATION_REQUIRED"
         mismatch_status = "balance_mismatch" if balance_mismatch_state == "material_mismatch" else "reconciliation_required"
         await record_live_order_reconciliation(
             db=db,
@@ -817,7 +872,7 @@ async def record_live_order_reconciliation(
         )
 
     recorded_at = datetime.now(timezone.utc)
-    async with db.begin():
+    async with _join_or_begin_transaction(db):
         existing_sequence = await db.scalar(
             select(func.max(LiveReconciliationEvent.sequence_number)).where(
                 LiveReconciliationEvent.live_trading_profile_id == request.live_trading_profile_id
@@ -959,7 +1014,7 @@ async def record_live_fill_reconciliation(
         net_cash_impact = net_cash_impact * Decimal("-1")
 
     recorded_at = datetime.now(timezone.utc)
-    async with db.begin():
+    async with _join_or_begin_transaction(db):
         existing_sequence = await db.scalar(
             select(func.max(LiveReconciliationEvent.sequence_number)).where(
                 LiveReconciliationEvent.live_trading_profile_id == request.live_trading_profile_id
