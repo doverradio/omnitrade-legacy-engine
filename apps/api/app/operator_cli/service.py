@@ -574,14 +574,13 @@ def _package_requires_refresh(
 ) -> bool:
     if package is None or preview is None:
         return True
-    if package.preview_expires_at <= now + timedelta(seconds=_PROVING_REFRESH_GRACE_SECONDS):
-        return True
     if package.package_state in _TERMINAL_PACKAGE_STATES:
         return True
-    if package.package_state == "ACTIVATED":
-        return not _activation_is_active(activation, now=now)
-    if package.package_state == "DRY_RUN_PASSED":
-        return not _approval_is_active(approval_event, now=now)
+    if package.dry_run_live_crypto_order_id is not None and package.package_state in {"AUTHORIZED", "DRY_RUN_PASSED", "ACTIVATED"}:
+        # Never supersede a post-dry-run package identity from commission resume flow.
+        return False
+    if package.preview_expires_at <= now + timedelta(seconds=_PROVING_REFRESH_GRACE_SECONDS):
+        return True
     if package.package_state == "AUTHORIZED":
         return not _approval_is_active(approval_event, now=now)
     return False
@@ -5508,7 +5507,52 @@ async def canonical_proving_commission_bundle(
 
                 if package.package_state == "AUTHORIZED":
                     if not _approval_is_active(approval_event, now=now):
+                        if package.dry_run_live_crypto_order_id is not None:
+                            renewed_approval_expires_at = now + timedelta(minutes=5)
+                            await authorize_canonical_preview_package(
+                                db=db,
+                                request=CanonicalPreviewPackageAuthorizeRequest(
+                                    package_id=package.package_id,
+                                    actor=actor,
+                                    approver_role=approver_role,
+                                    rationale=rationale,
+                                    expires_at=renewed_approval_expires_at,
+                                    max_order_usd=amount_usd,
+                                    max_total_deployed_campaign_capital_usd=amount_usd,
+                                    no_leverage=True,
+                                    idempotency_key=_commission_phase_idempotency_key(
+                                        root_idempotency_key=root_idempotency_key,
+                                        phase="canonical_package_authorize",
+                                        scope=str(package.package_id),
+                                    ),
+                                ),
+                            )
+                            await db.commit()
+                            approval_event = await _load_latest_approval_for_package(db=db, package=package)
+                            continue
                         package = None
+                        continue
+                    if package.dry_run_live_crypto_order_id is not None:
+                        activated = await activate_canonical_proving_campaign(
+                            db=db,
+                            request=CanonicalPreviewPackageActivationRequest(
+                                package_id=package.package_id,
+                                approval_event_id=approval_event.id,
+                                dry_run_live_crypto_order_id=package.dry_run_live_crypto_order_id,
+                                actor=actor,
+                                expires_at=approval_event.expires_at,
+                                idempotency_key=_commission_phase_idempotency_key(
+                                    root_idempotency_key=root_idempotency_key,
+                                    phase="canonical_proving_activate",
+                                    scope=str(package.package_id),
+                                ),
+                            ),
+                        )
+                        await db.commit()
+                        activation_payload = activated.get("activation") if isinstance(activated.get("activation"), dict) else {}
+                        activation = await _load_activation_for_package(db=db, package=package)
+                        if not activation_payload:
+                            raise PermissionError("canonical proving activation missing after activation")
                         continue
                     await run_dry_run_for_canonical_preview_package(
                         db=db,
@@ -5532,8 +5576,30 @@ async def canonical_proving_commission_bundle(
                     continue
 
                 if package.package_state == "DRY_RUN_PASSED":
+                    if package.dry_run_live_crypto_order_id is None:
+                        raise PermissionError("canonical proving dry-run evidence missing")
                     if not _approval_is_active(approval_event, now=now):
-                        package = None
+                        renewed_approval_expires_at = now + timedelta(minutes=5)
+                        await authorize_canonical_preview_package(
+                            db=db,
+                            request=CanonicalPreviewPackageAuthorizeRequest(
+                                package_id=package.package_id,
+                                actor=actor,
+                                approver_role=approver_role,
+                                rationale=rationale,
+                                expires_at=renewed_approval_expires_at,
+                                max_order_usd=amount_usd,
+                                max_total_deployed_campaign_capital_usd=amount_usd,
+                                no_leverage=True,
+                                idempotency_key=_commission_phase_idempotency_key(
+                                    root_idempotency_key=root_idempotency_key,
+                                    phase="canonical_package_authorize",
+                                    scope=str(package.package_id),
+                                ),
+                            ),
+                        )
+                        await db.commit()
+                        approval_event = await _load_latest_approval_for_package(db=db, package=package)
                         continue
                     activated = await activate_canonical_proving_campaign(
                         db=db,
@@ -5559,7 +5625,52 @@ async def canonical_proving_commission_bundle(
 
                 if package.package_state == "ACTIVATED":
                     if not _activation_is_active(activation, now=now):
-                        raise PermissionError("activated proving package expired before submission; manual recovery required")
+                        if package.dry_run_live_crypto_order_id is None:
+                            raise PermissionError("activated proving package missing dry-run evidence; manual recovery required")
+                        renewed_approval_expires_at = now + timedelta(minutes=5)
+                        await authorize_canonical_preview_package(
+                            db=db,
+                            request=CanonicalPreviewPackageAuthorizeRequest(
+                                package_id=package.package_id,
+                                actor=actor,
+                                approver_role=approver_role,
+                                rationale=rationale,
+                                expires_at=renewed_approval_expires_at,
+                                max_order_usd=amount_usd,
+                                max_total_deployed_campaign_capital_usd=amount_usd,
+                                no_leverage=True,
+                                idempotency_key=_commission_phase_idempotency_key(
+                                    root_idempotency_key=root_idempotency_key,
+                                    phase="canonical_package_authorize",
+                                    scope=str(package.package_id),
+                                ),
+                            ),
+                        )
+                        await db.commit()
+                        approval_event = await _load_latest_approval_for_package(db=db, package=package)
+                        if approval_event is None:
+                            raise PermissionError("renewed approval missing for activated proving package")
+                        activated = await activate_canonical_proving_campaign(
+                            db=db,
+                            request=CanonicalPreviewPackageActivationRequest(
+                                package_id=package.package_id,
+                                approval_event_id=approval_event.id,
+                                dry_run_live_crypto_order_id=package.dry_run_live_crypto_order_id,
+                                actor=actor,
+                                expires_at=approval_event.expires_at,
+                                idempotency_key=_commission_phase_idempotency_key(
+                                    root_idempotency_key=root_idempotency_key,
+                                    phase="canonical_proving_activate",
+                                    scope=str(package.package_id),
+                                ),
+                            ),
+                        )
+                        await db.commit()
+                        activation_payload = activated.get("activation") if isinstance(activated.get("activation"), dict) else {}
+                        activation = await _load_activation_for_package(db=db, package=package)
+                        if not activation_payload:
+                            raise PermissionError("canonical proving activation missing after renewal")
+                        continue
                     break
 
                 raise PermissionError(f"unsupported canonical proving package state: {package.package_state}")

@@ -425,6 +425,210 @@ async def test_canonical_proving_commission_refreshes_expired_approval(monkeypat
 
 
 @pytest.mark.asyncio
+async def test_canonical_proving_commission_never_supersedes_post_dry_run_package_when_expired(monkeypatch: pytest.MonkeyPatch) -> None:
+    state = _State()
+    state.package.package_state = "DRY_RUN_PASSED"
+    state.package.preview_expires_at = datetime.now(timezone.utc) - timedelta(minutes=1)
+    state.package.approval_event_id = state.approval.id
+    state.package.dry_run_live_crypto_order_id = uuid4()
+    state.approval.expires_at = datetime.now(timezone.utc) - timedelta(seconds=1)
+    _install_common_monkeypatches(monkeypatch, state)
+
+    payload = await service.canonical_proving_commission_bundle(
+        campaign_id=state.campaign_id,
+        campaign_version=1,
+        paper_account_id=state.paper_account_id,
+        live_trading_profile_id=state.profile_id,
+        provider="kraken_spot",
+        environment="production",
+        product="BTC-USD",
+        amount_usd=Decimal("5"),
+        actor="operator:human",
+        approver_role="operator",
+        rationale="bounded proving",
+        no_leverage=True,
+        confirm=True,
+        idempotency_key="root-post-dry-run-expired",
+    )
+
+    assert payload["current_state"] == "ACTIVE_POSITION"
+    assert state.create_calls == 0
+    assert state.dry_run_calls == 0
+    assert state.authorize_calls >= 1
+    assert state.activate_calls >= 1
+
+
+@pytest.mark.asyncio
+async def test_canonical_proving_commission_dry_run_passed_resumes_from_activation_stage(monkeypatch: pytest.MonkeyPatch) -> None:
+    state = _State()
+    state.package.package_state = "DRY_RUN_PASSED"
+    state.package.approval_event_id = state.approval.id
+    state.package.dry_run_live_crypto_order_id = uuid4()
+    _install_common_monkeypatches(monkeypatch, state)
+
+    payload = await service.canonical_proving_commission_bundle(
+        campaign_id=state.campaign_id,
+        campaign_version=1,
+        paper_account_id=state.paper_account_id,
+        live_trading_profile_id=state.profile_id,
+        provider="kraken_spot",
+        environment="production",
+        product="BTC-USD",
+        amount_usd=Decimal("5"),
+        actor="operator:human",
+        approver_role="operator",
+        rationale="bounded proving",
+        no_leverage=True,
+        confirm=True,
+        idempotency_key="root-resume-dry-run-passed",
+    )
+
+    assert payload["current_state"] == "ACTIVE_POSITION"
+    assert state.create_calls == 0
+    assert state.dry_run_calls == 0
+    assert state.activate_calls >= 1
+
+
+@pytest.mark.asyncio
+async def test_canonical_proving_commission_activated_resumes_submission_stage_without_new_package_or_dry_run(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    state = _State()
+    state.package.package_state = "ACTIVATED"
+    state.package.approval_event_id = state.approval.id
+    state.package.dry_run_live_crypto_order_id = uuid4()
+    state.activation = SimpleNamespace(
+        activation_id=uuid4(),
+        package_id=state.package.package_id,
+        activation_state="ACTIVE",
+        expires_at=datetime.now(timezone.utc) + timedelta(minutes=3),
+    )
+    _install_common_monkeypatches(monkeypatch, state)
+
+    payload = await service.canonical_proving_commission_bundle(
+        campaign_id=state.campaign_id,
+        campaign_version=1,
+        paper_account_id=state.paper_account_id,
+        live_trading_profile_id=state.profile_id,
+        provider="kraken_spot",
+        environment="production",
+        product="BTC-USD",
+        amount_usd=Decimal("5"),
+        actor="operator:human",
+        approver_role="operator",
+        rationale="bounded proving",
+        no_leverage=True,
+        confirm=True,
+        idempotency_key="root-resume-activated",
+    )
+
+    assert payload["current_state"] == "ACTIVE_POSITION"
+    assert state.create_calls == 0
+    assert state.dry_run_calls == 0
+    assert state.prepare_calls == 1
+    assert state.execute_calls == 1
+
+
+@pytest.mark.asyncio
+async def test_canonical_proving_commission_expired_activation_is_revalidated_without_superseding_or_new_dry_run(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    state = _State()
+    state.package.package_state = "ACTIVATED"
+    state.package.preview_expires_at = datetime.now(timezone.utc) - timedelta(minutes=1)
+    state.package.approval_event_id = state.approval.id
+    state.package.dry_run_live_crypto_order_id = uuid4()
+    state.approval.expires_at = datetime.now(timezone.utc) - timedelta(seconds=1)
+    state.activation = SimpleNamespace(
+        activation_id=uuid4(),
+        package_id=state.package.package_id,
+        activation_state="ACTIVE",
+        expires_at=datetime.now(timezone.utc) - timedelta(seconds=1),
+    )
+    _install_common_monkeypatches(monkeypatch, state)
+
+    payload = await service.canonical_proving_commission_bundle(
+        campaign_id=state.campaign_id,
+        campaign_version=1,
+        paper_account_id=state.paper_account_id,
+        live_trading_profile_id=state.profile_id,
+        provider="kraken_spot",
+        environment="production",
+        product="BTC-USD",
+        amount_usd=Decimal("5"),
+        actor="operator:human",
+        approver_role="operator",
+        rationale="bounded proving",
+        no_leverage=True,
+        confirm=True,
+        idempotency_key="root-resume-expired-activation",
+    )
+
+    assert payload["current_state"] == "ACTIVE_POSITION"
+    assert state.create_calls == 0
+    assert state.dry_run_calls == 0
+    assert state.authorize_calls >= 1
+    assert state.activate_calls >= 1
+
+
+@pytest.mark.asyncio
+async def test_canonical_proving_commission_same_key_after_activation_stage_keeps_single_live_order_identity(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    state = _State()
+    state.package.package_state = "ACTIVATED"
+    state.package.approval_event_id = state.approval.id
+    state.package.dry_run_live_crypto_order_id = uuid4()
+    state.activation = SimpleNamespace(
+        activation_id=uuid4(),
+        package_id=state.package.package_id,
+        activation_state="ACTIVE",
+        expires_at=datetime.now(timezone.utc) + timedelta(minutes=4),
+    )
+    _install_common_monkeypatches(monkeypatch, state)
+
+    first = await service.canonical_proving_commission_bundle(
+        campaign_id=state.campaign_id,
+        campaign_version=1,
+        paper_account_id=state.paper_account_id,
+        live_trading_profile_id=state.profile_id,
+        provider="kraken_spot",
+        environment="production",
+        product="BTC-USD",
+        amount_usd=Decimal("5"),
+        actor="operator:human",
+        approver_role="operator",
+        rationale="bounded proving",
+        no_leverage=True,
+        confirm=True,
+        idempotency_key="root-resume-same-key",
+    )
+    first_live_order_id = state.live_order.live_crypto_order_id
+
+    second = await service.canonical_proving_commission_bundle(
+        campaign_id=state.campaign_id,
+        campaign_version=1,
+        paper_account_id=state.paper_account_id,
+        live_trading_profile_id=state.profile_id,
+        provider="kraken_spot",
+        environment="production",
+        product="BTC-USD",
+        amount_usd=Decimal("5"),
+        actor="operator:human",
+        approver_role="operator",
+        rationale="bounded proving",
+        no_leverage=True,
+        confirm=True,
+        idempotency_key="root-resume-same-key",
+    )
+
+    assert first["current_state"] == "ACTIVE_POSITION"
+    assert second["replayed"] is True
+    assert state.live_order.live_crypto_order_id == first_live_order_id
+    assert state.execute_calls == 1
+
+
+@pytest.mark.asyncio
 async def test_canonical_proving_commission_repeat_does_not_duplicate_submission(monkeypatch: pytest.MonkeyPatch) -> None:
     state = _State()
     _install_common_monkeypatches(monkeypatch, state)
