@@ -187,6 +187,34 @@ async def test_material_control_change_checkpoint_grants_approved_without_forced
 
 
 @pytest.mark.asyncio
+async def test_bounded_proving_entry_checkpoint_does_not_regress_already_enabled_profile() -> None:
+    """Reproduces the production scenario: a profile already advanced to operating_mode=live /
+    lifecycle_state=enabled via first_live_enablement must not be regressed to lifecycle_state=approved
+    by a subsequent bounded_proving_entry checkpoint (canonical-proving-commission's own approval
+    renewal) -- that combination violates ck_live_trading_profiles_live_mode_lifecycle_boundary."""
+    profile = _profile(lifecycle_state="enabled", operating_mode="live")
+    profile.approval_state = "approved"
+    profile.human_approval_recorded = True
+    session = _FakeSession(profiles=[profile])
+
+    result = await record_live_approval_checkpoint(
+        db=session,
+        request=_checkpoint_request(
+            profile.id,
+            checkpoint_type="bounded_proving_entry",
+            idempotency_key="approval-key-bounded-1",
+        ),
+    )
+
+    assert result.approval_state == "approved"
+    assert result.lifecycle_state == "enabled"
+    assert result.operating_mode == "live"
+    assert profile.lifecycle_state == "enabled"
+    assert profile.operating_mode == "live"
+    assert session.commit_count == 1
+
+
+@pytest.mark.asyncio
 async def test_record_live_approval_checkpoint_is_idempotent() -> None:
     profile = _profile()
     session = _FakeSession(profiles=[profile])

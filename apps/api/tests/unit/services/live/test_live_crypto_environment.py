@@ -87,12 +87,25 @@ def _connection():
     )
 
 
-def _profile(account_id, *, environment: str = "production", provider: str = "coinbase_advanced"):
+def _profile(
+    account_id,
+    *,
+    environment: str = "production",
+    provider: str = "coinbase_advanced",
+    operating_mode: str = "paper",
+    lifecycle_state: str = "draft",
+    approval_state: str = "not_requested",
+    human_approval_recorded: bool = False,
+):
     return SimpleNamespace(
         id=uuid4(),
         paper_account_id=account_id,
         created_at=datetime.now(timezone.utc),
         provenance_metadata={"exchange_environment": environment, "registration_source": f"human_{environment}_initializer", "provider": provider},
+        operating_mode=operating_mode,
+        lifecycle_state=lifecycle_state,
+        approval_state=approval_state,
+        human_approval_recorded=human_approval_recorded,
     )
 
 

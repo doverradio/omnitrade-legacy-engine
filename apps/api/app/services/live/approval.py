@@ -229,7 +229,12 @@ async def record_live_approval_checkpoint(
 
     profile.approval_state = "approved"
     profile.human_approval_recorded = True
-    profile.lifecycle_state = next_state
+    if not (profile.operating_mode == "live" and profile.lifecycle_state in {"enabled", "suspended"}):
+        # Do not regress an already-live profile's lifecycle_state to "approved" merely because a
+        # subsequent, differently-typed checkpoint (e.g. bounded_proving_entry) is recorded --
+        # ck_live_trading_profiles_live_mode_lifecycle_boundary requires lifecycle_state in
+        # ('enabled','suspended') whenever operating_mode != 'paper'.
+        profile.lifecycle_state = next_state
 
     if request.checkpoint_type == "first_live_enablement":
         # Approval for first live enablement permits transitioning to enabled under explicit checkpoint.
