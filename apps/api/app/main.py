@@ -12,6 +12,7 @@ from app.api.routes.capital_campaigns import router as capital_campaigns_router
 from app.api.routes.dashboard import router as dashboard_router
 from app.api.routes.decisions import router as decisions_router
 from app.api.routes.exchange_connections import router as exchange_connections_router
+from app.api.routes.instant_trades import router as instant_trades_router
 from app.api.routes.live_crypto_orders import router as live_crypto_orders_router
 from app.api.routes.health import router as health_router
 from app.api.routes.live import router as live_router
@@ -69,6 +70,7 @@ def create_app() -> FastAPI:
     app.include_router(decisions_router)
     app.include_router(live_router)
     app.include_router(live_crypto_orders_router)
+    app.include_router(instant_trades_router)
     app.include_router(validation_runs_router)
 
     @app.on_event("startup")

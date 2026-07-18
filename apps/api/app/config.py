@@ -19,6 +19,9 @@ class Settings(BaseSettings):
     database_max_overflow: int = Field(default=20, validation_alias="DATABASE_MAX_OVERFLOW")
     database_pool_timeout_seconds: int = Field(default=30, validation_alias="DATABASE_POOL_TIMEOUT_SECONDS")
     database_pool_recycle_seconds: int = Field(default=1800, validation_alias="DATABASE_POOL_RECYCLE_SECONDS")
+    database_connect_timeout_seconds: int = Field(default=5, validation_alias="DATABASE_CONNECT_TIMEOUT_SECONDS")
+    database_command_timeout_seconds: int = Field(default=10, validation_alias="DATABASE_COMMAND_TIMEOUT_SECONDS")
+    operator_db_timeout_seconds: int = Field(default=20, validation_alias="OPERATOR_DB_TIMEOUT_SECONDS")
     supabase_url: str = "http://localhost:54321"
     supabase_service_role_key: SecretStr | None = None
     supabase_jwt_secret: SecretStr | None = None
@@ -100,6 +103,18 @@ class Settings(BaseSettings):
     live_crypto_accounting_balance_tolerance_usd: Decimal = Field(
         default=Decimal("0.01"),
         validation_alias="LIVE_CRYPTO_ACCOUNTING_BALANCE_TOLERANCE_USD",
+    )
+    instant_trade_db_timeout_seconds: int = Field(
+        default=4,
+        validation_alias="INSTANT_TRADE_DB_TIMEOUT_SECONDS",
+    )
+    instant_trade_provider_timeout_seconds: int = Field(
+        default=8,
+        validation_alias="INSTANT_TRADE_PROVIDER_TIMEOUT_SECONDS",
+    )
+    instant_trade_reconciliation_poll_timeout_seconds: int = Field(
+        default=6,
+        validation_alias="INSTANT_TRADE_RECONCILIATION_POLL_TIMEOUT_SECONDS",
     )
     research_evolution_enabled: bool = Field(default=True, validation_alias="RESEARCH_EVOLUTION_ENABLED")
     research_cycle_interval_minutes: int = Field(default=30, validation_alias="RESEARCH_CYCLE_INTERVAL_MINUTES")
