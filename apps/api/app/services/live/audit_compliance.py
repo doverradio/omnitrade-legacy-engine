@@ -8,6 +8,7 @@ from datetime import datetime, timezone
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.db.session import join_or_begin_transaction
 from app.models.live_accounting_record import LiveAccountingRecord
 from app.models.live_approval_event import LiveApprovalEvent
 from app.models.live_audit_evidence_record import LiveAuditEvidenceRecord
@@ -135,7 +136,7 @@ async def record_live_audit_evidence(
         provenance_metadata=request.provenance_metadata,
     )
 
-    async with db.begin():
+    async with join_or_begin_transaction(db):
         record = LiveAuditEvidenceRecord(
             idempotency_key=idempotency_key,
             live_trading_profile_id=request.live_trading_profile_id,

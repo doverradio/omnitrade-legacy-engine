@@ -6,6 +6,7 @@ from decimal import Decimal
 from typing import Any
 
 import pytest
+from sqlalchemy.exc import InvalidRequestError
 
 from app.models.live_accounting_record import LiveAccountingRecord
 from app.models.live_execution_event import LiveExecutionEvent
@@ -22,11 +23,17 @@ from app.services.live.contracts import (
 
 
 class _BeginContext:
+    """Mirrors real AsyncSession semantics: begin() while already begun raises."""
+
+    def __init__(self, session: "_FakeSession") -> None:
+        self._session = session
+
     async def __aenter__(self) -> "_BeginContext":
+        self._session._in_transaction = True
         return self
 
     async def __aexit__(self, exc_type: Any, exc: Any, tb: Any) -> None:
-        return None
+        self._session._in_transaction = False
 
 
 class _ScalarRows:
@@ -46,9 +53,17 @@ class _FakeSession:
         self.live_profiles: list[Any] = []
         self.capital_campaigns: list[Any] = []
         self.commits = 0
+        self._in_transaction = False
+        self.flush_fail_after: int | None = None
+        self._flush_calls = 0
+
+    def in_transaction(self) -> bool:
+        return self._in_transaction
 
     def begin(self) -> _BeginContext:
-        return _BeginContext()
+        if self._in_transaction:
+            raise InvalidRequestError("A transaction is already begun on this Session.")
+        return _BeginContext(self)
 
     async def scalar(self, statement: Any) -> Any:
         sql = str(statement)
@@ -160,6 +175,9 @@ class _FakeSession:
             self.accounting_records.append(obj)
 
     async def flush(self) -> None:
+        self._flush_calls += 1
+        if self.flush_fail_after is not None and self._flush_calls > self.flush_fail_after:
+            raise RuntimeError("simulated persistence failure")
         return None
 
     async def commit(self) -> None:
@@ -228,6 +246,66 @@ def _fill_request(event: LiveExecutionEvent, **overrides: Any) -> LiveFillReconc
     }
     payload.update(overrides)
     return LiveFillReconciliationRequest(**payload)
+
+
+def _build_reconciliation_fixture(monkeypatch: pytest.MonkeyPatch) -> tuple[_FakeSession, Any]:
+    source = _execution_event("execution_intent_created")
+    profile = type("Profile", (), {
+        "id": source.live_trading_profile_id,
+        "paper_account_id": uuid.uuid4(),
+        "operating_mode": "live",
+        "paper_default_mode": True,
+        "risk_authority_model": "risk_engine_final",
+    })()
+    live_order = type("LiveOrder", (), {
+        "live_crypto_order_id": uuid.uuid4(),
+        "provider": "coinbase_advanced",
+        "environment": "production",
+        "exchange_connection_id": uuid.uuid4(),
+        "provider_order_id": None,
+        "client_order_id": "client-order-1",
+        "product_id": "BTC-USD",
+        "side": "BUY",
+        "order_type": "MARKET",
+        "requested_quote_size": Decimal("5.00"),
+        "status": "RECONCILIATION_REQUIRED",
+        "risk_event_id": uuid.uuid4(),
+        "safe_provider_response": {"live_trading_profile_id": str(source.live_trading_profile_id)},
+        "audit_correlation_id": uuid.uuid4(),
+        "provider_status": None,
+        "updated_at": datetime.now(timezone.utc),
+        "filled_at": None,
+        "cancelled_at": None,
+        "failure_code": None,
+        "failure_reason": None,
+        "acknowledged_at": None,
+    })()
+    campaign = type("Campaign", (), {"id": 42, "paper_account_id": profile.paper_account_id, "updated_at": datetime.now(timezone.utc)})()
+    session = _FakeSession(execution_events=[source])
+    session.live_orders = [live_order]
+    session.live_profiles = [profile]
+    session.capital_campaigns = [campaign]
+
+    async def _load_exchange_connection(*_args, **_kwargs):
+        return type("Conn", (), {
+            "exchange_connection_id": live_order.exchange_connection_id,
+            "balances": [{"currency": "USD", "available": "100.00"}],
+        })()
+
+    monkeypatch.setattr("app.services.live_crypto_orders._load_exchange_connection", _load_exchange_connection)
+    monkeypatch.setattr("app.services.live_crypto_orders._load_decrypted_credentials", lambda _c: {"api_key": "k", "api_secret": "s"})
+
+    return session, live_order
+
+
+class _NoSubmitProvider:
+    """Base for reconciliation-path provider fakes: any submission attempt fails the test."""
+
+    async def create_order(self, **_kwargs):
+        raise AssertionError("reconciliation must never submit an order (AddOrder-equivalent)")
+
+    async def add_order(self, **_kwargs):
+        raise AssertionError("reconciliation must never submit an order (AddOrder-equivalent)")
 
 
 @pytest.mark.asyncio
@@ -1395,3 +1473,114 @@ async def test_canonical_reconciliation_profit_cycle_consistency_for_buy_fill_is
     assert consistency["buy_fill_realized_profit"] == "0"
     assert consistency["distributable_profit_created"] is False
     assert consistency["fees_reflected"] is True
+
+
+@pytest.mark.asyncio
+async def test_reconciliation_persists_atomically_when_session_already_has_active_transaction(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Reproduces the production incident: the request session already owns a
+    transaction (SQLAlchemy autobegin from earlier queries) before
+    reconcile_live_order_and_fills ever runs. Every nested persistence helper
+    (record_live_order_reconciliation, record_live_fill_reconciliation,
+    record_live_audit_evidence) must join that transaction rather than call
+    db.begin() again, or this raises InvalidRequestError just like production did.
+    """
+    session, live_order = _build_reconciliation_fixture(monkeypatch)
+    session._in_transaction = True
+
+    class _Provider(_NoSubmitProvider):
+        async def list_historical_orders(self, **_kwargs):
+            return {
+                "orders": [
+                    {
+                        "order_id": "provider-order-1",
+                        "client_order_id": "client-order-1",
+                        "product_id": "BTC-USD",
+                        "status": "FILLED",
+                        "completion_time": "2026-07-10T12:00:00Z",
+                    }
+                ]
+            }, {}
+
+        async def list_historical_fills(self, **_kwargs):
+            return {
+                "fills": [
+                    {
+                        "trade_id": "fill-1",
+                        "price": "90000.00",
+                        "size": "0.00002",
+                        "commission": "0.004",
+                        "commission_currency": "USD",
+                        "created_at": "2026-07-10T12:00:01Z",
+                    },
+                    {
+                        "trade_id": "fill-2",
+                        "price": "110000.00",
+                        "size": "0.00003",
+                        "commission": "0.006",
+                        "commission_currency": "USD",
+                        "created_at": "2026-07-10T12:00:02Z",
+                    },
+                ]
+            }, {}
+
+        async def get_historical_order(self, **_kwargs):
+            return {"order": {}}, {}
+
+    monkeypatch.setattr("app.services.live.accounting_reconciliation.get_exchange_provider", lambda *_args, **_kwargs: _Provider())
+
+    outcome = await reconcile_live_order_and_fills(
+        db=session,
+        live_crypto_order_id=live_order.live_crypto_order_id,
+        operator_identity="operator:human",
+    )
+
+    assert outcome["reconciliation_status"] == "FILLED"
+    assert outcome["provider_fill_observed"] is True
+    assert len(session.reconciliation_events) >= 3
+    assert len(session.accounting_records) == 4
+    assert session.commits == 0
+    assert session._in_transaction is True
+
+
+@pytest.mark.asyncio
+async def test_reconciliation_provider_lookup_failure_leaves_no_partial_state(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    session, live_order = _build_reconciliation_fixture(monkeypatch)
+
+    class _FailingProvider(_NoSubmitProvider):
+        async def list_historical_orders(self, **_kwargs):
+            raise RuntimeError("provider unreachable")
+
+    monkeypatch.setattr(
+        "app.services.live.accounting_reconciliation.get_exchange_provider",
+        lambda *_args, **_kwargs: _FailingProvider(),
+    )
+
+    with pytest.raises(RuntimeError, match="provider unreachable"):
+        await reconcile_live_order_and_fills(
+            db=session,
+            live_crypto_order_id=live_order.live_crypto_order_id,
+            operator_identity="operator:human",
+        )
+
+    assert session.reconciliation_events == []
+    assert session.accounting_records == []
+    assert session.commits == 0
+
+
+@pytest.mark.asyncio
+async def test_fill_reconciliation_persistence_failure_propagates_without_commit() -> None:
+    source = _execution_event("execution_intent_created")
+    session = _FakeSession(execution_events=[source])
+    session.flush_fail_after = 0
+
+    with pytest.raises(RuntimeError, match="simulated persistence failure"):
+        await record_live_fill_reconciliation(
+            db=session,
+            request=_fill_request(source, idempotency_key="fill-rec-key-persistence-failure"),
+        )
+
+    assert session.commits == 0

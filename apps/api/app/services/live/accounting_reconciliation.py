@@ -3,7 +3,6 @@ from __future__ import annotations
 import hashlib
 import json
 import uuid
-from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from decimal import Decimal
 
@@ -11,6 +10,7 @@ from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import get_settings
+from app.db.session import join_or_begin_transaction as _join_or_begin_transaction
 from app.models.capital_campaign import CapitalCampaign
 from app.models.live_accounting_record import LiveAccountingRecord
 from app.models.live_execution_event import LiveExecutionEvent
@@ -28,16 +28,6 @@ from app.services.live.contracts import (
     LiveOrderReconciliationRequest,
     LiveReconciliationResult,
 )
-
-
-@asynccontextmanager
-async def _join_or_begin_transaction(db: AsyncSession):
-    in_transaction = getattr(db, "in_transaction", None)
-    if callable(in_transaction) and in_transaction():
-        yield
-        return
-    async with db.begin():
-        yield
 
 
 def build_live_reconciliation_idempotency_key(

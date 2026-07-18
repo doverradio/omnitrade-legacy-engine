@@ -1,5 +1,6 @@
 from collections.abc import AsyncGenerator
-from collections.abc import Awaitable, Callable
+from collections.abc import AsyncIterator, Awaitable, Callable
+from contextlib import asynccontextmanager
 import logging
 
 from sqlalchemy.exc import DBAPIError, InterfaceError
@@ -25,6 +26,24 @@ engine = create_async_engine(
     },
 )
 AsyncSessionLocal = async_sessionmaker(engine, expire_on_commit=False, class_=AsyncSession)
+
+
+@asynccontextmanager
+async def join_or_begin_transaction(db: AsyncSession) -> AsyncIterator[None]:
+    """Join the session's already-active transaction, or begin one if none exists.
+
+    SQLAlchemy's AsyncSession autobegins a transaction on first use, so by the
+    time a persistence helper runs deep in a request's call graph, `db.begin()`
+    almost always raises `InvalidRequestError: A transaction is already begun`.
+    Persistence helpers that may be called either standalone or nested inside
+    a caller-owned transaction must use this instead of `db.begin()` directly.
+    """
+    in_transaction = getattr(db, "in_transaction", None)
+    if callable(in_transaction) and in_transaction():
+        yield
+        return
+    async with db.begin():
+        yield
 
 _RETRYABLE_DB_ERROR_SUBSTRINGS = (
     "connection is closed",
