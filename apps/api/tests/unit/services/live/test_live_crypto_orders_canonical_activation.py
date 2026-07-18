@@ -386,11 +386,11 @@ async def test_campaign_scoped_submission_sell_can_bypass_canonical_activation(m
     db = _FakeDb(profile=profile, preview=preview, approval_event=approval_event, activation=None, package=None, connection=connection)
 
     async def _campaign(*_args, **_kwargs):
-        return SimpleNamespace(uuid=campaign_id, definition_version=1)
+        return SimpleNamespace(id=42, uuid=campaign_id, definition_version=1)
 
     monkeypatch.setattr(service, "_load_active_campaign_for_account", _campaign)
 
-    await service._validate_campaign_scoped_submission_authority(
+    resolved_capital_campaign_id = await service._validate_campaign_scoped_submission_authority(
         db=db,
         approval_event_id=approval_event.id,
         profile=profile,
@@ -399,3 +399,5 @@ async def test_campaign_scoped_submission_sell_can_bypass_canonical_activation(m
         requested_quote_size=Decimal("3"),
         side="SELL",
     )
+
+    assert resolved_capital_campaign_id == 42

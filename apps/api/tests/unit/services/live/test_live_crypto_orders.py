@@ -166,6 +166,7 @@ def _provider_stub(**methods):
 
 def _submit_campaign(*, paper_account_id: uuid.UUID) -> SimpleNamespace:
     return SimpleNamespace(
+        id=4242,
         uuid=uuid.uuid4(),
         definition_version=1,
         starting_capital=service.Decimal("25.00"),
@@ -1807,6 +1808,39 @@ async def test_submit_allows_exact_campaign_scoped_authority_and_calls_provider_
     assert calls["idempotency_key"] == live_order.client_order_id
     assert service.Decimal(str(calls["payload_quote_size"])) == live_order.requested_quote_size
     assert response.live_crypto_order.status == "ACKNOWLEDGED"
+    assert response.live_crypto_order.safe_provider_response["capital_campaign_id"] == _campaign.id
+
+
+@pytest.mark.asyncio
+async def test_submit_persists_verified_capital_campaign_id_for_reconciliation_to_find(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A campaign-scoped submission must persist the already-verified campaign identity onto
+    the order so accounting reconciliation can resolve it later without re-deriving trust."""
+    fixture = _submit_authority_fixture()
+    _profile, live_order, _preview, _connection, campaign, _approval_event, db = fixture
+
+    async def _create_order(*_args, **_kwargs):
+        return {"success": True, "success_response": {"order_id": "provider-order-1", "status": "OPEN"}}, {"x-request-id": "ok"}
+
+    monkeypatch.setattr(service, "get_settings", _submit_settings)
+    monkeypatch.setattr(service, "_utcnow", lambda: datetime(2026, 7, 9, 12, 0, tzinfo=timezone.utc))
+    monkeypatch.setattr(service, "_build_intent_fingerprint", lambda **_kwargs: "intent-fingerprint")
+    monkeypatch.setattr(service, "_build_evidence_fingerprint", lambda **_kwargs: "evidence-fingerprint")
+    monkeypatch.setattr(service, "_load_decrypted_credentials", lambda _connection: {"api_key": "key", "api_secret": "secret"})
+    monkeypatch.setattr(service, "get_exchange_provider", lambda *_args, **_kwargs: _provider_stub(create_order=_create_order))
+
+    response = await service.service.submit(
+        db=db,
+        request=service.LiveCryptoOrderSubmitRequest(
+            live_crypto_order_id=live_order.live_crypto_order_id,
+            confirmation_challenge_id=live_order.operator_confirmation_id,
+            confirmation_phrase="BUY BTC",
+            operator_identity="operator:human",
+            idempotency_token="token-campaign-persistence",
+        ),
+    )
+
+    assert response.live_crypto_order.safe_provider_response["capital_campaign_id"] == campaign.id
+    assert isinstance(response.live_crypto_order.safe_provider_response["capital_campaign_id"], int)
 
 
 @pytest.mark.asyncio

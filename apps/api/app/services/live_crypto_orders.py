@@ -389,7 +389,7 @@ async def _validate_campaign_scoped_submission_authority(
     connection: ExchangeConnection,
     requested_quote_size: Decimal,
     side: str | None = None,
-) -> None:
+) -> int:
     approval_event = await db.scalar(
         select(LiveApprovalEvent)
         .where(LiveApprovalEvent.id == approval_event_id)
@@ -562,6 +562,8 @@ async def _validate_campaign_scoped_submission_authority(
         campaign_capital_limit = Decimal(str(campaign_capital))
         if requested_quote_size > campaign_capital_limit:
             raise PermissionError("approval campaign capital boundary violated")
+
+    return campaign.id
 
 
 async def _audit_guard_failure(
@@ -1826,7 +1828,7 @@ class LiveCryptoOrderService:
         if live_order.safe_provider_response.get("evidence_fingerprint") != _build_evidence_fingerprint(preview=preview, connection=connection):
             raise PermissionError("approval evidence fingerprint mismatch")
 
-        await _validate_campaign_scoped_submission_authority(
+        verified_capital_campaign_id = await _validate_campaign_scoped_submission_authority(
             db=db,
             approval_event_id=approval_event_uuid,
             profile=profile,
@@ -1868,6 +1870,7 @@ class LiveCryptoOrderService:
         live_order.failure_reason = None
         live_order.safe_provider_response = {
             **live_order.safe_provider_response,
+            "capital_campaign_id": verified_capital_campaign_id,
             "submission_identity": {
                 "live_crypto_order_id": str(live_order.live_crypto_order_id),
                 "client_order_id": live_order.client_order_id,
