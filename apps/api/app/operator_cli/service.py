@@ -568,25 +568,31 @@ async def mandate_identity_diagnosis(
 
         normalized_provider = provider.strip().lower()
         normalized_environment = environment.strip().lower()
-        mandates = [
-            {
-                "mandate_id": str(row.mandate_id),
-                "status": row.status,
-                "provider": row.provider,
-                "exchange_environment": row.exchange_environment,
-                "exchange_connection_id": str(row.exchange_connection_id) if row.exchange_connection_id is not None else None,
-                "capital_campaign_id": row.capital_campaign_id,
-                "paper_account_id": str(row.paper_account_id) if row.paper_account_id is not None else None,
-                "provider_environment_matches": (
-                    str(row.provider or "").strip().lower() == normalized_provider
-                    and str(row.exchange_environment or "").strip().lower() == normalized_environment
-                ),
-                "status_active": str(row.status or "").strip().upper() in {"ACTIVE", "AUTHORIZED"},
-                "campaign_id_matches": row.capital_campaign_id in {None, runtime_campaign_id},
-                "paper_account_id_matches": row.paper_account_id in {None, paper_account_id},
-            }
-            for row in mandate_rows
-        ]
+        mandates = []
+        for row in mandate_rows:
+            governing_version = await _load_authorized_mandate_version(db=db, mandate_id=row.mandate_id)
+            mandates.append(
+                {
+                    "mandate_id": str(row.mandate_id),
+                    "status": row.status,
+                    "provider": row.provider,
+                    "exchange_environment": row.exchange_environment,
+                    "exchange_connection_id": str(row.exchange_connection_id) if row.exchange_connection_id is not None else None,
+                    "capital_campaign_id": row.capital_campaign_id,
+                    "paper_account_id": str(row.paper_account_id) if row.paper_account_id is not None else None,
+                    "provider_environment_matches": (
+                        str(row.provider or "").strip().lower() == normalized_provider
+                        and str(row.exchange_environment or "").strip().lower() == normalized_environment
+                    ),
+                    "status_active": str(row.status or "").strip().upper() in {"ACTIVE", "AUTHORIZED"},
+                    "campaign_id_matches": row.capital_campaign_id in {None, runtime_campaign_id},
+                    "paper_account_id_matches": row.paper_account_id in {None, paper_account_id},
+                    "governing_mandate_version_id": str(governing_version.mandate_version_id) if governing_version is not None else None,
+                    "governing_mandate_version_number": governing_version.version_number if governing_version is not None else None,
+                    "governing_version_is_authorized": bool(governing_version.is_authorized) if governing_version is not None else None,
+                    "governing_version_is_active": bool(governing_version.is_active) if governing_version is not None else None,
+                }
+            )
 
         resolved_mandate = await _load_active_mandate_for_commissioning(
             db=db,

@@ -1955,3 +1955,94 @@ async def test_mandate_identity_diagnosis_reports_success_without_writes(monkeyp
     assert result["would_resolve_mandate_id"] == str(mandate.mandate_id)
     assert result["resolution_would_fail_reason"] is None
     assert db.write_calls == 0
+
+
+@pytest.mark.asyncio
+async def test_mandate_identity_diagnosis_surfaces_governing_version_authorization_flags(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A mandate can reach status=ACTIVE via the governed lifecycle API without its governing
+    version's is_authorized/is_active flags ever being set (those two booleans are gated
+    separately by canonical_proving_commission_bundle()'s mandate_version_lookup stage and are
+    never written by app.services.mandates.lifecycle.authorize_mandate_version). This must be
+    visible in the diagnostic without requiring a second command."""
+    campaign_id = uuid4()
+    paper_account_id = uuid4()
+    live_trading_profile_id = uuid4()
+    runtime = SimpleNamespace(id=2, uuid=campaign_id)
+    profile = SimpleNamespace(id=live_trading_profile_id, paper_account_id=paper_account_id)
+
+    mandate = SimpleNamespace(
+        mandate_id=uuid4(),
+        status="ACTIVE",
+        provider="kraken_spot",
+        exchange_environment="production",
+        exchange_connection_id=uuid4(),
+        capital_campaign_id=runtime.id,
+        paper_account_id=paper_account_id,
+        live_trading_profile_id=live_trading_profile_id,
+        activated_at=datetime.now(timezone.utc),
+        authorized_at=datetime.now(timezone.utc),
+        created_at=datetime.now(timezone.utc),
+    )
+    authorization = SimpleNamespace(
+        mandate_id=mandate.mandate_id,
+        mandate_version_id=uuid4(),
+        authorization_state="AUTHORIZED",
+        revoked_at=None,
+        recorded_at=datetime.now(timezone.utc),
+    )
+    version = SimpleNamespace(
+        mandate_version_id=authorization.mandate_version_id,
+        mandate_id=mandate.mandate_id,
+        version_number=1,
+        is_authorized=False,
+        is_active=False,
+    )
+
+    class _NoWriteDb:
+        def __init__(self) -> None:
+            self.write_calls = 0
+
+        async def scalar(self, statement):
+            sql = str(statement)
+            if "FROM capital_campaigns" in sql:
+                return runtime
+            if "FROM live_trading_profiles" in sql:
+                return profile
+            if "FROM autonomous_capital_mandate_authorizations" in sql:
+                return authorization
+            if "FROM autonomous_capital_mandate_versions" in sql:
+                return version
+            return None
+
+        async def execute(self, _statement):
+            return SimpleNamespace(scalars=lambda: SimpleNamespace(all=lambda: [mandate]))
+
+        def add(self, *_a, **_k):
+            self.write_calls += 1
+
+        async def flush(self):
+            self.write_calls += 1
+
+        async def commit(self):
+            self.write_calls += 1
+
+    db = _NoWriteDb()
+    monkeypatch.setattr(service, "AsyncSessionLocal", lambda: _SessionContext(db))
+
+    result = await service.mandate_identity_diagnosis(
+        campaign_id=campaign_id,
+        paper_account_id=paper_account_id,
+        live_trading_profile_id=live_trading_profile_id,
+        provider="kraken_spot",
+        environment="production",
+    )
+
+    row = result["mandates"][0]
+    assert row["campaign_id_matches"] is True
+    assert row["paper_account_id_matches"] is True
+    assert row["governing_mandate_version_id"] == str(version.mandate_version_id)
+    assert row["governing_version_is_authorized"] is False
+    assert row["governing_version_is_active"] is False
+    assert db.write_calls == 0
