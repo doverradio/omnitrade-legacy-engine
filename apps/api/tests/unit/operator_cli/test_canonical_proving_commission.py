@@ -1816,3 +1816,142 @@ async def test_canonical_proving_commission_non_converging_activation_fails_clos
     assert state.execute_calls == 0
     assert state.prepare_calls == 0
     assert 1 <= state.activate_calls <= service._CANONICAL_PROVING_MAX_STATE_TRANSITIONS
+
+
+@pytest.mark.asyncio
+async def test_mandate_identity_diagnosis_reports_campaign_mismatch_without_writes(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The read-only mandate diagnostic must reuse the real production comparison helpers
+    (_load_active_mandate_for_commissioning / _diagnose_mandate_resolution_failure) verbatim,
+    not a reimplementation that could drift, and must never write to the database."""
+    campaign_id = uuid4()
+    paper_account_id = uuid4()
+    live_trading_profile_id = uuid4()
+    runtime = SimpleNamespace(id=42, uuid=campaign_id)
+    profile = SimpleNamespace(id=live_trading_profile_id, paper_account_id=paper_account_id)
+
+    stale_campaign_id = 7  # deliberately different from runtime.id -- the mismatch under test
+    mandate = SimpleNamespace(
+        mandate_id=uuid4(),
+        status="ACTIVE",
+        provider="kraken_spot",
+        exchange_environment="production",
+        exchange_connection_id=uuid4(),
+        capital_campaign_id=stale_campaign_id,
+        paper_account_id=paper_account_id,
+        live_trading_profile_id=live_trading_profile_id,
+        activated_at=datetime.now(timezone.utc),
+        authorized_at=datetime.now(timezone.utc),
+        created_at=datetime.now(timezone.utc),
+    )
+
+    class _NoWriteDb:
+        def __init__(self) -> None:
+            self.write_calls = 0
+
+        async def scalar(self, statement):
+            sql = str(statement)
+            if "FROM capital_campaigns" in sql:
+                return runtime
+            if "FROM live_trading_profiles" in sql:
+                return profile
+            return None
+
+        async def execute(self, _statement):
+            return SimpleNamespace(scalars=lambda: SimpleNamespace(all=lambda: [mandate]))
+
+        def add(self, *_a, **_k):
+            self.write_calls += 1
+
+        async def flush(self):
+            self.write_calls += 1
+
+        async def commit(self):
+            self.write_calls += 1
+
+    db = _NoWriteDb()
+    monkeypatch.setattr(service, "AsyncSessionLocal", lambda: _SessionContext(db))
+
+    result = await service.mandate_identity_diagnosis(
+        campaign_id=campaign_id,
+        paper_account_id=paper_account_id,
+        live_trading_profile_id=live_trading_profile_id,
+        provider="kraken_spot",
+        environment="production",
+    )
+
+    assert result["campaign_found"] is True
+    assert result["runtime_campaign_id"] == 42
+    assert result["profile_paper_account_id_matches"] is True
+    assert result["mandates"][0]["capital_campaign_id"] == stale_campaign_id
+    assert result["mandates"][0]["campaign_id_matches"] is False
+    assert result["mandates"][0]["paper_account_id_matches"] is True
+    assert result["would_resolve_mandate_id"] is None
+    assert result["resolution_would_fail_reason"] == "campaign/profile/account mismatch"
+    assert db.write_calls == 0
+
+
+@pytest.mark.asyncio
+async def test_mandate_identity_diagnosis_reports_success_without_writes(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Sanity check the diagnostic also correctly reports a resolvable mandate, and still
+    performs no writes on the success path."""
+    campaign_id = uuid4()
+    paper_account_id = uuid4()
+    live_trading_profile_id = uuid4()
+    runtime = SimpleNamespace(id=42, uuid=campaign_id)
+    profile = SimpleNamespace(id=live_trading_profile_id, paper_account_id=paper_account_id)
+
+    mandate = SimpleNamespace(
+        mandate_id=uuid4(),
+        status="ACTIVE",
+        provider="kraken_spot",
+        exchange_environment="production",
+        exchange_connection_id=uuid4(),
+        capital_campaign_id=runtime.id,
+        paper_account_id=paper_account_id,
+        live_trading_profile_id=live_trading_profile_id,
+        activated_at=datetime.now(timezone.utc),
+        authorized_at=datetime.now(timezone.utc),
+        created_at=datetime.now(timezone.utc),
+    )
+
+    class _NoWriteDb:
+        def __init__(self) -> None:
+            self.write_calls = 0
+
+        async def scalar(self, statement):
+            sql = str(statement)
+            if "FROM capital_campaigns" in sql:
+                return runtime
+            if "FROM live_trading_profiles" in sql:
+                return profile
+            return None
+
+        async def execute(self, _statement):
+            return SimpleNamespace(scalars=lambda: SimpleNamespace(all=lambda: [mandate]))
+
+        def add(self, *_a, **_k):
+            self.write_calls += 1
+
+        async def flush(self):
+            self.write_calls += 1
+
+        async def commit(self):
+            self.write_calls += 1
+
+    db = _NoWriteDb()
+    monkeypatch.setattr(service, "AsyncSessionLocal", lambda: _SessionContext(db))
+
+    result = await service.mandate_identity_diagnosis(
+        campaign_id=campaign_id,
+        paper_account_id=paper_account_id,
+        live_trading_profile_id=live_trading_profile_id,
+        provider="kraken_spot",
+        environment="production",
+    )
+
+    assert result["mandates"][0]["campaign_id_matches"] is True
+    assert result["would_resolve_mandate_id"] == str(mandate.mandate_id)
+    assert result["resolution_would_fail_reason"] is None
+    assert db.write_calls == 0

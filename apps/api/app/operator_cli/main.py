@@ -41,6 +41,7 @@ from app.operator_cli.service import (
     canonical_proving_commission_bundle,
     canonical_proving_commission_status,
     canonical_proving_activation_status,
+    mandate_identity_diagnosis,
     canonical_campaign_status_transition_audit,
     canonical_campaign_status_transition_execute,
     canonical_campaign_status_transition_readiness,
@@ -775,6 +776,19 @@ def _build_parser() -> argparse.ArgumentParser:
     proving_commission_status.add_argument("--product", type=str, required=True)
     proving_commission_status.add_argument("--json", action="store_true", dest="json_output")
 
+    mandate_diagnosis = subparsers.add_parser(
+        "mandate-identity-diagnosis",
+        parents=[common],
+        help="Show the exact mandate/campaign/account identities canonical-proving-commission compares",
+        description="Read-only inspection of runtime campaign id, all mandates for the profile, and their capital_campaign_id/paper_account_id scoping, using the same resolution and diagnosis logic as canonical-proving-commission. Performs no writes.",
+    )
+    mandate_diagnosis.add_argument("--campaign-id", type=UUID, required=True)
+    mandate_diagnosis.add_argument("--paper-account-id", type=UUID, required=True)
+    mandate_diagnosis.add_argument("--live-trading-profile-id", type=UUID, required=True)
+    mandate_diagnosis.add_argument("--provider", type=str, required=True)
+    mandate_diagnosis.add_argument("--environment", type=str, required=True)
+    mandate_diagnosis.add_argument("--json", action="store_true", dest="json_output")
+
     proving_pause = subparsers.add_parser(
         "canonical-proving-pause",
         parents=[common],
@@ -1038,6 +1052,16 @@ async def _run_async(args: argparse.Namespace) -> tuple[int, dict[str, Any], str
         )
         text = render_json(payload) if args.json_output else render_canonical_proving_commission_status_text(payload, options)
         return 0, payload, text
+
+    if args.command == "mandate-identity-diagnosis":
+        payload = await mandate_identity_diagnosis(
+            campaign_id=args.campaign_id,
+            paper_account_id=args.paper_account_id,
+            live_trading_profile_id=args.live_trading_profile_id,
+            provider=args.provider,
+            environment=args.environment,
+        )
+        return 0, payload, render_json(payload)
 
     if args.command == "canonical-proving-pause":
         payload = await pause_canonical_proving_activation_bundle(

@@ -539,6 +539,93 @@ async def _diagnose_mandate_resolution_failure(
     return "mandate missing"
 
 
+async def mandate_identity_diagnosis(
+    *,
+    campaign_id: UUID,
+    paper_account_id: UUID,
+    live_trading_profile_id: UUID,
+    provider: str,
+    environment: str,
+) -> dict[str, Any]:
+    """Read-only inspection of the exact identities canonical_proving_commission_bundle()
+    compares during mandate resolution. Performs SELECT statements only -- no db.add, flush,
+    or commit -- and calls the same production lookup/diagnosis helpers the commissioning
+    flow uses, so this can never disagree with what a real commissioning run would see."""
+    async with AsyncSessionLocal() as db:
+        runtime = await _load_runtime_campaign_by_identity(db=db, campaign_id=campaign_id)
+        runtime_campaign_id = runtime.id if runtime is not None else None
+        profile = await _load_profile_by_id(db=db, live_trading_profile_id=live_trading_profile_id)
+
+        mandate_rows = list(
+            (
+                await db.execute(
+                    select(AutonomousCapitalMandate)
+                    .where(AutonomousCapitalMandate.live_trading_profile_id == live_trading_profile_id)
+                    .order_by(AutonomousCapitalMandate.activated_at.desc(), AutonomousCapitalMandate.authorized_at.desc(), AutonomousCapitalMandate.created_at.desc())
+                )
+            ).scalars().all()
+        )
+
+        normalized_provider = provider.strip().lower()
+        normalized_environment = environment.strip().lower()
+        mandates = [
+            {
+                "mandate_id": str(row.mandate_id),
+                "status": row.status,
+                "provider": row.provider,
+                "exchange_environment": row.exchange_environment,
+                "exchange_connection_id": str(row.exchange_connection_id) if row.exchange_connection_id is not None else None,
+                "capital_campaign_id": row.capital_campaign_id,
+                "paper_account_id": str(row.paper_account_id) if row.paper_account_id is not None else None,
+                "provider_environment_matches": (
+                    str(row.provider or "").strip().lower() == normalized_provider
+                    and str(row.exchange_environment or "").strip().lower() == normalized_environment
+                ),
+                "status_active": str(row.status or "").strip().upper() in {"ACTIVE", "AUTHORIZED"},
+                "campaign_id_matches": row.capital_campaign_id in {None, runtime_campaign_id},
+                "paper_account_id_matches": row.paper_account_id in {None, paper_account_id},
+            }
+            for row in mandate_rows
+        ]
+
+        resolved_mandate = await _load_active_mandate_for_commissioning(
+            db=db,
+            runtime_campaign_id=runtime_campaign_id,
+            live_trading_profile_id=live_trading_profile_id,
+            paper_account_id=paper_account_id,
+            provider=provider,
+            environment=environment,
+        )
+        diagnosis = (
+            None
+            if resolved_mandate is not None
+            else await _diagnose_mandate_resolution_failure(
+                db=db,
+                runtime_campaign_id=runtime_campaign_id,
+                live_trading_profile_id=live_trading_profile_id,
+                paper_account_id=paper_account_id,
+                provider=provider,
+                environment=environment,
+            )
+        )
+
+        return {
+            "campaign_id": str(campaign_id),
+            "campaign_found": runtime is not None,
+            "runtime_campaign_id": runtime_campaign_id,
+            "paper_account_id": str(paper_account_id),
+            "live_trading_profile_id": str(live_trading_profile_id),
+            "provider": provider,
+            "environment": environment,
+            "profile_found": profile is not None,
+            "profile_paper_account_id": str(profile.paper_account_id) if profile is not None and profile.paper_account_id is not None else None,
+            "profile_paper_account_id_matches": profile is not None and getattr(profile, "paper_account_id", None) == paper_account_id,
+            "mandates": mandates,
+            "would_resolve_mandate_id": str(resolved_mandate.mandate_id) if resolved_mandate is not None else None,
+            "resolution_would_fail_reason": diagnosis,
+        }
+
+
 async def _resolve_exchange_connection_for_commissioning(
     *,
     db,
