@@ -229,6 +229,144 @@ async def test_repeated_idempotency_key_does_not_duplicate_submission(monkeypatc
 
 
 @pytest.mark.asyncio
+async def test_user_directed_buy_persists_risk_without_related_signal_id(monkeypatch: pytest.MonkeyPatch, base_request: instant_service.InstantTradeBuyRequest) -> None:
+    db = _FakeDb()
+    _install_common_mocks(monkeypatch, base_request)
+    observed: dict[str, object] = {"signal_id": "unset"}
+
+    async def _persist(*, db, request):  # noqa: ANN001
+        observed["signal_id"] = request.signal_id
+        return SimpleNamespace(risk_event_id=uuid.uuid4())
+
+    async def _preview_market_order(**_kwargs):
+        return SimpleNamespace(
+            success=True,
+            failure_reason=None,
+            warning_messages=[],
+            estimated_base_size=Decimal("0.00005"),
+            estimated_fee=Decimal("0.01"),
+            estimated_fee_currency="USD",
+            estimated_average_price=Decimal("100000"),
+            best_ask=Decimal("100000"),
+        )
+
+    async def _submit_order(**_kwargs):
+        return SimpleNamespace(
+            classification="success",
+            order=SimpleNamespace(provider_order_id="O-1", status="OPEN"),
+            rejection=None,
+            ambiguous=None,
+            raw_response={"ok": True},
+            safe_headers={},
+        )
+
+    monkeypatch.setattr(instant_service, "persist_risk_decision", _persist)
+    monkeypatch.setattr(
+        instant_service,
+        "get_exchange_provider",
+        lambda *_args, **_kwargs: SimpleNamespace(preview_market_order=_preview_market_order, submit_order=_submit_order),
+    )
+    monkeypatch.setattr(instant_service.InstantTradeService, "_bounded_reconcile", lambda *args, **kwargs: _preview_market_order())
+
+    await instant_service.service.buy(db=db, request=base_request, authenticated_user_id=base_request.actor)
+
+    assert observed["signal_id"] is None
+
+
+@pytest.mark.asyncio
+async def test_provider_submission_happens_only_after_risk_persistence_and_durable_order(monkeypatch: pytest.MonkeyPatch, base_request: instant_service.InstantTradeBuyRequest) -> None:
+    db = _FakeDb()
+    _install_common_mocks(monkeypatch, base_request)
+    state: dict[str, object] = {"risk_persisted": False, "order_seen_before_submit": False}
+
+    async def _persist(*, db, request):  # noqa: ANN001
+        state["risk_persisted"] = True
+        return SimpleNamespace(risk_event_id=uuid.uuid4())
+
+    async def _preview_market_order(**_kwargs):
+        return SimpleNamespace(
+            success=True,
+            failure_reason=None,
+            warning_messages=[],
+            estimated_base_size=Decimal("0.00005"),
+            estimated_fee=Decimal("0.01"),
+            estimated_fee_currency="USD",
+            estimated_average_price=Decimal("100000"),
+            best_ask=Decimal("100000"),
+        )
+
+    async def _submit_order(**_kwargs):
+        state["order_seen_before_submit"] = len(db.orders_by_client_id) == 1
+        return SimpleNamespace(
+            classification="success",
+            order=SimpleNamespace(provider_order_id="O-1", status="OPEN"),
+            rejection=None,
+            ambiguous=None,
+            raw_response={"ok": True},
+            safe_headers={},
+        )
+
+    monkeypatch.setattr(instant_service, "persist_risk_decision", _persist)
+    monkeypatch.setattr(
+        instant_service,
+        "get_exchange_provider",
+        lambda *_args, **_kwargs: SimpleNamespace(preview_market_order=_preview_market_order, submit_order=_submit_order),
+    )
+    monkeypatch.setattr(instant_service.InstantTradeService, "_bounded_reconcile", lambda *args, **kwargs: _preview_market_order())
+
+    await instant_service.service.buy(db=db, request=base_request, authenticated_user_id=base_request.actor)
+
+    assert state["risk_persisted"] is True
+    assert state["order_seen_before_submit"] is True
+
+
+@pytest.mark.asyncio
+async def test_risk_rejection_is_persisted_and_blocks_provider_submission(monkeypatch: pytest.MonkeyPatch, base_request: instant_service.InstantTradeBuyRequest) -> None:
+    db = _FakeDb()
+    _install_common_mocks(monkeypatch, base_request)
+    state: dict[str, int] = {"persist_calls": 0, "submit_calls": 0}
+
+    async def _persist(*, db, request):  # noqa: ANN001
+        state["persist_calls"] += 1
+        return SimpleNamespace(risk_event_id=uuid.uuid4())
+
+    async def _preview_market_order(**_kwargs):
+        return SimpleNamespace(
+            success=True,
+            failure_reason=None,
+            warning_messages=[],
+            estimated_base_size=Decimal("0.00005"),
+            estimated_fee=Decimal("0.01"),
+            estimated_fee_currency="USD",
+            estimated_average_price=Decimal("100000"),
+            best_ask=Decimal("100000"),
+        )
+
+    async def _submit_order(**_kwargs):
+        state["submit_calls"] += 1
+        return SimpleNamespace(classification="success", order=SimpleNamespace(provider_order_id="O-1", status="OPEN"), rejection=None, ambiguous=None, raw_response={}, safe_headers={})
+
+    monkeypatch.setattr(
+        instant_service,
+        "evaluate_signal_risk",
+        lambda **_kwargs: SimpleNamespace(action=RiskDecisionAction.REJECT, approved_quantity=Decimal("0"), reason_code="max_daily_loss_breached"),
+    )
+    monkeypatch.setattr(instant_service, "persist_risk_decision", _persist)
+    monkeypatch.setattr(
+        instant_service,
+        "get_exchange_provider",
+        lambda *_args, **_kwargs: SimpleNamespace(preview_market_order=_preview_market_order, submit_order=_submit_order),
+    )
+
+    with pytest.raises(Exception, match="Risk engine blocked instant buy"):
+        await instant_service.service.buy(db=db, request=base_request, authenticated_user_id=base_request.actor)
+
+    assert state["persist_calls"] == 1
+    assert state["submit_calls"] == 0
+    assert len(db.orders_by_client_id) == 0
+
+
+@pytest.mark.asyncio
 async def test_insufficient_balance_blocks(monkeypatch: pytest.MonkeyPatch, base_request: instant_service.InstantTradeBuyRequest) -> None:
     db = _FakeDb()
     _install_common_mocks(monkeypatch, base_request, balance=Decimal("1"))
@@ -347,6 +485,81 @@ async def test_provider_ambiguity_does_not_resubmit(monkeypatch: pytest.MonkeyPa
     assert first.status == "RECONCILIATION_REQUIRED"
     assert second.internal_order_id == first.internal_order_id
     assert calls["submit"] == 1
+
+
+@pytest.mark.asyncio
+async def test_risk_persistence_failure_causes_zero_provider_submission(monkeypatch: pytest.MonkeyPatch, base_request: instant_service.InstantTradeBuyRequest) -> None:
+    db = _FakeDb()
+    _install_common_mocks(monkeypatch, base_request)
+    state = {"submit_calls": 0}
+
+    class _SyntheticForeignKeyViolation(RuntimeError):
+        pass
+
+    async def _persist(*, db, request):  # noqa: ANN001
+        if request.signal_id is not None:
+            raise _SyntheticForeignKeyViolation("risk_events_related_signal_id_fkey")
+        raise _SyntheticForeignKeyViolation("risk_events_related_signal_id_fkey")
+
+    async def _preview_market_order(**_kwargs):
+        return SimpleNamespace(success=True, failure_reason=None, warning_messages=[], estimated_base_size=Decimal("0.00005"), estimated_fee=Decimal("0.01"), estimated_fee_currency="USD", estimated_average_price=Decimal("100000"), best_ask=Decimal("100000"))
+
+    async def _submit_order(**_kwargs):
+        state["submit_calls"] += 1
+        return SimpleNamespace(classification="success", order=SimpleNamespace(provider_order_id="O-1", status="OPEN"), rejection=None, ambiguous=None, raw_response={}, safe_headers={})
+
+    monkeypatch.setattr(instant_service, "persist_risk_decision", _persist)
+    monkeypatch.setattr(
+        instant_service,
+        "get_exchange_provider",
+        lambda *_args, **_kwargs: SimpleNamespace(preview_market_order=_preview_market_order, submit_order=_submit_order),
+    )
+
+    with pytest.raises(_SyntheticForeignKeyViolation, match="related_signal_id"):
+        await instant_service.service.buy(db=db, request=base_request, authenticated_user_id=base_request.actor)
+
+    assert state["submit_calls"] == 0
+    assert len(db.orders_by_client_id) == 0
+
+
+@pytest.mark.asyncio
+async def test_retry_same_idempotency_key_after_risk_persistence_failure_is_safe(monkeypatch: pytest.MonkeyPatch, base_request: instant_service.InstantTradeBuyRequest) -> None:
+    db = _FakeDb()
+    _install_common_mocks(monkeypatch, base_request)
+    state = {"persist_calls": 0, "submit_calls": 0}
+
+    class _SyntheticForeignKeyViolation(RuntimeError):
+        pass
+
+    async def _persist(*, db, request):  # noqa: ANN001
+        state["persist_calls"] += 1
+        if state["persist_calls"] == 1:
+            raise _SyntheticForeignKeyViolation("risk_events_related_signal_id_fkey")
+        return SimpleNamespace(risk_event_id=uuid.uuid4())
+
+    async def _preview_market_order(**_kwargs):
+        return SimpleNamespace(success=True, failure_reason=None, warning_messages=[], estimated_base_size=Decimal("0.00005"), estimated_fee=Decimal("0.01"), estimated_fee_currency="USD", estimated_average_price=Decimal("100000"), best_ask=Decimal("100000"))
+
+    async def _submit_order(**_kwargs):
+        state["submit_calls"] += 1
+        return SimpleNamespace(classification="success", order=SimpleNamespace(provider_order_id="O-1", status="OPEN"), rejection=None, ambiguous=None, raw_response={}, safe_headers={})
+
+    monkeypatch.setattr(instant_service, "persist_risk_decision", _persist)
+    monkeypatch.setattr(
+        instant_service,
+        "get_exchange_provider",
+        lambda *_args, **_kwargs: SimpleNamespace(preview_market_order=_preview_market_order, submit_order=_submit_order),
+    )
+    monkeypatch.setattr(instant_service.InstantTradeService, "_bounded_reconcile", lambda *args, **kwargs: _preview_market_order())
+
+    with pytest.raises(_SyntheticForeignKeyViolation, match="related_signal_id"):
+        await instant_service.service.buy(db=db, request=base_request, authenticated_user_id=base_request.actor)
+
+    receipt = await instant_service.service.buy(db=db, request=base_request, authenticated_user_id=base_request.actor)
+
+    assert receipt.provider_order_id == "O-1"
+    assert state["submit_calls"] == 1
+    assert len(db.orders_by_client_id) == 1
 
 
 @pytest.mark.asyncio

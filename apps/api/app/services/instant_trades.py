@@ -256,7 +256,7 @@ class InstantTradeService:
             ),
             timeout_seconds=db_timeout,
         )
-        await _with_db_timeout(
+        asset = await _with_db_timeout(
             _load_asset_for_product(db=db, product_id=normalized_product),
             timeout_seconds=db_timeout,
         )
@@ -339,7 +339,7 @@ class InstantTradeService:
             request=RiskEvaluationRequest(
                 signal_id=_preview_identity_for_order(client_order_id),
                 paper_account_id=account.id,
-                asset_id=_preview_identity_for_order(f"asset:{normalized_product}"),
+                asset_id=asset.id,
                 side="buy",
                 quantity=requested_base_quantity,
                 account_equity=governed_capital,
@@ -379,7 +379,7 @@ class InstantTradeService:
                 db=db,
                 request=RiskDecisionPersistenceRequest(
                     paper_account_id=account.id,
-                    signal_id=_preview_identity_for_order(client_order_id),
+                    signal_id=None,
                     actor=request.actor,
                     evaluation_result=risk_result,
                 ),
