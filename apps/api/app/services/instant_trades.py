@@ -90,6 +90,40 @@ def _stable_client_order_id(*, request: InstantTradeBuyRequest) -> str:
     return f"instant-{digest[:48]}"
 
 
+def _request_fingerprint(*, request: InstantTradeBuyRequest) -> str:
+    """Full economic/request identity retained for internal audit and idempotency."""
+    payload = "|".join(
+        [
+            str(request.paper_account_id),
+            str(request.live_trading_profile_id),
+            request.provider.strip().lower(),
+            request.environment.strip().lower(),
+            request.product.strip().upper(),
+            format(request.quote_amount, "f"),
+            request.idempotency_key.strip(),
+        ]
+    )
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
+def _provider_client_order_id(*, internal_client_order_id: str, provider: str) -> str:
+    if provider.strip().lower() == "kraken_spot":
+        return str(uuid.uuid5(uuid.NAMESPACE_URL, f"omnitrade:instant-buy:{internal_client_order_id}"))
+    return internal_client_order_id
+
+
+def _is_retryable_legacy_kraken_client_id_rejection(order: LiveCryptoOrder) -> bool:
+    if order.provider != "kraken_spot" or order.status != "REJECTED" or order.provider_order_id is not None:
+        return False
+    evidence = " ".join(
+        [
+            order.failure_reason or "",
+            str((order.safe_provider_response or {}).get("create_order", "")),
+        ]
+    ).lower()
+    return "invalid arguments:cl_ord_id" in evidence
+
+
 def _preview_identity_for_order(client_order_id: str) -> uuid.UUID:
     return uuid.uuid5(uuid.NAMESPACE_URL, f"instant-preview:{client_order_id}")
 
@@ -223,30 +257,49 @@ class InstantTradeService:
             db.scalar(
                 select(LiveCryptoOrder)
                 .where(LiveCryptoOrder.client_order_id == client_order_id)
+                .with_for_update()
                 .limit(1)
             ),
             timeout_seconds=db_timeout,
         )
+        if existing is None:
+            existing = await _with_db_timeout(
+                db.scalar(
+                    select(LiveCryptoOrder)
+                    .where(LiveCryptoOrder.safe_provider_response["paper_account_id"].as_string() == str(request.paper_account_id))
+                    .where(LiveCryptoOrder.safe_provider_response["idempotency_key"].as_string() == request.idempotency_key.strip())
+                    .with_for_update()
+                    .limit(1)
+                ),
+                timeout_seconds=db_timeout,
+            )
+        resume_rejected_order: LiveCryptoOrder | None = None
         if existing is not None:
+            existing_metadata = existing.safe_provider_response or {}
             if (
                 existing.provider != normalized_provider
                 or existing.environment != normalized_environment
                 or existing.product_id != normalized_product
                 or existing.side != "BUY"
                 or _quantize_usd(_decimal(existing.requested_quote_size)) != normalized_quote
+                or str(existing_metadata.get("paper_account_id")) != str(request.paper_account_id)
+                or str(existing_metadata.get("live_trading_profile_id")) != str(request.live_trading_profile_id)
             ):
                 raise ConflictError(
                     message="Idempotency key payload mismatch",
                     details={"internal_order_id": str(existing.live_crypto_order_id)},
                 )
-            await self._bounded_reconcile(
-                db=db,
-                order=existing,
-                actor=request.actor,
-                provider_timeout=provider_timeout,
-                timeout_seconds=int(getattr(settings, "instant_trade_reconciliation_poll_timeout_seconds", 6)),
-            )
-            return self._build_receipt(existing)
+            if _is_retryable_legacy_kraken_client_id_rejection(existing):
+                resume_rejected_order = existing
+            else:
+                await self._bounded_reconcile(
+                    db=db,
+                    order=existing,
+                    actor=request.actor,
+                    provider_timeout=provider_timeout,
+                    timeout_seconds=int(getattr(settings, "instant_trade_reconciliation_poll_timeout_seconds", 6)),
+                )
+                return self._build_receipt(existing)
 
         connection = await _with_db_timeout(
             _resolve_connection(
@@ -392,7 +445,11 @@ class InstantTradeService:
                 details={"reason_code": risk_result.reason_code or "rejected"},
             )
 
-        order = LiveCryptoOrder(
+        provider_client_order_id = _provider_client_order_id(
+            internal_client_order_id=client_order_id,
+            provider=normalized_provider,
+        )
+        order = resume_rejected_order or LiveCryptoOrder(
             crypto_order_preview_id=_preview_identity_for_order(client_order_id),
             exchange_connection_id=connection.exchange_connection_id,
             provider=normalized_provider,
@@ -420,6 +477,8 @@ class InstantTradeService:
                 "live_trading_profile_id": str(profile.id),
                 "actor": request.actor,
                 "idempotency_key": request.idempotency_key.strip(),
+                "request_fingerprint": _request_fingerprint(request=request),
+                "provider_client_order_id": provider_client_order_id,
                 "requested_quote_amount": format(normalized_quote, "f"),
                 "preview_summary": {
                     "estimated_base_size": None if preview.estimated_base_size is None else format(preview.estimated_base_size, "f"),
@@ -432,11 +491,24 @@ class InstantTradeService:
             audit_correlation_id=uuid.uuid4(),
             operator_confirmation_id=None,
         )
-        db.add(order)
+        if resume_rejected_order is None:
+            db.add(order)
+        else:
+            order.status = "SUBMISSION_PENDING"
+            order.failure_code = None
+            order.failure_reason = None
+            order.submitted_at = _utcnow()
+            order.safe_provider_response = {
+                **(order.safe_provider_response or {}),
+                "idempotency_key": request.idempotency_key.strip(),
+                "request_fingerprint": _request_fingerprint(request=request),
+                "provider_client_order_id": provider_client_order_id,
+                "legacy_cl_ord_id_rejection_resumed": True,
+            }
         await _with_db_timeout(db.flush(), timeout_seconds=db_timeout)
         await _record_audit(
             db=db,
-            action="INSTANT_BUY_ACCEPTED",
+            action="INSTANT_BUY_LEGACY_CL_ORD_ID_RETRY" if resume_rejected_order is not None else "INSTANT_BUY_ACCEPTED",
             actor=request.actor,
             entity_id=order.live_crypto_order_id,
             before_state=None,
@@ -452,7 +524,7 @@ class InstantTradeService:
         await _with_db_timeout(_commit_if_supported(db=db), timeout_seconds=db_timeout)
 
         request_payload = {
-            "client_order_id": order.client_order_id,
+            "client_order_id": provider_client_order_id,
             "product_id": order.product_id,
             "side": order.side,
             "order_configuration": {
@@ -474,7 +546,7 @@ class InstantTradeService:
                         order_type=order.order_type,
                         quote_size=order.requested_quote_size,
                         base_size=None,
-                        client_order_id=order.client_order_id,
+                        client_order_id=provider_client_order_id,
                         idempotency_key=order.client_order_id,
                         raw_payload=request_payload,
                     ),

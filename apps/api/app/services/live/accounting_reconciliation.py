@@ -293,13 +293,19 @@ async def reconcile_live_order_and_fills(
         environment=live_order.environment,
     )
     provider = get_exchange_provider(live_order.provider, environment=live_order.environment)
+    stored_provider_client_order_id = (live_order.safe_provider_response or {}).get("provider_client_order_id")
+    provider_client_order_id = (
+        stored_provider_client_order_id
+        if isinstance(stored_provider_client_order_id, str) and stored_provider_client_order_id
+        else live_order.client_order_id
+    )
 
     if hasattr(provider, "lookup_order"):
         provider_order = await provider.lookup_order(
             credentials=credentials,
             environment=live_order.environment,
             provider_order_id=live_order.provider_order_id,
-            client_order_id=live_order.client_order_id,
+            client_order_id=provider_client_order_id,
             product_id=live_order.product_id,
         )
     else:
@@ -309,7 +315,7 @@ async def reconcile_live_order_and_fills(
                 credentials=credentials,
                 environment=live_order.environment,
                 order_id=live_order.provider_order_id,
-                client_order_id=live_order.client_order_id,
+                client_order_id=provider_client_order_id,
             )
             payload = order_payload.get("order") if isinstance(order_payload.get("order"), dict) else None
         else:
@@ -323,7 +329,7 @@ async def reconcile_live_order_and_fills(
             for item in rows:
                 if not isinstance(item, dict):
                     continue
-                if str(item.get("client_order_id", "")) != live_order.client_order_id:
+                if str(item.get("client_order_id", "")) != provider_client_order_id:
                     continue
                 if str(item.get("product_id", "")) != live_order.product_id:
                     continue
@@ -335,7 +341,7 @@ async def reconcile_live_order_and_fills(
 
             provider_order = ExchangeProviderOrder(
                 provider_order_id=payload.get("order_id") if isinstance(payload.get("order_id"), str) else live_order.provider_order_id,
-                client_order_id=payload.get("client_order_id") if isinstance(payload.get("client_order_id"), str) else live_order.client_order_id,
+                client_order_id=payload.get("client_order_id") if isinstance(payload.get("client_order_id"), str) else provider_client_order_id,
                 product_id=payload.get("product_id") if isinstance(payload.get("product_id"), str) else live_order.product_id,
                 side=payload.get("side") if isinstance(payload.get("side"), str) else None,
                 status=payload.get("status") if isinstance(payload.get("status"), str) else None,

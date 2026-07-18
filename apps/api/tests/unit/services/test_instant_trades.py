@@ -147,11 +147,30 @@ def _install_common_mocks(monkeypatch: pytest.MonkeyPatch, request: instant_serv
     )
 
 
+def test_kraken_provider_client_order_id_is_deterministic_uuid_and_economically_unique(
+    base_request: instant_service.InstantTradeBuyRequest,
+) -> None:
+    internal_id = instant_service._stable_client_order_id(request=base_request)
+    same = instant_service._provider_client_order_id(internal_client_order_id=internal_id, provider="kraken_spot")
+    repeated = instant_service._provider_client_order_id(internal_client_order_id=internal_id, provider="kraken_spot")
+    different_request = base_request.model_copy(update={"quote_amount": Decimal("4.99")})
+    different = instant_service._provider_client_order_id(
+        internal_client_order_id=instant_service._stable_client_order_id(request=different_request),
+        provider="kraken_spot",
+    )
+
+    assert str(uuid.UUID(same)) == same
+    assert len(same) == 36
+    assert same == repeated
+    assert same != different
+    assert len(internal_id) == 56
+
+
 @pytest.mark.asyncio
 async def test_exact_five_usd_buy_succeeds_with_one_provider_submission(monkeypatch: pytest.MonkeyPatch, base_request: instant_service.InstantTradeBuyRequest) -> None:
     db = _FakeDb()
     _install_common_mocks(monkeypatch, base_request)
-    calls = {"submit": 0}
+    calls = {"submit": 0, "client_order_id": None}
 
     async def _must_not_be_called(**_kwargs):
         raise AssertionError("autonomous campaign helper should not be consulted for instant buy")
@@ -170,8 +189,9 @@ async def test_exact_five_usd_buy_succeeds_with_one_provider_submission(monkeypa
             best_ask=Decimal("100000"),
         )
 
-    async def _submit_order(**_kwargs):
+    async def _submit_order(**kwargs):
         calls["submit"] += 1
+        calls["client_order_id"] = kwargs["request"].client_order_id
         return SimpleNamespace(
             classification="success",
             order=SimpleNamespace(provider_order_id="O-1", status="OPEN"),
@@ -189,6 +209,61 @@ async def test_exact_five_usd_buy_succeeds_with_one_provider_submission(monkeypa
     assert receipt.requested_amount == Decimal("5.00")
     assert receipt.provider_order_id == "O-1"
     assert calls["submit"] == 1
+    assert str(uuid.UUID(str(calls["client_order_id"]))) == calls["client_order_id"]
+    order = next(iter(db.orders_by_client_id.values()))
+    assert order.client_order_id.startswith("instant-")
+    assert order.safe_provider_response["idempotency_key"] == base_request.idempotency_key
+    assert len(order.safe_provider_response["request_fingerprint"]) == 64
+    assert order.safe_provider_response["provider_client_order_id"] == calls["client_order_id"]
+
+
+@pytest.mark.asyncio
+async def test_same_key_retry_after_legacy_kraken_cl_ord_id_rejection_reuses_order_and_submits_once(
+    monkeypatch: pytest.MonkeyPatch,
+    base_request: instant_service.InstantTradeBuyRequest,
+) -> None:
+    db = _FakeDb()
+    _install_common_mocks(monkeypatch, base_request)
+    calls = {"submit": 0}
+
+    async def _preview_market_order(**_kwargs):
+        return SimpleNamespace(success=True, failure_reason=None, warning_messages=[], estimated_base_size=Decimal("0.00005"), estimated_fee=Decimal("0.01"), estimated_fee_currency="USD", estimated_average_price=Decimal("100000"), best_ask=Decimal("100000"))
+
+    async def _submit_order(**kwargs):
+        calls["submit"] += 1
+        assert len(kwargs["request"].client_order_id) == 36
+        return SimpleNamespace(classification="success", order=SimpleNamespace(provider_order_id="O-accepted", status="OPEN"), rejection=None, ambiguous=None, raw_response={}, safe_headers={})
+
+    internal_id = instant_service._stable_client_order_id(request=base_request)
+    rejected = LiveCryptoOrder(
+        live_crypto_order_id=uuid.UUID("c142df4e-1f2d-4960-8b72-0c6186da9e62"),
+        crypto_order_preview_id=uuid.uuid4(), exchange_connection_id=uuid.uuid4(), provider="kraken_spot",
+        environment="production", product_id="BTC-USD", side="BUY", order_type="MARKET",
+        requested_quote_size=Decimal("5.00"), client_order_id=internal_id, status="REJECTED",
+        risk_event_id=None, decision_record_id=None, validation_run_id=None, provider_order_id=None,
+        provider_status=None, submitted_at=datetime.now(timezone.utc), acknowledged_at=None, filled_at=None,
+        cancelled_at=None, failure_code="provider_rejected", failure_reason="EGeneral:Invalid arguments:cl_ord_id",
+        safe_provider_response={
+            "paper_account_id": str(base_request.paper_account_id),
+            "live_trading_profile_id": str(base_request.live_trading_profile_id),
+            "idempotency_key": base_request.idempotency_key,
+            "create_order_responded": True,
+        },
+        audit_correlation_id=uuid.uuid4(), operator_confirmation_id=None,
+        created_at=datetime.now(timezone.utc), updated_at=datetime.now(timezone.utc),
+    )
+    db.orders_by_client_id[internal_id] = rejected
+    db.orders_by_id[rejected.live_crypto_order_id] = rejected
+    monkeypatch.setattr(instant_service, "get_exchange_provider", lambda *_args, **_kwargs: SimpleNamespace(preview_market_order=_preview_market_order, submit_order=_submit_order))
+    monkeypatch.setattr(instant_service.InstantTradeService, "_bounded_reconcile", lambda *args, **kwargs: _preview_market_order())
+
+    receipt = await instant_service.service.buy(db=db, request=base_request, authenticated_user_id=base_request.actor)
+    replay = await instant_service.service.buy(db=db, request=base_request, authenticated_user_id=base_request.actor)
+
+    assert receipt.internal_order_id == rejected.live_crypto_order_id == replay.internal_order_id
+    assert receipt.provider_order_id == "O-accepted"
+    assert calls["submit"] == 1
+    assert len(db.orders_by_client_id) == 1
 
 
 @pytest.mark.asyncio
