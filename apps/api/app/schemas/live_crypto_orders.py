@@ -30,6 +30,8 @@ LiveCryptoOrderProviderStatus = Literal[
     "PENDING",
     "OPEN",
     "FILLED",
+    "PARTIALLY_FILLED",
+    "CLOSED",
     "CANCELLED",
     "EXPIRED",
     "FAILED",

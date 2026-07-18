@@ -1889,3 +1889,125 @@ async def test_reconcile_can_discover_order_by_client_order_id_when_provider_ord
     assert response.live_crypto_order.provider_order_id == "provider-order-1"
     assert response.reconciliation_status in {"ACKNOWLEDGED", "UNKNOWN", "RECONCILIATION_REQUIRED"}
     assert db.commits == 1
+
+
+@pytest.mark.parametrize("provider_status", ["PARTIALLY_FILLED", "CLOSED"])
+@pytest.mark.asyncio
+async def test_reconcile_accepts_provider_statuses_kraken_legitimately_reports(
+    monkeypatch: pytest.MonkeyPatch, provider_status: str
+) -> None:
+    """Regression: Kraken's own status-mapping logic (KrakenSpotClient.lookup_order
+    and the ClosedOrders fallback) legitimately reports PARTIALLY_FILLED for an
+    order closed with a partial fill, and CLOSED for a closed order with zero
+    executed volume. _normalize_provider_status already maps both of these to
+    an internal reconciliation status. Previously, LiveCryptoOrderResponse's
+    provider_status Literal did not include either value, so persisting the
+    reconciliation succeeded (no CHECK constraint on the DB column) but
+    constructing the HTTP response afterward raised a pydantic ValidationError,
+    turning a successful reconciliation into a client-visible failure.
+    """
+    profile = SimpleNamespace(id=uuid.uuid4())
+    live_order = _submit_live_order(status="RECONCILIATION_REQUIRED")
+    live_order.provider_order_id = None
+    preview = _submit_preview(
+        live_trading_profile_id=profile.id,
+        crypto_order_preview_id=live_order.crypto_order_preview_id,
+        exchange_connection_id=live_order.exchange_connection_id,
+    )
+    connection = _submit_connection(exchange_connection_id=live_order.exchange_connection_id)
+    db = _SubmitStateDb(profile=profile, preview=preview, live_order=live_order, connection=connection)
+
+    monkeypatch.setattr(service, "_load_decrypted_credentials", lambda _connection: {"api_key": "key", "api_secret": "secret"})
+
+    async def _list_orders(*_args, **_kwargs):
+        return {
+            "orders": [
+                {
+                    "order_id": "provider-order-1",
+                    "client_order_id": live_order.client_order_id,
+                    "product_id": live_order.product_id,
+                    "status": provider_status,
+                    "filled_size": "0.00002",
+                }
+            ]
+        }, {"x-request-id": "2"}
+
+    async def _list_fills(*_args, **_kwargs):
+        return {"fills": []}, {"x-request-id": "3"}
+
+    monkeypatch.setattr(
+        "app.services.live.accounting_reconciliation.get_exchange_provider",
+        lambda *_args, **_kwargs: _provider_stub(list_historical_orders=_list_orders, list_historical_fills=_list_fills),
+    )
+
+    response = await service.service.reconcile(
+        db=db,
+        live_crypto_order_id=live_order.live_crypto_order_id,
+        request=service.LiveCryptoOrderReconcileRequest(operator_identity="operator:human"),
+    )
+
+    assert response.live_crypto_order.provider_status == provider_status
+    assert db.commits == 1
+
+
+def test_reconcile_endpoint_returns_http_200_for_partially_filled_provider_status(monkeypatch: pytest.MonkeyPatch) -> None:
+    """End-to-end HTTP regression for the same defect: drives the real
+    /live-crypto-orders/{id}/reconcile route (auth, routing, response
+    serialization included) and asserts it returns 200, not a 500 from a
+    ValidationError while building LiveCryptoOrderResponse.
+    """
+    from fastapi.testclient import TestClient
+
+    from app.db.session import get_db
+    from app.main import create_app
+
+    profile = SimpleNamespace(id=uuid.uuid4())
+    live_order = _submit_live_order(status="RECONCILIATION_REQUIRED")
+    live_order.provider_order_id = None
+    preview = _submit_preview(
+        live_trading_profile_id=profile.id,
+        crypto_order_preview_id=live_order.crypto_order_preview_id,
+        exchange_connection_id=live_order.exchange_connection_id,
+    )
+    connection = _submit_connection(exchange_connection_id=live_order.exchange_connection_id)
+    db = _SubmitStateDb(profile=profile, preview=preview, live_order=live_order, connection=connection)
+
+    monkeypatch.setattr(service, "_load_decrypted_credentials", lambda _connection: {"api_key": "key", "api_secret": "secret"})
+
+    async def _list_orders(*_args, **_kwargs):
+        return {
+            "orders": [
+                {
+                    "order_id": "provider-order-1",
+                    "client_order_id": live_order.client_order_id,
+                    "product_id": live_order.product_id,
+                    "status": "PARTIALLY_FILLED",
+                    "filled_size": "0.00002",
+                }
+            ]
+        }, {"x-request-id": "2"}
+
+    async def _list_fills(*_args, **_kwargs):
+        return {"fills": []}, {"x-request-id": "3"}
+
+    monkeypatch.setattr(
+        "app.services.live.accounting_reconciliation.get_exchange_provider",
+        lambda *_args, **_kwargs: _provider_stub(list_historical_orders=_list_orders, list_historical_fills=_list_fills),
+    )
+
+    app = create_app()
+
+    async def override_get_db():
+        yield db
+
+    app.dependency_overrides[get_db] = override_get_db
+
+    with TestClient(app, raise_server_exceptions=False) as client:
+        response = client.post(
+            f"/live-crypto-orders/{live_order.live_crypto_order_id}/reconcile",
+            json={"operator_identity": "operator:human"},
+            headers={"Authorization": "Bearer operator:human"},
+        )
+
+    assert response.status_code == 200
+    assert response.json()["live_crypto_order"]["provider_status"] == "PARTIALLY_FILLED"
