@@ -191,6 +191,7 @@ _COMMISSIONED_SUBMISSION_MAY_HAVE_OCCURRED = {
 }
 _COMMISSIONED_RECONCILIATION_STATES = {"BUY_RECONCILIATION_PENDING", "RECONCILIATION_REQUIRED", "ACTIVE_POSITION"}
 _PROVING_REFRESH_GRACE_SECONDS = 90
+_CANONICAL_PROVING_MAX_STATE_TRANSITIONS = 12
 
 
 def _commission_db_timeout_seconds() -> int:
@@ -5505,7 +5506,13 @@ async def canonical_proving_commission_bundle(
 
         if commissioned_state not in _COMMISSIONED_SUBMISSION_MAY_HAVE_OCCURRED:
             attempted_refresh_scopes: set[str] = set()
+            state_transitions = 0
             while True:
+                state_transitions += 1
+                if state_transitions > _CANONICAL_PROVING_MAX_STATE_TRANSITIONS:
+                    raise PermissionError(
+                        f"canonical proving commissioning did not converge after {_CANONICAL_PROVING_MAX_STATE_TRANSITIONS} state transitions"
+                    )
                 package = await _await_db_operation(
                     stage="latest_forced_package_lookup",
                     root_idempotency_key=root_idempotency_key,
@@ -5649,7 +5656,7 @@ async def canonical_proving_commission_bundle(
                                         idempotency_key=_commission_phase_idempotency_key(
                                             root_idempotency_key=root_idempotency_key,
                                             phase="canonical_package_authorize",
-                                            scope=str(package.package_id),
+                                            scope=f"{package.package_id}:renew:{package.approval_event_id}",
                                         ),
                                     ),
                                 ),
@@ -5759,7 +5766,7 @@ async def canonical_proving_commission_bundle(
                                     idempotency_key=_commission_phase_idempotency_key(
                                         root_idempotency_key=root_idempotency_key,
                                         phase="canonical_package_authorize",
-                                        scope=str(package.package_id),
+                                        scope=f"{package.package_id}:renew:{package.approval_event_id}",
                                     ),
                                 ),
                             ),
@@ -5835,7 +5842,7 @@ async def canonical_proving_commission_bundle(
                                     idempotency_key=_commission_phase_idempotency_key(
                                         root_idempotency_key=root_idempotency_key,
                                         phase="canonical_package_authorize",
-                                        scope=str(package.package_id),
+                                        scope=f"{package.package_id}:renew:{package.approval_event_id}",
                                     ),
                                 ),
                             ),

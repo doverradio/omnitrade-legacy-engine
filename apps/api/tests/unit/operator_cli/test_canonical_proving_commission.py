@@ -1640,3 +1640,179 @@ async def test_canonical_proving_commission_status_is_read_only(monkeypatch: pyt
     assert payload["no_execution"] is True
     assert db.commit_calls == 0
     assert db.flush_calls == 0
+
+
+@pytest.mark.asyncio
+async def test_canonical_proving_commission_activation_renewal_converges_to_submission(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Reproduces the production infinite loop: a package that is ACTIVATED but whose
+    activation has expired kept cycling through approval_renewal -> canonical_package_authorize
+    -> reactivation -> canonical_proving_activate forever, because the renewal call reused the
+    package's existing (frozen) idempotency-key scope and so always replayed the SAME stale
+    approval/activation instead of producing a genuinely renewed one. These fakes model the
+    real, now-fixed contract: a call keyed by a distinct idempotency_key produces a fresh
+    approval, and reactivation actually extends the existing activation's expiry when the
+    approval backing it has changed. Proves the loop converges after exactly one renewal cycle
+    and reaches provider submission."""
+    state = _State()
+    state.package.package_state = "ACTIVATED"
+    state.package.approval_event_id = state.approval.id
+    state.package.dry_run_live_crypto_order_id = uuid4()
+    state.approval.expires_at = datetime.now(timezone.utc) - timedelta(seconds=1)
+    state.activation = SimpleNamespace(
+        activation_id=uuid4(),
+        package_id=state.package.package_id,
+        activation_state="ACTIVE",
+        approval_event_id=state.approval.id,
+        expires_at=datetime.now(timezone.utc) - timedelta(seconds=1),
+    )
+    _install_common_monkeypatches(monkeypatch, state)
+
+    approvals_by_key: dict[str, SimpleNamespace] = {}
+
+    async def _authorize_realistic(*, db, request):
+        _ = db
+        state.authorize_calls += 1
+        existing = approvals_by_key.get(request.idempotency_key)
+        if existing is None:
+            existing = SimpleNamespace(id=uuid4(), approval_state="approved", expires_at=request.expires_at)
+            approvals_by_key[request.idempotency_key] = existing
+        state.approval = existing
+        state.package.approval_event_id = existing.id
+        state.package.package_state = "AUTHORIZED"
+        return {"approval_event_id": str(existing.id)}
+
+    async def _activate_realistic(*, db, request):
+        _ = db
+        state.activate_calls += 1
+        existing = state.activation
+        if existing.approval_event_id != request.approval_event_id:
+            existing.approval_event_id = request.approval_event_id
+            existing.expires_at = request.expires_at
+        state.package.package_state = "ACTIVATED"
+        return {"activation": {"activation_id": str(existing.activation_id)}}
+
+    async def _load_approval_realistic(**_kwargs):
+        return state.approval if state.package.approval_event_id else None
+
+    async def _load_activation_realistic(**_kwargs):
+        return state.activation
+
+    monkeypatch.setattr(service, "authorize_canonical_preview_package", _authorize_realistic)
+    monkeypatch.setattr(service, "activate_canonical_proving_campaign", _activate_realistic)
+    monkeypatch.setattr(service, "_load_latest_approval_for_package", _load_approval_realistic)
+    monkeypatch.setattr(service, "_load_activation_for_package", _load_activation_realistic)
+
+    payload = await service.canonical_proving_commission_bundle(
+        campaign_id=state.campaign_id,
+        campaign_version=1,
+        paper_account_id=state.paper_account_id,
+        live_trading_profile_id=state.profile_id,
+        provider="kraken_spot",
+        environment="production",
+        product="BTC-USD",
+        amount_usd=Decimal("5"),
+        actor="operator:human",
+        approver_role="operator",
+        rationale="bounded proving",
+        no_leverage=True,
+        confirm=True,
+        idempotency_key="root-activation-renewal-converges",
+    )
+
+    # Converges to submission after exactly one renewal/reactivation cycle.
+    assert payload["current_state"] == "ACTIVE_POSITION"
+    assert state.authorize_calls == 1
+    assert state.activate_calls == 1
+    assert len(approvals_by_key) == 1
+    assert state.execute_calls == 1
+
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert "stage=reactivation status=completed" in captured.err
+    json.dumps(payload)
+
+    # Retrying with the same root idempotency key must not submit a duplicate order: the
+    # campaign is already ACTIVE_POSITION, so this replays via the early-return status path.
+    payload_retry = await service.canonical_proving_commission_bundle(
+        campaign_id=state.campaign_id,
+        campaign_version=1,
+        paper_account_id=state.paper_account_id,
+        live_trading_profile_id=state.profile_id,
+        provider="kraken_spot",
+        environment="production",
+        product="BTC-USD",
+        amount_usd=Decimal("5"),
+        actor="operator:human",
+        approver_role="operator",
+        rationale="bounded proving",
+        no_leverage=True,
+        confirm=True,
+        idempotency_key="root-activation-renewal-converges",
+    )
+
+    assert payload_retry["current_state"] == "ACTIVE_POSITION"
+    assert state.execute_calls == 1
+
+
+@pytest.mark.asyncio
+async def test_canonical_proving_commission_non_converging_activation_fails_closed_within_bounded_transitions(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """If activation renewal ever again fails to make forward progress (e.g. a future
+    regression reintroduces the frozen-idempotency-key defect), the loop must fail closed
+    deterministically within a small, bounded number of state transitions instead of cycling
+    indefinitely -- this is the safety net for the exact production incident, reproduced here
+    with fakes that intentionally never renew the stale approval/activation."""
+    state = _State()
+    state.package.package_state = "ACTIVATED"
+    state.package.approval_event_id = state.approval.id
+    state.package.dry_run_live_crypto_order_id = uuid4()
+    state.approval.expires_at = datetime.now(timezone.utc) - timedelta(seconds=1)
+    state.activation = SimpleNamespace(
+        activation_id=uuid4(),
+        package_id=state.package.package_id,
+        activation_state="ACTIVE",
+        approval_event_id=state.approval.id,
+        expires_at=datetime.now(timezone.utc) - timedelta(seconds=1),
+    )
+    _install_common_monkeypatches(monkeypatch, state)
+
+    async def _authorize_never_renews(**_kwargs):
+        state.authorize_calls += 1
+        state.package.approval_event_id = state.approval.id
+        state.package.package_state = "AUTHORIZED"
+        return {"approval_event_id": str(state.approval.id)}
+
+    async def _activate_never_renews(**_kwargs):
+        state.activate_calls += 1
+        state.package.package_state = "ACTIVATED"
+        return {"activation": {"activation_id": str(state.activation.activation_id)}}
+
+    monkeypatch.setattr(service, "authorize_canonical_preview_package", _authorize_never_renews)
+    monkeypatch.setattr(service, "activate_canonical_proving_campaign", _activate_never_renews)
+
+    with pytest.raises(PermissionError, match=r"did not converge after \d+ state transitions"):
+        await service.canonical_proving_commission_bundle(
+            campaign_id=state.campaign_id,
+            campaign_version=1,
+            paper_account_id=state.paper_account_id,
+            live_trading_profile_id=state.profile_id,
+            provider="kraken_spot",
+            environment="production",
+            product="BTC-USD",
+            amount_usd=Decimal("5"),
+            actor="operator:human",
+            approver_role="operator",
+            rationale="bounded proving",
+            no_leverage=True,
+            confirm=True,
+            idempotency_key="root-non-convergent-activation",
+        )
+
+    # Fails closed with no submission ever attempted, after a small, deterministic number
+    # of transitions -- not thousands, and not an unbounded hang.
+    assert state.execute_calls == 0
+    assert state.prepare_calls == 0
+    assert 1 <= state.activate_calls <= service._CANONICAL_PROVING_MAX_STATE_TRANSITIONS

@@ -1291,6 +1291,12 @@ async def activate_canonical_proving_campaign(
         select(CanonicalProvingActivation).where(CanonicalProvingActivation.package_id == package.package_id).limit(1)
     )
     if existing is not None:
+        if existing.activation_state != "ACTIVE":
+            raise PermissionError("canonical proving activation is not active and cannot be renewed")
+        if existing.approval_event_id != request.approval_event_id:
+            existing.approval_event_id = request.approval_event_id
+            existing.expires_at = request.expires_at
+            await db.flush()
         if package.package_state != "ACTIVATED":
             package.package_state = "ACTIVATED"
             await db.flush()
