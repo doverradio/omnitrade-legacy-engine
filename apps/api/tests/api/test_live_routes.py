@@ -32,6 +32,8 @@ class _FakeSession:
         self.profiles = profiles or []
         self.approval_events = approval_events or []
         self.reconciliation_events = reconciliation_events or []
+        self.added: list[Any] = []
+        self.commit_count = 0
 
     async def scalar(self, statement: Any) -> Any:
         sql = str(statement)
@@ -47,7 +49,31 @@ class _FakeSession:
                     return item
             return None
 
+        if "FROM live_approval_events" in sql and "idempotency_key_1" in params:
+            key = params.get("idempotency_key_1")
+            for item in self.approval_events:
+                if item.idempotency_key == key:
+                    return item
+            return None
+
+        if "max(live_approval_events.sequence_number)" in sql:
+            profile_id = params.get("live_trading_profile_id_1")
+            seqs = [item.sequence_number for item in self.approval_events if item.live_trading_profile_id == profile_id]
+            return max(seqs) if seqs else None
+
         return None
+
+    def add(self, obj: Any) -> None:
+        if isinstance(obj, LiveApprovalEvent):
+            if not getattr(obj, "id", None):
+                obj.id = uuid.uuid4()
+            self.approval_events.append(obj)
+
+    async def flush(self) -> None:
+        return None
+
+    async def commit(self) -> None:
+        self.commit_count += 1
 
     async def scalars(self, statement: Any) -> _Rows:
         sql = str(statement)
@@ -321,6 +347,46 @@ def test_live_approval_checkpoint_uses_authenticated_actor_identity(monkeypatch)
     assert captured["approver_id"] == "operator:human"
     assert captured["requested_by"] == "operator:human"
     assert captured["approver_role"] == "risk_owner"
+
+
+def test_live_approval_checkpoint_route_durably_persists_first_live_enablement() -> None:
+    """Exercises the real (unstubbed) record_live_approval_checkpoint() through the HTTP route
+    to prove the checkpoint and the profile transition are actually committed, not just returned."""
+    profile = _profile(operating_mode="paper")
+    session = _FakeSession(profiles=[profile])
+    app = create_app()
+
+    async def _override_get_db():
+        yield session
+
+    app.dependency_overrides[get_db] = _override_get_db
+
+    with TestClient(app) as client:
+        response = client.post(
+            "/live/approvals/checkpoints",
+            json={
+                "live_trading_profile_id": str(profile.id),
+                "checkpoint_type": "first_live_enablement",
+                "approver_id": "forged:body",
+                "approver_role": "risk_owner",
+                "rationale": "approved",
+                "approval_scope": {"scope": ["x"]},
+                "requested_by": "forged:body",
+                "idempotency_key": "route-persist-key-1",
+            },
+            headers={"Authorization": "Bearer operator:human"},
+        )
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["operating_mode"] == "live"
+    assert body["lifecycle_state"] == "enabled"
+    assert session.commit_count == 1
+    assert len(session.approval_events) == 1
+    assert profile.operating_mode == "live"
+    assert profile.lifecycle_state == "enabled"
+    assert profile.approval_state == "approved"
+    assert profile.human_approval_recorded is True
 
 
 def test_live_approval_revoke_uses_authenticated_actor_identity(monkeypatch) -> None:

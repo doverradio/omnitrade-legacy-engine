@@ -19,6 +19,8 @@ class _FakeDb:
         self.campaign = None
         self.preview = None
         self.approval = None
+        self.added: list = []
+        self.commit_count = 0
 
     async def scalar(self, statement):
         sql = str(statement)
@@ -37,6 +39,17 @@ class _FakeDb:
         if "FROM live_approval_events" in sql:
             return self.approval
         return None
+
+    def add(self, obj) -> None:
+        if not getattr(obj, "id", None):
+            obj.id = uuid4()
+        self.added.append(obj)
+
+    async def flush(self) -> None:
+        return None
+
+    async def commit(self) -> None:
+        self.commit_count += 1
 
 
 class _CampaignSelectionDb:
@@ -604,6 +617,32 @@ async def test_approval_helper_uses_first_live_enablement_checkpoint(monkeypatch
     assert captured["strategy_version"] == "ma_crossover@1.0.0"
     assert captured["parameter_set_version"] == "param-set-v1"
     assert captured["crypto_order_preview_id"] == str(preview_id)
+
+
+@pytest.mark.asyncio
+async def test_record_first_live_enablement_approval_durably_persists_via_real_checkpoint_recording() -> None:
+    """Covers the exact call path used by `initialize_live_crypto_environment.py --create-approval`,
+    exercising the real record_live_approval_checkpoint() (unstubbed) to prove the fix persists."""
+    db = _FakeDb()
+    db.profile = _profile(uuid4(), environment="production", provider="kraken_spot")
+
+    result = await service.record_first_live_enablement_approval(
+        db=db,
+        request=service.RecordApprovalHelperRequest(
+            actor="operator:human",
+            live_trading_profile_id=db.profile.id,
+            provider="kraken_spot",
+            exchange_environment="production",
+        ),
+    )
+
+    assert result.approval_state == "approved"
+    assert db.commit_count == 1
+    assert len(db.added) == 1
+    assert db.profile.operating_mode == "live"
+    assert db.profile.lifecycle_state == "enabled"
+    assert db.profile.approval_state == "approved"
+    assert db.profile.human_approval_recorded is True
 
 
 @pytest.mark.asyncio

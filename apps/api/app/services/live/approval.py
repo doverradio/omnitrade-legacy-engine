@@ -18,6 +18,11 @@ from app.services.live.contracts import (
 )
 
 
+async def _commit_if_supported(*, db: AsyncSession) -> None:
+    if hasattr(db, "commit"):
+        await db.commit()
+
+
 def build_live_approval_idempotency_key(
     *,
     live_trading_profile_id: uuid.UUID,
@@ -232,6 +237,7 @@ async def record_live_approval_checkpoint(
         profile.lifecycle_state = "enabled"
 
     await db.flush()
+    await _commit_if_supported(db=db)
 
     return LiveApprovalCheckpointResult(
         approval_event_id=approval_event.id,
@@ -373,6 +379,7 @@ async def _record_approval_state_change(
     profile.operating_mode = "paper"
 
     await db.flush()
+    await _commit_if_supported(db=db)
 
     return LiveApprovalCheckpointResult(
         approval_event_id=approval_event.id,

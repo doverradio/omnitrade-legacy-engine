@@ -26,12 +26,19 @@ class _BeginContext:
 
 
 class _FakeSession:
-    def __init__(self, *, profiles: list[LiveTradingProfile]) -> None:
+    def __init__(self, *, profiles: list[LiveTradingProfile], raise_on_commit: bool = False) -> None:
         self.profiles = profiles
         self.approval_events: list[LiveApprovalEvent] = []
+        self.commit_count = 0
+        self.raise_on_commit = raise_on_commit
 
     def begin(self) -> _BeginContext:
         return _BeginContext()
+
+    async def commit(self) -> None:
+        if self.raise_on_commit:
+            raise RuntimeError("simulated commit failure")
+        self.commit_count += 1
 
     async def scalar(self, statement: Any) -> Any:
         sql = str(statement)
@@ -193,6 +200,55 @@ async def test_record_live_approval_checkpoint_is_idempotent() -> None:
 
 
 @pytest.mark.asyncio
+async def test_record_live_approval_checkpoint_commits_durable_first_live_enablement_state() -> None:
+    profile = _profile()
+    session = _FakeSession(profiles=[profile])
+
+    result = await record_live_approval_checkpoint(
+        db=session,
+        request=_checkpoint_request(profile.id, idempotency_key="approval-key-commit-1"),
+    )
+
+    assert session.commit_count == 1
+    assert len(session.approval_events) == 1
+    assert result.operating_mode == "live"
+    assert result.lifecycle_state == "enabled"
+    assert result.approval_state == "approved"
+    assert profile.operating_mode == "live"
+    assert profile.lifecycle_state == "enabled"
+    assert profile.approval_state == "approved"
+    assert profile.human_approval_recorded is True
+
+
+@pytest.mark.asyncio
+async def test_record_live_approval_checkpoint_idempotent_replay_does_not_recommit() -> None:
+    profile = _profile()
+    session = _FakeSession(profiles=[profile])
+    request = _checkpoint_request(profile.id, idempotency_key="approval-key-commit-2")
+
+    first = await record_live_approval_checkpoint(db=session, request=request)
+    second = await record_live_approval_checkpoint(db=session, request=request)
+
+    assert first.approval_event_id == second.approval_event_id
+    assert len(session.approval_events) == 1
+    assert session.commit_count == 1
+    assert profile.operating_mode == "live"
+    assert profile.lifecycle_state == "enabled"
+
+
+@pytest.mark.asyncio
+async def test_record_live_approval_checkpoint_commit_failure_does_not_report_success() -> None:
+    profile = _profile()
+    session = _FakeSession(profiles=[profile], raise_on_commit=True)
+
+    with pytest.raises(RuntimeError, match="simulated commit failure"):
+        await record_live_approval_checkpoint(
+            db=session,
+            request=_checkpoint_request(profile.id, idempotency_key="approval-key-commit-3"),
+        )
+
+
+@pytest.mark.asyncio
 async def test_revoke_live_approval_suspends_profile_and_returns_to_paper_mode() -> None:
     profile = _profile(lifecycle_state="enabled", operating_mode="live")
     profile.approval_state = "approved"
@@ -209,6 +265,21 @@ async def test_revoke_live_approval_suspends_profile_and_returns_to_paper_mode()
     assert result.operating_mode == "paper"
     assert profile.approval_state == "revoked"
     assert profile.human_approval_recorded is False
+    assert session.commit_count == 1
+
+
+@pytest.mark.asyncio
+async def test_revoke_live_approval_commit_failure_does_not_report_success() -> None:
+    profile = _profile(lifecycle_state="enabled", operating_mode="live")
+    profile.approval_state = "approved"
+    profile.human_approval_recorded = True
+    session = _FakeSession(profiles=[profile], raise_on_commit=True)
+
+    with pytest.raises(RuntimeError, match="simulated commit failure"):
+        await revoke_live_approval(
+            db=session,
+            request=_state_change_request(profile.id, idempotency_key="approval-key-4-fail"),
+        )
 
 
 @pytest.mark.asyncio
@@ -225,6 +296,7 @@ async def test_suspend_live_approval_records_suspension_without_bypass() -> None
 
     assert result.approval_state == "suspended"
     assert result.lifecycle_state == "suspended"
+    assert session.commit_count == 1
     assert result.operating_mode == "paper"
 
 
