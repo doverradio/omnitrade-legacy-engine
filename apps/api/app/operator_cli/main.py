@@ -73,6 +73,7 @@ from app.operator_cli.service import (
     fetch_risk_ledger_diagnosis,
     fetch_watch_status,
     mandate_bootstrap,
+    mandate_bootstrap_commission,
     mandate_bootstrap_create,
     mandate_bootstrap_create_status,
     mandate_bootstrap_export,
@@ -997,6 +998,30 @@ def _build_parser() -> argparse.ArgumentParser:
     mandate_bootstrap_create_status_parser.add_argument("--idempotency-key", type=str, required=True)
     mandate_bootstrap_create_status_parser.add_argument("--json", action="store_true", dest="json_output")
 
+    mandate_bootstrap_commission_parser = subparsers.add_parser(
+        "mandate-bootstrap-commission",
+        parents=[common],
+        help="Orchestrates the existing governance audit + create + status pipeline to commission exactly one DRAFT mandate -- never authorizes, activates, or trades",
+        description=(
+            "Stage 9A.2: reuses the existing pipeline end to end for one "
+            "--capital-campaign-id/--owner-input-json pair -- adds no new validation or "
+            "write logic. Runs mandate-governance-readiness-audit first (aborts with zero "
+            "writes if not READY_FOR_STAGE9), then mandate-bootstrap-create (itself reusing "
+            "export/session-validate and Stage 9A.1's idempotency-conflict guard), then "
+            "mandate-bootstrap-create-status to independently re-verify the just-created "
+            "state from the database's own perspective. Never calls "
+            "apply_mandate_lifecycle_action(), authorize_mandate_version(), "
+            "mandate_bootstrap() itself, or any order-execution/autonomous-cycle function. "
+            "The resulting mandate is always DRAFT/unauthorized/inactive. Exit code 0 for "
+            "COMMISSIONED, 1 for any other overall_status (ABORTED_NOT_READY, "
+            "FAILED_VALIDATION, CONFLICT, COMMISSIONED_INTEGRITY_WARNING), 2 only for an "
+            "infrastructure or unexpected failure."
+        ),
+    )
+    mandate_bootstrap_commission_parser.add_argument("--capital-campaign-id", type=int, required=True)
+    mandate_bootstrap_commission_parser.add_argument("--owner-input-json", type=_parse_owner_input_json, required=True)
+    mandate_bootstrap_commission_parser.add_argument("--json", action="store_true", dest="json_output")
+
     proving_pause = subparsers.add_parser(
         "canonical-proving-pause",
         parents=[common],
@@ -1416,6 +1441,14 @@ async def _run_async(args: argparse.Namespace) -> tuple[int, dict[str, Any], str
             idempotency_key=args.idempotency_key,
         )
         exit_code = 0 if payload["overall_status"] in {"NOT_STARTED", "COMPLETE_DRAFT"} else 1
+        return exit_code, payload, render_json(payload)
+
+    if args.command == "mandate-bootstrap-commission":
+        payload = await mandate_bootstrap_commission(
+            capital_campaign_id=args.capital_campaign_id,
+            owner_input=args.owner_input_json,
+        )
+        exit_code = 0 if payload["overall_status"] == "COMMISSIONED" else 1
         return exit_code, payload, render_json(payload)
 
     if args.command == "canonical-proving-pause":

@@ -3396,6 +3396,105 @@ async def mandate_bootstrap_create_status(*, capital_campaign_id: int, idempoten
     }
 
 
+async def mandate_bootstrap_commission(*, capital_campaign_id: int, owner_input: dict[str, Any]) -> dict[str, Any]:
+    """Stage 9A.2: orchestrates the existing, already-governed Stage 6-9A.1 pipeline to
+    commission exactly one DRAFT mandate -- reuses every step as-is and adds no new
+    validation, resolution, or write logic of its own. Sequence: (1)
+    mandate_governance_readiness_audit() -- if not READY_FOR_STAGE9, aborts with zero
+    writes; (2) mandate_bootstrap_create() -- itself reusing
+    mandate_bootstrap_export()/mandate_bootstrap_session_validate() and only writing if
+    validation succeeds, with its own idempotency-conflict guard from Stage 9A.1; (3) on a
+    genuine CREATED result, mandate_bootstrap_create_status() to independently re-verify
+    the just-created state is coherent from the database's own perspective, not merely
+    trusted from the write call's in-memory return value. Never calls
+    apply_mandate_lifecycle_action(), authorize_mandate_version(), mandate_bootstrap(), or
+    any order-execution/autonomous-cycle function -- this function references none of
+    them."""
+    audit = await mandate_governance_readiness_audit(capital_campaign_id=capital_campaign_id)
+    transaction_model = _mandate_bootstrap_create_transaction_model()
+
+    if audit["overall_status"] != "READY_FOR_STAGE9":
+        return {
+            "overall_status": "ABORTED_NOT_READY",
+            "mandate_id": None,
+            "mandate_version_id": None,
+            "audit_summary": {
+                "governance_audit_status": audit["overall_status"],
+                "write_paths": audit["write_paths"],
+                "writes_performed": False,
+            },
+            "integrity_status": None,
+            "transaction_model": transaction_model,
+            "current_state": None,
+            "next_required_action": (
+                "mandate-governance-readiness-audit reported NOT_READY for this campaign's "
+                "pipeline. Resolve the reported write_paths/failing checks (see "
+                "mandate-governance-readiness-audit's own output) before attempting "
+                "commissioning again. Zero writes were performed."
+            ),
+        }
+
+    creation = await mandate_bootstrap_create(capital_campaign_id=capital_campaign_id, owner_input=owner_input)
+
+    if creation["overall_status"] != "CREATED":
+        return {
+            "overall_status": creation["overall_status"],
+            "mandate_id": creation["mandate_id"],
+            "mandate_version_id": creation["mandate_version_id"],
+            "audit_summary": {
+                "governance_audit_status": audit["overall_status"],
+                **creation["audit_summary"],
+            },
+            "integrity_status": None,
+            "transaction_model": creation["transaction_model"],
+            "current_state": None,
+            "next_required_action": creation["next_required_action"],
+        }
+
+    root_idempotency_key = creation["audit_summary"]["root_idempotency_key"]
+    status = await mandate_bootstrap_create_status(
+        capital_campaign_id=capital_campaign_id, idempotency_key=root_idempotency_key
+    )
+
+    current_state = {
+        "mandate_status": creation["write_summary"]["mandate_status"],
+        "is_authorized": creation["write_summary"]["mandate_version_is_authorized"],
+        "is_active": creation["write_summary"]["mandate_version_is_active"],
+    }
+
+    if status["overall_status"] == "COMPLETE_DRAFT":
+        overall_status = "COMMISSIONED"
+        next_required_action = (
+            "Exactly one production DRAFT mandate and its initial version now exist, "
+            "independently re-verified coherent via mandate-bootstrap-create-status. "
+            "Status remains DRAFT/unauthorized/inactive. A human operator must separately "
+            "and explicitly authorize and activate this mandate -- no command in this "
+            "pipeline does so automatically, and none was called here."
+        )
+    else:
+        overall_status = "COMMISSIONED_INTEGRITY_WARNING"
+        next_required_action = (
+            f"Creation succeeded but the independent coherence re-check reported "
+            f"{status['overall_status']} rather than COMPLETE_DRAFT. Do not proceed to "
+            f"authorization. Investigate via mandate-bootstrap-create-status "
+            f"(conflicts={status['conflicts']!r}) before any further action."
+        )
+
+    return {
+        "overall_status": overall_status,
+        "mandate_id": creation["mandate_id"],
+        "mandate_version_id": creation["mandate_version_id"],
+        "audit_summary": {
+            "governance_audit_status": audit["overall_status"],
+            **creation["audit_summary"],
+        },
+        "integrity_status": status["overall_status"],
+        "transaction_model": creation["transaction_model"],
+        "current_state": current_state,
+        "next_required_action": next_required_action,
+    }
+
+
 async def _resolve_exchange_connection_for_commissioning(
     *,
     db,
