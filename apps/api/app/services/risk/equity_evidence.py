@@ -6,7 +6,7 @@ from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal
 from typing import Any
 
-from sqlalchemy import func, select
+from sqlalchemy import and_, func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.models.asset import Asset
@@ -472,17 +472,55 @@ async def _count_reconciliation_uncertainty(*, db: AsyncSession, paper_account_i
     if not profile_ids:
         return (0, 0)
 
-    unresolved_count = int(
+    # Reconciliation events are append-only: an order can accumulate several
+    # historical events (e.g. partially_filled, then reconciliation_required)
+    # as its state evolves. Only the LATEST event per order reflects its
+    # current effective state, so unresolved-ness is evaluated per order
+    # (max sequence_number within that order), not by counting every
+    # superseded historical row.
+    latest_per_order = (
+        select(
+            LiveReconciliationEvent.live_crypto_order_id.label("order_id"),
+            func.max(LiveReconciliationEvent.sequence_number).label("max_seq"),
+        )
+        .where(LiveReconciliationEvent.live_trading_profile_id.in_(profile_ids))
+        .where(LiveReconciliationEvent.live_crypto_order_id.is_not(None))
+        .group_by(LiveReconciliationEvent.live_crypto_order_id)
+        .subquery()
+    )
+    unresolved_orders_count = int(
         (
             await db.scalar(
                 select(func.count())
-                .select_from(LiveReconciliationEvent)
-                .where(LiveReconciliationEvent.live_trading_profile_id.in_(profile_ids))
+                .select_from(latest_per_order)
+                .join(
+                    LiveReconciliationEvent,
+                    and_(
+                        LiveReconciliationEvent.live_crypto_order_id == latest_per_order.c.order_id,
+                        LiveReconciliationEvent.sequence_number == latest_per_order.c.max_seq,
+                        LiveReconciliationEvent.live_trading_profile_id.in_(profile_ids),
+                    ),
+                )
                 .where(LiveReconciliationEvent.reconciliation_status.in_(sorted(_UNRESOLVED_RECONCILIATION_STATUSES)))
             )
         )
         or 0
     )
+    # Events with no order association (no per-order "latest state" concept
+    # applies) are each counted individually -- conservative/fail-closed.
+    unresolved_unassociated_count = int(
+        (
+            await db.scalar(
+                select(func.count())
+                .select_from(LiveReconciliationEvent)
+                .where(LiveReconciliationEvent.live_trading_profile_id.in_(profile_ids))
+                .where(LiveReconciliationEvent.live_crypto_order_id.is_(None))
+                .where(LiveReconciliationEvent.reconciliation_status.in_(sorted(_UNRESOLVED_RECONCILIATION_STATUSES)))
+            )
+        )
+        or 0
+    )
+    unresolved_count = unresolved_orders_count + unresolved_unassociated_count
 
     unknown_provider_order_count = int(
         (

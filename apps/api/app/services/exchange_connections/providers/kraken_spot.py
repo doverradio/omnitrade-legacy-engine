@@ -55,6 +55,24 @@ def _quantize(value: Decimal, places: int) -> Decimal:
     return value.quantize(quantum, rounding=ROUND_DOWN)
 
 
+def _kraken_execution_progress(row: dict[str, Any]) -> tuple[Decimal, Decimal]:
+    """Return (requested, executed) volume for a Kraken order, in matching units.
+
+    Kraken's `vol_exec` is always reported in base-currency units. When an
+    order was submitted with the `viqc` flag (volume-in-quote-currency, used
+    by this system's quote-sized market buys -- see the `oflags` set in
+    `submit_order`), `vol` is reported in quote currency instead, so
+    comparing `vol_exec` against `vol` mixes base and quote units and a
+    fully-spent quote-sized order will never appear to reach `vol`. In that
+    case, use `cost` (quote-currency executed) against `vol` instead.
+    """
+    vol = _to_decimal(row.get("vol"))
+    oflags = str(row.get("oflags") or "").split(",")
+    if "viqc" in oflags:
+        return vol, _to_decimal(row.get("cost"))
+    return vol, _to_decimal(row.get("vol_exec"))
+
+
 def _parse_kraken_timestamp(payload: dict[str, Any]) -> datetime | None:
     candidates = [
         payload.get("opentm"),
@@ -1312,8 +1330,7 @@ class KrakenSpotClient:
                 if not _kraken_pair_matches(actual=pair, expected=normalized_pair):
                     return None
                 raw_status = str(exact_row.get("status") or "").lower()
-                vol = _to_decimal(exact_row.get("vol"))
-                vol_exec = _to_decimal(exact_row.get("vol_exec"))
+                vol, vol_exec = _kraken_execution_progress(exact_row)
                 if raw_status in {"canceled", "expired"}:
                     status = "CANCELLED"
                 elif raw_status == "closed" and vol > Decimal("0") and vol_exec >= vol:
@@ -1393,8 +1410,7 @@ class KrakenSpotClient:
             if not _kraken_pair_matches(actual=pair, expected=normalized_pair):
                 continue
             raw_status = str(row.get("status") or "").lower()
-            vol = _to_decimal(row.get("vol"))
-            vol_exec = _to_decimal(row.get("vol_exec"))
+            vol, vol_exec = _kraken_execution_progress(row)
             if raw_status in {"canceled", "expired"}:
                 status = "CANCELLED"
             elif raw_status == "closed" and vol > Decimal("0") and vol_exec >= vol:

@@ -690,6 +690,170 @@ async def test_lookup_known_txid_uses_query_orders_and_accepts_rest_pair_format(
 
 
 @pytest.mark.asyncio
+async def test_lookup_quote_sized_viqc_order_fully_spent_maps_to_filled(monkeypatch: pytest.MonkeyPatch) -> None:
+    # Regression test: quote-sized market buys are submitted with oflags=viqc
+    # (see submit_order), which makes Kraken report `vol` in quote currency
+    # while `vol_exec` remains in base currency. Comparing them directly
+    # previously misclassified a fully-spent closed order as PARTIALLY_FILLED
+    # because a tiny base-currency vol_exec (e.g. BTC) never reaches a much
+    # larger quote-currency vol (e.g. USD). `cost` (quote-currency executed)
+    # is the correct comparator against `vol` in this case.
+    client = KrakenSpotClient()
+
+    async def _private(*, path, payload, **_kwargs):
+        assert path == "/private/QueryOrders"
+        return {
+            "error": [],
+            "result": {
+                "OAXUZJ-7WRL5-NPFWYA": {
+                    "status": "closed",
+                    "cl_ord_id": "60fd004d-c15b-5b01-a863-05a84379bb60",
+                    "opentm": 1784351307.0,
+                    "closetm": 1784351308.0,
+                    "vol": "5.00000",
+                    "vol_exec": "0.00007817",
+                    "cost": "5.00000",
+                    "fee": "0.04000",
+                    "oflags": "viqc,fciq",
+                    "descr": {"pair": "XBTUSD", "type": "buy", "order": "buy 5.00000 (USD) XBTUSD @ market"},
+                }
+            },
+        }
+
+    monkeypatch.setattr(client, "_private_request", _private)
+    order = await client.lookup_order(
+        credentials={"api_key": "k", "api_secret": "s"},
+        environment="production",
+        provider_order_id="OAXUZJ-7WRL5-NPFWYA",
+        client_order_id="60fd004d-c15b-5b01-a863-05a84379bb60",
+        product_id="BTC-USD",
+    )
+
+    assert order is not None
+    assert order.status == "FILLED"
+
+
+@pytest.mark.asyncio
+async def test_lookup_quote_sized_viqc_order_partially_spent_stays_partially_filled(monkeypatch: pytest.MonkeyPatch) -> None:
+    client = KrakenSpotClient()
+
+    async def _private(*, path, payload, **_kwargs):
+        assert path == "/private/QueryOrders"
+        return {
+            "error": [],
+            "result": {
+                "OAXUZJ-PARTIAL": {
+                    "status": "closed",
+                    "cl_ord_id": "client-partial",
+                    "opentm": 1784351307.0,
+                    "closetm": 1784351308.0,
+                    "vol": "5.00000",
+                    "vol_exec": "0.00003000",
+                    "cost": "2.50000",
+                    "fee": "0.02000",
+                    "oflags": "viqc,fciq",
+                    "descr": {"pair": "XBTUSD", "type": "buy"},
+                }
+            },
+        }
+
+    monkeypatch.setattr(client, "_private_request", _private)
+    order = await client.lookup_order(
+        credentials={"api_key": "k", "api_secret": "s"},
+        environment="production",
+        provider_order_id="OAXUZJ-PARTIAL",
+        client_order_id="client-partial",
+        product_id="BTC-USD",
+    )
+
+    assert order is not None
+    assert order.status == "PARTIALLY_FILLED"
+
+
+@pytest.mark.asyncio
+async def test_lookup_base_sized_order_without_viqc_still_compares_vol_exec_to_vol(monkeypatch: pytest.MonkeyPatch) -> None:
+    # Orders not submitted with viqc must keep the original base-currency
+    # vol/vol_exec comparison unaffected by the quote-currency fix.
+    client = KrakenSpotClient()
+
+    async def _private(*, path, payload, **_kwargs):
+        assert path == "/private/QueryOrders"
+        return {
+            "error": [],
+            "result": {
+                "OID-BASE": {
+                    "status": "closed",
+                    "cl_ord_id": "client-base",
+                    "opentm": 1784351307.0,
+                    "closetm": 1784351308.0,
+                    "vol": "0.00050000",
+                    "vol_exec": "0.00050000",
+                    "cost": "25.00000",
+                    "descr": {"pair": "XBTUSD", "type": "sell"},
+                }
+            },
+        }
+
+    monkeypatch.setattr(client, "_private_request", _private)
+    order = await client.lookup_order(
+        credentials={"api_key": "k", "api_secret": "s"},
+        environment="production",
+        provider_order_id="OID-BASE",
+        client_order_id="client-base",
+        product_id="BTC-USD",
+    )
+
+    assert order is not None
+    assert order.status == "FILLED"
+
+
+@pytest.mark.asyncio
+async def test_lookup_quote_sized_viqc_order_via_closed_orders_fallback_maps_to_filled(monkeypatch: pytest.MonkeyPatch) -> None:
+    # Same defect, but through the /private/ClosedOrders fallback path (used
+    # when QueryOrders by exact txid finds nothing).
+    client = KrakenSpotClient()
+
+    async def _private(*, path, payload, **_kwargs):
+        if path == "/private/QueryOrders":
+            return {"error": [], "result": {}}
+        if path == "/private/OpenOrders":
+            return {"error": [], "result": {"open": {}}}
+        if path == "/private/ClosedOrders":
+            return {
+                "error": [],
+                "result": {
+                    "closed": {
+                        "OAXUZJ-7WRL5-NPFWYA": {
+                            "status": "closed",
+                            "cl_ord_id": "client-closed-viqc",
+                            "opentm": 1784351307.0,
+                            "closetm": 1784351308.0,
+                            "vol": "5.00000",
+                            "vol_exec": "0.00007817",
+                            "cost": "5.00000",
+                            "fee": "0.04000",
+                            "oflags": "viqc,fciq",
+                            "descr": {"pair": "XBTUSD", "type": "buy"},
+                        }
+                    }
+                },
+            }
+        raise AssertionError(f"unexpected private path {path}")
+
+    monkeypatch.setattr(client, "_private_request", _private)
+    order = await client.lookup_order(
+        credentials={"api_key": "k", "api_secret": "s"},
+        environment="production",
+        provider_order_id="OAXUZJ-7WRL5-NPFWYA",
+        client_order_id="client-closed-viqc",
+        product_id="BTC-USD",
+    )
+
+    assert order is not None
+    assert order.status == "FILLED"
+
+
+@pytest.mark.asyncio
 async def test_known_order_fill_lookup_queries_exact_trade_ids_and_preserves_fees(monkeypatch: pytest.MonkeyPatch) -> None:
     client = KrakenSpotClient()
     paths: list[str] = []
