@@ -855,22 +855,26 @@ def _build_parser() -> argparse.ArgumentParser:
     mandate_bootstrap_export_parser = subparsers.add_parser(
         "mandate-bootstrap-export",
         parents=[common],
-        help="Read-only export of authoritative mandate-bootstrap inputs for one capital campaign (Stages 1-3: campaign, definition, paper account, live trading profile, exchange connection)",
+        help="Read-only export of authoritative mandate-bootstrap inputs for one capital campaign (Stages 1-4: campaign, definition, paper account, live trading profile, exchange connection, strategy evidence)",
         description=(
-            "Stages 1-3 of the read-only mandate-bootstrap export design. Resolves "
+            "Stages 1-4 of the read-only mandate-bootstrap export design. Resolves "
             "CapitalCampaign identity, (if pinned) CapitalCampaignDefinition evidence, the "
             "campaign's PaperAccount, LiveTradingProfile candidates strictly scoped to "
-            "LiveTradingProfile.paper_account_id == CapitalCampaign.paper_account_id, and "
+            "LiveTradingProfile.paper_account_id == CapitalCampaign.paper_account_id, "
             "ExchangeConnection candidates resolved from the campaign's own exchange label "
             "(provider+environment together, never provider alone) gated on the live "
-            "trading profile having already resolved uniquely, for one "
-            "--capital-campaign-id. Performs no writes -- no lifecycle action, no "
-            "authorization, no mandate creation. Every field is classified as "
-            "DATABASE_DERIVED, CONFIGURATION_DERIVED, OWNER_INPUT_REQUIRED, MISSING, or "
-            "CONFLICTING; this stage classifies capital_campaign_id, campaign_uuid, "
-            "paper_account_id, base_currency, paper_account_asset_class, "
+            "trading profile having already resolved uniquely, and non-authoritative "
+            "strategy evidence, for one --capital-campaign-id. Performs no writes -- no "
+            "lifecycle action, no authorization, no mandate creation. Every field is "
+            "classified as DATABASE_DERIVED, CONFIGURATION_DERIVED, OWNER_INPUT_REQUIRED, "
+            "MISSING, or CONFLICTING; this stage classifies capital_campaign_id, "
+            "campaign_uuid, paper_account_id, base_currency, paper_account_asset_class, "
             "paper_account_is_active, live_trading_profile_id, exchange_connection_id, "
-            "exchange_provider, and exchange_environment. Never reuses another campaign's, "
+            "exchange_provider, exchange_environment, and allowed_strategy_versions (always "
+            "OWNER_INPUT_REQUIRED -- capital_campaigns.strategy_id is not the canonical "
+            "strategy authority for the modern campaign path, and no other campaign-scoped "
+            "field can derive it; strategy_evidence surfaces informational-only candidates "
+            "that are never converted into that value). Never reuses another campaign's, "
             "another mandate's, or a conversational value; multiple candidate live trading "
             "profiles or exchange connections fail closed as CONFLICTING rather than "
             "picking the newest. Always reports executable=false and overall_status=BLOCKED."

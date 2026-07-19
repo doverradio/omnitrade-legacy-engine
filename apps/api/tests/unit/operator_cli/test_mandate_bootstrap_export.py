@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import uuid
+from datetime import datetime, timezone
 from decimal import Decimal
 from typing import Any
 
@@ -8,11 +9,14 @@ import pytest
 from sqlalchemy.ext.asyncio import AsyncSession
 
 import app.operator_cli.service as service
+from app.models.canonical_preview_package import CanonicalPreviewPackage
 from app.models.capital_campaign import CapitalCampaign
 from app.models.capital_campaign_definition import CapitalCampaignDefinition
 from app.models.exchange_connection import ExchangeConnection
 from app.models.live_trading_profile import LiveTradingProfile
 from app.models.paper_account import PaperAccount
+from app.models.strategy import Strategy
+from app.services.strategies.identity import build_strategy_identity
 from tests.support.real_sqlite_session import real_sqlite_session
 
 _TABLES = [
@@ -21,6 +25,8 @@ _TABLES = [
     PaperAccount.__table__,
     LiveTradingProfile.__table__,
     ExchangeConnection.__table__,
+    Strategy.__table__,
+    CanonicalPreviewPackage.__table__,
 ]
 
 # Fields that must never appear anywhere in mandate-bootstrap-export output.
@@ -162,6 +168,60 @@ async def _seed_exchange_connection(db: AsyncSession, **overrides: Any) -> Excha
     return connection
 
 
+async def _seed_strategy(db: AsyncSession, **overrides: Any) -> Strategy:
+    defaults: dict[str, Any] = dict(
+        id=uuid.uuid4(),
+        name="MA Crossover",
+        slug=f"ma_crossover_{uuid.uuid4().hex[:8]}",
+        module_version="1.0.0",
+        is_active=False,
+    )
+    defaults.update(overrides)
+    strategy = Strategy(**defaults)
+    db.add(strategy)
+    await db.flush()
+    await db.commit()
+    return strategy
+
+
+async def _seed_canonical_preview_package(
+    db: AsyncSession, *, campaign_id: uuid.UUID, campaign_version: int, strategy_id: uuid.UUID, **overrides: Any
+) -> CanonicalPreviewPackage:
+    now = datetime.now(timezone.utc)
+    defaults: dict[str, Any] = dict(
+        package_id=uuid.uuid4(),
+        campaign_id=campaign_id,
+        campaign_version=campaign_version,
+        runtime_campaign_id=uuid.uuid4(),
+        paper_account_id=uuid.uuid4(),
+        live_trading_profile_id=uuid.uuid4(),
+        provider="kraken_spot",
+        environment="production",
+        product="BTC-USD",
+        side="BUY",
+        proposed_order_amount=Decimal("5"),
+        risk_approved_amount=Decimal("5"),
+        strategy_id=strategy_id,
+        strategy_version="1.0.0",
+        parameter_set_id=uuid.uuid4(),
+        parameter_set_version="1",
+        decision_record_id=uuid.uuid4(),
+        risk_event_id=uuid.uuid4(),
+        crypto_order_preview_id=uuid.uuid4(),
+        preview_expires_at=now,
+        package_state="READY",
+        generated_at=now,
+        idempotency_key=f"pkg-{uuid.uuid4()}",
+        input_fingerprint=f"fp-{uuid.uuid4()}",
+    )
+    defaults.update(overrides)
+    package = CanonicalPreviewPackage(**defaults)
+    db.add(package)
+    await db.flush()
+    await db.commit()
+    return package
+
+
 def _assert_no_forbidden_keys(payload: Any) -> None:
     if isinstance(payload, dict):
         for key, value in payload.items():
@@ -196,6 +256,7 @@ async def test_campaign_not_found(monkeypatch: pytest.MonkeyPatch) -> None:
         assert result["live_trading_profile_candidates"] == []
         assert result["exchange_connection"] is None
         assert result["exchange_connection_candidates"] == []
+        assert result["strategy_evidence"] is None
         for field in (
             "capital_campaign_id",
             "campaign_uuid",
@@ -210,6 +271,14 @@ async def test_campaign_not_found(monkeypatch: pytest.MonkeyPatch) -> None:
         ):
             assert result["fields"][field]["classification"] == "MISSING"
             assert result["fields"][field]["value"] is None
+        # allowed_strategy_versions is always OWNER_INPUT_REQUIRED, even when the campaign
+        # itself is not found -- it is never derived from this function's own findings.
+        assert result["fields"]["allowed_strategy_versions"] == {
+            "classification": "OWNER_INPUT_REQUIRED",
+            "value": None,
+            "source": None,
+            "notes": service._MANDATE_BOOTSTRAP_EXPORT_ALLOWED_STRATEGY_VERSIONS_FIELD["notes"],
+        }
 
 
 @pytest.mark.asyncio
@@ -323,6 +392,7 @@ async def test_deterministic_json_shape(monkeypatch: pytest.MonkeyPatch) -> None
             "live_trading_profile_candidates",
             "exchange_connection",
             "exchange_connection_candidates",
+            "strategy_evidence",
             "fields",
         }
         assert set(first["fields"].keys()) == {
@@ -336,6 +406,7 @@ async def test_deterministic_json_shape(monkeypatch: pytest.MonkeyPatch) -> None
             "exchange_connection_id",
             "exchange_provider",
             "exchange_environment",
+            "allowed_strategy_versions",
         }
         for field_payload in first["fields"].values():
             assert set(field_payload.keys()) == {"classification", "value", "source", "notes"}
@@ -885,3 +956,371 @@ async def test_executable_remains_false_with_stage3_data_resolved(monkeypatch: p
         assert result["fields"]["exchange_connection_id"]["classification"] == "DATABASE_DERIVED"
         assert result["executable"] is False
         assert result["overall_status"] == "BLOCKED"
+
+
+# ---------------------------------------------------------------------------
+# Stage 4 (strategy evidence -- informational only, allowed_strategy_versions
+# always OWNER_INPUT_REQUIRED)
+# ---------------------------------------------------------------------------
+
+
+async def _seed_pinned_campaign(db: AsyncSession, *, campaign_id: int = 2) -> CapitalCampaign:
+    campaign = await _seed_campaign(db, id=campaign_id)
+    campaign.definition_campaign_id = campaign.uuid
+    campaign.definition_version = 1
+    await db.commit()
+    return campaign
+
+
+@pytest.mark.asyncio
+async def test_null_campaign_strategy_id(monkeypatch: pytest.MonkeyPatch) -> None:
+    async with real_sqlite_session(_TABLES) as db:
+        monkeypatch.setattr(service, "AsyncSessionLocal", lambda: _SessionContext(db))
+        await _seed_campaign(db, strategy_id=None)
+
+        result = await service.mandate_bootstrap_export(capital_campaign_id=2)
+
+        assert result["strategy_evidence"]["legacy_campaign_strategy_reference"] is None
+
+
+@pytest.mark.asyncio
+async def test_valid_legacy_campaign_strategy_reference(monkeypatch: pytest.MonkeyPatch) -> None:
+    async with real_sqlite_session(_TABLES) as db:
+        monkeypatch.setattr(service, "AsyncSessionLocal", lambda: _SessionContext(db))
+        strategy = await _seed_strategy(db, slug="legacy_slug", module_version="1.0.0", is_active=False)
+        await _seed_campaign(db, strategy_id=strategy.id)
+
+        result = await service.mandate_bootstrap_export(capital_campaign_id=2)
+
+        assert result["strategy_evidence"]["legacy_campaign_strategy_reference"] == {
+            "source": "legacy_campaign_strategy_reference",
+            "found": True,
+            "id": str(strategy.id),
+            "name": "MA Crossover",
+            "slug": "legacy_slug",
+            "module_version": "1.0.0",
+            "is_active": False,
+            "canonical_identity": build_strategy_identity(slug="legacy_slug", module_version="1.0.0"),
+            "notes": service._MANDATE_BOOTSTRAP_EXPORT_LEGACY_STRATEGY_REFERENCE_NOTE,
+        }
+
+
+@pytest.mark.asyncio
+async def test_dangling_legacy_strategy_reference(monkeypatch: pytest.MonkeyPatch) -> None:
+    async with real_sqlite_session(_TABLES) as db:
+        monkeypatch.setattr(service, "AsyncSessionLocal", lambda: _SessionContext(db))
+        dangling_strategy_id = uuid.uuid4()
+        await _seed_campaign(db, strategy_id=dangling_strategy_id)
+
+        result = await service.mandate_bootstrap_export(capital_campaign_id=2)
+
+        reference = result["strategy_evidence"]["legacy_campaign_strategy_reference"]
+        assert reference["source"] == "legacy_campaign_strategy_reference"
+        assert reference["found"] is False
+        assert "no matching strategies row exists" in reference["notes"]
+
+
+@pytest.mark.asyncio
+async def test_zero_globally_active_strategies(monkeypatch: pytest.MonkeyPatch) -> None:
+    async with real_sqlite_session(_TABLES) as db:
+        monkeypatch.setattr(service, "AsyncSessionLocal", lambda: _SessionContext(db))
+        await _seed_strategy(db, is_active=False)
+        await _seed_campaign(db)
+
+        result = await service.mandate_bootstrap_export(capital_campaign_id=2)
+
+        assert result["strategy_evidence"]["global_active_strategy"] == {
+            "source": "global_active_strategy",
+            "items": [],
+            "notes": service._MANDATE_BOOTSTRAP_EXPORT_GLOBAL_ACTIVE_STRATEGY_NOTE,
+        }
+
+
+@pytest.mark.asyncio
+async def test_one_globally_active_strategy(monkeypatch: pytest.MonkeyPatch) -> None:
+    async with real_sqlite_session(_TABLES) as db:
+        monkeypatch.setattr(service, "AsyncSessionLocal", lambda: _SessionContext(db))
+        active = await _seed_strategy(db, slug="active_one", module_version="2.0.0", is_active=True)
+        await _seed_campaign(db)
+
+        result = await service.mandate_bootstrap_export(capital_campaign_id=2)
+
+        assert result["strategy_evidence"]["global_active_strategy"]["items"] == [
+            {
+                "id": str(active.id),
+                "name": "MA Crossover",
+                "slug": "active_one",
+                "module_version": "2.0.0",
+                "is_active": True,
+                "canonical_identity": build_strategy_identity(slug="active_one", module_version="2.0.0"),
+            }
+        ]
+
+
+@pytest.mark.asyncio
+async def test_multiple_globally_active_strategies_deterministic_ordering(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Multiple active rows must remain visible as evidence, without an implicit winner,
+    ordered by primary key -- not creation order or any notion of 'best'."""
+    async with real_sqlite_session(_TABLES) as db:
+        monkeypatch.setattr(service, "AsyncSessionLocal", lambda: _SessionContext(db))
+        high_id = uuid.UUID("ffffffff-ffff-ffff-ffff-fffffffffffe")
+        low_id = uuid.UUID("00000000-0000-0000-0000-000000000001")
+        # Seed the higher id first so "creation order" and "id order" disagree.
+        await _seed_strategy(db, id=high_id, slug="strategy_high", is_active=True)
+        await _seed_strategy(db, id=low_id, slug="strategy_low", is_active=True)
+        await _seed_campaign(db)
+
+        first = await service.mandate_bootstrap_export(capital_campaign_id=2)
+        second = await service.mandate_bootstrap_export(capital_campaign_id=2)
+
+        first_ids = [item["id"] for item in first["strategy_evidence"]["global_active_strategy"]["items"]]
+        second_ids = [item["id"] for item in second["strategy_evidence"]["global_active_strategy"]["items"]]
+        assert first_ids == second_ids == sorted(first_ids)
+        assert len(first_ids) == 2
+
+
+@pytest.mark.asyncio
+async def test_campaign_definition_top_level_strategy_hint(monkeypatch: pytest.MonkeyPatch) -> None:
+    async with real_sqlite_session(_TABLES) as db:
+        monkeypatch.setattr(service, "AsyncSessionLocal", lambda: _SessionContext(db))
+        campaign = await _seed_pinned_campaign(db)
+        await _seed_definition(
+            db,
+            campaign_uuid=campaign.uuid,
+            version=1,
+            metadata_evidence={"canonical_strategy_identity": "top_level_hint@1.0.0"},
+        )
+
+        result = await service.mandate_bootstrap_export(capital_campaign_id=2)
+
+        assert result["strategy_evidence"]["campaign_definition_metadata_hint"] == {
+            "source": "campaign_definition_metadata_hint",
+            "preferred_strategy_identity": "top_level_hint@1.0.0",
+            "notes": service._MANDATE_BOOTSTRAP_EXPORT_METADATA_HINT_NOTE,
+        }
+
+
+@pytest.mark.asyncio
+async def test_campaign_definition_nested_strategy_hint(monkeypatch: pytest.MonkeyPatch) -> None:
+    async with real_sqlite_session(_TABLES) as db:
+        monkeypatch.setattr(service, "AsyncSessionLocal", lambda: _SessionContext(db))
+        campaign = await _seed_pinned_campaign(db)
+        await _seed_definition(
+            db,
+            campaign_uuid=campaign.uuid,
+            version=1,
+            metadata_evidence={"strategy": {"selected_strategy_identity": "nested_hint@2.0.0"}},
+        )
+
+        result = await service.mandate_bootstrap_export(capital_campaign_id=2)
+
+        assert result["strategy_evidence"]["campaign_definition_metadata_hint"] == {
+            "source": "campaign_definition_metadata_hint",
+            "preferred_strategy_identity": "nested_hint@2.0.0",
+            "notes": service._MANDATE_BOOTSTRAP_EXPORT_METADATA_HINT_NOTE,
+        }
+
+
+@pytest.mark.asyncio
+async def test_malformed_unrelated_metadata_ignored_safely(monkeypatch: pytest.MonkeyPatch) -> None:
+    async with real_sqlite_session(_TABLES) as db:
+        monkeypatch.setattr(service, "AsyncSessionLocal", lambda: _SessionContext(db))
+        campaign = await _seed_pinned_campaign(db)
+        await _seed_definition(
+            db,
+            campaign_uuid=campaign.uuid,
+            version=1,
+            metadata_evidence={
+                "unrelated_key": "top-secret-junk-value",
+                "strategy": "not-a-dict-should-be-ignored",
+                "another_unrelated_blob": {"nested": "also-junk"},
+            },
+        )
+
+        result = await service.mandate_bootstrap_export(capital_campaign_id=2)
+
+        assert result["strategy_evidence"]["campaign_definition_metadata_hint"] is None
+        serialized = repr(result)
+        assert "top-secret-junk-value" not in serialized
+        assert "not-a-dict-should-be-ignored" not in serialized
+        assert "also-junk" not in serialized
+
+
+@pytest.mark.asyncio
+async def test_no_canonical_preview_package(monkeypatch: pytest.MonkeyPatch) -> None:
+    async with real_sqlite_session(_TABLES) as db:
+        monkeypatch.setattr(service, "AsyncSessionLocal", lambda: _SessionContext(db))
+        await _seed_pinned_campaign(db)
+
+        result = await service.mandate_bootstrap_export(capital_campaign_id=2)
+
+        assert result["strategy_evidence"]["canonical_preview_package_continuity"] is None
+
+
+@pytest.mark.asyncio
+async def test_valid_campaign_version_specific_preview_package_continuity(monkeypatch: pytest.MonkeyPatch) -> None:
+    async with real_sqlite_session(_TABLES) as db:
+        monkeypatch.setattr(service, "AsyncSessionLocal", lambda: _SessionContext(db))
+        campaign = await _seed_pinned_campaign(db)
+        strategy = await _seed_strategy(db, slug="continuity_strategy", module_version="3.0.0")
+        package = await _seed_canonical_preview_package(
+            db, campaign_id=campaign.uuid, campaign_version=1, strategy_id=strategy.id, strategy_version="3.0.0"
+        )
+
+        result = await service.mandate_bootstrap_export(capital_campaign_id=2)
+
+        assert result["strategy_evidence"]["canonical_preview_package_continuity"] == {
+            "source": "canonical_preview_package_continuity",
+            "package_id": str(package.package_id),
+            "strategy_id": str(strategy.id),
+            "strategy_version": "3.0.0",
+            "canonical_identity": build_strategy_identity(slug="continuity_strategy", module_version="3.0.0"),
+            "package_state": "READY",
+            "notes": service._MANDATE_BOOTSTRAP_EXPORT_PACKAGE_CONTINUITY_NOTE,
+        }
+
+
+@pytest.mark.asyncio
+async def test_package_from_another_campaign_ignored(monkeypatch: pytest.MonkeyPatch) -> None:
+    async with real_sqlite_session(_TABLES) as db:
+        monkeypatch.setattr(service, "AsyncSessionLocal", lambda: _SessionContext(db))
+        await _seed_pinned_campaign(db)
+        strategy = await _seed_strategy(db)
+        other_campaign_uuid = uuid.uuid4()
+        await _seed_canonical_preview_package(db, campaign_id=other_campaign_uuid, campaign_version=1, strategy_id=strategy.id)
+
+        result = await service.mandate_bootstrap_export(capital_campaign_id=2)
+
+        assert result["strategy_evidence"]["canonical_preview_package_continuity"] is None
+
+
+@pytest.mark.asyncio
+async def test_package_from_another_version_ignored(monkeypatch: pytest.MonkeyPatch) -> None:
+    async with real_sqlite_session(_TABLES) as db:
+        monkeypatch.setattr(service, "AsyncSessionLocal", lambda: _SessionContext(db))
+        campaign = await _seed_pinned_campaign(db)
+        strategy = await _seed_strategy(db)
+        await _seed_canonical_preview_package(db, campaign_id=campaign.uuid, campaign_version=2, strategy_id=strategy.id)
+
+        result = await service.mandate_bootstrap_export(capital_campaign_id=2)
+
+        assert result["strategy_evidence"]["canonical_preview_package_continuity"] is None
+
+
+@pytest.mark.asyncio
+async def test_evidence_never_becomes_allowed_strategy_versions_value(monkeypatch: pytest.MonkeyPatch) -> None:
+    """With all four evidence sources populated simultaneously, allowed_strategy_versions
+    must still be OWNER_INPUT_REQUIRED with value=null -- evidence is never converted."""
+    async with real_sqlite_session(_TABLES) as db:
+        monkeypatch.setattr(service, "AsyncSessionLocal", lambda: _SessionContext(db))
+        legacy_strategy = await _seed_strategy(db, slug="legacy", module_version="1.0.0", is_active=False)
+        active_strategy = await _seed_strategy(db, slug="active", module_version="1.0.0", is_active=True)
+        campaign = await _seed_campaign(db, strategy_id=legacy_strategy.id)
+        campaign.definition_campaign_id = campaign.uuid
+        campaign.definition_version = 1
+        await db.commit()
+        await _seed_definition(
+            db,
+            campaign_uuid=campaign.uuid,
+            version=1,
+            metadata_evidence={"canonical_strategy_identity": "hinted@9.9.9"},
+        )
+        await _seed_canonical_preview_package(db, campaign_id=campaign.uuid, campaign_version=1, strategy_id=active_strategy.id)
+
+        result = await service.mandate_bootstrap_export(capital_campaign_id=2)
+
+        evidence = result["strategy_evidence"]
+        assert evidence["legacy_campaign_strategy_reference"] is not None
+        assert len(evidence["global_active_strategy"]["items"]) == 1
+        assert evidence["campaign_definition_metadata_hint"] is not None
+        assert evidence["canonical_preview_package_continuity"] is not None
+
+        assert result["fields"]["allowed_strategy_versions"] == {
+            "classification": "OWNER_INPUT_REQUIRED",
+            "value": None,
+            "source": None,
+            "notes": service._MANDATE_BOOTSTRAP_EXPORT_ALLOWED_STRATEGY_VERSIONS_FIELD["notes"],
+        }
+
+
+@pytest.mark.asyncio
+async def test_allowed_strategy_versions_always_owner_input_required(monkeypatch: pytest.MonkeyPatch) -> None:
+    async with real_sqlite_session(_TABLES) as db:
+        monkeypatch.setattr(service, "AsyncSessionLocal", lambda: _SessionContext(db))
+
+        not_found = await service.mandate_bootstrap_export(capital_campaign_id=999)
+        assert not_found["fields"]["allowed_strategy_versions"]["classification"] == "OWNER_INPUT_REQUIRED"
+
+        await _seed_campaign(db)
+        no_pin = await service.mandate_bootstrap_export(capital_campaign_id=2)
+        assert no_pin["fields"]["allowed_strategy_versions"]["classification"] == "OWNER_INPUT_REQUIRED"
+        assert no_pin["fields"]["allowed_strategy_versions"]["value"] is None
+
+
+@pytest.mark.asyncio
+async def test_no_database_mutation_occurs_stage4(monkeypatch: pytest.MonkeyPatch) -> None:
+    async with real_sqlite_session(_TABLES) as db:
+        legacy_strategy = await _seed_strategy(db, slug="legacy4", is_active=False)
+        active_strategy = await _seed_strategy(db, slug="active4", is_active=True)
+        campaign = await _seed_campaign(db, strategy_id=legacy_strategy.id)
+        campaign.definition_campaign_id = campaign.uuid
+        campaign.definition_version = 1
+        await db.commit()
+        await _seed_definition(
+            db, campaign_uuid=campaign.uuid, version=1, metadata_evidence={"strategy_identity": "hint4@1.0.0"}
+        )
+        await _seed_canonical_preview_package(db, campaign_id=campaign.uuid, campaign_version=1, strategy_id=active_strategy.id)
+
+        monkeypatch.setattr(service, "AsyncSessionLocal", lambda: _SessionContext(db))
+
+        def _forbid(*args: Any, **kwargs: Any) -> Any:
+            raise AssertionError("mandate_bootstrap_export must never mutate the database")
+
+        monkeypatch.setattr(db, "add", _forbid)
+        monkeypatch.setattr(db, "commit", _forbid)
+        monkeypatch.setattr(db, "flush", _forbid)
+        monkeypatch.setattr(db, "delete", _forbid)
+
+        result = await service.mandate_bootstrap_export(capital_campaign_id=2)
+
+        assert result["strategy_evidence"]["legacy_campaign_strategy_reference"]["found"] is True
+        assert len(result["strategy_evidence"]["global_active_strategy"]["items"]) == 1
+        assert result["strategy_evidence"]["campaign_definition_metadata_hint"] is not None
+        assert result["strategy_evidence"]["canonical_preview_package_continuity"] is not None
+
+
+@pytest.mark.asyncio
+async def test_executable_and_overall_status_remain_fixed_with_stage4_evidence(monkeypatch: pytest.MonkeyPatch) -> None:
+    async with real_sqlite_session(_TABLES) as db:
+        monkeypatch.setattr(service, "AsyncSessionLocal", lambda: _SessionContext(db))
+        strategy = await _seed_strategy(db, is_active=True)
+        campaign = await _seed_pinned_campaign(db)
+        await _seed_canonical_preview_package(db, campaign_id=campaign.uuid, campaign_version=1, strategy_id=strategy.id)
+
+        result = await service.mandate_bootstrap_export(capital_campaign_id=2)
+
+        assert result["executable"] is False
+        assert result["overall_status"] == "BLOCKED"
+
+
+@pytest.mark.asyncio
+async def test_deterministic_serialized_output_stage4(monkeypatch: pytest.MonkeyPatch) -> None:
+    async with real_sqlite_session(_TABLES) as db:
+        monkeypatch.setattr(service, "AsyncSessionLocal", lambda: _SessionContext(db))
+        legacy_strategy = await _seed_strategy(db, slug="legacy_det", is_active=False)
+        active_strategy = await _seed_strategy(db, slug="active_det", is_active=True)
+        campaign = await _seed_campaign(db, strategy_id=legacy_strategy.id)
+        campaign.definition_campaign_id = campaign.uuid
+        campaign.definition_version = 1
+        await db.commit()
+        await _seed_definition(
+            db, campaign_uuid=campaign.uuid, version=1, metadata_evidence={"strategy_identity": "det@1.0.0"}
+        )
+        await _seed_canonical_preview_package(db, campaign_id=campaign.uuid, campaign_version=1, strategy_id=active_strategy.id)
+
+        first = await service.mandate_bootstrap_export(capital_campaign_id=2)
+        second = await service.mandate_bootstrap_export(capital_campaign_id=2)
+
+        first_without_timestamp = {k: v for k, v in first.items() if k != "resolved_at"}
+        second_without_timestamp = {k: v for k, v in second.items() if k != "resolved_at"}
+        assert first_without_timestamp == second_without_timestamp

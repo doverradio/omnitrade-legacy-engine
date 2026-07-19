@@ -114,6 +114,10 @@ from app.services.capital_campaign_orchestration import (
     run_campaign_orchestration_preview_for_candle,
 )
 from app.services.capital_campaign_orchestration.service import _eligible_for_orchestration
+from app.services.capital_campaign_orchestration.authoritative import (
+    _extract_preferred_strategy_identity as _extract_preferred_strategy_identity_hint,
+)
+from app.services.strategies.identity import build_strategy_identity
 from app.services.capital_campaign_domain.service import list_campaign_definitions as _list_campaign_definitions
 from app.services.capital_campaign_domain.commissioned_control_plane import (
     backfill_commissioned_ready_metadata,
@@ -934,6 +938,68 @@ def _decimal_str(value: Decimal | None) -> str | None:
     return str(value) if value is not None else None
 
 
+# Stage 4: allowed_strategy_versions. Per the Strategy Identity Architecture Review,
+# capital_campaigns.strategy_id is not the canonical strategy authority for the modern
+# definition-pinned campaign path, and no other campaign-scoped database field can
+# authoritatively derive allowed_strategy_versions either -- runtime execution resolves it
+# dynamically every cycle by intersecting the mandate version's own allowlist with whichever
+# Strategy row is currently globally active (app/services/autonomous_cycle/orchestrator.py
+# ::_run_approved_strategy). This field is therefore always OWNER_INPUT_REQUIRED, regardless
+# of campaign state -- it is never computed from this function's own findings.
+_MANDATE_BOOTSTRAP_EXPORT_ALLOWED_STRATEGY_VERSIONS_FIELD: dict[str, Any] = {
+    "classification": "OWNER_INPUT_REQUIRED",
+    "value": None,
+    "source": None,
+    "notes": (
+        "No campaign-scoped database field can authoritatively derive allowed_strategy_versions "
+        "(capital_campaigns.strategy_id is not the canonical strategy authority for the modern "
+        "definition-pinned campaign path). Runtime execution later intersects the mandate "
+        "version's allowed_strategy_versions allowlist with whichever Strategy row is currently "
+        "globally active -- see strategy_evidence for informational, non-authoritative candidates "
+        "only; none of it may be converted into this value."
+    ),
+}
+
+_MANDATE_BOOTSTRAP_EXPORT_LEGACY_STRATEGY_REFERENCE_NOTE = (
+    "capital_campaigns.strategy_id is a legacy field; the modern canonical execution pipeline "
+    "does not use it as strategy authority."
+)
+_MANDATE_BOOTSTRAP_EXPORT_GLOBAL_ACTIVE_STRATEGY_NOTE = (
+    "Strategy.is_active is a system-wide activation flag, not campaign-scoped, and may change "
+    "independently of this campaign. Multiple rows (if present) are listed without an implicit "
+    "winner -- none is selected as newest, active, or best."
+)
+_MANDATE_BOOTSTRAP_EXPORT_METADATA_HINT_NOTE = (
+    "Unstructured advisory evidence from capital_campaign_definitions.metadata_evidence -- not "
+    "authoritative."
+)
+_MANDATE_BOOTSTRAP_EXPORT_PACKAGE_CONTINUITY_NOTE = (
+    "Historical continuity evidence from a prior canonical preview package for this exact "
+    "campaign UUID and definition version. Must not auto-populate allowed_strategy_versions."
+)
+_MANDATE_BOOTSTRAP_EXPORT_STRATEGY_EVIDENCE_NOTE = (
+    "All evidence below is informational and non-authoritative. It exists only to help the "
+    "owner decide allowed_strategy_versions; none of it is ever converted into that value."
+)
+
+# Mirrors canonical_preview_package.py's own package_state lifecycle states that represent a
+# genuinely-issued (not failed/expired/superseded) package -- identical to the set
+# capital_campaign_orchestration/authoritative.py::_load_campaign_strategy_authority uses for
+# continuity evidence, so this export's package selection matches that existing logic exactly.
+_MANDATE_BOOTSTRAP_EXPORT_CONTINUITY_PACKAGE_STATES = ("READY", "AUTHORIZED", "DRY_RUN_PASSED", "ACTIVATED")
+
+
+def _strategy_safe_summary(strategy: Strategy) -> dict[str, Any]:
+    return {
+        "id": str(strategy.id),
+        "name": strategy.name,
+        "slug": strategy.slug,
+        "module_version": strategy.module_version,
+        "is_active": bool(strategy.is_active),
+        "canonical_identity": build_strategy_identity(slug=strategy.slug, module_version=strategy.module_version),
+    }
+
+
 _MANDATE_BOOTSTRAP_EXPORT_LIVE_PROFILE_GOVERNANCE_FIELDS = (
     "operating_mode",
     "lifecycle_state",
@@ -998,19 +1064,28 @@ def _live_trading_profile_candidate_summary(profile: LiveTradingProfile) -> dict
 
 
 async def mandate_bootstrap_export(*, capital_campaign_id: int) -> dict[str, Any]:
-    """Stages 1-3 of the read-only mandate-bootstrap export design: resolves
+    """Stages 1-4 of the read-only mandate-bootstrap export design: resolves
     CapitalCampaign identity, (if pinned) CapitalCampaignDefinition evidence, the
     campaign's PaperAccount, LiveTradingProfile candidates strictly scoped to
-    LiveTradingProfile.paper_account_id == CapitalCampaign.paper_account_id, and
+    LiveTradingProfile.paper_account_id == CapitalCampaign.paper_account_id,
     ExchangeConnection candidates resolved from the campaign's own exchange label
     (provider+environment together, never provider alone) gated on the live trading
-    profile having already resolved uniquely, for one capital_campaign_id. Performs
-    SELECT statements only -- no db.add, flush, or commit, no lifecycle action, no
-    authorization, no mandate creation. Never reuses another mandate's, another
-    campaign's, or a conversational value -- every field is either read fresh from this
-    campaign's own records or explicitly marked unresolved. Strategy resolution is out
-    of scope for this stage -- see the approved read-only mandate-bootstrap export
-    design for the full field set."""
+    profile having already resolved uniquely, and non-authoritative strategy evidence,
+    for one capital_campaign_id. Performs SELECT statements only -- no db.add, flush,
+    or commit, no lifecycle action, no authorization, no mandate creation. Never
+    reuses another mandate's, another campaign's, or a conversational value -- every
+    field is either read fresh from this campaign's own records or explicitly marked
+    unresolved.
+
+    allowed_strategy_versions is always OWNER_INPUT_REQUIRED (per the Strategy Identity
+    Architecture Review: capital_campaigns.strategy_id is not the canonical strategy
+    authority for the modern definition-pinned campaign path, and no other
+    campaign-scoped field can derive it either). strategy_evidence surfaces up to four
+    informational, non-authoritative candidate signals -- a legacy campaign.strategy_id
+    reference, the currently globally-active Strategy row(s), an optional
+    capital_campaign_definitions.metadata_evidence hint, and canonical preview package
+    continuity evidence for this exact campaign+version -- none of which is ever
+    converted into the allowed_strategy_versions value."""
     async with AsyncSessionLocal() as db:
         campaign = await db.get(CapitalCampaign, capital_campaign_id)
 
@@ -1027,6 +1102,7 @@ async def mandate_bootstrap_export(*, capital_campaign_id: int) -> dict[str, Any
                 "live_trading_profile_candidates": [],
                 "exchange_connection": None,
                 "exchange_connection_candidates": [],
+                "strategy_evidence": None,
                 "fields": {
                     "capital_campaign_id": {
                         "classification": "MISSING",
@@ -1088,12 +1164,14 @@ async def mandate_bootstrap_export(*, capital_campaign_id: int) -> dict[str, Any
                         "source": "capital_campaigns.exchange (parsed)",
                         "notes": "Campaign not found.",
                     },
+                    "allowed_strategy_versions": dict(_MANDATE_BOOTSTRAP_EXPORT_ALLOWED_STRATEGY_VERSIONS_FIELD),
                 },
             }
 
         has_definition_pin = campaign.definition_campaign_id is not None and campaign.definition_version is not None
 
         definition_payload: dict[str, Any] | None = None
+        definition_metadata_evidence: dict[str, Any] | None = None
         base_currency_field: dict[str, Any]
         if not has_definition_pin:
             base_currency_field = {
@@ -1138,6 +1216,7 @@ async def mandate_bootstrap_export(*, capital_campaign_id: int) -> dict[str, Any
                     "source": "capital_campaign_definitions.base_currency",
                     "notes": None,
                 }
+                definition_metadata_evidence = dict(definition.metadata_evidence or {})
 
         # Paper account: loaded strictly from this campaign's own paper_account_id FK --
         # never from another campaign's or mandate's paper account.
@@ -1363,6 +1442,105 @@ async def mandate_bootstrap_export(*, capital_campaign_id: int) -> dict[str, Any
                     "notes": f"{len(connection_rows)} exchange_connections rows match provider={parsed_provider!r} environment={parsed_environment!r}; cannot resolve unambiguously.",
                 }
 
+        # Strategy evidence: informational and non-authoritative only. allowed_strategy_versions
+        # always stays OWNER_INPUT_REQUIRED (see the constant above) regardless of what is found
+        # here -- none of these four sources is ever converted into that field's value.
+
+        # 1. Legacy campaign strategy reference (capital_campaigns.strategy_id). Present only if
+        # the column is set; the modern canonical execution pipeline does not consult it.
+        legacy_campaign_strategy_reference: dict[str, Any] | None = None
+        if campaign.strategy_id is not None:
+            legacy_strategy = await db.get(Strategy, campaign.strategy_id)
+            if legacy_strategy is None:
+                legacy_campaign_strategy_reference = {
+                    "source": "legacy_campaign_strategy_reference",
+                    "found": False,
+                    "notes": (
+                        "capital_campaigns.strategy_id is set but no matching strategies row exists. "
+                        + _MANDATE_BOOTSTRAP_EXPORT_LEGACY_STRATEGY_REFERENCE_NOTE
+                    ),
+                }
+            else:
+                legacy_campaign_strategy_reference = {
+                    "source": "legacy_campaign_strategy_reference",
+                    "found": True,
+                    **_strategy_safe_summary(legacy_strategy),
+                    "notes": _MANDATE_BOOTSTRAP_EXPORT_LEGACY_STRATEGY_REFERENCE_NOTE,
+                }
+
+        # 2. Globally active strategies (Strategy.is_active = true). System-wide, never
+        # campaign-scoped. Ordered by primary key -- deterministic, never "newest".
+        active_strategy_rows = list(
+            (
+                await db.scalars(
+                    select(Strategy).where(Strategy.is_active.is_(True)).order_by(Strategy.id)
+                )
+            )
+        )
+        global_active_strategy = {
+            "source": "global_active_strategy",
+            "items": [_strategy_safe_summary(row) for row in active_strategy_rows],
+            "notes": _MANDATE_BOOTSTRAP_EXPORT_GLOBAL_ACTIVE_STRATEGY_NOTE,
+        }
+
+        # 3. Campaign definition metadata hint. Reuses the exact same key-recognition logic
+        # capital_campaign_orchestration/authoritative.py already uses (canonical_strategy_identity
+        # / selected_strategy_identity / strategy_identity, top-level or nested under "strategy")
+        # so this never invents a new, divergent notion of what counts as a hint, and never
+        # exposes any other metadata_evidence content.
+        campaign_definition_metadata_hint: dict[str, Any] | None = None
+        if definition_metadata_evidence is not None:
+            preferred_identity = _extract_preferred_strategy_identity_hint(definition_metadata_evidence)
+            if preferred_identity:
+                campaign_definition_metadata_hint = {
+                    "source": "campaign_definition_metadata_hint",
+                    "preferred_strategy_identity": preferred_identity,
+                    "notes": _MANDATE_BOOTSTRAP_EXPORT_METADATA_HINT_NOTE,
+                }
+
+        # 4. Canonical preview package continuity evidence. Only considered for this exact
+        # campaign UUID + definition version, using the identical package_state set and
+        # ordering capital_campaign_orchestration/authoritative.py::_load_campaign_strategy_authority
+        # already uses for continuity evidence -- not a newly invented selection rule.
+        canonical_preview_package_continuity: dict[str, Any] | None = None
+        if has_definition_pin:
+            try:
+                continuity_package = await db.scalar(
+                    select(CanonicalPreviewPackage)
+                    .where(CanonicalPreviewPackage.campaign_id == campaign.definition_campaign_id)
+                    .where(CanonicalPreviewPackage.campaign_version == campaign.definition_version)
+                    .where(CanonicalPreviewPackage.package_state.in_(_MANDATE_BOOTSTRAP_EXPORT_CONTINUITY_PACKAGE_STATES))
+                    .order_by(desc(CanonicalPreviewPackage.updated_at), desc(CanonicalPreviewPackage.generated_at))
+                    .limit(1)
+                )
+            except Exception:
+                continuity_package = None
+
+            if continuity_package is not None:
+                package_strategy = await db.get(Strategy, continuity_package.strategy_id)
+                canonical_preview_package_continuity = {
+                    "source": "canonical_preview_package_continuity",
+                    "package_id": str(continuity_package.package_id),
+                    "strategy_id": str(continuity_package.strategy_id),
+                    "strategy_version": continuity_package.strategy_version,
+                    "canonical_identity": (
+                        build_strategy_identity(slug=package_strategy.slug, module_version=package_strategy.module_version)
+                        if package_strategy is not None
+                        else None
+                    ),
+                    "package_state": continuity_package.package_state,
+                    "notes": _MANDATE_BOOTSTRAP_EXPORT_PACKAGE_CONTINUITY_NOTE,
+                }
+
+        strategy_evidence = {
+            "informational_only": True,
+            "notes": _MANDATE_BOOTSTRAP_EXPORT_STRATEGY_EVIDENCE_NOTE,
+            "legacy_campaign_strategy_reference": legacy_campaign_strategy_reference,
+            "global_active_strategy": global_active_strategy,
+            "campaign_definition_metadata_hint": campaign_definition_metadata_hint,
+            "canonical_preview_package_continuity": canonical_preview_package_continuity,
+        }
+
         return {
             "capital_campaign_id": capital_campaign_id,
             "resolved_at": datetime.now(timezone.utc).isoformat(),
@@ -1387,6 +1565,7 @@ async def mandate_bootstrap_export(*, capital_campaign_id: int) -> dict[str, Any
             "live_trading_profile_candidates": live_trading_profile_candidates,
             "exchange_connection": exchange_connection_payload,
             "exchange_connection_candidates": exchange_connection_candidates,
+            "strategy_evidence": strategy_evidence,
             "fields": {
                 "capital_campaign_id": {
                     "classification": "DATABASE_DERIVED",
@@ -1422,6 +1601,7 @@ async def mandate_bootstrap_export(*, capital_campaign_id: int) -> dict[str, Any
                 "exchange_connection_id": exchange_connection_id_field,
                 "exchange_provider": exchange_provider_field,
                 "exchange_environment": exchange_environment_field,
+                "allowed_strategy_versions": dict(_MANDATE_BOOTSTRAP_EXPORT_ALLOWED_STRATEGY_VERSIONS_FIELD),
             },
         }
 
