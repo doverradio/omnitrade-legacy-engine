@@ -65,6 +65,7 @@ from app.services.mandates.contracts import (
 from app.services.mandates.lifecycle import (
     _build_version_hash,
     _find_audit_by_idempotency,
+    _load_governing_authorized_version,
     apply_mandate_lifecycle_action,
     authorize_mandate_version,
     create_mandate,
@@ -72,6 +73,7 @@ from app.services.mandates.lifecycle import (
 )
 from app.services.mandates.validation import (
     validate_autonomy_level,
+    validate_mandate_state_transition,
     validate_mandate_version,
 )
 from app.services.strategies.identity import is_strategy_identity
@@ -3492,6 +3494,499 @@ async def mandate_bootstrap_commission(*, capital_campaign_id: int, owner_input:
         "transaction_model": creation["transaction_model"],
         "current_state": current_state,
         "next_required_action": next_required_action,
+    }
+
+
+# --- mandate-lifecycle command family -----------------------------------------------
+# Distinct from mandate-bootstrap-*: these commands act on a mandate that already
+# exists (created by mandate-bootstrap-create/-commission), advancing it through
+# SUBMIT_FOR_AUTHORIZATION -> authorize -> ACTIVATE. "bootstrap" in this codebase means
+# creation only, ending at DRAFT -- these commands intentionally live under a separate
+# name so that boundary stays legible from the command name alone.
+
+_MANDATE_LIFECYCLE_AUTHORIZE_REQUIRED_FIELDS: tuple[str, ...] = (
+    "actor",
+    "reason",
+    "authorization_method",
+    "owner_acknowledgements",
+    "authorization_evidence",
+    "deterministic_explanation",
+    "idempotency_key",
+)
+
+
+def _mandate_lifecycle_coerce_owner_input(owner_input: dict[str, Any]) -> dict[str, Any]:
+    """Validates and coerces the owner-input document for mandate_lifecycle_authorize()
+    using the exact same per-field type-checking helper (_coerce_worksheet_field_value)
+    and the exact same worksheet entries Stage 7's session validator already defined for
+    these identical field names -- not a new, duplicated set of rules for the same
+    concepts."""
+    missing_fields = sorted(name for name in _MANDATE_LIFECYCLE_AUTHORIZE_REQUIRED_FIELDS if name not in owner_input)
+    field_errors: list[dict[str, str]] = []
+    coerced: dict[str, Any] = {}
+    for name in _MANDATE_LIFECYCLE_AUTHORIZE_REQUIRED_FIELDS:
+        if name not in owner_input:
+            continue
+        entry = _MANDATE_BOOTSTRAP_EXPORT_WORKSHEET_ENTRIES[name]
+        value, error = _coerce_worksheet_field_value(
+            input_type=entry["input_type"], raw=owner_input[name], accepted_values=entry["accepted_values"]
+        )
+        if error is not None:
+            field_errors.append({"field": name, "error": error})
+            continue
+        coerced[name] = value
+
+    optional_coerced: dict[str, Any] = {}
+    if "authorization_expires_at" in owner_input:
+        value, error = _coerce_optional_timestamp(owner_input["authorization_expires_at"])
+        if error is not None:
+            field_errors.append({"field": "authorization_expires_at", "error": error})
+        elif value is not None:
+            optional_coerced["authorization_expires_at"] = value
+    if "audit_correlation_id" in owner_input:
+        value, error = _coerce_optional_uuid(owner_input["audit_correlation_id"])
+        if error is not None:
+            field_errors.append({"field": "audit_correlation_id", "error": error})
+        elif value is not None:
+            optional_coerced["audit_correlation_id"] = value
+
+    known_names = set(_MANDATE_LIFECYCLE_AUTHORIZE_REQUIRED_FIELDS) | {"authorization_expires_at", "audit_correlation_id"}
+    unexpected_fields = sorted(name for name in owner_input if name not in known_names)
+    field_errors = sorted(field_errors, key=lambda entry: (entry["field"], entry["error"]))
+
+    return {
+        "coerced": coerced,
+        "optional_coerced": optional_coerced,
+        "missing_fields": missing_fields,
+        "field_errors": field_errors,
+        "unexpected_fields": unexpected_fields,
+    }
+
+
+def _mandate_lifecycle_not_found_payload(*, mandate_id: UUID, mandate_version_id: UUID, reason: str) -> dict[str, Any]:
+    return {
+        "overall_status": "FAILED_VALIDATION",
+        "mandate_id": str(mandate_id),
+        "mandate_version_id": str(mandate_version_id),
+        "mandate_authorization_id": None,
+        "mandate_status": None,
+        "write_summary": {"submitted_for_authorization": False, "authorized": False},
+        "validation": {"field_errors": [{"field": "mandate_id", "error": reason}], "missing_fields": [], "unexpected_fields": []},
+        "next_required_action": "Verify --mandate-id and --mandate-version-id. Zero writes were performed.",
+    }
+
+
+async def mandate_lifecycle_authorize(
+    *, mandate_id: UUID, mandate_version_id: UUID, owner_input: dict[str, Any]
+) -> dict[str, Any]:
+    """mandate-lifecycle family: submits an existing DRAFT mandate for authorization (if
+    not already submitted) and records a genuine authorization event against a specific
+    existing version. Reuses apply_mandate_lifecycle_action()/authorize_mandate_version()
+    exactly as mandate_bootstrap() itself does for these same two stages -- no new
+    lifecycle rule, transition, or validator is introduced; mandate.status transition
+    validity is enforced entirely by those existing functions and by
+    validate_mandate_state_transition(). Never activates, never calls mandate_bootstrap(),
+    order-execution, or autonomous-cycle functions. Idempotent on the owner-supplied
+    idempotency_key; reusing that key with materially different authorization evidence
+    fails closed as overall_status=CONFLICT with zero new writes -- the same governance
+    rule Stage 9A.1 already applies to mandate creation, applied one stage later."""
+    validation = _mandate_lifecycle_coerce_owner_input(owner_input)
+    if validation["missing_fields"] or validation["field_errors"] or validation["unexpected_fields"]:
+        return {
+            "overall_status": "FAILED_VALIDATION",
+            "mandate_id": str(mandate_id),
+            "mandate_version_id": str(mandate_version_id),
+            "mandate_authorization_id": None,
+            "mandate_status": None,
+            "write_summary": {"submitted_for_authorization": False, "authorized": False},
+            "validation": {
+                "missing_fields": validation["missing_fields"],
+                "field_errors": validation["field_errors"],
+                "unexpected_fields": validation["unexpected_fields"],
+            },
+            "next_required_action": (
+                "Resolve the validation failures reported under validation and retry "
+                "mandate-lifecycle-authorize. Zero writes were performed."
+            ),
+        }
+
+    coerced = validation["coerced"]
+    optional_coerced = validation["optional_coerced"]
+    root_idempotency_key = coerced["idempotency_key"]
+    actor = coerced["actor"]
+
+    async with AsyncSessionLocal() as db:
+        mandate = await db.get(AutonomousCapitalMandate, mandate_id)
+        if mandate is None:
+            return _mandate_lifecycle_not_found_payload(
+                mandate_id=mandate_id, mandate_version_id=mandate_version_id, reason="mandate_not_found"
+            )
+
+        version = await db.get(AutonomousCapitalMandateVersion, mandate_version_id)
+        if version is None or version.mandate_id != mandate.mandate_id:
+            return _mandate_lifecycle_not_found_payload(
+                mandate_id=mandate_id,
+                mandate_version_id=mandate_version_id,
+                reason="mandate_version_not_found_or_mismatched",
+            )
+
+        # AUTHORIZED is included alongside the two pre-authorization states so that a
+        # rerun with the exact same idempotency_key (already-authorized, no-op resume)
+        # is never rejected by this pre-check before authorize_mandate_version()'s own
+        # idempotency lookup even gets a chance to run -- authorize_mandate_version()
+        # itself already accepts AUTHORIZED for exactly this reason.
+        if mandate.status not in {"DRAFT", "PENDING_AUTHORIZATION", "AUTHORIZED"}:
+            return {
+                "overall_status": "FAILED_VALIDATION",
+                "mandate_id": str(mandate_id),
+                "mandate_version_id": str(mandate_version_id),
+                "mandate_authorization_id": None,
+                "mandate_status": mandate.status,
+                "write_summary": {"submitted_for_authorization": False, "authorized": False},
+                "validation": {
+                    "field_errors": [{"field": "mandate_id", "error": "mandate_not_in_authorizable_state"}],
+                    "missing_fields": [],
+                    "unexpected_fields": [],
+                },
+                "next_required_action": (
+                    f"mandate.status is {mandate.status!r}; mandate-lifecycle-authorize only "
+                    "operates on a mandate in DRAFT or PENDING_AUTHORIZATION. Zero writes were performed."
+                ),
+            }
+
+        authorize_idempotency_key = f"{root_idempotency_key}:authorize"
+        existing_authorization = await db.scalar(
+            select(AutonomousCapitalMandateAuthorization)
+            .where(AutonomousCapitalMandateAuthorization.idempotency_key == authorize_idempotency_key)
+            .limit(1)
+        )
+        if existing_authorization is not None:
+            mismatched_fields = sorted(
+                field_name
+                for field_name, existing_value in (
+                    ("authorization_method", existing_authorization.authorization_method),
+                    ("owner_acknowledgements", existing_authorization.owner_acknowledgements),
+                    ("authorization_evidence", existing_authorization.authorization_evidence),
+                    ("deterministic_explanation", existing_authorization.deterministic_explanation),
+                )
+                if existing_value != coerced[field_name]
+            )
+            if mismatched_fields:
+                return {
+                    "overall_status": "CONFLICT",
+                    "mandate_id": str(mandate_id),
+                    "mandate_version_id": str(mandate_version_id),
+                    "mandate_authorization_id": str(existing_authorization.mandate_authorization_id),
+                    "mandate_status": mandate.status,
+                    "write_summary": {"submitted_for_authorization": False, "authorized": False},
+                    "conflict": {
+                        "reason": "IDEMPOTENCY_KEY_REUSED_WITH_DIFFERENT_AUTHORIZATION_EVIDENCE",
+                        "idempotency_key": root_idempotency_key,
+                        "mismatched_fields": mismatched_fields,
+                    },
+                    "next_required_action": (
+                        "This idempotency_key was already used to record different authorization "
+                        "evidence. Choose a new idempotency_key, or resupply the exact original "
+                        "owner-input document. Zero new writes were performed."
+                    ),
+                }
+
+        submitted = False
+        if mandate.status == "DRAFT":
+            mandate = await apply_mandate_lifecycle_action(
+                db=db,
+                request=MandateLifecycleActionRequest(
+                    mandate_id=mandate.mandate_id,
+                    actor=actor,
+                    action="SUBMIT_FOR_AUTHORIZATION",
+                    reason=coerced["reason"],
+                    idempotency_key=f"{root_idempotency_key}:submit-for-authorization",
+                    audit_correlation_id=optional_coerced.get("audit_correlation_id"),
+                ),
+            )
+            submitted = True
+
+        authorization = await authorize_mandate_version(
+            db=db,
+            request=MandateAuthorizationRequest(
+                mandate_id=mandate.mandate_id,
+                mandate_version_id=version.mandate_version_id,
+                actor=actor,
+                authorization_method=coerced["authorization_method"],
+                owner_acknowledgements=coerced["owner_acknowledgements"],
+                authorization_evidence=coerced["authorization_evidence"],
+                deterministic_explanation=coerced["deterministic_explanation"],
+                expires_at=optional_coerced.get("authorization_expires_at"),
+                idempotency_key=authorize_idempotency_key,
+                audit_correlation_id=optional_coerced.get("audit_correlation_id"),
+            ),
+        )
+
+    return {
+        "overall_status": "AUTHORIZED",
+        "mandate_id": str(mandate_id),
+        "mandate_version_id": str(mandate_version_id),
+        "mandate_authorization_id": str(authorization.mandate_authorization_id),
+        "mandate_status": mandate.status,
+        "write_summary": {
+            "submitted_for_authorization": submitted,
+            "authorized": True,
+            "authorization_state": authorization.authorization_state,
+        },
+        "next_required_action": (
+            "This mandate version is now authorized. It remains inactive until a separate, "
+            "explicit mandate-lifecycle-activate call. No activation, order execution, or "
+            "autonomous cycle has occurred."
+        ),
+    }
+
+
+async def mandate_lifecycle_status(*, mandate_id: UUID) -> dict[str, Any]:
+    """mandate-lifecycle family: read-only. Independently reports the current lifecycle,
+    authorization, and activation state of an existing mandate, re-derived from the
+    database -- the standing verification tool for mandate_lifecycle_authorize()/
+    mandate_lifecycle_activate(), the same role mandate_bootstrap_create_status() already
+    plays for the creation phase. Reuses _mandate_bootstrap_create_identity_drift() as-is
+    for the campaign-identity coherence check. Performs zero writes."""
+    conflicts: list[str] = []
+    warnings: list[str] = []
+
+    async with AsyncSessionLocal() as db:
+        mandate = await db.get(AutonomousCapitalMandate, mandate_id)
+        if mandate is None:
+            return {
+                "overall_status": "NOT_FOUND",
+                "mandate_id": str(mandate_id),
+                "mandate_status": None,
+                "mandate_version_id": None,
+                "mandate_version_number": None,
+                "is_authorized": None,
+                "is_active": None,
+                "latest_authorization_state": None,
+                "identity_coherent": None,
+                "audit_coherent": None,
+                "conflicts": [],
+                "warnings": ["mandate not found for this mandate_id"],
+            }
+
+        versions = list(
+            await db.scalars(
+                select(AutonomousCapitalMandateVersion)
+                .where(AutonomousCapitalMandateVersion.mandate_id == mandate_id)
+                .order_by(AutonomousCapitalMandateVersion.version_number.desc())
+            )
+        )
+        governing_version = next((item for item in versions if item.is_active), None)
+        version = governing_version or (versions[0] if versions else None)
+
+        audit_coherent = True
+        if version is not None and version.mandate_id != mandate.mandate_id:
+            audit_coherent = False
+            conflicts.append("version.mandate_id does not match mandate_id")
+
+        authorizations = list(
+            await db.scalars(
+                select(AutonomousCapitalMandateAuthorization)
+                .where(AutonomousCapitalMandateAuthorization.mandate_id == mandate_id)
+                .order_by(AutonomousCapitalMandateAuthorization.recorded_at.desc())
+            )
+        )
+        latest_authorization = authorizations[0] if authorizations else None
+        if (
+            latest_authorization is not None
+            and version is not None
+            and latest_authorization.mandate_version_id != version.mandate_version_id
+        ):
+            warnings.append("latest authorization references a different version than the current governing/latest version")
+
+        identity_coherent = True
+        if mandate.capital_campaign_id is not None:
+            export = await mandate_bootstrap_export(capital_campaign_id=mandate.capital_campaign_id)
+            if not export["campaign"].get("found", False):
+                warnings.append(
+                    f"capital_campaign_id={mandate.capital_campaign_id} no longer resolves; cannot "
+                    "confirm continued identity coherence against a campaign that may have been deleted."
+                )
+            else:
+                drift = _mandate_bootstrap_create_identity_drift(mandate=mandate, export_fields=export["fields"])
+                if drift:
+                    identity_coherent = False
+                    conflicts.extend(f"campaign identity drift -- {item}" for item in drift)
+
+        overall_status = "CONFLICT" if conflicts else "OK"
+
+        return {
+            "overall_status": overall_status,
+            "mandate_id": str(mandate_id),
+            "mandate_status": mandate.status,
+            "mandate_version_id": str(version.mandate_version_id) if version is not None else None,
+            "mandate_version_number": version.version_number if version is not None else None,
+            "is_authorized": bool(version.is_authorized) if version is not None else None,
+            "is_active": bool(version.is_active) if version is not None else None,
+            "latest_authorization_state": latest_authorization.authorization_state if latest_authorization is not None else None,
+            "identity_coherent": identity_coherent,
+            "audit_coherent": audit_coherent,
+            "conflicts": conflicts,
+            "warnings": warnings,
+        }
+
+
+async def mandate_lifecycle_activate(*, mandate_id: UUID, actor: str, reason: str, idempotency_key: str) -> dict[str, Any]:
+    """mandate-lifecycle family: activates an existing, already-authorized mandate.
+    Reuses apply_mandate_lifecycle_action(action=ACTIVATE) and
+    _load_governing_authorized_version() exactly as mandate_bootstrap() and
+    apply_mandate_lifecycle_action() itself already use them for this stage -- no new
+    transition rule is introduced. Never authorizes, never creates, never touches order
+    execution or the autonomous cycle."""
+    async with AsyncSessionLocal() as db:
+        mandate = await db.get(AutonomousCapitalMandate, mandate_id)
+        if mandate is None:
+            return {
+                "overall_status": "FAILED_VALIDATION",
+                "mandate_id": str(mandate_id),
+                "mandate_status": None,
+                "governing_mandate_version_id": None,
+                "validation": {"field_errors": [{"field": "mandate_id", "error": "mandate_not_found"}]},
+                "next_required_action": "No mandate exists for this mandate_id. Zero writes were performed.",
+            }
+
+        activate_idempotency_key = f"{idempotency_key}:activate"
+        already_activated = await _find_audit_by_idempotency(
+            db=db, entity_type="autonomous_capital_mandate", action="MANDATE_ACTIVATE", idempotency_key=activate_idempotency_key
+        )
+        # A matching prior activation is a no-op resume -- apply_mandate_lifecycle_action()
+        # will itself short-circuit on this same idempotency_key regardless of the
+        # mandate's current status (already ACTIVE), so the transition pre-check below
+        # must not reject that legitimate resume before the real function even sees it.
+        if already_activated is None:
+            transition = validate_mandate_state_transition(from_status=mandate.status, to_status="ACTIVE")
+            if not transition.valid:
+                return {
+                    "overall_status": "FAILED_VALIDATION",
+                    "mandate_id": str(mandate_id),
+                    "mandate_status": mandate.status,
+                    "governing_mandate_version_id": None,
+                    "validation": {
+                        "field_errors": [
+                            {"field": "mandate_id", "error": transition.reason or "invalid_mandate_state_transition"}
+                        ]
+                    },
+                    "next_required_action": (
+                        f"mandate.status is {mandate.status!r}; the transition to ACTIVE is not valid "
+                        "from this state. Zero writes were performed."
+                    ),
+                }
+
+        governing_version = await _load_governing_authorized_version(db=db, mandate_id=mandate.mandate_id)
+        if governing_version is None:
+            return {
+                "overall_status": "FAILED_VALIDATION",
+                "mandate_id": str(mandate_id),
+                "mandate_status": mandate.status,
+                "governing_mandate_version_id": None,
+                "validation": {"field_errors": [{"field": "mandate_id", "error": "no_authorized_mandate_version"}]},
+                "next_required_action": (
+                    "No authorized mandate version exists for this mandate. Run "
+                    "mandate-lifecycle-authorize first. Zero writes were performed."
+                ),
+            }
+
+        mandate = await apply_mandate_lifecycle_action(
+            db=db,
+            request=MandateLifecycleActionRequest(
+                mandate_id=mandate.mandate_id,
+                actor=actor,
+                action="ACTIVATE",
+                reason=reason,
+                idempotency_key=activate_idempotency_key,
+            ),
+        )
+
+        return {
+            "overall_status": "ACTIVE",
+            "mandate_id": str(mandate_id),
+            "mandate_status": mandate.status,
+            "governing_mandate_version_id": str(governing_version.mandate_version_id),
+            "next_required_action": (
+                "This mandate is now ACTIVE. Order execution and autonomous evaluation are "
+                "governed by separate, existing pipelines (e.g. canonical-proving-commission) "
+                "-- this command does not itself trigger any of them."
+            ),
+        }
+
+
+async def mandate_lifecycle_commission(
+    *,
+    capital_campaign_id: int,
+    mandate_id: UUID,
+    action: str,
+    mandate_version_id: UUID | None = None,
+    owner_input: dict[str, Any] | None = None,
+    actor: str | None = None,
+    reason: str | None = None,
+    idempotency_key: str | None = None,
+) -> dict[str, Any]:
+    """mandate-lifecycle family: orchestrates mandate_governance_readiness_audit() ->
+    mandate_lifecycle_authorize()/mandate_lifecycle_activate() (selected by `action`) ->
+    mandate_lifecycle_status(), mirroring mandate_bootstrap_commission()'s own
+    audit-then-write-then-independently-reverify shape exactly. Adds no new validation,
+    resolution, or write logic of its own -- pure orchestration of the three functions
+    above."""
+    if action not in {"AUTHORIZE", "ACTIVATE"}:
+        raise ValueError("action must be AUTHORIZE or ACTIVATE")
+
+    audit = await mandate_governance_readiness_audit(capital_campaign_id=capital_campaign_id)
+    if audit["overall_status"] != "READY_FOR_STAGE9":
+        return {
+            "overall_status": "ABORTED_NOT_READY",
+            "mandate_id": str(mandate_id),
+            "action": action,
+            "audit_summary": {"governance_audit_status": audit["overall_status"], "write_paths": audit["write_paths"]},
+            "lifecycle_status": None,
+            "next_required_action": (
+                "mandate-governance-readiness-audit reported NOT_READY. Resolve the reported "
+                "issues before attempting this lifecycle action again. Zero writes were performed."
+            ),
+        }
+
+    if action == "AUTHORIZE":
+        if mandate_version_id is None or owner_input is None:
+            raise ValueError("mandate_version_id and owner_input are required for action=AUTHORIZE")
+        write_result = await mandate_lifecycle_authorize(
+            mandate_id=mandate_id, mandate_version_id=mandate_version_id, owner_input=owner_input
+        )
+        success_status = "AUTHORIZED"
+    else:
+        if actor is None or reason is None or idempotency_key is None:
+            raise ValueError("actor, reason, and idempotency_key are required for action=ACTIVATE")
+        write_result = await mandate_lifecycle_activate(
+            mandate_id=mandate_id, actor=actor, reason=reason, idempotency_key=idempotency_key
+        )
+        success_status = "ACTIVE"
+
+    status = await mandate_lifecycle_status(mandate_id=mandate_id)
+
+    if write_result["overall_status"] != success_status:
+        return {
+            "overall_status": write_result["overall_status"],
+            "mandate_id": str(mandate_id),
+            "action": action,
+            "audit_summary": {"governance_audit_status": audit["overall_status"]},
+            "write_result": write_result,
+            "lifecycle_status": status,
+            "next_required_action": write_result["next_required_action"],
+        }
+
+    overall_status = "COMMISSIONED" if status["overall_status"] == "OK" else "COMMISSIONED_INTEGRITY_WARNING"
+
+    return {
+        "overall_status": overall_status,
+        "mandate_id": str(mandate_id),
+        "action": action,
+        "audit_summary": {"governance_audit_status": audit["overall_status"]},
+        "write_result": write_result,
+        "lifecycle_status": status,
+        "next_required_action": write_result["next_required_action"],
     }
 
 

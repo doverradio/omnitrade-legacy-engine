@@ -79,6 +79,10 @@ from app.operator_cli.service import (
     mandate_bootstrap_export,
     mandate_bootstrap_session_validate,
     mandate_governance_readiness_audit,
+    mandate_lifecycle_activate,
+    mandate_lifecycle_authorize,
+    mandate_lifecycle_commission,
+    mandate_lifecycle_status,
     refresh_provider_balance_evidence,
     inspect_legacy_campaign_transition,
     pause_canonical_proving_activation_bundle,
@@ -1022,6 +1026,99 @@ def _build_parser() -> argparse.ArgumentParser:
     mandate_bootstrap_commission_parser.add_argument("--owner-input-json", type=_parse_owner_input_json, required=True)
     mandate_bootstrap_commission_parser.add_argument("--json", action="store_true", dest="json_output")
 
+    mandate_lifecycle_authorize_parser = subparsers.add_parser(
+        "mandate-lifecycle-authorize",
+        parents=[common],
+        help="Submit an existing DRAFT mandate for authorization (if needed) and authorize its version -- never activates, never trades",
+        description=(
+            "mandate-lifecycle family (distinct from mandate-bootstrap-*, which is "
+            "creation-only and ends at DRAFT): for an existing mandate identified by "
+            "--mandate-id/--mandate-version-id, submits it for authorization via "
+            "apply_mandate_lifecycle_action(SUBMIT_FOR_AUTHORIZATION) if it is still "
+            "DRAFT, then records a genuine authorization event via "
+            "authorize_mandate_version() -- the exact same functions "
+            "mandate_bootstrap() and the REST API already call for these stages. Never "
+            "activates, never creates a mandate, never touches order execution or the "
+            "autonomous cycle. Reusing --owner-input-json's idempotency_key with "
+            "materially different authorization evidence fails closed as "
+            "overall_status=CONFLICT with zero new writes. Exit code 0 for AUTHORIZED, "
+            "1 for FAILED_VALIDATION/CONFLICT, 2 only for an infrastructure or "
+            "unexpected failure."
+        ),
+    )
+    mandate_lifecycle_authorize_parser.add_argument("--mandate-id", type=UUID, required=True)
+    mandate_lifecycle_authorize_parser.add_argument("--mandate-version-id", type=UUID, required=True)
+    mandate_lifecycle_authorize_parser.add_argument("--owner-input-json", type=_parse_owner_input_json, required=True)
+    mandate_lifecycle_authorize_parser.add_argument("--json", action="store_true", dest="json_output")
+
+    mandate_lifecycle_status_parser = subparsers.add_parser(
+        "mandate-lifecycle-status",
+        parents=[common],
+        help="Read-only: independently re-derive an existing mandate's lifecycle/authorization/activation state from the database",
+        description=(
+            "mandate-lifecycle family: read-only inspection of one --mandate-id's "
+            "current mandate.status, governing/latest version, authorization state, and "
+            "campaign-identity coherence (reusing the same identity-drift check "
+            "mandate-bootstrap-create-status already uses). Performs zero writes. The "
+            "standing verification tool for mandate-lifecycle-authorize/-activate, the "
+            "same role mandate-bootstrap-create-status plays for the creation phase. "
+            "Exit code 0 for OK, 1 for NOT_FOUND/CONFLICT, 2 only for an infrastructure "
+            "or unexpected failure."
+        ),
+    )
+    mandate_lifecycle_status_parser.add_argument("--mandate-id", type=UUID, required=True)
+    mandate_lifecycle_status_parser.add_argument("--json", action="store_true", dest="json_output")
+
+    mandate_lifecycle_activate_parser = subparsers.add_parser(
+        "mandate-lifecycle-activate",
+        parents=[common],
+        help="Activate an existing, already-authorized mandate -- never authorizes, never trades",
+        description=(
+            "mandate-lifecycle family: for an existing mandate identified by "
+            "--mandate-id, transitions it to ACTIVE via "
+            "apply_mandate_lifecycle_action(ACTIVATE) -- the exact same function "
+            "mandate_bootstrap() and the REST API already call for this stage. Requires "
+            "an authorized governing version to already exist (checked read-only via "
+            "the same _load_governing_authorized_version() lookup "
+            "apply_mandate_lifecycle_action() itself uses). Never authorizes, never "
+            "creates, never touches order execution or the autonomous cycle -- those are "
+            "governed by separate, existing pipelines (e.g. canonical-proving-"
+            "commission). Exit code 0 for ACTIVE, 1 for FAILED_VALIDATION, 2 only for an "
+            "infrastructure or unexpected failure."
+        ),
+    )
+    mandate_lifecycle_activate_parser.add_argument("--mandate-id", type=UUID, required=True)
+    mandate_lifecycle_activate_parser.add_argument("--actor", type=str, required=True)
+    mandate_lifecycle_activate_parser.add_argument("--reason", type=str, required=True)
+    mandate_lifecycle_activate_parser.add_argument("--idempotency-key", type=str, required=True)
+    mandate_lifecycle_activate_parser.add_argument("--json", action="store_true", dest="json_output")
+
+    mandate_lifecycle_commission_parser = subparsers.add_parser(
+        "mandate-lifecycle-commission",
+        parents=[common],
+        help="Orchestrates mandate-governance-readiness-audit + mandate-lifecycle-authorize/-activate + mandate-lifecycle-status for one existing mandate",
+        description=(
+            "mandate-lifecycle family: reuses mandate-governance-readiness-audit "
+            "(aborts with zero writes if not READY_FOR_STAGE9), then performs the "
+            "requested --action (AUTHORIZE or ACTIVATE) via mandate-lifecycle-authorize/"
+            "-activate, then independently re-verifies via mandate-lifecycle-status -- "
+            "mirroring mandate-bootstrap-commission's own audit-then-write-then-"
+            "reverify shape exactly. --action AUTHORIZE requires --mandate-version-id "
+            "and --owner-input-json; --action ACTIVATE requires --actor/--reason/"
+            "--idempotency-key. Exit code 0 for COMMISSIONED, 1 for any other "
+            "overall_status, 2 only for an infrastructure or unexpected failure."
+        ),
+    )
+    mandate_lifecycle_commission_parser.add_argument("--capital-campaign-id", type=int, required=True)
+    mandate_lifecycle_commission_parser.add_argument("--mandate-id", type=UUID, required=True)
+    mandate_lifecycle_commission_parser.add_argument("--action", type=str, choices=["AUTHORIZE", "ACTIVATE"], required=True)
+    mandate_lifecycle_commission_parser.add_argument("--mandate-version-id", type=UUID, default=None)
+    mandate_lifecycle_commission_parser.add_argument("--owner-input-json", type=_parse_owner_input_json, default=None)
+    mandate_lifecycle_commission_parser.add_argument("--actor", type=str, default=None)
+    mandate_lifecycle_commission_parser.add_argument("--reason", type=str, default=None)
+    mandate_lifecycle_commission_parser.add_argument("--idempotency-key", type=str, default=None)
+    mandate_lifecycle_commission_parser.add_argument("--json", action="store_true", dest="json_output")
+
     proving_pause = subparsers.add_parser(
         "canonical-proving-pause",
         parents=[common],
@@ -1447,6 +1544,44 @@ async def _run_async(args: argparse.Namespace) -> tuple[int, dict[str, Any], str
         payload = await mandate_bootstrap_commission(
             capital_campaign_id=args.capital_campaign_id,
             owner_input=args.owner_input_json,
+        )
+        exit_code = 0 if payload["overall_status"] == "COMMISSIONED" else 1
+        return exit_code, payload, render_json(payload)
+
+    if args.command == "mandate-lifecycle-authorize":
+        payload = await mandate_lifecycle_authorize(
+            mandate_id=args.mandate_id,
+            mandate_version_id=args.mandate_version_id,
+            owner_input=args.owner_input_json,
+        )
+        exit_code = 0 if payload["overall_status"] == "AUTHORIZED" else 1
+        return exit_code, payload, render_json(payload)
+
+    if args.command == "mandate-lifecycle-status":
+        payload = await mandate_lifecycle_status(mandate_id=args.mandate_id)
+        exit_code = 0 if payload["overall_status"] == "OK" else 1
+        return exit_code, payload, render_json(payload)
+
+    if args.command == "mandate-lifecycle-activate":
+        payload = await mandate_lifecycle_activate(
+            mandate_id=args.mandate_id,
+            actor=args.actor,
+            reason=args.reason,
+            idempotency_key=args.idempotency_key,
+        )
+        exit_code = 0 if payload["overall_status"] == "ACTIVE" else 1
+        return exit_code, payload, render_json(payload)
+
+    if args.command == "mandate-lifecycle-commission":
+        payload = await mandate_lifecycle_commission(
+            capital_campaign_id=args.capital_campaign_id,
+            mandate_id=args.mandate_id,
+            action=args.action,
+            mandate_version_id=args.mandate_version_id,
+            owner_input=args.owner_input_json,
+            actor=args.actor,
+            reason=args.reason,
+            idempotency_key=args.idempotency_key,
         )
         exit_code = 0 if payload["overall_status"] == "COMMISSIONED" else 1
         return exit_code, payload, render_json(payload)
