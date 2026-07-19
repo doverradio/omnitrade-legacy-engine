@@ -302,6 +302,16 @@ async def authorize_mandate_version(
         mandate.authorized_at = _utcnow()
         mandate.updated_at = _utcnow()
 
+    if not version.is_authorized:
+        version.is_authorized = True
+        version.authorized_at = _utcnow()
+
+    if mandate.status == "ACTIVE":
+        # Authorizing a new version while the mandate is already ACTIVE (e.g. the
+        # governing-version replacement flow) immediately promotes it to governing:
+        # an ACTIVE mandate must always have exactly one authorized+active version.
+        await _promote_governing_version(db=db, mandate_id=mandate.mandate_id, governing_version=version)
+
     db.add(
         AuditLog(
             actor=request.actor,
@@ -354,9 +364,10 @@ async def apply_mandate_lifecycle_action(
             details={"from": mandate.status, "to": target_status, "reason": transition.reason},
         )
 
+    governing_version: AutonomousCapitalMandateVersion | None = None
     if request.action in {"ACTIVATE", "RESUME", "SET_EXIT_ONLY"}:
-        has_authorization = await _has_authorized_mandate_version(db=db, mandate_id=mandate.mandate_id)
-        if not has_authorization:
+        governing_version = await _load_governing_authorized_version(db=db, mandate_id=mandate.mandate_id)
+        if governing_version is None:
             raise InvalidRequestError(
                 message="Lifecycle action requires at least one authorized mandate version",
                 details={"action": request.action},
@@ -374,6 +385,17 @@ async def apply_mandate_lifecycle_action(
         mandate.expires_at = now
     if target_status in {"REVOKED", "KILLED"}:
         mandate.revoked_at = now
+
+    # A mandate is ACTIVE if and only if exactly one of its versions is is_active=True
+    # (the governing version). Every other target status -- PAUSED, EXIT_ONLY, EXPIRED,
+    # REVOKED, KILLED, COMPLETED -- must leave no version falsely active, so that
+    # canonical_proving_commission_bundle()'s is_active gate can never pass for a
+    # mandate that is not truly ACTIVE.
+    if target_status == "ACTIVE":
+        assert governing_version is not None
+        await _promote_governing_version(db=db, mandate_id=mandate.mandate_id, governing_version=governing_version)
+    else:
+        await _clear_active_versions(db=db, mandate_id=mandate.mandate_id)
 
     db.add(
         AuditLog(
@@ -462,17 +484,64 @@ async def read_mandate_history(
     ]
 
 
-async def _has_authorized_mandate_version(*, db: AsyncSession, mandate_id: uuid.UUID) -> bool:
-    authorized = await db.scalar(
-        select(AutonomousCapitalMandateAuthorization.mandate_authorization_id)
+async def _load_governing_authorized_version(
+    *, db: AsyncSession, mandate_id: uuid.UUID
+) -> AutonomousCapitalMandateVersion | None:
+    """Resolve the version backing the most recent AUTHORIZED, non-revoked
+    authorization for mandate_id. This is the sole definition of "the governing
+    version" used to gate/perform activation -- there is no separate fallback to
+    "latest version regardless of authorization" here, unlike some read-only
+    diagnostic helpers, because activation must never treat an unauthorized
+    version as governing."""
+    authorization = await db.scalar(
+        select(AutonomousCapitalMandateAuthorization)
         .where(
             AutonomousCapitalMandateAuthorization.mandate_id == mandate_id,
             AutonomousCapitalMandateAuthorization.authorization_state == "AUTHORIZED",
             AutonomousCapitalMandateAuthorization.revoked_at.is_(None),
         )
+        .order_by(AutonomousCapitalMandateAuthorization.recorded_at.desc())
         .limit(1)
     )
-    return authorized is not None
+    if authorization is None:
+        return None
+    return await db.get(AutonomousCapitalMandateVersion, authorization.mandate_version_id)
+
+
+async def _promote_governing_version(
+    *,
+    db: AsyncSession,
+    mandate_id: uuid.UUID,
+    governing_version: AutonomousCapitalMandateVersion,
+) -> None:
+    """Make governing_version the sole is_active=True version for mandate_id."""
+    other_active_versions = list(
+        await db.scalars(
+            select(AutonomousCapitalMandateVersion).where(
+                AutonomousCapitalMandateVersion.mandate_id == mandate_id,
+                AutonomousCapitalMandateVersion.mandate_version_id != governing_version.mandate_version_id,
+                AutonomousCapitalMandateVersion.is_active.is_(True),
+            )
+        )
+    )
+    for stale_version in other_active_versions:
+        stale_version.is_active = False
+    if not governing_version.is_active:
+        governing_version.is_active = True
+
+
+async def _clear_active_versions(*, db: AsyncSession, mandate_id: uuid.UUID) -> None:
+    """Ensure no version of mandate_id is left is_active=True."""
+    active_versions = list(
+        await db.scalars(
+            select(AutonomousCapitalMandateVersion).where(
+                AutonomousCapitalMandateVersion.mandate_id == mandate_id,
+                AutonomousCapitalMandateVersion.is_active.is_(True),
+            )
+        )
+    )
+    for version in active_versions:
+        version.is_active = False
 
 
 async def _find_audit_by_idempotency(

@@ -1,0 +1,4 @@
+ id | paper_account_id | signal_id | asset_id | side | quantity | price | executed_at 
+----+------------------+-----------+----------+------+----------+-------+-------------
+(0 rows)
+

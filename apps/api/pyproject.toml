@@ -12,6 +12,7 @@ dependencies = [
   "uvicorn[standard]",
   "sqlalchemy[asyncio]",
   "asyncpg",
+  "aiosqlite",
   "alembic",
   "cryptography",
   "PyJWT",

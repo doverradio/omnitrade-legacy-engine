@@ -5,7 +5,7 @@ from datetime import datetime
 from decimal import Decimal
 from typing import Any
 
-from sqlalchemy import Boolean, CheckConstraint, DateTime, ForeignKey, Index, Integer, Numeric, Text, UniqueConstraint, event, text
+from sqlalchemy import Boolean, CheckConstraint, DateTime, ForeignKey, Index, Integer, Numeric, Text, UniqueConstraint, event, inspect, text
 from sqlalchemy.dialects.postgresql import JSONB, UUID
 from sqlalchemy.orm import Mapped, mapped_column
 
@@ -69,10 +69,28 @@ class AutonomousCapitalMandateVersion(Base):
     authorized_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
 
 
+# is_active is deliberately excluded: it is lifecycle bookkeeping (which authorized
+# version currently governs an ACTIVE mandate), not part of the authorized economic
+# terms, and must remain settable by apply_mandate_lifecycle_action()/
+# authorize_mandate_version() after a version has been authorized.
+_MUTABLE_AFTER_AUTHORIZATION_COLUMNS = {"is_active"}
+
+
 @event.listens_for(AutonomousCapitalMandateVersion, "before_update", propagate=True)
 def _prevent_authorized_version_update(_mapper: Any, _connection: Any, target: AutonomousCapitalMandateVersion) -> None:
-    if bool(target.is_authorized):
-        raise ValueError("authorized mandate versions are immutable")
+    state = inspect(target)
+    authorized_history = state.attrs.is_authorized.history
+    # Use the pre-flush (committed) value of is_authorized, not the pending one --
+    # otherwise the very update that flips is_authorized False->True would trip
+    # this guard on itself and authorization could never be persisted.
+    was_already_authorized = bool(authorized_history.deleted[0]) if authorized_history.deleted else bool(target.is_authorized)
+    if not was_already_authorized:
+        return
+    for attr in state.attrs:
+        if attr.key in _MUTABLE_AFTER_AUTHORIZATION_COLUMNS:
+            continue
+        if attr.history.has_changes():
+            raise ValueError("authorized mandate versions are immutable")
 
 
 @event.listens_for(AutonomousCapitalMandateVersion, "before_delete", propagate=True)

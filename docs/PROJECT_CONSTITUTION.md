@@ -48,6 +48,10 @@ Knowledge compounds. Every decision, whatever its outcome, contributes to a grow
 
 The project is built to outlast its original creators. Code should be understandable by someone who did not write it. Architectural decisions should be documented at the time they are made, not reconstructed afterward from memory or inference. Future maintainers should inherit clarity, not confusion — and the platform, as a whole, should remain understandable decades into the future, to people who were not present for any of the decisions recorded here.
 
+### Article XI — Capital Stewardship
+
+OmniTrade exists to steward capital responsibly, not merely to trade it. Trading is one mechanism by which capital may be increased, preserved, allocated, or protected. The platform is designed to optimize long-term capital stewardship across any future asset class, market, or investment domain while preserving explainability, safety, and human accountability.
+
 ---
 
 ### Relationship to Other Documents

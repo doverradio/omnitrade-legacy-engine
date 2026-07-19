@@ -1,23 +1,24 @@
 # OmniTrade Legacy Engine
 # ARCHITECTURAL DECISIONS
 
-Purpose
+Authority:
+Append Only
 
-This document records major architectural decisions.
+Never rewrite history.
+
+Never remove previous decisions.
+
+Append new decisions as the project evolves.
+
+This document records **why** important architectural decisions were made.
 
 It is not a changelog.
 
-It records WHY important decisions were made so future chats and contributors understand the reasoning.
-
-Each decision is immutable once recorded.
-
-Append new entries only.
-
 ---
 
-# Template
+# Entry Format
 
-## YYYY-MM-DD
+## Date
 
 Decision
 
@@ -31,152 +32,245 @@ Future Impact
 
 ---
 
-## 2026-07-XX
+## 2026-07
+
+### Execution Provider Layer
 
 Decision
 
-Execution became provider-neutral through the Execution Provider Layer.
+Execution became provider-neutral.
 
 Reason
 
 No exchange should ever become a permanent dependency.
 
-Coinbase onboarding delays demonstrated the need for interchangeable providers.
+Provider onboarding delays demonstrated the need for interchangeable execution providers.
 
 Alternatives Considered
 
-Continue building around Coinbase only.
+Building directly around one exchange.
 
-Rejected because it created unnecessary operational risk.
+Rejected.
 
 Consequences
 
-Kraken became the primary execution provider.
+Execution providers can be replaced independently of the remainder of the architecture.
+
+Future Impact
 
 Future providers require only provider implementations.
 
-Decision Engine, Risk Engine, Portfolio Intelligence, and Decision Intelligence remain unchanged.
-
-Future Impact
-
-Additional providers (Gemini, Interactive Brokers, Alpaca, Kalshi, etc.) can be added without architectural redesign.
+No architectural redesign.
 
 ---
 
-## 2026-07-XX
+## 2026-07
+
+### Autonomous Capital Campaigns
 
 Decision
 
-Autonomous Capital Campaigns became a first-class Portfolio Intelligence capability.
+Capital is managed through campaigns rather than isolated trades.
 
 Reason
 
-Capital should be managed through campaigns rather than isolated trades.
+Investment objectives belong to campaigns, not individual orders.
 
 Future Impact
 
-Future markets, strategies, and asset classes inherit the same campaign architecture.
+Every future asset class inherits the same campaign architecture.
 
 ---
 
-## 2026-07-XX
+## 2026-07
+
+### Decision Quality
 
 Decision
 
-Decision Quality became more important than raw profitability.
+Decision quality is more important than raw profitability.
 
 Reason
 
-Profitable decisions can be poor decisions.
+A profitable decision can still be poor.
 
-Poor decisions can occasionally be profitable.
-
-The platform optimizes for decision quality first.
+A losing decision can still be correct.
 
 Future Impact
 
-All future AI systems evaluate reasoning before profit.
+The AI layer evaluates reasoning before outcome.
 
 ---
 
-## 2026-07-XX
+## 2026-07
+
+### Small Account Mode
 
 Decision
 
-Small Account Mode became a permanent design constraint.
+The platform must succeed with very small balances.
 
 Reason
 
-If the platform cannot intelligently compound $25, larger balances merely hide weaknesses.
+If the system cannot intelligently compound $25, larger balances merely conceal weaknesses.
 
 Future Impact
 
-Every future feature must function correctly at the smallest supported balance.
+Every feature must function correctly for the smallest supported account.
 
 ---
 
-## Future Entries
+## 2026-07
+
+### Replay Architecture
+
+Decision
+
+Every production decision must be replayable.
+
+Reason
+
+Replay enables:
+
+- debugging
+- AI coaching
+- deterministic audits
+- research
+- regression testing
+
+Future Impact
+
+Future AI systems learn from immutable historical evidence rather than reconstructed guesses.
+
+---
+
+## 2026-07
+
+### Immutable Decision Records
+
+Decision
+
+Decision Records are immutable.
+
+Reason
+
+Historical decisions are evidence.
+
+Evidence must never change.
+
+Future Impact
+
+Every AI evaluation is based on trustworthy historical facts.
+
+---
+
+## 2026-07
+
+### Fail Closed
+
+Decision
+
+Every production safety boundary fails closed.
+
+Reason
+
+Unexpected behavior should stop execution rather than continue unpredictably.
+
+Future Impact
+
+Safety always overrides opportunity.
+
+---
+
+## 2026-07
+
+### Provider-Neutral Governance
+
+Decision
+
+Governance must never depend upon any exchange.
+
+Reason
+
+Operational control belongs to OmniTrade.
+
+Execution belongs to providers.
+
+Those responsibilities remain separate.
+
+Future Impact
+
+Future providers inherit identical governance.
+
+---
+
+## 2026-07
+
+### Campaign Identity
+
+Decision
+
+Campaign identity is authoritative throughout execution.
+
+Reason
+
+Every production order must remain attributable to the campaign that authorized it.
+
+Future Impact
+
+Reconciliation, accounting, AI analysis, and reporting all preserve campaign ownership.
+
+---
+
+## 2026-07
+
+### Production Before Expansion
+
+Decision
+
+The first autonomous profitable trade takes precedence over new functionality.
+
+Reason
+
+An unfinished platform gains little from additional features.
+
+Production proof creates confidence for every subsequent phase.
+
+Future Impact
+
+Development remains milestone-driven rather than feature-driven.
+
+---
+
+## 2026-07
+
+### Small, Bounded Engineering Tasks
+
+Decision
+
+Large implementation prompts are avoided.
+
+Reason
+
+Smaller implementation tasks consistently produce higher quality code, simpler reviews, and fewer regressions.
+
+Future Impact
+
+Future AI-assisted development remains incremental, verifiable, and maintainable.
+
+---
+
+## Future Decisions
 
 Append only.
 
-Never rewrite history.
+Never rewrite previous entries.
 
-Always explain WHY.
+Always explain:
 
----
+- what changed
+- why it changed
+- alternatives rejected
+- long-term consequences
 
-## 2026-07-16
-
-Decision
-
-Commissioned campaign operator control must remain provider-neutral and non-executing.
-
-Reason
-
-The commissioned control plane exists to mutate operator governance metadata only.
-
-Provider submission authority must remain in the existing governed orchestration and execution layers so pause, resume, acknowledge, and cancel cannot directly place or retry an order.
-
-Alternatives Considered
-
-Allow REST or CLI control-plane handlers to call provider adapters directly.
-
-Rejected because it would blur the recommendation-versus-execution boundary, weaken duplicate-order protection, and create a second live-execution path.
-
-Consequences
-
-The API and CLI wrappers delegate to the shared commissioned control-plane domain service.
-
-The service records audit evidence, enforces allowed source states, requires idempotency keys, rejects changed-intent key reuse, and returns no_execution=true.
-
-Future Impact
-
-Any future commissioning workflow must continue to treat control-plane mutation as a governance surface rather than an execution surface.
-
----
-
-## 2026-07-16
-
-Decision
-
-Production proving-window evidence must be gathered through read-only commands before any explicit campaign activation approval.
-
-Reason
-
-The final Task 10 handoff must prove runtime stability, observability, reconciliation coherence, and audit visibility without introducing a live economic action during documentation or validation.
-
-Alternatives Considered
-
-Validate readiness by performing a live commissioning action during handoff.
-
-Rejected because documentation and go/no-go preparation must remain operationally safe and reversible.
-
-Consequences
-
-Task 10 defines PASS, FAIL, ABORT, and escalation criteria with exact read-only evidence-gathering commands.
-
-Later mutating steps are documented separately and explicitly marked as requiring operator approval.
-
-Future Impact
-
-Activation decisions can be made from a deterministic evidence package rather than ad hoc judgment.
+The goal is to preserve engineering reasoning for every future contributor, human or AI.

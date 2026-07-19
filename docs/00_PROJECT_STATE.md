@@ -1,149 +1,228 @@
 # OmniTrade Legacy Engine
 # PROJECT STATE
 
+Version:
+2.0
+
 Last Updated:
-2026-07-16 23:59 UTC
+2026-07-18
+
+Authority:
+Highest
+
+---
+
+# Purpose
+
+This document is the authoritative snapshot of the OmniTrade project.
+
+It records what has actually been proven, what remains unproven, the current engineering objective, and the immediate direction of development.
+
+If this document conflicts with conversation history, this document is considered authoritative until intentionally updated.
+
+---
+
+# Project Vision
+
+OmniTrade is **not** a cryptocurrency trading bot.
+
+OmniTrade is being engineered as an Autonomous Capital Management Platform capable of intelligently allocating capital across multiple financial markets while continuously improving the quality of its own decisions.
+
+The architecture is intentionally market-neutral.
+
+Future asset classes include:
+
+- Cryptocurrency
+- Equities
+- ETFs
+- Options
+- Futures
+- Forex
+- Prediction Markets
+- Additional financial markets
+
+No future expansion should require architectural redesign.
 
 ---
 
 # Current Objective
 
-Build the world's most intelligent autonomous capital management platform.
+Achieve the first fully autonomous profitable real-money trade while preserving:
 
-Immediate mission:
+- Explainability
+- Auditability
+- Deterministic behavior
+- Capital preservation
+- Risk governance
 
-Safely achieve the first fully autonomous profitable real-money trade while preserving explainability, auditability, and capital stewardship.
+Every engineering decision should move the platform closer to this objective.
 
 ---
 
 # Current Milestone
 
-FIRST AUTONOMOUS PROFIT
+## FIRST AUTONOMOUS PROFIT
 
 Definition of Done
 
-✓ Funds deposited
-✓ Strategy selected
-✓ Risk approved
-✓ Order submitted
-✓ Position managed automatically
-✓ Position exited automatically
-✓ Profit realized
-✓ Decision fully explainable
-✓ Decision permanently recorded
+One commissioned autonomous capital campaign performs:
 
-Success is waking up to more money than when the system began trading.
+Campaign Selection
 
----
+↓
 
-# Current Development Stage
+Strategy Selection
 
-Current Phase:
+↓
 
-Operational resilience
-Research/Evolution activation
-Autonomous Capital Management
-Commissioned campaign production handoff complete
+Risk Approval
 
-Project Status:
+↓
 
-Approximately 97% complete toward first autonomous production trade.
+Production BUY
 
----
+↓
 
-# Production Status
+Autonomous Position Management
 
-Architecture:
-Stable
+↓
 
-Paper Trading:
-Operational
+Production SELL
 
-Research:
-Operational
+↓
 
-Decision Intelligence:
-Operational
+Reconciliation
 
-Risk Engine:
-Operational
+↓
 
-Execution Provider Layer:
-Operational
+Accounting Completion
 
-Autonomous Capital Campaigns:
-Implemented
+↓
 
-Commissioned Autonomous Seed Campaign:
-Implemented
-Task 10 handoff package complete
+Verified Positive Net Profit
 
-Profit Policies:
-Implemented
+without operator intervention during execution.
 
-Compounding Foundation:
-Implemented
-
-Live Trading:
-
-Governed
-Approval gated
-Production safety enforced
-Not activated for commissioned live entry
+Success is waking up to more money than when the campaign began.
 
 ---
 
-# Active Execution Provider
+# Proven Capabilities
 
-Primary:
+## Execution Layer
 
-Kraken
+✅ Live Kraken authentication
 
-Secondary:
+✅ Live production BUY
 
-Coinbase
+✅ Live production SELL
 
-Provider layer is exchange-neutral.
+✅ Live production reconciliation
+
+## Decision Layer
+
+✅ Decision Records
+
+✅ Replay architecture
+
+✅ Decision Intelligence
+
+✅ Risk Engine
+
+✅ Position lifecycle
+
+✅ Immutable audit evidence
+
+## Capital Management
+
+✅ Autonomous Capital Campaign architecture
+
+✅ Campaign governance
+
+✅ Campaign lifecycle
+
+✅ Campaign identity persistence
+
+## Platform
+
+✅ Provider-neutral execution layer
+
+✅ Exchange abstraction
+
+✅ Production accounting framework
+
+✅ Commissioned proving workflow
 
 ---
 
-# Immediate Priorities
+# Not Yet Proven
 
-1. Execute the commissioned-campaign production proving window with read-only evidence collection.
+The following remain before the First Autonomous Profit milestone is complete.
 
-2. Review proving-window evidence and decide go or no-go for explicit operator-approved commissioning.
+□ One commissioned campaign executes a production BUY.
 
-3. If approved later, complete the first successful production BUY.
+□ Campaign identity remains authoritative throughout reconciliation.
 
-4. If approved later, complete the first successful production SELL.
+□ Accounting completes successfully.
 
-5. Demonstrate profitable autonomous trading.
+□ Autonomous lifecycle manages the position.
 
-6. Build "Money While You Sleep."
+□ Production SELL completes.
 
----
-
-# Permanent Principles
-
-Never sacrifice:
-
-• Explainability
-
-• Auditability
-
-• Risk Engine authority
-
-• Capital preservation
-
-• Deterministic behavior
-
-• Human governance where required
+□ Net profit is verified.
 
 ---
 
-# Success Metric
+# Engineering Philosophy
 
-The platform continuously compounds capital while continuously improving the quality of its own decisions.
+OmniTrade optimizes for:
+
+Correctness before speed.
+
+Evidence before assumptions.
+
+Architecture before features.
+
+Production proof before expansion.
+
+Safety before automation.
+
+Decision quality before profitability.
+
+Long-term compounding over short-term gains.
+
+---
+
+# Current Development Philosophy
+
+Development proceeds in small, bounded implementation tasks.
+
+Large speculative implementation prompts are avoided.
+
+Every completed task should be:
+
+- testable
+- reviewable
+- deterministic
+- independently valuable
+
+---
+
+# Current Priority
+
+Before implementing any new feature, ask:
+
+"Does this move OmniTrade closer to First Autonomous Profit?"
+
+If the answer is no, the work should normally be postponed.
+
+---
+
+# Long-Term North Star
+
+The long-term objective is not merely profitable trading.
+
+The objective is a continuously improving autonomous capital management platform whose knowledge compounds alongside its capital.
 
 Every decision becomes permanent knowledge.
 
@@ -152,25 +231,3 @@ The knowledge compounds.
 The capital compounds.
 
 Both improve together.
-
----
-
-# Task 1–10 Tracker
-
-Task 1  Repository and architecture audit                     COMPLETE
-Task 2  Final implementation plan and invariant map          COMPLETE
-Task 3  Campaign domain/state-machine implementation         COMPLETE
-Task 4  Readiness and preview                                COMPLETE
-Task 5  Commissioning and governed entry execution           COMPLETE
-Task 6  Reconciliation and position ownership                COMPLETE
-Task 7  Autonomous exit lifecycle                            COMPLETE
-Task 8  Operator commands and status                         COMPLETE
-Task 9  Regression, resilience, and security validation      COMPLETE
-Task 10 Documentation, production handoff, and go/no-go prep COMPLETE
-
-Current release posture:
-
-- Production code for commissioned control-plane hardening and dependency/runtime repairs is deployed.
-- Documentation and operator handoff are complete.
-- No commissioned campaign activation has occurred.
-- Next action is read-only proving-window evidence collection on VPS using the canonical service names and worker entrypoint documented in the commissioned architecture handoff.
