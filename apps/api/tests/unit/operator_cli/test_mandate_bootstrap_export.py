@@ -10,6 +10,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 import app.operator_cli.service as service
 from app.models.capital_campaign import CapitalCampaign
 from app.models.capital_campaign_definition import CapitalCampaignDefinition
+from app.models.exchange_connection import ExchangeConnection
 from app.models.live_trading_profile import LiveTradingProfile
 from app.models.paper_account import PaperAccount
 from tests.support.real_sqlite_session import real_sqlite_session
@@ -19,13 +20,26 @@ _TABLES = [
     CapitalCampaignDefinition.__table__,
     PaperAccount.__table__,
     LiveTradingProfile.__table__,
+    ExchangeConnection.__table__,
 ]
 
 # Fields that must never appear anywhere in mandate-bootstrap-export output.
 # "name" is deliberately excluded from this blanket check: CapitalCampaign.name is a
 # legitimate Stage 1 field. PaperAccount.name's absence is instead proven by the exact
 # dict-equality assertions in test_paper_account_found_and_active/_but_inactive below.
-_FORBIDDEN_KEYS = {"starting_balance", "current_cash_balance", "owner_user_id"}
+_FORBIDDEN_KEYS = {
+    "starting_balance",
+    "current_cash_balance",
+    "owner_user_id",
+    "credentials_encrypted",
+    "api_key_masked",
+    "api_secret_masked",
+    "passphrase_configured",
+    "balances",
+    "total_equity_usd",
+    "account_status",
+    "last_api_error",
+}
 
 
 class _SessionContext:
@@ -48,7 +62,7 @@ async def _seed_campaign(db: AsyncSession, **overrides: Any) -> CapitalCampaign:
         owner="operator:owner",
         name="Campaign 2",
         campaign_type="crypto",
-        exchange="kraken_spot:production",
+        exchange="kraken_spot",
         paper_account_id=None,
         strategy_id=None,
         definition_campaign_id=None,
@@ -127,6 +141,27 @@ async def _seed_live_trading_profile(db: AsyncSession, *, paper_account_id: uuid
     return profile
 
 
+async def _seed_exchange_connection(db: AsyncSession, **overrides: Any) -> ExchangeConnection:
+    defaults: dict[str, Any] = dict(
+        exchange_connection_id=uuid.uuid4(),
+        provider="kraken_spot",
+        connection_name="kraken-campaign-2",
+        environment="production",
+        status="connected",
+        credentials_encrypted="encrypted-blob",
+        api_key_masked="****1234",
+        api_secret_masked="****5678",
+        credentials_valid=True,
+        api_permissions=["trade", "view"],
+    )
+    defaults.update(overrides)
+    connection = ExchangeConnection(**defaults)
+    db.add(connection)
+    await db.flush()
+    await db.commit()
+    return connection
+
+
 def _assert_no_forbidden_keys(payload: Any) -> None:
     if isinstance(payload, dict):
         for key, value in payload.items():
@@ -159,6 +194,8 @@ async def test_campaign_not_found(monkeypatch: pytest.MonkeyPatch) -> None:
         assert result["paper_account"] is None
         assert result["live_trading_profile"] is None
         assert result["live_trading_profile_candidates"] == []
+        assert result["exchange_connection"] is None
+        assert result["exchange_connection_candidates"] == []
         for field in (
             "capital_campaign_id",
             "campaign_uuid",
@@ -167,6 +204,9 @@ async def test_campaign_not_found(monkeypatch: pytest.MonkeyPatch) -> None:
             "paper_account_asset_class",
             "paper_account_is_active",
             "live_trading_profile_id",
+            "exchange_connection_id",
+            "exchange_provider",
+            "exchange_environment",
         ):
             assert result["fields"][field]["classification"] == "MISSING"
             assert result["fields"][field]["value"] is None
@@ -187,7 +227,7 @@ async def test_campaign_found_without_definition_pin(monkeypatch: pytest.MonkeyP
         assert result["campaign"]["id"] == 2
         assert result["campaign"]["uuid"] == str(campaign.uuid)
         assert result["campaign"]["name"] == "Campaign 2"
-        assert result["campaign"]["exchange_label_raw"] == "kraken_spot:production"
+        assert result["campaign"]["exchange_label_raw"] == "kraken_spot"
         assert result["campaign"]["has_definition_pin"] is False
         assert result["campaign"]["definition_campaign_id"] is None
         assert result["campaign"]["definition_version"] is None
@@ -281,6 +321,8 @@ async def test_deterministic_json_shape(monkeypatch: pytest.MonkeyPatch) -> None
             "paper_account",
             "live_trading_profile",
             "live_trading_profile_candidates",
+            "exchange_connection",
+            "exchange_connection_candidates",
             "fields",
         }
         assert set(first["fields"].keys()) == {
@@ -291,6 +333,9 @@ async def test_deterministic_json_shape(monkeypatch: pytest.MonkeyPatch) -> None
             "paper_account_asset_class",
             "paper_account_is_active",
             "live_trading_profile_id",
+            "exchange_connection_id",
+            "exchange_provider",
+            "exchange_environment",
         }
         for field_payload in first["fields"].values():
             assert set(field_payload.keys()) == {"classification", "value", "source", "notes"}
@@ -604,5 +649,239 @@ async def test_executable_remains_false_with_stage2_data_resolved(monkeypatch: p
         result = await service.mandate_bootstrap_export(capital_campaign_id=2)
 
         assert result["fields"]["live_trading_profile_id"]["classification"] == "DATABASE_DERIVED"
+        assert result["executable"] is False
+        assert result["overall_status"] == "BLOCKED"
+
+
+# ---------------------------------------------------------------------------
+# Stage 3 (exchange connection resolution)
+# ---------------------------------------------------------------------------
+
+
+async def _seed_resolved_chain(db: AsyncSession, *, campaign_id: int = 2, exchange: str = "kraken_spot") -> tuple[CapitalCampaign, PaperAccount, LiveTradingProfile]:
+    """Seeds a campaign whose paper account and live trading profile both resolve
+    uniquely -- the precondition Stage 3 requires before it will even attempt exchange
+    connection resolution."""
+    paper_account = await _seed_paper_account(db)
+    campaign = await _seed_campaign(db, id=campaign_id, paper_account_id=paper_account.id, exchange=exchange)
+    profile = await _seed_live_trading_profile(db, paper_account_id=paper_account.id)
+    return campaign, paper_account, profile
+
+
+@pytest.mark.asyncio
+async def test_zero_exchange_connections(monkeypatch: pytest.MonkeyPatch) -> None:
+    async with real_sqlite_session(_TABLES) as db:
+        monkeypatch.setattr(service, "AsyncSessionLocal", lambda: _SessionContext(db))
+        await _seed_resolved_chain(db)
+
+        result = await service.mandate_bootstrap_export(capital_campaign_id=2)
+
+        assert result["fields"]["exchange_provider"] == {
+            "classification": "DATABASE_DERIVED",
+            "value": "kraken_spot",
+            "source": "capital_campaigns.exchange (parsed)",
+            "notes": None,
+        }
+        assert result["fields"]["exchange_environment"]["value"] == "production"
+        assert result["fields"]["exchange_connection_id"]["classification"] == "MISSING"
+        assert result["fields"]["exchange_connection_id"]["value"] is None
+        assert result["exchange_connection"] is None
+        assert result["exchange_connection_candidates"] == []
+
+
+@pytest.mark.asyncio
+async def test_exchange_connection_not_attempted_without_unique_live_profile(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A matching exchange_connections row must still be ignored if the live trading
+    profile itself did not resolve uniquely -- proves the resolution is gated on the
+    live trading profile, not just on the parsed provider/environment."""
+    async with real_sqlite_session(_TABLES) as db:
+        monkeypatch.setattr(service, "AsyncSessionLocal", lambda: _SessionContext(db))
+        paper_account = await _seed_paper_account(db)
+        await _seed_campaign(db, paper_account_id=paper_account.id, exchange="kraken_spot")
+        # Zero live trading profiles -> live_trading_profile_id is MISSING, not resolved.
+        await _seed_exchange_connection(db, provider="kraken_spot", environment="production")
+
+        result = await service.mandate_bootstrap_export(capital_campaign_id=2)
+
+        assert result["fields"]["live_trading_profile_id"]["classification"] == "MISSING"
+        assert result["fields"]["exchange_connection_id"]["classification"] == "MISSING"
+        assert "live_trading_profile_id is not uniquely resolved" in result["fields"]["exchange_connection_id"]["notes"]
+        assert result["exchange_connection"] is None
+        assert result["exchange_connection_candidates"] == []
+
+
+@pytest.mark.asyncio
+async def test_exactly_one_exchange_connection(monkeypatch: pytest.MonkeyPatch) -> None:
+    async with real_sqlite_session(_TABLES) as db:
+        monkeypatch.setattr(service, "AsyncSessionLocal", lambda: _SessionContext(db))
+        await _seed_resolved_chain(db)
+        connection = await _seed_exchange_connection(
+            db, provider="kraken_spot", environment="production", status="connected", credentials_valid=True, api_permissions=["trade", "view"]
+        )
+        # A same-provider, different-environment row must never match (never infer by provider alone).
+        await _seed_exchange_connection(db, provider="kraken_spot", environment="sandbox")
+        # A different-provider row at the same environment must never match either.
+        await _seed_exchange_connection(db, provider="coinbase_advanced", environment="production")
+
+        result = await service.mandate_bootstrap_export(capital_campaign_id=2)
+
+        assert result["fields"]["exchange_connection_id"] == {
+            "classification": "DATABASE_DERIVED",
+            "value": str(connection.exchange_connection_id),
+            "source": "exchange_connections WHERE provider = ? AND environment = ?",
+            "notes": None,
+        }
+        assert result["exchange_connection"] == {
+            "found": True,
+            "id": str(connection.exchange_connection_id),
+            "provider": "kraken_spot",
+            "environment": "production",
+            "connection_status": "connected",
+            "authentication_state": True,
+            "capability_profile": ["trade", "view"],
+            "trading_enabled": None,
+            "withdrawals_enabled": None,
+            "supports_market_orders": None,
+            "supports_limit_orders": None,
+            "notes": service._MANDATE_BOOTSTRAP_EXPORT_CAPABILITY_FLAGS_NOTES,
+        }
+        assert result["exchange_connection_candidates"] == [
+            {
+                "id": str(connection.exchange_connection_id),
+                "provider": "kraken_spot",
+                "environment": "production",
+                "connection_status": "connected",
+            }
+        ]
+
+
+@pytest.mark.asyncio
+async def test_conflicting_exchange_connections_fail_closed(monkeypatch: pytest.MonkeyPatch) -> None:
+    async with real_sqlite_session(_TABLES) as db:
+        monkeypatch.setattr(service, "AsyncSessionLocal", lambda: _SessionContext(db))
+        await _seed_resolved_chain(db)
+        connection_a = await _seed_exchange_connection(db, provider="kraken_spot", environment="production")
+        connection_b = await _seed_exchange_connection(db, provider="kraken_spot", environment="production")
+
+        result = await service.mandate_bootstrap_export(capital_campaign_id=2)
+
+        assert result["fields"]["exchange_connection_id"]["classification"] == "CONFLICTING"
+        assert result["fields"]["exchange_connection_id"]["value"] is None
+        assert "2 exchange_connections rows" in result["fields"]["exchange_connection_id"]["notes"]
+        assert result["exchange_connection"] is None
+
+        expected_ids = sorted([str(connection_a.exchange_connection_id), str(connection_b.exchange_connection_id)])
+        actual_ids = sorted(candidate["id"] for candidate in result["exchange_connection_candidates"])
+        assert actual_ids == expected_ids
+        assert len(result["exchange_connection_candidates"]) == 2
+
+
+@pytest.mark.asyncio
+async def test_deterministic_exchange_connection_candidate_ordering(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Candidate order must be a stable function of primary key, not creation order or
+    'newest first' -- proven by seeding in reverse-id order and asserting stable output."""
+    async with real_sqlite_session(_TABLES) as db:
+        monkeypatch.setattr(service, "AsyncSessionLocal", lambda: _SessionContext(db))
+        await _seed_resolved_chain(db)
+
+        low_id = uuid.UUID("00000000-0000-0000-0000-000000000001")
+        high_id = uuid.UUID("ffffffff-ffff-ffff-ffff-fffffffffffe")
+        # Seed the higher id first so "creation order" and "id order" disagree.
+        await _seed_exchange_connection(db, exchange_connection_id=high_id, provider="kraken_spot", environment="production")
+        await _seed_exchange_connection(db, exchange_connection_id=low_id, provider="kraken_spot", environment="production")
+
+        first = await service.mandate_bootstrap_export(capital_campaign_id=2)
+        second = await service.mandate_bootstrap_export(capital_campaign_id=2)
+
+        candidate_ids_first = [c["id"] for c in first["exchange_connection_candidates"]]
+        candidate_ids_second = [c["id"] for c in second["exchange_connection_candidates"]]
+        assert candidate_ids_first == candidate_ids_second
+        assert candidate_ids_first == sorted(candidate_ids_first)
+
+
+@pytest.mark.asyncio
+async def test_exchange_connection_output_is_secret_safe(monkeypatch: pytest.MonkeyPatch) -> None:
+    async with real_sqlite_session(_TABLES) as db:
+        monkeypatch.setattr(service, "AsyncSessionLocal", lambda: _SessionContext(db))
+        await _seed_resolved_chain(db)
+        await _seed_exchange_connection(
+            db,
+            provider="kraken_spot",
+            environment="production",
+            credentials_encrypted="TOP-SECRET-ENCRYPTED-BLOB",
+            api_key_masked="sk-live-abcdef",
+            api_secret_masked="secret-xyz",
+            passphrase_configured=True,
+        )
+        # A conflicting second connection too, to cover the candidate-listing path.
+        other_paper_account = await _seed_paper_account(db)
+        await _seed_campaign(db, id=3, paper_account_id=other_paper_account.id, exchange="coinbase_advanced_sandbox")
+        await _seed_live_trading_profile(db, paper_account_id=other_paper_account.id)
+        await _seed_exchange_connection(
+            db,
+            provider="coinbase_advanced",
+            environment="sandbox",
+            credentials_encrypted="ANOTHER-SECRET",
+            api_key_masked="sk-live-999",
+            api_secret_masked="secret-999",
+        )
+        await _seed_exchange_connection(
+            db,
+            provider="coinbase_advanced",
+            environment="sandbox",
+            credentials_encrypted="YET-ANOTHER-SECRET",
+            api_key_masked="sk-live-000",
+            api_secret_masked="secret-000",
+        )
+
+        result_unique = await service.mandate_bootstrap_export(capital_campaign_id=2)
+        result_conflicting = await service.mandate_bootstrap_export(capital_campaign_id=3)
+
+        _assert_no_forbidden_keys(result_unique)
+        _assert_no_forbidden_keys(result_conflicting)
+
+        for payload in (result_unique, result_conflicting):
+            serialized = repr(payload)
+            assert "TOP-SECRET-ENCRYPTED-BLOB" not in serialized
+            assert "sk-live-abcdef" not in serialized
+            assert "secret-xyz" not in serialized
+            assert "ANOTHER-SECRET" not in serialized
+            assert "YET-ANOTHER-SECRET" not in serialized
+            assert "sk-live-999" not in serialized
+            assert "sk-live-000" not in serialized
+
+
+@pytest.mark.asyncio
+async def test_no_database_mutation_occurs_stage3(monkeypatch: pytest.MonkeyPatch) -> None:
+    async with real_sqlite_session(_TABLES) as db:
+        await _seed_resolved_chain(db)
+        connection = await _seed_exchange_connection(db, provider="kraken_spot", environment="production")
+
+        monkeypatch.setattr(service, "AsyncSessionLocal", lambda: _SessionContext(db))
+
+        def _forbid(*args: Any, **kwargs: Any) -> Any:
+            raise AssertionError("mandate_bootstrap_export must never mutate the database")
+
+        monkeypatch.setattr(db, "add", _forbid)
+        monkeypatch.setattr(db, "commit", _forbid)
+        monkeypatch.setattr(db, "flush", _forbid)
+        monkeypatch.setattr(db, "delete", _forbid)
+
+        result = await service.mandate_bootstrap_export(capital_campaign_id=2)
+
+        assert result["fields"]["exchange_connection_id"]["classification"] == "DATABASE_DERIVED"
+        assert result["fields"]["exchange_connection_id"]["value"] == str(connection.exchange_connection_id)
+
+
+@pytest.mark.asyncio
+async def test_executable_remains_false_with_stage3_data_resolved(monkeypatch: pytest.MonkeyPatch) -> None:
+    async with real_sqlite_session(_TABLES) as db:
+        monkeypatch.setattr(service, "AsyncSessionLocal", lambda: _SessionContext(db))
+        await _seed_resolved_chain(db)
+        await _seed_exchange_connection(db, provider="kraken_spot", environment="production")
+
+        result = await service.mandate_bootstrap_export(capital_campaign_id=2)
+
+        assert result["fields"]["exchange_connection_id"]["classification"] == "DATABASE_DERIVED"
         assert result["executable"] is False
         assert result["overall_status"] == "BLOCKED"

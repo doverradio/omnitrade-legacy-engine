@@ -855,21 +855,25 @@ def _build_parser() -> argparse.ArgumentParser:
     mandate_bootstrap_export_parser = subparsers.add_parser(
         "mandate-bootstrap-export",
         parents=[common],
-        help="Read-only export of authoritative mandate-bootstrap inputs for one capital campaign (Stages 1-2: campaign, definition, paper account, live trading profile)",
+        help="Read-only export of authoritative mandate-bootstrap inputs for one capital campaign (Stages 1-3: campaign, definition, paper account, live trading profile, exchange connection)",
         description=(
-            "Stages 1-2 of the read-only mandate-bootstrap export design. Resolves "
+            "Stages 1-3 of the read-only mandate-bootstrap export design. Resolves "
             "CapitalCampaign identity, (if pinned) CapitalCampaignDefinition evidence, the "
-            "campaign's PaperAccount, and LiveTradingProfile candidates strictly scoped to "
-            "LiveTradingProfile.paper_account_id == CapitalCampaign.paper_account_id, for "
-            "one --capital-campaign-id. Performs no writes -- no lifecycle action, no "
+            "campaign's PaperAccount, LiveTradingProfile candidates strictly scoped to "
+            "LiveTradingProfile.paper_account_id == CapitalCampaign.paper_account_id, and "
+            "ExchangeConnection candidates resolved from the campaign's own exchange label "
+            "(provider+environment together, never provider alone) gated on the live "
+            "trading profile having already resolved uniquely, for one "
+            "--capital-campaign-id. Performs no writes -- no lifecycle action, no "
             "authorization, no mandate creation. Every field is classified as "
             "DATABASE_DERIVED, CONFIGURATION_DERIVED, OWNER_INPUT_REQUIRED, MISSING, or "
             "CONFLICTING; this stage classifies capital_campaign_id, campaign_uuid, "
             "paper_account_id, base_currency, paper_account_asset_class, "
-            "paper_account_is_active, and live_trading_profile_id. Never reuses another "
-            "campaign's, another mandate's, or a conversational value; multiple candidate "
-            "live trading profiles fail closed as CONFLICTING rather than picking the "
-            "newest. Always reports executable=false and overall_status=BLOCKED."
+            "paper_account_is_active, live_trading_profile_id, exchange_connection_id, "
+            "exchange_provider, and exchange_environment. Never reuses another campaign's, "
+            "another mandate's, or a conversational value; multiple candidate live trading "
+            "profiles or exchange connections fail closed as CONFLICTING rather than "
+            "picking the newest. Always reports executable=false and overall_status=BLOCKED."
         ),
     )
     mandate_bootstrap_export_parser.add_argument("--capital-campaign-id", type=int, required=True)

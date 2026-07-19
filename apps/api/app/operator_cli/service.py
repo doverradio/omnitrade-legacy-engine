@@ -948,6 +948,43 @@ _MANDATE_BOOTSTRAP_EXPORT_LIVE_PROFILE_GOVERNANCE_FIELDS = (
 )
 
 
+_KNOWN_EXCHANGE_PROVIDERS = ("coinbase_advanced", "kraken_spot")
+
+_MANDATE_BOOTSTRAP_EXPORT_CAPABILITY_FLAGS_NOTES = (
+    "trading_enabled/withdrawals_enabled/supports_market_orders/supports_limit_orders are "
+    "not derivable from the current exchange_connections schema -- no column or documented "
+    "mapping from api_permissions exists for these flags. Reported null rather than guessed."
+)
+
+
+def _parse_exchange_label(label: str | None) -> tuple[str | None, str | None]:
+    """Deterministic inverse of canonical_campaign_binding._exchange_label(): "{provider}"
+    for production, "{provider}_sandbox" for sandbox. Returns (None, None) if the label is
+    absent or does not match this exact, known format -- never guesses at what an
+    unrecognized label might mean."""
+    if not label:
+        return None, None
+    normalized = label.strip().lower()
+    if normalized.endswith("_sandbox"):
+        provider, environment = normalized[: -len("_sandbox")], "sandbox"
+    else:
+        provider, environment = normalized, "production"
+    if provider not in _KNOWN_EXCHANGE_PROVIDERS:
+        return None, None
+    return provider, environment
+
+
+def _exchange_connection_candidate_summary(connection: ExchangeConnection) -> dict[str, Any]:
+    """Secret-safe summary for candidate listing -- never api keys, secrets, passphrases,
+    signatures, tokens, or balances."""
+    return {
+        "id": str(connection.exchange_connection_id),
+        "provider": connection.provider,
+        "environment": connection.environment,
+        "connection_status": connection.status,
+    }
+
+
 def _live_trading_profile_candidate_summary(profile: LiveTradingProfile) -> dict[str, Any]:
     """Secret-safe summary for candidate listing -- LiveTradingProfile has no
     secret-bearing columns, but this stays deliberately narrower than the full
@@ -961,17 +998,19 @@ def _live_trading_profile_candidate_summary(profile: LiveTradingProfile) -> dict
 
 
 async def mandate_bootstrap_export(*, capital_campaign_id: int) -> dict[str, Any]:
-    """Stages 1-2 of the read-only mandate-bootstrap export design: resolves
+    """Stages 1-3 of the read-only mandate-bootstrap export design: resolves
     CapitalCampaign identity, (if pinned) CapitalCampaignDefinition evidence, the
-    campaign's PaperAccount, and LiveTradingProfile candidates strictly scoped to
-    LiveTradingProfile.paper_account_id == CapitalCampaign.paper_account_id, for one
-    capital_campaign_id. Performs SELECT statements only -- no db.add, flush, or commit,
-    no lifecycle action, no authorization, no mandate creation. Never reuses another
-    mandate's, another campaign's, or a conversational value -- every field is either
-    read fresh from this campaign's own records or explicitly marked unresolved.
-    exchange_connection_id, provider/environment, and strategy resolution are out of
-    scope for this stage -- see the approved read-only mandate-bootstrap export design
-    for the full field set."""
+    campaign's PaperAccount, LiveTradingProfile candidates strictly scoped to
+    LiveTradingProfile.paper_account_id == CapitalCampaign.paper_account_id, and
+    ExchangeConnection candidates resolved from the campaign's own exchange label
+    (provider+environment together, never provider alone) gated on the live trading
+    profile having already resolved uniquely, for one capital_campaign_id. Performs
+    SELECT statements only -- no db.add, flush, or commit, no lifecycle action, no
+    authorization, no mandate creation. Never reuses another mandate's, another
+    campaign's, or a conversational value -- every field is either read fresh from this
+    campaign's own records or explicitly marked unresolved. Strategy resolution is out
+    of scope for this stage -- see the approved read-only mandate-bootstrap export
+    design for the full field set."""
     async with AsyncSessionLocal() as db:
         campaign = await db.get(CapitalCampaign, capital_campaign_id)
 
@@ -986,6 +1025,8 @@ async def mandate_bootstrap_export(*, capital_campaign_id: int) -> dict[str, Any
                 "paper_account": None,
                 "live_trading_profile": None,
                 "live_trading_profile_candidates": [],
+                "exchange_connection": None,
+                "exchange_connection_candidates": [],
                 "fields": {
                     "capital_campaign_id": {
                         "classification": "MISSING",
@@ -1027,6 +1068,24 @@ async def mandate_bootstrap_export(*, capital_campaign_id: int) -> dict[str, Any
                         "classification": "MISSING",
                         "value": None,
                         "source": "live_trading_profiles.id WHERE paper_account_id = capital_campaigns.paper_account_id",
+                        "notes": "Campaign not found.",
+                    },
+                    "exchange_connection_id": {
+                        "classification": "MISSING",
+                        "value": None,
+                        "source": "exchange_connections WHERE provider = ? AND environment = ?",
+                        "notes": "Campaign not found.",
+                    },
+                    "exchange_provider": {
+                        "classification": "MISSING",
+                        "value": None,
+                        "source": "capital_campaigns.exchange (parsed)",
+                        "notes": "Campaign not found.",
+                    },
+                    "exchange_environment": {
+                        "classification": "MISSING",
+                        "value": None,
+                        "source": "capital_campaigns.exchange (parsed)",
                         "notes": "Campaign not found.",
                     },
                 },
@@ -1196,6 +1255,114 @@ async def mandate_bootstrap_export(*, capital_campaign_id: int) -> dict[str, Any
                     "notes": f"{len(candidate_rows)} live_trading_profiles rows share this campaign's paper_account_id; cannot resolve unambiguously.",
                 }
 
+        # Exchange connection: resolved from the campaign's own raw exchange label
+        # (provider AND environment together, via the exact deterministic inverse of
+        # canonical_campaign_binding._exchange_label -- never provider alone), and gated
+        # on the live trading profile having already resolved uniquely. If the profile is
+        # MISSING or CONFLICTING, exchange-connection resolution is not attempted at all:
+        # resolving it from the label in isolation would mean trusting that label without
+        # the corroborating live-trading identity this stage requires.
+        exchange_connection_payload: dict[str, Any] | None = None
+        exchange_connection_candidates: list[dict[str, Any]] = []
+        parsed_provider, parsed_environment = _parse_exchange_label(campaign.exchange)
+
+        if parsed_provider is None:
+            exchange_provider_field = {
+                "classification": "MISSING",
+                "value": None,
+                "source": "capital_campaigns.exchange (parsed)",
+                "notes": "capital_campaigns.exchange is unset or does not match the known {provider}/{provider}_sandbox label format.",
+            }
+            exchange_environment_field = {
+                "classification": "MISSING",
+                "value": None,
+                "source": "capital_campaigns.exchange (parsed)",
+                "notes": "capital_campaigns.exchange is unset or does not match the known {provider}/{provider}_sandbox label format.",
+            }
+        else:
+            exchange_provider_field = {
+                "classification": "DATABASE_DERIVED",
+                "value": parsed_provider,
+                "source": "capital_campaigns.exchange (parsed)",
+                "notes": None,
+            }
+            exchange_environment_field = {
+                "classification": "DATABASE_DERIVED",
+                "value": parsed_environment,
+                "source": "capital_campaigns.exchange (parsed)",
+                "notes": None,
+            }
+
+        live_profile_uniquely_resolved = live_trading_profile_id_field["classification"] == "DATABASE_DERIVED"
+
+        if parsed_provider is None or not live_profile_uniquely_resolved:
+            exchange_connection_id_field = {
+                "classification": "MISSING",
+                "value": None,
+                "source": "exchange_connections WHERE provider = ? AND environment = ?",
+                "notes": (
+                    "Exchange connection resolution requires both a parseable capital_campaigns.exchange "
+                    "label and a uniquely resolved live_trading_profile_id; "
+                    + (
+                        "the exchange label did not parse."
+                        if parsed_provider is None
+                        else "live_trading_profile_id is not uniquely resolved."
+                    )
+                ),
+            }
+        else:
+            connection_rows = list(
+                (
+                    await db.scalars(
+                        select(ExchangeConnection)
+                        .where(ExchangeConnection.provider == parsed_provider)
+                        .where(ExchangeConnection.environment == parsed_environment)
+                        .order_by(ExchangeConnection.exchange_connection_id)
+                    )
+                )
+            )
+            exchange_connection_candidates = [_exchange_connection_candidate_summary(row) for row in connection_rows]
+
+            if len(connection_rows) == 0:
+                exchange_connection_id_field = {
+                    "classification": "MISSING",
+                    "value": None,
+                    "source": "exchange_connections WHERE provider = ? AND environment = ?",
+                    "notes": "No exchange_connections row matches this campaign's parsed provider/environment.",
+                }
+            elif len(connection_rows) == 1:
+                connection = connection_rows[0]
+                # Secret-safe only: never credentials_encrypted, api_key_masked,
+                # api_secret_masked, passphrase_configured, balances, total_equity_usd,
+                # account_status, or last_api_error.
+                exchange_connection_payload = {
+                    "found": True,
+                    "id": str(connection.exchange_connection_id),
+                    "provider": connection.provider,
+                    "environment": connection.environment,
+                    "connection_status": connection.status,
+                    "authentication_state": bool(connection.credentials_valid),
+                    "capability_profile": list(connection.api_permissions),
+                    "trading_enabled": None,
+                    "withdrawals_enabled": None,
+                    "supports_market_orders": None,
+                    "supports_limit_orders": None,
+                    "notes": _MANDATE_BOOTSTRAP_EXPORT_CAPABILITY_FLAGS_NOTES,
+                }
+                exchange_connection_id_field = {
+                    "classification": "DATABASE_DERIVED",
+                    "value": str(connection.exchange_connection_id),
+                    "source": "exchange_connections WHERE provider = ? AND environment = ?",
+                    "notes": None,
+                }
+            else:
+                exchange_connection_id_field = {
+                    "classification": "CONFLICTING",
+                    "value": None,
+                    "source": "exchange_connections WHERE provider = ? AND environment = ?",
+                    "notes": f"{len(connection_rows)} exchange_connections rows match provider={parsed_provider!r} environment={parsed_environment!r}; cannot resolve unambiguously.",
+                }
+
         return {
             "capital_campaign_id": capital_campaign_id,
             "resolved_at": datetime.now(timezone.utc).isoformat(),
@@ -1218,6 +1385,8 @@ async def mandate_bootstrap_export(*, capital_campaign_id: int) -> dict[str, Any
             "paper_account": paper_account_payload,
             "live_trading_profile": live_trading_profile_payload,
             "live_trading_profile_candidates": live_trading_profile_candidates,
+            "exchange_connection": exchange_connection_payload,
+            "exchange_connection_candidates": exchange_connection_candidates,
             "fields": {
                 "capital_campaign_id": {
                     "classification": "DATABASE_DERIVED",
@@ -1250,6 +1419,9 @@ async def mandate_bootstrap_export(*, capital_campaign_id: int) -> dict[str, Any
                 "paper_account_asset_class": paper_account_asset_class_field,
                 "paper_account_is_active": paper_account_is_active_field,
                 "live_trading_profile_id": live_trading_profile_id_field,
+                "exchange_connection_id": exchange_connection_id_field,
+                "exchange_provider": exchange_provider_field,
+                "exchange_environment": exchange_environment_field,
             },
         }
 
