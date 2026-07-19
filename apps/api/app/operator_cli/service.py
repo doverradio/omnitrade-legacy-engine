@@ -1063,8 +1063,266 @@ def _live_trading_profile_candidate_summary(profile: LiveTradingProfile) -> dict
     }
 
 
+# Stage 5: the remaining mandate-bootstrap owner-input manifest. Every one of these
+# fields is a genuine mandate_bootstrap()/CLI parameter (apps/api/app/operator_cli/
+# main.py's mandate-bootstrap subparser, cross-checked against mandate_bootstrap()'s
+# own signature) that Stages 1-4 do not already resolve. None of them varies with
+# campaign state -- they are fixed properties of the mandate-bootstrap contract itself,
+# not this specific campaign -- so this is a single static manifest reused unchanged
+# whether the campaign is found or not (per-call copies are made via
+# _static_mandate_input_fields() so no caller can mutate the shared constant).
+#
+# capital_campaign_id, campaign_uuid, paper_account_id, base_currency,
+# paper_account_asset_class, paper_account_is_active, live_trading_profile_id,
+# exchange_connection_id, exchange_provider, exchange_environment, and
+# allowed_strategy_versions are already covered by Stages 1-4 and are deliberately not
+# duplicated here -- mandate_bootstrap()'s own paper_account_id/exchange_connection_id/
+# live_trading_profile_id/provider/environment/base_currency parameters are exactly the
+# values those existing fields already resolve.
+_MANDATE_BOOTSTRAP_EXPORT_STATIC_MANDATE_FIELDS: dict[str, dict[str, Any]] = {
+    "owner_actor_id": {
+        "classification": "OWNER_INPUT_REQUIRED",
+        "value": None,
+        "source": None,
+        "notes": "No table stores an actor identity equivalent to mandate owner_actor_id for this campaign; must be supplied by the owner.",
+    },
+    "autonomy_level": {
+        "classification": "OWNER_INPUT_REQUIRED",
+        "value": None,
+        "source": None,
+        "notes": "autonomy_level is stored only on AutonomousCapitalMandate/AutonomousCapitalMandateEvaluation rows, never per-campaign or per-owner -- there is no prior mandate to read it from for a first bootstrap.",
+    },
+    "authorized_capital_usd": {
+        "classification": "OWNER_INPUT_REQUIRED",
+        "value": None,
+        "source": None,
+        "notes": "No campaign-scoped USD-notional capital limit exists outside AutonomousCapitalMandateVersion rows themselves; capital_campaign_definitions' own limits use different units/semantics and are not substitutable.",
+    },
+    "max_order_notional_usd": {
+        "classification": "OWNER_INPUT_REQUIRED",
+        "value": None,
+        "source": None,
+        "notes": "No authoritative USD-notional order limit exists anywhere outside mandate version rows themselves.",
+    },
+    "max_open_exposure_usd": {
+        "classification": "OWNER_INPUT_REQUIRED",
+        "value": None,
+        "source": None,
+        "notes": "No authoritative USD-notional exposure limit exists anywhere outside mandate version rows themselves.",
+    },
+    "max_daily_deployed_usd": {
+        "classification": "OWNER_INPUT_REQUIRED",
+        "value": None,
+        "source": None,
+        "notes": "No authoritative USD-notional daily-deployment limit exists anywhere outside mandate version rows themselves.",
+    },
+    "max_daily_realized_loss_usd": {
+        "classification": "OWNER_INPUT_REQUIRED",
+        "value": None,
+        "source": None,
+        "notes": "No authoritative USD-notional daily-loss limit exists anywhere outside mandate version rows themselves.",
+    },
+    "max_campaign_drawdown_usd": {
+        "classification": "OWNER_INPUT_REQUIRED",
+        "value": None,
+        "source": None,
+        "notes": "capital_campaign_definitions.maximum_drawdown is a related but not substitutable value (different unit/semantics, no existing coercion); no authoritative USD-notional mandate drawdown limit exists elsewhere.",
+    },
+    "max_consecutive_losses": {
+        "classification": "OWNER_INPUT_REQUIRED",
+        "value": None,
+        "source": None,
+        "notes": "No authoritative source exists; this is a mandate-specific risk limit decided by the owner.",
+    },
+    "position_limit": {
+        "classification": "OWNER_INPUT_REQUIRED",
+        "value": None,
+        "source": None,
+        "notes": "No authoritative source exists; this is a mandate-specific risk limit decided by the owner.",
+    },
+    "price_evidence_max_age_seconds": {
+        "classification": "OWNER_INPUT_REQUIRED",
+        "value": None,
+        "source": None,
+        "notes": "The CLI has no default and requires this explicitly. Similarly-named app-config settings (e.g. live_crypto_price_max_age_seconds) exist for unrelated dry-run/preview paths and are not wired to this field -- they must not be treated as its source.",
+    },
+    "max_slippage_bps": {
+        "classification": "OWNER_INPUT_REQUIRED",
+        "value": None,
+        "source": None,
+        "notes": "No authoritative source exists; this is a mandate-specific risk limit decided by the owner.",
+    },
+    "max_fee_bps": {
+        "classification": "OWNER_INPUT_REQUIRED",
+        "value": None,
+        "source": None,
+        "notes": "No authoritative source exists; this is a mandate-specific risk limit decided by the owner.",
+    },
+    "allowed_products": {
+        "classification": "OWNER_INPUT_REQUIRED",
+        "value": None,
+        "source": None,
+        "notes": "capital_campaign_definitions.allowed_instruments/allowed_asset_classes use a different taxonomy (asset-class/venue/instrument vs. exact product IDs like BTC-USD) with no existing mapping -- not substitutable.",
+    },
+    "allowed_order_sides": {
+        "classification": "OWNER_INPUT_REQUIRED",
+        "value": None,
+        "source": None,
+        "notes": "No model represents this concept at all; must be supplied by the owner.",
+    },
+    "approval_policy": {
+        "classification": "OWNER_INPUT_REQUIRED",
+        "value": None,
+        "source": None,
+        "notes": "No deterministic derivation exists (it is a policy choice, not a mechanical function of autonomy_level -- a LEVEL_2 mandate may still deliberately choose HUMAN_REQUIRED).",
+    },
+    "entry_policy": {
+        "classification": "OWNER_INPUT_REQUIRED",
+        "value": None,
+        "source": None,
+        "notes": "No schema field holds this; must be supplied by the owner as part of --policy-bundle-json.",
+    },
+    "exit_policy": {
+        "classification": "OWNER_INPUT_REQUIRED",
+        "value": None,
+        "source": None,
+        "notes": "No schema field holds this; must be supplied by the owner as part of --policy-bundle-json.",
+    },
+    "cooldown_policy": {
+        "classification": "OWNER_INPUT_REQUIRED",
+        "value": None,
+        "source": None,
+        "notes": "No schema field holds this; must be supplied by the owner as part of --policy-bundle-json.",
+    },
+    "operating_schedule": {
+        "classification": "OWNER_INPUT_REQUIRED",
+        "value": None,
+        "source": None,
+        "notes": "No schema field holds this; must be supplied by the owner as part of --policy-bundle-json.",
+    },
+    "reconciliation_policy": {
+        "classification": "OWNER_INPUT_REQUIRED",
+        "value": None,
+        "source": None,
+        "notes": "No schema field holds this; must be supplied by the owner as part of --policy-bundle-json.",
+    },
+    "kill_switch_policy": {
+        "classification": "OWNER_INPUT_REQUIRED",
+        "value": None,
+        "source": None,
+        "notes": "No schema field holds this; must be supplied by the owner as part of --policy-bundle-json.",
+    },
+    "owner_acknowledgements": {
+        "classification": "OWNER_INPUT_REQUIRED",
+        "value": None,
+        "source": None,
+        "notes": "This is the record of a genuine, fresh authorization act by the owner; no record can supply it in advance.",
+    },
+    "authorization_evidence_summary": {
+        "classification": "OWNER_INPUT_REQUIRED",
+        "value": None,
+        "source": None,
+        "notes": "Genuine authorization evidence for this specific mandate; not derivable from any prior mandate, approval, or campaign record.",
+    },
+    "authorization_evidence": {
+        "classification": "OWNER_INPUT_REQUIRED",
+        "value": None,
+        "source": None,
+        "notes": "Genuine authorization evidence for this specific mandate; not derivable from any prior mandate, approval, or campaign record.",
+    },
+    "deterministic_explanation": {
+        "classification": "OWNER_INPUT_REQUIRED",
+        "value": None,
+        "source": None,
+        "notes": "Genuine authorization evidence for this specific mandate; not derivable from any prior mandate, approval, or campaign record.",
+    },
+    "authorization_method": {
+        "classification": "OWNER_INPUT_REQUIRED",
+        "value": None,
+        "source": None,
+        "notes": "No authoritative source exists; the owner must state how this authorization was obtained.",
+    },
+    "actor": {
+        "classification": "OWNER_INPUT_REQUIRED",
+        "value": None,
+        "source": None,
+        "notes": (
+            "The CLI offers 'operator:human' as a convenience default matching the "
+            "repository-wide convention used across all operator commands -- it is not a "
+            "resolved identity for this specific mandate and must be confirmed or "
+            "overridden by the actual operator."
+        ),
+    },
+    "reason": {
+        "classification": "OWNER_INPUT_REQUIRED",
+        "value": None,
+        "source": None,
+        "notes": "No authoritative source exists; a free-text operator justification is required.",
+    },
+    "idempotency_key": {
+        "classification": "OWNER_INPUT_REQUIRED",
+        "value": None,
+        "source": None,
+        "notes": "Required by the current mandate-bootstrap CLI contract with no default; the operator must choose this value.",
+    },
+    "confirm": {
+        "classification": "OWNER_INPUT_REQUIRED",
+        "value": None,
+        "source": None,
+        "notes": "A boolean safety gate requiring explicit operator confirmation; mandate_bootstrap() raises PermissionError unless this is affirmatively supplied.",
+    },
+    "audit_correlation_id": {
+        "classification": "RUNTIME_DERIVED",
+        "value": None,
+        "source": None,
+        "notes": (
+            "Dual behavior in the current contract: if --audit-correlation-id is omitted, "
+            "mandate_bootstrap() generates a fresh UUID4 internally at execution time "
+            "(RUNTIME_DERIVED); if explicitly supplied, that exact operator-provided value "
+            "is used instead (operator-supplied). This export does not generate or observe "
+            "a value either way -- it only describes this behavior."
+        ),
+    },
+    "mandate_expires_at": {
+        "classification": "NOT_REQUIRED",
+        "value": None,
+        "source": None,
+        "notes": "Optional in the current contract (CLI default is omitted/None); a mandate created without this simply has no expiration.",
+    },
+    "authorization_expires_at": {
+        "classification": "NOT_REQUIRED",
+        "value": None,
+        "source": None,
+        "notes": "Optional in the current contract (CLI default is omitted/None); an authorization created without this simply has no expiration.",
+    },
+}
+
+
+def _static_mandate_input_fields() -> dict[str, dict[str, Any]]:
+    """Fresh, independently-mutable copies of the Stage 5 static manifest -- never the
+    shared module-level dicts themselves."""
+    return {name: dict(field) for name, field in _MANDATE_BOOTSTRAP_EXPORT_STATIC_MANDATE_FIELDS.items()}
+
+
+def _owner_input_summary(fields: dict[str, dict[str, Any]]) -> dict[str, Any]:
+    """Informational only -- computed purely from the already-assembled fields dict, and
+    never itself affects executable/overall_status. Counts only OWNER_INPUT_REQUIRED
+    fields (DATABASE_DERIVED and NOT_REQUIRED fields are excluded by construction, since
+    neither classification is ever OWNER_INPUT_REQUIRED)."""
+    owner_required = {name: field for name, field in fields.items() if field.get("classification") == "OWNER_INPUT_REQUIRED"}
+    unresolved_fields = sorted(name for name, field in owner_required.items() if field.get("value") is None)
+    total_required = len(owner_required)
+    unresolved_count = len(unresolved_fields)
+    return {
+        "total_required": total_required,
+        "resolved_count": total_required - unresolved_count,
+        "unresolved_count": unresolved_count,
+        "unresolved_fields": unresolved_fields,
+    }
+
+
 async def mandate_bootstrap_export(*, capital_campaign_id: int) -> dict[str, Any]:
-    """Stages 1-4 of the read-only mandate-bootstrap export design: resolves
+    """Stages 1-5 of the read-only mandate-bootstrap export design: resolves
     CapitalCampaign identity, (if pinned) CapitalCampaignDefinition evidence, the
     campaign's PaperAccount, LiveTradingProfile candidates strictly scoped to
     LiveTradingProfile.paper_account_id == CapitalCampaign.paper_account_id,
@@ -1085,11 +1343,84 @@ async def mandate_bootstrap_export(*, capital_campaign_id: int) -> dict[str, Any
     reference, the currently globally-active Strategy row(s), an optional
     capital_campaign_definitions.metadata_evidence hint, and canonical preview package
     continuity evidence for this exact campaign+version -- none of which is ever
-    converted into the allowed_strategy_versions value."""
+    converted into the allowed_strategy_versions value.
+
+    Stage 5 adds the remaining mandate-bootstrap owner-input manifest: every
+    mandate_bootstrap()/CLI parameter Stages 1-4 do not already resolve (risk limits,
+    allowed_products/order_sides, policies, authorization evidence, actor/reason/
+    idempotency_key/confirm, audit_correlation_id, expiry fields). None of these is ever
+    filled from campaign-definition limits, strategy evidence, or any other record --
+    they are always OWNER_INPUT_REQUIRED (or RUNTIME_DERIVED/NOT_REQUIRED where the
+    existing contract genuinely allows it). owner_input_summary is a purely informational
+    tally computed from the fields dict; it never affects executable or overall_status."""
     async with AsyncSessionLocal() as db:
         campaign = await db.get(CapitalCampaign, capital_campaign_id)
 
         if campaign is None:
+            not_found_fields: dict[str, dict[str, Any]] = {
+                "capital_campaign_id": {
+                    "classification": "MISSING",
+                    "value": None,
+                    "source": "capital_campaigns.id",
+                    "notes": "No capital_campaigns row exists for this id.",
+                },
+                "campaign_uuid": {
+                    "classification": "MISSING",
+                    "value": None,
+                    "source": "capital_campaigns.uuid",
+                    "notes": "Campaign not found.",
+                },
+                "paper_account_id": {
+                    "classification": "MISSING",
+                    "value": None,
+                    "source": "capital_campaigns.paper_account_id",
+                    "notes": "Campaign not found.",
+                },
+                "base_currency": {
+                    "classification": "MISSING",
+                    "value": None,
+                    "source": "capital_campaign_definitions.base_currency",
+                    "notes": "Campaign not found.",
+                },
+                "paper_account_asset_class": {
+                    "classification": "MISSING",
+                    "value": None,
+                    "source": "paper_accounts.asset_class",
+                    "notes": "Campaign not found.",
+                },
+                "paper_account_is_active": {
+                    "classification": "MISSING",
+                    "value": None,
+                    "source": "paper_accounts.is_active",
+                    "notes": "Campaign not found.",
+                },
+                "live_trading_profile_id": {
+                    "classification": "MISSING",
+                    "value": None,
+                    "source": "live_trading_profiles.id WHERE paper_account_id = capital_campaigns.paper_account_id",
+                    "notes": "Campaign not found.",
+                },
+                "exchange_connection_id": {
+                    "classification": "MISSING",
+                    "value": None,
+                    "source": "exchange_connections WHERE provider = ? AND environment = ?",
+                    "notes": "Campaign not found.",
+                },
+                "exchange_provider": {
+                    "classification": "MISSING",
+                    "value": None,
+                    "source": "capital_campaigns.exchange (parsed)",
+                    "notes": "Campaign not found.",
+                },
+                "exchange_environment": {
+                    "classification": "MISSING",
+                    "value": None,
+                    "source": "capital_campaigns.exchange (parsed)",
+                    "notes": "Campaign not found.",
+                },
+                "allowed_strategy_versions": dict(_MANDATE_BOOTSTRAP_EXPORT_ALLOWED_STRATEGY_VERSIONS_FIELD),
+                **_static_mandate_input_fields(),
+            }
             return {
                 "capital_campaign_id": capital_campaign_id,
                 "resolved_at": datetime.now(timezone.utc).isoformat(),
@@ -1103,69 +1434,8 @@ async def mandate_bootstrap_export(*, capital_campaign_id: int) -> dict[str, Any
                 "exchange_connection": None,
                 "exchange_connection_candidates": [],
                 "strategy_evidence": None,
-                "fields": {
-                    "capital_campaign_id": {
-                        "classification": "MISSING",
-                        "value": None,
-                        "source": "capital_campaigns.id",
-                        "notes": "No capital_campaigns row exists for this id.",
-                    },
-                    "campaign_uuid": {
-                        "classification": "MISSING",
-                        "value": None,
-                        "source": "capital_campaigns.uuid",
-                        "notes": "Campaign not found.",
-                    },
-                    "paper_account_id": {
-                        "classification": "MISSING",
-                        "value": None,
-                        "source": "capital_campaigns.paper_account_id",
-                        "notes": "Campaign not found.",
-                    },
-                    "base_currency": {
-                        "classification": "MISSING",
-                        "value": None,
-                        "source": "capital_campaign_definitions.base_currency",
-                        "notes": "Campaign not found.",
-                    },
-                    "paper_account_asset_class": {
-                        "classification": "MISSING",
-                        "value": None,
-                        "source": "paper_accounts.asset_class",
-                        "notes": "Campaign not found.",
-                    },
-                    "paper_account_is_active": {
-                        "classification": "MISSING",
-                        "value": None,
-                        "source": "paper_accounts.is_active",
-                        "notes": "Campaign not found.",
-                    },
-                    "live_trading_profile_id": {
-                        "classification": "MISSING",
-                        "value": None,
-                        "source": "live_trading_profiles.id WHERE paper_account_id = capital_campaigns.paper_account_id",
-                        "notes": "Campaign not found.",
-                    },
-                    "exchange_connection_id": {
-                        "classification": "MISSING",
-                        "value": None,
-                        "source": "exchange_connections WHERE provider = ? AND environment = ?",
-                        "notes": "Campaign not found.",
-                    },
-                    "exchange_provider": {
-                        "classification": "MISSING",
-                        "value": None,
-                        "source": "capital_campaigns.exchange (parsed)",
-                        "notes": "Campaign not found.",
-                    },
-                    "exchange_environment": {
-                        "classification": "MISSING",
-                        "value": None,
-                        "source": "capital_campaigns.exchange (parsed)",
-                        "notes": "Campaign not found.",
-                    },
-                    "allowed_strategy_versions": dict(_MANDATE_BOOTSTRAP_EXPORT_ALLOWED_STRATEGY_VERSIONS_FIELD),
-                },
+                "fields": not_found_fields,
+                "owner_input_summary": _owner_input_summary(not_found_fields),
             }
 
         has_definition_pin = campaign.definition_campaign_id is not None and campaign.definition_version is not None
@@ -1541,6 +1811,45 @@ async def mandate_bootstrap_export(*, capital_campaign_id: int) -> dict[str, Any
             "canonical_preview_package_continuity": canonical_preview_package_continuity,
         }
 
+        resolved_fields: dict[str, dict[str, Any]] = {
+            "capital_campaign_id": {
+                "classification": "DATABASE_DERIVED",
+                "value": campaign.id,
+                "source": "capital_campaigns.id",
+                "notes": None,
+            },
+            "campaign_uuid": {
+                "classification": "DATABASE_DERIVED",
+                "value": str(campaign.uuid),
+                "source": "capital_campaigns.uuid",
+                "notes": None,
+            },
+            "paper_account_id": (
+                {
+                    "classification": "DATABASE_DERIVED",
+                    "value": str(campaign.paper_account_id),
+                    "source": "capital_campaigns.paper_account_id",
+                    "notes": None,
+                }
+                if campaign.paper_account_id is not None
+                else {
+                    "classification": "MISSING",
+                    "value": None,
+                    "source": "capital_campaigns.paper_account_id",
+                    "notes": "capital_campaigns.paper_account_id is not set for this campaign.",
+                }
+            ),
+            "base_currency": base_currency_field,
+            "paper_account_asset_class": paper_account_asset_class_field,
+            "paper_account_is_active": paper_account_is_active_field,
+            "live_trading_profile_id": live_trading_profile_id_field,
+            "exchange_connection_id": exchange_connection_id_field,
+            "exchange_provider": exchange_provider_field,
+            "exchange_environment": exchange_environment_field,
+            "allowed_strategy_versions": dict(_MANDATE_BOOTSTRAP_EXPORT_ALLOWED_STRATEGY_VERSIONS_FIELD),
+            **_static_mandate_input_fields(),
+        }
+
         return {
             "capital_campaign_id": capital_campaign_id,
             "resolved_at": datetime.now(timezone.utc).isoformat(),
@@ -1566,43 +1875,8 @@ async def mandate_bootstrap_export(*, capital_campaign_id: int) -> dict[str, Any
             "exchange_connection": exchange_connection_payload,
             "exchange_connection_candidates": exchange_connection_candidates,
             "strategy_evidence": strategy_evidence,
-            "fields": {
-                "capital_campaign_id": {
-                    "classification": "DATABASE_DERIVED",
-                    "value": campaign.id,
-                    "source": "capital_campaigns.id",
-                    "notes": None,
-                },
-                "campaign_uuid": {
-                    "classification": "DATABASE_DERIVED",
-                    "value": str(campaign.uuid),
-                    "source": "capital_campaigns.uuid",
-                    "notes": None,
-                },
-                "paper_account_id": (
-                    {
-                        "classification": "DATABASE_DERIVED",
-                        "value": str(campaign.paper_account_id),
-                        "source": "capital_campaigns.paper_account_id",
-                        "notes": None,
-                    }
-                    if campaign.paper_account_id is not None
-                    else {
-                        "classification": "MISSING",
-                        "value": None,
-                        "source": "capital_campaigns.paper_account_id",
-                        "notes": "capital_campaigns.paper_account_id is not set for this campaign.",
-                    }
-                ),
-                "base_currency": base_currency_field,
-                "paper_account_asset_class": paper_account_asset_class_field,
-                "paper_account_is_active": paper_account_is_active_field,
-                "live_trading_profile_id": live_trading_profile_id_field,
-                "exchange_connection_id": exchange_connection_id_field,
-                "exchange_provider": exchange_provider_field,
-                "exchange_environment": exchange_environment_field,
-                "allowed_strategy_versions": dict(_MANDATE_BOOTSTRAP_EXPORT_ALLOWED_STRATEGY_VERSIONS_FIELD),
-            },
+            "fields": resolved_fields,
+            "owner_input_summary": _owner_input_summary(resolved_fields),
         }
 
 

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import inspect
 import uuid
 from datetime import datetime, timezone
 from decimal import Decimal
@@ -46,6 +47,27 @@ _FORBIDDEN_KEYS = {
     "account_status",
     "last_api_error",
 }
+
+# The Stage 1-4 identity-chain/strategy-evidence fields, kept separate from Stage 5's
+# static owner-input manifest (service._MANDATE_BOOTSTRAP_EXPORT_STATIC_MANDATE_FIELDS)
+# so the expected full field set is assembled the same way the service does, without
+# hardcoding a duplicate list that could silently drift.
+_STAGE_1_TO_4_FIELD_NAMES = {
+    "capital_campaign_id",
+    "campaign_uuid",
+    "paper_account_id",
+    "base_currency",
+    "paper_account_asset_class",
+    "paper_account_is_active",
+    "live_trading_profile_id",
+    "exchange_connection_id",
+    "exchange_provider",
+    "exchange_environment",
+    "allowed_strategy_versions",
+}
+_ALL_MANDATE_BOOTSTRAP_EXPORT_FIELD_NAMES = _STAGE_1_TO_4_FIELD_NAMES | set(
+    service._MANDATE_BOOTSTRAP_EXPORT_STATIC_MANDATE_FIELDS.keys()
+)
 
 
 class _SessionContext:
@@ -279,6 +301,13 @@ async def test_campaign_not_found(monkeypatch: pytest.MonkeyPatch) -> None:
             "source": None,
             "notes": service._MANDATE_BOOTSTRAP_EXPORT_ALLOWED_STRATEGY_VERSIONS_FIELD["notes"],
         }
+        # Campaign-not-found must still produce the complete manifest, per Stage 5 --
+        # the remaining owner-input fields are properties of the mandate-bootstrap
+        # contract itself, independent of whether this specific campaign was found.
+        assert set(result["fields"].keys()) == _ALL_MANDATE_BOOTSTRAP_EXPORT_FIELD_NAMES
+        assert "owner_input_summary" in result
+        assert result["owner_input_summary"]["total_required"] > 0
+        assert result["owner_input_summary"]["unresolved_count"] == result["owner_input_summary"]["total_required"]
 
 
 @pytest.mark.asyncio
@@ -394,29 +423,26 @@ async def test_deterministic_json_shape(monkeypatch: pytest.MonkeyPatch) -> None
             "exchange_connection_candidates",
             "strategy_evidence",
             "fields",
+            "owner_input_summary",
         }
-        assert set(first["fields"].keys()) == {
-            "capital_campaign_id",
-            "campaign_uuid",
-            "paper_account_id",
-            "base_currency",
-            "paper_account_asset_class",
-            "paper_account_is_active",
-            "live_trading_profile_id",
-            "exchange_connection_id",
-            "exchange_provider",
-            "exchange_environment",
-            "allowed_strategy_versions",
-        }
+        assert set(first["fields"].keys()) == _ALL_MANDATE_BOOTSTRAP_EXPORT_FIELD_NAMES
         for field_payload in first["fields"].values():
             assert set(field_payload.keys()) == {"classification", "value", "source", "notes"}
             assert field_payload["classification"] in {
                 "DATABASE_DERIVED",
                 "CONFIGURATION_DERIVED",
                 "OWNER_INPUT_REQUIRED",
+                "RUNTIME_DERIVED",
+                "NOT_REQUIRED",
                 "MISSING",
                 "CONFLICTING",
             }
+        assert set(first["owner_input_summary"].keys()) == {
+            "total_required",
+            "resolved_count",
+            "unresolved_count",
+            "unresolved_fields",
+        }
 
         first_without_timestamp = {k: v for k, v in first.items() if k != "resolved_at"}
         second_without_timestamp = {k: v for k, v in second.items() if k != "resolved_at"}
@@ -1317,6 +1343,276 @@ async def test_deterministic_serialized_output_stage4(monkeypatch: pytest.Monkey
             db, campaign_uuid=campaign.uuid, version=1, metadata_evidence={"strategy_identity": "det@1.0.0"}
         )
         await _seed_canonical_preview_package(db, campaign_id=campaign.uuid, campaign_version=1, strategy_id=active_strategy.id)
+
+        first = await service.mandate_bootstrap_export(capital_campaign_id=2)
+        second = await service.mandate_bootstrap_export(capital_campaign_id=2)
+
+        first_without_timestamp = {k: v for k, v in first.items() if k != "resolved_at"}
+        second_without_timestamp = {k: v for k, v in second.items() if k != "resolved_at"}
+        assert first_without_timestamp == second_without_timestamp
+
+
+# ---------------------------------------------------------------------------
+# Stage 5 (remaining mandate-bootstrap owner-input manifest + owner_input_summary)
+# ---------------------------------------------------------------------------
+
+# mandate_bootstrap()'s own parameter names that differ from this export's field keys
+# (the underlying value is identical -- provider/environment are just named
+# exchange_provider/exchange_environment here, consistent with Stages 1-3).
+_MANDATE_BOOTSTRAP_PARAM_TO_EXPORT_FIELD = {
+    "provider": "exchange_provider",
+    "environment": "exchange_environment",
+}
+
+_GENUINE_OWNER_DECISION_FIELDS = (
+    "owner_actor_id",
+    "autonomy_level",
+    "authorized_capital_usd",
+    "max_order_notional_usd",
+    "max_open_exposure_usd",
+    "max_daily_deployed_usd",
+    "max_daily_realized_loss_usd",
+    "max_campaign_drawdown_usd",
+    "max_consecutive_losses",
+    "position_limit",
+    "price_evidence_max_age_seconds",
+    "max_slippage_bps",
+    "max_fee_bps",
+    "allowed_products",
+    "allowed_order_sides",
+    "allowed_strategy_versions",
+    "approval_policy",
+    "entry_policy",
+    "exit_policy",
+    "cooldown_policy",
+    "operating_schedule",
+    "reconciliation_policy",
+    "kill_switch_policy",
+    "owner_acknowledgements",
+    "authorization_evidence_summary",
+    "authorization_evidence",
+    "deterministic_explanation",
+    "authorization_method",
+    "actor",
+    "reason",
+    "idempotency_key",
+    "confirm",
+)
+
+
+@pytest.mark.asyncio
+async def test_every_mandate_bootstrap_contract_field_appears_in_export(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Cross-checks the live mandate_bootstrap() signature (not a hand-copied list) --
+    fails loudly if the real contract and this export's manifest ever diverge."""
+    async with real_sqlite_session(_TABLES) as db:
+        monkeypatch.setattr(service, "AsyncSessionLocal", lambda: _SessionContext(db))
+        result = await service.mandate_bootstrap_export(capital_campaign_id=999)
+
+        mandate_bootstrap_params = set(inspect.signature(service.mandate_bootstrap).parameters.keys())
+        exported_field_names = set(result["fields"].keys())
+
+        missing = [
+            param
+            for param in mandate_bootstrap_params
+            if _MANDATE_BOOTSTRAP_PARAM_TO_EXPORT_FIELD.get(param, param) not in exported_field_names
+        ]
+        assert missing == [], f"mandate_bootstrap() parameters missing from export fields: {missing}"
+
+
+@pytest.mark.asyncio
+async def test_every_genuine_owner_decision_is_owner_input_required(monkeypatch: pytest.MonkeyPatch) -> None:
+    async with real_sqlite_session(_TABLES) as db:
+        monkeypatch.setattr(service, "AsyncSessionLocal", lambda: _SessionContext(db))
+        result = await service.mandate_bootstrap_export(capital_campaign_id=999)
+
+        for field_name in _GENUINE_OWNER_DECISION_FIELDS:
+            assert result["fields"][field_name]["classification"] == "OWNER_INPUT_REQUIRED", field_name
+            assert result["fields"][field_name]["value"] is None, field_name
+
+
+@pytest.mark.asyncio
+async def test_no_owner_input_silently_filled_from_campaign_definition(monkeypatch: pytest.MonkeyPatch) -> None:
+    async with real_sqlite_session(_TABLES) as db:
+        monkeypatch.setattr(service, "AsyncSessionLocal", lambda: _SessionContext(db))
+        campaign = await _seed_pinned_campaign(db)
+        await _seed_definition(
+            db,
+            campaign_uuid=campaign.uuid,
+            version=1,
+            maximum_position_size=Decimal("999"),
+            maximum_total_exposure=Decimal("888"),
+            maximum_drawdown=Decimal("777"),
+            allowed_instruments=["BTC-USD", "ETH-USD"],
+            allowed_asset_classes=["crypto"],
+        )
+
+        result = await service.mandate_bootstrap_export(capital_campaign_id=2)
+
+        # None of the mandate's own risk-limit/scope fields may pick up the definition's
+        # numbers, no matter how suggestively similar they look.
+        for field_name in (
+            "authorized_capital_usd",
+            "max_order_notional_usd",
+            "max_open_exposure_usd",
+            "max_campaign_drawdown_usd",
+            "allowed_products",
+        ):
+            assert result["fields"][field_name]["classification"] == "OWNER_INPUT_REQUIRED"
+            assert result["fields"][field_name]["value"] is None
+
+
+@pytest.mark.asyncio
+async def test_no_owner_input_silently_filled_from_strategy_evidence(monkeypatch: pytest.MonkeyPatch) -> None:
+    async with real_sqlite_session(_TABLES) as db:
+        monkeypatch.setattr(service, "AsyncSessionLocal", lambda: _SessionContext(db))
+        strategy = await _seed_strategy(db, slug="ma_crossover", module_version="1.0.0", is_active=True)
+        campaign = await _seed_pinned_campaign(db)
+        await _seed_canonical_preview_package(db, campaign_id=campaign.uuid, campaign_version=1, strategy_id=strategy.id, strategy_version="1.0.0")
+
+        result = await service.mandate_bootstrap_export(capital_campaign_id=2)
+
+        assert result["strategy_evidence"]["global_active_strategy"]["items"][0]["canonical_identity"] == "ma_crossover@1.0.0"
+        assert result["strategy_evidence"]["canonical_preview_package_continuity"]["canonical_identity"] == "ma_crossover@1.0.0"
+        assert result["fields"]["allowed_strategy_versions"]["classification"] == "OWNER_INPUT_REQUIRED"
+        assert result["fields"]["allowed_strategy_versions"]["value"] is None
+        assert result["fields"]["approval_policy"]["value"] is None
+
+
+@pytest.mark.asyncio
+async def test_allowed_strategy_versions_remains_null_despite_matching_production_like_evidence(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Reproduces the exact production scenario described for campaign 2: global active
+    strategy AND canonical preview package continuity both agree on ma_crossover@1.0.0.
+    allowed_strategy_versions must still be OWNER_INPUT_REQUIRED / null."""
+    async with real_sqlite_session(_TABLES) as db:
+        monkeypatch.setattr(service, "AsyncSessionLocal", lambda: _SessionContext(db))
+        strategy = await _seed_strategy(db, slug="ma_crossover", module_version="1.0.0", is_active=True)
+        campaign = await _seed_pinned_campaign(db)
+        await _seed_canonical_preview_package(
+            db, campaign_id=campaign.uuid, campaign_version=1, strategy_id=strategy.id, strategy_version="1.0.0"
+        )
+
+        result = await service.mandate_bootstrap_export(capital_campaign_id=2)
+
+        assert result["fields"]["allowed_strategy_versions"] == {
+            "classification": "OWNER_INPUT_REQUIRED",
+            "value": None,
+            "source": None,
+            "notes": service._MANDATE_BOOTSTRAP_EXPORT_ALLOWED_STRATEGY_VERSIONS_FIELD["notes"],
+        }
+
+
+@pytest.mark.asyncio
+async def test_optional_expiration_fields_correct_classification(monkeypatch: pytest.MonkeyPatch) -> None:
+    async with real_sqlite_session(_TABLES) as db:
+        monkeypatch.setattr(service, "AsyncSessionLocal", lambda: _SessionContext(db))
+        result = await service.mandate_bootstrap_export(capital_campaign_id=999)
+
+        for field_name in ("mandate_expires_at", "authorization_expires_at"):
+            assert result["fields"][field_name]["classification"] == "NOT_REQUIRED"
+            assert result["fields"][field_name]["value"] is None
+
+
+@pytest.mark.asyncio
+async def test_audit_correlation_id_dual_behavior_described_without_generating_value(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async with real_sqlite_session(_TABLES) as db:
+        monkeypatch.setattr(service, "AsyncSessionLocal", lambda: _SessionContext(db))
+        result = await service.mandate_bootstrap_export(capital_campaign_id=999)
+
+        field = result["fields"]["audit_correlation_id"]
+        assert field["classification"] == "RUNTIME_DERIVED"
+        assert field["value"] is None
+        assert "omitted" in field["notes"]
+        assert "uuid4" in field["notes"].lower() or "UUID4" in field["notes"]
+        assert "explicitly supplied" in field["notes"]
+
+
+@pytest.mark.asyncio
+async def test_owner_input_summary_counts_correct(monkeypatch: pytest.MonkeyPatch) -> None:
+    async with real_sqlite_session(_TABLES) as db:
+        monkeypatch.setattr(service, "AsyncSessionLocal", lambda: _SessionContext(db))
+        result = await service.mandate_bootstrap_export(capital_campaign_id=999)
+
+        owner_required_field_names = {
+            name for name, field in result["fields"].items() if field["classification"] == "OWNER_INPUT_REQUIRED"
+        }
+        summary = result["owner_input_summary"]
+        assert summary["total_required"] == len(owner_required_field_names) == 32
+        assert summary["unresolved_count"] == len(owner_required_field_names)
+        assert summary["resolved_count"] == 0
+        assert set(summary["unresolved_fields"]) == owner_required_field_names
+
+
+@pytest.mark.asyncio
+async def test_owner_input_summary_excludes_not_required_fields(monkeypatch: pytest.MonkeyPatch) -> None:
+    async with real_sqlite_session(_TABLES) as db:
+        monkeypatch.setattr(service, "AsyncSessionLocal", lambda: _SessionContext(db))
+        result = await service.mandate_bootstrap_export(capital_campaign_id=999)
+
+        unresolved = set(result["owner_input_summary"]["unresolved_fields"])
+        assert "mandate_expires_at" not in unresolved
+        assert "authorization_expires_at" not in unresolved
+        assert "audit_correlation_id" not in unresolved  # RUNTIME_DERIVED, not OWNER_INPUT_REQUIRED
+        # DATABASE_DERIVED fields (already resolved in Stages 1-3) must never appear either.
+        assert "capital_campaign_id" not in unresolved
+
+
+@pytest.mark.asyncio
+async def test_owner_input_summary_unresolved_list_deterministic(monkeypatch: pytest.MonkeyPatch) -> None:
+    async with real_sqlite_session(_TABLES) as db:
+        monkeypatch.setattr(service, "AsyncSessionLocal", lambda: _SessionContext(db))
+
+        first = await service.mandate_bootstrap_export(capital_campaign_id=999)
+        second = await service.mandate_bootstrap_export(capital_campaign_id=999)
+
+        first_unresolved = first["owner_input_summary"]["unresolved_fields"]
+        second_unresolved = second["owner_input_summary"]["unresolved_fields"]
+        assert first_unresolved == second_unresolved
+        assert first_unresolved == sorted(first_unresolved)
+
+
+@pytest.mark.asyncio
+async def test_no_database_mutation_occurs_stage5(monkeypatch: pytest.MonkeyPatch) -> None:
+    async with real_sqlite_session(_TABLES) as db:
+        strategy = await _seed_strategy(db, slug="ma_crossover", module_version="1.0.0", is_active=True)
+        campaign = await _seed_pinned_campaign(db)
+        await _seed_canonical_preview_package(db, campaign_id=campaign.uuid, campaign_version=1, strategy_id=strategy.id)
+
+        monkeypatch.setattr(service, "AsyncSessionLocal", lambda: _SessionContext(db))
+
+        def _forbid(*args: Any, **kwargs: Any) -> Any:
+            raise AssertionError("mandate_bootstrap_export must never mutate the database")
+
+        monkeypatch.setattr(db, "add", _forbid)
+        monkeypatch.setattr(db, "commit", _forbid)
+        monkeypatch.setattr(db, "flush", _forbid)
+        monkeypatch.setattr(db, "delete", _forbid)
+
+        result = await service.mandate_bootstrap_export(capital_campaign_id=2)
+
+        assert result["owner_input_summary"]["total_required"] == 32
+
+
+@pytest.mark.asyncio
+async def test_executable_and_overall_status_remain_fixed_with_stage5_manifest(monkeypatch: pytest.MonkeyPatch) -> None:
+    async with real_sqlite_session(_TABLES) as db:
+        monkeypatch.setattr(service, "AsyncSessionLocal", lambda: _SessionContext(db))
+        result = await service.mandate_bootstrap_export(capital_campaign_id=999)
+
+        assert result["executable"] is False
+        assert result["overall_status"] == "BLOCKED"
+
+
+@pytest.mark.asyncio
+async def test_deterministic_serialized_output_stage5(monkeypatch: pytest.MonkeyPatch) -> None:
+    async with real_sqlite_session(_TABLES) as db:
+        monkeypatch.setattr(service, "AsyncSessionLocal", lambda: _SessionContext(db))
+        strategy = await _seed_strategy(db, slug="ma_crossover", module_version="1.0.0", is_active=True)
+        campaign = await _seed_pinned_campaign(db)
+        await _seed_canonical_preview_package(db, campaign_id=campaign.uuid, campaign_version=1, strategy_id=strategy.id)
 
         first = await service.mandate_bootstrap_export(capital_campaign_id=2)
         second = await service.mandate_bootstrap_export(capital_campaign_id=2)
