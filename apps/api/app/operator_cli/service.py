@@ -1,14 +1,17 @@
 from __future__ import annotations
 
 import asyncio
+import ast
 from collections import Counter
 from dataclasses import asdict, is_dataclass
 from enum import Enum
 import hashlib
+import inspect
 import json
 import logging
 import re
 import sys
+import textwrap
 from datetime import datetime, timezone
 from datetime import timedelta
 from decimal import Decimal
@@ -2584,6 +2587,349 @@ async def mandate_bootstrap_session_validate(*, capital_campaign_id: int, owner_
             "informational_strategy_evidence": strategy_evidence,
             "evidence_matches_owner_selection": evidence_matches_owner_selection,
         },
+    }
+
+
+_MANDATE_GOVERNANCE_AUDIT_FORBIDDEN_BARE_CALLS: frozenset[str] = frozenset(
+    {
+        "create_mandate",
+        "create_mandate_version",
+        "authorize_mandate_version",
+        "apply_mandate_lifecycle_action",
+        "mandate_bootstrap",
+    }
+)
+_MANDATE_GOVERNANCE_AUDIT_FORBIDDEN_ATTRIBUTE_CALLS: frozenset[str] = frozenset({"add", "commit", "flush", "delete"})
+
+
+def _mandate_governance_audit_scan_calls(fn: Any) -> list[str]:
+    """Parses fn's own source (inspect.getsource) as a real Python AST and returns the
+    sorted names of any forbidden write/lifecycle calls actually present as ast.Call nodes
+    in its code. Deliberately AST-based rather than a text/regex scan: a regex would false-
+    positive on a docstring merely mentioning "mandate_bootstrap()" in prose, where an AST
+    walk only ever matches genuine call sites, however deeply nested (e.g. inside another
+    call's keyword argument)."""
+    source = textwrap.dedent(inspect.getsource(fn))
+    tree = ast.parse(source)
+    found: set[str] = set()
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call):
+            continue
+        func = node.func
+        if isinstance(func, ast.Name) and func.id in _MANDATE_GOVERNANCE_AUDIT_FORBIDDEN_BARE_CALLS:
+            found.add(func.id)
+        elif (
+            isinstance(func, ast.Attribute)
+            and func.attr in _MANDATE_GOVERNANCE_AUDIT_FORBIDDEN_ATTRIBUTE_CALLS
+            and isinstance(func.value, ast.Name)
+            and func.value.id == "db"
+        ):
+            # Deliberately scoped to the `db` session variable specifically -- a bare
+            # attribute-name match (e.g. func.attr == "add") would also catch unrelated,
+            # perfectly legitimate calls like set.add()/dict.update() that happen to share
+            # a method name with a real SQLAlchemy session mutation.
+            found.add(f"db.{func.attr}")
+    return sorted(found)
+
+
+def _mandate_governance_audit_strip_docstring(source: str) -> str:
+    """Removes the function's own leading docstring before pattern-matching its code, so a
+    prose description can never be mistaken for (or coincidentally launder) the real code
+    pattern being checked for."""
+    return re.sub(r'""".*?"""', "", source, count=1, flags=re.DOTALL)
+
+
+async def mandate_governance_readiness_audit(*, capital_campaign_id: int) -> dict[str, Any]:
+    """Read-only inspection of the mandate-bootstrap pipeline's write-safety -- exists
+    solely to answer whether Stage 9 (mandate creation) is safe to allow. Never performs a
+    write itself: every database read is delegated to mandate_bootstrap_export()/
+    mandate_bootstrap_session_validate() (already proven write-free by their own Stage 1-7
+    tests), and every safety property is checked against the real running code via
+    inspect.getsource()/inspect.signature()/ast (never a hand-written description of what
+    the code is assumed to do). Creates zero rows, calls no lifecycle method, and never
+    authorizes, activates, or triggers Stage 9 itself -- overall_status is a report, not a
+    gate; a human operator still decides whether to proceed."""
+    from app.services.mandates import validation as _validation_module
+    from app.services.strategies import identity as _identity_module
+
+    inspection_timestamp = datetime.now(timezone.utc).isoformat()
+    commands_inspected: list[str] = []
+    write_paths: list[dict[str, Any]] = []
+    blocked_write_paths: list[dict[str, Any]] = []
+    warnings: list[str] = []
+
+    # --- Items 1/2/3/15: the two read-only commands must contain zero forbidden write or
+    # lifecycle calls anywhere in their own code.
+    for name, fn in (
+        ("mandate_bootstrap_export", mandate_bootstrap_export),
+        ("mandate_bootstrap_session_validate", mandate_bootstrap_session_validate),
+    ):
+        commands_inspected.append(name)
+        found_calls = _mandate_governance_audit_scan_calls(fn)
+        if found_calls:
+            write_paths.append({"function": name, "forbidden_calls_found": found_calls})
+        else:
+            blocked_write_paths.append(
+                {
+                    "function": name,
+                    "status": "no write or lifecycle calls found anywhere in this function's own AST",
+                    "checked_calls": sorted(
+                        _MANDATE_GOVERNANCE_AUDIT_FORBIDDEN_BARE_CALLS
+                        | {f"db.{attr}" for attr in _MANDATE_GOVERNANCE_AUDIT_FORBIDDEN_ATTRIBUTE_CALLS}
+                    ),
+                }
+            )
+
+    # mandate_bootstrap() is the repository's one legitimate write path (Stage 9's future
+    # target) -- it must still exist, but must remain gated behind confirm=True.
+    commands_inspected.append("mandate_bootstrap")
+    bootstrap_source = _mandate_governance_audit_strip_docstring(
+        textwrap.dedent(inspect.getsource(mandate_bootstrap))
+    )
+    bootstrap_gated = bool(re.search(r"if\s+not\s+confirm\s*:\s*\n\s*raise\s+PermissionError", bootstrap_source))
+    if bootstrap_gated:
+        blocked_write_paths.append(
+            {
+                "function": "mandate_bootstrap",
+                "status": "write path exists but is gated behind confirm=True (PermissionError otherwise)",
+            }
+        )
+    else:
+        write_paths.append({"function": "mandate_bootstrap", "forbidden_calls_found": ["confirm_gate_not_found"]})
+
+    session_validate_params = set(inspect.signature(mandate_bootstrap_session_validate).parameters.keys())
+    no_own_db_session = "db" not in session_validate_params and "session" not in session_validate_params
+
+    session_validate_source = _mandate_governance_audit_strip_docstring(
+        textwrap.dedent(inspect.getsource(mandate_bootstrap_session_validate))
+    )
+
+    # --- Item 4: owner input can never overwrite a DATABASE_DERIVED field.
+    forbidden_field_names = _MANDATE_BOOTSTRAP_SESSION_FORBIDDEN_FIELD_NAMES
+    database_field_map = _MANDATE_BOOTSTRAP_SESSION_DATABASE_FIELD_MAP
+    forbidden_covers_database_fields = set(database_field_map.keys()) | set(database_field_map.values())
+    forbidden_field_map_consistent = forbidden_covers_database_fields.issubset(forbidden_field_names)
+
+    worksheet_field_names = set(_MANDATE_BOOTSTRAP_EXPORT_WORKSHEET_ENTRIES.keys())
+    required_field_names = sorted(worksheet_field_names - {"confirm"})
+    no_owner_forbidden_overlap = not (set(required_field_names) & forbidden_field_names)
+
+    probe_override_input = {name: "__governance_audit_probe__" for name in forbidden_field_names}
+    override_probe = await mandate_bootstrap_session_validate(
+        capital_campaign_id=capital_campaign_id, owner_input=probe_override_input
+    )
+    override_probe_blocked = (
+        set(override_probe["validation"]["forbidden_override_fields"]) == set(forbidden_field_names)
+        and override_probe["session_status"] == "INVALID"
+    )
+
+    # --- Items 6/7: no hidden defaults for OWNER_INPUT_REQUIRED fields; every one of them
+    # must still require explicit owner input (proven statically and by an empty-document probe).
+    hidden_default_fields: list[str] = []
+    for field_name, entry in _MANDATE_BOOTSTRAP_EXPORT_STATIC_MANDATE_FIELDS.items():
+        if entry["classification"] == "OWNER_INPUT_REQUIRED" and (entry["value"] is not None or entry["source"] is not None):
+            hidden_default_fields.append(field_name)
+    strategy_field = _MANDATE_BOOTSTRAP_EXPORT_ALLOWED_STRATEGY_VERSIONS_FIELD
+    if strategy_field["classification"] == "OWNER_INPUT_REQUIRED" and (
+        strategy_field["value"] is not None or strategy_field["source"] is not None
+    ):
+        hidden_default_fields.append("allowed_strategy_versions")
+
+    empty_document_probe = await mandate_bootstrap_session_validate(
+        capital_campaign_id=capital_campaign_id, owner_input={}
+    )
+    every_required_field_still_required = (
+        empty_document_probe["validation"]["missing_fields"] == required_field_names
+        and empty_document_probe["session_status"] == "INVALID"
+    )
+
+    # --- Item 5: confirm cannot become true.
+    confirm_excluded_from_required = "confirm" not in required_field_names
+    confirm_hardcoded_false = bool(re.search(r'"confirm"\s*:\s*False', session_validate_source))
+
+    session_validate_parser_options: list[str] | None = None
+    try:
+        import argparse
+
+        import app.operator_cli.main as _main_module
+
+        parser = _main_module._build_parser()
+        subparsers_action = next(
+            action for action in parser._actions if isinstance(action, argparse._SubParsersAction)
+        )
+        session_validate_parser_options = [
+            option
+            for action in subparsers_action.choices["mandate-bootstrap-session-validate"]._actions
+            for option in action.option_strings
+        ]
+    except Exception as exc:  # pragma: no cover - defensive only, never expected
+        warnings.append(f"could not introspect CLI parser for mandate-bootstrap-session-validate: {exc}")
+    # Fail closed: if the parser could not be introspected, this check must not silently pass.
+    no_confirm_cli_flag = session_validate_parser_options is not None and "--confirm" not in session_validate_parser_options
+
+    confirm_probe = await mandate_bootstrap_session_validate(
+        capital_campaign_id=capital_campaign_id, owner_input={"confirm": True}
+    )
+    confirm_probe_blocked = (
+        {"field": "confirm", "error": "OWNER_INPUT_ATTEMPTED_EXECUTION_CONFIRM"}
+        in confirm_probe["validation"]["field_errors"]
+        and confirm_probe["candidate_mandate_bootstrap_request"]["confirm"] is False
+        and confirm_probe["session_status"] == "INVALID"
+    )
+
+    # --- Item 8: every validation failure blocks execution (session_status strictly follows valid).
+    session_status_follows_valid = bool(
+        re.search(
+            r'session_status\s*=\s*"COMPLETE_FOR_OWNER_REVIEW"\s+if\s+valid\s+else\s+"INVALID"',
+            session_validate_source,
+        )
+    )
+
+    # --- Item 9: every validator used is the repository's authoritative one -- compared by
+    # identity against the module each is actually defined in, so a local shadowing
+    # reimplementation (not merely a same-named duplicate) would be caught.
+    validators_verified = [
+        {
+            "name": "validate_mandate_version",
+            "source_module": _validation_module.__name__,
+            "is_authoritative": validate_mandate_version is _validation_module.validate_mandate_version,
+        },
+        {
+            "name": "validate_autonomy_level",
+            "source_module": _validation_module.__name__,
+            "is_authoritative": validate_autonomy_level is _validation_module.validate_autonomy_level,
+        },
+        {
+            "name": "is_strategy_identity",
+            "source_module": _identity_module.__name__,
+            "is_authoritative": is_strategy_identity is _identity_module.is_strategy_identity,
+        },
+    ]
+    all_validators_authoritative = all(entry["is_authoritative"] for entry in validators_verified)
+
+    # --- Items 10/11: strategy evidence stays informational-only and is never converted
+    # into owner authorization; evidence_matches_owner_selection is computed strictly after
+    # -- and independent of -- the validity determination (proven by source position).
+    strategy_field_always_owner_required = strategy_field["classification"] == "OWNER_INPUT_REQUIRED"
+    valid_assignment_index = session_validate_source.find("valid = not (")
+    evidence_match_index = session_validate_source.find("evidence_matches_owner_selection = (")
+    evidence_match_computed_after_validity = (
+        valid_assignment_index != -1 and evidence_match_index != -1 and evidence_match_index > valid_assignment_index
+    )
+
+    export_probe = await mandate_bootstrap_export(capital_campaign_id=capital_campaign_id)
+    strategy_evidence_informational = (
+        export_probe["strategy_evidence"] is None or export_probe["strategy_evidence"].get("informational_only") is True
+    )
+    if not export_probe["campaign"].get("found", False):
+        warnings.append(
+            f"capital_campaign_id={capital_campaign_id} was not found; identity-chain-specific "
+            "probes above reflect the not-found path, not a live resolved campaign."
+        )
+
+    # --- Item 12: runtime-derived fields are never minted by this validator -- it only
+    # ever reads what the owner supplied, or leaves the field None.
+    no_audit_correlation_id_minted = (
+        'audit_correlation_id"] = uuid.uuid4()' not in session_validate_source
+        and "audit_correlation_id = uuid.uuid4()" not in session_validate_source
+    )
+
+    # --- Item 13: no hidden mutable global state -- the field-classification sets this
+    # function depends on are frozensets (immutable), and the function never assigns into
+    # any module-level worksheet/static-field dict.
+    all_constants_immutable = all(
+        isinstance(value, frozenset)
+        for value in (
+            _MANDATE_BOOTSTRAP_SESSION_FORBIDDEN_FIELD_NAMES,
+            _MANDATE_BOOTSTRAP_SESSION_OPTIONAL_FIELD_NAMES,
+            _MANDATE_BOOTSTRAP_SESSION_VERSION_VALIDATION_FIELDS,
+        )
+    )
+    no_module_state_mutation = not re.search(
+        r"_MANDATE_BOOTSTRAP_EXPORT_(WORKSHEET_ENTRIES|STATIC_MANDATE_FIELDS)\s*\[[^\]]*\]\s*=(?!=)",
+        session_validate_source,
+    )
+
+    # --- Item 14: no side effects -- no audit-log rows, no orchestration-stage logging calls.
+    no_audit_logging_calls = not any(
+        pattern in session_validate_source
+        for pattern in ("AuditLog(", "_log_orchestration_stage(", "_log_commission_stage(")
+    )
+
+    owner_boundaries: dict[str, Any] = {
+        "forbidden_field_map_consistent_with_database_fields": forbidden_field_map_consistent,
+        "no_overlap_between_required_and_forbidden_fields": no_owner_forbidden_overlap,
+        "override_probe_blocked_all_forbidden_fields": override_probe_blocked,
+        "no_hidden_default_values_for_owner_required_fields": not hidden_default_fields,
+        "hidden_default_fields_found": hidden_default_fields,
+        "every_required_field_still_required_probe": every_required_field_still_required,
+    }
+    runtime_boundaries: dict[str, Any] = {
+        "audit_correlation_id_never_minted": no_audit_correlation_id_minted,
+        "session_validator_has_no_own_db_session_parameter": no_own_db_session,
+        "field_classification_constants_are_immutable": all_constants_immutable,
+        "no_module_level_state_mutation_in_source": no_module_state_mutation,
+        "no_audit_logging_side_effects_in_validator": no_audit_logging_calls,
+    }
+    strategy_boundaries: dict[str, Any] = {
+        "allowed_strategy_versions_always_owner_input_required": strategy_field_always_owner_required,
+        "strategy_evidence_marked_informational_only": strategy_evidence_informational,
+        "evidence_match_flag_computed_after_and_independent_of_validity": evidence_match_computed_after_validity,
+    }
+    authorization_boundaries: dict[str, Any] = {
+        "confirm_excluded_from_owner_required_fields": confirm_excluded_from_required,
+        "confirm_hardcoded_false_in_candidate": confirm_hardcoded_false,
+        "no_confirm_cli_flag_registered": no_confirm_cli_flag,
+        "confirm_true_probe_blocked": confirm_probe_blocked,
+        "session_status_strictly_follows_valid": session_status_follows_valid,
+        "all_validators_are_repository_authoritative": all_validators_authoritative,
+        "mandate_bootstrap_write_path_gated_behind_confirm": bootstrap_gated,
+    }
+
+    pass_fail_checks: dict[str, bool] = {
+        **{k: v for k, v in owner_boundaries.items() if isinstance(v, bool)},
+        **{k: v for k, v in runtime_boundaries.items() if isinstance(v, bool)},
+        **{k: v for k, v in strategy_boundaries.items() if isinstance(v, bool)},
+        **{k: v for k, v in authorization_boundaries.items() if isinstance(v, bool)},
+    }
+    overall_pass = not write_paths and all(pass_fail_checks.values())
+    overall_status = "READY_FOR_STAGE9" if overall_pass else "NOT_READY"
+
+    recommendations: list[str] = [
+        "This audit is a report, not a gate: it does not itself authorize, trigger, or "
+        "block Stage 9 -- a human operator must still decide whether to proceed.",
+        "Re-run this audit after any change to the mandate-bootstrap pipeline in "
+        "app/operator_cli/service.py or to app/services/mandates/validation.py before "
+        "trusting a prior result.",
+    ]
+    if not overall_pass:
+        recommendations.append("Resolve every failing check below before considering Stage 9.")
+        recommendations.extend(
+            sorted(f"failing_check:{name}" for name, passed in pass_fail_checks.items() if not passed)
+        )
+        if write_paths:
+            recommendations.extend(
+                sorted(f"unexpected_write_path:{entry['function']}" for entry in write_paths)
+            )
+
+    return {
+        "overall_status": overall_status,
+        "repository_safe_for_stage9": overall_pass,
+        "inspection_timestamp": inspection_timestamp,
+        "commands_inspected": commands_inspected,
+        "validators_verified": validators_verified,
+        "write_paths": write_paths,
+        "blocked_write_paths": blocked_write_paths,
+        "owner_boundaries": owner_boundaries,
+        "runtime_boundaries": runtime_boundaries,
+        "strategy_boundaries": strategy_boundaries,
+        "authorization_boundaries": authorization_boundaries,
+        "warnings": warnings,
+        "recommendations": recommendations,
+        "next_stage": (
+            "Stage 9 (mandate creation) is never triggered by this audit regardless of "
+            "overall_status; it requires separate, explicit human authorization."
+        ),
     }
 
 

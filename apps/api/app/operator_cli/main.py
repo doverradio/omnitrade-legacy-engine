@@ -75,6 +75,7 @@ from app.operator_cli.service import (
     mandate_bootstrap,
     mandate_bootstrap_export,
     mandate_bootstrap_session_validate,
+    mandate_governance_readiness_audit,
     refresh_provider_balance_evidence,
     inspect_legacy_campaign_transition,
     pause_canonical_proving_activation_bundle,
@@ -922,6 +923,28 @@ def _build_parser() -> argparse.ArgumentParser:
     mandate_bootstrap_session_validate_parser.add_argument("--owner-input-json", type=_parse_owner_input_json, required=True)
     mandate_bootstrap_session_validate_parser.add_argument("--json", action="store_true", dest="json_output")
 
+    mandate_governance_readiness_audit_parser = subparsers.add_parser(
+        "mandate-governance-readiness-audit",
+        parents=[common],
+        help="Read-only inspection of whether the mandate-bootstrap pipeline is safe to allow mandate creation/authorization (Stage 9)",
+        description=(
+            "Inspects the mandate-bootstrap pipeline (campaign/exchange/paper-account/"
+            "live-trading-profile resolution, strategy evidence, the owner worksheet, the "
+            "session validator, and the mandate_bootstrap() write path) and reports whether "
+            "the repository is safe to allow Stage 9 (mandate creation/authorization). "
+            "Performs ONLY inspection -- zero writes, zero rows created, no lifecycle "
+            "method called. Every property is checked against the real running code via "
+            "inspect.getsource()/inspect.signature()/ast, and via read-only probe calls "
+            "into mandate_bootstrap_export()/mandate_bootstrap_session_validate() -- never a "
+            "hand-written description of what the code is assumed to do. This command "
+            "never itself authorizes, triggers, or blocks Stage 9; overall_status is a "
+            "report for a human operator to act on. Exit code 0 for READY_FOR_STAGE9, 1 "
+            "for NOT_READY, 2 only for an infrastructure or unexpected failure."
+        ),
+    )
+    mandate_governance_readiness_audit_parser.add_argument("--capital-campaign-id", type=int, required=True)
+    mandate_governance_readiness_audit_parser.add_argument("--json", action="store_true", dest="json_output")
+
     proving_pause = subparsers.add_parser(
         "canonical-proving-pause",
         parents=[common],
@@ -1320,6 +1343,11 @@ async def _run_async(args: argparse.Namespace) -> tuple[int, dict[str, Any], str
             owner_input=args.owner_input_json,
         )
         exit_code = 0 if payload["session_status"] == "COMPLETE_FOR_OWNER_REVIEW" else 1
+        return exit_code, payload, render_json(payload)
+
+    if args.command == "mandate-governance-readiness-audit":
+        payload = await mandate_governance_readiness_audit(capital_campaign_id=args.capital_campaign_id)
+        exit_code = 0 if payload["overall_status"] == "READY_FOR_STAGE9" else 1
         return exit_code, payload, render_json(payload)
 
     if args.command == "canonical-proving-pause":
