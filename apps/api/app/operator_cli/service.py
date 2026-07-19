@@ -1321,8 +1321,305 @@ def _owner_input_summary(fields: dict[str, dict[str, Any]]) -> dict[str, Any]:
     }
 
 
+# Stage 6: the owner decision worksheet. One static, deterministic entry per
+# OWNER_INPUT_REQUIRED field, describing HOW to supply it -- never WHAT to supply.
+# accepted_values is populated ONLY where an actual repository validator or DB CHECK
+# constraint defines a closed set (autonomy_level, approval_policy); every numeric field's
+# constraint is copied verbatim from AutonomousCapitalMandateVersion's CheckConstraints
+# and/or app/services/mandates/validation.py::validate_mandate_version; every JSON policy
+# field's "structure" is exactly what apps/api/app/operator_cli/main.py::
+# _parse_mandate_policy_bundle enforces today (a JSON object, no sub-keys) -- nothing here
+# is invented. current_value is always None; example_format is placeholder syntax only,
+# never a real (or realistic-looking) authorization value.
+_MANDATE_BOOTSTRAP_EXPORT_WORKSHEET_ENTRIES: dict[str, dict[str, Any]] = {
+    "owner_actor_id": {
+        "input_type": "text",
+        "accepted_values": None,
+        "example_format": "<owner-actor-identifier>",
+        "description": "Identifies the owner authorizing this mandate for audit purposes.",
+        "source_contract": "AutonomousCapitalMandate.owner_actor_id (Text, no CHECK constraint); mandate_bootstrap() required parameter",
+    },
+    "autonomy_level": {
+        "input_type": "enum",
+        "accepted_values": ["LEVEL_0", "LEVEL_1", "LEVEL_2", "LEVEL_3"],
+        "example_format": "<one of accepted_values>",
+        "description": "The mandate's autonomy tier.",
+        "source_contract": "AUTONOMY_LEVELS (app/services/mandates/contracts.py) + CHECK ck_ac_mandates_autonomy_level",
+    },
+    "authorized_capital_usd": {
+        "input_type": "decimal",
+        "accepted_values": None,
+        "example_format": "<positive decimal>",
+        "description": "Total USD capital this mandate authorizes.",
+        "source_contract": "CHECK ck_ac_mandate_versions_authorized_capital (> 0); validate_mandate_version()",
+    },
+    "max_order_notional_usd": {
+        "input_type": "decimal",
+        "accepted_values": None,
+        "example_format": "<positive decimal>",
+        "description": "Maximum USD notional per order; must not exceed authorized_capital_usd.",
+        "source_contract": "CHECK ck_ac_mandate_versions_max_order_notional (> 0); validate_mandate_version() (<= authorized_capital_usd)",
+    },
+    "max_open_exposure_usd": {
+        "input_type": "decimal",
+        "accepted_values": None,
+        "example_format": "<positive decimal>",
+        "description": "Maximum total open USD exposure; must not exceed authorized_capital_usd.",
+        "source_contract": "CHECK ck_ac_mandate_versions_max_open_exposure (> 0); validate_mandate_version() (<= authorized_capital_usd)",
+    },
+    "max_daily_deployed_usd": {
+        "input_type": "decimal",
+        "accepted_values": None,
+        "example_format": "<positive decimal>",
+        "description": "Maximum USD deployed in a single day; must not exceed authorized_capital_usd.",
+        "source_contract": "CHECK ck_ac_mandate_versions_max_daily_deployed (> 0); validate_mandate_version() (<= authorized_capital_usd)",
+    },
+    "max_daily_realized_loss_usd": {
+        "input_type": "decimal",
+        "accepted_values": None,
+        "example_format": "<non-negative decimal>",
+        "description": "Maximum realized loss permitted in a single day.",
+        "source_contract": "CHECK ck_ac_mandate_versions_max_daily_loss (>= 0)",
+    },
+    "max_campaign_drawdown_usd": {
+        "input_type": "decimal",
+        "accepted_values": None,
+        "example_format": "<non-negative decimal>",
+        "description": "Maximum campaign drawdown in USD.",
+        "source_contract": "CHECK ck_ac_mandate_versions_max_drawdown (>= 0)",
+    },
+    "max_consecutive_losses": {
+        "input_type": "integer",
+        "accepted_values": None,
+        "example_format": "<non-negative integer>",
+        "description": "Maximum consecutive losses before this mandate's risk limits engage.",
+        "source_contract": "CHECK ck_ac_mandate_versions_max_consecutive_losses (>= 0)",
+    },
+    "position_limit": {
+        "input_type": "integer",
+        "accepted_values": None,
+        "example_format": "<non-negative integer>",
+        "description": "Maximum concurrent open positions.",
+        "source_contract": "CHECK ck_ac_mandate_versions_position_limit (>= 0); validate_mandate_version()",
+    },
+    "price_evidence_max_age_seconds": {
+        "input_type": "integer",
+        "accepted_values": None,
+        "example_format": "<positive integer>",
+        "description": "Maximum age, in seconds, of price evidence this mandate treats as fresh.",
+        "source_contract": "CHECK ck_ac_mandate_versions_price_freshness (> 0); validate_mandate_version()",
+    },
+    "max_slippage_bps": {
+        "input_type": "decimal",
+        "accepted_values": None,
+        "example_format": "<non-negative decimal>",
+        "description": "Maximum allowed slippage, in basis points.",
+        "source_contract": "CHECK ck_ac_mandate_versions_max_slippage (>= 0)",
+    },
+    "max_fee_bps": {
+        "input_type": "decimal",
+        "accepted_values": None,
+        "example_format": "<non-negative decimal>",
+        "description": "Maximum allowed fee, in basis points.",
+        "source_contract": "CHECK ck_ac_mandate_versions_max_fee (>= 0)",
+    },
+    "allowed_products": {
+        "input_type": "csv_list",
+        "accepted_values": None,
+        "example_format": "<PRODUCT-1>,<PRODUCT-2>",
+        "description": "Comma-separated list of exact product identifiers this mandate may trade; must be non-empty. No fixed product enum is enforced by the current validator.",
+        "source_contract": "validate_mandate_version() (empty_allowed_products)",
+    },
+    "allowed_order_sides": {
+        "input_type": "csv_list",
+        "accepted_values": None,
+        "example_format": "<SIDE-1>,<SIDE-2>",
+        "description": "Comma-separated list of order sides this mandate may take; must be non-empty. No fixed side enum is enforced by the current validator.",
+        "source_contract": "validate_mandate_version() (empty_allowed_order_sides)",
+    },
+    "allowed_strategy_versions": {
+        "input_type": "csv_list",
+        "accepted_values": None,
+        "example_format": "<strategy-slug>@<module-version>",
+        "description": (
+            "Comma-separated list of canonical strategy identities this mandate permits. "
+            "Per the Strategy Identity Architecture Review, no campaign-scoped record can "
+            "supply this -- see strategy_evidence for informational-only candidates, which "
+            "must not be copied into this value even when they agree with each other."
+        ),
+        "source_contract": "validate_mandate_version() (non-empty; each entry via is_strategy_identity()); app/services/strategies/identity.py (exactly one '@', non-empty slug and version)",
+    },
+    "approval_policy": {
+        "input_type": "enum",
+        "accepted_values": ["HUMAN_REQUIRED", "MANDATE_ALLOWED"],
+        "example_format": "<one of accepted_values>",
+        "description": "Whether this mandate's own policy allows autonomous evaluation to proceed without a human in the loop.",
+        "source_contract": "CHECK ck_ac_mandate_versions_approval_policy; validate_mandate_version()",
+    },
+    "entry_policy": {
+        "input_type": "json_object",
+        "accepted_values": None,
+        "example_format": '{"<key>": "<value>"}',
+        "description": "Structured entry policy, supplied as part of --policy-bundle-json.",
+        "source_contract": "_parse_mandate_policy_bundle() (app/operator_cli/main.py) -- requires a JSON object; no sub-keys are enforced by the current parser",
+    },
+    "exit_policy": {
+        "input_type": "json_object",
+        "accepted_values": None,
+        "example_format": '{"<key>": "<value>"}',
+        "description": "Structured exit policy, supplied as part of --policy-bundle-json.",
+        "source_contract": "_parse_mandate_policy_bundle() (app/operator_cli/main.py) -- requires a JSON object; no sub-keys are enforced by the current parser",
+    },
+    "cooldown_policy": {
+        "input_type": "json_object",
+        "accepted_values": None,
+        "example_format": '{"<key>": "<value>"}',
+        "description": "Structured cooldown policy, supplied as part of --policy-bundle-json.",
+        "source_contract": "_parse_mandate_policy_bundle() (app/operator_cli/main.py) -- requires a JSON object; no sub-keys are enforced by the current parser",
+    },
+    "operating_schedule": {
+        "input_type": "json_object",
+        "accepted_values": None,
+        "example_format": '{"<key>": "<value>"}',
+        "description": "Structured operating schedule, supplied as part of --policy-bundle-json.",
+        "source_contract": "_parse_mandate_policy_bundle() (app/operator_cli/main.py) -- requires a JSON object; no sub-keys are enforced by the current parser",
+    },
+    "reconciliation_policy": {
+        "input_type": "json_object",
+        "accepted_values": None,
+        "example_format": '{"<key>": "<value>"}',
+        "description": "Structured reconciliation policy, supplied as part of --policy-bundle-json.",
+        "source_contract": "_parse_mandate_policy_bundle() (app/operator_cli/main.py) -- requires a JSON object; no sub-keys are enforced by the current parser",
+    },
+    "kill_switch_policy": {
+        "input_type": "json_object",
+        "accepted_values": None,
+        "example_format": '{"<key>": "<value>"}',
+        "description": "Structured kill-switch policy, supplied as part of --policy-bundle-json.",
+        "source_contract": "_parse_mandate_policy_bundle() (app/operator_cli/main.py) -- requires a JSON object; no sub-keys are enforced by the current parser",
+    },
+    "owner_acknowledgements": {
+        "input_type": "json_object",
+        "accepted_values": None,
+        "example_format": '{"<key>": "<value>"}',
+        "description": "Structured record of the owner's acknowledgements, supplied as part of --policy-bundle-json. A genuine, fresh act by the owner -- never derivable from any record.",
+        "source_contract": "_parse_mandate_policy_bundle() (app/operator_cli/main.py) -- requires a JSON object; no sub-keys are enforced by the current parser",
+    },
+    "authorization_evidence_summary": {
+        "input_type": "json_object",
+        "accepted_values": None,
+        "example_format": '{"<key>": "<value>"}',
+        "description": "Structured summary of authorization evidence, supplied as part of --policy-bundle-json. A genuine, fresh act by the owner -- never derivable from any record.",
+        "source_contract": "_parse_mandate_policy_bundle() (app/operator_cli/main.py) -- requires a JSON object; no sub-keys are enforced by the current parser",
+    },
+    "authorization_evidence": {
+        "input_type": "json_object",
+        "accepted_values": None,
+        "example_format": '{"<key>": "<value>"}',
+        "description": "Structured authorization evidence, supplied as part of --policy-bundle-json. A genuine, fresh act by the owner -- never derivable from any record.",
+        "source_contract": "_parse_mandate_policy_bundle() (app/operator_cli/main.py) -- requires a JSON object; no sub-keys are enforced by the current parser",
+    },
+    "deterministic_explanation": {
+        "input_type": "json_object",
+        "accepted_values": None,
+        "example_format": '{"<key>": "<value>"}',
+        "description": "Structured deterministic explanation, supplied as part of --policy-bundle-json. A genuine, fresh act by the owner -- never derivable from any record.",
+        "source_contract": "_parse_mandate_policy_bundle() (app/operator_cli/main.py) -- requires a JSON object; no sub-keys are enforced by the current parser",
+    },
+    "authorization_method": {
+        "input_type": "text",
+        "accepted_values": None,
+        "example_format": "<authorization-method-identifier>",
+        "description": "Free-text description of how this authorization was obtained. No enum is enforced by the current schema.",
+        "source_contract": "AutonomousCapitalMandateAuthorization.authorization_method (Text, no CHECK constraint)",
+    },
+    "actor": {
+        "input_type": "text",
+        "accepted_values": None,
+        "example_format": "<actor-identifier>",
+        "description": (
+            "Identifies who is performing this bootstrap action, for audit logging. The "
+            "CLI offers 'operator:human' only as a convenience default matching a "
+            "repository-wide convention -- it is not a resolved identity and must be "
+            "confirmed or overridden."
+        ),
+        "source_contract": "mandate_bootstrap() required parameter (app/operator_cli/service.py)",
+    },
+    "reason": {
+        "input_type": "text",
+        "accepted_values": None,
+        "example_format": "<free-text-justification>",
+        "description": "Free-text justification recorded in the audit log.",
+        "source_contract": "mandate_bootstrap() required parameter (app/operator_cli/service.py); apply_mandate_lifecycle_action() reason",
+    },
+    "idempotency_key": {
+        "input_type": "text",
+        "accepted_values": None,
+        "example_format": "<unique-key-string>",
+        "description": "Operator-chosen idempotency key; each mandate-bootstrap stage derives its own sub-key from this root value.",
+        "source_contract": "mandate_bootstrap() required parameter; --idempotency-key CLI flag (required=True)",
+    },
+    "confirm": {
+        "input_type": "boolean",
+        "accepted_values": None,
+        "example_format": "<true|false>",
+        "description": "Must be explicitly affirmed or mandate_bootstrap() raises PermissionError; there is no default that authorizes execution.",
+        "source_contract": "mandate_bootstrap(): 'if not confirm: raise PermissionError(...)' (app/operator_cli/service.py)",
+    },
+}
+
+
+def _owner_decision_worksheet(fields: dict[str, dict[str, Any]]) -> list[dict[str, Any]]:
+    """One deterministic entry per OWNER_INPUT_REQUIRED field, sorted by field name.
+    Never fills, recommends, or infers a value -- current_value is always None, and
+    accepted_values/example_format only ever restate what a real validator or CHECK
+    constraint already enforces."""
+    worksheet: list[dict[str, Any]] = []
+    for name in sorted(fields.keys()):
+        field = fields[name]
+        if field.get("classification") != "OWNER_INPUT_REQUIRED":
+            continue
+        entry_spec = _MANDATE_BOOTSTRAP_EXPORT_WORKSHEET_ENTRIES.get(name)
+        if entry_spec is None:
+            continue
+        worksheet.append(
+            {
+                "field": name,
+                "classification": field["classification"],
+                "current_value": None,
+                "required": True,
+                "input_type": entry_spec["input_type"],
+                "accepted_values": list(entry_spec["accepted_values"]) if entry_spec["accepted_values"] is not None else None,
+                "example_format": entry_spec["example_format"],
+                "description": entry_spec["description"],
+                "source_contract": entry_spec["source_contract"],
+            }
+        )
+    return worksheet
+
+
+def _worksheet_summary(worksheet: list[dict[str, Any]]) -> dict[str, Any]:
+    """Informational only, derived purely from the worksheet's own contents -- never
+    hardcoded, never affects executable/overall_status. structured_json_count +
+    numeric_count + text_count + boolean_count always equals field_count exactly (a
+    complete partition by fundamental data shape); "enum" input_type entries fold into
+    text_count there, since enum values are still string input to the CLI --
+    enum_constrained_count is a separate, orthogonal tally of which fields (of any
+    input_type) have a closed value set defined by a real validator/CHECK constraint."""
+    numeric_types = {"decimal", "integer"}
+    text_types = {"text", "csv_list", "enum"}
+    return {
+        "field_count": len(worksheet),
+        "enum_constrained_count": sum(1 for entry in worksheet if entry["accepted_values"]),
+        "structured_json_count": sum(1 for entry in worksheet if entry["input_type"] == "json_object"),
+        "numeric_count": sum(1 for entry in worksheet if entry["input_type"] in numeric_types),
+        "text_count": sum(1 for entry in worksheet if entry["input_type"] in text_types),
+        "boolean_count": sum(1 for entry in worksheet if entry["input_type"] == "boolean"),
+    }
+
+
 async def mandate_bootstrap_export(*, capital_campaign_id: int) -> dict[str, Any]:
-    """Stages 1-5 of the read-only mandate-bootstrap export design: resolves
+    """Stages 1-6 of the read-only mandate-bootstrap export design: resolves
     CapitalCampaign identity, (if pinned) CapitalCampaignDefinition evidence, the
     campaign's PaperAccount, LiveTradingProfile candidates strictly scoped to
     LiveTradingProfile.paper_account_id == CapitalCampaign.paper_account_id,
@@ -1352,7 +1649,17 @@ async def mandate_bootstrap_export(*, capital_campaign_id: int) -> dict[str, Any
     filled from campaign-definition limits, strategy evidence, or any other record --
     they are always OWNER_INPUT_REQUIRED (or RUNTIME_DERIVED/NOT_REQUIRED where the
     existing contract genuinely allows it). owner_input_summary is a purely informational
-    tally computed from the fields dict; it never affects executable or overall_status."""
+    tally computed from the fields dict; it never affects executable or overall_status.
+
+    Stage 6 adds owner_decision_worksheet: one deterministic entry per OWNER_INPUT_REQUIRED
+    field describing HOW to supply it (input_type, accepted_values, example_format,
+    description, source_contract) -- never WHAT to supply. current_value is always None.
+    accepted_values is populated only where a real validator or DB CHECK constraint defines
+    a closed set; every other constraint (numeric bounds, JSON-object shape, non-empty
+    lists) is copied verbatim from validate_mandate_version()/the model's CheckConstraints/
+    _parse_mandate_policy_bundle(), never invented. worksheet_summary tallies the worksheet
+    by input_type, derived purely from its contents. Neither key ever affects executable or
+    overall_status."""
     async with AsyncSessionLocal() as db:
         campaign = await db.get(CapitalCampaign, capital_campaign_id)
 
@@ -1421,6 +1728,7 @@ async def mandate_bootstrap_export(*, capital_campaign_id: int) -> dict[str, Any
                 "allowed_strategy_versions": dict(_MANDATE_BOOTSTRAP_EXPORT_ALLOWED_STRATEGY_VERSIONS_FIELD),
                 **_static_mandate_input_fields(),
             }
+            not_found_worksheet = _owner_decision_worksheet(not_found_fields)
             return {
                 "capital_campaign_id": capital_campaign_id,
                 "resolved_at": datetime.now(timezone.utc).isoformat(),
@@ -1436,6 +1744,8 @@ async def mandate_bootstrap_export(*, capital_campaign_id: int) -> dict[str, Any
                 "strategy_evidence": None,
                 "fields": not_found_fields,
                 "owner_input_summary": _owner_input_summary(not_found_fields),
+                "owner_decision_worksheet": not_found_worksheet,
+                "worksheet_summary": _worksheet_summary(not_found_worksheet),
             }
 
         has_definition_pin = campaign.definition_campaign_id is not None and campaign.definition_version is not None
@@ -1849,6 +2159,7 @@ async def mandate_bootstrap_export(*, capital_campaign_id: int) -> dict[str, Any
             "allowed_strategy_versions": dict(_MANDATE_BOOTSTRAP_EXPORT_ALLOWED_STRATEGY_VERSIONS_FIELD),
             **_static_mandate_input_fields(),
         }
+        resolved_worksheet = _owner_decision_worksheet(resolved_fields)
 
         return {
             "capital_campaign_id": capital_campaign_id,
@@ -1877,6 +2188,8 @@ async def mandate_bootstrap_export(*, capital_campaign_id: int) -> dict[str, Any
             "strategy_evidence": strategy_evidence,
             "fields": resolved_fields,
             "owner_input_summary": _owner_input_summary(resolved_fields),
+            "owner_decision_worksheet": resolved_worksheet,
+            "worksheet_summary": _worksheet_summary(resolved_worksheet),
         }
 
 

@@ -855,19 +855,20 @@ def _build_parser() -> argparse.ArgumentParser:
     mandate_bootstrap_export_parser = subparsers.add_parser(
         "mandate-bootstrap-export",
         parents=[common],
-        help="Read-only export of authoritative mandate-bootstrap inputs for one capital campaign (Stages 1-5: campaign, definition, paper account, live trading profile, exchange connection, strategy evidence, remaining owner-input manifest)",
+        help="Read-only export of authoritative mandate-bootstrap inputs for one capital campaign (Stages 1-6: campaign, definition, paper account, live trading profile, exchange connection, strategy evidence, owner-input manifest, owner decision worksheet)",
         description=(
-            "Stages 1-5 of the read-only mandate-bootstrap export design. Resolves "
+            "Stages 1-6 of the read-only mandate-bootstrap export design. Resolves "
             "CapitalCampaign identity, (if pinned) CapitalCampaignDefinition evidence, the "
             "campaign's PaperAccount, LiveTradingProfile candidates strictly scoped to "
             "LiveTradingProfile.paper_account_id == CapitalCampaign.paper_account_id, "
             "ExchangeConnection candidates resolved from the campaign's own exchange label "
             "(provider+environment together, never provider alone) gated on the live "
             "trading profile having already resolved uniquely, non-authoritative strategy "
-            "evidence, and the complete remaining mandate-bootstrap owner-input manifest "
+            "evidence, the complete remaining mandate-bootstrap owner-input manifest "
             "(risk limits, execution scope, policies, authorization evidence, operational "
-            "inputs), for one --capital-campaign-id. Performs no writes -- no lifecycle "
-            "action, no authorization, no mandate creation. Every field is classified as "
+            "inputs), and a deterministic owner_decision_worksheet, for one "
+            "--capital-campaign-id. Performs no writes -- no lifecycle action, no "
+            "authorization, no mandate creation. Every field is classified as "
             "DATABASE_DERIVED, CONFIGURATION_DERIVED, OWNER_INPUT_REQUIRED, RUNTIME_DERIVED, "
             "NOT_REQUIRED, MISSING, or CONFLICTING; this stage adds owner_actor_id, "
             "autonomy_level, every risk-limit field, allowed_products, allowed_order_sides, "
@@ -878,10 +879,14 @@ def _build_parser() -> argparse.ArgumentParser:
             "authorization_expires_at -- none of it ever filled from campaign-definition "
             "limits, strategy evidence, prior mandates, or any other record. A compact "
             "owner_input_summary (informational only) tallies unresolved OWNER_INPUT_REQUIRED "
-            "fields. Never reuses another campaign's, another mandate's, or a conversational "
-            "value; multiple candidate live trading profiles or exchange connections fail "
-            "closed as CONFLICTING rather than picking the newest. Always reports "
-            "executable=false and overall_status=BLOCKED."
+            "fields; owner_decision_worksheet gives one entry per such field describing HOW "
+            "to supply it (input_type/accepted_values/example_format, sourced only from real "
+            "validators and CHECK constraints) -- never WHAT to supply; current_value is "
+            "always null. worksheet_summary tallies the worksheet by input_type. Never reuses "
+            "another campaign's, another mandate's, or a conversational value; multiple "
+            "candidate live trading profiles or exchange connections fail closed as "
+            "CONFLICTING rather than picking the newest. Always reports executable=false "
+            "and overall_status=BLOCKED."
         ),
     )
     mandate_bootstrap_export_parser.add_argument("--capital-campaign-id", type=int, required=True)

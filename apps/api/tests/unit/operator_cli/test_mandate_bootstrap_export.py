@@ -308,6 +308,12 @@ async def test_campaign_not_found(monkeypatch: pytest.MonkeyPatch) -> None:
         assert "owner_input_summary" in result
         assert result["owner_input_summary"]["total_required"] > 0
         assert result["owner_input_summary"]["unresolved_count"] == result["owner_input_summary"]["total_required"]
+        # Stage 6: campaign-not-found must still produce the complete worksheet too --
+        # it describes properties of the mandate-bootstrap contract itself, not this
+        # specific campaign.
+        assert len(result["owner_decision_worksheet"]) == result["owner_input_summary"]["total_required"] == 32
+        assert all(entry["current_value"] is None for entry in result["owner_decision_worksheet"])
+        assert result["worksheet_summary"]["field_count"] == 32
 
 
 @pytest.mark.asyncio
@@ -424,6 +430,8 @@ async def test_deterministic_json_shape(monkeypatch: pytest.MonkeyPatch) -> None
             "strategy_evidence",
             "fields",
             "owner_input_summary",
+            "owner_decision_worksheet",
+            "worksheet_summary",
         }
         assert set(first["fields"].keys()) == _ALL_MANDATE_BOOTSTRAP_EXPORT_FIELD_NAMES
         for field_payload in first["fields"].values():
@@ -442,6 +450,26 @@ async def test_deterministic_json_shape(monkeypatch: pytest.MonkeyPatch) -> None
             "resolved_count",
             "unresolved_count",
             "unresolved_fields",
+        }
+        for worksheet_entry in first["owner_decision_worksheet"]:
+            assert set(worksheet_entry.keys()) == {
+                "field",
+                "classification",
+                "current_value",
+                "required",
+                "input_type",
+                "accepted_values",
+                "example_format",
+                "description",
+                "source_contract",
+            }
+        assert set(first["worksheet_summary"].keys()) == {
+            "field_count",
+            "enum_constrained_count",
+            "structured_json_count",
+            "numeric_count",
+            "text_count",
+            "boolean_count",
         }
 
         first_without_timestamp = {k: v for k, v in first.items() if k != "resolved_at"}
@@ -1353,8 +1381,251 @@ async def test_deterministic_serialized_output_stage4(monkeypatch: pytest.Monkey
 
 
 # ---------------------------------------------------------------------------
-# Stage 5 (remaining mandate-bootstrap owner-input manifest + owner_input_summary)
+# Stage 6 (owner decision worksheet + worksheet_summary)
 # ---------------------------------------------------------------------------
+
+# No financial/authorization value must ever appear as an example_format or
+# accepted_values entry anywhere in the worksheet.
+_FORBIDDEN_RECOMMENDATION_SUBSTRINGS = (
+    "25.00",
+    "1000",
+    "5000",
+    "BTC-USD,ETH-USD",
+    "BUY,SELL",
+    "ma_crossover@1.0.0",
+)
+
+
+@pytest.mark.asyncio
+async def test_every_owner_input_required_field_appears_exactly_once_in_worksheet(monkeypatch: pytest.MonkeyPatch) -> None:
+    async with real_sqlite_session(_TABLES) as db:
+        monkeypatch.setattr(service, "AsyncSessionLocal", lambda: _SessionContext(db))
+        result = await service.mandate_bootstrap_export(capital_campaign_id=999)
+
+        worksheet_fields = [entry["field"] for entry in result["owner_decision_worksheet"]]
+        owner_required_fields = {
+            name for name, field in result["fields"].items() if field["classification"] == "OWNER_INPUT_REQUIRED"
+        }
+        assert len(worksheet_fields) == len(set(worksheet_fields))  # no duplicates
+        assert set(worksheet_fields) == owner_required_fields
+
+
+@pytest.mark.asyncio
+async def test_no_non_owner_input_field_appears_in_worksheet(monkeypatch: pytest.MonkeyPatch) -> None:
+    async with real_sqlite_session(_TABLES) as db:
+        monkeypatch.setattr(service, "AsyncSessionLocal", lambda: _SessionContext(db))
+        result = await service.mandate_bootstrap_export(capital_campaign_id=999)
+
+        worksheet_fields = {entry["field"] for entry in result["owner_decision_worksheet"]}
+        for excluded in ("capital_campaign_id", "campaign_uuid", "paper_account_id", "base_currency", "mandate_expires_at", "authorization_expires_at", "audit_correlation_id"):
+            assert excluded not in worksheet_fields
+
+
+@pytest.mark.asyncio
+async def test_all_current_values_remain_null(monkeypatch: pytest.MonkeyPatch) -> None:
+    async with real_sqlite_session(_TABLES) as db:
+        monkeypatch.setattr(service, "AsyncSessionLocal", lambda: _SessionContext(db))
+        strategy = await _seed_strategy(db, slug="ma_crossover", module_version="1.0.0", is_active=True)
+        campaign = await _seed_pinned_campaign(db)
+        await _seed_canonical_preview_package(db, campaign_id=campaign.uuid, campaign_version=1, strategy_id=strategy.id)
+
+        result = await service.mandate_bootstrap_export(capital_campaign_id=2)
+
+        assert all(entry["current_value"] is None for entry in result["owner_decision_worksheet"])
+
+
+@pytest.mark.asyncio
+async def test_accepted_values_come_only_from_repository_defined_validators(monkeypatch: pytest.MonkeyPatch) -> None:
+    async with real_sqlite_session(_TABLES) as db:
+        monkeypatch.setattr(service, "AsyncSessionLocal", lambda: _SessionContext(db))
+        result = await service.mandate_bootstrap_export(capital_campaign_id=999)
+
+        by_field = {entry["field"]: entry for entry in result["owner_decision_worksheet"]}
+
+        # autonomy_level: AUTONOMY_LEVELS + CHECK ck_ac_mandates_autonomy_level
+        assert set(by_field["autonomy_level"]["accepted_values"]) == {"LEVEL_0", "LEVEL_1", "LEVEL_2", "LEVEL_3"}
+        # approval_policy: CHECK ck_ac_mandate_versions_approval_policy
+        assert set(by_field["approval_policy"]["accepted_values"]) == {"HUMAN_REQUIRED", "MANDATE_ALLOWED"}
+
+        # No validator defines a fixed enum for these -- accepted_values must be null.
+        for field_name in (
+            "allowed_products",
+            "allowed_order_sides",
+            "allowed_strategy_versions",
+            "authorized_capital_usd",
+            "authorization_method",
+            "owner_actor_id",
+            "actor",
+            "reason",
+            "idempotency_key",
+            "confirm",
+            "entry_policy",
+            "owner_acknowledgements",
+        ):
+            assert by_field[field_name]["accepted_values"] is None, field_name
+
+
+@pytest.mark.asyncio
+async def test_no_financial_recommendation_appears_in_worksheet(monkeypatch: pytest.MonkeyPatch) -> None:
+    async with real_sqlite_session(_TABLES) as db:
+        monkeypatch.setattr(service, "AsyncSessionLocal", lambda: _SessionContext(db))
+        strategy = await _seed_strategy(db, slug="ma_crossover", module_version="1.0.0", is_active=True)
+        campaign = await _seed_pinned_campaign(db)
+        await _seed_canonical_preview_package(db, campaign_id=campaign.uuid, campaign_version=1, strategy_id=strategy.id)
+
+        result = await service.mandate_bootstrap_export(capital_campaign_id=2)
+
+        serialized = repr(result["owner_decision_worksheet"])
+        for forbidden in _FORBIDDEN_RECOMMENDATION_SUBSTRINGS:
+            assert forbidden not in serialized
+
+        risk_fields = (
+            "authorized_capital_usd",
+            "max_order_notional_usd",
+            "max_open_exposure_usd",
+            "max_daily_deployed_usd",
+            "max_daily_realized_loss_usd",
+            "max_campaign_drawdown_usd",
+            "max_slippage_bps",
+            "max_fee_bps",
+        )
+        by_field = {entry["field"]: entry for entry in result["owner_decision_worksheet"]}
+        for field_name in risk_fields:
+            entry = by_field[field_name]
+            assert entry["current_value"] is None
+            # example_format must be structural placeholder text, never a number.
+            assert entry["example_format"].startswith("<") and entry["example_format"].endswith(">")
+
+
+@pytest.mark.asyncio
+async def test_strategy_evidence_never_fills_allowed_strategy_versions_worksheet_entry(monkeypatch: pytest.MonkeyPatch) -> None:
+    async with real_sqlite_session(_TABLES) as db:
+        monkeypatch.setattr(service, "AsyncSessionLocal", lambda: _SessionContext(db))
+        strategy = await _seed_strategy(db, slug="ma_crossover", module_version="1.0.0", is_active=True)
+        campaign = await _seed_pinned_campaign(db)
+        await _seed_canonical_preview_package(
+            db, campaign_id=campaign.uuid, campaign_version=1, strategy_id=strategy.id, strategy_version="1.0.0"
+        )
+
+        result = await service.mandate_bootstrap_export(capital_campaign_id=2)
+
+        assert result["strategy_evidence"]["global_active_strategy"]["items"][0]["canonical_identity"] == "ma_crossover@1.0.0"
+        assert result["strategy_evidence"]["canonical_preview_package_continuity"]["canonical_identity"] == "ma_crossover@1.0.0"
+
+        entry = next(e for e in result["owner_decision_worksheet"] if e["field"] == "allowed_strategy_versions")
+        assert entry["current_value"] is None
+        assert entry["accepted_values"] is None
+        assert "ma_crossover@1.0.0" not in entry["example_format"]
+        assert "ma_crossover" not in repr(entry).lower()
+
+
+@pytest.mark.asyncio
+async def test_json_policy_structures_match_existing_contracts(monkeypatch: pytest.MonkeyPatch) -> None:
+    async with real_sqlite_session(_TABLES) as db:
+        monkeypatch.setattr(service, "AsyncSessionLocal", lambda: _SessionContext(db))
+        result = await service.mandate_bootstrap_export(capital_campaign_id=999)
+
+        by_field = {entry["field"]: entry for entry in result["owner_decision_worksheet"]}
+        policy_fields = (
+            "entry_policy",
+            "exit_policy",
+            "cooldown_policy",
+            "operating_schedule",
+            "reconciliation_policy",
+            "kill_switch_policy",
+            "owner_acknowledgements",
+            "authorization_evidence_summary",
+            "authorization_evidence",
+            "deterministic_explanation",
+        )
+        for field_name in policy_fields:
+            entry = by_field[field_name]
+            assert entry["input_type"] == "json_object"
+            assert entry["accepted_values"] is None
+            # _parse_mandate_policy_bundle only enforces "must be a JSON object" --
+            # no historical policy contents or prior mandate values may appear.
+            assert "prior" not in entry["description"].lower() or "never derivable" in entry["description"].lower()
+
+
+@pytest.mark.asyncio
+async def test_worksheet_ordering_is_deterministic(monkeypatch: pytest.MonkeyPatch) -> None:
+    async with real_sqlite_session(_TABLES) as db:
+        monkeypatch.setattr(service, "AsyncSessionLocal", lambda: _SessionContext(db))
+
+        first = await service.mandate_bootstrap_export(capital_campaign_id=999)
+        second = await service.mandate_bootstrap_export(capital_campaign_id=999)
+
+        first_order = [entry["field"] for entry in first["owner_decision_worksheet"]]
+        second_order = [entry["field"] for entry in second["owner_decision_worksheet"]]
+        assert first_order == second_order == sorted(first_order)
+
+
+@pytest.mark.asyncio
+async def test_summary_counts_derive_from_worksheet_contents(monkeypatch: pytest.MonkeyPatch) -> None:
+    async with real_sqlite_session(_TABLES) as db:
+        monkeypatch.setattr(service, "AsyncSessionLocal", lambda: _SessionContext(db))
+        result = await service.mandate_bootstrap_export(capital_campaign_id=999)
+
+        worksheet = result["owner_decision_worksheet"]
+        summary = result["worksheet_summary"]
+
+        assert summary["field_count"] == len(worksheet)
+        assert summary["enum_constrained_count"] == sum(1 for e in worksheet if e["accepted_values"])
+        assert summary["structured_json_count"] == sum(1 for e in worksheet if e["input_type"] == "json_object")
+        assert summary["numeric_count"] == sum(1 for e in worksheet if e["input_type"] in {"decimal", "integer"})
+        assert summary["text_count"] == sum(1 for e in worksheet if e["input_type"] in {"text", "csv_list", "enum"})
+        assert summary["boolean_count"] == sum(1 for e in worksheet if e["input_type"] == "boolean")
+        # All six counters must partition the worksheet with no double-counting and no gaps.
+        assert (
+            summary["structured_json_count"]
+            + summary["numeric_count"]
+            + summary["text_count"]
+            + summary["boolean_count"]
+            == summary["field_count"]
+        )
+
+
+@pytest.mark.asyncio
+async def test_campaign_not_found_still_produces_complete_worksheet(monkeypatch: pytest.MonkeyPatch) -> None:
+    async with real_sqlite_session(_TABLES) as db:
+        monkeypatch.setattr(service, "AsyncSessionLocal", lambda: _SessionContext(db))
+        result = await service.mandate_bootstrap_export(capital_campaign_id=999)
+
+        assert len(result["owner_decision_worksheet"]) == 32
+        assert result["worksheet_summary"]["field_count"] == 32
+        assert all(entry["current_value"] is None for entry in result["owner_decision_worksheet"])
+
+
+@pytest.mark.asyncio
+async def test_no_database_mutation_occurs_stage6(monkeypatch: pytest.MonkeyPatch) -> None:
+    async with real_sqlite_session(_TABLES) as db:
+        strategy = await _seed_strategy(db, slug="ma_crossover", module_version="1.0.0", is_active=True)
+        campaign = await _seed_pinned_campaign(db)
+        await _seed_canonical_preview_package(db, campaign_id=campaign.uuid, campaign_version=1, strategy_id=strategy.id)
+
+        monkeypatch.setattr(service, "AsyncSessionLocal", lambda: _SessionContext(db))
+
+        def _forbid(*args: Any, **kwargs: Any) -> Any:
+            raise AssertionError("mandate_bootstrap_export must never mutate the database")
+
+        monkeypatch.setattr(db, "add", _forbid)
+        monkeypatch.setattr(db, "commit", _forbid)
+        monkeypatch.setattr(db, "flush", _forbid)
+        monkeypatch.setattr(db, "delete", _forbid)
+
+        result = await service.mandate_bootstrap_export(capital_campaign_id=2)
+
+        assert result["worksheet_summary"]["field_count"] == 32
+
+
+@pytest.mark.asyncio
+async def test_executable_and_overall_status_remain_fixed_with_stage6_worksheet(monkeypatch: pytest.MonkeyPatch) -> None:
+    async with real_sqlite_session(_TABLES) as db:
+        monkeypatch.setattr(service, "AsyncSessionLocal", lambda: _SessionContext(db))
+        result = await service.mandate_bootstrap_export(capital_campaign_id=999)
+
+        assert result["executable"] is False
+        assert result["overall_status"] == "BLOCKED"
 
 # mandate_bootstrap()'s own parameter names that differ from this export's field keys
 # (the underlying value is identical -- provider/environment are just named
