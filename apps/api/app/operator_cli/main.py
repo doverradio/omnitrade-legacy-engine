@@ -2,9 +2,11 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import json
 import sys
 from datetime import datetime, timezone
 from decimal import Decimal
+from pathlib import Path
 from typing import Any
 from uuid import UUID, uuid4
 
@@ -70,6 +72,7 @@ from app.operator_cli.service import (
     historical_buy_campaign_replay_audit,
     fetch_risk_ledger_diagnosis,
     fetch_watch_status,
+    mandate_bootstrap,
     refresh_provider_balance_evidence,
     inspect_legacy_campaign_transition,
     pause_canonical_proving_activation_bundle,
@@ -120,6 +123,7 @@ def _build_parser() -> argparse.ArgumentParser:
             "  ./operator legacy-campaign-transition-audit --legacy-campaign-id <legacy_uuid> --json\n"
             "  ./operator legacy-campaign-transition-rollback --legacy-campaign-id <legacy_uuid> --canonical-campaign-id <canonical_uuid> --canonical-campaign-version 1 --paper-account-id <paper_uuid> --live-trading-profile-id <profile_uuid> --provider kraken_spot --environment production --product BTC-USD --actor operator:human --confirm --json\n"
             "  ./operator risk-ledger-diagnosis --account-id <paper_uuid> --json\n"
+            "  ./operator mandate-bootstrap --owner-actor-id operator:human --autonomy-level LEVEL_2 --provider kraken_spot --environment production --exchange-connection-id <conn_uuid> --live-trading-profile-id <profile_uuid> --capital-campaign-id 2 --authorized-capital-usd 25 --max-order-notional-usd 5 --max-open-exposure-usd 10 --max-daily-deployed-usd 10 --max-daily-realized-loss-usd 3 --max-campaign-drawdown-usd 5 --max-consecutive-losses 2 --position-limit 1 --price-evidence-max-age-seconds 30 --max-slippage-bps 25 --max-fee-bps 10 --allowed-products BTC-USD --allowed-order-sides BUY,SELL,HOLD --allowed-strategy-versions ma_crossover@1.0.0 --approval-policy MANDATE_ALLOWED --policy-bundle-json @campaign-2-mandate-policy.json --authorization-method owner_signature --actor operator:human --reason campaign_2_bootstrap --idempotency-key mandate-bootstrap-campaign-2 --confirm --json\n"
             "  ./operator status --json\n"
             "  ./operator status --no-color --verbose"
         ),
@@ -789,6 +793,64 @@ def _build_parser() -> argparse.ArgumentParser:
     mandate_diagnosis.add_argument("--environment", type=str, required=True)
     mandate_diagnosis.add_argument("--json", action="store_true", dest="json_output")
 
+    mandate_bootstrap_parser = subparsers.add_parser(
+        "mandate-bootstrap",
+        parents=[common],
+        help="Governed end-to-end creation of a new Autonomous Capital Mandate",
+        description=(
+            "Orchestrates the existing governed mandate lifecycle service functions in order -- "
+            "create_mandate, create_mandate_version, apply_mandate_lifecycle_action(SUBMIT_FOR_AUTHORIZATION), "
+            "authorize_mandate_version, apply_mandate_lifecycle_action(ACTIVATE) -- the same functions "
+            "app/api/routes/autonomous_capital_mandates.py calls. No business logic, validation, or "
+            "governance rule is added or bypassed here; this only sequences the existing calls. "
+            "Fully idempotent: rerunning with the same --idempotency-key resumes at whatever stage "
+            "already completed instead of creating duplicates. Never mutates any pre-existing mandate."
+        ),
+    )
+    mandate_bootstrap_parser.add_argument("--owner-actor-id", type=str, required=True)
+    mandate_bootstrap_parser.add_argument("--autonomy-level", type=str, required=True)
+    mandate_bootstrap_parser.add_argument("--provider", type=str, required=True)
+    mandate_bootstrap_parser.add_argument("--environment", type=str, required=True)
+    mandate_bootstrap_parser.add_argument("--exchange-connection-id", type=UUID, required=True)
+    mandate_bootstrap_parser.add_argument("--live-trading-profile-id", type=UUID, required=True)
+    mandate_bootstrap_parser.add_argument("--paper-account-id", type=UUID, default=None)
+    mandate_bootstrap_parser.add_argument("--capital-campaign-id", type=int, default=None, help="capital_campaign_id to scope the new mandate to, e.g. 2 for campaign 2")
+    mandate_bootstrap_parser.add_argument("--mandate-expires-at", type=str, default=None)
+    mandate_bootstrap_parser.add_argument("--base-currency", type=str, default="USD")
+    mandate_bootstrap_parser.add_argument("--authorized-capital-usd", type=Decimal, required=True)
+    mandate_bootstrap_parser.add_argument("--max-order-notional-usd", type=Decimal, required=True)
+    mandate_bootstrap_parser.add_argument("--max-open-exposure-usd", type=Decimal, required=True)
+    mandate_bootstrap_parser.add_argument("--max-daily-deployed-usd", type=Decimal, required=True)
+    mandate_bootstrap_parser.add_argument("--max-daily-realized-loss-usd", type=Decimal, required=True)
+    mandate_bootstrap_parser.add_argument("--max-campaign-drawdown-usd", type=Decimal, required=True)
+    mandate_bootstrap_parser.add_argument("--max-consecutive-losses", type=int, required=True)
+    mandate_bootstrap_parser.add_argument("--position-limit", type=int, required=True)
+    mandate_bootstrap_parser.add_argument("--price-evidence-max-age-seconds", type=int, required=True)
+    mandate_bootstrap_parser.add_argument("--max-slippage-bps", type=Decimal, required=True)
+    mandate_bootstrap_parser.add_argument("--max-fee-bps", type=Decimal, required=True)
+    mandate_bootstrap_parser.add_argument("--allowed-products", type=_parse_csv_argument, required=True, help="comma-separated, e.g. BTC-USD,ETH-USD")
+    mandate_bootstrap_parser.add_argument("--allowed-order-sides", type=_parse_csv_argument, required=True, help="comma-separated, e.g. BUY,SELL,HOLD")
+    mandate_bootstrap_parser.add_argument("--allowed-strategy-versions", type=_parse_csv_argument, required=True)
+    mandate_bootstrap_parser.add_argument("--approval-policy", type=str, required=True, help="HUMAN_REQUIRED or MANDATE_ALLOWED")
+    mandate_bootstrap_parser.add_argument(
+        "--policy-bundle-json",
+        type=_parse_mandate_policy_bundle,
+        required=True,
+        help=(
+            "JSON object (or @path/to/file.json) with keys: entry_policy, exit_policy, cooldown_policy, "
+            "operating_schedule, reconciliation_policy, kill_switch_policy, owner_acknowledgements, "
+            "authorization_evidence_summary, authorization_evidence, deterministic_explanation"
+        ),
+    )
+    mandate_bootstrap_parser.add_argument("--authorization-method", type=str, required=True)
+    mandate_bootstrap_parser.add_argument("--authorization-expires-at", type=str, default=None)
+    mandate_bootstrap_parser.add_argument("--actor", type=str, default="operator:human")
+    mandate_bootstrap_parser.add_argument("--reason", type=str, required=True)
+    mandate_bootstrap_parser.add_argument("--idempotency-key", type=str, required=True)
+    mandate_bootstrap_parser.add_argument("--audit-correlation-id", type=UUID, default=None)
+    mandate_bootstrap_parser.add_argument("--confirm", action="store_true")
+    mandate_bootstrap_parser.add_argument("--json", action="store_true", dest="json_output")
+
     proving_pause = subparsers.add_parser(
         "canonical-proving-pause",
         parents=[common],
@@ -877,6 +939,53 @@ def _build_parser() -> argparse.ArgumentParser:
     hold_diagnostic.add_argument("--json", action="store_true", dest="json_output")
 
     return parser
+
+
+_MANDATE_POLICY_BUNDLE_REQUIRED_KEYS = (
+    "entry_policy",
+    "exit_policy",
+    "cooldown_policy",
+    "operating_schedule",
+    "reconciliation_policy",
+    "kill_switch_policy",
+    "owner_acknowledgements",
+    "authorization_evidence_summary",
+    "authorization_evidence",
+    "deterministic_explanation",
+)
+
+
+def _parse_csv_argument(value: str) -> tuple[str, ...]:
+    items = tuple(item.strip() for item in value.split(",") if item.strip())
+    if not items:
+        raise argparse.ArgumentTypeError("expected at least one comma-separated value")
+    return items
+
+
+def _parse_mandate_policy_bundle(value: str) -> dict[str, dict[str, Any]]:
+    """Parses --policy-bundle-json: either a raw JSON object string or an @-prefixed path
+    to a JSON file (mirroring curl's `-d @file.json` convention), containing every nested
+    policy/evidence dict mandate-bootstrap needs. These are inherently unstructured JSON
+    objects, not flat scalars, so one JSON blob is far less error-prone here than a dozen
+    more --flag values -- especially for owner_acknowledgements/authorization_evidence/
+    deterministic_explanation, which are the actual audit evidence for a live-money
+    authorization decision and must be supplied deliberately, never defaulted."""
+    raw = value
+    if value.startswith("@"):
+        raw = Path(value[1:]).read_text(encoding="utf-8")
+    try:
+        parsed = json.loads(raw)
+    except json.JSONDecodeError as exc:
+        raise argparse.ArgumentTypeError(f"--policy-bundle-json: invalid JSON: {exc}") from exc
+    if not isinstance(parsed, dict):
+        raise argparse.ArgumentTypeError("--policy-bundle-json: expected a JSON object")
+    missing = [key for key in _MANDATE_POLICY_BUNDLE_REQUIRED_KEYS if key not in parsed]
+    if missing:
+        raise argparse.ArgumentTypeError(f"--policy-bundle-json: missing required keys: {', '.join(missing)}")
+    non_dict_keys = [key for key in _MANDATE_POLICY_BUNDLE_REQUIRED_KEYS if not isinstance(parsed[key], dict)]
+    if non_dict_keys:
+        raise argparse.ArgumentTypeError(f"--policy-bundle-json: expected JSON objects for keys: {', '.join(non_dict_keys)}")
+    return parsed
 
 
 def _resolve_preview_idempotency_seed(args: argparse.Namespace) -> str | None:
@@ -1060,6 +1169,54 @@ async def _run_async(args: argparse.Namespace) -> tuple[int, dict[str, Any], str
             live_trading_profile_id=args.live_trading_profile_id,
             provider=args.provider,
             environment=args.environment,
+        )
+        return 0, payload, render_json(payload)
+
+    if args.command == "mandate-bootstrap":
+        policy_bundle = args.policy_bundle_json
+        payload = await mandate_bootstrap(
+            owner_actor_id=args.owner_actor_id,
+            autonomy_level=args.autonomy_level,
+            provider=args.provider,
+            environment=args.environment,
+            exchange_connection_id=args.exchange_connection_id,
+            live_trading_profile_id=args.live_trading_profile_id,
+            paper_account_id=args.paper_account_id,
+            capital_campaign_id=args.capital_campaign_id,
+            mandate_expires_at=_parse_iso_datetime(args.mandate_expires_at) if args.mandate_expires_at else None,
+            base_currency=args.base_currency,
+            authorized_capital_usd=args.authorized_capital_usd,
+            max_order_notional_usd=args.max_order_notional_usd,
+            max_open_exposure_usd=args.max_open_exposure_usd,
+            max_daily_deployed_usd=args.max_daily_deployed_usd,
+            max_daily_realized_loss_usd=args.max_daily_realized_loss_usd,
+            max_campaign_drawdown_usd=args.max_campaign_drawdown_usd,
+            max_consecutive_losses=args.max_consecutive_losses,
+            position_limit=args.position_limit,
+            price_evidence_max_age_seconds=args.price_evidence_max_age_seconds,
+            max_slippage_bps=args.max_slippage_bps,
+            max_fee_bps=args.max_fee_bps,
+            allowed_products=args.allowed_products,
+            allowed_order_sides=args.allowed_order_sides,
+            allowed_strategy_versions=args.allowed_strategy_versions,
+            approval_policy=args.approval_policy,
+            entry_policy=policy_bundle["entry_policy"],
+            exit_policy=policy_bundle["exit_policy"],
+            cooldown_policy=policy_bundle["cooldown_policy"],
+            operating_schedule=policy_bundle["operating_schedule"],
+            reconciliation_policy=policy_bundle["reconciliation_policy"],
+            kill_switch_policy=policy_bundle["kill_switch_policy"],
+            owner_acknowledgements=policy_bundle["owner_acknowledgements"],
+            authorization_evidence_summary=policy_bundle["authorization_evidence_summary"],
+            authorization_method=args.authorization_method,
+            authorization_evidence=policy_bundle["authorization_evidence"],
+            deterministic_explanation=policy_bundle["deterministic_explanation"],
+            authorization_expires_at=_parse_iso_datetime(args.authorization_expires_at) if args.authorization_expires_at else None,
+            actor=args.actor,
+            reason=args.reason,
+            idempotency_key=args.idempotency_key,
+            audit_correlation_id=args.audit_correlation_id,
+            confirm=bool(args.confirm),
         )
         return 0, payload, render_json(payload)
 

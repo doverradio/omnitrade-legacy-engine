@@ -53,6 +53,17 @@ from app.models.strategy_roster_proposal_outcome import StrategyRosterProposalOu
 from app.models.strategy_roster_run import StrategyRosterRun
 from app.services.autonomous_cycle import AutonomousCycleRequest, run_autonomous_preview_cycle
 from app.services.autonomous_cycle.orchestrator import normalize_product_id
+from app.services.mandates.contracts import (
+    MandateAuthorizationRequest,
+    MandateLifecycleActionRequest,
+    MandateVersionCreateRequest,
+)
+from app.services.mandates.lifecycle import (
+    apply_mandate_lifecycle_action,
+    authorize_mandate_version,
+    create_mandate,
+    create_mandate_version,
+)
 from app.services.canonical_campaign_binding import (
     CanonicalProvingAccountTransitionRequest,
     CanonicalCampaignBindingRequest,
@@ -201,18 +212,21 @@ def _commission_db_timeout_seconds() -> int:
 _commission_stage_sequence_by_key: dict[str, int] = {}
 
 
-def _log_commission_stage(*, stage: str, status: str, root_idempotency_key: str, **extra: Any) -> None:
-    """Structured log plus unconditional stderr progress line for one canonical-proving-commission
-    stage transition. Always writes to stderr directly (not only via `logging`) so operators see
-    forward progress even when no logging handler is configured -- the failure mode this exists to
+def _log_orchestration_stage(*, operation: str, stage: str, status: str, root_idempotency_key: str, **extra: Any) -> None:
+    """Structured log plus unconditional stderr progress line for one stage transition of a
+    governed multi-stage orchestration command (canonical-proving-commission, mandate-bootstrap,
+    ...). Always writes to stderr directly (not only via `logging`) so operators see forward
+    progress even when no logging handler is configured -- the failure mode this exists to
     prevent is the command appearing frozen with zero visible output for its entire runtime.
     Never touches stdout: --json callers must get byte-for-byte the same stdout as before."""
-    sequence = _commission_stage_sequence_by_key.get(root_idempotency_key, 0) + 1
-    _commission_stage_sequence_by_key[root_idempotency_key] = sequence
+    sequence_key = f"{operation}:{root_idempotency_key}"
+    sequence = _commission_stage_sequence_by_key.get(sequence_key, 0) + 1
+    _commission_stage_sequence_by_key[sequence_key] = sequence
     detail = " ".join(f"{key}={value}" for key, value in extra.items())
     suffix = f" {detail}" if detail else ""
     logger.info(
-        "canonical_proving_commission_stage seq=%s stage=%s status=%s root_idempotency_key=%s%s",
+        "%s_stage seq=%s stage=%s status=%s root_idempotency_key=%s%s",
+        operation.replace("-", "_"),
         sequence,
         stage,
         status,
@@ -220,20 +234,30 @@ def _log_commission_stage(*, stage: str, status: str, root_idempotency_key: str,
         suffix,
     )
     print(
-        f"[canonical-proving-commission] [{sequence}] stage={stage} status={status} root_idempotency_key={root_idempotency_key}{suffix}",
+        f"[{operation}] [{sequence}] stage={stage} status={status} root_idempotency_key={root_idempotency_key}{suffix}",
         file=sys.stderr,
         flush=True,
     )
 
 
-async def _await_db_operation(*, stage: str, root_idempotency_key: str, operation, **extra: Any):
-    _log_commission_stage(stage=stage, status="started", root_idempotency_key=root_idempotency_key, **extra)
+def _log_commission_stage(*, stage: str, status: str, root_idempotency_key: str, **extra: Any) -> None:
+    _log_orchestration_stage(
+        operation="canonical-proving-commission",
+        stage=stage,
+        status=status,
+        root_idempotency_key=root_idempotency_key,
+        **extra,
+    )
+
+
+async def _await_db_operation(*, stage: str, root_idempotency_key: str, operation, operation_name: str = "canonical-proving-commission", **extra: Any):
+    _log_orchestration_stage(operation=operation_name, stage=stage, status="started", root_idempotency_key=root_idempotency_key, **extra)
     try:
         result = await asyncio.wait_for(operation, timeout=_commission_db_timeout_seconds())
     except asyncio.TimeoutError as exc:
-        _log_commission_stage(stage=stage, status="timeout", root_idempotency_key=root_idempotency_key, **extra)
+        _log_orchestration_stage(operation=operation_name, stage=stage, status="timeout", root_idempotency_key=root_idempotency_key, **extra)
         raise PermissionError(f"database_connection_timeout stage={stage}") from exc
-    _log_commission_stage(stage=stage, status="completed", root_idempotency_key=root_idempotency_key, **extra)
+    _log_orchestration_stage(operation=operation_name, stage=stage, status="completed", root_idempotency_key=root_idempotency_key, **extra)
     return result
 
 
@@ -630,6 +654,271 @@ async def mandate_identity_diagnosis(
             "would_resolve_mandate_id": str(resolved_mandate.mandate_id) if resolved_mandate is not None else None,
             "resolution_would_fail_reason": diagnosis,
         }
+
+
+class MandateBootstrapStageError(RuntimeError):
+    """Raised when mandate_bootstrap() fails partway through its governed stage sequence.
+    Carries exactly which stage failed and which stages already completed (and therefore
+    do not need to be repeated -- rerunning mandate_bootstrap() with the same
+    idempotency_key resumes from here via each stage's own idempotency-key dedup) so
+    operator-facing output never just says "it failed" without saying where."""
+
+    def __init__(
+        self,
+        *,
+        stage: str,
+        completed_stages: list[dict[str, Any]],
+        root_idempotency_key: str,
+        audit_correlation_id: uuid.UUID,
+        original: Exception,
+    ) -> None:
+        self.stage = stage
+        self.completed_stages = completed_stages
+        self.root_idempotency_key = root_idempotency_key
+        self.audit_correlation_id = audit_correlation_id
+        self.original = original
+        completed_names = ", ".join(item["stage"] for item in completed_stages) or "none"
+        super().__init__(
+            f"mandate_bootstrap stopped at stage={stage} (completed: {completed_names}; "
+            f"root_idempotency_key={root_idempotency_key}): {original}"
+        )
+
+
+async def mandate_bootstrap(
+    *,
+    owner_actor_id: str,
+    autonomy_level: str,
+    provider: str,
+    environment: str,
+    exchange_connection_id: UUID,
+    live_trading_profile_id: UUID,
+    paper_account_id: UUID | None,
+    capital_campaign_id: int | None,
+    mandate_expires_at: datetime | None,
+    base_currency: str,
+    authorized_capital_usd: Decimal,
+    max_order_notional_usd: Decimal,
+    max_open_exposure_usd: Decimal,
+    max_daily_deployed_usd: Decimal,
+    max_daily_realized_loss_usd: Decimal,
+    max_campaign_drawdown_usd: Decimal,
+    max_consecutive_losses: int,
+    position_limit: int,
+    price_evidence_max_age_seconds: int,
+    max_slippage_bps: Decimal,
+    max_fee_bps: Decimal,
+    allowed_products: tuple[str, ...],
+    allowed_order_sides: tuple[str, ...],
+    allowed_strategy_versions: tuple[str, ...],
+    approval_policy: str,
+    entry_policy: dict[str, Any],
+    exit_policy: dict[str, Any],
+    cooldown_policy: dict[str, Any],
+    operating_schedule: dict[str, Any],
+    reconciliation_policy: dict[str, Any],
+    kill_switch_policy: dict[str, Any],
+    owner_acknowledgements: dict[str, Any],
+    authorization_evidence_summary: dict[str, Any],
+    authorization_method: str,
+    authorization_evidence: dict[str, Any],
+    deterministic_explanation: dict[str, Any],
+    authorization_expires_at: datetime | None,
+    actor: str,
+    reason: str,
+    idempotency_key: str,
+    audit_correlation_id: UUID | None,
+    confirm: bool,
+) -> dict[str, Any]:
+    """Governed orchestration of the existing, unmodified mandate lifecycle: create_mandate()
+    -> create_mandate_version() -> apply_mandate_lifecycle_action(SUBMIT_FOR_AUTHORIZATION) ->
+    authorize_mandate_version() -> apply_mandate_lifecycle_action(ACTIVATE). These are exactly
+    the same service-layer functions app/api/routes/autonomous_capital_mandates.py calls --
+    this function reimplements no business logic, validation, or governance rule; it only
+    sequences the existing calls and surfaces per-stage progress/failure to the operator.
+
+    Every stage derives its own idempotency key from `idempotency_key` (f"{root}:<stage>")
+    and shares one `audit_correlation_id`, so a full rerun with the same `idempotency_key`
+    resumes/no-ops at whatever stage already completed instead of creating duplicate
+    mandates, versions, authorizations, or audit rows."""
+    if not confirm:
+        raise PermissionError("confirm=true is required for mandate bootstrap")
+
+    root_idempotency_key = idempotency_key
+    correlation_id = audit_correlation_id or uuid.uuid4()
+    stages: list[dict[str, Any]] = []
+    current_stage = "create_mandate"
+
+    async with AsyncSessionLocal() as db:
+        try:
+            mandate = await _await_db_operation(
+                operation_name="mandate-bootstrap",
+                stage=current_stage,
+                root_idempotency_key=root_idempotency_key,
+                operation=create_mandate(
+                    db=db,
+                    owner_actor_id=owner_actor_id,
+                    autonomy_level=autonomy_level,
+                    provider=provider,
+                    exchange_environment=environment,
+                    exchange_connection_id=exchange_connection_id,
+                    live_trading_profile_id=live_trading_profile_id,
+                    paper_account_id=paper_account_id,
+                    capital_campaign_id=capital_campaign_id,
+                    expires_at=mandate_expires_at,
+                    actor=actor,
+                    idempotency_key=f"{root_idempotency_key}:create-mandate",
+                    reason=reason,
+                ),
+            )
+            stages.append({"stage": current_stage, "mandate_id": str(mandate.mandate_id), "status": mandate.status})
+
+            current_stage = "create_mandate_version"
+            version = await _await_db_operation(
+                operation_name="mandate-bootstrap",
+                stage=current_stage,
+                root_idempotency_key=root_idempotency_key,
+                operation=create_mandate_version(
+                    db=db,
+                    request=MandateVersionCreateRequest(
+                        mandate_id=mandate.mandate_id,
+                        actor=actor,
+                        base_currency=base_currency,
+                        authorized_capital_usd=authorized_capital_usd,
+                        max_order_notional_usd=max_order_notional_usd,
+                        max_open_exposure_usd=max_open_exposure_usd,
+                        max_daily_deployed_usd=max_daily_deployed_usd,
+                        max_daily_realized_loss_usd=max_daily_realized_loss_usd,
+                        max_campaign_drawdown_usd=max_campaign_drawdown_usd,
+                        max_consecutive_losses=max_consecutive_losses,
+                        position_limit=position_limit,
+                        price_evidence_max_age_seconds=price_evidence_max_age_seconds,
+                        max_slippage_bps=max_slippage_bps,
+                        max_fee_bps=max_fee_bps,
+                        allowed_products=tuple(allowed_products),
+                        allowed_order_sides=tuple(allowed_order_sides),
+                        allowed_strategy_versions=tuple(allowed_strategy_versions),
+                        entry_policy=entry_policy,
+                        exit_policy=exit_policy,
+                        cooldown_policy=cooldown_policy,
+                        operating_schedule=operating_schedule,
+                        approval_policy=approval_policy,
+                        reconciliation_policy=reconciliation_policy,
+                        kill_switch_policy=kill_switch_policy,
+                        owner_acknowledgements=owner_acknowledgements,
+                        authorization_evidence_summary=authorization_evidence_summary,
+                        idempotency_key=f"{root_idempotency_key}:create-version",
+                        audit_correlation_id=correlation_id,
+                    ),
+                ),
+            )
+            stages.append(
+                {
+                    "stage": current_stage,
+                    "mandate_version_id": str(version.mandate_version_id),
+                    "version_number": version.version_number,
+                }
+            )
+
+            current_stage = "submit_for_authorization"
+            submitted = await _await_db_operation(
+                operation_name="mandate-bootstrap",
+                stage=current_stage,
+                root_idempotency_key=root_idempotency_key,
+                operation=apply_mandate_lifecycle_action(
+                    db=db,
+                    request=MandateLifecycleActionRequest(
+                        mandate_id=mandate.mandate_id,
+                        actor=actor,
+                        action="SUBMIT_FOR_AUTHORIZATION",
+                        reason=reason,
+                        idempotency_key=f"{root_idempotency_key}:submit-for-authorization",
+                        audit_correlation_id=correlation_id,
+                        software_build_version=None,
+                    ),
+                ),
+            )
+            stages.append({"stage": current_stage, "mandate_id": str(submitted.mandate_id), "status": submitted.status})
+
+            current_stage = "authorize_version"
+            authorization = await _await_db_operation(
+                operation_name="mandate-bootstrap",
+                stage=current_stage,
+                root_idempotency_key=root_idempotency_key,
+                operation=authorize_mandate_version(
+                    db=db,
+                    request=MandateAuthorizationRequest(
+                        mandate_id=mandate.mandate_id,
+                        mandate_version_id=version.mandate_version_id,
+                        actor=actor,
+                        authorization_method=authorization_method,
+                        owner_acknowledgements=owner_acknowledgements,
+                        authorization_evidence=authorization_evidence,
+                        deterministic_explanation=deterministic_explanation,
+                        expires_at=authorization_expires_at,
+                        idempotency_key=f"{root_idempotency_key}:authorize",
+                        audit_correlation_id=correlation_id,
+                    ),
+                ),
+            )
+            stages.append(
+                {
+                    "stage": current_stage,
+                    "mandate_authorization_id": str(authorization.mandate_authorization_id),
+                    "authorization_state": authorization.authorization_state,
+                }
+            )
+
+            current_stage = "activate_mandate"
+            activated = await _await_db_operation(
+                operation_name="mandate-bootstrap",
+                stage=current_stage,
+                root_idempotency_key=root_idempotency_key,
+                operation=apply_mandate_lifecycle_action(
+                    db=db,
+                    request=MandateLifecycleActionRequest(
+                        mandate_id=mandate.mandate_id,
+                        actor=actor,
+                        action="ACTIVATE",
+                        reason=reason,
+                        idempotency_key=f"{root_idempotency_key}:activate",
+                        audit_correlation_id=correlation_id,
+                        software_build_version=None,
+                    ),
+                ),
+            )
+            stages.append({"stage": current_stage, "mandate_id": str(activated.mandate_id), "status": activated.status})
+        except Exception as exc:
+            await db.rollback()
+            _log_orchestration_stage(
+                operation="mandate-bootstrap",
+                stage=current_stage,
+                status="failed",
+                root_idempotency_key=root_idempotency_key,
+                error=str(exc),
+            )
+            raise MandateBootstrapStageError(
+                stage=current_stage,
+                completed_stages=stages,
+                root_idempotency_key=root_idempotency_key,
+                audit_correlation_id=correlation_id,
+                original=exc,
+            ) from exc
+
+        governing_version = await db.get(AutonomousCapitalMandateVersion, version.mandate_version_id)
+
+    return {
+        "mandate_id": str(mandate.mandate_id),
+        "mandate_version_id": str(version.mandate_version_id),
+        "mandate_version_number": version.version_number,
+        "mandate_authorization_id": str(authorization.mandate_authorization_id),
+        "status": activated.status,
+        "capital_campaign_id": activated.capital_campaign_id,
+        "governing_version_is_authorized": bool(governing_version.is_authorized) if governing_version is not None else None,
+        "governing_version_is_active": bool(governing_version.is_active) if governing_version is not None else None,
+        "audit_correlation_id": str(correlation_id),
+        "root_idempotency_key": root_idempotency_key,
+        "stages": stages,
+    }
 
 
 async def _resolve_exchange_connection_for_commissioning(
