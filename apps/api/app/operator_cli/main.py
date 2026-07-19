@@ -855,16 +855,21 @@ def _build_parser() -> argparse.ArgumentParser:
     mandate_bootstrap_export_parser = subparsers.add_parser(
         "mandate-bootstrap-export",
         parents=[common],
-        help="Read-only export of authoritative mandate-bootstrap inputs for one capital campaign (Stage 1: campaign + definition evidence only)",
+        help="Read-only export of authoritative mandate-bootstrap inputs for one capital campaign (Stages 1-2: campaign, definition, paper account, live trading profile)",
         description=(
-            "Stage 1 of the read-only mandate-bootstrap export design. Resolves only "
-            "CapitalCampaign identity and, if pinned, CapitalCampaignDefinition evidence for "
+            "Stages 1-2 of the read-only mandate-bootstrap export design. Resolves "
+            "CapitalCampaign identity, (if pinned) CapitalCampaignDefinition evidence, the "
+            "campaign's PaperAccount, and LiveTradingProfile candidates strictly scoped to "
+            "LiveTradingProfile.paper_account_id == CapitalCampaign.paper_account_id, for "
             "one --capital-campaign-id. Performs no writes -- no lifecycle action, no "
             "authorization, no mandate creation. Every field is classified as "
             "DATABASE_DERIVED, CONFIGURATION_DERIVED, OWNER_INPUT_REQUIRED, MISSING, or "
-            "CONFLICTING; this stage only classifies capital_campaign_id, campaign_uuid, "
-            "paper_account_id, and base_currency. Never reuses another campaign's or "
-            "mandate's values. Always reports executable=false and overall_status=BLOCKED."
+            "CONFLICTING; this stage classifies capital_campaign_id, campaign_uuid, "
+            "paper_account_id, base_currency, paper_account_asset_class, "
+            "paper_account_is_active, and live_trading_profile_id. Never reuses another "
+            "campaign's, another mandate's, or a conversational value; multiple candidate "
+            "live trading profiles fail closed as CONFLICTING rather than picking the "
+            "newest. Always reports executable=false and overall_status=BLOCKED."
         ),
     )
     mandate_bootstrap_export_parser.add_argument("--capital-campaign-id", type=int, required=True)

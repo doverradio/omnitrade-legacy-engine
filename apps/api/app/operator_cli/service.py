@@ -934,15 +934,44 @@ def _decimal_str(value: Decimal | None) -> str | None:
     return str(value) if value is not None else None
 
 
+_MANDATE_BOOTSTRAP_EXPORT_LIVE_PROFILE_GOVERNANCE_FIELDS = (
+    "operating_mode",
+    "lifecycle_state",
+    "approval_state",
+    "live_opt_in",
+    "human_approval_recorded",
+    "governance_approved",
+    "risk_authority_model",
+    "autonomous_capital_allocation",
+    "autonomous_strategy_evolution",
+    "automatic_promotion_enabled",
+)
+
+
+def _live_trading_profile_candidate_summary(profile: LiveTradingProfile) -> dict[str, Any]:
+    """Secret-safe summary for candidate listing -- LiveTradingProfile has no
+    secret-bearing columns, but this stays deliberately narrower than the full
+    governance-field payload emitted only for a uniquely resolved profile."""
+    return {
+        "id": str(profile.id),
+        "operating_mode": profile.operating_mode,
+        "lifecycle_state": profile.lifecycle_state,
+        "approval_state": profile.approval_state,
+    }
+
+
 async def mandate_bootstrap_export(*, capital_campaign_id: int) -> dict[str, Any]:
-    """Stage 1 of the read-only mandate-bootstrap export design: resolves only
-    CapitalCampaign identity and (if pinned) CapitalCampaignDefinition evidence for one
+    """Stages 1-2 of the read-only mandate-bootstrap export design: resolves
+    CapitalCampaign identity, (if pinned) CapitalCampaignDefinition evidence, the
+    campaign's PaperAccount, and LiveTradingProfile candidates strictly scoped to
+    LiveTradingProfile.paper_account_id == CapitalCampaign.paper_account_id, for one
     capital_campaign_id. Performs SELECT statements only -- no db.add, flush, or commit,
     no lifecycle action, no authorization, no mandate creation. Never reuses another
-    mandate's or another campaign's values; every field is either read fresh from this
-    campaign's own records or explicitly marked unresolved. exchange_connection_id,
-    live_trading_profile_id, and strategy resolution are out of scope for this stage --
-    see the approved read-only mandate-bootstrap export design for the full field set."""
+    mandate's, another campaign's, or a conversational value -- every field is either
+    read fresh from this campaign's own records or explicitly marked unresolved.
+    exchange_connection_id, provider/environment, and strategy resolution are out of
+    scope for this stage -- see the approved read-only mandate-bootstrap export design
+    for the full field set."""
     async with AsyncSessionLocal() as db:
         campaign = await db.get(CapitalCampaign, capital_campaign_id)
 
@@ -954,6 +983,9 @@ async def mandate_bootstrap_export(*, capital_campaign_id: int) -> dict[str, Any
                 "executable": False,
                 "campaign": {"found": False},
                 "definition": None,
+                "paper_account": None,
+                "live_trading_profile": None,
+                "live_trading_profile_candidates": [],
                 "fields": {
                     "capital_campaign_id": {
                         "classification": "MISSING",
@@ -977,6 +1009,24 @@ async def mandate_bootstrap_export(*, capital_campaign_id: int) -> dict[str, Any
                         "classification": "MISSING",
                         "value": None,
                         "source": "capital_campaign_definitions.base_currency",
+                        "notes": "Campaign not found.",
+                    },
+                    "paper_account_asset_class": {
+                        "classification": "MISSING",
+                        "value": None,
+                        "source": "paper_accounts.asset_class",
+                        "notes": "Campaign not found.",
+                    },
+                    "paper_account_is_active": {
+                        "classification": "MISSING",
+                        "value": None,
+                        "source": "paper_accounts.is_active",
+                        "notes": "Campaign not found.",
+                    },
+                    "live_trading_profile_id": {
+                        "classification": "MISSING",
+                        "value": None,
+                        "source": "live_trading_profiles.id WHERE paper_account_id = capital_campaigns.paper_account_id",
                         "notes": "Campaign not found.",
                     },
                 },
@@ -1030,6 +1080,122 @@ async def mandate_bootstrap_export(*, capital_campaign_id: int) -> dict[str, Any
                     "notes": None,
                 }
 
+        # Paper account: loaded strictly from this campaign's own paper_account_id FK --
+        # never from another campaign's or mandate's paper account.
+        paper_account_payload: dict[str, Any] | None = None
+        paper_account_asset_class_field: dict[str, Any]
+        paper_account_is_active_field: dict[str, Any]
+        if campaign.paper_account_id is None:
+            paper_account_asset_class_field = {
+                "classification": "MISSING",
+                "value": None,
+                "source": "paper_accounts.asset_class",
+                "notes": "capital_campaigns.paper_account_id is not set for this campaign.",
+            }
+            paper_account_is_active_field = {
+                "classification": "MISSING",
+                "value": None,
+                "source": "paper_accounts.is_active",
+                "notes": "capital_campaigns.paper_account_id is not set for this campaign.",
+            }
+        else:
+            paper_account = await db.get(PaperAccount, campaign.paper_account_id)
+            if paper_account is None:
+                paper_account_payload = {
+                    "found": False,
+                    "notes": "capital_campaigns.paper_account_id is set but no matching paper_accounts row exists.",
+                }
+                paper_account_asset_class_field = {
+                    "classification": "MISSING",
+                    "value": None,
+                    "source": "paper_accounts.asset_class",
+                    "notes": "Referenced paper_accounts row not found.",
+                }
+                paper_account_is_active_field = {
+                    "classification": "MISSING",
+                    "value": None,
+                    "source": "paper_accounts.is_active",
+                    "notes": "Referenced paper_accounts row not found.",
+                }
+            else:
+                # Deliberately excludes starting_balance, current_cash_balance, and
+                # owner_user_id -- financial/identity data this export must never print.
+                # name is excluded too: no existing operator diagnostic exposes
+                # PaperAccount.name today, so this export does not become the first.
+                paper_account_payload = {
+                    "found": True,
+                    "id": str(paper_account.id),
+                    "asset_class": paper_account.asset_class,
+                    "is_active": bool(paper_account.is_active),
+                }
+                paper_account_asset_class_field = {
+                    "classification": "DATABASE_DERIVED",
+                    "value": paper_account.asset_class,
+                    "source": "paper_accounts.asset_class",
+                    "notes": None,
+                }
+                paper_account_is_active_field = {
+                    "classification": "DATABASE_DERIVED",
+                    "value": bool(paper_account.is_active),
+                    "source": "paper_accounts.is_active",
+                    "notes": None,
+                }
+
+        # Live trading profile: candidates are resolved strictly by
+        # LiveTradingProfile.paper_account_id == CapitalCampaign.paper_account_id --
+        # never by provider, environment, Campaign 1, another mandate, or any other
+        # inferred link. Ordered by primary key for a deterministic, non-preferential
+        # listing; never "most recently created wins."
+        live_trading_profile_payload: dict[str, Any] | None = None
+        live_trading_profile_candidates: list[dict[str, Any]] = []
+        if campaign.paper_account_id is None:
+            live_trading_profile_id_field = {
+                "classification": "MISSING",
+                "value": None,
+                "source": "live_trading_profiles.id WHERE paper_account_id = capital_campaigns.paper_account_id",
+                "notes": "capital_campaigns.paper_account_id is not set for this campaign.",
+            }
+        else:
+            candidate_rows = list(
+                (
+                    await db.scalars(
+                        select(LiveTradingProfile)
+                        .where(LiveTradingProfile.paper_account_id == campaign.paper_account_id)
+                        .order_by(LiveTradingProfile.id)
+                    )
+                )
+            )
+            live_trading_profile_candidates = [_live_trading_profile_candidate_summary(row) for row in candidate_rows]
+
+            if len(candidate_rows) == 0:
+                live_trading_profile_id_field = {
+                    "classification": "MISSING",
+                    "value": None,
+                    "source": "live_trading_profiles.id WHERE paper_account_id = capital_campaigns.paper_account_id",
+                    "notes": "No live_trading_profiles row references this campaign's paper_account_id.",
+                }
+            elif len(candidate_rows) == 1:
+                profile = candidate_rows[0]
+                live_trading_profile_payload = {
+                    "found": True,
+                    "id": str(profile.id),
+                    "paper_account_id": str(profile.paper_account_id),
+                    **{field: getattr(profile, field) for field in _MANDATE_BOOTSTRAP_EXPORT_LIVE_PROFILE_GOVERNANCE_FIELDS},
+                }
+                live_trading_profile_id_field = {
+                    "classification": "DATABASE_DERIVED",
+                    "value": str(profile.id),
+                    "source": "live_trading_profiles.id WHERE paper_account_id = capital_campaigns.paper_account_id",
+                    "notes": None,
+                }
+            else:
+                live_trading_profile_id_field = {
+                    "classification": "CONFLICTING",
+                    "value": None,
+                    "source": "live_trading_profiles.id WHERE paper_account_id = capital_campaigns.paper_account_id",
+                    "notes": f"{len(candidate_rows)} live_trading_profiles rows share this campaign's paper_account_id; cannot resolve unambiguously.",
+                }
+
         return {
             "capital_campaign_id": capital_campaign_id,
             "resolved_at": datetime.now(timezone.utc).isoformat(),
@@ -1049,6 +1215,9 @@ async def mandate_bootstrap_export(*, capital_campaign_id: int) -> dict[str, Any
                 "has_definition_pin": has_definition_pin,
             },
             "definition": definition_payload,
+            "paper_account": paper_account_payload,
+            "live_trading_profile": live_trading_profile_payload,
+            "live_trading_profile_candidates": live_trading_profile_candidates,
             "fields": {
                 "capital_campaign_id": {
                     "classification": "DATABASE_DERIVED",
@@ -1078,6 +1247,9 @@ async def mandate_bootstrap_export(*, capital_campaign_id: int) -> dict[str, Any
                     }
                 ),
                 "base_currency": base_currency_field,
+                "paper_account_asset_class": paper_account_asset_class_field,
+                "paper_account_is_active": paper_account_is_active_field,
+                "live_trading_profile_id": live_trading_profile_id_field,
             },
         }
 
