@@ -74,6 +74,7 @@ from app.operator_cli.service import (
     fetch_watch_status,
     mandate_bootstrap,
     mandate_bootstrap_export,
+    mandate_bootstrap_session_validate,
     refresh_provider_balance_evidence,
     inspect_legacy_campaign_transition,
     pause_canonical_proving_activation_bundle,
@@ -892,6 +893,35 @@ def _build_parser() -> argparse.ArgumentParser:
     mandate_bootstrap_export_parser.add_argument("--capital-campaign-id", type=int, required=True)
     mandate_bootstrap_export_parser.add_argument("--json", action="store_true", dest="json_output")
 
+    mandate_bootstrap_session_validate_parser = subparsers.add_parser(
+        "mandate-bootstrap-session-validate",
+        parents=[common],
+        help="Read-only validation of an owner-supplied mandate-bootstrap input document against the current campaign's export and the real mandate-bootstrap contract",
+        description=(
+            "Reuses mandate_bootstrap_export()'s read-only resolution for one "
+            "--capital-campaign-id, merges it with the owner-supplied "
+            "--owner-input-json document, and validates the result against the actual "
+            "mandate_bootstrap() contract (validate_mandate_version(), "
+            "validate_autonomy_level(), is_strategy_identity(), and the same numeric "
+            "CHECK-constraint bounds AutonomousCapitalMandateVersion enforces). Performs "
+            "no writes -- no lifecycle action, no authorization, no mandate creation, and "
+            "never calls mandate_bootstrap() itself. The owner-input document must supply "
+            "every OWNER_INPUT_REQUIRED field except confirm (which this command always "
+            "forces to false) and must never attempt to override a database-derived field "
+            "(provider/environment/exchange_connection_id/live_trading_profile_id/"
+            "paper_account_id/capital_campaign_id/base_currency/campaign_uuid) -- doing so "
+            "fails closed with OWNER_INPUT_ATTEMPTED_DATABASE_OVERRIDE. Never infers a "
+            "missing owner decision from strategy evidence, campaign-definition limits, or "
+            "any other record. Returns session_status of INVALID or "
+            "COMPLETE_FOR_OWNER_REVIEW -- never executable=true. Exit code 0 for "
+            "COMPLETE_FOR_OWNER_REVIEW, 1 for INVALID, 2 only for an infrastructure or "
+            "unexpected failure."
+        ),
+    )
+    mandate_bootstrap_session_validate_parser.add_argument("--capital-campaign-id", type=int, required=True)
+    mandate_bootstrap_session_validate_parser.add_argument("--owner-input-json", type=_parse_owner_input_json, required=True)
+    mandate_bootstrap_session_validate_parser.add_argument("--json", action="store_true", dest="json_output")
+
     proving_pause = subparsers.add_parser(
         "canonical-proving-pause",
         parents=[common],
@@ -1003,21 +1033,27 @@ def _parse_csv_argument(value: str) -> tuple[str, ...]:
     return items
 
 
-def _parse_mandate_policy_bundle(value: str) -> dict[str, dict[str, Any]]:
-    """Parses --policy-bundle-json: either a raw JSON object string or an @-prefixed path
-    to a JSON file (mirroring curl's `-d @file.json` convention), containing every nested
-    policy/evidence dict mandate-bootstrap needs. These are inherently unstructured JSON
-    objects, not flat scalars, so one JSON blob is far less error-prone here than a dozen
-    more --flag values -- especially for owner_acknowledgements/authorization_evidence/
-    deterministic_explanation, which are the actual audit evidence for a live-money
-    authorization decision and must be supplied deliberately, never defaulted."""
+def _read_json_argument(value: str, *, flag_name: str) -> Any:
+    """Reads --{flag_name}: either a raw JSON string or an @-prefixed path to a JSON file
+    (mirroring curl's `-d @file.json` convention). Shared by every CLI argument that
+    accepts a JSON document this way (--policy-bundle-json, --owner-input-json)."""
     raw = value
     if value.startswith("@"):
         raw = Path(value[1:]).read_text(encoding="utf-8")
     try:
-        parsed = json.loads(raw)
+        return json.loads(raw)
     except json.JSONDecodeError as exc:
-        raise argparse.ArgumentTypeError(f"--policy-bundle-json: invalid JSON: {exc}") from exc
+        raise argparse.ArgumentTypeError(f"--{flag_name}: invalid JSON: {exc}") from exc
+
+
+def _parse_mandate_policy_bundle(value: str) -> dict[str, dict[str, Any]]:
+    """Parses --policy-bundle-json, containing every nested policy/evidence dict
+    mandate-bootstrap needs. These are inherently unstructured JSON objects, not flat
+    scalars, so one JSON blob is far less error-prone here than a dozen more --flag
+    values -- especially for owner_acknowledgements/authorization_evidence/
+    deterministic_explanation, which are the actual audit evidence for a live-money
+    authorization decision and must be supplied deliberately, never defaulted."""
+    parsed = _read_json_argument(value, flag_name="policy-bundle-json")
     if not isinstance(parsed, dict):
         raise argparse.ArgumentTypeError("--policy-bundle-json: expected a JSON object")
     missing = [key for key in _MANDATE_POLICY_BUNDLE_REQUIRED_KEYS if key not in parsed]
@@ -1026,6 +1062,19 @@ def _parse_mandate_policy_bundle(value: str) -> dict[str, dict[str, Any]]:
     non_dict_keys = [key for key in _MANDATE_POLICY_BUNDLE_REQUIRED_KEYS if not isinstance(parsed[key], dict)]
     if non_dict_keys:
         raise argparse.ArgumentTypeError(f"--policy-bundle-json: expected JSON objects for keys: {', '.join(non_dict_keys)}")
+    return parsed
+
+
+def _parse_owner_input_json(value: str) -> dict[str, Any]:
+    """Parses --owner-input-json for mandate-bootstrap-session-validate: either a raw
+    JSON object string or an @-prefixed path to a JSON file, containing the
+    owner-controlled mandate-bootstrap fields. Only checks it's a JSON object here --
+    which keys are required/forbidden depends on this specific campaign's own export
+    resolution, and is validated inside mandate_bootstrap_session_validate(), not at
+    CLI parse time."""
+    parsed = _read_json_argument(value, flag_name="owner-input-json")
+    if not isinstance(parsed, dict):
+        raise argparse.ArgumentTypeError("--owner-input-json: expected a JSON object")
     return parsed
 
 
@@ -1264,6 +1313,14 @@ async def _run_async(args: argparse.Namespace) -> tuple[int, dict[str, Any], str
     if args.command == "mandate-bootstrap-export":
         payload = await mandate_bootstrap_export(capital_campaign_id=args.capital_campaign_id)
         return 0, payload, render_json(payload)
+
+    if args.command == "mandate-bootstrap-session-validate":
+        payload = await mandate_bootstrap_session_validate(
+            capital_campaign_id=args.capital_campaign_id,
+            owner_input=args.owner_input_json,
+        )
+        exit_code = 0 if payload["session_status"] == "COMPLETE_FOR_OWNER_REVIEW" else 1
+        return exit_code, payload, render_json(payload)
 
     if args.command == "canonical-proving-pause":
         payload = await pause_canonical_proving_activation_bundle(

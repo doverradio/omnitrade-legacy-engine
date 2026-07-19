@@ -57,6 +57,7 @@ from app.services.mandates.contracts import (
     MandateAuthorizationRequest,
     MandateLifecycleActionRequest,
     MandateVersionCreateRequest,
+    MandateVersionModel,
 )
 from app.services.mandates.lifecycle import (
     apply_mandate_lifecycle_action,
@@ -64,6 +65,11 @@ from app.services.mandates.lifecycle import (
     create_mandate,
     create_mandate_version,
 )
+from app.services.mandates.validation import (
+    validate_autonomy_level,
+    validate_mandate_version,
+)
+from app.services.strategies.identity import is_strategy_identity
 from app.services.canonical_campaign_binding import (
     CanonicalProvingAccountTransitionRequest,
     CanonicalCampaignBindingRequest,
@@ -2191,6 +2197,394 @@ async def mandate_bootstrap_export(*, capital_campaign_id: int) -> dict[str, Any
             "owner_decision_worksheet": resolved_worksheet,
             "worksheet_summary": _worksheet_summary(resolved_worksheet),
         }
+
+
+# The exact set of mandate_bootstrap()/mandate-bootstrap-export fields whose value is
+# resolved from this campaign's own database records and therefore may never be
+# overridden by owner-supplied JSON. Two request-side names (provider/environment) are
+# spelled differently in mandate_bootstrap_export's `fields` dict (exchange_provider/
+# exchange_environment) -- both spellings are rejected if an owner document supplies them.
+_MANDATE_BOOTSTRAP_SESSION_DATABASE_FIELD_MAP: dict[str, str] = {
+    "capital_campaign_id": "capital_campaign_id",
+    "campaign_uuid": "campaign_uuid",
+    "paper_account_id": "paper_account_id",
+    "base_currency": "base_currency",
+    "live_trading_profile_id": "live_trading_profile_id",
+    "exchange_connection_id": "exchange_connection_id",
+    "provider": "exchange_provider",
+    "environment": "exchange_environment",
+}
+
+_MANDATE_BOOTSTRAP_SESSION_FORBIDDEN_FIELD_NAMES: frozenset[str] = frozenset(
+    {
+        "provider",
+        "exchange_provider",
+        "environment",
+        "exchange_environment",
+        "exchange_connection_id",
+        "live_trading_profile_id",
+        "paper_account_id",
+        "capital_campaign_id",
+        "base_currency",
+        "campaign_uuid",
+    }
+)
+
+_MANDATE_BOOTSTRAP_SESSION_OPTIONAL_FIELD_NAMES: frozenset[str] = frozenset(
+    {"mandate_expires_at", "authorization_expires_at", "audit_correlation_id"}
+)
+
+_MANDATE_BOOTSTRAP_SESSION_VERSION_VALIDATION_FIELDS: frozenset[str] = frozenset(
+    {
+        "authorized_capital_usd",
+        "max_order_notional_usd",
+        "max_open_exposure_usd",
+        "max_daily_deployed_usd",
+        "position_limit",
+        "price_evidence_max_age_seconds",
+        "allowed_products",
+        "allowed_order_sides",
+        "allowed_strategy_versions",
+        "approval_policy",
+    }
+)
+
+_MANDATE_BOOTSTRAP_SESSION_NONNEGATIVE_DECIMAL_FIELDS: tuple[str, ...] = (
+    "max_daily_realized_loss_usd",
+    "max_campaign_drawdown_usd",
+    "max_slippage_bps",
+    "max_fee_bps",
+)
+
+
+def _coerce_worksheet_field_value(
+    *, input_type: str, raw: Any, accepted_values: list[str] | None
+) -> tuple[Any, str | None]:
+    """Coerces one owner-supplied JSON value per its `_MANDATE_BOOTSTRAP_EXPORT_WORKSHEET_ENTRIES`
+    input_type, returning (value, None) on success or (None, error_code) on failure. Purely a
+    JSON-shape/type check -- never a business-rule check (those belong to validate_mandate_version()/
+    validate_autonomy_level(), reused as-is in mandate_bootstrap_session_validate())."""
+    if input_type == "text":
+        if not isinstance(raw, str) or not raw.strip():
+            return None, "invalid_text"
+        return raw, None
+    if input_type == "enum":
+        if not isinstance(raw, str):
+            return None, "invalid_enum_value"
+        if accepted_values is not None and raw not in accepted_values:
+            return None, "invalid_enum_value"
+        return raw, None
+    if input_type == "decimal":
+        if isinstance(raw, bool) or not isinstance(raw, (int, float, str)):
+            return None, "invalid_decimal"
+        try:
+            return Decimal(str(raw)), None
+        except Exception:
+            return None, "invalid_decimal"
+    if input_type == "integer":
+        if isinstance(raw, bool) or not isinstance(raw, int):
+            return None, "invalid_integer"
+        return raw, None
+    if input_type == "csv_list":
+        if not isinstance(raw, list):
+            return None, "invalid_list"
+        if not raw:
+            return None, "empty_list"
+        if any(not isinstance(item, str) or not item.strip() for item in raw):
+            return None, "invalid_list_item"
+        return list(raw), None
+    if input_type == "json_object":
+        if not isinstance(raw, dict):
+            return None, "invalid_json_object"
+        return raw, None
+    return None, "unknown_input_type"
+
+
+def _coerce_optional_timestamp(raw: Any) -> tuple[datetime | None, str | None]:
+    if raw is None:
+        return None, None
+    if not isinstance(raw, str):
+        return None, "invalid_timestamp"
+    try:
+        parsed = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+    except ValueError:
+        return None, "invalid_timestamp"
+    if parsed.tzinfo is None:
+        return None, "timestamp_not_timezone_aware"
+    return parsed, None
+
+
+def _coerce_optional_uuid(raw: Any) -> tuple[UUID | None, str | None]:
+    if raw is None:
+        return None, None
+    if not isinstance(raw, str):
+        return None, "invalid_uuid"
+    try:
+        return UUID(raw), None
+    except ValueError:
+        return None, "invalid_uuid"
+
+
+def _mandate_bootstrap_session_serialize(value: Any) -> Any:
+    if isinstance(value, Decimal):
+        return str(value)
+    if isinstance(value, UUID):
+        return str(value)
+    if isinstance(value, datetime):
+        return value.isoformat()
+    return value
+
+
+async def mandate_bootstrap_session_validate(*, capital_campaign_id: int, owner_input: dict[str, Any]) -> dict[str, Any]:
+    """Read-only mandate-bootstrap session validator. Reuses mandate_bootstrap_export()'s
+    existing read-only resolution (never re-derives database identity itself), merges the
+    owner-supplied JSON document with the campaign's DATABASE_DERIVED fields (owner input can
+    never override provider/environment/exchange_connection_id/live_trading_profile_id/
+    paper_account_id/capital_campaign_id/base_currency/campaign_uuid -- any attempt fails
+    closed with OWNER_INPUT_ATTEMPTED_DATABASE_OVERRIDE), and validates the merged candidate
+    against the REAL mandate_bootstrap() contract using the REAL validate_mandate_version()/
+    validate_autonomy_level()/is_strategy_identity() validators -- never a reimplementation of
+    their rules. Performs no db.add/flush/commit, no lifecycle action, no authorization, and
+    never calls mandate_bootstrap() itself; `confirm` is always forced to False in the returned
+    candidate and session_status is never a stand-in for `executable=true`. If the owner
+    document itself supplies confirm=true, that is rejected as an attempted execution gate
+    bypass, not silently dropped."""
+    export = await mandate_bootstrap_export(capital_campaign_id=capital_campaign_id)
+    fields = export["fields"]
+
+    resolved_database_inputs: dict[str, Any] = {}
+    database_identity_errors: list[str] = []
+    for request_key, fields_key in _MANDATE_BOOTSTRAP_SESSION_DATABASE_FIELD_MAP.items():
+        entry = fields[fields_key]
+        resolved_database_inputs[request_key] = {
+            "classification": entry["classification"],
+            "value": entry["value"],
+        }
+        if entry["classification"] != "DATABASE_DERIVED":
+            database_identity_errors.append(request_key)
+
+    worksheet_field_names = set(_MANDATE_BOOTSTRAP_EXPORT_WORKSHEET_ENTRIES.keys())
+    required_field_names = sorted(worksheet_field_names - {"confirm"})
+    known_field_names = (
+        set(required_field_names)
+        | _MANDATE_BOOTSTRAP_SESSION_OPTIONAL_FIELD_NAMES
+        | _MANDATE_BOOTSTRAP_SESSION_FORBIDDEN_FIELD_NAMES
+        | {"confirm"}
+    )
+
+    missing_fields = sorted(name for name in required_field_names if name not in owner_input)
+
+    field_errors: list[dict[str, str]] = []
+
+    forbidden_override_fields = sorted(
+        name for name in owner_input if name in _MANDATE_BOOTSTRAP_SESSION_FORBIDDEN_FIELD_NAMES
+    )
+    for name in forbidden_override_fields:
+        field_errors.append({"field": name, "error": "OWNER_INPUT_ATTEMPTED_DATABASE_OVERRIDE"})
+
+    confirm_rejected = "confirm" in owner_input and owner_input["confirm"] is True
+    if confirm_rejected:
+        field_errors.append({"field": "confirm", "error": "OWNER_INPUT_ATTEMPTED_EXECUTION_CONFIRM"})
+
+    unexpected_fields = sorted(name for name in owner_input if name not in known_field_names)
+    if "confirm" in owner_input and not confirm_rejected:
+        unexpected_fields = sorted(unexpected_fields + ["confirm"])
+
+    coerced: dict[str, Any] = {}
+    for name in required_field_names:
+        if name not in owner_input or name in _MANDATE_BOOTSTRAP_SESSION_FORBIDDEN_FIELD_NAMES:
+            continue
+        entry = _MANDATE_BOOTSTRAP_EXPORT_WORKSHEET_ENTRIES[name]
+        value, error = _coerce_worksheet_field_value(
+            input_type=entry["input_type"], raw=owner_input[name], accepted_values=entry["accepted_values"]
+        )
+        if error is not None:
+            field_errors.append({"field": name, "error": error})
+            continue
+        if name == "allowed_strategy_versions" and any(not is_strategy_identity(item) for item in value):
+            field_errors.append({"field": name, "error": "invalid_strategy_identity"})
+            continue
+        coerced[name] = value
+
+    optional_coerced: dict[str, Any] = {}
+    for name in _MANDATE_BOOTSTRAP_SESSION_OPTIONAL_FIELD_NAMES:
+        if name not in owner_input:
+            continue
+        if name == "audit_correlation_id":
+            value, error = _coerce_optional_uuid(owner_input[name])
+        else:
+            value, error = _coerce_optional_timestamp(owner_input[name])
+        if error is not None:
+            field_errors.append({"field": name, "error": error})
+            continue
+        if value is not None:
+            optional_coerced[name] = value
+
+    fields_with_errors = {entry["field"] for entry in field_errors}
+
+    cross_field_errors: list[str] = []
+    if _MANDATE_BOOTSTRAP_SESSION_VERSION_VALIDATION_FIELDS.issubset(coerced.keys()) and not (
+        _MANDATE_BOOTSTRAP_SESSION_VERSION_VALIDATION_FIELDS & fields_with_errors
+    ):
+        synthetic_version = MandateVersionModel(
+            mandate_version_id=uuid.uuid4(),
+            mandate_id=uuid.uuid4(),
+            version_number=1,
+            base_currency=resolved_database_inputs["base_currency"]["value"] or "",
+            authorized_capital_usd=coerced["authorized_capital_usd"],
+            max_order_notional_usd=coerced["max_order_notional_usd"],
+            max_open_exposure_usd=coerced["max_open_exposure_usd"],
+            max_daily_deployed_usd=coerced["max_daily_deployed_usd"],
+            max_daily_realized_loss_usd=coerced.get("max_daily_realized_loss_usd", Decimal("0")),
+            max_campaign_drawdown_usd=coerced.get("max_campaign_drawdown_usd", Decimal("0")),
+            max_consecutive_losses=coerced.get("max_consecutive_losses", 0),
+            position_limit=coerced["position_limit"],
+            price_evidence_max_age_seconds=coerced["price_evidence_max_age_seconds"],
+            max_slippage_bps=coerced.get("max_slippage_bps", Decimal("0")),
+            max_fee_bps=coerced.get("max_fee_bps", Decimal("0")),
+            allowed_products=tuple(coerced["allowed_products"]),
+            allowed_order_sides=tuple(coerced["allowed_order_sides"]),
+            allowed_strategy_versions=tuple(coerced["allowed_strategy_versions"]),
+            approval_policy=coerced["approval_policy"],
+            is_authorized=False,
+            is_active=False,
+        )
+        version_result = validate_mandate_version(synthetic_version)
+        if not version_result.valid:
+            cross_field_errors.append(version_result.reason)
+
+    if "autonomy_level" in coerced and "autonomy_level" not in fields_with_errors:
+        autonomy_result = validate_autonomy_level(coerced["autonomy_level"])
+        if not autonomy_result.valid:
+            cross_field_errors.append(autonomy_result.reason)
+
+    for name in _MANDATE_BOOTSTRAP_SESSION_NONNEGATIVE_DECIMAL_FIELDS:
+        if name in coerced and name not in fields_with_errors and coerced[name] < 0:
+            cross_field_errors.append(f"invalid_{name}")
+    if (
+        "max_consecutive_losses" in coerced
+        and "max_consecutive_losses" not in fields_with_errors
+        and coerced["max_consecutive_losses"] < 0
+    ):
+        cross_field_errors.append("invalid_max_consecutive_losses")
+
+    cross_field_errors = sorted(set(cross_field_errors))
+
+    for name in database_identity_errors:
+        field_errors.append({"field": name, "error": "database_identity_unresolved"})
+
+    field_errors = sorted(field_errors, key=lambda entry: (entry["field"], entry["error"]))
+
+    valid = not (
+        missing_fields
+        or unexpected_fields
+        or forbidden_override_fields
+        or field_errors
+        or cross_field_errors
+    )
+    session_status = "COMPLETE_FOR_OWNER_REVIEW" if valid else "INVALID"
+
+    def _resolved_db_value(request_key: str) -> Any:
+        entry = resolved_database_inputs[request_key]
+        return entry["value"] if entry["classification"] == "DATABASE_DERIVED" else None
+
+    s = _mandate_bootstrap_session_serialize
+    candidate_mandate_bootstrap_request = {
+        "owner_actor_id": s(coerced.get("owner_actor_id")),
+        "autonomy_level": s(coerced.get("autonomy_level")),
+        "provider": _resolved_db_value("provider"),
+        "environment": _resolved_db_value("environment"),
+        "exchange_connection_id": _resolved_db_value("exchange_connection_id"),
+        "live_trading_profile_id": _resolved_db_value("live_trading_profile_id"),
+        "paper_account_id": _resolved_db_value("paper_account_id"),
+        "capital_campaign_id": _resolved_db_value("capital_campaign_id"),
+        "mandate_expires_at": s(optional_coerced.get("mandate_expires_at")),
+        "base_currency": _resolved_db_value("base_currency"),
+        "authorized_capital_usd": s(coerced.get("authorized_capital_usd")),
+        "max_order_notional_usd": s(coerced.get("max_order_notional_usd")),
+        "max_open_exposure_usd": s(coerced.get("max_open_exposure_usd")),
+        "max_daily_deployed_usd": s(coerced.get("max_daily_deployed_usd")),
+        "max_daily_realized_loss_usd": s(coerced.get("max_daily_realized_loss_usd")),
+        "max_campaign_drawdown_usd": s(coerced.get("max_campaign_drawdown_usd")),
+        "max_consecutive_losses": coerced.get("max_consecutive_losses"),
+        "position_limit": coerced.get("position_limit"),
+        "price_evidence_max_age_seconds": coerced.get("price_evidence_max_age_seconds"),
+        "max_slippage_bps": s(coerced.get("max_slippage_bps")),
+        "max_fee_bps": s(coerced.get("max_fee_bps")),
+        "allowed_products": coerced.get("allowed_products"),
+        "allowed_order_sides": coerced.get("allowed_order_sides"),
+        "allowed_strategy_versions": coerced.get("allowed_strategy_versions"),
+        "approval_policy": s(coerced.get("approval_policy")),
+        "entry_policy": coerced.get("entry_policy"),
+        "exit_policy": coerced.get("exit_policy"),
+        "cooldown_policy": coerced.get("cooldown_policy"),
+        "operating_schedule": coerced.get("operating_schedule"),
+        "reconciliation_policy": coerced.get("reconciliation_policy"),
+        "kill_switch_policy": coerced.get("kill_switch_policy"),
+        "owner_acknowledgements": coerced.get("owner_acknowledgements"),
+        "authorization_evidence_summary": coerced.get("authorization_evidence_summary"),
+        "authorization_method": s(coerced.get("authorization_method")),
+        "authorization_evidence": coerced.get("authorization_evidence"),
+        "deterministic_explanation": coerced.get("deterministic_explanation"),
+        "authorization_expires_at": s(optional_coerced.get("authorization_expires_at")),
+        "actor": s(coerced.get("actor")),
+        "reason": s(coerced.get("reason")),
+        "idempotency_key": s(coerced.get("idempotency_key")),
+        "audit_correlation_id": s(optional_coerced.get("audit_correlation_id")),
+        "confirm": False,
+    }
+
+    owner_selected_allowed_strategy_versions = coerced.get("allowed_strategy_versions") or []
+    strategy_evidence = export["strategy_evidence"] or {}
+    candidate_identities: set[str] = set()
+    legacy_ref = strategy_evidence.get("legacy_campaign_strategy_reference")
+    if legacy_ref and legacy_ref.get("canonical_identity"):
+        candidate_identities.add(legacy_ref["canonical_identity"])
+    for item in (strategy_evidence.get("global_active_strategy") or {}).get("items", []) or []:
+        if item.get("canonical_identity"):
+            candidate_identities.add(item["canonical_identity"])
+    hint = strategy_evidence.get("campaign_definition_metadata_hint")
+    if hint and hint.get("preferred_strategy_identity"):
+        candidate_identities.add(hint["preferred_strategy_identity"])
+    continuity = strategy_evidence.get("canonical_preview_package_continuity")
+    if continuity and continuity.get("canonical_identity"):
+        candidate_identities.add(continuity["canonical_identity"])
+
+    evidence_matches_owner_selection = (
+        bool(set(owner_selected_allowed_strategy_versions) & candidate_identities)
+        if owner_selected_allowed_strategy_versions
+        else False
+    )
+
+    campaign_payload = export["campaign"]
+    source_identity = {
+        "capital_campaign_id": export["capital_campaign_id"],
+        "campaign_uuid": fields["campaign_uuid"]["value"],
+        "definition_campaign_id": campaign_payload.get("definition_campaign_id") if campaign_payload.get("found") else None,
+        "definition_version": campaign_payload.get("definition_version") if campaign_payload.get("found") else None,
+        "export_resolved_at": export["resolved_at"],
+    }
+
+    return {
+        "session_status": session_status,
+        "resolved_database_inputs": resolved_database_inputs,
+        "owner_inputs": owner_input,
+        "candidate_mandate_bootstrap_request": candidate_mandate_bootstrap_request,
+        "validation": {
+            "valid": valid,
+            "missing_fields": missing_fields,
+            "unexpected_fields": unexpected_fields,
+            "forbidden_override_fields": forbidden_override_fields,
+            "field_errors": field_errors,
+            "cross_field_errors": cross_field_errors,
+        },
+        "source_identity": source_identity,
+        "strategy_review": {
+            "owner_selected_allowed_strategy_versions": sorted(owner_selected_allowed_strategy_versions),
+            "informational_strategy_evidence": strategy_evidence,
+            "evidence_matches_owner_selection": evidence_matches_owner_selection,
+        },
+    }
 
 
 async def _resolve_exchange_connection_for_commissioning(
