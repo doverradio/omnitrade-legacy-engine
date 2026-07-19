@@ -73,6 +73,7 @@ from app.operator_cli.service import (
     fetch_risk_ledger_diagnosis,
     fetch_watch_status,
     mandate_bootstrap,
+    mandate_bootstrap_export,
     refresh_provider_balance_evidence,
     inspect_legacy_campaign_transition,
     pause_canonical_proving_activation_bundle,
@@ -851,6 +852,24 @@ def _build_parser() -> argparse.ArgumentParser:
     mandate_bootstrap_parser.add_argument("--confirm", action="store_true")
     mandate_bootstrap_parser.add_argument("--json", action="store_true", dest="json_output")
 
+    mandate_bootstrap_export_parser = subparsers.add_parser(
+        "mandate-bootstrap-export",
+        parents=[common],
+        help="Read-only export of authoritative mandate-bootstrap inputs for one capital campaign (Stage 1: campaign + definition evidence only)",
+        description=(
+            "Stage 1 of the read-only mandate-bootstrap export design. Resolves only "
+            "CapitalCampaign identity and, if pinned, CapitalCampaignDefinition evidence for "
+            "one --capital-campaign-id. Performs no writes -- no lifecycle action, no "
+            "authorization, no mandate creation. Every field is classified as "
+            "DATABASE_DERIVED, CONFIGURATION_DERIVED, OWNER_INPUT_REQUIRED, MISSING, or "
+            "CONFLICTING; this stage only classifies capital_campaign_id, campaign_uuid, "
+            "paper_account_id, and base_currency. Never reuses another campaign's or "
+            "mandate's values. Always reports executable=false and overall_status=BLOCKED."
+        ),
+    )
+    mandate_bootstrap_export_parser.add_argument("--capital-campaign-id", type=int, required=True)
+    mandate_bootstrap_export_parser.add_argument("--json", action="store_true", dest="json_output")
+
     proving_pause = subparsers.add_parser(
         "canonical-proving-pause",
         parents=[common],
@@ -1218,6 +1237,10 @@ async def _run_async(args: argparse.Namespace) -> tuple[int, dict[str, Any], str
             audit_correlation_id=args.audit_correlation_id,
             confirm=bool(args.confirm),
         )
+        return 0, payload, render_json(payload)
+
+    if args.command == "mandate-bootstrap-export":
+        payload = await mandate_bootstrap_export(capital_campaign_id=args.capital_campaign_id)
         return 0, payload, render_json(payload)
 
     if args.command == "canonical-proving-pause":

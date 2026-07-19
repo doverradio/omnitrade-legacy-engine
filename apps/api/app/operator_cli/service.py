@@ -921,6 +921,167 @@ async def mandate_bootstrap(
     }
 
 
+_MANDATE_BOOTSTRAP_EXPORT_DEFINITION_NOTES = (
+    "capital_campaign_definitions fields above are the campaign's own operational bounds "
+    "(position sizing, exposure, drawdown), not mandate-bootstrap risk limits. They use "
+    "different units/semantics and are not automatically substitutable for "
+    "authorized_capital_usd, max_order_notional_usd, max_open_exposure_usd, "
+    "max_campaign_drawdown_usd, or any other mandate-bootstrap risk field."
+)
+
+
+def _decimal_str(value: Decimal | None) -> str | None:
+    return str(value) if value is not None else None
+
+
+async def mandate_bootstrap_export(*, capital_campaign_id: int) -> dict[str, Any]:
+    """Stage 1 of the read-only mandate-bootstrap export design: resolves only
+    CapitalCampaign identity and (if pinned) CapitalCampaignDefinition evidence for one
+    capital_campaign_id. Performs SELECT statements only -- no db.add, flush, or commit,
+    no lifecycle action, no authorization, no mandate creation. Never reuses another
+    mandate's or another campaign's values; every field is either read fresh from this
+    campaign's own records or explicitly marked unresolved. exchange_connection_id,
+    live_trading_profile_id, and strategy resolution are out of scope for this stage --
+    see the approved read-only mandate-bootstrap export design for the full field set."""
+    async with AsyncSessionLocal() as db:
+        campaign = await db.get(CapitalCampaign, capital_campaign_id)
+
+        if campaign is None:
+            return {
+                "capital_campaign_id": capital_campaign_id,
+                "resolved_at": datetime.now(timezone.utc).isoformat(),
+                "overall_status": "BLOCKED",
+                "executable": False,
+                "campaign": {"found": False},
+                "definition": None,
+                "fields": {
+                    "capital_campaign_id": {
+                        "classification": "MISSING",
+                        "value": None,
+                        "source": "capital_campaigns.id",
+                        "notes": "No capital_campaigns row exists for this id.",
+                    },
+                    "campaign_uuid": {
+                        "classification": "MISSING",
+                        "value": None,
+                        "source": "capital_campaigns.uuid",
+                        "notes": "Campaign not found.",
+                    },
+                    "paper_account_id": {
+                        "classification": "MISSING",
+                        "value": None,
+                        "source": "capital_campaigns.paper_account_id",
+                        "notes": "Campaign not found.",
+                    },
+                    "base_currency": {
+                        "classification": "MISSING",
+                        "value": None,
+                        "source": "capital_campaign_definitions.base_currency",
+                        "notes": "Campaign not found.",
+                    },
+                },
+            }
+
+        has_definition_pin = campaign.definition_campaign_id is not None and campaign.definition_version is not None
+
+        definition_payload: dict[str, Any] | None = None
+        base_currency_field: dict[str, Any]
+        if not has_definition_pin:
+            base_currency_field = {
+                "classification": "MISSING",
+                "value": None,
+                "source": "capital_campaign_definitions.base_currency",
+                "notes": "Campaign has no definition_campaign_id/definition_version pin.",
+            }
+        else:
+            definition = await _load_campaign_definition_by_identity(
+                db=db, campaign_id=campaign.definition_campaign_id, version=campaign.definition_version
+            )
+            if definition is None:
+                definition_payload = {
+                    "found": False,
+                    "notes": "definition_campaign_id/definition_version is pinned but no matching capital_campaign_definitions row exists.",
+                }
+                base_currency_field = {
+                    "classification": "MISSING",
+                    "value": None,
+                    "source": "capital_campaign_definitions.base_currency",
+                    "notes": "Pinned definition row not found (dangling pin).",
+                }
+            else:
+                definition_payload = {
+                    "found": True,
+                    "status": definition.status,
+                    "base_currency": definition.base_currency,
+                    "allowed_asset_classes": list(definition.allowed_asset_classes),
+                    "allowed_venues": list(definition.allowed_venues),
+                    "allowed_instruments": list(definition.allowed_instruments),
+                    "maximum_open_positions": definition.maximum_open_positions,
+                    "maximum_position_size": _decimal_str(definition.maximum_position_size),
+                    "maximum_total_exposure": _decimal_str(definition.maximum_total_exposure),
+                    "maximum_drawdown": _decimal_str(definition.maximum_drawdown),
+                    "informational_only": True,
+                    "notes": _MANDATE_BOOTSTRAP_EXPORT_DEFINITION_NOTES,
+                }
+                base_currency_field = {
+                    "classification": "DATABASE_DERIVED",
+                    "value": definition.base_currency,
+                    "source": "capital_campaign_definitions.base_currency",
+                    "notes": None,
+                }
+
+        return {
+            "capital_campaign_id": capital_campaign_id,
+            "resolved_at": datetime.now(timezone.utc).isoformat(),
+            "overall_status": "BLOCKED",
+            "executable": False,
+            "campaign": {
+                "found": True,
+                "id": campaign.id,
+                "uuid": str(campaign.uuid),
+                "status": campaign.status,
+                "name": campaign.name,
+                "exchange_label_raw": campaign.exchange,
+                "paper_account_id": str(campaign.paper_account_id) if campaign.paper_account_id is not None else None,
+                "strategy_id": str(campaign.strategy_id) if campaign.strategy_id is not None else None,
+                "definition_campaign_id": str(campaign.definition_campaign_id) if campaign.definition_campaign_id is not None else None,
+                "definition_version": campaign.definition_version,
+                "has_definition_pin": has_definition_pin,
+            },
+            "definition": definition_payload,
+            "fields": {
+                "capital_campaign_id": {
+                    "classification": "DATABASE_DERIVED",
+                    "value": campaign.id,
+                    "source": "capital_campaigns.id",
+                    "notes": None,
+                },
+                "campaign_uuid": {
+                    "classification": "DATABASE_DERIVED",
+                    "value": str(campaign.uuid),
+                    "source": "capital_campaigns.uuid",
+                    "notes": None,
+                },
+                "paper_account_id": (
+                    {
+                        "classification": "DATABASE_DERIVED",
+                        "value": str(campaign.paper_account_id),
+                        "source": "capital_campaigns.paper_account_id",
+                        "notes": None,
+                    }
+                    if campaign.paper_account_id is not None
+                    else {
+                        "classification": "MISSING",
+                        "value": None,
+                        "source": "capital_campaigns.paper_account_id",
+                        "notes": "capital_campaigns.paper_account_id is not set for this campaign.",
+                    }
+                ),
+                "base_currency": base_currency_field,
+            },
+        }
+
+
 async def _resolve_exchange_connection_for_commissioning(
     *,
     db,
