@@ -63,6 +63,8 @@ from app.services.mandates.contracts import (
     MandateVersionModel,
 )
 from app.services.mandates.lifecycle import (
+    _build_version_hash,
+    _find_audit_by_idempotency,
     apply_mandate_lifecycle_action,
     authorize_mandate_version,
     create_mandate,
@@ -2933,20 +2935,107 @@ async def mandate_governance_readiness_audit(*, capital_campaign_id: int) -> dic
     }
 
 
+_MANDATE_BOOTSTRAP_CREATE_TRANSACTION_MODEL: dict[str, Any] = {
+    "classification": "SEPARATE_IDEMPOTENT_TRANSACTIONS",
+    "description": (
+        "create_mandate() and create_mandate_version() each commit their own transaction "
+        "(db.add + db.flush + AuditLog row + db.commit) -- these are two separate database "
+        "transactions, NOT one atomic transaction spanning both writes. A process "
+        "interruption between the two commits leaves a real, durable, partial state "
+        "(mandate row exists, no version row yet) rather than rolling back to nothing. "
+        "Recovery is deterministic, not atomic: rerunning mandate-bootstrap-create with the "
+        "same owner-input document resumes via each function's own idempotency-key lookup, "
+        "creating only the missing version and never a duplicate mandate. This model is "
+        "preserved as-is (not merged into one transaction) because create_mandate() offers "
+        "no commit=False option and is shared by other callers -- changing that is out of "
+        "this stage's narrow scope. The requirement met here is deterministic recovery and "
+        "honest reporting, not atomicity."
+    ),
+}
+
+
+def _mandate_bootstrap_create_transaction_model() -> dict[str, Any]:
+    return dict(_MANDATE_BOOTSTRAP_CREATE_TRANSACTION_MODEL)
+
+
+def _mandate_bootstrap_create_mandate_mismatches(
+    *, existing: AutonomousCapitalMandate, candidate: dict[str, Any]
+) -> list[str]:
+    """Compares an already-created mandate's real, committed identity against the CURRENT
+    call's candidate request. A mismatch here means the same idempotency_key is being
+    reused either with materially different owner input, or because the campaign's own
+    underlying database identity (provider/exchange/profile/account/campaign) drifted
+    since the mandate was created -- both cases must fail closed, never silently resume
+    against the old row as if nothing changed."""
+    candidate_expires_at = _parse_datetime(candidate.get("mandate_expires_at"))
+    checks: list[tuple[str, Any, Any]] = [
+        ("owner_actor_id", existing.owner_actor_id, candidate.get("owner_actor_id")),
+        ("autonomy_level", existing.autonomy_level, candidate.get("autonomy_level")),
+        ("provider", existing.provider, candidate.get("provider")),
+        ("exchange_environment", existing.exchange_environment, candidate.get("environment")),
+        ("exchange_connection_id", str(existing.exchange_connection_id), candidate.get("exchange_connection_id")),
+        ("live_trading_profile_id", str(existing.live_trading_profile_id), candidate.get("live_trading_profile_id")),
+        (
+            "paper_account_id",
+            str(existing.paper_account_id) if existing.paper_account_id is not None else None,
+            candidate.get("paper_account_id"),
+        ),
+        ("capital_campaign_id", existing.capital_campaign_id, candidate.get("capital_campaign_id")),
+        ("mandate_expires_at", existing.expires_at, candidate_expires_at),
+    ]
+    return [name for name, existing_value, candidate_value in checks if existing_value != candidate_value]
+
+
+def _mandate_bootstrap_create_conflict_payload(
+    *,
+    reason: str,
+    root_idempotency_key: str,
+    mandate_id: uuid.UUID | None,
+    mandate_version_id: uuid.UUID | None,
+    database_identity: dict[str, Any],
+    detail: dict[str, Any],
+) -> dict[str, Any]:
+    return {
+        "overall_status": "CONFLICT",
+        "mandate_id": str(mandate_id) if mandate_id is not None else None,
+        "mandate_version_id": str(mandate_version_id) if mandate_version_id is not None else None,
+        "database_identity": database_identity,
+        "audit_summary": {"writes_performed": False},
+        "write_summary": {"mandate_created": False, "mandate_version_created": False},
+        "transaction_model": _mandate_bootstrap_create_transaction_model(),
+        "conflict": {"reason": reason, "idempotency_key": root_idempotency_key, **detail},
+        "next_required_action": (
+            "This idempotency_key was already used with materially different mandate or "
+            "version input (or the underlying campaign identity has since drifted). Choose "
+            "a new idempotency_key for a genuinely new mandate, or resupply the exact "
+            "original owner-input document to resume safely. Zero new writes were "
+            "performed by this call."
+        ),
+    }
+
+
 async def mandate_bootstrap_create(*, capital_campaign_id: int, owner_input: dict[str, Any]) -> dict[str, Any]:
-    """Stage 9A: crosses the write boundary for the first time, and stops exactly there.
-    Reuses mandate_bootstrap_export()/mandate_bootstrap_session_validate() for all identity
-    resolution and validation (never re-derives or re-validates anything), and on success
-    reuses the exact same create_mandate()/create_mandate_version() functions and
+    """Stage 9A/9A.1: crosses the write boundary for the first time, and stops exactly
+    there. Reuses mandate_bootstrap_export()/mandate_bootstrap_session_validate() for all
+    identity resolution and validation (never re-derives or re-validates anything), and on
+    success reuses the exact same create_mandate()/create_mandate_version() functions and
     MandateVersionCreateRequest contract mandate_bootstrap() itself already calls for its
     first two stages -- this is a deliberately truncated prefix of that existing, already
     production-validated write path, not a new one. Never calls
     apply_mandate_lifecycle_action(), authorize_mandate_version(), or mandate_bootstrap()
     itself: the created mandate is left in its default DRAFT status with an unauthorized,
-    inactive initial version. Both underlying writes are already idempotent via
-    create_mandate()/create_mandate_version()'s own idempotency_key-keyed AuditLog lookups,
-    so rerunning this with the same owner-supplied idempotency_key resumes/no-ops onto the
-    same mandate_id/mandate_version_id rather than creating duplicates."""
+    inactive initial version.
+
+    Recovery/idempotency (Stage 9A.1): create_mandate()/create_mandate_version() are each
+    already idempotent via their own idempotency_key-keyed AuditLog lookup, so a rerun with
+    the same owner-input document after a process interruption safely creates only
+    whichever of the two rows is still missing, never a duplicate. Before resuming onto an
+    existing mandate (or existing version), this function additionally verifies the
+    existing row's real, committed identity/economic terms still match the CURRENT
+    candidate request -- reusing create_mandate_version()'s own version_hash fingerprint
+    (via lifecycle._build_version_hash(), not a reimplementation) for the version side. Any
+    mismatch fails closed as overall_status=CONFLICT with zero new writes, rather than
+    silently resuming against stale or divergent data."""
     export = await mandate_bootstrap_export(capital_campaign_id=capital_campaign_id)
     session = await mandate_bootstrap_session_validate(capital_campaign_id=capital_campaign_id, owner_input=owner_input)
 
@@ -2958,6 +3047,7 @@ async def mandate_bootstrap_create(*, capital_campaign_id: int, owner_input: dic
             "database_identity": session["resolved_database_inputs"],
             "audit_summary": {"writes_performed": False},
             "write_summary": {"mandate_created": False, "mandate_version_created": False},
+            "transaction_model": _mandate_bootstrap_create_transaction_model(),
             "validation": session["validation"],
             "next_required_action": (
                 "Resolve the validation failures reported under validation (missing_fields/"
@@ -2969,8 +3059,32 @@ async def mandate_bootstrap_create(*, capital_campaign_id: int, owner_input: dic
     candidate = session["candidate_mandate_bootstrap_request"]
     root_idempotency_key = candidate["idempotency_key"]
     actor = candidate["actor"]
+    mandate_idempotency_key = f"{root_idempotency_key}:create-mandate"
+    version_idempotency_key = f"{root_idempotency_key}:create-version"
 
     async with AsyncSessionLocal() as db:
+        existing_mandate: AutonomousCapitalMandate | None = None
+        existing_mandate_audit = await _find_audit_by_idempotency(
+            db=db,
+            entity_type="autonomous_capital_mandate",
+            action="MANDATE_CREATED",
+            idempotency_key=mandate_idempotency_key,
+        )
+        if existing_mandate_audit is not None and existing_mandate_audit.entity_id is not None:
+            existing_mandate = await db.get(AutonomousCapitalMandate, existing_mandate_audit.entity_id)
+
+        if existing_mandate is not None:
+            mismatched_fields = _mandate_bootstrap_create_mandate_mismatches(existing=existing_mandate, candidate=candidate)
+            if mismatched_fields:
+                return _mandate_bootstrap_create_conflict_payload(
+                    reason="IDEMPOTENCY_KEY_REUSED_WITH_DIFFERENT_MANDATE_INPUT",
+                    root_idempotency_key=root_idempotency_key,
+                    mandate_id=existing_mandate.mandate_id,
+                    mandate_version_id=None,
+                    database_identity=session["resolved_database_inputs"],
+                    detail={"mismatched_fields": sorted(mismatched_fields)},
+                )
+
         mandate = await create_mandate(
             db=db,
             owner_actor_id=candidate["owner_actor_id"],
@@ -2983,43 +3097,69 @@ async def mandate_bootstrap_create(*, capital_campaign_id: int, owner_input: dic
             capital_campaign_id=candidate["capital_campaign_id"],
             expires_at=_parse_datetime(candidate["mandate_expires_at"]),
             actor=actor,
-            idempotency_key=f"{root_idempotency_key}:create-mandate",
+            idempotency_key=mandate_idempotency_key,
             reason=candidate["reason"],
         )
 
-        version = await create_mandate_version(
-            db=db,
-            request=MandateVersionCreateRequest(
-                mandate_id=mandate.mandate_id,
-                actor=actor,
-                base_currency=candidate["base_currency"],
-                authorized_capital_usd=Decimal(candidate["authorized_capital_usd"]),
-                max_order_notional_usd=Decimal(candidate["max_order_notional_usd"]),
-                max_open_exposure_usd=Decimal(candidate["max_open_exposure_usd"]),
-                max_daily_deployed_usd=Decimal(candidate["max_daily_deployed_usd"]),
-                max_daily_realized_loss_usd=Decimal(candidate["max_daily_realized_loss_usd"]),
-                max_campaign_drawdown_usd=Decimal(candidate["max_campaign_drawdown_usd"]),
-                max_consecutive_losses=candidate["max_consecutive_losses"],
-                position_limit=candidate["position_limit"],
-                price_evidence_max_age_seconds=candidate["price_evidence_max_age_seconds"],
-                max_slippage_bps=Decimal(candidate["max_slippage_bps"]),
-                max_fee_bps=Decimal(candidate["max_fee_bps"]),
-                allowed_products=tuple(candidate["allowed_products"]),
-                allowed_order_sides=tuple(candidate["allowed_order_sides"]),
-                allowed_strategy_versions=tuple(candidate["allowed_strategy_versions"]),
-                entry_policy=candidate["entry_policy"],
-                exit_policy=candidate["exit_policy"],
-                cooldown_policy=candidate["cooldown_policy"],
-                operating_schedule=candidate["operating_schedule"],
-                approval_policy=candidate["approval_policy"],
-                reconciliation_policy=candidate["reconciliation_policy"],
-                kill_switch_policy=candidate["kill_switch_policy"],
-                owner_acknowledgements=candidate["owner_acknowledgements"],
-                authorization_evidence_summary=candidate["authorization_evidence_summary"],
-                idempotency_key=f"{root_idempotency_key}:create-version",
-                audit_correlation_id=UUID(candidate["audit_correlation_id"]) if candidate["audit_correlation_id"] else None,
-            ),
+        version_request = MandateVersionCreateRequest(
+            mandate_id=mandate.mandate_id,
+            actor=actor,
+            base_currency=candidate["base_currency"],
+            authorized_capital_usd=Decimal(candidate["authorized_capital_usd"]),
+            max_order_notional_usd=Decimal(candidate["max_order_notional_usd"]),
+            max_open_exposure_usd=Decimal(candidate["max_open_exposure_usd"]),
+            max_daily_deployed_usd=Decimal(candidate["max_daily_deployed_usd"]),
+            max_daily_realized_loss_usd=Decimal(candidate["max_daily_realized_loss_usd"]),
+            max_campaign_drawdown_usd=Decimal(candidate["max_campaign_drawdown_usd"]),
+            max_consecutive_losses=candidate["max_consecutive_losses"],
+            position_limit=candidate["position_limit"],
+            price_evidence_max_age_seconds=candidate["price_evidence_max_age_seconds"],
+            max_slippage_bps=Decimal(candidate["max_slippage_bps"]),
+            max_fee_bps=Decimal(candidate["max_fee_bps"]),
+            allowed_products=tuple(candidate["allowed_products"]),
+            allowed_order_sides=tuple(candidate["allowed_order_sides"]),
+            allowed_strategy_versions=tuple(candidate["allowed_strategy_versions"]),
+            entry_policy=candidate["entry_policy"],
+            exit_policy=candidate["exit_policy"],
+            cooldown_policy=candidate["cooldown_policy"],
+            operating_schedule=candidate["operating_schedule"],
+            approval_policy=candidate["approval_policy"],
+            reconciliation_policy=candidate["reconciliation_policy"],
+            kill_switch_policy=candidate["kill_switch_policy"],
+            owner_acknowledgements=candidate["owner_acknowledgements"],
+            authorization_evidence_summary=candidate["authorization_evidence_summary"],
+            idempotency_key=version_idempotency_key,
+            audit_correlation_id=UUID(candidate["audit_correlation_id"]) if candidate["audit_correlation_id"] else None,
         )
+
+        existing_version_audit = await _find_audit_by_idempotency(
+            db=db,
+            entity_type="autonomous_capital_mandate",
+            action="MANDATE_VERSION_CREATED",
+            idempotency_key=version_idempotency_key,
+        )
+        existing_version: AutonomousCapitalMandateVersion | None = None
+        if existing_version_audit is not None and existing_version_audit.after_state:
+            version_id_raw = existing_version_audit.after_state.get("mandate_version_id")
+            if isinstance(version_id_raw, str):
+                try:
+                    existing_version = await db.get(AutonomousCapitalMandateVersion, uuid.UUID(version_id_raw))
+                except ValueError:
+                    existing_version = None
+
+        if existing_version is not None:
+            probe_hash = _build_version_hash(request=version_request, version_number=existing_version.version_number)
+            if probe_hash != existing_version.version_hash:
+                return _mandate_bootstrap_create_conflict_payload(
+                    reason="IDEMPOTENCY_KEY_REUSED_WITH_DIFFERENT_VERSION_INPUT",
+                    root_idempotency_key=root_idempotency_key,
+                    mandate_id=mandate.mandate_id,
+                    mandate_version_id=existing_version.mandate_version_id,
+                    database_identity=session["resolved_database_inputs"],
+                    detail={},
+                )
+
+        version = await create_mandate_version(db=db, request=version_request)
 
     return {
         "overall_status": "CREATED",
@@ -3041,6 +3181,7 @@ async def mandate_bootstrap_create(*, capital_campaign_id: int, owner_input: dic
             "mandate_version_is_authorized": bool(version.is_authorized),
             "mandate_version_is_active": bool(version.is_active),
         },
+        "transaction_model": _mandate_bootstrap_create_transaction_model(),
         "next_required_action": (
             "This mandate and its initial version exist in an unauthorized, inactive state "
             "only (mandate.status remains DRAFT). No lifecycle action, authorization, "
@@ -3048,6 +3189,210 @@ async def mandate_bootstrap_create(*, capital_campaign_id: int, owner_input: dic
             "explicitly submit this version for authorization and activate it -- this "
             "command never does so automatically."
         ),
+    }
+
+
+async def _mandate_bootstrap_create_all_audits_by_idempotency(
+    *, db: Any, entity_type: str, action: str, idempotency_key: str
+) -> list[AuditLog]:
+    """Mirrors _find_audit_by_idempotency()'s exact query shape (same entity_type/action
+    filter, same recency ordering) but returns EVERY matching row instead of only the
+    first. _find_audit_by_idempotency() cannot be reused as-is for this: it deliberately
+    stops at the first match, which is exactly right for idempotent-resume but would
+    silently hide a second, conflicting audit row filed under the same idempotency_key
+    (e.g. a race between two concurrent creation attempts) -- the one scenario this
+    read-only status command exists to surface."""
+    records = list(
+        await db.scalars(
+            select(AuditLog)
+            .where(AuditLog.entity_type == entity_type, AuditLog.action == action)
+            .order_by(AuditLog.created_at.desc(), AuditLog.id.desc())
+            .limit(200)
+        )
+    )
+    return [record for record in records if (record.after_state or {}).get("idempotency_key") == idempotency_key]
+
+
+def _mandate_bootstrap_create_serialize_audit_event(row: AuditLog) -> dict[str, Any]:
+    return {
+        "audit_id": row.id,
+        "actor": row.actor,
+        "action": row.action,
+        "created_at": row.created_at.isoformat(),
+        "entity_id": str(row.entity_id) if row.entity_id is not None else None,
+    }
+
+
+def _mandate_bootstrap_create_identity_drift(
+    *, mandate: AutonomousCapitalMandate, export_fields: dict[str, dict[str, Any]]
+) -> list[str]:
+    """Compares a real, already-created mandate's committed identity against what
+    mandate_bootstrap_export() resolves for this campaign RIGHT NOW. Only ever compares a
+    field the export currently classifies DATABASE_DERIVED -- a currently MISSING/
+    CONFLICTING classification means the campaign's live identity cannot be confirmed
+    either way today, which is reported separately as a warning, not asserted as drift."""
+    comparisons = [
+        ("provider", mandate.provider, export_fields["exchange_provider"]),
+        ("exchange_environment", mandate.exchange_environment, export_fields["exchange_environment"]),
+        ("exchange_connection_id", str(mandate.exchange_connection_id), export_fields["exchange_connection_id"]),
+        ("live_trading_profile_id", str(mandate.live_trading_profile_id), export_fields["live_trading_profile_id"]),
+        (
+            "paper_account_id",
+            str(mandate.paper_account_id) if mandate.paper_account_id is not None else None,
+            export_fields["paper_account_id"],
+        ),
+        ("capital_campaign_id", mandate.capital_campaign_id, export_fields["capital_campaign_id"]),
+    ]
+    drifted: list[str] = []
+    for field_name, mandate_value, export_field in comparisons:
+        if export_field["classification"] != "DATABASE_DERIVED":
+            continue
+        if export_field["value"] != mandate_value:
+            drifted.append(
+                f"{field_name}: mandate has {mandate_value!r}, campaign currently resolves {export_field['value']!r}"
+            )
+    return drifted
+
+
+async def mandate_bootstrap_create_status(*, capital_campaign_id: int, idempotency_key: str) -> dict[str, Any]:
+    """Stage 9A.1 Part 1: read-only inspection of mandate-bootstrap-create's real,
+    committed database state for one capital_campaign_id + root idempotency_key. Performs
+    SELECT-only reads (db.get()/db.scalars()) plus one reused call into
+    mandate_bootstrap_export() for identity-drift comparison -- no db.add/commit/flush/
+    delete, no lifecycle call, ever. Exists to make the creation boundary observable and
+    recoverable in production: distinguishing "nothing created yet" from "mandate created,
+    version still missing" (safely repairable by rerunning mandate-bootstrap-create with
+    the same owner-input document) from genuine conflicts or broken audit trails that must
+    never be silently resumed through."""
+    mandate_idempotency_key = f"{idempotency_key}:create-mandate"
+    version_idempotency_key = f"{idempotency_key}:create-version"
+
+    conflicts: list[str] = []
+    warnings: list[str] = []
+
+    async with AsyncSessionLocal() as db:
+        mandate_audit_rows = await _mandate_bootstrap_create_all_audits_by_idempotency(
+            db=db, entity_type="autonomous_capital_mandate", action="MANDATE_CREATED", idempotency_key=mandate_idempotency_key
+        )
+        version_audit_rows = await _mandate_bootstrap_create_all_audits_by_idempotency(
+            db=db,
+            entity_type="autonomous_capital_mandate",
+            action="MANDATE_VERSION_CREATED",
+            idempotency_key=version_idempotency_key,
+        )
+
+        duplicate_key_conflict = False
+        mandate_entity_ids = sorted({str(row.entity_id) for row in mandate_audit_rows if row.entity_id is not None})
+        if len(mandate_entity_ids) > 1:
+            duplicate_key_conflict = True
+            conflicts.append(
+                f"{len(mandate_entity_ids)} distinct mandates ({', '.join(mandate_entity_ids)}) share "
+                f"idempotency_key {mandate_idempotency_key!r} -- concurrent creation race or manual tampering."
+            )
+
+        mandate_audit_event = _mandate_bootstrap_create_serialize_audit_event(mandate_audit_rows[0]) if mandate_audit_rows else None
+        version_audit_event = _mandate_bootstrap_create_serialize_audit_event(version_audit_rows[0]) if version_audit_rows else None
+
+        audit_broken_reference = False
+        mandate: AutonomousCapitalMandate | None = None
+        if mandate_audit_rows and mandate_audit_rows[0].entity_id is not None:
+            mandate = await db.get(AutonomousCapitalMandate, mandate_audit_rows[0].entity_id)
+            if mandate is None:
+                audit_broken_reference = True
+                conflicts.append("mandate audit record references a mandate row that no longer exists.")
+
+        version: AutonomousCapitalMandateVersion | None = None
+        if version_audit_rows:
+            version_id_raw = (version_audit_rows[0].after_state or {}).get("mandate_version_id")
+            if isinstance(version_id_raw, str):
+                try:
+                    version = await db.get(AutonomousCapitalMandateVersion, uuid.UUID(version_id_raw))
+                except ValueError:
+                    version = None
+            if version is None:
+                audit_broken_reference = True
+                conflicts.append("mandate version audit record references a version row that no longer exists.")
+            elif mandate is not None and version.mandate_id != mandate.mandate_id:
+                audit_broken_reference = True
+                conflicts.append("mandate version row's mandate_id does not match the audited mandate.")
+
+        identity_drift_conflict = False
+        if mandate is not None:
+            export = await mandate_bootstrap_export(capital_campaign_id=capital_campaign_id)
+            if not export["campaign"].get("found", False):
+                warnings.append(
+                    f"capital_campaign_id={capital_campaign_id} no longer resolves; cannot confirm "
+                    "continued identity coherence against a campaign that may have been deleted."
+                )
+            else:
+                drift = _mandate_bootstrap_create_identity_drift(mandate=mandate, export_fields=export["fields"])
+                if drift:
+                    identity_drift_conflict = True
+                    conflicts.extend(f"campaign identity drift -- {item}" for item in drift)
+
+        audit_coherent = not audit_broken_reference
+        identity_coherent = not identity_drift_conflict
+
+    if duplicate_key_conflict or identity_drift_conflict:
+        overall_status = "CONFLICT"
+    elif audit_broken_reference:
+        overall_status = "INCOHERENT"
+    elif mandate is None:
+        overall_status = "NOT_STARTED"
+    elif version is None:
+        overall_status = "PARTIAL_RECOVERABLE"
+    else:
+        overall_status = "COMPLETE_DRAFT"
+        if mandate.status != "DRAFT":
+            warnings.append(
+                f"mandate.status has progressed to {mandate.status!r}; this command reports only on "
+                "creation-stage integrity, not on subsequent lifecycle state."
+            )
+
+    creation_complete = overall_status == "COMPLETE_DRAFT"
+    recovery_required = overall_status == "PARTIAL_RECOVERABLE"
+
+    next_safe_action = {
+        "NOT_STARTED": "Run mandate-bootstrap-create to begin creation.",
+        "PARTIAL_RECOVERABLE": (
+            "Rerun mandate-bootstrap-create with the exact same owner-input document to "
+            "safely create only the missing initial version; create_mandate()'s own "
+            "idempotency lookup guarantees no duplicate mandate is created."
+        ),
+        "COMPLETE_DRAFT": (
+            "Creation is complete. No action required from this command; authorization and "
+            "activation are separate stages requiring explicit human action, not yet "
+            "implemented by any command in this pipeline."
+        ),
+        "CONFLICT": (
+            "Do not rerun mandate-bootstrap-create under this idempotency_key. Investigate "
+            "the reported conflicts before choosing a new idempotency_key or taking any "
+            "further action."
+        ),
+        "INCOHERENT": (
+            "Do not take any further action. The audit trail itself is broken or "
+            "self-contradictory; investigate the underlying database state directly."
+        ),
+    }[overall_status]
+
+    return {
+        "overall_status": overall_status,
+        "capital_campaign_id": capital_campaign_id,
+        "idempotency_key": idempotency_key,
+        "mandate_id": str(mandate.mandate_id) if mandate is not None else None,
+        "mandate_version_id": str(version.mandate_version_id) if version is not None else None,
+        "mandate_status": mandate.status if mandate is not None else None,
+        "mandate_version_number": version.version_number if version is not None else None,
+        "mandate_audit_event": mandate_audit_event,
+        "mandate_version_audit_event": version_audit_event,
+        "identity_coherent": identity_coherent,
+        "audit_coherent": audit_coherent,
+        "creation_complete": creation_complete,
+        "recovery_required": recovery_required,
+        "transaction_model": _mandate_bootstrap_create_transaction_model(),
+        "conflicts": conflicts,
+        "warnings": warnings,
+        "next_safe_action": next_safe_action,
     }
 
 

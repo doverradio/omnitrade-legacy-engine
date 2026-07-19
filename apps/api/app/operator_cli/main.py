@@ -74,6 +74,7 @@ from app.operator_cli.service import (
     fetch_watch_status,
     mandate_bootstrap,
     mandate_bootstrap_create,
+    mandate_bootstrap_create_status,
     mandate_bootstrap_export,
     mandate_bootstrap_session_validate,
     mandate_governance_readiness_audit,
@@ -971,6 +972,31 @@ def _build_parser() -> argparse.ArgumentParser:
     mandate_bootstrap_create_parser.add_argument("--owner-input-json", type=_parse_owner_input_json, required=True)
     mandate_bootstrap_create_parser.add_argument("--json", action="store_true", dest="json_output")
 
+    mandate_bootstrap_create_status_parser = subparsers.add_parser(
+        "mandate-bootstrap-create-status",
+        parents=[common],
+        help="Read-only inspection of mandate-bootstrap-create's real database state for one campaign + idempotency key -- detects partial/conflicting/incoherent creation",
+        description=(
+            "Stage 9A.1: read-only inspection of the real, committed database state left "
+            "behind by mandate-bootstrap-create for one --capital-campaign-id + "
+            "--idempotency-key (the same root idempotency_key originally supplied inside "
+            "the owner-input document). Performs zero writes. Distinguishes NOT_STARTED "
+            "(nothing created yet) from PARTIAL_RECOVERABLE (mandate created, initial "
+            "version still missing -- safely repairable by rerunning mandate-bootstrap-"
+            "create with the same owner-input document) from COMPLETE_DRAFT (both exist, "
+            "coherent, mandate still unauthorized/inactive) from CONFLICT (idempotency key "
+            "reused with materially different input, or the campaign's underlying database "
+            "identity has drifted since creation) from INCOHERENT (the audit trail itself "
+            "is broken/self-contradictory -- never silently continue past this). Exit code "
+            "0 for NOT_STARTED/COMPLETE_DRAFT, 1 for PARTIAL_RECOVERABLE/CONFLICT/"
+            "INCOHERENT (all require operator attention), 2 only for an infrastructure or "
+            "unexpected failure."
+        ),
+    )
+    mandate_bootstrap_create_status_parser.add_argument("--capital-campaign-id", type=int, required=True)
+    mandate_bootstrap_create_status_parser.add_argument("--idempotency-key", type=str, required=True)
+    mandate_bootstrap_create_status_parser.add_argument("--json", action="store_true", dest="json_output")
+
     proving_pause = subparsers.add_parser(
         "canonical-proving-pause",
         parents=[common],
@@ -1382,6 +1408,14 @@ async def _run_async(args: argparse.Namespace) -> tuple[int, dict[str, Any], str
             owner_input=args.owner_input_json,
         )
         exit_code = 0 if payload["overall_status"] == "CREATED" else 1
+        return exit_code, payload, render_json(payload)
+
+    if args.command == "mandate-bootstrap-create-status":
+        payload = await mandate_bootstrap_create_status(
+            capital_campaign_id=args.capital_campaign_id,
+            idempotency_key=args.idempotency_key,
+        )
+        exit_code = 0 if payload["overall_status"] in {"NOT_STARTED", "COMPLETE_DRAFT"} else 1
         return exit_code, payload, render_json(payload)
 
     if args.command == "canonical-proving-pause":
