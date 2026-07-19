@@ -2933,6 +2933,124 @@ async def mandate_governance_readiness_audit(*, capital_campaign_id: int) -> dic
     }
 
 
+async def mandate_bootstrap_create(*, capital_campaign_id: int, owner_input: dict[str, Any]) -> dict[str, Any]:
+    """Stage 9A: crosses the write boundary for the first time, and stops exactly there.
+    Reuses mandate_bootstrap_export()/mandate_bootstrap_session_validate() for all identity
+    resolution and validation (never re-derives or re-validates anything), and on success
+    reuses the exact same create_mandate()/create_mandate_version() functions and
+    MandateVersionCreateRequest contract mandate_bootstrap() itself already calls for its
+    first two stages -- this is a deliberately truncated prefix of that existing, already
+    production-validated write path, not a new one. Never calls
+    apply_mandate_lifecycle_action(), authorize_mandate_version(), or mandate_bootstrap()
+    itself: the created mandate is left in its default DRAFT status with an unauthorized,
+    inactive initial version. Both underlying writes are already idempotent via
+    create_mandate()/create_mandate_version()'s own idempotency_key-keyed AuditLog lookups,
+    so rerunning this with the same owner-supplied idempotency_key resumes/no-ops onto the
+    same mandate_id/mandate_version_id rather than creating duplicates."""
+    export = await mandate_bootstrap_export(capital_campaign_id=capital_campaign_id)
+    session = await mandate_bootstrap_session_validate(capital_campaign_id=capital_campaign_id, owner_input=owner_input)
+
+    if session["session_status"] != "COMPLETE_FOR_OWNER_REVIEW":
+        return {
+            "overall_status": "FAILED_VALIDATION",
+            "mandate_id": None,
+            "mandate_version_id": None,
+            "database_identity": session["resolved_database_inputs"],
+            "audit_summary": {"writes_performed": False},
+            "write_summary": {"mandate_created": False, "mandate_version_created": False},
+            "validation": session["validation"],
+            "next_required_action": (
+                "Resolve the validation failures reported under validation (missing_fields/"
+                "unexpected_fields/forbidden_override_fields/field_errors/cross_field_errors) "
+                "and retry mandate-bootstrap-create. Zero writes were performed."
+            ),
+        }
+
+    candidate = session["candidate_mandate_bootstrap_request"]
+    root_idempotency_key = candidate["idempotency_key"]
+    actor = candidate["actor"]
+
+    async with AsyncSessionLocal() as db:
+        mandate = await create_mandate(
+            db=db,
+            owner_actor_id=candidate["owner_actor_id"],
+            autonomy_level=candidate["autonomy_level"],
+            provider=candidate["provider"],
+            exchange_environment=candidate["environment"],
+            exchange_connection_id=UUID(candidate["exchange_connection_id"]),
+            live_trading_profile_id=UUID(candidate["live_trading_profile_id"]),
+            paper_account_id=UUID(candidate["paper_account_id"]) if candidate["paper_account_id"] else None,
+            capital_campaign_id=candidate["capital_campaign_id"],
+            expires_at=_parse_datetime(candidate["mandate_expires_at"]),
+            actor=actor,
+            idempotency_key=f"{root_idempotency_key}:create-mandate",
+            reason=candidate["reason"],
+        )
+
+        version = await create_mandate_version(
+            db=db,
+            request=MandateVersionCreateRequest(
+                mandate_id=mandate.mandate_id,
+                actor=actor,
+                base_currency=candidate["base_currency"],
+                authorized_capital_usd=Decimal(candidate["authorized_capital_usd"]),
+                max_order_notional_usd=Decimal(candidate["max_order_notional_usd"]),
+                max_open_exposure_usd=Decimal(candidate["max_open_exposure_usd"]),
+                max_daily_deployed_usd=Decimal(candidate["max_daily_deployed_usd"]),
+                max_daily_realized_loss_usd=Decimal(candidate["max_daily_realized_loss_usd"]),
+                max_campaign_drawdown_usd=Decimal(candidate["max_campaign_drawdown_usd"]),
+                max_consecutive_losses=candidate["max_consecutive_losses"],
+                position_limit=candidate["position_limit"],
+                price_evidence_max_age_seconds=candidate["price_evidence_max_age_seconds"],
+                max_slippage_bps=Decimal(candidate["max_slippage_bps"]),
+                max_fee_bps=Decimal(candidate["max_fee_bps"]),
+                allowed_products=tuple(candidate["allowed_products"]),
+                allowed_order_sides=tuple(candidate["allowed_order_sides"]),
+                allowed_strategy_versions=tuple(candidate["allowed_strategy_versions"]),
+                entry_policy=candidate["entry_policy"],
+                exit_policy=candidate["exit_policy"],
+                cooldown_policy=candidate["cooldown_policy"],
+                operating_schedule=candidate["operating_schedule"],
+                approval_policy=candidate["approval_policy"],
+                reconciliation_policy=candidate["reconciliation_policy"],
+                kill_switch_policy=candidate["kill_switch_policy"],
+                owner_acknowledgements=candidate["owner_acknowledgements"],
+                authorization_evidence_summary=candidate["authorization_evidence_summary"],
+                idempotency_key=f"{root_idempotency_key}:create-version",
+                audit_correlation_id=UUID(candidate["audit_correlation_id"]) if candidate["audit_correlation_id"] else None,
+            ),
+        )
+
+    return {
+        "overall_status": "CREATED",
+        "mandate_id": str(mandate.mandate_id),
+        "mandate_version_id": str(version.mandate_version_id),
+        "database_identity": session["resolved_database_inputs"],
+        "audit_summary": {
+            "writes_performed": True,
+            "actor": actor,
+            "reason": candidate["reason"],
+            "root_idempotency_key": root_idempotency_key,
+            "audit_actions": ["MANDATE_CREATED", "MANDATE_VERSION_CREATED"],
+        },
+        "write_summary": {
+            "mandate_created": True,
+            "mandate_version_created": True,
+            "mandate_status": mandate.status,
+            "mandate_version_number": version.version_number,
+            "mandate_version_is_authorized": bool(version.is_authorized),
+            "mandate_version_is_active": bool(version.is_active),
+        },
+        "next_required_action": (
+            "This mandate and its initial version exist in an unauthorized, inactive state "
+            "only (mandate.status remains DRAFT). No lifecycle action, authorization, "
+            "activation, or trading has occurred. A human operator must separately and "
+            "explicitly submit this version for authorization and activate it -- this "
+            "command never does so automatically."
+        ),
+    }
+
+
 async def _resolve_exchange_connection_for_commissioning(
     *,
     db,

@@ -73,6 +73,7 @@ from app.operator_cli.service import (
     fetch_risk_ledger_diagnosis,
     fetch_watch_status,
     mandate_bootstrap,
+    mandate_bootstrap_create,
     mandate_bootstrap_export,
     mandate_bootstrap_session_validate,
     mandate_governance_readiness_audit,
@@ -945,6 +946,31 @@ def _build_parser() -> argparse.ArgumentParser:
     mandate_governance_readiness_audit_parser.add_argument("--capital-campaign-id", type=int, required=True)
     mandate_governance_readiness_audit_parser.add_argument("--json", action="store_true", dest="json_output")
 
+    mandate_bootstrap_create_parser = subparsers.add_parser(
+        "mandate-bootstrap-create",
+        parents=[common],
+        help="Governed mandate creation: validates an owner-input document and, only on success, creates the mandate and its initial version -- never authorizes or activates",
+        description=(
+            "Stage 9A: reuses mandate_bootstrap_export()'s read-only resolution and "
+            "mandate_bootstrap_session_validate()'s validation for one "
+            "--capital-campaign-id/--owner-input-json pair. If validation fails, performs "
+            "zero writes and returns overall_status=FAILED_VALIDATION. If validation "
+            "succeeds, reuses the same create_mandate()/create_mandate_version() functions "
+            "mandate_bootstrap() itself already calls to create exactly one mandate and its "
+            "initial version, then stops -- never calling "
+            "apply_mandate_lifecycle_action(), authorize_mandate_version(), or "
+            "mandate_bootstrap() itself. The created mandate is left DRAFT/unauthorized/"
+            "inactive; a human operator must separately authorize and activate it. Both "
+            "writes are idempotent on the owner-supplied idempotency_key -- rerunning with "
+            "the same owner-input document resumes onto the same mandate_id/"
+            "mandate_version_id rather than creating duplicates. Exit code 0 for CREATED, "
+            "1 for FAILED_VALIDATION, 2 only for an infrastructure or unexpected failure."
+        ),
+    )
+    mandate_bootstrap_create_parser.add_argument("--capital-campaign-id", type=int, required=True)
+    mandate_bootstrap_create_parser.add_argument("--owner-input-json", type=_parse_owner_input_json, required=True)
+    mandate_bootstrap_create_parser.add_argument("--json", action="store_true", dest="json_output")
+
     proving_pause = subparsers.add_parser(
         "canonical-proving-pause",
         parents=[common],
@@ -1348,6 +1374,14 @@ async def _run_async(args: argparse.Namespace) -> tuple[int, dict[str, Any], str
     if args.command == "mandate-governance-readiness-audit":
         payload = await mandate_governance_readiness_audit(capital_campaign_id=args.capital_campaign_id)
         exit_code = 0 if payload["overall_status"] == "READY_FOR_STAGE9" else 1
+        return exit_code, payload, render_json(payload)
+
+    if args.command == "mandate-bootstrap-create":
+        payload = await mandate_bootstrap_create(
+            capital_campaign_id=args.capital_campaign_id,
+            owner_input=args.owner_input_json,
+        )
+        exit_code = 0 if payload["overall_status"] == "CREATED" else 1
         return exit_code, payload, render_json(payload)
 
     if args.command == "canonical-proving-pause":
