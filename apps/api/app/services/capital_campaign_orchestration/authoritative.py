@@ -164,20 +164,36 @@ async def _load_campaign_strategy_authority(
             "preferred_strategy_identity": preferred_identity,
         }
 
+    # Continuity-lineage lookups are best-effort, informational-only reads
+    # (a miss just means "no historical continuity signal"). Each runs in
+    # its own savepoint so any failure -- of any kind, including a
+    # database-level error -- rolls back only that savepoint, not the
+    # caller's ambient transaction, and is logged rather than silently
+    # absorbed. This function runs unconditionally at the start of every
+    # authoritative composition cycle, before roster/aggregate evidence is
+    # even loaded, so an unguarded failure here poisons the entire rest of
+    # the cycle's transaction -- surfacing much later, and seemingly
+    # unrelated, wherever the next statement on this session happens to run.
     try:
-        package = await db.scalar(
-            select(CanonicalPreviewPackage)
-            .where(CanonicalPreviewPackage.campaign_id == campaign_id)
-            .where(CanonicalPreviewPackage.campaign_version == campaign_version)
-            .where(
-                CanonicalPreviewPackage.package_state.in_(
-                    ("READY", "AUTHORIZED", "DRY_RUN_PASSED", "ACTIVATED")
+        async with db.begin_nested():
+            package = await db.scalar(
+                select(CanonicalPreviewPackage)
+                .where(CanonicalPreviewPackage.campaign_id == campaign_id)
+                .where(CanonicalPreviewPackage.campaign_version == campaign_version)
+                .where(
+                    CanonicalPreviewPackage.package_state.in_(
+                        ("READY", "AUTHORIZED", "DRY_RUN_PASSED", "ACTIVATED")
+                    )
                 )
+                .order_by(desc(CanonicalPreviewPackage.updated_at), desc(CanonicalPreviewPackage.generated_at))
+                .limit(1)
             )
-            .order_by(desc(CanonicalPreviewPackage.updated_at), desc(CanonicalPreviewPackage.generated_at))
-            .limit(1)
-        )
     except Exception:
+        logger.warning(
+            "campaign_strategy_authority_package_lookup_failed campaign_id=%s campaign_version=%s",
+            campaign_id, campaign_version,
+            exc_info=True,
+        )
         package = None
 
     if package is None:
@@ -187,8 +203,14 @@ async def _load_campaign_strategy_authority(
 
     strategy_slug = None
     try:
-        strategy = await db.scalar(select(Strategy).where(Strategy.id == package.strategy_id).limit(1))
+        async with db.begin_nested():
+            strategy = await db.scalar(select(Strategy).where(Strategy.id == package.strategy_id).limit(1))
     except Exception:
+        logger.warning(
+            "campaign_strategy_authority_strategy_lookup_failed campaign_id=%s campaign_version=%s",
+            campaign_id, campaign_version,
+            exc_info=True,
+        )
         strategy = None
     if strategy is not None and hasattr(strategy, "slug"):
         strategy_slug = str(strategy.slug)
@@ -1895,9 +1917,24 @@ async def compose_campaign_authoritative_cycle(
             runtime_available_authority = getattr(runtime_campaign, "available_capital", None)
         if runtime_available_authority is None and runtime_campaign.current_equity is not None:
             runtime_available_authority = Decimal(str(runtime_campaign.current_equity))
+        # campaign_definition.remaining_unallocated_capital (via the domain
+        # service's CapitalCampaignDefinitionResponse) and runtime_campaign's
+        # available-authority fields all ultimately trace back to
+        # runtime.current_equity, which is never updated by any trade, fill,
+        # execution, reconciliation, risk-monitoring, or portfolio-valuation
+        # code -- the only writers are campaign draft creation/edit
+        # (capital_campaign_domain/service.py) and the human-operator
+        # PATCH /capital-campaigns endpoint (capital_campaigns/service.py),
+        # neither of which reacts to trading activity. That frozen snapshot
+        # must never be allowed to sit below the campaign's own authorized
+        # capital_budget and silently become the binding constraint on a
+        # well-funded campaign's entry sizing: it is only ever raised here,
+        # never lowered, so real liquid cash (paper_account_cash_balance) and
+        # every hard cap (maximum_position_size, maximum_total_exposure) stay
+        # exactly as strict as before.
         runtime_available_authority_decimal = None
         if runtime_available_authority is not None:
-            runtime_available_authority_decimal = Decimal(str(runtime_available_authority))
+            runtime_available_authority_decimal = max(Decimal(str(runtime_available_authority)), campaign_capital_budget)
         minimum_viable_amount = max(
             Decimal(str(campaign_definition.minimum_position_size)),
             Decimal(str(asset.min_order_notional or "0")),
@@ -1909,7 +1946,11 @@ async def compose_campaign_authoritative_cycle(
             quantity = Decimal(str(position["position"]["quantity"]))
         else:
             side = "buy"
-            cap_terms = [campaign_definition.remaining_unallocated_capital, campaign_definition.maximum_position_size, campaign_definition.maximum_total_exposure, paper_account_cash_balance]
+            remaining_unallocated_capital_cap = max(
+                Decimal(str(campaign_definition.remaining_unallocated_capital)),
+                campaign_capital_budget,
+            )
+            cap_terms = [remaining_unallocated_capital_cap, campaign_definition.maximum_position_size, campaign_definition.maximum_total_exposure, paper_account_cash_balance]
             if enforce_requested_proving_amount:
                 cap_terms.append(requested_proving_amount)
             if runtime_available_authority_decimal is not None:

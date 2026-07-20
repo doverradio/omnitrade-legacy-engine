@@ -1,9 +1,11 @@
 from __future__ import annotations
 
+import logging
+from contextlib import asynccontextmanager
 from decimal import Decimal
 from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
-from uuid import UUID
+from uuid import UUID, uuid4
 
 import pytest
 
@@ -764,6 +766,152 @@ async def test_authoritative_no_action_reason_is_minimum_order_continuity(monkey
 
     result = await compose_campaign_authoritative_cycle(db=_Db(), campaign_definition=campaign, trigger="kraken_btc_15m_candle_close", candle=candle)
     assert result.composition["failed_closed"] is False
+    assert result.composition["selected_decision"]["decision_kind"] == "HOLD"
+    assert result.composition["selected_decision"]["reason"] == "position_below_minimum_order_size"
+
+
+# Regression for production incident: a valid buy_agreement_threshold_met
+# decision was still skipping READY package creation with
+# position_below_minimum_order_size. Root cause: campaign_definition's
+# remaining_unallocated_capital (and runtime_campaign's available-authority
+# fields) trace back to runtime.current_equity, which is written exactly
+# once -- at campaign draft creation/edit time -- and is never updated by
+# any trade, fill, or reconciliation code afterward (confirmed: the only
+# assignment to CapitalCampaign.current_equity in the whole codebase is in
+# capital_campaign_domain/service.py's draft create/edit path). A
+# well-funded campaign (capital_budget=1000) whose frozen equity snapshot
+# happens to sit below the $5 proving floor was therefore permanently
+# blocked from its very first entry, with no way to self-correct. This is a
+# campaign allocation bug, not a position-sizing calculation defect or an
+# incorrect minimum-order validation -- the $5 floor/asset minimum are
+# working exactly as configured; capital_budget just never got consulted as
+# a rescue ceiling.
+@pytest.mark.asyncio
+async def test_authoritative_capital_budget_rescues_stale_remaining_unallocated_capital(monkeypatch: pytest.MonkeyPatch) -> None:
+    from app.services.capital_campaign_orchestration.authoritative import compose_campaign_authoritative_cycle
+
+    campaign = SimpleNamespace(
+        campaign_id=UUID("aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa"),
+        version=1,
+        runtime_campaign_uuid=UUID("bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb"),
+        allowed_instruments=["BTC-USD"],
+        capital_budget=Decimal("1000"),
+        remaining_unallocated_capital=Decimal("1"),
+        maximum_position_size=Decimal("5"),
+        minimum_position_size=Decimal("5"),
+        maximum_total_exposure=Decimal("5"),
+        metadata_evidence={},
+    )
+    runtime_campaign = SimpleNamespace(id=17, paper_account_id=UUID("12345678-1234-1234-1234-1234567890ab"), exchange="kraken_spot", current_equity=Decimal("1"), status="READY")
+    paper_account = SimpleNamespace(id=runtime_campaign.paper_account_id, starting_balance=Decimal("1000"))
+    candle = SimpleNamespace(asset_id=UUID("dddddddd-dddd-dddd-dddd-dddddddddddd"), close=Decimal("100"), close_time=datetime(2026, 7, 15, 0, 15, tzinfo=timezone.utc), interval="15m", open_time=datetime(2026, 7, 15, 0, 0, tzinfo=timezone.utc))
+    asset = SimpleNamespace(id=UUID("eeeeeeee-eeee-eeee-eeee-eeeeeeeeeeee"), exchange="kraken_spot", base_currency="USD", min_order_notional=Decimal("5"), qty_step_size=None, supports_fractional=True)
+    market = {"authority_class": "AUTHORITATIVE", "reason": "market data resolved from canonical asset and candle tables", "freshness": "fresh", "close_price": "100"}
+    strategy = {"authority_class": "AUTHORITATIVE", "strategy_identity": "ma_crossover@1", "strategy_version": "1", "action": "BUY", "confidence": "0.8", "sample_size": 12, "profitable_after_fees_performance": "4.2", "expected_value": "4.2", "evidence_timestamp": "2026-07-15T00:15:00+00:00", "source_identity": {"decision_record_id": "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa"}}
+    position = {"authority_class": "AUTHORITATIVE", "position": None, "lifecycle": None, "profitability": None}
+    risk_context = SimpleNamespace(
+        account_equity=Decimal("1000"),
+        start_of_day_equity=Decimal("1000"),
+        current_equity=Decimal("1000"),
+        max_position_size_pct=Decimal("0.10"),
+        max_daily_loss_pct=Decimal("0.03"),
+        high_water_mark_equity=Decimal("1000"),
+        max_drawdown_pct=Decimal("0.10"),
+        consecutive_losses_on_pair=0,
+        cooldown_after_losses=3,
+        last_loss_at=None,
+        cooldown_duration_minutes=Decimal("1440"),
+        evaluation_time=datetime(2026, 7, 15, 0, 16, tzinfo=timezone.utc),
+        data_is_stale=False,
+        data_has_gaps=False,
+        global_kill_switch_engaged_state=False,
+        global_kill_switch_rearm_required=False,
+        account_kill_switch_engaged_state=False,
+        account_kill_switch_rearm_required=False,
+        global_kill_switch_state_observed=True,
+        account_kill_switch_state_observed=True,
+        risk_policy_source="module_fallback_default",
+    )
+
+    class _Db:
+        async def scalar(self, _statement):
+            return paper_account
+
+    monkeypatch.setattr("app.services.capital_campaign_orchestration.authoritative._load_runtime_campaign", _async_return(runtime_campaign))
+    monkeypatch.setattr("app.services.capital_campaign_orchestration.authoritative._load_market_evidence", _async_return((market, asset, candle)))
+    monkeypatch.setattr("app.services.capital_campaign_orchestration.authoritative.resolve_and_persist_strategy_aggregate_evidence", _async_return((strategy, None)))
+    monkeypatch.setattr("app.services.capital_campaign_orchestration.authoritative._load_position_evidence", _async_return(position))
+    monkeypatch.setattr("app.services.capital_campaign_orchestration.authoritative.resolve_execution_risk_context", _async_return(risk_context))
+    monkeypatch.setattr("app.services.capital_campaign_orchestration.authoritative.evaluate_signal_risk", lambda **_kwargs: RiskEvaluationResult(action=RiskDecisionAction.APPROVE, reason_code=None, approved_quantity=Decimal("0.05"), steps=[]))
+    monkeypatch.setattr("app.services.capital_campaign_orchestration.authoritative.persist_risk_decision", _async_return(SimpleNamespace(risk_event_id=UUID("ffffffff-ffff-ffff-ffff-ffffffffffff"))))
+    monkeypatch.setattr("app.services.capital_campaign_orchestration.authoritative.build_campaign_preview", lambda **_kwargs: SimpleNamespace(model_dump=lambda **_dump_kwargs: {"no_action": False, "preview": "stub"}))
+
+    result = await compose_campaign_authoritative_cycle(db=_Db(), campaign_definition=campaign, trigger="kraken_btc_15m_candle_close", candle=candle)
+    assert result.composition["failed_closed"] is False
+    assert result.composition["selected_decision"]["decision_kind"] == "OPEN_POSITION_PROPOSED"
+
+
+@pytest.mark.asyncio
+async def test_authoritative_genuinely_insufficient_capital_budget_still_blocked(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The capital_budget rescue must never mask a campaign whose real,
+    current capital_budget is ALSO below the floor -- and must never touch
+    the independent real-cash or hard-exposure caps."""
+    from app.services.capital_campaign_orchestration.authoritative import compose_campaign_authoritative_cycle
+
+    campaign = SimpleNamespace(
+        campaign_id=UUID("aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa"),
+        version=1,
+        runtime_campaign_uuid=UUID("bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb"),
+        allowed_instruments=["BTC-USD"],
+        capital_budget=Decimal("1"),
+        remaining_unallocated_capital=Decimal("1"),
+        maximum_position_size=Decimal("5"),
+        minimum_position_size=Decimal("5"),
+        maximum_total_exposure=Decimal("5"),
+        metadata_evidence={},
+    )
+    runtime_campaign = SimpleNamespace(id=17, paper_account_id=UUID("12345678-1234-1234-1234-1234567890ab"), exchange="kraken_spot", current_equity=Decimal("1"), status="READY")
+    paper_account = SimpleNamespace(id=runtime_campaign.paper_account_id, starting_balance=Decimal("1000"))
+    candle = SimpleNamespace(asset_id=UUID("dddddddd-dddd-dddd-dddd-dddddddddddd"), close=Decimal("100"), close_time=datetime(2026, 7, 15, 0, 15, tzinfo=timezone.utc), interval="15m", open_time=datetime(2026, 7, 15, 0, 0, tzinfo=timezone.utc))
+    asset = SimpleNamespace(id=UUID("eeeeeeee-eeee-eeee-eeee-eeeeeeeeeeee"), exchange="kraken_spot", base_currency="USD", min_order_notional=Decimal("5"), qty_step_size=None, supports_fractional=True)
+    strategy = {"authority_class": "AUTHORITATIVE", "strategy_identity": "ma_crossover@1", "strategy_version": "1", "action": "BUY", "confidence": "0.8", "sample_size": 12, "profitable_after_fees_performance": "4.2", "expected_value": "4.2", "evidence_timestamp": "2026-07-15T00:15:00+00:00", "source_identity": {"decision_record_id": "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa"}}
+    position = {"authority_class": "AUTHORITATIVE", "position": None, "lifecycle": None, "profitability": None}
+    risk_context = SimpleNamespace(
+        account_equity=Decimal("1000"),
+        start_of_day_equity=Decimal("1000"),
+        current_equity=Decimal("1000"),
+        max_position_size_pct=Decimal("0.10"),
+        max_daily_loss_pct=Decimal("0.03"),
+        high_water_mark_equity=Decimal("1000"),
+        max_drawdown_pct=Decimal("0.10"),
+        consecutive_losses_on_pair=0,
+        cooldown_after_losses=3,
+        last_loss_at=None,
+        cooldown_duration_minutes=Decimal("1440"),
+        evaluation_time=datetime(2026, 7, 15, 0, 16, tzinfo=timezone.utc),
+        data_is_stale=False,
+        data_has_gaps=False,
+        global_kill_switch_engaged_state=False,
+        global_kill_switch_rearm_required=False,
+        account_kill_switch_engaged_state=False,
+        account_kill_switch_rearm_required=False,
+        global_kill_switch_state_observed=True,
+        account_kill_switch_state_observed=True,
+        risk_policy_source="module_fallback_default",
+    )
+
+    class _Db:
+        async def scalar(self, _statement):
+            return paper_account
+
+    monkeypatch.setattr("app.services.capital_campaign_orchestration.authoritative._load_runtime_campaign", _async_return(runtime_campaign))
+    monkeypatch.setattr("app.services.capital_campaign_orchestration.authoritative._load_market_evidence", _async_return(({"authority_class": "AUTHORITATIVE", "reason": "market data resolved from canonical asset and candle tables", "freshness": "fresh", "close_price": "100"}, asset, candle)))
+    monkeypatch.setattr("app.services.capital_campaign_orchestration.authoritative.resolve_and_persist_strategy_aggregate_evidence", _async_return((strategy, None)))
+    monkeypatch.setattr("app.services.capital_campaign_orchestration.authoritative._load_position_evidence", _async_return(position))
+    monkeypatch.setattr("app.services.capital_campaign_orchestration.authoritative.resolve_execution_risk_context", _async_return(risk_context))
+    monkeypatch.setattr("app.services.capital_campaign_orchestration.authoritative.build_campaign_preview", lambda **_kwargs: SimpleNamespace(model_dump=lambda **_dump_kwargs: {"no_action": True, "preview": "stub"}))
+
+    result = await compose_campaign_authoritative_cycle(db=_Db(), campaign_definition=campaign, trigger="kraken_btc_15m_candle_close", candle=candle)
     assert result.composition["selected_decision"]["decision_kind"] == "HOLD"
     assert result.composition["selected_decision"]["reason"] == "position_below_minimum_order_size"
 
@@ -1557,3 +1705,148 @@ async def test_preview_for_candle_reports_considered_eligible_and_skipped_campai
     # decoupled from the per-instrument decision outcome.
     assert payload["cycle_count"] == 1
     assert db.added.termination_stage == "hold_no_package_created"
+
+
+class _FakeNestedDb:
+    """Minimal db double that actually engages an async savepoint context
+    manager, so these tests exercise the real transactional contract
+    (isolate-via-savepoint, then log, then continue) rather than passing
+    only because a fake without begin_nested() happened to raise an
+    AttributeError that got swallowed the same way a real failure would."""
+
+    def __init__(self, *, scalar_results: list[object]) -> None:
+        self._scalar_results = list(scalar_results)
+        self._call_index = 0
+        self.savepoint_enter_count = 0
+        self.savepoint_rollback_count = 0
+
+    async def scalar(self, _statement):
+        value = self._scalar_results[self._call_index]
+        self._call_index += 1
+        if isinstance(value, Exception):
+            raise value
+        return value
+
+    @asynccontextmanager
+    async def begin_nested(self):
+        self.savepoint_enter_count += 1
+        try:
+            yield
+        except Exception:
+            self.savepoint_rollback_count += 1
+            raise
+
+
+# Regression for continued intermittent PendingRollbackError after the prior
+# nested-transaction fix: _load_campaign_strategy_authority runs
+# unconditionally at the start of every authoritative composition cycle --
+# before roster/aggregate evidence is even loaded -- and had two bare
+# except-Exception blocks around live db.scalar reads with no rollback and
+# no logging. A real database-level failure there poisoned the entire rest
+# of the cycle's transaction, surfacing much later (and seemingly
+# unrelated) at whatever statement ran next -- exactly the same failure
+# shape as the aggregate-evidence scorecard-fetch sites fixed previously,
+# just one call earlier in the same chain.
+@pytest.mark.asyncio
+async def test_campaign_strategy_authority_package_lookup_failure_is_isolated_and_logged(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    from app.services.capital_campaign_orchestration.authoritative import _load_campaign_strategy_authority
+
+    db = _FakeNestedDb(scalar_results=[RuntimeError("simulated package lookup failure")])
+    caplog.set_level(logging.WARNING)
+
+    result = await _load_campaign_strategy_authority(
+        db=db,
+        campaign_id=UUID("aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa"),
+        campaign_version=1,
+        metadata_evidence={},
+    )
+
+    assert result == {"authority_source": "none", "preferred_strategy_identity": None}
+    assert db.savepoint_enter_count == 1
+    assert db.savepoint_rollback_count == 1
+
+    matching = [
+        record
+        for record in caplog.records
+        if record.getMessage().startswith("campaign_strategy_authority_package_lookup_failed")
+    ]
+    assert len(matching) == 1
+    assert matching[0].exc_info is not None
+    assert str(matching[0].exc_info[1]) == "simulated package lookup failure"
+
+    # The session is still usable for an unrelated query afterward -- the
+    # savepoint isolated the failure rather than leaving the db unusable.
+    db._scalar_results.append("still usable")
+    assert await db.scalar("unrelated") == "still usable"
+
+
+@pytest.mark.asyncio
+async def test_campaign_strategy_authority_strategy_lookup_failure_is_isolated_and_logged(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    from app.services.capital_campaign_orchestration.authoritative import _load_campaign_strategy_authority
+
+    package = SimpleNamespace(
+        package_id=uuid4(),
+        strategy_id=uuid4(),
+        parameter_set_id=uuid4(),
+        strategy_version="1.0.0",
+    )
+    db = _FakeNestedDb(scalar_results=[package, RuntimeError("simulated strategy lookup failure")])
+    caplog.set_level(logging.WARNING)
+
+    result = await _load_campaign_strategy_authority(
+        db=db,
+        campaign_id=UUID("aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa"),
+        campaign_version=1,
+        metadata_evidence={},
+    )
+
+    assert result["authority_source"] == "canonical_preview_package_continuity_only"
+    assert result["historical_strategy_identity"] is None
+    assert db.savepoint_enter_count == 2
+    assert db.savepoint_rollback_count == 1
+
+    matching = [
+        record
+        for record in caplog.records
+        if record.getMessage().startswith("campaign_strategy_authority_strategy_lookup_failed")
+    ]
+    assert len(matching) == 1
+    assert matching[0].exc_info is not None
+
+    db._scalar_results.append("still usable")
+    assert await db.scalar("unrelated") == "still usable"
+
+
+@pytest.mark.asyncio
+async def test_campaign_strategy_authority_healthy_path_unaffected_by_savepoint(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Control case: no fault injected. Wrapping both lookups in a savepoint
+    must not change the successful-resolution result."""
+    from app.services.capital_campaign_orchestration.authoritative import _load_campaign_strategy_authority
+
+    package = SimpleNamespace(
+        package_id=uuid4(),
+        strategy_id=uuid4(),
+        parameter_set_id=uuid4(),
+        strategy_version="1.0.0",
+    )
+    strategy = SimpleNamespace(slug="ma_crossover")
+    db = _FakeNestedDb(scalar_results=[package, strategy])
+    caplog.set_level(logging.WARNING)
+
+    result = await _load_campaign_strategy_authority(
+        db=db,
+        campaign_id=UUID("aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa"),
+        campaign_version=1,
+        metadata_evidence={},
+    )
+
+    assert result["authority_source"] == "canonical_preview_package_continuity_only"
+    assert result["historical_strategy_identity"] == "ma_crossover@1.0.0"
+    assert db.savepoint_rollback_count == 0
+    assert not any("lookup_failed" in record.getMessage() for record in caplog.records)
