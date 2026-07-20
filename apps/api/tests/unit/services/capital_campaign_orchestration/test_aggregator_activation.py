@@ -19,6 +19,8 @@ from app.models.audit_log import AuditLog
 from app.models.canonical_preview_package import CanonicalPreviewPackage
 from app.models.capital_campaign_definition import CapitalCampaignDefinition
 from app.models.strategy import Strategy
+from app.schemas.capital_campaign_domain import CampaignCompoundingPolicy, CampaignProfitDistributionPolicy
+from app.services.capital_campaign_domain.preview_engine import _validate_percentages
 from app.services.capital_campaign_orchestration.aggregator_activation import (
     execute_campaign_aggregator_activation,
     fetch_campaign_aggregator_activation_audit,
@@ -211,7 +213,15 @@ async def test_execute_pins_identity_and_disables_compounding_and_leaves_package
         )).scalar_one())
         assert definition.metadata_evidence["selected_strategy_identity"] == AGGREGATE_STRATEGY_IDENTITY
         assert definition.compounding_policy["reinvestment_percentage"] == "0"
-        # policy_type must be preserved -- only reinvestment_percentage changes.
+        # The freed 100% previously earmarked for reinvestment must be
+        # reallocated to reserve, not simply dropped -- otherwise the
+        # percentages-sum-to-100 invariant enforced by
+        # capital_campaign_domain.preview_engine._validate_percentages breaks
+        # and campaign preview composition raises InvalidRequestError in
+        # production on the very next orchestration cycle.
+        assert definition.compounding_policy["reserve_percentage"] == "100"
+        assert result.after["reserve_percentage"] == "100"
+        # policy_type must be preserved -- only the percentages change.
         assert definition.compounding_policy["policy_type"] == "REINVEST_PERCENTAGE"
 
         packages = (await session.execute(select(CanonicalPreviewPackage))).scalars().all()
@@ -220,6 +230,83 @@ async def test_execute_pins_identity_and_disables_compounding_and_leaves_package
 
         post_readiness = await inspect_campaign_aggregator_activation(db=session, campaign_id=CAMPAIGN_ID, campaign_version=CAMPAIGN_VERSION)
         assert post_readiness.snapshot["continuity_conflict_risk_if_deployed_now"] is False
+        assert post_readiness.snapshot["already_compounding_disabled"] is True
+
+        # The exact validator that broke production must accept the migrated
+        # policy without raising.
+        _validate_percentages(
+            compounding_policy=CampaignCompoundingPolicy(**definition.compounding_policy),
+            distribution_policy=CampaignProfitDistributionPolicy(reinvestment_percentage=Decimal("100")),
+        )
+
+
+@pytest.mark.asyncio
+async def test_execute_reallocates_partial_reserve_and_preserves_distribution() -> None:
+    async with _real_session() as session:
+        await _seed_definition(
+            session,
+            compounding_policy={
+                "policy_type": "REINVEST_PERCENTAGE",
+                "reinvestment_percentage": "70",
+                "profit_distribution_percentage": "10",
+                "reserve_percentage": "20",
+            },
+        )
+
+        result = await execute_campaign_aggregator_activation(
+            db=session, campaign_id=CAMPAIGN_ID, campaign_version=CAMPAIGN_VERSION,
+            actor="operator:eric", reason="test", idempotency_key="key-1", confirm=True,
+        )
+
+        assert result.after["reinvestment_percentage"] == "0"
+        assert result.after["profit_distribution_percentage"] == "10"
+        # 20 (prior reserve) + 70 (reclaimed reinvestment) = 90.
+        assert result.after["reserve_percentage"] == "90"
+
+        _validate_percentages(
+            compounding_policy=CampaignCompoundingPolicy(
+                policy_type="REINVEST_PERCENTAGE",
+                reinvestment_percentage=Decimal(result.after["reinvestment_percentage"]),
+                profit_distribution_percentage=Decimal(result.after["profit_distribution_percentage"]),
+                reserve_percentage=Decimal(result.after["reserve_percentage"]),
+            ),
+            distribution_policy=CampaignProfitDistributionPolicy(reinvestment_percentage=Decimal("100")),
+        )
+
+
+@pytest.mark.asyncio
+async def test_readiness_detects_incomplete_prior_migration_and_execute_repairs_it() -> None:
+    """Models the exact production incident: an earlier migration pinned the
+    aggregate identity and zeroed reinvestment_percentage without
+    reallocating it, leaving percentages summing to 0 instead of 100. The
+    readiness check must not report this as already-applied, and a repeat
+    execute call (with a new idempotency key, since this is logically a new
+    corrective operation) must fix reserve_percentage without disturbing the
+    identity pin."""
+    async with _real_session() as session:
+        await _seed_definition(
+            session,
+            metadata_evidence={"selected_strategy_identity": AGGREGATE_STRATEGY_IDENTITY},
+            compounding_policy={"policy_type": "REINVEST_PERCENTAGE", "reinvestment_percentage": "0"},
+        )
+
+        readiness = await inspect_campaign_aggregator_activation(db=session, campaign_id=CAMPAIGN_ID, campaign_version=CAMPAIGN_VERSION)
+        assert readiness.ready is True
+        assert readiness.snapshot["already_pinned_to_aggregate_identity"] is True
+        assert readiness.snapshot["already_compounding_disabled"] is False
+
+        result = await execute_campaign_aggregator_activation(
+            db=session, campaign_id=CAMPAIGN_ID, campaign_version=CAMPAIGN_VERSION,
+            actor="operator:eric", reason="repair incomplete migration", idempotency_key="repair-key-1", confirm=True,
+        )
+
+        assert result.changed is True
+        assert result.after["selected_strategy_identity"] == AGGREGATE_STRATEGY_IDENTITY
+        assert result.after["reinvestment_percentage"] == "0"
+        assert result.after["reserve_percentage"] == "100"
+
+        post_readiness = await inspect_campaign_aggregator_activation(db=session, campaign_id=CAMPAIGN_ID, campaign_version=CAMPAIGN_VERSION)
+        assert post_readiness.snapshot["already_compounding_disabled"] is True
 
 
 @pytest.mark.asyncio
@@ -251,7 +338,12 @@ async def test_execute_is_idempotent_even_with_a_new_idempotency_key_once_state_
         await _seed_definition(
             session,
             metadata_evidence={"selected_strategy_identity": AGGREGATE_STRATEGY_IDENTITY},
-            compounding_policy={"policy_type": "REINVEST_PERCENTAGE", "reinvestment_percentage": "0"},
+            compounding_policy={
+                "policy_type": "REINVEST_PERCENTAGE",
+                "reinvestment_percentage": "0",
+                "profit_distribution_percentage": "0",
+                "reserve_percentage": "100",
+            },
         )
 
         result = await execute_campaign_aggregator_activation(

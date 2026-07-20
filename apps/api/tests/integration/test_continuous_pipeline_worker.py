@@ -83,6 +83,44 @@ class _CampaignPreviewCapableDB(_FakeDB):
         return SimpleNamespace(scalars=lambda: SimpleNamespace(all=lambda: []))
 
 
+class _MissingGreenletSimulation(RuntimeError):
+    """Stands in for sqlalchemy.exc.MissingGreenlet: raised when code touches
+    an attribute of an expired ORM instance outside the async greenlet
+    bridge -- exactly what Session.rollback() sets up by expiring every
+    instance the session was tracking."""
+
+
+class _ExpiringCandle:
+    def __init__(self, *, id, asset_id, open_time, close_time) -> None:
+        self._values = {"id": id, "asset_id": asset_id, "open_time": open_time, "close_time": close_time}
+        self._expired = False
+
+    def expire(self) -> None:
+        self._expired = True
+
+    def __getattr__(self, name):
+        if name not in self._values:
+            raise AttributeError(name)
+        if self._expired:
+            raise _MissingGreenletSimulation(
+                f"greenlet_spawn has not been called; attribute {name!r} requires a lazy refresh outside async context"
+            )
+        return self._values[name]
+
+
+class _ExpiringSessionCampaignPreviewCapableDB(_CampaignPreviewCapableDB):
+    """A campaign-preview-capable fake whose rollback() expires a tracked
+    candle, mirroring Session.rollback()'s expire-everything behavior."""
+
+    def __init__(self, *, tracked_candle: _ExpiringCandle) -> None:
+        super().__init__()
+        self._tracked_candle = tracked_candle
+
+    async def rollback(self) -> None:
+        await super().rollback()
+        self._tracked_candle.expire()
+
+
 class _FixedStrategy:
     def __init__(self, action: str) -> None:
         self._action = action
@@ -1615,6 +1653,120 @@ async def test_worker_rolls_back_and_continues_when_roster_raises(monkeypatch: p
 
     assert stats.ingestion_assets_ok == 1
     assert db.rollbacks == 1
+
+
+# Regression for the first production incident after the aggregator went
+# live: campaign orchestration composed the cycle before the strategy roster
+# had created this candle's StrategyRosterRun, so the aggregator's exact-match
+# lookup always missed (strategy_aggregate_skipped
+# reason=exact_roster_run_unavailable) on every single cycle. The roster must
+# run, and its writes must be visible, before campaign orchestration composes
+# the same candle.
+@pytest.mark.asyncio
+async def test_worker_runs_strategy_roster_before_campaign_orchestration_preview(monkeypatch: pytest.MonkeyPatch) -> None:
+    db = _CampaignPreviewCapableDB()
+    cycle_id = uuid.uuid4()
+    candle = SimpleNamespace(
+        id=uuid.uuid4(),
+        asset_id=uuid.uuid4(),
+        open_time=datetime(2026, 7, 10, 12, 0, tzinfo=timezone.utc),
+        close_time=datetime(2026, 7, 10, 12, 15, tzinfo=timezone.utc),
+    )
+    call_order: list[str] = []
+
+    async def _roster(*, db, request):
+        call_order.append("strategy_roster")
+        return SimpleNamespace(roster_run_id=uuid.uuid4(), replayed=False)
+
+    async def _campaign_preview(*, db, trigger):
+        call_order.append("campaign_orchestration_preview")
+        return {"cycle_count": 0, "reason": "no_campaign_candidates", "considered_campaigns": [], "eligible_campaigns": [], "skipped_campaigns": []}
+
+    import app.services.orchestration.continuous_pipeline_worker as worker_module
+
+    monkeypatch.setattr(worker_module, "run_ingestion_cycle", _fake_ingestion_cycle)
+    monkeypatch.setattr(worker_module, "_run_kraken_btc_autonomous_cycle_if_due", _async_return((cycle_id, candle)))
+    monkeypatch.setattr(worker_module, "run_strategy_roster_for_candle", _roster)
+    monkeypatch.setattr(worker_module, "run_campaign_orchestration_preview_for_candle", _campaign_preview)
+    monkeypatch.setattr(worker_module, "_attempt_automatic_ready_package_creation", _async_return(None))
+    monkeypatch.setattr(worker_module, "_load_active_assets", _async_return([]))
+    monkeypatch.setattr(worker_module, "_load_active_strategies", _async_return([]))
+    monkeypatch.setattr(worker_module, "run_deterministic_research_cycle_if_due", _async_return(_not_due_research_result()))
+    monkeypatch.setattr(worker_module, "capture_system_intelligence_snapshot_if_due", _async_return(None))
+
+    stats = await run_orchestration_cycle(db=db, client=object(), config=_config())
+
+    assert stats.ingestion_assets_ok == 1
+    assert call_order == ["strategy_roster", "campaign_orchestration_preview"]
+
+
+# Regression for the second half of the same production incident: a
+# campaign_orchestration failure (e.g. the compounding-percentage bug above)
+# rolls back the shared session, which expires every ORM instance the session
+# was tracking, including the previously loaded kraken candle. Any later code
+# that still touches candle.<attr> directly (rather than a primitive captured
+# before the rollback) raises MissingGreenlet under the real async ORM. This
+# proves the worker only ever uses primitives captured up front, so a prior
+# rollback cannot poison the campaign_orchestration block's own logging, and
+# the cycle still proceeds into its later stages (research, snapshot).
+@pytest.mark.asyncio
+async def test_worker_survives_a_prior_rollback_without_touching_expired_candle_and_continues(monkeypatch: pytest.MonkeyPatch) -> None:
+    candle = _ExpiringCandle(
+        id=uuid.uuid4(),
+        asset_id=uuid.uuid4(),
+        open_time=datetime(2026, 7, 10, 12, 0, tzinfo=timezone.utc),
+        close_time=datetime(2026, 7, 10, 12, 15, tzinfo=timezone.utc),
+    )
+    db = _ExpiringSessionCampaignPreviewCapableDB(tracked_candle=candle)
+    cycle_id = uuid.uuid4()
+    research_started = {"count": 0}
+    ready_package_attempted = {"count": 0}
+
+    async def _raise_roster(*, db, request):
+        # Simulates any independently caught, database-backed subsystem
+        # failure that triggers _rollback_active_session before this point --
+        # here it is the roster itself, but the same hazard exists for any
+        # earlier block once identities are shared across the whole cycle.
+        raise RuntimeError("roster failed")
+
+    async def _campaign_preview(*, db, trigger):
+        return {"cycle_count": 0, "reason": "no_campaign_candidates", "considered_campaigns": [], "eligible_campaigns": [], "skipped_campaigns": []}
+
+    async def _ready_package_attempted(*, db, orchestration_payload):
+        # Only reached if campaign_orchestration's try body -- including its
+        # logging, which reads the candle's id/close_time -- ran to
+        # completion without raising. A stale direct attribute touch on the
+        # expired candle there would raise _MissingGreenletSimulation and get
+        # caught by that block's own except before this point is ever reached.
+        ready_package_attempted["count"] += 1
+
+    async def _research_started(*, db):
+        research_started["count"] += 1
+        return _not_due_research_result()
+
+    import app.services.orchestration.continuous_pipeline_worker as worker_module
+
+    monkeypatch.setattr(worker_module, "run_ingestion_cycle", _fake_ingestion_cycle)
+    monkeypatch.setattr(worker_module, "_run_kraken_btc_autonomous_cycle_if_due", _async_return((cycle_id, candle)))
+    monkeypatch.setattr(worker_module, "run_strategy_roster_for_candle", _raise_roster)
+    monkeypatch.setattr(worker_module, "run_campaign_orchestration_preview_for_candle", _campaign_preview)
+    monkeypatch.setattr(worker_module, "_attempt_automatic_ready_package_creation", _ready_package_attempted)
+    monkeypatch.setattr(worker_module, "_load_active_assets", _async_return([]))
+    monkeypatch.setattr(worker_module, "_load_active_strategies", _async_return([]))
+    monkeypatch.setattr(worker_module, "run_deterministic_research_cycle_if_due", _research_started)
+    monkeypatch.setattr(worker_module, "capture_system_intelligence_snapshot_if_due", _async_return(None))
+
+    stats = await run_orchestration_cycle(db=db, client=object(), config=_config())
+
+    assert stats.ingestion_assets_ok == 1
+    # Exactly one rollback, from the roster failure. If campaign_orchestration's
+    # logging still touched the expired candle directly (the pre-fix bug), it
+    # would raise inside that block's own try, get caught by its own except,
+    # and trigger a second rollback here.
+    assert db.rollbacks == 1
+    assert ready_package_attempted["count"] == 1
+    # The cycle must still reach its later stages after the contained failure.
+    assert research_started["count"] == 1
 
 
 @pytest.mark.asyncio

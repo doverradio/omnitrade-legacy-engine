@@ -281,6 +281,31 @@ async def _load_latest_kraken_btc_15m_candle(db: AsyncSession) -> Candle | None:
     return candle
 
 
+@dataclass(frozen=True, slots=True)
+class _KrakenBtcCandleIdentity:
+    id: uuid.UUID | None
+    asset_id: uuid.UUID
+    open_time: datetime
+    close_time: datetime
+
+
+def _capture_kraken_btc_candle_identity(candle: Candle | None) -> _KrakenBtcCandleIdentity | None:
+    """Snapshot the primitive fields of a Candle into plain values immediately
+    after it is loaded. A rollback triggered by any later, independently
+    caught subsystem failure expires every ORM instance tracked by the shared
+    session; touching candle.<attr> again after that point forces an implicit
+    lazy refresh that raises MissingGreenlet under the async ORM. Primitives
+    captured here are immune to that because they are no longer session-bound."""
+    if candle is None:
+        return None
+    return _KrakenBtcCandleIdentity(
+        id=getattr(candle, "id", None),
+        asset_id=candle.asset_id,
+        open_time=candle.open_time,
+        close_time=candle.close_time,
+    )
+
+
 def _build_kraken_btc_candle_idempotency_seed(*, candle: Candle) -> str:
     close_time = candle.close_time
     close_time_utc = close_time if close_time.tzinfo is not None else close_time.replace(tzinfo=timezone.utc)
@@ -867,12 +892,46 @@ async def run_orchestration_cycle(
             logger.exception("venue_commission_resume_failed")
 
     autonomous_cycle_id: uuid.UUID | None = None
-    kraken_btc_candle: Candle | None = None
+    kraken_btc_identity: _KrakenBtcCandleIdentity | None = None
     try:
         autonomous_cycle_id, kraken_btc_candle = await _run_kraken_btc_autonomous_cycle_if_due(db=db)
+        kraken_btc_identity = _capture_kraken_btc_candle_identity(kraken_btc_candle)
     except Exception:
         await _rollback_active_session(db=db)
         logger.exception("autonomous_cycle_failed trigger=%s", _AUTONOMOUS_CYCLE_TRIGGER)
+
+    # The strategy roster must run, and its StrategyRosterRun row must be
+    # committed, before campaign orchestration composes this candle -- the
+    # aggregator resolves the roster run by an exact (asset, provider,
+    # product, interval, candle_close_time, trigger) match and never falls
+    # back to "latest", so composing first always sees no matching run yet
+    # and skips with strategy_aggregate_skipped reason=exact_roster_run_unavailable.
+    try:
+        if kraken_btc_identity is None:
+            kraken_btc_identity = _capture_kraken_btc_candle_identity(await _load_latest_kraken_btc_15m_candle(db))
+        if kraken_btc_identity is not None:
+            await run_strategy_roster_for_candle(
+                db=db,
+                request=StrategyRosterRequest(
+                    asset_id=kraken_btc_identity.asset_id,
+                    provider=_AUTONOMOUS_CYCLE_PROVIDER,
+                    product_id=_AUTONOMOUS_CYCLE_PRODUCT_ID,
+                    interval=_AUTONOMOUS_CYCLE_INTERVAL,
+                    candle_open_time=kraken_btc_identity.open_time,
+                    candle_close_time=kraken_btc_identity.close_time,
+                    trigger=_AUTONOMOUS_CYCLE_TRIGGER,
+                    scheduled_cycle_id=autonomous_cycle_id,
+                ),
+            )
+    except Exception:
+        await _rollback_active_session(db=db)
+        logger.exception(
+            "strategy_roster_failed trigger=%s provider=%s product_id=%s interval=%s",
+            _AUTONOMOUS_CYCLE_TRIGGER,
+            _AUTONOMOUS_CYCLE_PROVIDER,
+            _AUTONOMOUS_CYCLE_PRODUCT_ID,
+            _AUTONOMOUS_CYCLE_INTERVAL,
+        )
 
     if all(hasattr(db, attr) for attr in ("execute", "scalar", "commit")):
         try:
@@ -889,12 +948,12 @@ async def run_orchestration_cycle(
             logger.info(
                 "campaign_orchestration_preview_result trigger=%s resolved_candle_id=%s resolved_candle_symbol=%s resolved_candle_product=%s resolved_candle_provider=%s resolved_candle_interval=%s resolved_candle_close_time=%s preview_reason=%s cycle_count=%s considered_campaigns=%s eligible_campaigns=%s skipped_campaigns=%s",
                 _AUTONOMOUS_CYCLE_TRIGGER,
-                None if kraken_btc_candle is None else getattr(kraken_btc_candle, "id", None),
+                None if kraken_btc_identity is None else kraken_btc_identity.id,
                 _AUTONOMOUS_CYCLE_PRODUCT_ID.split("-")[0],
                 _AUTONOMOUS_CYCLE_PRODUCT_ID,
                 _AUTONOMOUS_CYCLE_PROVIDER,
                 _AUTONOMOUS_CYCLE_INTERVAL,
-                None if kraken_btc_candle is None else _as_utc_iso(kraken_btc_candle.close_time),
+                None if kraken_btc_identity is None else _as_utc_iso(kraken_btc_identity.close_time),
                 preview_reason,
                 cycle_count,
                 json.dumps(considered_campaigns, sort_keys=True, separators=(",", ":")),
@@ -906,12 +965,12 @@ async def run_orchestration_cycle(
                 logger.info(
                     "campaign_orchestration_preview_skipped trigger=%s resolved_candle_id=%s resolved_candle_symbol=%s resolved_candle_product=%s resolved_candle_provider=%s resolved_candle_interval=%s resolved_candle_close_time=%s reason=%s cycle_count=%s",
                     _AUTONOMOUS_CYCLE_TRIGGER,
-                    None if kraken_btc_candle is None else getattr(kraken_btc_candle, "id", None),
+                    None if kraken_btc_identity is None else kraken_btc_identity.id,
                     _AUTONOMOUS_CYCLE_PRODUCT_ID.split("-")[0],
                     _AUTONOMOUS_CYCLE_PRODUCT_ID,
                     _AUTONOMOUS_CYCLE_PROVIDER,
                     _AUTONOMOUS_CYCLE_INTERVAL,
-                    None if kraken_btc_candle is None else _as_utc_iso(kraken_btc_candle.close_time),
+                    None if kraken_btc_identity is None else _as_utc_iso(kraken_btc_identity.close_time),
                     skip_reason,
                     cycle_count,
                 )
@@ -923,33 +982,6 @@ async def run_orchestration_cycle(
         except Exception:
             await _rollback_active_session(db=db)
             logger.exception("campaign_orchestration_failed trigger=%s", _AUTONOMOUS_CYCLE_TRIGGER)
-
-    try:
-        if kraken_btc_candle is None:
-            kraken_btc_candle = await _load_latest_kraken_btc_15m_candle(db)
-        if kraken_btc_candle is not None:
-            await run_strategy_roster_for_candle(
-                db=db,
-                request=StrategyRosterRequest(
-                    asset_id=kraken_btc_candle.asset_id,
-                    provider=_AUTONOMOUS_CYCLE_PROVIDER,
-                    product_id=_AUTONOMOUS_CYCLE_PRODUCT_ID,
-                    interval=_AUTONOMOUS_CYCLE_INTERVAL,
-                    candle_open_time=kraken_btc_candle.open_time,
-                    candle_close_time=kraken_btc_candle.close_time,
-                    trigger=_AUTONOMOUS_CYCLE_TRIGGER,
-                    scheduled_cycle_id=autonomous_cycle_id,
-                ),
-            )
-    except Exception:
-        await _rollback_active_session(db=db)
-        logger.exception(
-            "strategy_roster_failed trigger=%s provider=%s product_id=%s interval=%s",
-            _AUTONOMOUS_CYCLE_TRIGGER,
-            _AUTONOMOUS_CYCLE_PROVIDER,
-            _AUTONOMOUS_CYCLE_PRODUCT_ID,
-            _AUTONOMOUS_CYCLE_INTERVAL,
-        )
 
     if all(hasattr(db, attr) for attr in ("execute", "scalar", "commit")):
         try:

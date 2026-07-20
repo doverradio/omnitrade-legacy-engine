@@ -4,6 +4,7 @@ import inspect
 import uuid
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
+from decimal import Decimal
 from types import SimpleNamespace
 from typing import Any, AsyncIterator
 
@@ -23,6 +24,8 @@ from app.models.strategy import Strategy
 from app.models.strategy_aggregate_decision import StrategyAggregateDecision
 from app.models.strategy_roster_proposal import StrategyRosterProposal
 from app.models.strategy_roster_run import StrategyRosterRun
+from app.schemas.capital_campaign_domain import CampaignCompoundingPolicy, CampaignProfitDistributionPolicy
+from app.services.capital_campaign_domain.preview_engine import _validate_percentages
 from app.services.capital_campaign_orchestration import authoritative
 from app.services.capital_campaign_orchestration.authoritative import (
     AGGREGATE_STRATEGY_IDENTITY,
@@ -522,3 +525,56 @@ async def test_decision_snapshot_must_reconstruct_exact_aggregate(monkeypatch: p
     )
     assert evidence is None
     assert reason == "decision_snapshot_aggregate_mismatch"
+
+
+# Regression for the first production incident after the aggregator went live:
+# continuous_pipeline_worker composed the campaign cycle before creating this
+# candle's StrategyRosterRun, so the exact-match lookup always missed and every
+# cycle logged strategy_aggregate_skipped reason=exact_roster_run_unavailable.
+# This proves the aggregator resolves correctly once the roster run exists
+# first (the corrected pipeline ordering), and reproduces the pre-fix failure
+# signature when it does not -- and that the resulting evidence is consistent
+# with a campaign whose compounding has been disabled via the aggregator
+# activation migration (percentages still sum to 100).
+@pytest.mark.asyncio
+async def test_exact_roster_run_must_exist_before_composition_for_aggregate_to_resolve(monkeypatch: pytest.MonkeyPatch) -> None:
+    _patch_flat_position(monkeypatch)
+    _patch_no_scorecards(monkeypatch)
+    async with _real_session() as session:
+        # Composing before the roster run for this candle exists reproduces
+        # the exact production failure signature.
+        evidence, reason = await _call_aggregator(session)
+        assert evidence is None
+        assert reason == "exact_roster_run_unavailable"
+
+        # Once the strategy roster has run for this exact candle (the
+        # corrected pipeline order: roster before composition), the aggregate
+        # resolves deterministically against that run -- never an inferred
+        # "latest" run.
+        roster_run_id = await _seed_roster_run_and_proposals(
+            session, actions={"ma_crossover": "BUY", "momentum": "BUY", "breakout": "BUY"}
+        )
+        evidence, reason = await _call_aggregator(session)
+        assert reason is None
+        assert evidence is not None
+        assert evidence["action"] == "BUY"
+        assert evidence["strategy_identity"] == AGGREGATE_STRATEGY_IDENTITY
+        assert uuid.UUID(evidence["source_identity"]["decision_record_id"]) is not None
+        assert evidence["aggregate_evidence"]["eligible_strategy_count"] == 3
+
+        assert roster_run_id is not None
+
+        # The evidence this cycle produced is only useful if the campaign it
+        # feeds is actually composable -- a campaign migrated to disabled
+        # compounding (reinvestment=0, reserve=100, matching the aggregator
+        # activation migration) must still pass the preview engine's
+        # percentages-sum-to-100 invariant.
+        _validate_percentages(
+            compounding_policy=CampaignCompoundingPolicy(
+                policy_type="REINVEST_PERCENTAGE",
+                reinvestment_percentage=Decimal("0"),
+                profit_distribution_percentage=Decimal("0"),
+                reserve_percentage=Decimal("100"),
+            ),
+            distribution_policy=CampaignProfitDistributionPolicy(reinvestment_percentage=Decimal("100")),
+        )

@@ -45,13 +45,26 @@ class AggregatorActivationResult:
     readiness: AggregatorActivationReadiness
 
 
-def _is_reinvestment_disabled(value: Any) -> bool:
+def _as_decimal(value: Any) -> Decimal:
     if value is None:
-        return True
+        return Decimal("0")
+    return Decimal(str(value))
+
+
+def _is_compounding_disabled(compounding_policy: dict[str, Any]) -> bool:
+    """Compounding is disabled only when reinvestment is zero AND the three
+    compounding percentages still sum to 100 -- the preview engine's
+    _validate_percentages invariant. Checking reinvestment_percentage alone is
+    not sufficient: an incomplete migration can zero out reinvestment without
+    reallocating it, which passes a naive check but breaks preview composition
+    in production (percentages summing to 0, not 100)."""
     try:
-        return Decimal(str(value)) == Decimal("0")
+        reinvestment = _as_decimal(compounding_policy.get("reinvestment_percentage"))
+        distribution = _as_decimal(compounding_policy.get("profit_distribution_percentage"))
+        reserve = _as_decimal(compounding_policy.get("reserve_percentage"))
     except Exception:
         return False
+    return reinvestment == Decimal("0") and (reinvestment + distribution + reserve) == Decimal("100")
 
 
 async def _load_definition_for_campaign(
@@ -82,7 +95,7 @@ async def _snapshot_campaign_aggregator_activation_state(
     current_pin = metadata.get("selected_strategy_identity")
     current_reinvestment = compounding.get("reinvestment_percentage")
     already_pinned = current_pin == AGGREGATE_STRATEGY_IDENTITY
-    already_disabled = _is_reinvestment_disabled(current_reinvestment)
+    already_disabled = _is_compounding_disabled(compounding)
 
     active_packages = list(
         (
@@ -124,6 +137,10 @@ async def _snapshot_campaign_aggregator_activation_state(
         "definition_id": definition.id,
         "current_selected_strategy_identity": current_pin,
         "current_reinvestment_percentage": None if current_reinvestment is None else str(current_reinvestment),
+        "current_profit_distribution_percentage": (
+            None if compounding.get("profit_distribution_percentage") is None else str(compounding.get("profit_distribution_percentage"))
+        ),
+        "current_reserve_percentage": None if compounding.get("reserve_percentage") is None else str(compounding.get("reserve_percentage")),
         "already_pinned_to_aggregate_identity": already_pinned,
         "already_compounding_disabled": already_disabled,
         "active_packages_in_continuity_states": package_snapshots,
@@ -222,6 +239,8 @@ async def execute_campaign_aggregator_activation(
         before = {
             "selected_strategy_identity": readiness.snapshot["current_selected_strategy_identity"],
             "reinvestment_percentage": readiness.snapshot["current_reinvestment_percentage"],
+            "profit_distribution_percentage": readiness.snapshot["current_profit_distribution_percentage"],
+            "reserve_percentage": readiness.snapshot["current_reserve_percentage"],
         }
         return AggregatorActivationResult(changed=False, idempotent=True, audit_created=False, before=before, after=before, readiness=readiness)
 
@@ -231,15 +250,29 @@ async def execute_campaign_aggregator_activation(
 
     before_metadata = dict(definition.metadata_evidence or {})
     before_compounding = dict(definition.compounding_policy or {})
+    before_reinvestment = _as_decimal(before_compounding.get("reinvestment_percentage"))
+    before_distribution = _as_decimal(before_compounding.get("profit_distribution_percentage"))
+    before_reserve = _as_decimal(before_compounding.get("reserve_percentage"))
     before = {
         "selected_strategy_identity": before_metadata.get("selected_strategy_identity"),
-        "reinvestment_percentage": None if before_compounding.get("reinvestment_percentage") is None else str(before_compounding.get("reinvestment_percentage")),
+        "reinvestment_percentage": str(before_reinvestment),
+        "profit_distribution_percentage": str(before_distribution),
+        "reserve_percentage": str(before_reserve),
     }
 
+    # Disabling compounding must preserve the preview engine's percentages-sum-to-100
+    # invariant (_validate_percentages). Reallocate the freed capital into reserve --
+    # held back, neither reinvested nor distributed -- computed as the shortfall
+    # against 100 rather than "old_reserve + old_reinvestment": a prior incomplete
+    # migration may have already zeroed reinvestment_percentage without reallocating
+    # it (the exact production incident this repairs), so old_reinvestment can no
+    # longer be trusted to reflect the amount actually owed to reserve.
+    new_reserve = Decimal("100") - before_distribution
     new_metadata = dict(before_metadata)
     new_metadata["selected_strategy_identity"] = AGGREGATE_STRATEGY_IDENTITY
     new_compounding = dict(before_compounding)
     new_compounding["reinvestment_percentage"] = "0"
+    new_compounding["reserve_percentage"] = str(new_reserve)
     definition.metadata_evidence = new_metadata
     definition.compounding_policy = new_compounding
     definition.updated_at = datetime.now(timezone.utc)
@@ -247,6 +280,8 @@ async def execute_campaign_aggregator_activation(
     after = {
         "selected_strategy_identity": AGGREGATE_STRATEGY_IDENTITY,
         "reinvestment_percentage": "0",
+        "profit_distribution_percentage": str(before_distribution),
+        "reserve_percentage": str(new_reserve),
         "reason": reason,
         "idempotency_key": idempotency_key,
     }
