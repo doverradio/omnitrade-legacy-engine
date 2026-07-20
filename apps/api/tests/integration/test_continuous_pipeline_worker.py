@@ -226,11 +226,27 @@ def _automatic_cycle(
     risk_verdict: str = "ALLOW",
     freshness: str = "fresh",
     final_amount: str = "5",
+    selected_decision_reason: str | None = None,
+    rejected_candidates: list[dict[str, object]] | None = None,
 ) -> SimpleNamespace:
     cycle_id = uuid.uuid4()
     campaign_id = uuid.UUID("aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa")
     if decision_record_id is _MISSING:
         decision_record_id = uuid.UUID("bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb")
+    selected_decision: dict[str, object] = {
+        "decision_kind": decision_kind,
+        "risk_verdict": risk_verdict,
+        "evidence_freshness": freshness,
+        "sizing_trace": {"final_amount": final_amount},
+    }
+    if selected_decision_reason is not None:
+        selected_decision["reason"] = selected_decision_reason
+    authoritative_composition: dict[str, object] = {
+        "proposed_action": proposed_action,
+        "selected_decision": selected_decision,
+    }
+    if rejected_candidates is not None:
+        authoritative_composition["rejected_candidates"] = rejected_candidates
     return SimpleNamespace(
         cycle_id=cycle_id,
         capital_campaign_id=campaign_id,
@@ -241,15 +257,7 @@ def _automatic_cycle(
         risk_verdict=risk_verdict,
         cycle_context={
             "candle": {"close_time": "2026-07-15T00:15:00+00:00"},
-            "authoritative_composition": {
-                "proposed_action": proposed_action,
-                "selected_decision": {
-                    "decision_kind": decision_kind,
-                    "risk_verdict": risk_verdict,
-                    "evidence_freshness": freshness,
-                    "sizing_trace": {"final_amount": final_amount},
-                },
-            },
+            "authoritative_composition": authoritative_composition,
         },
     )
 
@@ -687,6 +695,140 @@ async def test_automatic_ready_package_hold_termination_logs_skip_reason(
     assert create_calls["count"] == 0
     assert "automatic_ready_package_skipped" in caplog.text
     assert "reason=termination_stage_hold_no_package_created" in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_automatic_ready_package_hold_exposes_strategy_hold_signal_underlying_reason(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    import app.services.orchestration.continuous_pipeline_worker as worker_module
+
+    cycle = _automatic_cycle(
+        termination_stage="hold_no_package_created",
+        proposed_action="HOLD",
+        decision_kind="HOLD",
+        selected_decision_reason="strategy_hold_signal",
+        rejected_candidates=[{"instrument": "BTC-USD", "reason": "strategy_hold_signal"}],
+    )
+
+    caplog.set_level(logging.INFO)
+    monkeypatch.setattr(worker_module, "_load_cycle_by_id", _async_return(cycle))
+
+    await worker_module._attempt_automatic_ready_package_creation(
+        db=object(),
+        orchestration_payload=_automatic_payload(cycle),
+    )
+
+    assert "automatic_ready_package_skipped" in caplog.text
+    assert "reason=termination_stage_hold_no_package_created" in caplog.text
+    assert "underlying_reason=strategy_hold_signal" in caplog.text
+    assert '"strategy_hold_signal"' in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_automatic_ready_package_position_transition_hold_exposes_underlying_reason(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    import app.services.orchestration.continuous_pipeline_worker as worker_module
+
+    cycle = _automatic_cycle(
+        termination_stage="hold_no_package_created",
+        proposed_action="HOLD",
+        decision_kind="HOLD",
+        selected_decision_reason="action_position_transition_hold",
+        rejected_candidates=[{"instrument": "BTC-USD", "reason": "action_position_transition_hold"}],
+    )
+
+    caplog.set_level(logging.INFO)
+    monkeypatch.setattr(worker_module, "_load_cycle_by_id", _async_return(cycle))
+
+    await worker_module._attempt_automatic_ready_package_creation(
+        db=object(),
+        orchestration_payload=_automatic_payload(cycle),
+    )
+
+    assert "underlying_reason=action_position_transition_hold" in caplog.text
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "reason",
+    ["global_kill_switch_engaged", "position_below_minimum_order_size", "non_positive_net_edge"],
+)
+async def test_automatic_ready_package_hold_reasons_are_distinguishable(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    reason: str,
+) -> None:
+    import app.services.orchestration.continuous_pipeline_worker as worker_module
+
+    cycle = _automatic_cycle(
+        termination_stage="hold_no_package_created",
+        proposed_action="HOLD",
+        decision_kind="HOLD",
+        selected_decision_reason=reason,
+        rejected_candidates=[{"instrument": "BTC-USD", "reason": reason}],
+    )
+
+    caplog.set_level(logging.INFO)
+    monkeypatch.setattr(worker_module, "_load_cycle_by_id", _async_return(cycle))
+
+    await worker_module._attempt_automatic_ready_package_creation(
+        db=object(),
+        orchestration_payload=_automatic_payload(cycle),
+    )
+
+    assert f"underlying_reason={reason}" in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_automatic_ready_package_failed_closed_exposes_underlying_reason(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    import app.services.orchestration.continuous_pipeline_worker as worker_module
+
+    cycle = _automatic_cycle(
+        termination_stage="failed_closed",
+        proposed_action="FAILED_CLOSED",
+        decision_kind="MANUAL_REVIEW_REQUIRED",
+        selected_decision_reason="risk_unavailable",
+        rejected_candidates=[{"instrument": "BTC-USD", "reason": "risk_unavailable"}],
+    )
+
+    caplog.set_level(logging.INFO)
+    monkeypatch.setattr(worker_module, "_load_cycle_by_id", _async_return(cycle))
+
+    await worker_module._attempt_automatic_ready_package_creation(
+        db=object(),
+        orchestration_payload=_automatic_payload(cycle),
+    )
+
+    assert "reason=termination_stage_failed_closed" in caplog.text
+    assert "underlying_reason=risk_unavailable" in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_automatic_ready_package_non_hold_skip_has_no_underlying_reason(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    import app.services.orchestration.continuous_pipeline_worker as worker_module
+
+    cycle = _automatic_cycle(risk_verdict="VETO")
+
+    caplog.set_level(logging.INFO)
+    monkeypatch.setattr(worker_module, "_load_cycle_by_id", _async_return(cycle))
+
+    await worker_module._attempt_automatic_ready_package_creation(
+        db=object(),
+        orchestration_payload=_automatic_payload(cycle),
+    )
+
+    assert "reason=risk_not_permitted" in caplog.text
+    assert "underlying_reason=None" in caplog.text
 
 
 @pytest.mark.asyncio

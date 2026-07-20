@@ -16,6 +16,7 @@ from app.models.capital_campaign import CapitalCampaign
 from app.models.capital_campaign_definition import CapitalCampaignDefinition
 from app.models.candle import Candle
 from app.schemas.capital_campaign_domain import CampaignCompoundingPolicy, CapitalCampaignPreviewRequest
+from app.services.capital_campaign_domain.repository import CapitalCampaignDomainRepository
 from app.services.capital_campaign_domain.service import get_campaign_definition, list_campaign_definitions, preview_campaign_definition
 from app.services.capital_campaign_orchestration.authoritative import compose_campaign_authoritative_cycle
 
@@ -278,6 +279,45 @@ def _eligible_for_orchestration(*, campaign) -> bool:
     )
 
 
+def _campaign_level_skip_reason(*, campaign, allow_draft_preview: bool) -> str | None:
+    if campaign.status not in _READINESS_ELIGIBLE_STATUSES:
+        return "status_not_eligible"
+    allowed_instruments = {value.strip().upper() for value in campaign.allowed_instruments}
+    if _SUPPORTED_TRIGGER_PRODUCT not in allowed_instruments:
+        return "instrument_not_allowed"
+    allowed_venues = {value.strip().lower() for value in campaign.allowed_venues}
+    if _SUPPORTED_TRIGGER_PROVIDER not in allowed_venues:
+        return "venue_not_allowed"
+    if campaign.status == "DRAFT" and not allow_draft_preview:
+        return "draft_preview_not_allowed"
+    return None
+
+
+def _considered_campaign_entry(campaign) -> dict[str, Any]:
+    return {
+        "campaign_id": str(campaign.campaign_id),
+        "version": campaign.version,
+        "status": campaign.status,
+        "allowed_instruments": list(campaign.allowed_instruments or []),
+        "allowed_venues": list(campaign.allowed_venues or []),
+    }
+
+
+def _eligible_campaign_entry(campaign) -> dict[str, Any]:
+    return {
+        "campaign_id": str(campaign.campaign_id),
+        "version": campaign.version,
+    }
+
+
+def _skipped_campaign_entry(campaign, reason: str) -> dict[str, Any]:
+    return {
+        "campaign_id": str(campaign.campaign_id),
+        "version": campaign.version,
+        "reason": reason,
+    }
+
+
 async def fetch_campaign_orchestration_readiness(*, db: AsyncSession, campaign_id: UUID | None, version: int | None) -> dict[str, Any]:
     if campaign_id is None:
         campaigns = await _list_orchestration_definitions(db=db)
@@ -323,22 +363,57 @@ async def run_campaign_orchestration_preview_for_candle(
 ) -> dict[str, Any]:
     candle = await _resolve_latest_btc_candle(db=db)
     if candle is None:
-        return {"mode": "campaign_orchestration_preview", "trigger": trigger, "ready": False, "reason": "latest_btc_15m_candle_not_found", "cycle_count": 0, "cycles": []}
+        return {
+            "mode": "campaign_orchestration_preview",
+            "trigger": trigger,
+            "ready": False,
+            "reason": "latest_btc_15m_candle_not_found",
+            "cycle_count": 0,
+            "cycles": [],
+            "considered_campaigns": [],
+            "eligible_campaigns": [],
+            "skipped_campaigns": [],
+        }
+
+    considered_campaigns: list[dict[str, Any]] = []
+    eligible_campaigns: list[dict[str, Any]] = []
+    skipped_campaigns: list[dict[str, Any]] = []
+    candidates: list[Any] = []
 
     if campaign_id is None:
+        raw_rows = await CapitalCampaignDomainRepository(db).list(campaign_id=None, status=None, latest_only=True)
         campaigns = await list_campaign_definitions(db=db, campaign_id=None, status=None, latest_only=True)
-        candidates = [
-            item
-            for item in campaigns.items
-            if _eligible_for_orchestration(campaign=item)
-            and (allow_draft_preview or item.status != "DRAFT")
-        ]
+        domain_by_key = {(item.campaign_id, item.version): item for item in campaigns.items}
+
+        for row in raw_rows:
+            considered_campaigns.append(_considered_campaign_entry(row))
+            domain_item = domain_by_key.get((row.campaign_id, row.version))
+            if domain_item is None:
+                runtime = await _load_runtime_for_definition(db=db, campaign_id=row.campaign_id)
+                reason = "runtime_campaign_missing" if runtime is None else "runtime_definition_version_mismatch"
+                skipped_campaigns.append(_skipped_campaign_entry(row, reason))
+                continue
+
+            skip_reason = _campaign_level_skip_reason(campaign=domain_item, allow_draft_preview=allow_draft_preview)
+            if skip_reason is not None:
+                skipped_campaigns.append(_skipped_campaign_entry(domain_item, skip_reason))
+                continue
+
+            eligible_campaigns.append(_eligible_campaign_entry(domain_item))
+            candidates.append(domain_item)
     else:
         campaign = await get_campaign_definition(db=db, campaign_id=campaign_id, version=version)
+        considered_campaigns.append(_considered_campaign_entry(campaign))
         if campaign.status == "DRAFT" and not allow_draft_preview:
-            candidates = []
+            skipped_campaigns.append(_skipped_campaign_entry(campaign, "draft_preview_not_allowed"))
         else:
-            candidates = [campaign] if _eligible_for_orchestration(campaign=campaign) else [campaign]
+            # An explicitly requested campaign_id is always submitted to composition
+            # once it clears the draft-preview gate, independent of
+            # _eligible_for_orchestration -- preserved as-is since changing it would
+            # alter campaign-authorization behavior, out of scope for this
+            # observability repair.
+            eligible_campaigns.append(_eligible_campaign_entry(campaign))
+            candidates.append(campaign)
 
     created_cycles: list[dict[str, Any]] = []
     now = datetime.now(timezone.utc)
@@ -421,6 +496,9 @@ async def run_campaign_orchestration_preview_for_candle(
         "reason": None if created_cycles else "no_campaign_candidates",
         "cycle_count": len(created_cycles),
         "cycles": created_cycles,
+        "considered_campaigns": considered_campaigns,
+        "eligible_campaigns": eligible_campaigns,
+        "skipped_campaigns": skipped_campaigns,
     }
 
 

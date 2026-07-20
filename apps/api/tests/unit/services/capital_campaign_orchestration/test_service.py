@@ -1415,3 +1415,145 @@ async def test_market_evidence_unrelated_interval_uses_safe_rule(monkeypatch: py
     payload_stale, _, _ = await _load_market_evidence(db=_Db(), symbol="BTC-USD", exchange="kraken_spot", candle_interval="1m", now=close_time + timedelta(minutes=2, seconds=1))
     assert payload_stale["reason"] == "stale_market_data"
     assert payload_stale["freshness_verdict"] == "stale"
+
+
+def test_campaign_level_skip_reason_flags_status_not_eligible() -> None:
+    from app.services.capital_campaign_orchestration.service import _campaign_level_skip_reason
+
+    campaign = SimpleNamespace(status="COMPLETED", allowed_instruments=["BTC-USD"], allowed_venues=["kraken_spot"])
+    assert _campaign_level_skip_reason(campaign=campaign, allow_draft_preview=False) == "status_not_eligible"
+
+
+def test_campaign_level_skip_reason_flags_instrument_not_allowed() -> None:
+    from app.services.capital_campaign_orchestration.service import _campaign_level_skip_reason
+
+    campaign = SimpleNamespace(status="READY", allowed_instruments=["ETH-USD"], allowed_venues=["kraken_spot"])
+    assert _campaign_level_skip_reason(campaign=campaign, allow_draft_preview=False) == "instrument_not_allowed"
+
+
+def test_campaign_level_skip_reason_flags_venue_not_allowed() -> None:
+    from app.services.capital_campaign_orchestration.service import _campaign_level_skip_reason
+
+    campaign = SimpleNamespace(status="READY", allowed_instruments=["BTC-USD"], allowed_venues=["coinbase_spot"])
+    assert _campaign_level_skip_reason(campaign=campaign, allow_draft_preview=False) == "venue_not_allowed"
+
+
+def test_campaign_level_skip_reason_flags_draft_preview_not_allowed() -> None:
+    from app.services.capital_campaign_orchestration.service import _campaign_level_skip_reason
+
+    campaign = SimpleNamespace(status="DRAFT", allowed_instruments=["BTC-USD"], allowed_venues=["kraken_spot"])
+    assert _campaign_level_skip_reason(campaign=campaign, allow_draft_preview=False) == "draft_preview_not_allowed"
+
+
+def test_campaign_level_skip_reason_none_when_eligible() -> None:
+    from app.services.capital_campaign_orchestration.service import _campaign_level_skip_reason
+
+    campaign = SimpleNamespace(status="READY", allowed_instruments=["BTC-USD"], allowed_venues=["kraken_spot"])
+    assert _campaign_level_skip_reason(campaign=campaign, allow_draft_preview=False) is None
+
+    draft_campaign = SimpleNamespace(status="DRAFT", allowed_instruments=["BTC-USD"], allowed_venues=["kraken_spot"])
+    assert _campaign_level_skip_reason(campaign=draft_campaign, allow_draft_preview=True) is None
+
+
+@pytest.mark.asyncio
+async def test_preview_for_candle_reports_considered_eligible_and_skipped_campaigns(monkeypatch: pytest.MonkeyPatch) -> None:
+    from app.services.capital_campaign_orchestration.service import run_campaign_orchestration_preview_for_candle
+
+    btc_asset_id = UUID("12345678-1234-1234-1234-1234567890ab")
+    eligible_id = UUID("11111111-1111-1111-1111-111111111111")
+    draft_id = UUID("22222222-2222-2222-2222-222222222222")
+    missing_runtime_id = UUID("33333333-3333-3333-3333-333333333333")
+    mismatched_version_id = UUID("44444444-4444-4444-4444-444444444444")
+
+    raw_rows = [
+        SimpleNamespace(campaign_id=eligible_id, version=1, status="READY", allowed_instruments=["BTC-USD"], allowed_venues=["kraken_spot"]),
+        SimpleNamespace(campaign_id=draft_id, version=1, status="DRAFT", allowed_instruments=["BTC-USD"], allowed_venues=["kraken_spot"]),
+        SimpleNamespace(campaign_id=missing_runtime_id, version=1, status="READY", allowed_instruments=["BTC-USD"], allowed_venues=["kraken_spot"]),
+        SimpleNamespace(campaign_id=mismatched_version_id, version=1, status="READY", allowed_instruments=["BTC-USD"], allowed_venues=["kraken_spot"]),
+    ]
+
+    eligible_campaign_response = SimpleNamespace(
+        campaign_id=eligible_id,
+        version=1,
+        status="READY",
+        allowed_instruments=["BTC-USD"],
+        allowed_venues=["kraken_spot"],
+    )
+    draft_campaign_response = SimpleNamespace(
+        campaign_id=draft_id,
+        version=1,
+        status="DRAFT",
+        allowed_instruments=["BTC-USD"],
+        allowed_venues=["kraken_spot"],
+    )
+
+    class _MultiCampaignPreviewDb:
+        def __init__(self) -> None:
+            self._responses = [
+                SimpleNamespace(id=btc_asset_id),
+                SimpleNamespace(
+                    asset_id=btc_asset_id,
+                    open_time=datetime(2026, 7, 15, 0, 0, tzinfo=timezone.utc),
+                    close_time=datetime(2026, 7, 15, 0, 15, tzinfo=timezone.utc),
+                ),
+                None,
+                SimpleNamespace(definition_version=99),
+                None,
+            ]
+            self._index = 0
+            self.added = None
+
+        async def scalar(self, _statement):
+            value = self._responses[self._index]
+            self._index += 1
+            return value
+
+        async def execute(self, _statement):
+            return SimpleNamespace(scalars=lambda: SimpleNamespace(all=lambda: list(raw_rows)))
+
+        def add(self, item):
+            self.added = item
+
+        async def flush(self):
+            return None
+
+        async def commit(self):
+            return None
+
+    async def _list_campaign_definitions(**_kwargs):
+        return SimpleNamespace(items=[eligible_campaign_response, draft_campaign_response])
+
+    async def _compose_campaign_authoritative_cycle(**_kwargs):
+        return SimpleNamespace(
+            composition={
+                "failed_closed": False,
+                "termination_stage": "hold_no_package_created",
+                "decision_record_id": None,
+                "selected_decision": {"decision_kind": "HOLD", "risk_verdict": "NOT_APPLICABLE", "reason": "strategy_hold_signal"},
+                "deterministic_explanation": [],
+                "rejected_candidates": [{"instrument": "BTC-USD", "reason": "strategy_hold_signal"}],
+            },
+            preview=SimpleNamespace(model_dump=lambda **_kwargs: {}),
+        )
+
+    monkeypatch.setattr("app.services.capital_campaign_orchestration.service.list_campaign_definitions", _list_campaign_definitions)
+    monkeypatch.setattr("app.services.capital_campaign_orchestration.service.compose_campaign_authoritative_cycle", _compose_campaign_authoritative_cycle)
+
+    db = _MultiCampaignPreviewDb()
+    payload = await run_campaign_orchestration_preview_for_candle(db=db, campaign_id=None, allow_draft_preview=False)
+
+    considered_ids = {c["campaign_id"] for c in payload["considered_campaigns"]}
+    assert considered_ids == {str(eligible_id), str(draft_id), str(missing_runtime_id), str(mismatched_version_id)}
+
+    assert payload["eligible_campaigns"] == [{"campaign_id": str(eligible_id), "version": 1}]
+
+    skipped_by_id = {s["campaign_id"]: s["reason"] for s in payload["skipped_campaigns"]}
+    assert skipped_by_id[str(draft_id)] == "draft_preview_not_allowed"
+    assert skipped_by_id[str(missing_runtime_id)] == "runtime_campaign_missing"
+    assert skipped_by_id[str(mismatched_version_id)] == "runtime_definition_version_mismatch"
+
+    # An eligible campaign whose authoritative composition resolves to HOLD must
+    # still be reported as considered/eligible -- campaign-level selection is
+    # decoupled from the per-instrument decision outcome.
+    assert payload["cycle_count"] == 1
+    assert db.added.termination_stage == "hold_no_package_created"

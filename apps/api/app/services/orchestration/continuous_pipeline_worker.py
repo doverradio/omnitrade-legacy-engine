@@ -736,6 +736,7 @@ async def _attempt_automatic_ready_package_creation(
         cycle_context = cycle.cycle_context if isinstance(cycle.cycle_context, dict) else {}
         composition = cycle_context.get("authoritative_composition") if isinstance(cycle_context.get("authoritative_composition"), dict) else {}
         selected_decision = composition.get("selected_decision") if isinstance(composition.get("selected_decision"), dict) else {}
+        rejected_candidates = composition.get("rejected_candidates") if isinstance(composition.get("rejected_candidates"), list) else []
         candle = cycle_context.get("candle") if isinstance(cycle_context.get("candle"), dict) else {}
 
         provider = _AUTONOMOUS_CYCLE_PROVIDER
@@ -768,6 +769,16 @@ async def _attempt_automatic_ready_package_creation(
             skip_reason = "non_canonical_amount"
         elif candle_close_time is None:
             skip_reason = "missing_candle_close_time"
+
+        underlying_reason: str | None = None
+        rejection_reasons: list[str] = []
+        if cycle.termination_stage in {"hold_no_package_created", "failed_closed"}:
+            underlying_reason = str(selected_decision.get("reason") or "").strip() or None
+            rejection_reasons = [
+                str(item.get("reason"))
+                for item in rejected_candidates
+                if isinstance(item, dict) and item.get("reason")
+            ]
 
         package_id: str | None = None
         idempotency_key: str | None = None
@@ -852,7 +863,7 @@ async def _attempt_automatic_ready_package_creation(
 
         if skip_reason is not None:
             logger.info(
-                "automatic_ready_package_skipped campaign_id=%s campaign_version=%s cycle_id=%s candle_close_time=%s decision_record_id=%s package_id=%s idempotency_key=%s reason=%s",
+                "automatic_ready_package_skipped campaign_id=%s campaign_version=%s cycle_id=%s candle_close_time=%s decision_record_id=%s package_id=%s idempotency_key=%s reason=%s underlying_reason=%s rejection_reasons=%s",
                 campaign_id,
                 campaign_version,
                 cycle_id,
@@ -861,6 +872,8 @@ async def _attempt_automatic_ready_package_creation(
                 package_id,
                 idempotency_key,
                 skip_reason,
+                underlying_reason,
+                json.dumps(rejection_reasons, sort_keys=True, separators=(",", ":")),
             )
 
 
