@@ -1957,6 +1957,32 @@ async def compose_campaign_authoritative_cycle(
                 cap_terms.append(runtime_available_authority_decimal)
             proposed_allocation = min(cap_terms)
             if proposed_allocation < minimum_viable_amount:
+                logger.info(
+                    "campaign_sizing_rejected site=pre_risk_capital_check campaign_id=%s campaign_version=%s instrument=%s "
+                    "campaign_capital_budget=%s campaign_remaining_unallocated_capital=%s remaining_unallocated_capital_cap=%s "
+                    "runtime_current_equity=%s runtime_available_authority=%s runtime_available_authority_decimal=%s "
+                    "paper_account_cash_balance=%s maximum_position_size=%s maximum_total_exposure=%s minimum_position_size=%s "
+                    "requested_proving_amount=%s enforce_requested_proving_amount=%s minimum_viable_amount=%s "
+                    "proposed_allocation=%s cap_terms=%s",
+                    campaign_definition.campaign_id,
+                    campaign_definition.version,
+                    instrument,
+                    campaign_capital_budget,
+                    campaign_definition.remaining_unallocated_capital,
+                    remaining_unallocated_capital_cap,
+                    runtime_campaign.current_equity,
+                    runtime_available_authority,
+                    runtime_available_authority_decimal,
+                    paper_account_cash_balance,
+                    campaign_definition.maximum_position_size,
+                    campaign_definition.maximum_total_exposure,
+                    campaign_definition.minimum_position_size,
+                    requested_proving_amount,
+                    enforce_requested_proving_amount,
+                    minimum_viable_amount,
+                    proposed_allocation,
+                    [str(term) for term in cap_terms],
+                )
                 rejected_candidates.append(
                     {
                         "instrument": instrument,
@@ -2133,6 +2159,47 @@ async def compose_campaign_authoritative_cycle(
                 expected_net_edge = (expected_net_dollars / current_market_value) * Decimal("100")
 
         if risk_summary["verdict"] == "VETO":
+            if risk_summary["reason"] == "position_below_minimum_order_size":
+                # Distinct from the pre-risk capital check above: this is the
+                # risk engine's OWN minimum-viable-order gate
+                # (risk_engine.py::validate_minimum_viable_order), driven by
+                # requested quantity resized against real account_equity *
+                # max_position_size_pct -- not by anything in cap_terms
+                # above. The same reason string can originate from either
+                # site; only the log line distinguishes which one fired.
+                logger.info(
+                    "campaign_sizing_rejected site=risk_engine_minimum_viable_order campaign_id=%s campaign_version=%s instrument=%s "
+                    "campaign_capital_budget=%s campaign_remaining_unallocated_capital=%s runtime_current_equity=%s "
+                    "runtime_available_authority_decimal=%s paper_account_cash_balance=%s maximum_position_size=%s "
+                    "maximum_total_exposure=%s minimum_position_size=%s requested_proving_amount=%s minimum_viable_amount=%s "
+                    "proposed_allocation=%s risk_account_equity=%s risk_max_position_size_pct=%s requested_quantity=%s "
+                    "requested_notional=%s risk_approved_quantity=%s risk_approved_notional=%s asset_min_order_notional=%s "
+                    "reference_price=%s risk_reason_code=%s risk_steps=%s",
+                    campaign_definition.campaign_id,
+                    campaign_definition.version,
+                    instrument,
+                    campaign_capital_budget,
+                    campaign_definition.remaining_unallocated_capital,
+                    runtime_campaign.current_equity,
+                    runtime_available_authority_decimal,
+                    paper_account_cash_balance,
+                    campaign_definition.maximum_position_size,
+                    campaign_definition.maximum_total_exposure,
+                    campaign_definition.minimum_position_size,
+                    requested_proving_amount,
+                    minimum_viable_amount,
+                    proposed_allocation,
+                    risk_context.account_equity,
+                    risk_context.max_position_size_pct,
+                    quantity,
+                    quantity * price,
+                    risk_result.approved_quantity,
+                    risk_result.approved_quantity * price,
+                    asset.min_order_notional,
+                    price,
+                    risk_result.reason_code,
+                    [f"{step.step}:{step.status}:{step.reason_code}" for step in risk_result.steps],
+                )
             rejected_candidates.append({"instrument": instrument, "reason": risk_summary["reason"], "market": market, "strategy": strategy, "position": position, "risk": risk_summary})
             continue
 
@@ -2266,6 +2333,18 @@ async def compose_campaign_authoritative_cycle(
         "decision_evidence": selected_decision,
         "candidate_instruments": allowed_instruments,
     }
+    logger.info(
+        "campaign_cycle_termination_resolved campaign_id=%s campaign_version=%s termination_stage=%s failed_closed=%s "
+        "proposed_action=%s decision_kind=%s selected_decision_reason=%s rejected_candidates=%s",
+        campaign_definition.campaign_id,
+        campaign_definition.version,
+        composition["termination_stage"],
+        composition["failed_closed"],
+        composition["proposed_action"],
+        selected_decision.get("decision_kind"),
+        selected_decision.get("reason"),
+        [(item.get("instrument"), item.get("reason")) for item in rejected_candidates],
+    )
     preview_strategy_inputs = _preview_strategy_inputs_from_authoritative_evidence(
         strategy_evidence=strategy_evidence,
         allowed_instruments=allowed_instruments,
