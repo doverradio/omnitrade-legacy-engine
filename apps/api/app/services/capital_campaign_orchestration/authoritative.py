@@ -506,7 +506,14 @@ async def _load_latest_roster_proposal_group(
         or bool(run.strategies_failed)
         or run.strategies_completed_count != run.strategies_requested_count
         or sorted(run.strategies_completed) != sorted(run.strategies_requested)
-        or run.error_summary
+        # strategy_roster.service always persists error_summary as
+        # {"failed": failed} -- a non-empty dict even when failed == [].
+        # Checking truthiness of the dict itself (rather than its "failed"
+        # payload) made every roster run, including fully successful ones,
+        # look "failed"; the actual failure signal is whether that list is
+        # non-empty, which strategies_failed/strategies_failed_count above
+        # already establish independently.
+        or bool((run.error_summary or {}).get("failed"))
         or run.execution_mode != "SHADOW"
         or run.live_submission_allowed
         or candle_age_seconds < -60

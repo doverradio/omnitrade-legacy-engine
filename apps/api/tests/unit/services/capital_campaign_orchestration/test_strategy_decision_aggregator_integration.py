@@ -128,6 +128,7 @@ async def _seed_roster_run_and_proposals(
     complete: bool = True,
 ) -> uuid.UUID:
     roster_run_id = uuid.uuid4()
+    failed_entries = [] if complete else [{"strategy_slug": "injected", "reason": "injected"}]
     run = StrategyRosterRun(
         roster_run_id=roster_run_id,
         idempotency_key=f"run-{uuid.uuid4()}",
@@ -140,13 +141,19 @@ async def _seed_roster_run_and_proposals(
         trigger=trigger,
         strategies_requested=list(actions.keys()),
         strategies_completed=list(actions.keys()) if complete else [],
-        strategies_failed=[] if complete else [{"reason": "injected"}],
+        strategies_failed=failed_entries,
         strategies_requested_count=len(actions),
         strategies_completed_count=len(actions) if complete else 0,
         strategies_failed_count=0 if complete else 1,
         buy_count=sum(1 for a in actions.values() if a == "BUY"),
         sell_count=sum(1 for a in actions.values() if a == "SELL"),
         hold_count=sum(1 for a in actions.values() if a == "HOLD"),
+        # strategy_roster.service always persists error_summary as
+        # {"failed": failed}, a non-empty dict even when failed == [] -- mirror
+        # that exact shape here so this harness doesn't mask the truthy-dict
+        # regression (production evidence: roster_run_incomplete_or_failed on
+        # a fully successful roster) behind a falsy-by-default test fixture.
+        error_summary={"failed": failed_entries},
         started_at=NOW,
         completed_at=NOW if complete else None,
     )
@@ -452,6 +459,59 @@ async def test_incomplete_roster_run_fails_closed(monkeypatch: pytest.MonkeyPatc
         evidence, reason = await _call_aggregator(session)
         assert evidence is None
         assert reason == "roster_run_incomplete_or_failed"
+
+
+# Regression for the second production incident: strategy_roster.service
+# always persists error_summary as {"failed": failed} -- a non-empty dict
+# even when failed == [] -- and the aggregation eligibility check used to
+# test truthiness of that dict directly (`or run.error_summary`), not its
+# "failed" payload. A dict with one key is truthy regardless of its values,
+# so every roster run, including fully successful ones, was rejected as
+# roster_run_incomplete_or_failed. Reproduces the exact production shape:
+# requested=7, completed=7, failed=0, one SELL and six HOLD proposals.
+@pytest.mark.asyncio
+async def test_fully_successful_seven_strategy_roster_is_accepted_despite_nonempty_error_summary_wrapper(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _patch_flat_position(monkeypatch)
+    _patch_no_scorecards(monkeypatch)
+    async with _real_session() as session:
+        actions = {
+            "ma_crossover": "HOLD",
+            "momentum": "HOLD",
+            "breakout": "HOLD",
+            "mean_reversion": "HOLD",
+            "rsi_mean_reversion": "HOLD",
+            "bollinger_reversion": "HOLD",
+            "donchian_breakout": "SELL",
+        }
+        roster_run_id = await _seed_roster_run_and_proposals(session, actions=actions)
+
+        run = await session.get(StrategyRosterRun, roster_run_id)
+        assert run.strategies_requested_count == 7
+        assert run.strategies_completed_count == 7
+        assert run.strategies_failed_count == 0
+        # The exact shape that used to falsely trip eligibility: a non-empty
+        # dict wrapping an empty failure list.
+        assert run.error_summary == {"failed": []}
+
+        evidence, reason = await _call_aggregator(session)
+        assert reason is None
+        assert evidence is not None
+        assert evidence["aggregate_evidence"]["eligible_strategy_count"] == 7
+
+        # Replay: the second call for the identical exact scope must hit the
+        # pure-read idempotent-replay path and return the same decision,
+        # never re-derive or re-reject it.
+        replay_evidence, replay_reason = await _call_aggregator(session)
+        assert replay_reason is None
+        assert replay_evidence["action"] == evidence["action"]
+        assert replay_evidence["source_identity"]["aggregate_decision_id"] == evidence["source_identity"]["aggregate_decision_id"]
+        assert replay_evidence["source_identity"]["decision_record_id"] == evidence["source_identity"]["decision_record_id"]
+        assert replay_evidence["aggregate_evidence"]["eligible_strategy_count"] == 7
+
+        rows = (await session.execute(StrategyAggregateDecision.__table__.select())).fetchall()
+        assert len(rows) == 1
 
 
 async def _persist_then_corrupt(monkeypatch: pytest.MonkeyPatch, statement) -> tuple[dict[str, Any] | None, str | None]:
