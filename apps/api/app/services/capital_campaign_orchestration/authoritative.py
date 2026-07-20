@@ -10,6 +10,7 @@ from typing import Any
 from uuid import UUID
 
 from sqlalchemy import desc, select
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import get_settings
@@ -59,6 +60,7 @@ from app.services.strategy_roster.decision_aggregator import (
     StrategyOutcomeSummary,
     StrategyProposalInput,
     aggregate_strategy_proposals,
+    resolve_action_position_transition,
 )
 from app.services.strategy_roster.registry import ENABLED_PHASE1_ROSTER
 
@@ -411,6 +413,10 @@ def _hash_payload(payload: dict[str, Any]) -> str:
     return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
 
 
+def _as_utc(value: datetime) -> datetime:
+    return value.replace(tzinfo=timezone.utc) if value.tzinfo is None else value.astimezone(timezone.utc)
+
+
 def _build_aggregate_decision_idempotency_key(
     *,
     roster_run_id: UUID,
@@ -466,42 +472,71 @@ async def _load_latest_roster_proposal_group(
     *,
     db: AsyncSession,
     asset_id: UUID,
+    provider: str,
     product_id: str,
     interval: str,
-    preferred_slug: str | None,
-) -> list[StrategyRosterProposal]:
-    """Loads every proposal belonging to the single most recent roster run for
-    this exact (asset, product, interval) scope -- i.e. every strategy's
-    proposal for the same candle close, not just one strategy's. Proposals
-    whose roster_run_id disagrees with the majority for that candle close are
-    dropped defensively (mismatched-scope evidence must never be mixed in)."""
-    latest_close_result = await db.execute(
-        select(StrategyRosterProposal.candle_close_time)
-        .where(StrategyRosterProposal.asset_id == asset_id)
-        .where(StrategyRosterProposal.product_id == product_id)
-        .where(StrategyRosterProposal.interval == interval)
-        .order_by(StrategyRosterProposal.candle_close_time.desc())
-        .limit(1)
+    expected_candle_close_time: datetime,
+    required_trigger: str,
+    now: datetime,
+    max_age_minutes: int,
+    scheduled_cycle_id: UUID | None = None,
+) -> tuple[StrategyRosterRun | None, list[StrategyRosterProposal], str | None]:
+    """Select one complete roster run by exact governed scope, never inference."""
+    statement = (
+        select(StrategyRosterRun)
+        .where(StrategyRosterRun.asset_id == asset_id)
+        .where(StrategyRosterRun.provider == provider)
+        .where(StrategyRosterRun.product_id == product_id)
+        .where(StrategyRosterRun.interval == interval)
+        .where(StrategyRosterRun.candle_close_time == expected_candle_close_time)
+        .where(StrategyRosterRun.trigger == required_trigger)
     )
-    latest_close_time = latest_close_result.scalar_one_or_none()
-    if latest_close_time is None:
-        return []
-
-    proposals_result = await db.execute(
-        select(StrategyRosterProposal)
-        .where(StrategyRosterProposal.asset_id == asset_id)
-        .where(StrategyRosterProposal.product_id == product_id)
-        .where(StrategyRosterProposal.interval == interval)
-        .where(StrategyRosterProposal.candle_close_time == latest_close_time)
-        .where(StrategyRosterProposal.strategy_slug == preferred_slug if preferred_slug is not None else True)
+    if scheduled_cycle_id is not None:
+        statement = statement.where(StrategyRosterRun.scheduled_cycle_id == scheduled_cycle_id)
+    runs = list((await db.execute(statement)).scalars().all())
+    if not runs:
+        return None, [], "exact_roster_run_unavailable"
+    if len(runs) != 1:
+        return None, [], "ambiguous_exact_roster_run"
+    run = runs[0]
+    candle_age_seconds = (_as_utc(now) - _as_utc(run.candle_close_time)).total_seconds()
+    if (
+        run.completed_at is None
+        or run.strategies_failed_count != 0
+        or bool(run.strategies_failed)
+        or run.strategies_completed_count != run.strategies_requested_count
+        or sorted(run.strategies_completed) != sorted(run.strategies_requested)
+        or run.error_summary
+        or run.execution_mode != "SHADOW"
+        or run.live_submission_allowed
+        or candle_age_seconds < -60
+        or candle_age_seconds > max_age_minutes * 60
+    ):
+        return None, [], "roster_run_incomplete_or_failed"
+    proposals = list(
+        (
+            await db.execute(
+                select(StrategyRosterProposal)
+                .where(StrategyRosterProposal.roster_run_id == run.roster_run_id)
+                .order_by(StrategyRosterProposal.strategy_slug.asc(), StrategyRosterProposal.proposal_id.asc())
+            )
+        ).scalars().all()
     )
-    proposals = list(proposals_result.scalars().all())
-    if not proposals:
-        return []
-
-    run_ids = [item.roster_run_id for item in proposals]
-    majority_run_id = max(set(run_ids), key=run_ids.count)
-    return [item for item in proposals if item.roster_run_id == majority_run_id]
+    if len(proposals) != run.strategies_completed_count:
+        return None, [], "roster_proposal_count_mismatch"
+    for proposal in proposals:
+        if (
+            proposal.asset_id != run.asset_id
+            or proposal.provider != run.provider
+            or proposal.product_id != run.product_id
+            or proposal.interval != run.interval
+            or proposal.candle_close_time != run.candle_close_time
+            or proposal.scheduled_cycle_id != run.scheduled_cycle_id
+            or proposal.execution_mode != "SHADOW"
+            or proposal.live_submission_allowed
+        ):
+            return None, [], "roster_proposal_scope_conflict"
+    return run, proposals, None
 
 
 def _resolve_scorecard_summary(*, scorecard_by_slug: dict[str, Any], dominant_contributor_identity: str | None) -> Any | None:
@@ -643,7 +678,61 @@ async def load_strategy_aggregate_evidence(
         return None, "not_yet_computed"
     decision_record = await db.get(DecisionRecord, aggregate_row.decision_record_id)
     if decision_record is None:
-        return None, "not_yet_computed"
+        return None, "aggregate_decision_record_missing"
+    if (
+        aggregate_row.roster_run_id != roster_run_id
+        or aggregate_row.asset_id != asset_id
+        or aggregate_row.candle_close_time != candle_close_time
+        or aggregate_row.campaign_id != campaign_id
+        or aggregate_row.campaign_version != campaign_version
+        or aggregate_row.environment != environment
+        or aggregate_row.provider != provider
+        or aggregate_row.product_id != product_id
+        or aggregate_row.interval != interval
+    ):
+        return None, "aggregate_campaign_scope_mismatch"
+    if (
+        aggregate_row.primary_strategy_identity != AGGREGATE_STRATEGY_IDENTITY
+        or aggregate_row.primary_strategy_version != AGGREGATE_STRATEGY_VERSION
+    ):
+        return None, "aggregate_identity_conflict"
+    generated_signals = decision_record.generated_signals if isinstance(decision_record.generated_signals, list) else []
+    if len(generated_signals) != 1 or generated_signals[0].get("strategy_identity") != AGGREGATE_STRATEGY_IDENTITY:
+        return None, "generated_signal_identity_conflict"
+    if generated_signals[0].get("strategy_version") != AGGREGATE_STRATEGY_VERSION or generated_signals[0].get("action") != aggregate_row.final_action:
+        return None, "generated_signal_payload_conflict"
+
+    contributions = aggregate_row.strategy_contributions if isinstance(aggregate_row.strategy_contributions, list) else []
+    contribution_lineage = {
+        (item.get("strategy_identity"), item.get("raw_action"), str(item.get("weight")))
+        for item in contributions
+        if isinstance(item, dict) and item.get("eligible")
+    }
+    decision_lineage = {
+        (item.get("strategy_identity"), item.get("action"), str(item.get("weight")))
+        for item in list(decision_record.supporting_strategies or []) + list(decision_record.opposing_strategies or [])
+        if isinstance(item, dict)
+    }
+    if decision_lineage != contribution_lineage:
+        return None, "aggregate_contributor_lineage_mismatch"
+
+    snapshot = await db.get(DecisionSnapshot, decision_record.decision_id)
+    snapshot_inputs = snapshot.strategy_inputs if snapshot is not None and isinstance(snapshot.strategy_inputs, dict) else {}
+    try:
+        snapshot_scores_match = (
+            Decimal(str(snapshot_inputs.get("weighted_buy_score"))) == Decimal(str(aggregate_row.weighted_buy_score))
+            and Decimal(str(snapshot_inputs.get("weighted_sell_score"))) == Decimal(str(aggregate_row.weighted_sell_score))
+            and Decimal(str(snapshot_inputs.get("weighted_hold_score"))) == Decimal(str(aggregate_row.weighted_hold_score))
+        )
+    except Exception:
+        snapshot_scores_match = False
+    if (
+        snapshot is None
+        or snapshot_inputs.get("roster_run_id") != str(roster_run_id)
+        or snapshot_inputs.get("contributions") != contributions
+        or not snapshot_scores_match
+    ):
+        return None, "decision_snapshot_aggregate_mismatch"
 
     scorecard_by_slug: dict[str, Any] = {}
     try:
@@ -652,7 +741,6 @@ async def load_strategy_aggregate_evidence(
     except Exception:
         scorecard_by_slug = {}
 
-    contributions = aggregate_row.strategy_contributions if isinstance(aggregate_row.strategy_contributions, list) else []
     evidence = _build_aggregate_evidence_dict(
         roster_run_id=roster_run_id,
         candle_close_time=candle_close_time,
@@ -690,7 +778,8 @@ async def resolve_or_create_strategy_aggregate_evidence(
     now: datetime,
     provider: str = "kraken_spot",
     actor: str = "strategy_decision_aggregator",
-    preferred_strategy_identity: str | None = None,
+    required_trigger: str,
+    scheduled_cycle_id: UUID | None = None,
 ) -> tuple[dict[str, Any] | None, str | None]:
     """Governed read-or-create operation for the authoritative campaign's
     strategy evidence. Tries a pure read first (load_strategy_aggregate_evidence);
@@ -703,19 +792,24 @@ async def resolve_or_create_strategy_aggregate_evidence(
     idempotent: repeated calls for the same scope never create duplicate rows."""
     settings = get_settings()
 
-    preferred_slug = None
-    if preferred_strategy_identity and "@" in preferred_strategy_identity:
-        preferred_slug = preferred_strategy_identity.split("@", 1)[0].strip()
-
-    proposals = await _load_latest_roster_proposal_group(
-        db=db, asset_id=asset_id, product_id=product_id, interval=interval, preferred_slug=preferred_slug
+    run, proposals, selection_reason = await _load_latest_roster_proposal_group(
+        db=db,
+        asset_id=asset_id,
+        provider=provider,
+        product_id=product_id,
+        interval=interval,
+        expected_candle_close_time=candle_item.close_time,
+        required_trigger=required_trigger,
+        now=now,
+        max_age_minutes=settings.strategy_aggregator_max_evidence_age_minutes,
+        scheduled_cycle_id=scheduled_cycle_id,
     )
-    if not proposals:
+    if run is None or not proposals:
         logger.info(
-            "strategy_aggregate_skipped reason=no_roster_proposals asset_id=%s product_id=%s interval=%s",
-            asset_id, product_id, interval,
+            "strategy_aggregate_skipped reason=%s asset_id=%s product_id=%s interval=%s",
+            selection_reason or "no_roster_proposals", asset_id, product_id, interval,
         )
-        return None, "strategy_evidence_unavailable"
+        return None, selection_reason or "strategy_evidence_unavailable"
 
     roster_run_id = proposals[0].roster_run_id
     candle_close_time = proposals[0].candle_close_time
@@ -839,22 +933,44 @@ async def resolve_or_create_strategy_aggregate_evidence(
     # and only write for this scope. A concurrent duplicate insert (a second
     # worker cycle racing this one) is prevented at the database level by the
     # UNIQUE constraint on strategy_aggregate_decisions.idempotency_key.
-    aggregate_row, decision_record = await _persist_strategy_aggregate_decision(
-        db=db,
-        idempotency_key=idempotency_key,
-        roster_run_id=roster_run_id,
-        asset_id=asset_id,
-        candle_close_time=candle_close_time,
-        campaign_id=campaign_id,
-        campaign_version=campaign_version,
-        environment=environment,
-        provider=provider,
-        product_id=product_id,
-        interval=interval,
-        position_state=position_state,
-        result=result,
-        actor=actor,
-    )
+    try:
+        async with db.begin_nested():
+            aggregate_row, decision_record = await _persist_strategy_aggregate_decision(
+                db=db,
+                idempotency_key=idempotency_key,
+                roster_run_id=roster_run_id,
+                asset_id=asset_id,
+                candle_close_time=candle_close_time,
+                campaign_id=campaign_id,
+                campaign_version=campaign_version,
+                environment=environment,
+                provider=provider,
+                product_id=product_id,
+                interval=interval,
+                position_state=position_state,
+                result=result,
+                actor=actor,
+            )
+    except IntegrityError:
+        # A competing worker may have won the exact idempotency-key race. The
+        # savepoint rolls back only this attempted insert chain; validate and
+        # reuse the winner rather than poisoning the caller's transaction.
+        raced_evidence, raced_reason = await load_strategy_aggregate_evidence(
+            db=db,
+            roster_run_id=roster_run_id,
+            asset_id=asset_id,
+            candle_close_time=candle_close_time,
+            campaign_id=campaign_id,
+            campaign_version=campaign_version,
+            config_version=config.config_version,
+            environment=environment,
+            provider=provider,
+            product_id=product_id,
+            interval=interval,
+        )
+        if raced_evidence is not None:
+            return raced_evidence, None
+        return None, f"aggregate_idempotency_conflict:{raced_reason or 'winner_unavailable'}"
     log_event = "strategy_aggregate_failed_closed" if result.failed_closed else "strategy_aggregate_completed"
 
     logger.info(
@@ -1102,7 +1218,7 @@ async def _persist_strategy_aggregate_decision(
     return aggregate_row, decision_record
 
 
-async def _load_latest_strategy_evidence(
+async def resolve_and_persist_strategy_aggregate_evidence(
     *,
     db: AsyncSession,
     asset_id: UUID,
@@ -1117,14 +1233,17 @@ async def _load_latest_strategy_evidence(
     candle_item: Candle,
     now: datetime,
     preferred_strategy_identity: str | None = None,
+    required_trigger: str,
+    scheduled_cycle_id: UUID | None = None,
 ) -> tuple[dict[str, Any] | None, str | None]:
-    """NOTE: despite the "_load_" name (kept for backward-compatible call-site
-    stability inside compose_campaign_authoritative_cycle), this delegates to
-    resolve_or_create_strategy_aggregate_evidence, which WILL write a new
-    StrategyAggregateDecision/DecisionRecord/DecisionSnapshot on a cache miss.
-    It must only be called from within the authoritative campaign composition
-    transaction. Do not call this from a read-only context -- use
-    load_strategy_aggregate_evidence directly for pure reads."""
+    """Explicit transactional write API for governed aggregate evidence.
+
+    No commit occurs here. The caller owns commit/rollback of the aggregate,
+    DecisionRecord, DecisionSnapshot and all downstream composition writes.
+    """
+    # Historical contributor preference is continuity metadata only. It must
+    # never filter or otherwise alter current ensemble membership.
+    _ = preferred_strategy_identity
     return await resolve_or_create_strategy_aggregate_evidence(
         db=db,
         asset_id=asset_id,
@@ -1138,7 +1257,8 @@ async def _load_latest_strategy_evidence(
         asset=asset,
         candle_item=candle_item,
         now=now,
-        preferred_strategy_identity=preferred_strategy_identity,
+        required_trigger=required_trigger,
+        scheduled_cycle_id=scheduled_cycle_id,
     )
 
 
@@ -1568,7 +1688,7 @@ async def compose_campaign_authoritative_cycle(
             rejected_candidates.append({"instrument": instrument, "reason": market.get("reason", "market_data_unavailable"), "market": market})
             continue
 
-        strategy, strategy_reason = await _load_latest_strategy_evidence(
+        strategy, strategy_reason = await resolve_and_persist_strategy_aggregate_evidence(
             db=db,
             asset_id=asset.id,
             product_id=instrument,
@@ -1582,6 +1702,8 @@ async def compose_campaign_authoritative_cycle(
             candle_item=candle_item,
             now=now,
             preferred_strategy_identity=strategy_authority.get("preferred_strategy_identity"),
+            required_trigger=trigger,
+            scheduled_cycle_id=getattr(candle, "scheduled_cycle_id", None),
         )
         if strategy is None:
             rejected_candidates.append({"instrument": instrument, "reason": strategy_reason or "strategy_evidence_unavailable", "market": market})
@@ -1669,6 +1791,42 @@ async def compose_campaign_authoritative_cycle(
         )
         position_evidence[instrument] = position
 
+        position_row = position.get("position")
+        position_open = bool(
+            position_row is not None
+            and position_row.get("closed_indicator") is False
+            and position_row.get("quantity") not in {None, "0", "0.0"}
+        )
+        position_state = "UNKNOWN" if position.get("authority_class") == "UNAVAILABLE" else ("OPEN" if position_open else "FLAT")
+        compounding_policy = getattr(campaign_definition, "compounding_policy", None)
+        compounding_allowed = bool(
+            "COMPOUND" in set(getattr(campaign_definition, "campaign_modes", []) or [])
+            and compounding_policy is not None
+            and Decimal(str(getattr(compounding_policy, "reinvestment_percentage", "0"))) > Decimal("0")
+        )
+        transition = resolve_action_position_transition(
+            action=action,
+            position_state=position_state,
+            compounding_allowed=compounding_allowed,
+        )
+        if transition == "HOLD":
+            rejected_candidates.append(
+                {
+                    "instrument": instrument,
+                    "reason": "action_position_transition_hold",
+                    "action": action,
+                    "position_state": position_state,
+                    "compounding_allowed": compounding_allowed,
+                    "market": market,
+                    "strategy": strategy,
+                    "position": position,
+                    "decision_record_id": decision_record_id,
+                    "strategy_identity": strategy_identity,
+                    "strategy_version": strategy_version,
+                }
+            )
+            continue
+
         risk_result = None
         risk_reason = None
         risk_verdict = None
@@ -1706,7 +1864,7 @@ async def compose_campaign_authoritative_cycle(
             requested_proving_amount,
         )
         proposed_allocation = None
-        if position["position"] is not None and position["position"].get("closed_indicator") is False and position["position"].get("quantity") not in {None, "0", "0.0"}:
+        if transition == "CLOSE_CANDIDATE":
             side = "sell"
             quantity = Decimal(str(position["position"]["quantity"]))
         else:
@@ -1897,8 +2055,8 @@ async def compose_campaign_authoritative_cycle(
             rejected_candidates.append({"instrument": instrument, "reason": risk_summary["reason"], "market": market, "strategy": strategy, "position": position, "risk": risk_summary})
             continue
 
-        candidate_kind = "OPEN_POSITION_PROPOSED"
-        if position["position"] is not None and position["position"].get("closed_indicator") is False and position["position"].get("quantity") not in {None, "0", "0.0"}:
+        candidate_kind = "ADD_POSITION_PROPOSED" if transition == "ADD_CANDIDATE" else "OPEN_POSITION_PROPOSED"
+        if transition == "CLOSE_CANDIDATE":
             candidate_kind = "CLOSE_POSITION_PROPOSED" if expected_net_dollars > Decimal("0") else "HOLD_POSITION"
         elif expected_net_dollars <= Decimal("0"):
             rejected_candidates.append({"instrument": instrument, "reason": "non_positive_net_edge", "market": market, "strategy": strategy, "position": position, "risk": risk_summary})

@@ -474,7 +474,7 @@ async def test_authoritative_open_candidate_selects_best(monkeypatch: pytest.Mon
 
     monkeypatch.setattr("app.services.capital_campaign_orchestration.authoritative._load_runtime_campaign", _async_return(runtime_campaign))
     monkeypatch.setattr("app.services.capital_campaign_orchestration.authoritative._load_market_evidence", _async_return((market, asset, candle)))
-    monkeypatch.setattr("app.services.capital_campaign_orchestration.authoritative._load_latest_strategy_evidence", _async_return((strategy, None)))
+    monkeypatch.setattr("app.services.capital_campaign_orchestration.authoritative.resolve_and_persist_strategy_aggregate_evidence", _async_return((strategy, None)))
     monkeypatch.setattr("app.services.capital_campaign_orchestration.authoritative._load_position_evidence", _async_return(position))
     monkeypatch.setattr("app.services.capital_campaign_orchestration.authoritative.resolve_execution_risk_context", _async_return(risk_context))
     monkeypatch.setattr("app.services.capital_campaign_orchestration.authoritative.evaluate_signal_risk", lambda **_kwargs: RiskEvaluationResult(action=RiskDecisionAction.APPROVE, reason_code=None, approved_quantity=Decimal("0.10"), steps=[]))
@@ -509,7 +509,7 @@ async def test_authoritative_risk_veto_is_preserved(monkeypatch: pytest.MonkeyPa
 
     monkeypatch.setattr("app.services.capital_campaign_orchestration.authoritative._load_runtime_campaign", _async_return(runtime_campaign))
     monkeypatch.setattr("app.services.capital_campaign_orchestration.authoritative._load_market_evidence", _async_return((market, asset, candle)))
-    monkeypatch.setattr("app.services.capital_campaign_orchestration.authoritative._load_latest_strategy_evidence", _async_return((strategy, None)))
+    monkeypatch.setattr("app.services.capital_campaign_orchestration.authoritative.resolve_and_persist_strategy_aggregate_evidence", _async_return((strategy, None)))
     monkeypatch.setattr("app.services.capital_campaign_orchestration.authoritative._load_position_evidence", _async_return(position))
     monkeypatch.setattr("app.services.capital_campaign_orchestration.authoritative.resolve_execution_risk_context", _async_return(risk_context))
     monkeypatch.setattr("app.services.capital_campaign_orchestration.authoritative.evaluate_signal_risk", lambda **_kwargs: RiskEvaluationResult(action=RiskDecisionAction.REJECT, reason_code="global_kill_switch_engaged", approved_quantity=Decimal("0"), steps=[]))
@@ -538,7 +538,7 @@ async def test_authoritative_risk_unavailable_fails_closed(monkeypatch: pytest.M
 
     monkeypatch.setattr("app.services.capital_campaign_orchestration.authoritative._load_runtime_campaign", _async_return(runtime_campaign))
     monkeypatch.setattr("app.services.capital_campaign_orchestration.authoritative._load_market_evidence", _async_return((market, asset, candle)))
-    monkeypatch.setattr("app.services.capital_campaign_orchestration.authoritative._load_latest_strategy_evidence", _async_return(({"authority_class": "AUTHORITATIVE", "strategy_identity": "ma_crossover@1", "strategy_version": "1", "action": "BUY", "confidence": "0.8", "sample_size": 12, "profitable_after_fees_performance": "4.2", "expected_value": "4.2", "evidence_timestamp": "2026-07-15T00:15:00+00:00", "source_identity": {"decision_record_id": "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa"}}, None)))
+    monkeypatch.setattr("app.services.capital_campaign_orchestration.authoritative.resolve_and_persist_strategy_aggregate_evidence", _async_return(({"authority_class": "AUTHORITATIVE", "strategy_identity": "ma_crossover@1", "strategy_version": "1", "action": "BUY", "confidence": "0.8", "sample_size": 12, "profitable_after_fees_performance": "4.2", "expected_value": "4.2", "evidence_timestamp": "2026-07-15T00:15:00+00:00", "source_identity": {"decision_record_id": "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa"}}, None)))
     monkeypatch.setattr("app.services.capital_campaign_orchestration.authoritative._load_position_evidence", _async_return({"authority_class": "AUTHORITATIVE", "position": None, "lifecycle": None, "profitability": None}))
     monkeypatch.setattr(
         "app.services.capital_campaign_orchestration.authoritative.resolve_execution_risk_context",
@@ -615,7 +615,7 @@ async def test_authoritative_missing_strategy_rejected(monkeypatch: pytest.Monke
 
     monkeypatch.setattr("app.services.capital_campaign_orchestration.authoritative._load_runtime_campaign", _async_return(runtime_campaign))
     monkeypatch.setattr("app.services.capital_campaign_orchestration.authoritative._load_market_evidence", _async_return((market, asset, candle)))
-    monkeypatch.setattr("app.services.capital_campaign_orchestration.authoritative._load_latest_strategy_evidence", _async_return((None, "strategy_evidence_unavailable")))
+    monkeypatch.setattr("app.services.capital_campaign_orchestration.authoritative.resolve_and_persist_strategy_aggregate_evidence", _async_return((None, "strategy_evidence_unavailable")))
     monkeypatch.setattr("app.services.capital_campaign_orchestration.authoritative.build_campaign_preview", lambda **_kwargs: SimpleNamespace(model_dump=lambda **_dump_kwargs: {"no_action": True, "preview": "stub"}))
 
     result = await compose_campaign_authoritative_cycle(db=_Db(), campaign_definition=campaign, trigger="kraken_btc_15m_candle_close", candle=candle)
@@ -655,7 +655,7 @@ async def test_authoritative_scopes_to_trigger_instrument(monkeypatch: pytest.Mo
 
     monkeypatch.setattr("app.services.capital_campaign_orchestration.authoritative._load_runtime_campaign", _async_return(runtime_campaign))
     monkeypatch.setattr("app.services.capital_campaign_orchestration.authoritative._load_market_evidence", _load_market_evidence)
-    monkeypatch.setattr("app.services.capital_campaign_orchestration.authoritative._load_latest_strategy_evidence", _async_return((None, "strategy_evidence_unavailable")))
+    monkeypatch.setattr("app.services.capital_campaign_orchestration.authoritative.resolve_and_persist_strategy_aggregate_evidence", _async_return((None, "strategy_evidence_unavailable")))
     monkeypatch.setattr("app.services.capital_campaign_orchestration.authoritative.build_campaign_preview", lambda **_kwargs: SimpleNamespace(model_dump=lambda **_dump_kwargs: {"no_action": True, "preview": "stub"}))
 
     result = await compose_campaign_authoritative_cycle(db=_Db(), campaign_definition=campaign, trigger="kraken_btc_15m_candle_close", candle=candle)
@@ -695,7 +695,7 @@ async def test_authoritative_strategy_identity_from_metadata_passed_to_loader(mo
 
     monkeypatch.setattr("app.services.capital_campaign_orchestration.authoritative._load_runtime_campaign", _async_return(runtime_campaign))
     monkeypatch.setattr("app.services.capital_campaign_orchestration.authoritative._load_market_evidence", _async_return(({"authority_class": "AUTHORITATIVE", "reason": "market data resolved from canonical asset and candle tables", "freshness": "fresh", "close_price": "100"}, asset, candle)))
-    monkeypatch.setattr("app.services.capital_campaign_orchestration.authoritative._load_latest_strategy_evidence", _load_strategy)
+    monkeypatch.setattr("app.services.capital_campaign_orchestration.authoritative.resolve_and_persist_strategy_aggregate_evidence", _load_strategy)
     monkeypatch.setattr("app.services.capital_campaign_orchestration.authoritative.build_campaign_preview", lambda **_kwargs: SimpleNamespace(model_dump=lambda **_dump_kwargs: {"no_action": True, "preview": "stub"}))
 
     await compose_campaign_authoritative_cycle(db=_Db(), campaign_definition=campaign, trigger="kraken_btc_15m_candle_close", candle=candle)
@@ -730,7 +730,7 @@ async def test_authoritative_no_action_reason_is_minimum_order_continuity(monkey
 
     monkeypatch.setattr("app.services.capital_campaign_orchestration.authoritative._load_runtime_campaign", _async_return(runtime_campaign))
     monkeypatch.setattr("app.services.capital_campaign_orchestration.authoritative._load_market_evidence", _async_return(({"authority_class": "AUTHORITATIVE", "reason": "market data resolved from canonical asset and candle tables", "freshness": "fresh", "close_price": "100"}, asset, candle)))
-    monkeypatch.setattr("app.services.capital_campaign_orchestration.authoritative._load_latest_strategy_evidence", _async_return((strategy, None)))
+    monkeypatch.setattr("app.services.capital_campaign_orchestration.authoritative.resolve_and_persist_strategy_aggregate_evidence", _async_return((strategy, None)))
     monkeypatch.setattr("app.services.capital_campaign_orchestration.authoritative._load_position_evidence", _async_return(position))
     monkeypatch.setattr(
         "app.services.capital_campaign_orchestration.authoritative.resolve_execution_risk_context",
@@ -796,7 +796,7 @@ async def test_authoritative_liquid_cash_499_rejects_without_risk_submission(mon
 
     monkeypatch.setattr("app.services.capital_campaign_orchestration.authoritative._load_runtime_campaign", _async_return(runtime_campaign))
     monkeypatch.setattr("app.services.capital_campaign_orchestration.authoritative._load_market_evidence", _async_return(({"authority_class": "AUTHORITATIVE", "reason": "market data resolved from canonical asset and candle tables", "freshness": "fresh", "close_price": "100"}, asset, candle)))
-    monkeypatch.setattr("app.services.capital_campaign_orchestration.authoritative._load_latest_strategy_evidence", _async_return((strategy, None)))
+    monkeypatch.setattr("app.services.capital_campaign_orchestration.authoritative.resolve_and_persist_strategy_aggregate_evidence", _async_return((strategy, None)))
     monkeypatch.setattr("app.services.capital_campaign_orchestration.authoritative._load_position_evidence", _async_return(position))
     monkeypatch.setattr(
         "app.services.capital_campaign_orchestration.authoritative.resolve_execution_risk_context",
@@ -874,7 +874,7 @@ async def test_authoritative_liquid_cash_500_permits_exact_five(monkeypatch: pyt
 
     monkeypatch.setattr("app.services.capital_campaign_orchestration.authoritative._load_runtime_campaign", _async_return(runtime_campaign))
     monkeypatch.setattr("app.services.capital_campaign_orchestration.authoritative._load_market_evidence", _async_return(({"authority_class": "AUTHORITATIVE", "reason": "market data resolved from canonical asset and candle tables", "freshness": "fresh", "close_price": "100"}, asset, candle)))
-    monkeypatch.setattr("app.services.capital_campaign_orchestration.authoritative._load_latest_strategy_evidence", _async_return((strategy, None)))
+    monkeypatch.setattr("app.services.capital_campaign_orchestration.authoritative.resolve_and_persist_strategy_aggregate_evidence", _async_return((strategy, None)))
     monkeypatch.setattr("app.services.capital_campaign_orchestration.authoritative._load_position_evidence", _async_return(position))
     monkeypatch.setattr(
         "app.services.capital_campaign_orchestration.authoritative.resolve_execution_risk_context",
@@ -951,7 +951,7 @@ async def test_authoritative_liquid_cash_cap_wins_over_campaign_and_equity(monke
 
     monkeypatch.setattr("app.services.capital_campaign_orchestration.authoritative._load_runtime_campaign", _async_return(runtime_campaign))
     monkeypatch.setattr("app.services.capital_campaign_orchestration.authoritative._load_market_evidence", _async_return(({"authority_class": "AUTHORITATIVE", "reason": "market data resolved from canonical asset and candle tables", "freshness": "fresh", "close_price": "100"}, asset, candle)))
-    monkeypatch.setattr("app.services.capital_campaign_orchestration.authoritative._load_latest_strategy_evidence", _async_return((strategy, None)))
+    monkeypatch.setattr("app.services.capital_campaign_orchestration.authoritative.resolve_and_persist_strategy_aggregate_evidence", _async_return((strategy, None)))
     monkeypatch.setattr("app.services.capital_campaign_orchestration.authoritative._load_position_evidence", _async_return(position))
 
 
@@ -1026,7 +1026,7 @@ async def test_authoritative_hold_preserves_strategy_evidence_in_preview_seriali
 
     monkeypatch.setattr("app.services.capital_campaign_orchestration.authoritative._load_runtime_campaign", _async_return(runtime_campaign))
     monkeypatch.setattr("app.services.capital_campaign_orchestration.authoritative._load_market_evidence", _async_return((market, asset, candle)))
-    monkeypatch.setattr("app.services.capital_campaign_orchestration.authoritative._load_latest_strategy_evidence", _async_return((strategy, None)))
+    monkeypatch.setattr("app.services.capital_campaign_orchestration.authoritative.resolve_and_persist_strategy_aggregate_evidence", _async_return((strategy, None)))
     monkeypatch.setattr("app.services.capital_campaign_orchestration.authoritative.build_campaign_preview", _capture_preview)
 
     result = await compose_campaign_authoritative_cycle(
@@ -1111,7 +1111,7 @@ async def test_authoritative_rejected_candidate_preserves_strategy_evidence(monk
 
     monkeypatch.setattr("app.services.capital_campaign_orchestration.authoritative._load_runtime_campaign", _async_return(runtime_campaign))
     monkeypatch.setattr("app.services.capital_campaign_orchestration.authoritative._load_market_evidence", _async_return(({"authority_class": "AUTHORITATIVE", "reason": "market data resolved from canonical asset and candle tables", "freshness": "fresh", "close_price": "100"}, asset, candle)))
-    monkeypatch.setattr("app.services.capital_campaign_orchestration.authoritative._load_latest_strategy_evidence", _async_return((strategy, None)))
+    monkeypatch.setattr("app.services.capital_campaign_orchestration.authoritative.resolve_and_persist_strategy_aggregate_evidence", _async_return((strategy, None)))
     monkeypatch.setattr("app.services.capital_campaign_orchestration.authoritative._load_position_evidence", _async_return(position))
     monkeypatch.setattr(
         "app.services.capital_campaign_orchestration.authoritative.resolve_execution_risk_context",
@@ -1184,7 +1184,7 @@ async def test_authoritative_strategy_hold_signal_returns_hold_no_package_create
     monkeypatch.setattr("app.services.capital_campaign_orchestration.authoritative._load_runtime_campaign", _async_return(runtime_campaign))
     monkeypatch.setattr("app.services.capital_campaign_orchestration.authoritative._load_market_evidence", _async_return(({"authority_class": "AUTHORITATIVE", "reason": "market data resolved from canonical asset and candle tables", "freshness": "fresh", "close_price": "100"}, asset, candle)))
     monkeypatch.setattr(
-        "app.services.capital_campaign_orchestration.authoritative._load_latest_strategy_evidence",
+        "app.services.capital_campaign_orchestration.authoritative.resolve_and_persist_strategy_aggregate_evidence",
         _async_return(({"authority_class": "AUTHORITATIVE", "strategy_identity": "ma_crossover@1.0.0", "strategy_version": "ma_crossover@1.0.0", "action": "HOLD", "source_identity": {"decision_record_id": "facbd8a9-7784-4cdd-b689-06d4a1d7ebe7"}}, None)),
     )
     monkeypatch.setattr("app.services.capital_campaign_orchestration.authoritative.build_campaign_preview", lambda **_kwargs: SimpleNamespace(model_dump=lambda **_dump_kwargs: {"no_action": True, "preview": "stub"}))
@@ -1224,7 +1224,7 @@ async def test_authoritative_incoherent_strategy_identity_fails_closed(monkeypat
     monkeypatch.setattr("app.services.capital_campaign_orchestration.authoritative._load_runtime_campaign", _async_return(runtime_campaign))
     monkeypatch.setattr("app.services.capital_campaign_orchestration.authoritative._load_market_evidence", _async_return(({"authority_class": "AUTHORITATIVE", "reason": "market data resolved from canonical asset and candle tables", "freshness": "fresh", "close_price": "100"}, asset, candle)))
     monkeypatch.setattr(
-        "app.services.capital_campaign_orchestration.authoritative._load_latest_strategy_evidence",
+        "app.services.capital_campaign_orchestration.authoritative.resolve_and_persist_strategy_aggregate_evidence",
         _async_return(({"authority_class": "AUTHORITATIVE", "strategy_identity": "donchian_breakout@1.0.0", "strategy_version": "ma_crossover@1.0.0", "action": "BUY", "source_identity": {"decision_record_id": "facbd8a9-7784-4cdd-b689-06d4a1d7ebe7"}}, None)),
     )
     monkeypatch.setattr("app.services.capital_campaign_orchestration.authoritative.build_campaign_preview", lambda **_kwargs: SimpleNamespace(model_dump=lambda **_dump_kwargs: {"no_action": True, "preview": "stub"}))
@@ -1262,7 +1262,7 @@ async def test_authoritative_historical_package_conflict_fails_closed(monkeypatc
     monkeypatch.setattr("app.services.capital_campaign_orchestration.authoritative._load_campaign_strategy_authority", _async_return({"authority_source": "canonical_preview_package_continuity_only", "preferred_strategy_identity": None, "historical_strategy_identity": "donchian_breakout@1.0.0"}))
     monkeypatch.setattr("app.services.capital_campaign_orchestration.authoritative._load_market_evidence", _async_return(({"authority_class": "AUTHORITATIVE", "reason": "market data resolved from canonical asset and candle tables", "freshness": "fresh", "close_price": "100"}, asset, candle)))
     monkeypatch.setattr(
-        "app.services.capital_campaign_orchestration.authoritative._load_latest_strategy_evidence",
+        "app.services.capital_campaign_orchestration.authoritative.resolve_and_persist_strategy_aggregate_evidence",
         _async_return(({"authority_class": "AUTHORITATIVE", "strategy_identity": "ma_crossover@1.0.0", "strategy_version": "ma_crossover@1.0.0", "action": "BUY", "source_identity": {"decision_record_id": "facbd8a9-7784-4cdd-b689-06d4a1d7ebe7"}}, None)),
     )
     monkeypatch.setattr("app.services.capital_campaign_orchestration.authoritative.build_campaign_preview", lambda **_kwargs: SimpleNamespace(model_dump=lambda **_dump_kwargs: {"no_action": True, "preview": "stub"}))
@@ -1275,7 +1275,7 @@ async def test_authoritative_historical_package_conflict_fails_closed(monkeypatc
 # NOTE: test_latest_strategy_evidence_uses_decision_signal_identity_not_scorecard_best
 # and test_latest_strategy_evidence_conflicting_generated_signals_fail_closed were
 # removed here. Both asserted internal mechanics of the OLD single-best-scorecard
-# + single-DecisionRecord-lookup implementation of _load_latest_strategy_evidence
+# + single-DecisionRecord-lookup implementation of resolve_and_persist_strategy_aggregate_evidence
 # (a `best_scorecard` variable and a scan of decision_record.supporting_strategies
 # for a match) that no longer exist -- that function is now a governed, deterministic
 # multi-strategy aggregator (app/services/strategy_roster/decision_aggregator.py) and

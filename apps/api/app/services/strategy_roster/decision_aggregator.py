@@ -6,6 +6,27 @@ from decimal import Decimal
 
 _VALID_ACTIONS = {"BUY", "SELL", "HOLD"}
 _DISQUALIFYING_FAILURE_STREAK = 3
+MISSING_CONFIDENCE_MAGNITUDE = Decimal("0.50")
+
+
+def resolve_action_position_transition(*, action: str, position_state: str, compounding_allowed: bool = False) -> str:
+    """Return the only governed campaign transition for a signal/position pair.
+
+    Unknown values always fail closed. Compounding is represented explicitly;
+    callers must still prove capital, exposure, order, package, reconciliation,
+    and execution-authority gates before treating ADD_CANDIDATE as actionable.
+    """
+    normalized_action = str(action).strip().upper()
+    normalized_position = str(position_state).strip().upper()
+    if normalized_position not in {"FLAT", "OPEN"} or normalized_action not in _VALID_ACTIONS:
+        return "HOLD"
+    if normalized_action == "HOLD":
+        return "HOLD"
+    if normalized_action == "BUY":
+        if normalized_position == "FLAT":
+            return "OPEN_CANDIDATE"
+        return "ADD_CANDIDATE" if compounding_allowed else "HOLD"
+    return "CLOSE_CANDIDATE" if normalized_position == "OPEN" else "HOLD"
 
 # Canonical, stable identity for every aggregate decision. An ensemble outcome
 # must never be attributed to whichever individual contributor happened to be
@@ -133,32 +154,22 @@ def _split_identity(identity: str) -> tuple[str, str] | None:
 def _effective_signal_magnitude(proposal: StrategyProposalInput) -> Decimal:
     raw = proposal.strength if proposal.strength is not None else proposal.confidence
     if raw is None:
-        return Decimal("1")
+        # Absence remains absence in persisted evidence. It is not fabricated
+        # into a confidence value and receives a deliberately reduced neutral
+        # contribution rather than the maximum possible magnitude.
+        return MISSING_CONFIDENCE_MAGNITUDE
     return max(Decimal("0"), min(Decimal("1"), raw))
 
 
 def _strategy_weight(proposal: StrategyProposalInput, *, config: AggregationConfig) -> tuple[Decimal, str]:
-    """Deterministic weight for one eligible strategy. Falls back to a conservative
-    neutral weight (1) whenever real persisted outcome evidence is insufficient --
-    never fabricates performance."""
-    outcome = proposal.outcome_evidence
-    if (
-        outcome is None
-        or outcome.sample_size < config.min_outcome_sample_size
-        or outcome.average_fee_adjusted_return_pct is None
-        or outcome.overall_correct_pct is None
-    ):
-        return Decimal("1"), "neutral_no_evidence"
+    """Use equal base weights until scorecard governance is complete.
 
-    accuracy_edge = (outcome.overall_correct_pct - Decimal("50")) / Decimal("50")
-    return_component = outcome.average_fee_adjusted_return_pct / Decimal("100")
-    raw_weight = Decimal("1") + accuracy_edge + return_component
-    if outcome.regime_match is True:
-        raw_weight += Decimal("0.25")
-    elif outcome.regime_match is False:
-        raw_weight -= Decimal("0.25")
-    bounded = max(Decimal("0.25"), min(Decimal("2.5"), raw_weight))
-    return bounded, "real_outcome_evidence"
+    Outcome evidence is still collected and persisted, but horizon alignment,
+    freshness, deduplication, regime compatibility, look-ahead protection and
+    confidence intervals are not all governed yet. It therefore cannot alter a
+    production aggregate.
+    """
+    return Decimal("1"), "equal_weight_default"
 
 
 def _evaluate_eligibility(

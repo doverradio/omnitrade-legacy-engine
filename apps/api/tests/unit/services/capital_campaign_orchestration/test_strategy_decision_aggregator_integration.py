@@ -8,10 +8,10 @@ from types import SimpleNamespace
 from typing import Any, AsyncIterator
 
 import pytest
-from sqlalchemy import event, text
+from sqlalchemy import create_engine, event, text, update
 from sqlalchemy.dialects.postgresql import JSONB, UUID as PG_UUID
-from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 from sqlalchemy.ext.compiler import compiles
+from sqlalchemy.orm import Session
 from sqlalchemy.pool import StaticPool
 from sqlalchemy.schema import DefaultClause
 from sqlalchemy.sql.elements import TextClause
@@ -26,7 +26,7 @@ from app.models.strategy_roster_run import StrategyRosterRun
 from app.services.capital_campaign_orchestration import authoritative
 from app.services.capital_campaign_orchestration.authoritative import (
     AGGREGATE_STRATEGY_IDENTITY,
-    _load_latest_strategy_evidence,
+    resolve_and_persist_strategy_aggregate_evidence,
 )
 
 
@@ -40,11 +40,45 @@ def _compile_uuid_sqlite(element, compiler, **kw) -> str:
     return "CHAR(36)"
 
 
-@asynccontextmanager
-async def _real_session() -> AsyncIterator[AsyncSession]:
-    engine = create_async_engine("sqlite+aiosqlite:///:memory:", poolclass=StaticPool)
+class _AwaitableSession:
+    """Minimal AsyncSession-shaped adapter over a real synchronous ORM Session.
 
-    @event.listens_for(engine.sync_engine, "connect")
+    This keeps all real SQL, constraints, defaults and mapper events while
+    avoiding aiosqlite's connection-worker deadlock in the sandbox.
+    """
+
+    def __init__(self, session: Session) -> None:
+        self._session = session
+
+    def add(self, instance: Any) -> None:
+        self._session.add(instance)
+
+    async def flush(self) -> None:
+        self._session.flush()
+
+    async def execute(self, statement):
+        return self._session.execute(statement)
+
+    async def scalar(self, statement):
+        return self._session.scalar(statement)
+
+    async def get(self, entity, ident):
+        return self._session.get(entity, ident)
+
+    async def rollback(self) -> None:
+        self._session.rollback()
+
+    @asynccontextmanager
+    async def begin_nested(self):
+        with self._session.begin_nested():
+            yield
+
+
+@asynccontextmanager
+async def _real_session() -> AsyncIterator[_AwaitableSession]:
+    engine = create_engine("sqlite:///:memory:", poolclass=StaticPool)
+
+    @event.listens_for(engine, "connect")
     def _register_sqlite_functions(dbapi_conn, _record) -> None:
         dbapi_conn.create_function("now", 0, lambda: datetime.now(timezone.utc).isoformat())
         # postgresql.UUID(as_uuid=True)'s bind_processor compares using
@@ -71,14 +105,11 @@ async def _real_session() -> AsyncIterator[AsyncSession]:
                 column.server_default = DefaultClause(text(raw))
 
     try:
-        async with engine.begin() as conn:
-            await conn.run_sync(StrategyRosterRun.metadata.create_all, tables=tables)
-
-        session_factory = async_sessionmaker(engine, expire_on_commit=False, class_=AsyncSession)
-        async with session_factory() as session:
-            yield session
+        StrategyRosterRun.metadata.create_all(engine, tables=tables)
+        with Session(engine, expire_on_commit=False) as session:
+            yield _AwaitableSession(session)
     finally:
-        await engine.dispose()
+        engine.dispose()
 
 
 NOW = datetime(2026, 7, 18, 12, 0, tzinfo=timezone.utc)
@@ -86,7 +117,13 @@ ASSET_ID = uuid.uuid4()
 CAMPAIGN_ID = uuid.uuid4()
 
 
-async def _seed_roster_run_and_proposals(session: AsyncSession, *, actions: dict[str, str]) -> uuid.UUID:
+async def _seed_roster_run_and_proposals(
+    session: _AwaitableSession,
+    *,
+    actions: dict[str, str],
+    trigger: str = "kraken_btc_15m_candle_close",
+    complete: bool = True,
+) -> uuid.UUID:
     roster_run_id = uuid.uuid4()
     run = StrategyRosterRun(
         roster_run_id=roster_run_id,
@@ -97,18 +134,18 @@ async def _seed_roster_run_and_proposals(session: AsyncSession, *, actions: dict
         interval="15m",
         candle_open_time=NOW,
         candle_close_time=NOW,
-        trigger="kraken_btc_15m_candle_close",
+        trigger=trigger,
         strategies_requested=list(actions.keys()),
-        strategies_completed=list(actions.keys()),
-        strategies_failed=[],
+        strategies_completed=list(actions.keys()) if complete else [],
+        strategies_failed=[] if complete else [{"reason": "injected"}],
         strategies_requested_count=len(actions),
-        strategies_completed_count=len(actions),
-        strategies_failed_count=0,
+        strategies_completed_count=len(actions) if complete else 0,
+        strategies_failed_count=0 if complete else 1,
         buy_count=sum(1 for a in actions.values() if a == "BUY"),
         sell_count=sum(1 for a in actions.values() if a == "SELL"),
         hold_count=sum(1 for a in actions.values() if a == "HOLD"),
         started_at=NOW,
-        completed_at=NOW,
+        completed_at=NOW if complete else None,
     )
     session.add(run)
     await session.flush()
@@ -156,8 +193,10 @@ def _patch_no_scorecards(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(authoritative, "fetch_strategy_scorecards", _fake_scorecards)
 
 
-async def _call_aggregator(session: AsyncSession) -> tuple[dict[str, Any] | None, str | None]:
-    return await _load_latest_strategy_evidence(
+async def _call_aggregator(
+    session: _AwaitableSession, *, preferred_strategy_identity: str | None = None
+) -> tuple[dict[str, Any] | None, str | None]:
+    return await resolve_and_persist_strategy_aggregate_evidence(
         db=session,
         asset_id=ASSET_ID,
         product_id="BTC-USD",
@@ -168,8 +207,10 @@ async def _call_aggregator(session: AsyncSession) -> tuple[dict[str, Any] | None
         paper_account_id=uuid.uuid4(),
         runtime_campaign_id=1,
         asset=SimpleNamespace(id=ASSET_ID),
-        candle_item=SimpleNamespace(close="60000", interval="15m"),
+        candle_item=SimpleNamespace(close="60000", interval="15m", close_time=NOW),
         now=NOW,
+        required_trigger="kraken_btc_15m_candle_close",
+        preferred_strategy_identity=preferred_strategy_identity,
     )
 
 
@@ -180,7 +221,6 @@ async def test_authoritative_evidence_reflects_multi_strategy_aggregate_buy(monk
     _patch_no_scorecards(monkeypatch)
     async with _real_session() as session:
         await _seed_roster_run_and_proposals(session, actions={"ma_crossover": "BUY", "momentum": "BUY", "breakout": "BUY"})
-
         evidence, reason = await _call_aggregator(session)
 
         assert reason is None
@@ -367,3 +407,118 @@ def test_aggregator_never_calls_order_submission() -> None:
     for token in forbidden:
         assert token not in persist_source
         assert token not in load_source
+
+
+@pytest.mark.asyncio
+async def test_preferred_contributor_does_not_collapse_ensemble(monkeypatch: pytest.MonkeyPatch) -> None:
+    _patch_flat_position(monkeypatch)
+    _patch_no_scorecards(monkeypatch)
+    async with _real_session() as session:
+        await _seed_roster_run_and_proposals(
+            session, actions={"ma_crossover": "BUY", "momentum": "BUY", "breakout": "BUY"}
+        )
+        evidence, reason = await _call_aggregator(
+            session, preferred_strategy_identity="ma_crossover@1.0.0"
+        )
+        assert reason is None
+        assert evidence["strategy_identity"] == AGGREGATE_STRATEGY_IDENTITY
+        assert evidence["aggregate_evidence"]["eligible_strategy_count"] == 3
+
+
+@pytest.mark.asyncio
+async def test_wrong_trigger_has_no_exact_roster_run(monkeypatch: pytest.MonkeyPatch) -> None:
+    _patch_flat_position(monkeypatch)
+    _patch_no_scorecards(monkeypatch)
+    async with _real_session() as session:
+        await _seed_roster_run_and_proposals(
+            session, actions={"ma_crossover": "BUY", "momentum": "BUY"}, trigger="manual"
+        )
+        evidence, reason = await _call_aggregator(session)
+        assert evidence is None
+        assert reason == "exact_roster_run_unavailable"
+
+
+@pytest.mark.asyncio
+async def test_incomplete_roster_run_fails_closed(monkeypatch: pytest.MonkeyPatch) -> None:
+    _patch_flat_position(monkeypatch)
+    _patch_no_scorecards(monkeypatch)
+    async with _real_session() as session:
+        await _seed_roster_run_and_proposals(
+            session, actions={"ma_crossover": "BUY", "momentum": "BUY"}, complete=False
+        )
+        evidence, reason = await _call_aggregator(session)
+        assert evidence is None
+        assert reason == "roster_run_incomplete_or_failed"
+
+
+async def _persist_then_corrupt(monkeypatch: pytest.MonkeyPatch, statement) -> tuple[dict[str, Any] | None, str | None]:
+    _patch_flat_position(monkeypatch)
+    _patch_no_scorecards(monkeypatch)
+    async with _real_session() as session:
+        await _seed_roster_run_and_proposals(
+            session, actions={"ma_crossover": "BUY", "momentum": "BUY", "breakout": "BUY"}
+        )
+        evidence, _ = await _call_aggregator(session)
+        await session.execute(statement(evidence))
+        await session.flush()
+        return await authoritative.load_strategy_aggregate_evidence(
+            db=session,
+            roster_run_id=uuid.UUID(evidence["source_identity"]["strategy_roster_run_id"]),
+            asset_id=ASSET_ID,
+            candle_close_time=datetime.fromisoformat(evidence["evidence_timestamp"]),
+            campaign_id=CAMPAIGN_ID,
+            campaign_version=1,
+            config_version="v1",
+            environment="production",
+            provider="kraken_spot",
+            product_id="BTC-USD",
+            interval="15m",
+        )
+
+
+@pytest.mark.asyncio
+async def test_conflicting_aggregate_identity_fails_closed(monkeypatch: pytest.MonkeyPatch) -> None:
+    evidence, reason = await _persist_then_corrupt(
+        monkeypatch,
+        lambda evidence: update(StrategyAggregateDecision)
+        .where(StrategyAggregateDecision.aggregate_decision_id == uuid.UUID(evidence["source_identity"]["aggregate_decision_id"]))
+        .values(primary_strategy_identity="breakout@1.0.0"),
+    )
+    assert evidence is None
+    assert reason == "aggregate_identity_conflict"
+
+
+@pytest.mark.asyncio
+async def test_generated_signal_identity_conflict_fails_closed(monkeypatch: pytest.MonkeyPatch) -> None:
+    evidence, reason = await _persist_then_corrupt(
+        monkeypatch,
+        lambda evidence: update(DecisionRecord)
+        .where(DecisionRecord.decision_id == uuid.UUID(evidence["source_identity"]["decision_record_id"]))
+        .values(generated_signals=[{"strategy_identity": "breakout@1.0.0", "strategy_version": "1.0.0", "action": "BUY"}]),
+    )
+    assert evidence is None
+    assert reason == "generated_signal_identity_conflict"
+
+
+@pytest.mark.asyncio
+async def test_contributor_lineage_mismatch_fails_closed(monkeypatch: pytest.MonkeyPatch) -> None:
+    evidence, reason = await _persist_then_corrupt(
+        monkeypatch,
+        lambda evidence: update(DecisionRecord)
+        .where(DecisionRecord.decision_id == uuid.UUID(evidence["source_identity"]["decision_record_id"]))
+        .values(supporting_strategies=[]),
+    )
+    assert evidence is None
+    assert reason == "aggregate_contributor_lineage_mismatch"
+
+
+@pytest.mark.asyncio
+async def test_decision_snapshot_must_reconstruct_exact_aggregate(monkeypatch: pytest.MonkeyPatch) -> None:
+    evidence, reason = await _persist_then_corrupt(
+        monkeypatch,
+        lambda evidence: update(DecisionSnapshot)
+        .where(DecisionSnapshot.decision_id == uuid.UUID(evidence["source_identity"]["decision_record_id"]))
+        .values(strategy_inputs={"roster_run_id": "wrong", "contributions": []}),
+    )
+    assert evidence is None
+    assert reason == "decision_snapshot_aggregate_mismatch"

@@ -3,6 +3,8 @@ from __future__ import annotations
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 
+import pytest
+
 from app.services.strategy_roster.decision_aggregator import (
     AGGREGATE_STRATEGY_IDENTITY,
     AGGREGATE_STRATEGY_VERSION,
@@ -10,6 +12,7 @@ from app.services.strategy_roster.decision_aggregator import (
     StrategyOutcomeSummary,
     StrategyProposalInput,
     aggregate_strategy_proposals,
+    resolve_action_position_transition,
 )
 
 NOW = datetime(2026, 7, 18, 12, 0, tzinfo=timezone.utc)
@@ -267,7 +270,7 @@ def test_mismatched_scope_proposal_excluded() -> None:
     assert excluded.exclusion_reason == "mismatched_scope"
 
 
-def test_insufficient_real_evidence_falls_back_to_neutral_weight_and_records_reason() -> None:
+def test_scorecard_evidence_cannot_change_equal_weight_default() -> None:
     thin_outcome = StrategyOutcomeSummary(sample_size=3, overall_correct_pct=Decimal("90"), average_fee_adjusted_return_pct=Decimal("10.0"))
     proposals = [
         _proposal(slug="ma_crossover", action="BUY", outcome_evidence=thin_outcome),
@@ -275,5 +278,39 @@ def test_insufficient_real_evidence_falls_back_to_neutral_weight_and_records_rea
     ]
     result = aggregate_strategy_proposals(proposals=proposals, position_open=False, now=NOW, config=_config(min_outcome_sample_size=20))
     contribution = next(item for item in result.contributions if item.strategy_slug == "ma_crossover")
-    assert contribution.evidence_basis == "neutral_no_evidence"
+    assert contribution.evidence_basis == "equal_weight_default"
     assert contribution.weight == "1"
+
+
+def test_missing_confidence_receives_reduced_magnitude_without_fabrication() -> None:
+    proposals = [
+        _proposal(slug="ma_crossover", action="BUY", confidence=None, strength=None),
+        _proposal(slug="momentum", action="BUY", confidence=Decimal("1"), strength=None),
+    ]
+    result = aggregate_strategy_proposals(proposals=proposals, position_open=False, now=NOW, config=_config())
+    missing = next(item for item in result.contributions if item.strategy_slug == "ma_crossover")
+    assert missing.raw_confidence is None
+    assert missing.weighted_buy == "0.50"
+
+
+@pytest.mark.parametrize(
+    ("action", "position_state", "compounding_allowed", "expected"),
+    [
+        ("BUY", "FLAT", False, "OPEN_CANDIDATE"),
+        ("BUY", "OPEN", False, "HOLD"),
+        ("BUY", "OPEN", True, "ADD_CANDIDATE"),
+        ("SELL", "OPEN", False, "CLOSE_CANDIDATE"),
+        ("SELL", "FLAT", False, "HOLD"),
+        ("HOLD", "FLAT", False, "HOLD"),
+        ("HOLD", "OPEN", False, "HOLD"),
+        ("BUY", "UNKNOWN", False, "HOLD"),
+        ("SELL", "UNAVAILABLE", False, "HOLD"),
+        ("AMBIGUOUS", "FLAT", False, "HOLD"),
+    ],
+)
+def test_action_position_transition_table(action: str, position_state: str, compounding_allowed: bool, expected: str) -> None:
+    assert resolve_action_position_transition(
+        action=action,
+        position_state=position_state,
+        compounding_allowed=compounding_allowed,
+    ) == expected
