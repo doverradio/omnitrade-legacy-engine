@@ -70,7 +70,41 @@ from .contracts import (
 _TERMINAL_CYCLE_STATES = {"HOLD", "PREVIEW_READY", "FAILED", "COMPLETE"}
 _RESUMABLE_NON_TERMINAL_STATES = {"NOT_STARTED", "LOADING"}
 _MAX_RESUME_AGE_SECONDS = 30 * 60
-_RESOLVED_ORDER_STATUSES = {"filled", "cancelled", "failed", "rejected", "expired", "settled"}
+
+# Canonical (uppercase) terminal live-order statuses -- matches the casing
+# every real write site uses (see accounting_reconciliation.py,
+# live_crypto_orders.py) and the sibling terminal-status sets already
+# defined elsewhere (equity_evidence.py, canonical_campaign_binding.py).
+_RESOLVED_ORDER_STATUSES = {"FILLED", "CANCELLED", "FAILED", "REJECTED", "EXPIRED", "SETTLED"}
+_DRY_RUN_ORDER_STATUSES = {"DRY_RUN_READY", "DRY_RUN_BLOCKED"}
+
+
+def _is_live_order_unresolved(order: LiveCryptoOrder) -> bool:
+    """Single canonical classification boundary for the reconciliation gate.
+
+    Fail-closed by default: any status not explicitly recognized as resolved
+    (or as a genuinely never-submitted dry-run artifact) is unresolved.
+    """
+    status = (order.status or "").strip().upper()
+
+    if status in _RESOLVED_ORDER_STATUSES:
+        return False
+
+    if status in _DRY_RUN_ORDER_STATUSES:
+        safe_response = order.safe_provider_response if isinstance(order.safe_provider_response, dict) else {}
+        never_submitted = (
+            order.provider_order_id is None
+            and order.submitted_at is None
+            and bool(safe_response.get("submission_skipped"))
+        )
+        # Only a DRY_RUN_* row with ALL THREE markers of "never touched the
+        # exchange" is excluded. A DRY_RUN_* row that somehow carries a
+        # provider_order_id or submitted_at is an unexpected/ambiguous state
+        # and must still fail closed as unresolved.
+        return not never_submitted
+
+    return True
+
 
 _ALLOWED_TRANSITIONS: dict[str, set[str]] = {
     "NOT_STARTED": {"LOADING", "FAILED"},
@@ -578,15 +612,17 @@ async def _reconcile_state(
     if not balances_loaded:
         explanations.append("CHECK_FAILED:balances_unavailable")
 
-    unresolved_orders = await db.scalar(
-        select(func.count())
-        .select_from(LiveCryptoOrder)
-        .where(
-            LiveCryptoOrder.exchange_connection_id == mandate.exchange_connection_id,
-            LiveCryptoOrder.status.not_in(tuple(_RESOLVED_ORDER_STATUSES)),
+    # Classification requires inspecting provider_order_id/submitted_at/
+    # safe_provider_response alongside status (see _is_live_order_unresolved),
+    # which cannot be expressed safely as a single SQL status filter -- so
+    # candidate rows are loaded and classified through the one canonical
+    # boundary instead of duplicating that logic in a query predicate.
+    candidate_orders = (
+        await db.execute(
+            select(LiveCryptoOrder).where(LiveCryptoOrder.exchange_connection_id == mandate.exchange_connection_id)
         )
-    )
-    unresolved_order_count = int(unresolved_orders or 0)
+    ).scalars().all()
+    unresolved_order_count = sum(1 for order in candidate_orders if _is_live_order_unresolved(order))
     if unresolved_order_count > 0:
         explanations.append("CHECK_FAILED:unresolved_live_order_exists")
 
