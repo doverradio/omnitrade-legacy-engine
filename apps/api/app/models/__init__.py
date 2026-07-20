@@ -55,6 +55,7 @@ from app.models.risk_kill_switch import RiskKillSwitch
 from app.models.risk_rule_config import RiskRuleConfig
 from app.models.signal import Signal
 from app.models.strategy import Strategy
+from app.models.strategy_aggregate_decision import StrategyAggregateDecision
 from app.models.strategy_roster_proposal_outcome import StrategyRosterProposalOutcome
 from app.models.strategy_roster_proposal import StrategyRosterProposal
 from app.models.strategy_roster_run import StrategyRosterRun
@@ -131,6 +132,7 @@ __all__ = [
 	"RiskRuleConfig",
 	"Signal",
 	"Strategy",
+	"StrategyAggregateDecision",
 	"StrategyRosterProposalOutcome",
 	"StrategyRosterProposal",
 	"StrategyRosterRun",

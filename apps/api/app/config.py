@@ -141,6 +141,30 @@ class Settings(BaseSettings):
         default=50,
         validation_alias="OUTCOME_SCORECARDS_REGIME_MIN_EVALUATIONS",
     )
+    strategy_aggregator_config_version: str = Field(
+        default="v1", validation_alias="STRATEGY_AGGREGATOR_CONFIG_VERSION"
+    )
+    strategy_aggregator_min_eligible_strategies: int = Field(
+        default=2, validation_alias="STRATEGY_AGGREGATOR_MIN_ELIGIBLE_STRATEGIES"
+    )
+    strategy_aggregator_min_buy_agreement: Decimal = Field(
+        default=Decimal("0.60"), validation_alias="STRATEGY_AGGREGATOR_MIN_BUY_AGREEMENT"
+    )
+    strategy_aggregator_min_sell_agreement: Decimal = Field(
+        default=Decimal("0.60"), validation_alias="STRATEGY_AGGREGATOR_MIN_SELL_AGREEMENT"
+    )
+    strategy_aggregator_min_confidence: Decimal = Field(
+        default=Decimal("0.40"), validation_alias="STRATEGY_AGGREGATOR_MIN_CONFIDENCE"
+    )
+    strategy_aggregator_max_evidence_age_minutes: int = Field(
+        default=30, validation_alias="STRATEGY_AGGREGATOR_MAX_EVIDENCE_AGE_MINUTES"
+    )
+    strategy_aggregator_min_outcome_sample_size: int = Field(
+        default=20, validation_alias="STRATEGY_AGGREGATOR_MIN_OUTCOME_SAMPLE_SIZE"
+    )
+    strategy_aggregator_veto_on_data_quality_failure: bool = Field(
+        default=True, validation_alias="STRATEGY_AGGREGATOR_VETO_ON_DATA_QUALITY_FAILURE"
+    )
 
     environment: str = "local"
     log_level: str = "INFO"

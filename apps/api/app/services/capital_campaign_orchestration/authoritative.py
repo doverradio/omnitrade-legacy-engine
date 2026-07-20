@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+import hashlib
+import json
+import logging
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
@@ -9,16 +12,20 @@ from uuid import UUID
 from sqlalchemy import desc, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.config import get_settings
 from app.models.asset import Asset
 from app.models.canonical_preview_package import CanonicalPreviewPackage
 from app.models.capital_campaign import CapitalCampaign
 from app.models.candle import Candle
 from app.models.decision_record import DecisionRecord
+from app.models.decision_snapshot import DecisionSnapshot
 from app.models.paper_account import PaperAccount
 from app.models.strategy import Strategy
+from app.models.strategy_aggregate_decision import StrategyAggregateDecision
 from app.models.strategy_roster_proposal import StrategyRosterProposal
 from app.models.strategy_roster_proposal_outcome import StrategyRosterProposalOutcome
 from app.models.strategy_roster_run import StrategyRosterRun
+from app.services.decisions.ingestion import DECISION_ENGINE_VERSION
 from app.services.position_lifecycle.contracts import PositionLifecycleEvaluation
 from app.schemas.capital_campaign_domain import (
     CapitalCampaignDefinitionResponse,
@@ -42,6 +49,20 @@ from app.services.risk import (
 )
 from app.services.risk.risk_context import resolve_execution_risk_context
 from app.services.strategy_outcomes.service import fetch_strategy_scorecards
+from app.models.parameter_set import ParameterSet
+from app.services.strategy_roster.decision_aggregator import (
+    AGGREGATE_STRATEGY_IDENTITY,
+    AGGREGATE_STRATEGY_SLUG,
+    AGGREGATE_STRATEGY_VERSION,
+    AggregationConfig,
+    AggregationResult,
+    StrategyOutcomeSummary,
+    StrategyProposalInput,
+    aggregate_strategy_proposals,
+)
+from app.services.strategy_roster.registry import ENABLED_PHASE1_ROSTER
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True)
@@ -385,127 +406,172 @@ async def _load_latest_closed_candle(*, db: AsyncSession, asset_id: UUID, interv
     return result.scalar_one_or_none()
 
 
-async def _load_latest_strategy_evidence(
+def _hash_payload(payload: dict[str, Any]) -> str:
+    encoded = json.dumps(payload, sort_keys=True, separators=(",", ":"), default=str)
+    return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
+
+
+def _build_aggregate_decision_idempotency_key(
+    *,
+    roster_run_id: UUID,
+    asset_id: UUID,
+    candle_close_time: datetime,
+    campaign_id: UUID,
+    campaign_version: int,
+    config_version: str,
+    environment: str,
+) -> str:
+    return _hash_payload(
+        {
+            "kind": "strategy_aggregate_decision",
+            "roster_run_id": str(roster_run_id),
+            "asset_id": str(asset_id),
+            "candle_close_time": candle_close_time.isoformat(),
+            "campaign_id": str(campaign_id),
+            "campaign_version": campaign_version,
+            "config_version": config_version,
+            "environment": environment,
+        }
+    )
+
+
+async def _recent_strategy_failure_streak(
+    *,
+    db: AsyncSession,
+    asset_id: UUID,
+    interval: str,
+    strategy_slug: str,
+    before_candle_close_time: datetime,
+    limit: int = 5,
+) -> int:
+    result = await db.execute(
+        select(StrategyRosterProposal.evaluation_status)
+        .where(StrategyRosterProposal.asset_id == asset_id)
+        .where(StrategyRosterProposal.interval == interval)
+        .where(StrategyRosterProposal.strategy_slug == strategy_slug)
+        .where(StrategyRosterProposal.candle_close_time < before_candle_close_time)
+        .order_by(StrategyRosterProposal.candle_close_time.desc())
+        .limit(limit)
+    )
+    streak = 0
+    for row in result.all():
+        if row[0] == "FAILED":
+            streak += 1
+        else:
+            break
+    return streak
+
+
+async def _load_latest_roster_proposal_group(
     *,
     db: AsyncSession,
     asset_id: UUID,
     product_id: str,
     interval: str,
-    preferred_strategy_identity: str | None = None,
-) -> tuple[dict[str, Any] | None, str | None]:
-    scorecards = await fetch_strategy_scorecards(db=db, provider="kraken_spot", product_id=product_id, interval=interval)
-    if not scorecards:
-        return None, "strategy_evidence_unavailable"
-
-    preferred_slug = None
-    if preferred_strategy_identity and "@" in preferred_strategy_identity:
-        preferred_slug = preferred_strategy_identity.split("@", 1)[0].strip()
-    if preferred_slug:
-        preferred_scorecards = [item for item in scorecards if str(item.strategy_slug).strip() == preferred_slug]
-        if preferred_scorecards:
-            scorecards = preferred_scorecards
-
-    best_scorecard = max(
-        scorecards,
-        key=lambda item: (
-            item.aggregate.average_fee_adjusted_return_pct or Decimal("-999999"),
-            item.aggregate.overall_correct_pct or Decimal("-999999"),
-            item.aggregate.total_evaluated,
-            item.strategy_slug,
-        ),
+    preferred_slug: str | None,
+) -> list[StrategyRosterProposal]:
+    """Loads every proposal belonging to the single most recent roster run for
+    this exact (asset, product, interval) scope -- i.e. every strategy's
+    proposal for the same candle close, not just one strategy's. Proposals
+    whose roster_run_id disagrees with the majority for that candle close are
+    dropped defensively (mismatched-scope evidence must never be mixed in)."""
+    latest_close_result = await db.execute(
+        select(StrategyRosterProposal.candle_close_time)
+        .where(StrategyRosterProposal.asset_id == asset_id)
+        .where(StrategyRosterProposal.product_id == product_id)
+        .where(StrategyRosterProposal.interval == interval)
+        .order_by(StrategyRosterProposal.candle_close_time.desc())
+        .limit(1)
     )
+    latest_close_time = latest_close_result.scalar_one_or_none()
+    if latest_close_time is None:
+        return []
 
-    proposal_result = await db.execute(
+    proposals_result = await db.execute(
         select(StrategyRosterProposal)
         .where(StrategyRosterProposal.asset_id == asset_id)
         .where(StrategyRosterProposal.product_id == product_id)
         .where(StrategyRosterProposal.interval == interval)
+        .where(StrategyRosterProposal.candle_close_time == latest_close_time)
         .where(StrategyRosterProposal.strategy_slug == preferred_slug if preferred_slug is not None else True)
-        .order_by(StrategyRosterProposal.candle_close_time.desc(), StrategyRosterProposal.created_at.desc())
-        .limit(1)
     )
-    proposal = proposal_result.scalar_one_or_none()
-    if proposal is None:
-        return None, "strategy_evidence_unavailable"
+    proposals = list(proposals_result.scalars().all())
+    if not proposals:
+        return []
 
-    decision_records = (
-        await db.execute(
-            select(DecisionRecord)
-            .order_by(DecisionRecord.timestamp.desc(), DecisionRecord.decision_id.desc())
-            .limit(100)
-        )
-    ).scalars().all()
-    decision_record = None
-    for item in decision_records:
-        asset = item.asset if isinstance(item.asset, dict) else {}
-        if _normalize_symbol(str(asset.get("symbol") or asset.get("product_id") or "")) != _normalize_symbol(product_id):
-            continue
-        if str(item.timeframe).strip().lower() != interval.strip().lower():
-            continue
-        decision_record = item
-        break
-    if decision_record is None:
-        return None, "strategy_evidence_unavailable"
+    run_ids = [item.roster_run_id for item in proposals]
+    majority_run_id = max(set(run_ids), key=run_ids.count)
+    return [item for item in proposals if item.roster_run_id == majority_run_id]
 
-    matching_support = None
-    for entry in decision_record.supporting_strategies or []:
-        strategy_identity = str(entry.get("strategy_identity") or entry.get("strategyId") or entry.get("strategy_id") or entry.get("slug") or entry.get("name") or "")
-        if not strategy_identity or strategy_identity.split("@", 1)[0] == proposal.strategy_slug or strategy_identity == proposal.strategy_identity:
-            matching_support = entry
-            break
-    if matching_support is None and decision_record.supporting_strategies:
-        matching_support = decision_record.supporting_strategies[0]
-    if matching_support is None:
-        return None, "strategy_evidence_unavailable"
 
-    decision_strategy_identity, decision_strategy_version, decision_action, identity_error = _resolve_decision_signal_identity(decision_record)
-    if identity_error is not None:
-        return None, identity_error
+def _resolve_scorecard_summary(*, scorecard_by_slug: dict[str, Any], dominant_contributor_identity: str | None) -> Any | None:
+    # The aggregate's reported strategy_identity is always the canonical
+    # AGGREGATE_STRATEGY_IDENTITY (never a real roster slug -- see item 1 of
+    # the production-safety review), so the representative scorecard shown in
+    # evidence must be looked up via the informational dominant_contributor_identity,
+    # not the reported identity itself.
+    dominant_slug = dominant_contributor_identity.split("@", 1)[0] if dominant_contributor_identity else None
+    return scorecard_by_slug.get(dominant_slug) if dominant_slug else None
 
-    if preferred_strategy_identity and decision_strategy_identity != preferred_strategy_identity and proposal.strategy_identity != preferred_strategy_identity:
-        return None, "strategy_evidence_unavailable"
 
-    expected_value = None
-    if isinstance(decision_record.expected_reward, dict):
-        expected_value = decision_record.expected_reward.get("expected_value") or decision_record.expected_reward.get("value")
-
-    evidence = {
+def _build_aggregate_evidence_dict(
+    *,
+    roster_run_id: UUID,
+    candle_close_time: datetime,
+    aggregate_decision_id: UUID,
+    decision_record: DecisionRecord,
+    final_action: str,
+    primary_strategy_identity: str | None,
+    primary_strategy_version: str | None,
+    dominant_contributor_identity: str | None,
+    eligible_strategy_count: int,
+    weighted_buy_score: Decimal,
+    weighted_sell_score: Decimal,
+    weighted_hold_score: Decimal,
+    thresholds_applied: dict[str, Any],
+    deterministic_explanation: list[str],
+    strategy_contributions: list[dict[str, Any]],
+    scorecard_by_slug: dict[str, Any],
+) -> dict[str, Any]:
+    scorecard_summary = _resolve_scorecard_summary(scorecard_by_slug=scorecard_by_slug, dominant_contributor_identity=dominant_contributor_identity)
+    score = None
+    if primary_strategy_identity is not None:
+        score = str(weighted_buy_score if final_action == "BUY" else (weighted_sell_score if final_action == "SELL" else weighted_hold_score))
+    return {
         "authority_class": "AUTHORITATIVE",
-        "source_type": "decision_record_and_strategy_roster",
+        "source_type": "strategy_decision_aggregator",
         "source_identity": {
             "decision_record_id": str(decision_record.decision_id),
-            "strategy_roster_run_id": str(proposal.roster_run_id),
-            "proposal_id": str(proposal.proposal_id),
-            "scorecard_strategy_slug": best_scorecard.strategy_slug,
+            "strategy_roster_run_id": str(roster_run_id),
+            "aggregate_decision_id": str(aggregate_decision_id),
+            "scorecard_strategy_slug": scorecard_summary.strategy_slug if scorecard_summary is not None else None,
         },
-        "observed_at": max(
-            decision_record.timestamp,
-            proposal.evaluated_at,
-            getattr(best_scorecard.aggregate, "evaluated_at", proposal.evaluated_at),
-        ).isoformat(),
+        "observed_at": candle_close_time.isoformat(),
         "freshness": "fresh",
         "availability": "available",
-        "reason": "strategy evidence resolved from persisted decision and roster records",
-        "strategy_identity": decision_strategy_identity,
-        "strategy_version": decision_strategy_version,
-        "action": decision_action,
-        "score": str(matching_support.get("score")) if matching_support.get("score") is not None else (format(proposal.strength, "f") if proposal.strength is not None else None),
-        "confidence": str(matching_support.get("confidence")) if matching_support.get("confidence") is not None else (format(proposal.confidence, "f") if proposal.confidence is not None else None),
-        "sample_size": best_scorecard.aggregate.total_evaluated,
+        "reason": "strategy evidence resolved from governed multi-strategy roster aggregate decision",
+        "strategy_identity": primary_strategy_identity,
+        "strategy_version": primary_strategy_version,
+        "action": final_action,
+        "score": score,
+        "confidence": None,
+        "sample_size": scorecard_summary.aggregate.total_evaluated if scorecard_summary is not None else 0,
         "profitable_after_fees_performance": None
-        if best_scorecard.aggregate.average_fee_adjusted_return_pct is None
-        else format(best_scorecard.aggregate.average_fee_adjusted_return_pct, "f"),
-        "expected_value": None if expected_value is None else str(expected_value),
-        "evidence_timestamp": proposal.evaluated_at.isoformat(),
-        "scorecard": {
-            "best_strategy_slug": best_scorecard.strategy_slug,
-            "aggregate_total_evaluated": best_scorecard.aggregate.total_evaluated,
+        if scorecard_summary is None or scorecard_summary.aggregate.average_fee_adjusted_return_pct is None
+        else format(scorecard_summary.aggregate.average_fee_adjusted_return_pct, "f"),
+        "expected_value": None,
+        "evidence_timestamp": candle_close_time.isoformat(),
+        "scorecard": None
+        if scorecard_summary is None
+        else {
+            "best_strategy_slug": scorecard_summary.strategy_slug,
+            "aggregate_total_evaluated": scorecard_summary.aggregate.total_evaluated,
             "aggregate_average_fee_adjusted_return_pct": None
-            if best_scorecard.aggregate.average_fee_adjusted_return_pct is None
-            else format(best_scorecard.aggregate.average_fee_adjusted_return_pct, "f"),
+            if scorecard_summary.aggregate.average_fee_adjusted_return_pct is None
+            else format(scorecard_summary.aggregate.average_fee_adjusted_return_pct, "f"),
             "aggregate_overall_correct_pct": None
-            if best_scorecard.aggregate.overall_correct_pct is None
-            else format(best_scorecard.aggregate.overall_correct_pct, "f"),
+            if scorecard_summary.aggregate.overall_correct_pct is None
+            else format(scorecard_summary.aggregate.overall_correct_pct, "f"),
         },
         "decision_record": {
             "decision_id": str(decision_record.decision_id),
@@ -517,8 +583,563 @@ async def _load_latest_strategy_evidence(
             "expected_reward": decision_record.expected_reward,
             "generated_signals": decision_record.generated_signals,
         },
+        "aggregate_evidence": {
+            "aggregate_decision_id": str(aggregate_decision_id),
+            "dominant_contributor_identity": dominant_contributor_identity,
+            "eligible_strategy_count": eligible_strategy_count,
+            "weighted_buy_score": str(weighted_buy_score),
+            "weighted_sell_score": str(weighted_sell_score),
+            "weighted_hold_score": str(weighted_hold_score),
+            "thresholds_applied": thresholds_applied,
+            "deterministic_explanation": list(deterministic_explanation),
+            "contributions": [
+                {
+                    "strategy_slug": item.get("strategy_slug") if isinstance(item, dict) else item.strategy_slug,
+                    "strategy_identity": item.get("strategy_identity") if isinstance(item, dict) else item.strategy_identity,
+                    "raw_action": item.get("raw_action") if isinstance(item, dict) else item.raw_action,
+                    "eligible": item.get("eligible") if isinstance(item, dict) else item.eligible,
+                    "exclusion_reason": item.get("exclusion_reason") if isinstance(item, dict) else item.exclusion_reason,
+                    "weight": item.get("weight") if isinstance(item, dict) else item.weight,
+                }
+                for item in strategy_contributions
+            ],
+        },
     }
+
+
+async def load_strategy_aggregate_evidence(
+    *,
+    db: AsyncSession,
+    roster_run_id: UUID,
+    asset_id: UUID,
+    candle_close_time: datetime,
+    campaign_id: UUID,
+    campaign_version: int,
+    config_version: str,
+    environment: str,
+    provider: str,
+    product_id: str,
+    interval: str,
+) -> tuple[dict[str, Any] | None, str | None]:
+    """Pure read. Never performs any INSERT/UPDATE/DELETE. Returns evidence
+    for an aggregate decision only if one has already been persisted for this
+    exact (roster_run_id, asset_id, candle_close_time, campaign_id,
+    campaign_version, config_version, environment) scope; returns
+    (None, "not_yet_computed") otherwise. Safe to call from diagnostics,
+    dashboards, or any other read-only context."""
+    idempotency_key = _build_aggregate_decision_idempotency_key(
+        roster_run_id=roster_run_id,
+        asset_id=asset_id,
+        candle_close_time=candle_close_time,
+        campaign_id=campaign_id,
+        campaign_version=campaign_version,
+        config_version=config_version,
+        environment=environment,
+    )
+    aggregate_row = await db.scalar(
+        select(StrategyAggregateDecision).where(StrategyAggregateDecision.idempotency_key == idempotency_key).limit(1)
+    )
+    if aggregate_row is None or aggregate_row.decision_record_id is None:
+        return None, "not_yet_computed"
+    decision_record = await db.get(DecisionRecord, aggregate_row.decision_record_id)
+    if decision_record is None:
+        return None, "not_yet_computed"
+
+    scorecard_by_slug: dict[str, Any] = {}
+    try:
+        scorecards = await fetch_strategy_scorecards(db=db, provider=provider, product_id=product_id, interval=interval)
+        scorecard_by_slug = {item.strategy_slug: item for item in scorecards}
+    except Exception:
+        scorecard_by_slug = {}
+
+    contributions = aggregate_row.strategy_contributions if isinstance(aggregate_row.strategy_contributions, list) else []
+    evidence = _build_aggregate_evidence_dict(
+        roster_run_id=roster_run_id,
+        candle_close_time=candle_close_time,
+        aggregate_decision_id=aggregate_row.aggregate_decision_id,
+        decision_record=decision_record,
+        final_action=aggregate_row.final_action,
+        primary_strategy_identity=aggregate_row.primary_strategy_identity,
+        primary_strategy_version=aggregate_row.primary_strategy_version,
+        dominant_contributor_identity=aggregate_row.dominant_contributor_identity,
+        eligible_strategy_count=aggregate_row.eligible_strategy_count,
+        weighted_buy_score=Decimal(str(aggregate_row.weighted_buy_score)),
+        weighted_sell_score=Decimal(str(aggregate_row.weighted_sell_score)),
+        weighted_hold_score=Decimal(str(aggregate_row.weighted_hold_score)),
+        thresholds_applied=aggregate_row.thresholds_applied,
+        deterministic_explanation=aggregate_row.deterministic_explanation,
+        strategy_contributions=contributions,
+        scorecard_by_slug=scorecard_by_slug,
+    )
     return evidence, None
+
+
+async def resolve_or_create_strategy_aggregate_evidence(
+    *,
+    db: AsyncSession,
+    asset_id: UUID,
+    product_id: str,
+    interval: str,
+    campaign_id: UUID,
+    campaign_version: int,
+    environment: str,
+    paper_account_id: UUID,
+    runtime_campaign_id: int,
+    asset: Asset,
+    candle_item: Candle,
+    now: datetime,
+    provider: str = "kraken_spot",
+    actor: str = "strategy_decision_aggregator",
+    preferred_strategy_identity: str | None = None,
+) -> tuple[dict[str, Any] | None, str | None]:
+    """Governed read-or-create operation for the authoritative campaign's
+    strategy evidence. Tries a pure read first (load_strategy_aggregate_evidence);
+    only computes and persists a new StrategyAggregateDecision + DecisionRecord +
+    DecisionSnapshot when no matching one exists yet for this exact scope.
+    This function DOES write to the database on a cache-miss -- callers must
+    only invoke it from within the authoritative campaign composition
+    transaction, never from a read-only diagnostic context (use
+    load_strategy_aggregate_evidence for that instead). Persistence is
+    idempotent: repeated calls for the same scope never create duplicate rows."""
+    settings = get_settings()
+
+    preferred_slug = None
+    if preferred_strategy_identity and "@" in preferred_strategy_identity:
+        preferred_slug = preferred_strategy_identity.split("@", 1)[0].strip()
+
+    proposals = await _load_latest_roster_proposal_group(
+        db=db, asset_id=asset_id, product_id=product_id, interval=interval, preferred_slug=preferred_slug
+    )
+    if not proposals:
+        logger.info(
+            "strategy_aggregate_skipped reason=no_roster_proposals asset_id=%s product_id=%s interval=%s",
+            asset_id, product_id, interval,
+        )
+        return None, "strategy_evidence_unavailable"
+
+    roster_run_id = proposals[0].roster_run_id
+    candle_close_time = proposals[0].candle_close_time
+
+    # Pure-read fast path: if this exact scope was already resolved (e.g. a
+    # prior cycle, or a retry after a downstream failure earlier in the same
+    # composition), reuse it without any write and without the cost of
+    # re-fetching scorecards/position/failure-streak evidence.
+    cached_evidence, cached_reason = await load_strategy_aggregate_evidence(
+        db=db,
+        roster_run_id=roster_run_id,
+        asset_id=asset_id,
+        candle_close_time=candle_close_time,
+        campaign_id=campaign_id,
+        campaign_version=campaign_version,
+        config_version=settings.strategy_aggregator_config_version,
+        environment=environment,
+        provider=provider,
+        product_id=product_id,
+        interval=interval,
+    )
+    if cached_evidence is not None:
+        logger.info(
+            "strategy_aggregate_skipped roster_run_id=%s campaign_id=%s candle_close=%s reason=idempotent_replay",
+            roster_run_id, campaign_id, candle_close_time.isoformat(),
+        )
+        return cached_evidence, None
+
+    data_quality_failed = False
+    scorecard_by_slug: dict[str, Any] = {}
+    try:
+        scorecards = await fetch_strategy_scorecards(db=db, provider=provider, product_id=product_id, interval=interval)
+        scorecard_by_slug = {item.strategy_slug: item for item in scorecards}
+    except Exception:
+        data_quality_failed = True
+
+    proposal_inputs: list[StrategyProposalInput] = []
+    for proposal in proposals:
+        outcome_evidence = None
+        scorecard = scorecard_by_slug.get(proposal.strategy_slug)
+        if scorecard is not None:
+            outcome_evidence = StrategyOutcomeSummary(
+                sample_size=scorecard.aggregate.total_evaluated,
+                overall_correct_pct=scorecard.aggregate.overall_correct_pct,
+                average_fee_adjusted_return_pct=scorecard.aggregate.average_fee_adjusted_return_pct,
+                # Reliable current-regime evidence is not yet available at this
+                # integration point -- do not fabricate a match/mismatch signal.
+                regime_match=None,
+            )
+        failure_streak = await _recent_strategy_failure_streak(
+            db=db,
+            asset_id=asset_id,
+            interval=interval,
+            strategy_slug=proposal.strategy_slug,
+            before_candle_close_time=candle_close_time,
+        )
+        proposal_inputs.append(
+            StrategyProposalInput(
+                strategy_slug=proposal.strategy_slug,
+                strategy_identity=proposal.strategy_identity,
+                strategy_version=proposal.strategy_version,
+                action=proposal.action,
+                confidence=proposal.confidence,
+                strength=proposal.strength,
+                evaluation_status=proposal.evaluation_status,
+                evaluated_at=proposal.evaluated_at,
+                roster_run_id=str(proposal.roster_run_id),
+                asset_id=str(proposal.asset_id),
+                candle_close_time=proposal.candle_close_time,
+                registered_and_enabled=proposal.strategy_slug in ENABLED_PHASE1_ROSTER,
+                outcome_evidence=outcome_evidence,
+                recent_failure_streak=failure_streak,
+            )
+        )
+
+    position = await _load_position_evidence(
+        db=db, account_id=paper_account_id, campaign_id=runtime_campaign_id, symbol=product_id, asset=asset, candle=candle_item, now=now
+    )
+    position_row = position.get("position") if isinstance(position, dict) else None
+    position_open = bool(
+        position_row is not None
+        and position_row.get("closed_indicator") is False
+        and position_row.get("quantity") not in (None, "0", "0.0")
+    )
+    if position.get("authority_class") == "UNAVAILABLE":
+        position_state = "UNKNOWN"
+    else:
+        position_state = "OPEN" if position_open else "FLAT"
+
+    config = AggregationConfig(
+        config_version=settings.strategy_aggregator_config_version,
+        min_eligible_strategies=settings.strategy_aggregator_min_eligible_strategies,
+        min_buy_agreement=settings.strategy_aggregator_min_buy_agreement,
+        min_sell_agreement=settings.strategy_aggregator_min_sell_agreement,
+        min_confidence=settings.strategy_aggregator_min_confidence,
+        max_evidence_age_minutes=settings.strategy_aggregator_max_evidence_age_minutes,
+        min_outcome_sample_size=settings.strategy_aggregator_min_outcome_sample_size,
+        veto_on_data_quality_failure=settings.strategy_aggregator_veto_on_data_quality_failure,
+    )
+
+    result = aggregate_strategy_proposals(
+        proposals=proposal_inputs,
+        position_open=position_open,
+        now=now,
+        config=config,
+        data_quality_failed=data_quality_failed,
+    )
+
+    idempotency_key = _build_aggregate_decision_idempotency_key(
+        roster_run_id=roster_run_id,
+        asset_id=asset_id,
+        candle_close_time=candle_close_time,
+        campaign_id=campaign_id,
+        campaign_version=campaign_version,
+        config_version=config.config_version,
+        environment=environment,
+    )
+
+    # The cache-miss path above already proved no row exists for this exact
+    # idempotency key; _persist_strategy_aggregate_decision performs the one
+    # and only write for this scope. A concurrent duplicate insert (a second
+    # worker cycle racing this one) is prevented at the database level by the
+    # UNIQUE constraint on strategy_aggregate_decisions.idempotency_key.
+    aggregate_row, decision_record = await _persist_strategy_aggregate_decision(
+        db=db,
+        idempotency_key=idempotency_key,
+        roster_run_id=roster_run_id,
+        asset_id=asset_id,
+        candle_close_time=candle_close_time,
+        campaign_id=campaign_id,
+        campaign_version=campaign_version,
+        environment=environment,
+        provider=provider,
+        product_id=product_id,
+        interval=interval,
+        position_state=position_state,
+        result=result,
+        actor=actor,
+    )
+    log_event = "strategy_aggregate_failed_closed" if result.failed_closed else "strategy_aggregate_completed"
+
+    logger.info(
+        "%s roster_run_id=%s campaign_id=%s candle_close=%s eligible=%s buy=%s sell=%s hold=%s action=%s reason=%s",
+        log_event, roster_run_id, campaign_id, candle_close_time.isoformat(),
+        result.eligible_strategy_count, result.weighted_buy_score, result.weighted_sell_score,
+        result.weighted_hold_score, result.final_action, result.explanation,
+    )
+
+    if decision_record is None or aggregate_row.decision_record_id is None:
+        return None, "strategy_evidence_unavailable"
+
+    evidence = _build_aggregate_evidence_dict(
+        roster_run_id=roster_run_id,
+        candle_close_time=candle_close_time,
+        aggregate_decision_id=aggregate_row.aggregate_decision_id,
+        decision_record=decision_record,
+        final_action=result.final_action,
+        primary_strategy_identity=result.primary_strategy_identity,
+        primary_strategy_version=result.primary_strategy_version,
+        dominant_contributor_identity=result.dominant_contributor_identity,
+        eligible_strategy_count=result.eligible_strategy_count,
+        weighted_buy_score=result.weighted_buy_score,
+        weighted_sell_score=result.weighted_sell_score,
+        weighted_hold_score=result.weighted_hold_score,
+        thresholds_applied=result.thresholds_applied,
+        deterministic_explanation=list(result.deterministic_explanation),
+        strategy_contributions=list(result.contributions),
+        scorecard_by_slug=scorecard_by_slug,
+    )
+    return evidence, None
+
+
+async def _ensure_aggregate_strategy_catalog_entry(*, db: AsyncSession, actor: str) -> Strategy:
+    """Idempotently ensures a real, active Strategy catalog row (+ a
+    ParameterSet) exists for AGGREGATE_STRATEGY_IDENTITY. Canonical package
+    composition (_resolve_strategy_and_parameter_binding in
+    canonical_preview_package.py) requires a real Strategy row matching
+    (slug, module_version, is_active=True) plus a ParameterSet to resolve any
+    strategy_identity it is handed -- including this one."""
+    strategy = await db.scalar(
+        select(Strategy)
+        .where(Strategy.slug == AGGREGATE_STRATEGY_SLUG)
+        .where(Strategy.module_version == AGGREGATE_STRATEGY_VERSION)
+        .limit(1)
+    )
+    if strategy is None:
+        strategy = Strategy(
+            name="Strategy Roster Aggregate",
+            slug=AGGREGATE_STRATEGY_SLUG,
+            description=(
+                "Canonical identity for governed multi-strategy roster aggregate decisions "
+                "(app.services.strategy_roster.decision_aggregator). Not an independently "
+                "executable strategy module -- represents the ensemble outcome, never an "
+                "individual contributor."
+            ),
+            module_version=AGGREGATE_STRATEGY_VERSION,
+            is_active=True,
+        )
+        db.add(strategy)
+        await db.flush()
+    elif not strategy.is_active:
+        # Fail closed rather than silently reactivating a catalog row someone
+        # deliberately deactivated.
+        raise ValueError("strategy_roster_aggregate catalog entry exists but is not active")
+
+    parameter_set = await db.scalar(select(ParameterSet).where(ParameterSet.strategy_id == strategy.id).limit(1))
+    if parameter_set is None:
+        db.add(
+            ParameterSet(
+                strategy_id=strategy.id,
+                label="default",
+                params={},
+                created_by=actor,
+            )
+        )
+        await db.flush()
+    return strategy
+
+
+async def _persist_strategy_aggregate_decision(
+    *,
+    db: AsyncSession,
+    idempotency_key: str,
+    roster_run_id: UUID,
+    asset_id: UUID,
+    candle_close_time: datetime,
+    campaign_id: UUID,
+    campaign_version: int,
+    environment: str,
+    provider: str,
+    product_id: str,
+    interval: str,
+    position_state: str,
+    result: AggregationResult,
+    actor: str,
+) -> tuple[StrategyAggregateDecision, DecisionRecord]:
+    now = datetime.now(timezone.utc)
+    if result.primary_strategy_identity == AGGREGATE_STRATEGY_IDENTITY:
+        await _ensure_aggregate_strategy_catalog_entry(db=db, actor=actor)
+    contribution_payload = [
+        {
+            "strategy_slug": item.strategy_slug,
+            "strategy_identity": item.strategy_identity,
+            "raw_action": item.raw_action,
+            "raw_confidence": item.raw_confidence,
+            "raw_strength": item.raw_strength,
+            "eligible": item.eligible,
+            "exclusion_reason": item.exclusion_reason,
+            "weight": item.weight,
+            "evidence_basis": item.evidence_basis,
+            "weighted_buy": item.weighted_buy,
+            "weighted_sell": item.weighted_sell,
+            "weighted_hold": item.weighted_hold,
+        }
+        for item in result.contributions
+    ]
+    supporting_strategies = [
+        {"strategy_identity": item.strategy_identity, "action": item.raw_action, "weight": item.weight}
+        for item in result.contributions
+        if item.eligible and item.raw_action == result.final_action
+    ]
+    opposing_strategies = [
+        {"strategy_identity": item.strategy_identity, "action": item.raw_action, "weight": item.weight}
+        for item in result.contributions
+        if item.eligible and item.raw_action != result.final_action
+    ]
+
+    decision_record = DecisionRecord(
+        idempotency_key=f"strategy_aggregate_decision:{idempotency_key}",
+        source_lineage={
+            "strategy_roster_runs": [str(roster_run_id)],
+            "campaigns": [str(campaign_id)],
+            "risk_events": [],
+            "crypto_order_previews": [],
+            "signals": [],
+            "model_outputs": [],
+            "trades": [],
+        },
+        field_provenance={
+            "generated_signals": [{"entity_type": "strategy_roster_runs", "entity_id": str(roster_run_id)}],
+            "supporting_strategies": [{"entity_type": "strategy_roster_runs", "entity_id": str(roster_run_id)}],
+        },
+        version=DECISION_ENGINE_VERSION,
+        timestamp=now,
+        asset={"product_id": product_id, "provider": provider},
+        timeframe=interval,
+        market_regime={"state": "unknown", "source": "strategy_decision_aggregator"},
+        indicators={},
+        generated_signals=[
+            {
+                "strategy_identity": result.primary_strategy_identity,
+                "strategy_version": result.primary_strategy_version,
+                "action": result.final_action,
+            }
+        ]
+        if result.primary_strategy_identity is not None
+        else [{"strategy_identity": None, "strategy_version": None, "action": result.final_action}],
+        signal_strength=None,
+        confidence=None,
+        supporting_strategies=supporting_strategies,
+        opposing_strategies=opposing_strategies,
+        risk_adjustments=[],
+        expected_risk=None,
+        expected_reward=None,
+        position_size=None,
+        trade_accepted=result.final_action in {"BUY", "SELL"} and not result.failed_closed,
+        trade_rejected_reason=None if result.final_action in {"BUY", "SELL"} and not result.failed_closed else result.explanation,
+        execution_details={"stage": "strategy_decision_aggregator", "actor": actor},
+        exit_details=None,
+        pnl=None,
+        duration=None,
+        outcome="pending_preview" if result.final_action in {"BUY", "SELL"} else "not_taken",
+        post_trade_notes=None,
+        lessons_learned=None,
+        ai_reflection=None,
+        future_tags=["strategy_decision_aggregator"],
+        confidence_calibration=None,
+        review_status="unreviewed",
+        human_notes=None,
+    )
+    db.add(decision_record)
+    await db.flush()
+
+    snapshot = DecisionSnapshot(
+        decision_id=decision_record.decision_id,
+        timestamp=now,
+        asset=decision_record.asset,
+        exchange=provider,
+        timeframe=interval,
+        ohlcv_context=[],
+        indicators={},
+        generated_features={"eligible_strategy_count": result.eligible_strategy_count},
+        market_regime=decision_record.market_regime,
+        volatility={"state": "unknown"},
+        spread_liquidity_context=None,
+        strategy_inputs={
+            "roster_run_id": str(roster_run_id),
+            "contributions": contribution_payload,
+            "weighted_buy_score": str(result.weighted_buy_score),
+            "weighted_sell_score": str(result.weighted_sell_score),
+            "weighted_hold_score": str(result.weighted_hold_score),
+        },
+        risk_inputs={"position_state": position_state},
+        current_position_state=position_state,
+        open_trades=[],
+        portfolio_exposure={},
+        parameter_set_version="unknown",
+        strategy_version=result.primary_strategy_version or "unknown",
+        ai_model_version="none",
+        decision_engine_version=DECISION_ENGINE_VERSION,
+        configuration_version=f"strategy_decision_aggregator_{result.thresholds_applied.get('config_version', 'v1')}",
+    )
+    db.add(snapshot)
+    await db.flush()
+
+    aggregate_row = StrategyAggregateDecision(
+        idempotency_key=idempotency_key,
+        roster_run_id=roster_run_id,
+        asset_id=asset_id,
+        candle_close_time=candle_close_time,
+        campaign_id=campaign_id,
+        campaign_version=campaign_version,
+        environment=environment,
+        provider=provider,
+        product_id=product_id,
+        interval=interval,
+        strategy_contributions=contribution_payload,
+        eligible_strategy_count=result.eligible_strategy_count,
+        weighted_buy_score=result.weighted_buy_score,
+        weighted_sell_score=result.weighted_sell_score,
+        weighted_hold_score=result.weighted_hold_score,
+        position_state=position_state,
+        thresholds_applied=result.thresholds_applied,
+        final_action=result.final_action,
+        primary_strategy_identity=result.primary_strategy_identity,
+        primary_strategy_version=result.primary_strategy_version,
+        dominant_contributor_identity=result.dominant_contributor_identity,
+        explanation=result.explanation,
+        deterministic_explanation=list(result.deterministic_explanation),
+        decision_record_id=decision_record.decision_id,
+    )
+    db.add(aggregate_row)
+    await db.flush()
+    return aggregate_row, decision_record
+
+
+async def _load_latest_strategy_evidence(
+    *,
+    db: AsyncSession,
+    asset_id: UUID,
+    product_id: str,
+    interval: str,
+    campaign_id: UUID,
+    campaign_version: int,
+    environment: str,
+    paper_account_id: UUID,
+    runtime_campaign_id: int,
+    asset: Asset,
+    candle_item: Candle,
+    now: datetime,
+    preferred_strategy_identity: str | None = None,
+) -> tuple[dict[str, Any] | None, str | None]:
+    """NOTE: despite the "_load_" name (kept for backward-compatible call-site
+    stability inside compose_campaign_authoritative_cycle), this delegates to
+    resolve_or_create_strategy_aggregate_evidence, which WILL write a new
+    StrategyAggregateDecision/DecisionRecord/DecisionSnapshot on a cache miss.
+    It must only be called from within the authoritative campaign composition
+    transaction. Do not call this from a read-only context -- use
+    load_strategy_aggregate_evidence directly for pure reads."""
+    return await resolve_or_create_strategy_aggregate_evidence(
+        db=db,
+        asset_id=asset_id,
+        product_id=product_id,
+        interval=interval,
+        campaign_id=campaign_id,
+        campaign_version=campaign_version,
+        environment=environment,
+        paper_account_id=paper_account_id,
+        runtime_campaign_id=runtime_campaign_id,
+        asset=asset,
+        candle_item=candle_item,
+        now=now,
+        preferred_strategy_identity=preferred_strategy_identity,
+    )
 
 
 async def _load_position_evidence(
@@ -952,6 +1573,14 @@ async def compose_campaign_authoritative_cycle(
             asset_id=asset.id,
             product_id=instrument,
             interval=candle.interval,
+            campaign_id=campaign_definition.campaign_id,
+            campaign_version=campaign_definition.version,
+            environment="production",
+            paper_account_id=runtime_campaign.paper_account_id,
+            runtime_campaign_id=runtime_campaign.id,
+            asset=asset,
+            candle_item=candle_item,
+            now=now,
             preferred_strategy_identity=strategy_authority.get("preferred_strategy_identity"),
         )
         if strategy is None:

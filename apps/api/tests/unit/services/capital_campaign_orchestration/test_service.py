@@ -1272,154 +1272,21 @@ async def test_authoritative_historical_package_conflict_fails_closed(monkeypatc
     assert result.composition["selected_decision"]["reason"] == "strategy_continuity_conflict"
 
 
-@pytest.mark.asyncio
-async def test_latest_strategy_evidence_uses_decision_signal_identity_not_scorecard_best(monkeypatch: pytest.MonkeyPatch) -> None:
-    from app.services.capital_campaign_orchestration.authoritative import _load_latest_strategy_evidence
-
-    decision_id = UUID("dc98ca2e-f83c-494f-be72-d4cb6bf7ab24")
-    now = datetime(2026, 7, 15, 0, 15, tzinfo=timezone.utc)
-    proposal = SimpleNamespace(
-        roster_run_id=UUID("aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa"),
-        proposal_id=UUID("bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb"),
-        evaluated_at=now,
-        strategy_slug="donchian_breakout",
-        strategy_identity="donchian_breakout@1.0.0",
-        strategy_version="donchian_breakout@1.0.0",
-        action="BUY",
-        strength=Decimal("0.50"),
-        confidence=Decimal("0.60"),
-    )
-    decision_record = SimpleNamespace(
-        decision_id=decision_id,
-        timestamp=now,
-        asset={"product_id": "BTC-USD"},
-        timeframe="15m",
-        generated_signals=[
-            {
-                "strategy": "ma_crossover",
-                "strategy_version": "ma_crossover@1.0.0",
-                "action": "HOLD",
-            }
-        ],
-        supporting_strategies=[
-            {
-                "strategy_identity": "donchian_breakout@1.0.0",
-                "action": "BUY",
-            }
-        ],
-        trade_accepted=False,
-        trade_rejected_reason=None,
-        opposing_strategies=[],
-        expected_risk={},
-        expected_reward={"expected_value": "1.0"},
-    )
-    scorecard = SimpleNamespace(
-        strategy_slug="donchian_breakout",
-        aggregate=SimpleNamespace(
-            average_fee_adjusted_return_pct=Decimal("2.0"),
-            overall_correct_pct=Decimal("55"),
-            total_evaluated=20,
-            evaluated_at=now,
-        ),
-    )
-
-    class _Db:
-        def __init__(self) -> None:
-            self._execute_calls = 0
-
-        async def execute(self, _statement):
-            self._execute_calls += 1
-            if self._execute_calls == 1:
-                return SimpleNamespace(scalar_one_or_none=lambda: proposal)
-            return SimpleNamespace(scalars=lambda: SimpleNamespace(all=lambda: [decision_record]))
-
-    async def _scorecards(**_kwargs):
-        return [scorecard]
-
-    monkeypatch.setattr("app.services.capital_campaign_orchestration.authoritative.fetch_strategy_scorecards", _scorecards)
-
-    evidence, reason = await _load_latest_strategy_evidence(
-        db=_Db(),
-        asset_id=UUID("eeeeeeee-eeee-eeee-eeee-eeeeeeeeeeee"),
-        product_id="BTC-USD",
-        interval="15m",
-    )
-
-    assert reason is None
-    assert evidence is not None
-    assert evidence["strategy_identity"] == "ma_crossover@1.0.0"
-    assert evidence["strategy_version"] == "ma_crossover@1.0.0"
-    assert evidence["action"] == "HOLD"
-    assert evidence["source_identity"]["decision_record_id"] == str(decision_id)
-    assert evidence["source_identity"]["scorecard_strategy_slug"] == "donchian_breakout"
-
-
-@pytest.mark.asyncio
-async def test_latest_strategy_evidence_conflicting_generated_signals_fail_closed(monkeypatch: pytest.MonkeyPatch) -> None:
-    from app.services.capital_campaign_orchestration.authoritative import _load_latest_strategy_evidence
-
-    now = datetime(2026, 7, 15, 0, 15, tzinfo=timezone.utc)
-    proposal = SimpleNamespace(
-        roster_run_id=UUID("aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa"),
-        proposal_id=UUID("bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb"),
-        evaluated_at=now,
-        strategy_slug="ma_crossover",
-        strategy_identity="ma_crossover@1.0.0",
-        strategy_version="ma_crossover@1.0.0",
-        action="BUY",
-        strength=Decimal("0.50"),
-        confidence=Decimal("0.60"),
-    )
-    decision_record = SimpleNamespace(
-        decision_id=UUID("dc98ca2e-f83c-494f-be72-d4cb6bf7ab24"),
-        timestamp=now,
-        asset={"product_id": "BTC-USD"},
-        timeframe="15m",
-        generated_signals=[
-            {"strategy": "ma_crossover", "strategy_version": "ma_crossover@1.0.0", "action": "HOLD"},
-            {"strategy": "donchian_breakout", "strategy_version": "donchian_breakout@1.0.0", "action": "HOLD"},
-        ],
-        supporting_strategies=[{"strategy_identity": "ma_crossover@1.0.0", "action": "HOLD"}],
-        trade_accepted=False,
-        trade_rejected_reason=None,
-        opposing_strategies=[],
-        expected_risk={},
-        expected_reward={"expected_value": "1.0"},
-    )
-    scorecard = SimpleNamespace(
-        strategy_slug="donchian_breakout",
-        aggregate=SimpleNamespace(
-            average_fee_adjusted_return_pct=Decimal("2.0"),
-            overall_correct_pct=Decimal("55"),
-            total_evaluated=20,
-            evaluated_at=now,
-        ),
-    )
-
-    class _Db:
-        def __init__(self) -> None:
-            self._execute_calls = 0
-
-        async def execute(self, _statement):
-            self._execute_calls += 1
-            if self._execute_calls == 1:
-                return SimpleNamespace(scalar_one_or_none=lambda: proposal)
-            return SimpleNamespace(scalars=lambda: SimpleNamespace(all=lambda: [decision_record]))
-
-    async def _scorecards(**_kwargs):
-        return [scorecard]
-
-    monkeypatch.setattr("app.services.capital_campaign_orchestration.authoritative.fetch_strategy_scorecards", _scorecards)
-
-    evidence, reason = await _load_latest_strategy_evidence(
-        db=_Db(),
-        asset_id=UUID("eeeeeeee-eeee-eeee-eeee-eeeeeeeeeeee"),
-        product_id="BTC-USD",
-        interval="15m",
-    )
-
-    assert evidence is None
-    assert reason == "strategy_identity_incoherent"
+# NOTE: test_latest_strategy_evidence_uses_decision_signal_identity_not_scorecard_best
+# and test_latest_strategy_evidence_conflicting_generated_signals_fail_closed were
+# removed here. Both asserted internal mechanics of the OLD single-best-scorecard
+# + single-DecisionRecord-lookup implementation of _load_latest_strategy_evidence
+# (a `best_scorecard` variable and a scan of decision_record.supporting_strategies
+# for a match) that no longer exist -- that function is now a governed, deterministic
+# multi-strategy aggregator (app/services/strategy_roster/decision_aggregator.py) and
+# always produces its own paired DecisionRecord rather than searching for a
+# pre-existing one. The principle those tests encoded -- that the strategy evidence
+# used for the authoritative decision must come from a governed record, not raw
+# unvetted scorecard ranking -- is preserved and re-tested against the new
+# implementation in:
+#   tests/unit/services/strategy_roster/test_decision_aggregator.py
+#     (test_ma_crossover_does_not_automatically_win_against_stronger_evidence)
+#   tests/unit/services/capital_campaign_orchestration/test_strategy_decision_aggregator_integration.py
 
 
 @pytest.mark.asyncio
