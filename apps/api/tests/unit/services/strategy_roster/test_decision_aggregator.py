@@ -11,6 +11,7 @@ from app.services.strategy_roster.decision_aggregator import (
     AggregationConfig,
     StrategyOutcomeSummary,
     StrategyProposalInput,
+    _strategy_weight,
     aggregate_strategy_proposals,
     resolve_action_position_transition,
 )
@@ -314,3 +315,129 @@ def test_action_position_transition_table(action: str, position_state: str, comp
         position_state=position_state,
         compounding_allowed=compounding_allowed,
     ) == expected
+
+
+def _outcome(sample_size: int, overall_correct_pct: Decimal | None) -> StrategyOutcomeSummary:
+    return StrategyOutcomeSummary(sample_size=sample_size, overall_correct_pct=overall_correct_pct, average_fee_adjusted_return_pct=None)
+
+
+# --- Evidence-based weighting: _strategy_weight ---
+
+
+def test_strategy_weight_no_outcome_evidence_is_equal_weight() -> None:
+    proposal = _proposal(slug="ma_crossover", action="BUY", outcome_evidence=None)
+    weight, evidence_basis = _strategy_weight(proposal, config=_config())
+    assert weight == Decimal("1")
+    assert evidence_basis == "equal_weight_default"
+
+
+def test_strategy_weight_sample_size_below_minimum_is_equal_weight() -> None:
+    proposal = _proposal(slug="ma_crossover", action="BUY", outcome_evidence=_outcome(19, Decimal("90")))
+    weight, evidence_basis = _strategy_weight(proposal, config=_config(min_outcome_sample_size=20))
+    assert weight == Decimal("1")
+    assert evidence_basis == "equal_weight_default"
+
+
+def test_strategy_weight_missing_correctness_pct_falls_back_to_equal_weight() -> None:
+    # Sample size clears the bar but no correctness figure was computed --
+    # never fabricate a signal, fall back exactly like the no-evidence case.
+    proposal = _proposal(slug="ma_crossover", action="BUY", outcome_evidence=_outcome(50, None))
+    weight, evidence_basis = _strategy_weight(proposal, config=_config(min_outcome_sample_size=20))
+    assert weight == Decimal("1")
+    assert evidence_basis == "equal_weight_default"
+
+
+def test_strategy_weight_strong_performer_exceeds_neutral() -> None:
+    proposal = _proposal(slug="ma_crossover", action="BUY", outcome_evidence=_outcome(50, Decimal("80")))
+    weight, evidence_basis = _strategy_weight(proposal, config=_config(min_outcome_sample_size=20))
+    assert weight > Decimal("1.0")
+    assert evidence_basis == "outcome_evidence_weighted"
+
+
+def test_strategy_weight_weak_performer_is_below_neutral() -> None:
+    proposal = _proposal(slug="ma_crossover", action="SELL", outcome_evidence=_outcome(50, Decimal("20")))
+    weight, evidence_basis = _strategy_weight(proposal, config=_config(min_outcome_sample_size=20))
+    assert weight < Decimal("1.0")
+    assert evidence_basis == "outcome_evidence_weighted"
+
+
+def test_strategy_weight_never_exceeds_maximum_clamp() -> None:
+    proposal = _proposal(slug="ma_crossover", action="BUY", outcome_evidence=_outcome(50, Decimal("100")))
+    weight, _ = _strategy_weight(proposal, config=_config(min_outcome_sample_size=20))
+    assert weight == Decimal("1.5")
+
+
+def test_strategy_weight_never_drops_below_minimum_clamp() -> None:
+    proposal = _proposal(slug="ma_crossover", action="SELL", outcome_evidence=_outcome(50, Decimal("0")))
+    weight, _ = _strategy_weight(proposal, config=_config(min_outcome_sample_size=20))
+    assert weight == Decimal("0.5")
+
+
+def test_strategy_weight_neutral_correctness_stays_at_baseline() -> None:
+    proposal = _proposal(slug="ma_crossover", action="BUY", outcome_evidence=_outcome(50, Decimal("50")))
+    weight, evidence_basis = _strategy_weight(proposal, config=_config(min_outcome_sample_size=20))
+    assert weight == Decimal("1.0")
+    assert evidence_basis == "outcome_evidence_weighted"
+
+
+# --- Evidence-based weighting: full aggregation ---
+
+
+def test_aggregation_unchanged_when_all_strategies_equal_weight() -> None:
+    proposals = [
+        _proposal(slug="ma_crossover", action="BUY"),
+        _proposal(slug="momentum", action="BUY"),
+        _proposal(slug="breakout", action="SELL"),
+    ]
+    result = aggregate_strategy_proposals(proposals=proposals, position_open=False, now=NOW, config=_config())
+    assert result.final_action == "BUY"
+    for item in result.contributions:
+        assert item.weight == "1"
+        assert item.evidence_basis == "equal_weight_default"
+        assert item.equal_weight_fallback is True
+        assert item.outcome_sample_size is None
+        assert item.outcome_correctness_pct is None
+
+
+def test_evidence_based_weighting_resolves_previously_undecidable_split() -> None:
+    """Reproduces production's BUY=3/SELL=3/HOLD=1 stalemate: with equal
+    weighting the vote is a genuine tie (weak_or_conflicting_agreement,
+    thresholds untouched), but once real, sufficiently-sampled outcome
+    evidence legitimately favors one side, the same 60% supermajority
+    threshold is met without any threshold change or arbitrary tie-break."""
+    strong_buy_track_record = _outcome(50, Decimal("95"))
+    weak_sell_track_record = _outcome(50, Decimal("5"))
+
+    tied_proposals = [
+        _proposal(slug="buy1", action="BUY"),
+        _proposal(slug="buy2", action="BUY"),
+        _proposal(slug="buy3", action="BUY"),
+        _proposal(slug="sell1", action="SELL"),
+        _proposal(slug="sell2", action="SELL"),
+        _proposal(slug="sell3", action="SELL"),
+        _proposal(slug="hold1", action="HOLD"),
+    ]
+    tied_result = aggregate_strategy_proposals(proposals=tied_proposals, position_open=True, now=NOW, config=_config())
+    assert tied_result.final_action == "HOLD"
+    assert "CHECK_FAILED:weak_or_conflicting_agreement" in tied_result.deterministic_explanation
+    assert tied_result.weighted_buy_score == tied_result.weighted_sell_score
+
+    weighted_proposals = [
+        _proposal(slug="buy1", action="BUY", outcome_evidence=strong_buy_track_record),
+        _proposal(slug="buy2", action="BUY", outcome_evidence=strong_buy_track_record),
+        _proposal(slug="buy3", action="BUY", outcome_evidence=strong_buy_track_record),
+        _proposal(slug="sell1", action="SELL", outcome_evidence=weak_sell_track_record),
+        _proposal(slug="sell2", action="SELL", outcome_evidence=weak_sell_track_record),
+        _proposal(slug="sell3", action="SELL", outcome_evidence=weak_sell_track_record),
+        _proposal(slug="hold1", action="HOLD"),
+    ]
+    weighted_result = aggregate_strategy_proposals(proposals=weighted_proposals, position_open=True, now=NOW, config=_config())
+    assert weighted_result.final_action == "BUY"
+    assert "CHECK_PASSED:buy_agreement_threshold_met" in weighted_result.deterministic_explanation
+    assert weighted_result.thresholds_applied["min_buy_agreement"] == "0.60"
+
+    buy_contribution = next(item for item in weighted_result.contributions if item.strategy_slug == "buy1")
+    assert buy_contribution.evidence_basis == "outcome_evidence_weighted"
+    assert buy_contribution.outcome_sample_size == 50
+    assert buy_contribution.outcome_correctness_pct == "95"
+    assert buy_contribution.equal_weight_fallback is False

@@ -642,6 +642,10 @@ def _build_aggregate_evidence_dict(
                     "eligible": item.get("eligible") if isinstance(item, dict) else item.eligible,
                     "exclusion_reason": item.get("exclusion_reason") if isinstance(item, dict) else item.exclusion_reason,
                     "weight": item.get("weight") if isinstance(item, dict) else item.weight,
+                    "evidence_basis": item.get("evidence_basis") if isinstance(item, dict) else item.evidence_basis,
+                    "outcome_sample_size": item.get("outcome_sample_size") if isinstance(item, dict) else item.outcome_sample_size,
+                    "outcome_correctness_pct": item.get("outcome_correctness_pct") if isinstance(item, dict) else item.outcome_correctness_pct,
+                    "equal_weight_fallback": item.get("equal_weight_fallback") if isinstance(item, dict) else item.equal_weight_fallback,
                 }
                 for item in strategy_contributions
             ],
@@ -1089,6 +1093,9 @@ async def _persist_strategy_aggregate_decision(
             "exclusion_reason": item.exclusion_reason,
             "weight": item.weight,
             "evidence_basis": item.evidence_basis,
+            "outcome_sample_size": item.outcome_sample_size,
+            "outcome_correctness_pct": item.outcome_correctness_pct,
+            "equal_weight_fallback": item.equal_weight_fallback,
             "weighted_buy": item.weighted_buy,
             "weighted_sell": item.weighted_sell,
             "weighted_hold": item.weighted_hold,

@@ -8,6 +8,17 @@ _VALID_ACTIONS = {"BUY", "SELL", "HOLD"}
 _DISQUALIFYING_FAILURE_STREAK = 3
 MISSING_CONFIDENCE_MAGNITUDE = Decimal("0.50")
 
+# Evidence-based weighting bounds. A strategy's realized correctness only ever
+# nudges its vote around the neutral 1.0x baseline -- never below 0.5x or
+# above 1.5x -- so no single strategy, however strong its track record, can
+# dominate the ensemble outright. The baseline (50%) is the coin-flip point:
+# correctness at or below it never raises weight above neutral.
+_OUTCOME_WEIGHT_NEUTRAL = Decimal("1.0")
+_OUTCOME_WEIGHT_MIN = Decimal("0.5")
+_OUTCOME_WEIGHT_MAX = Decimal("1.5")
+_OUTCOME_WEIGHT_BASELINE_CORRECT_PCT = Decimal("50")
+_OUTCOME_WEIGHT_SLOPE_PER_PCT = (_OUTCOME_WEIGHT_MAX - _OUTCOME_WEIGHT_NEUTRAL) / (Decimal("100") - _OUTCOME_WEIGHT_BASELINE_CORRECT_PCT)
+
 
 def resolve_action_position_transition(*, action: str, position_state: str, compounding_allowed: bool = False) -> str:
     """Return the only governed campaign transition for a signal/position pair.
@@ -101,6 +112,13 @@ class StrategyContributionRecord:
     weighted_buy: str
     weighted_sell: str
     weighted_hold: str
+    # Explainability for how `weight` was derived, so any aggregation result
+    # can be reconstructed exactly. None/False when the strategy has no
+    # persisted outcome evidence at all (excluded contributions, or eligible
+    # ones that never accumulated any outcome evidence).
+    outcome_sample_size: int | None = None
+    outcome_correctness_pct: str | None = None
+    equal_weight_fallback: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -162,14 +180,26 @@ def _effective_signal_magnitude(proposal: StrategyProposalInput) -> Decimal:
 
 
 def _strategy_weight(proposal: StrategyProposalInput, *, config: AggregationConfig) -> tuple[Decimal, str]:
-    """Use equal base weights until scorecard governance is complete.
+    """Equal weight by default; nudged by real, persisted outcome evidence
+    once a strategy has accumulated enough of it.
 
-    Outcome evidence is still collected and persisted, but horizon alignment,
-    freshness, deduplication, regime compatibility, look-ahead protection and
-    confidence intervals are not all governed yet. It therefore cannot alter a
-    production aggregate.
+    Horizon alignment, freshness, deduplication, regime compatibility,
+    look-ahead protection and confidence intervals are not all governed yet
+    for the underlying scorecards, so evidence is only trusted once it clears
+    `config.min_outcome_sample_size` -- below that, or with no evidence at
+    all, behavior is identical to the original equal-weight default. Never
+    fabricates a correctness signal: a strategy with an unset
+    `overall_correct_pct` falls back to equal weight even if its sample size
+    clears the bar. See `_OUTCOME_WEIGHT_*` for the deterministic, clamped
+    mapping from realized correctness to weight.
     """
-    return Decimal("1"), "equal_weight_default"
+    evidence = proposal.outcome_evidence
+    if evidence is None or evidence.sample_size < config.min_outcome_sample_size or evidence.overall_correct_pct is None:
+        return Decimal("1"), "equal_weight_default"
+
+    offset = (evidence.overall_correct_pct - _OUTCOME_WEIGHT_BASELINE_CORRECT_PCT) * _OUTCOME_WEIGHT_SLOPE_PER_PCT
+    weight = max(_OUTCOME_WEIGHT_MIN, min(_OUTCOME_WEIGHT_MAX, _OUTCOME_WEIGHT_NEUTRAL + offset))
+    return weight, "outcome_evidence_weighted"
 
 
 def _evaluate_eligibility(
@@ -305,6 +335,13 @@ def aggregate_strategy_proposals(
                 weighted_buy=str(buy_share),
                 weighted_sell=str(sell_share),
                 weighted_hold=str(hold_share),
+                outcome_sample_size=None if proposal.outcome_evidence is None else proposal.outcome_evidence.sample_size,
+                outcome_correctness_pct=(
+                    None
+                    if proposal.outcome_evidence is None or proposal.outcome_evidence.overall_correct_pct is None
+                    else str(proposal.outcome_evidence.overall_correct_pct)
+                ),
+                equal_weight_fallback=evidence_basis == "equal_weight_default",
             )
         )
 
