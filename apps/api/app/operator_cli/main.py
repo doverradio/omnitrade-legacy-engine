@@ -84,6 +84,9 @@ from app.operator_cli.service import (
     mandate_lifecycle_commission,
     mandate_lifecycle_status,
     refresh_provider_balance_evidence,
+    execute_campaign_aggregator_activation,
+    fetch_campaign_aggregator_activation_audit,
+    inspect_campaign_aggregator_activation,
     inspect_legacy_campaign_transition,
     pause_canonical_proving_activation_bundle,
     rollback_legacy_campaign_transition,
@@ -132,6 +135,9 @@ def _build_parser() -> argparse.ArgumentParser:
             "  ./operator legacy-campaign-transition-execute --legacy-campaign-id <legacy_uuid> --canonical-campaign-id <canonical_uuid> --canonical-campaign-version 1 --paper-account-id <paper_uuid> --live-trading-profile-id <profile_uuid> --provider kraken_spot --environment production --product BTC-USD --actor operator:human --confirm --json\n"
             "  ./operator legacy-campaign-transition-audit --legacy-campaign-id <legacy_uuid> --json\n"
             "  ./operator legacy-campaign-transition-rollback --legacy-campaign-id <legacy_uuid> --canonical-campaign-id <canonical_uuid> --canonical-campaign-version 1 --paper-account-id <paper_uuid> --live-trading-profile-id <profile_uuid> --provider kraken_spot --environment production --product BTC-USD --actor operator:human --confirm --json\n"
+            "  ./operator campaign-aggregator-activation-readiness --campaign-id <campaign_uuid> --campaign-version 1 --json\n"
+            "  ./operator campaign-aggregator-activation-execute --campaign-id <campaign_uuid> --campaign-version 1 --actor operator:human --reason \"pre-deploy aggregator migration\" --idempotency-key aggregator-activation-1 --confirm --json\n"
+            "  ./operator campaign-aggregator-activation-audit --campaign-id <campaign_uuid> --limit 20 --json\n"
             "  ./operator risk-ledger-diagnosis --account-id <paper_uuid> --json\n"
             "  ./operator mandate-bootstrap --owner-actor-id operator:human --autonomy-level LEVEL_2 --provider kraken_spot --environment production --exchange-connection-id <conn_uuid> --live-trading-profile-id <profile_uuid> --capital-campaign-id 2 --authorized-capital-usd 25 --max-order-notional-usd 5 --max-open-exposure-usd 10 --max-daily-deployed-usd 10 --max-daily-realized-loss-usd 3 --max-campaign-drawdown-usd 5 --max-consecutive-losses 2 --position-limit 1 --price-evidence-max-age-seconds 30 --max-slippage-bps 25 --max-fee-bps 10 --allowed-products BTC-USD --allowed-order-sides BUY,SELL,HOLD --allowed-strategy-versions ma_crossover@1.0.0 --approval-policy MANDATE_ALLOWED --policy-bundle-json @campaign-2-mandate-policy.json --authorization-method owner_signature --actor operator:human --reason campaign_2_bootstrap --idempotency-key mandate-bootstrap-campaign-2 --confirm --json\n"
             "  ./operator status --json\n"
@@ -572,6 +578,49 @@ def _build_parser() -> argparse.ArgumentParser:
     legacy_transition_rollback.add_argument("--actor", type=str, default="operator:human")
     legacy_transition_rollback.add_argument("--confirm", action="store_true")
     legacy_transition_rollback.add_argument("--json", action="store_true", dest="json_output")
+
+    aggregator_activation_readiness = subparsers.add_parser(
+        "campaign-aggregator-activation-readiness",
+        parents=[common],
+        help="Read-only pre-deployment check for the governed strategy aggregator migration",
+        description=(
+            "Read-only diagnostics for one capital campaign definition: whether its strategy-continuity "
+            "identity is already pinned to the canonical multi-strategy aggregate identity, whether "
+            "compounding is already disabled, and whether any active canonical preview package was "
+            "issued under a different (pre-aggregator) strategy identity."
+        ),
+    )
+    aggregator_activation_readiness.add_argument("--campaign-id", type=UUID, required=True)
+    aggregator_activation_readiness.add_argument("--campaign-version", type=int, required=True)
+    aggregator_activation_readiness.add_argument("--json", action="store_true", dest="json_output")
+
+    aggregator_activation_execute = subparsers.add_parser(
+        "campaign-aggregator-activation-execute",
+        parents=[common],
+        help="Pin campaign continuity identity to the aggregate and disable compounding, ahead of aggregator deployment",
+        description=(
+            "Operator-confirmed, idempotent migration: pins capital_campaign_definitions.metadata_evidence."
+            "selected_strategy_identity to the canonical strategy_roster_aggregate identity and sets "
+            "compounding_policy.reinvestment_percentage to 0. Never touches any CanonicalPreviewPackage row."
+        ),
+    )
+    aggregator_activation_execute.add_argument("--campaign-id", type=UUID, required=True)
+    aggregator_activation_execute.add_argument("--campaign-version", type=int, required=True)
+    aggregator_activation_execute.add_argument("--actor", type=str, default="operator:human")
+    aggregator_activation_execute.add_argument("--reason", type=str, required=True)
+    aggregator_activation_execute.add_argument("--idempotency-key", type=str, required=True)
+    aggregator_activation_execute.add_argument("--confirm", action="store_true")
+    aggregator_activation_execute.add_argument("--json", action="store_true", dest="json_output")
+
+    aggregator_activation_audit = subparsers.add_parser(
+        "campaign-aggregator-activation-audit",
+        parents=[common],
+        help="Show immutable audit evidence for prior aggregator-activation migrations",
+        description="Read-only audit evidence for prior campaign-aggregator-activation-execute runs on one campaign.",
+    )
+    aggregator_activation_audit.add_argument("--campaign-id", type=UUID, required=True)
+    aggregator_activation_audit.add_argument("--limit", type=int, default=20)
+    aggregator_activation_audit.add_argument("--json", action="store_true", dest="json_output")
 
     risk_diagnosis = subparsers.add_parser(
         "risk-ledger-diagnosis",
@@ -1971,6 +2020,28 @@ async def _run_async(args: argparse.Namespace) -> tuple[int, dict[str, Any], str
             actor=args.actor,
             confirm=bool(args.confirm),
         )
+        return 0, payload, render_json(payload)
+
+    if args.command == "campaign-aggregator-activation-readiness":
+        payload = await inspect_campaign_aggregator_activation(
+            campaign_id=args.campaign_id,
+            campaign_version=args.campaign_version,
+        )
+        return 0, payload, render_json(payload)
+
+    if args.command == "campaign-aggregator-activation-execute":
+        payload = await execute_campaign_aggregator_activation(
+            campaign_id=args.campaign_id,
+            campaign_version=args.campaign_version,
+            actor=args.actor,
+            reason=args.reason,
+            idempotency_key=args.idempotency_key,
+            confirm=bool(args.confirm),
+        )
+        return 0, payload, render_json(payload)
+
+    if args.command == "campaign-aggregator-activation-audit":
+        payload = await fetch_campaign_aggregator_activation_audit(campaign_id=args.campaign_id, limit=args.limit)
         return 0, payload, render_json(payload)
 
     if args.command == "risk-ledger-diagnosis":

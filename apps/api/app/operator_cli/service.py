@@ -95,6 +95,11 @@ from app.services.canonical_campaign_binding import (
     rollback_legacy_campaign_transition as _rollback_legacy_campaign_transition,
     transition_legacy_campaign_to_canonical_successor as _transition_legacy_campaign_to_canonical_successor,
 )
+from app.services.capital_campaign_orchestration.aggregator_activation import (
+    execute_campaign_aggregator_activation as _execute_campaign_aggregator_activation,
+    fetch_campaign_aggregator_activation_audit as _fetch_campaign_aggregator_activation_audit,
+    inspect_campaign_aggregator_activation as _inspect_campaign_aggregator_activation,
+)
 from app.services.canonical_preview_package import (
     CanonicalPreviewPackageActivationRequest,
     CanonicalPreviewPackageAuthorizeRequest,
@@ -9892,6 +9897,57 @@ async def rollback_legacy_campaign_transition(
 async def fetch_legacy_campaign_transition_audit(*, legacy_campaign_id: UUID, limit: int = 20) -> dict[str, Any]:
     async with AsyncSessionLocal() as db:
         return await _fetch_legacy_campaign_transition_audit(db=db, legacy_campaign_id=legacy_campaign_id, limit=limit)
+
+
+async def inspect_campaign_aggregator_activation(*, campaign_id: UUID, campaign_version: int) -> dict[str, Any]:
+    async with AsyncSessionLocal() as db:
+        result = await _inspect_campaign_aggregator_activation(db=db, campaign_id=campaign_id, campaign_version=campaign_version)
+    return {
+        "ready": result.ready,
+        "blockers": result.blockers,
+        "checks": [{"code": item.code, "passed": item.passed, "detail": item.detail} for item in result.checks],
+        "snapshot": result.snapshot,
+    }
+
+
+async def execute_campaign_aggregator_activation(
+    *,
+    campaign_id: UUID,
+    campaign_version: int,
+    actor: str,
+    reason: str,
+    idempotency_key: str,
+    confirm: bool,
+) -> dict[str, Any]:
+    async with AsyncSessionLocal() as db:
+        result = await _execute_campaign_aggregator_activation(
+            db=db,
+            campaign_id=campaign_id,
+            campaign_version=campaign_version,
+            actor=actor,
+            reason=reason,
+            idempotency_key=idempotency_key,
+            confirm=confirm,
+        )
+    return {
+        "changed": result.changed,
+        "idempotent": result.idempotent,
+        "audit_created": result.audit_created,
+        "before": result.before,
+        "after": result.after,
+        "readiness": {
+            "ready": result.readiness.ready,
+            "blockers": result.readiness.blockers,
+            "checks": [{"code": item.code, "passed": item.passed, "detail": item.detail} for item in result.readiness.checks],
+            "snapshot": result.readiness.snapshot,
+        },
+    }
+
+
+async def fetch_campaign_aggregator_activation_audit(*, campaign_id: UUID, limit: int = 20) -> dict[str, Any]:
+    async with AsyncSessionLocal() as db:
+        records = await _fetch_campaign_aggregator_activation_audit(db=db, campaign_id=campaign_id, limit=limit)
+    return {"campaign_id": str(campaign_id), "records": records}
 
 
 async def canonical_proving_account_transition_preview(
