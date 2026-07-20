@@ -749,6 +749,11 @@ async def _attempt_automatic_ready_package_creation(
         sizing_trace = selected_decision.get("sizing_trace") if isinstance(selected_decision.get("sizing_trace"), dict) else {}
         final_amount = _coerce_decimal(sizing_trace.get("final_amount"))
         candle_close_time = _as_utc_iso(candle.get("close_time"))
+        # A close liquidates an already-bounded position at prevailing market
+        # value -- it is not a new proposed order and is not expected to
+        # equal the original $5 entry amount exactly, so the canonical-amount
+        # bound below only applies to new entries.
+        is_close_action = "CLOSE_POSITION_PROPOSED" in {proposed_action, decision_kind}
 
         skip_reason = None
         if campaign_id is None or campaign_version is None:
@@ -757,7 +762,10 @@ async def _attempt_automatic_ready_package_creation(
             skip_reason = "scope_not_supported"
         elif cycle.termination_stage in {"hold_no_package_created", "failed_closed"}:
             skip_reason = f"termination_stage_{cycle.termination_stage}"
-        elif proposed_action not in {"OPEN_POSITION_PROPOSED", "BUY", "OPEN_POSITION"} and decision_kind not in {"OPEN_POSITION_PROPOSED", "BUY", "OPEN_POSITION"}:
+        elif (
+            proposed_action not in {"OPEN_POSITION_PROPOSED", "BUY", "OPEN_POSITION", "CLOSE_POSITION_PROPOSED"}
+            and decision_kind not in {"OPEN_POSITION_PROPOSED", "BUY", "OPEN_POSITION", "CLOSE_POSITION_PROPOSED"}
+        ):
             skip_reason = "non_executable_action"
         elif decision_record_id is None:
             skip_reason = "missing_decision_record_id"
@@ -765,7 +773,7 @@ async def _attempt_automatic_ready_package_creation(
             skip_reason = "stale_market_data"
         elif risk_verdict != "ALLOW":
             skip_reason = "risk_not_permitted"
-        elif final_amount != _CANONICAL_READY_PACKAGE_AMOUNT:
+        elif not is_close_action and final_amount != _CANONICAL_READY_PACKAGE_AMOUNT:
             skip_reason = "non_canonical_amount"
         elif candle_close_time is None:
             skip_reason = "missing_candle_close_time"

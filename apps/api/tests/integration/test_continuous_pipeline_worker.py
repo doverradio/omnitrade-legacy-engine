@@ -464,6 +464,121 @@ async def test_automatic_ready_package_executable_buy_creates_one_ready_package(
     assert calls[0].max_proposed_order_amount == Decimal("5")
 
 
+# Regression for production-readiness gap: a fully computed, risk-checked
+# CLOSE_POSITION_PROPOSED (position monitoring already resolves SELL votes
+# against an open position into this decision every cycle, per
+# resolve_action_position_transition + authoritative.py's candidate_kind
+# resolution) was previously discarded before a READY package was ever
+# attempted -- non_executable_action (only OPEN_* was accepted) and, even if
+# that were fixed, non_canonical_amount (a close's market-value proceeds are
+# not expected to equal the original $5 entry exactly). Together these meant
+# "manage" could compute an exit forever without it ever becoming visible for
+# the same human-gated authorize/activate/execute path BUY already reaches.
+@pytest.mark.asyncio
+async def test_automatic_ready_package_executable_close_creates_one_ready_package(monkeypatch: pytest.MonkeyPatch) -> None:
+    import app.services.orchestration.continuous_pipeline_worker as worker_module
+
+    cycle = _automatic_cycle(
+        proposed_action="CLOSE_POSITION_PROPOSED",
+        decision_kind="CLOSE_POSITION_PROPOSED",
+        final_amount="4.73",
+    )
+    runtime_campaign = SimpleNamespace(paper_account_id=uuid.uuid4())
+    profile = SimpleNamespace(id=uuid.uuid4())
+    package_id = str(uuid.uuid4())
+    calls: list[object] = []
+
+    async def _fake_create(*, db, request):
+        calls.append(request)
+        return {
+            "idempotent": False,
+            "package": {"package_id": package_id, "package_state": "READY"},
+            "readiness": {"ready": True, "package_state": "READY"},
+        }
+
+    monkeypatch.setattr(worker_module, "_load_cycle_by_id", _async_return(cycle))
+    monkeypatch.setattr(worker_module, "_has_active_ready_package_for_opportunity", _async_return(False))
+    monkeypatch.setattr(worker_module, "_has_active_proving_activation", _async_return(False))
+    monkeypatch.setattr(worker_module, "_has_open_live_order", _async_return(False))
+    monkeypatch.setattr(worker_module, "_has_unresolved_reconciliation", _async_return(False))
+    monkeypatch.setattr(worker_module, "_load_runtime_campaign", _async_return(runtime_campaign))
+    monkeypatch.setattr(worker_module, "_load_live_trading_profile_for_paper_account", _async_return(profile))
+    monkeypatch.setattr(worker_module, "create_canonical_preview_package", _fake_create)
+
+    await worker_module._attempt_automatic_ready_package_creation(db=object(), orchestration_payload=_automatic_payload(cycle))
+
+    assert len(calls) == 1
+
+
+@pytest.mark.asyncio
+async def test_automatic_ready_package_close_still_blocked_by_risk_veto(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Widening the accepted action set to include closes must not create a
+    risk-engine bypass -- a vetoed close is skipped exactly like a vetoed
+    BUY."""
+    import app.services.orchestration.continuous_pipeline_worker as worker_module
+
+    cycle = _automatic_cycle(
+        proposed_action="CLOSE_POSITION_PROPOSED",
+        decision_kind="CLOSE_POSITION_PROPOSED",
+        final_amount="4.73",
+        risk_verdict="VETO",
+    )
+
+    create_calls = {"count": 0}
+
+    async def _fake_create(*, db, request):
+        create_calls["count"] += 1
+        return {
+            "idempotent": False,
+            "package": {"package_id": str(uuid.uuid4()), "package_state": "READY"},
+            "readiness": {"ready": True, "package_state": "READY"},
+        }
+
+    caplog.set_level(logging.INFO)
+    monkeypatch.setattr(worker_module, "_load_cycle_by_id", _async_return(cycle))
+    monkeypatch.setattr(worker_module, "create_canonical_preview_package", _fake_create)
+
+    await worker_module._attempt_automatic_ready_package_creation(db=object(), orchestration_payload=_automatic_payload(cycle))
+
+    assert create_calls["count"] == 0
+    assert "reason=risk_not_permitted" in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_automatic_ready_package_buy_still_requires_exact_canonical_amount(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Regression: the canonical $5 bound must still apply to new entries --
+    only closes (which liquidate an already-bounded position at prevailing
+    market value) are exempt from the exact-amount match."""
+    import app.services.orchestration.continuous_pipeline_worker as worker_module
+
+    cycle = _automatic_cycle(final_amount="4.50")
+
+    create_calls = {"count": 0}
+
+    async def _fake_create(*, db, request):
+        create_calls["count"] += 1
+        return {
+            "idempotent": False,
+            "package": {"package_id": str(uuid.uuid4()), "package_state": "READY"},
+            "readiness": {"ready": True, "package_state": "READY"},
+        }
+
+    caplog.set_level(logging.INFO)
+    monkeypatch.setattr(worker_module, "_load_cycle_by_id", _async_return(cycle))
+    monkeypatch.setattr(worker_module, "create_canonical_preview_package", _fake_create)
+
+    await worker_module._attempt_automatic_ready_package_creation(db=object(), orchestration_payload=_automatic_payload(cycle))
+
+    assert create_calls["count"] == 0
+    assert "reason=non_canonical_amount" in caplog.text
+
+
 @pytest.mark.asyncio
 async def test_automatic_ready_package_replayed_identical_opportunity_returns_same_package(monkeypatch: pytest.MonkeyPatch) -> None:
     import app.services.orchestration.continuous_pipeline_worker as worker_module
