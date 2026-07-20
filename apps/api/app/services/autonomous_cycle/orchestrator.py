@@ -1092,7 +1092,10 @@ def _evaluate_mandate_scope(
     normalized_product = normalize_product_id(product_id)
     if normalized_product not in {item.upper() for item in version.allowed_products}:
         return MANDATE_AUTHORIZATION_REJECTED, "product_not_allowed"
-    if action not in {item.upper() for item in version.allowed_order_sides}:
+    # HOLD submits no exchange order -- there is no "side" to authorize.
+    # _evaluate_risk() already exempts HOLD from risk evaluation for the same
+    # reason (reason_code="hold_action"); this mirrors that exemption here.
+    if action != "HOLD" and action not in {item.upper() for item in version.allowed_order_sides}:
         return MANDATE_AUTHORIZATION_REJECTED, "side_not_allowed"
     if strategy_version != "forced" and strategy_version not in set(version.allowed_strategy_versions):
         return MANDATE_AUTHORIZATION_REJECTED, "strategy_version_not_allowed"

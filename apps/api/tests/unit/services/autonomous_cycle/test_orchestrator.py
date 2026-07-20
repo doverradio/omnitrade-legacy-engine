@@ -727,6 +727,31 @@ async def test_hold_proposal_does_not_generate_preview(monkeypatch: pytest.Monke
 
 
 @pytest.mark.asyncio
+async def test_hold_completes_end_to_end_even_when_hold_absent_from_allowed_order_sides(monkeypatch: pytest.MonkeyPatch) -> None:
+    # Regression for the exact production defect: a real mandate version
+    # configured with only BUY/SELL in allowed_order_sides (no "HOLD" entry)
+    # must still let a HOLD cycle complete with mandate_verdict AUTHORIZED,
+    # not REJECTED/side_not_allowed.
+    db = _FakeDb()
+    mandate = _mandate()
+    version = _version(allowed_order_sides=["BUY", "SELL"])
+    db.connection = SimpleNamespace(last_readiness_verdict="READY_FOR_PREVIEW", provider="kraken_spot", environment="production")
+
+    _patch_happy_path(monkeypatch, mandate, version, action="HOLD", risk_verdict="NOT_EVALUATED")
+
+    result = await run_autonomous_preview_cycle(
+        db=db,
+        request=AutonomousCycleRequest(mandate_id=mandate.mandate_id, actor="operator:owner", forced_action="HOLD", idempotency_seed="hold-no-side-2"),
+    )
+
+    assert result.state == "COMPLETE"
+    assert result.proposed_action == "HOLD"
+    assert result.diagnostics.termination_stage != "mandate_evaluation"
+    assert result.diagnostics.failure_reason != "side_not_allowed"
+    assert result.preview_id is None
+
+
+@pytest.mark.asyncio
 async def test_sell_proposal_generates_preview(monkeypatch: pytest.MonkeyPatch) -> None:
     db = _FakeDb()
     mandate = _mandate()
@@ -1228,6 +1253,82 @@ def test_mandate_scope_accepts_exact_canonical_identity_membership() -> None:
 
     assert verdict == "AUTHORIZED"
     assert reason == "authorized_under_active_mandate"
+
+
+def test_mandate_scope_buy_authorized_when_buy_allowed() -> None:
+    version = _version(allowed_order_sides=["BUY", "SELL"])
+    runtime_identity = build_strategy_identity(slug="ma_crossover", module_version="1.0.0")
+
+    verdict, reason = _evaluate_mandate_scope(
+        version=version, product_id="BTC-USD", action="BUY", strategy_version=runtime_identity
+    )
+
+    assert verdict == "AUTHORIZED"
+    assert reason == "authorized_under_active_mandate"
+
+
+def test_mandate_scope_sell_authorized_when_sell_allowed() -> None:
+    version = _version(allowed_order_sides=["BUY", "SELL"])
+    runtime_identity = build_strategy_identity(slug="ma_crossover", module_version="1.0.0")
+
+    verdict, reason = _evaluate_mandate_scope(
+        version=version, product_id="BTC-USD", action="SELL", strategy_version=runtime_identity
+    )
+
+    assert verdict == "AUTHORIZED"
+    assert reason == "authorized_under_active_mandate"
+
+
+def test_mandate_scope_hold_never_fails_side_authorization_even_when_absent_from_allowed_sides() -> None:
+    # HOLD deliberately excluded from allowed_order_sides -- must still pass,
+    # since HOLD submits no order and there is no "side" to authorize.
+    version = _version(allowed_order_sides=["BUY", "SELL"])
+    runtime_identity = build_strategy_identity(slug="ma_crossover", module_version="1.0.0")
+
+    verdict, reason = _evaluate_mandate_scope(
+        version=version, product_id="BTC-USD", action="HOLD", strategy_version=runtime_identity
+    )
+
+    assert verdict == "AUTHORIZED"
+    assert reason == "authorized_under_active_mandate"
+
+
+def test_mandate_scope_hold_authorized_even_with_empty_allowed_sides_representation() -> None:
+    # Regression for the exact production defect: a mandate version whose
+    # allowed_order_sides never listed "HOLD" at all must not block HOLD.
+    version = _version(allowed_order_sides=["BUY"])
+    runtime_identity = build_strategy_identity(slug="ma_crossover", module_version="1.0.0")
+
+    verdict, reason = _evaluate_mandate_scope(
+        version=version, product_id="BTC-USD", action="HOLD", strategy_version=runtime_identity
+    )
+
+    assert verdict == "AUTHORIZED"
+    assert reason == "authorized_under_active_mandate"
+
+
+def test_mandate_scope_unauthorized_buy_still_rejected() -> None:
+    version = _version(allowed_order_sides=["SELL"])
+    runtime_identity = build_strategy_identity(slug="ma_crossover", module_version="1.0.0")
+
+    verdict, reason = _evaluate_mandate_scope(
+        version=version, product_id="BTC-USD", action="BUY", strategy_version=runtime_identity
+    )
+
+    assert verdict == "REJECTED"
+    assert reason == "side_not_allowed"
+
+
+def test_mandate_scope_unauthorized_sell_still_rejected() -> None:
+    version = _version(allowed_order_sides=["BUY"])
+    runtime_identity = build_strategy_identity(slug="ma_crossover", module_version="1.0.0")
+
+    verdict, reason = _evaluate_mandate_scope(
+        version=version, product_id="BTC-USD", action="SELL", strategy_version=runtime_identity
+    )
+
+    assert verdict == "REJECTED"
+    assert reason == "side_not_allowed"
 
 
 @pytest.mark.asyncio
