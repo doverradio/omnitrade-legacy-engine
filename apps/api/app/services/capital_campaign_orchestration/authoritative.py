@@ -745,11 +745,27 @@ async def load_strategy_aggregate_evidence(
     ):
         return None, "decision_snapshot_aggregate_mismatch"
 
+    # Scorecard enrichment is best-effort and must never leave the caller's
+    # transaction unusable: this read runs in its own savepoint so that any
+    # failure here -- of any kind, including a database-level error -- rolls
+    # back only this savepoint (never the caller's ambient transaction, and
+    # never any work already flushed before this pure-read call began) and
+    # is logged rather than silently absorbed. Without the savepoint, a
+    # failure here left the session's underlying transaction invalid for
+    # every subsequent statement on it, including ones with no relation to
+    # scorecards at all (e.g. the next idempotency lookup in campaign
+    # orchestration), surfacing there as an unexplained PendingRollbackError.
     scorecard_by_slug: dict[str, Any] = {}
     try:
-        scorecards = await fetch_strategy_scorecards(db=db, provider=provider, product_id=product_id, interval=interval)
-        scorecard_by_slug = {item.strategy_slug: item for item in scorecards}
+        async with db.begin_nested():
+            scorecards = await fetch_strategy_scorecards(db=db, provider=provider, product_id=product_id, interval=interval)
+            scorecard_by_slug = {item.strategy_slug: item for item in scorecards}
     except Exception:
+        logger.warning(
+            "strategy_scorecard_fetch_failed_during_replay roster_run_id=%s campaign_id=%s candle_close=%s",
+            roster_run_id, campaign_id, candle_close_time.isoformat(),
+            exc_info=True,
+        )
         scorecard_by_slug = {}
 
     evidence = _build_aggregate_evidence_dict(
@@ -849,12 +865,22 @@ async def resolve_or_create_strategy_aggregate_evidence(
         )
         return cached_evidence, None
 
+    # Same isolation as the cache-hit path above: scorecard fetch failure is a
+    # deliberate, governed data-quality veto signal (data_quality_failed),
+    # never a reason to leave the ambient transaction unusable for the writes
+    # that follow.
     data_quality_failed = False
     scorecard_by_slug: dict[str, Any] = {}
     try:
-        scorecards = await fetch_strategy_scorecards(db=db, provider=provider, product_id=product_id, interval=interval)
-        scorecard_by_slug = {item.strategy_slug: item for item in scorecards}
+        async with db.begin_nested():
+            scorecards = await fetch_strategy_scorecards(db=db, provider=provider, product_id=product_id, interval=interval)
+            scorecard_by_slug = {item.strategy_slug: item for item in scorecards}
     except Exception:
+        logger.warning(
+            "strategy_scorecard_fetch_failed roster_run_id=%s campaign_id=%s candle_close=%s",
+            roster_run_id, campaign_id, candle_close_time.isoformat(),
+            exc_info=True,
+        )
         data_quality_failed = True
 
     proposal_inputs: list[StrategyProposalInput] = []

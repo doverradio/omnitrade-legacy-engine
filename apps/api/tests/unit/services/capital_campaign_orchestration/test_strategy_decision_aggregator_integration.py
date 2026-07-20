@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import inspect
+import logging
 import uuid
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
@@ -638,3 +639,153 @@ async def test_exact_roster_run_must_exist_before_composition_for_aggregate_to_r
             ),
             distribution_policy=CampaignProfitDistributionPolicy(reinvestment_percentage=Decimal("100")),
         )
+
+
+# Regression for the production PendingRollbackError incident:
+# autonomous_cycle_triggered (replayed) -> strategy roster replayed ->
+# strategy_aggregate_skipped reason=idempotent_replay -> campaign
+# orchestration failed at service.py:436 with PendingRollbackError. The true
+# fault was not line 436 -- it was the scorecard-enrichment fetch inside the
+# pure-read idempotent-replay path (load_strategy_aggregate_evidence),
+# which caught any exception and silently continued without rolling back,
+# leaving the session's ambient transaction invalid for the very next
+# statement on it. These tests reproduce that failure shape and prove the
+# begin_nested() savepoint isolates it.
+@pytest.mark.asyncio
+async def test_scorecard_fetch_failure_during_idempotent_replay_recovers_and_stays_idempotent(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    _patch_flat_position(monkeypatch)
+    async with _real_session() as session:
+        await _seed_roster_run_and_proposals(
+            session, actions={"ma_crossover": "BUY", "momentum": "BUY", "breakout": "BUY"}
+        )
+
+        # First call: normal fresh computation (cache miss), scorecards healthy.
+        _patch_no_scorecards(monkeypatch)
+        first_evidence, first_reason = await _call_aggregator(session)
+        assert first_reason is None
+        assert first_evidence is not None
+
+        # Second call: identical scope -> pure-read idempotent-replay path
+        # (production's "strategy_aggregate_skipped reason=idempotent_replay"),
+        # but scorecard enrichment for the replay fails.
+        async def _raise_scorecards(**_kwargs):
+            raise RuntimeError("simulated scorecard fetch failure")
+
+        monkeypatch.setattr(authoritative, "fetch_strategy_scorecards", _raise_scorecards)
+        caplog.set_level(logging.WARNING)
+
+        second_evidence, second_reason = await _call_aggregator(session)
+
+        # Replay still succeeds and is still the same decision -- idempotency
+        # is preserved even though scorecard enrichment failed mid-replay.
+        assert second_reason is None
+        assert second_evidence is not None
+        assert second_evidence["action"] == first_evidence["action"]
+        assert (
+            second_evidence["source_identity"]["aggregate_decision_id"]
+            == first_evidence["source_identity"]["aggregate_decision_id"]
+        )
+
+        # The original exception is observable, not silently swallowed.
+        matching = [r for r in caplog.records if r.getMessage().startswith("strategy_scorecard_fetch_failed_during_replay")]
+        assert len(matching) == 1
+        assert matching[0].exc_info is not None
+        assert str(matching[0].exc_info[1]) == "simulated scorecard fetch failure"
+
+        # No duplicate aggregate/decision rows were created by the replay attempt.
+        aggregate_rows = (await session.execute(StrategyAggregateDecision.__table__.select())).fetchall()
+        assert len(aggregate_rows) == 1
+        decision_rows = (await session.execute(DecisionRecord.__table__.select())).fetchall()
+        assert len(decision_rows) == 1
+
+        # The session is still usable for an unrelated query afterward -- this
+        # is the exact failure shape production hit one statement later, at
+        # capital_campaign_orchestration/service.py:436's AutonomousCycleRun
+        # idempotency lookup (a query against a different table entirely). A
+        # PendingRollbackError here is exactly what the fix must prevent.
+        parameter_sets_after_failure = (await session.execute(ParameterSet.__table__.select())).fetchall()
+        assert isinstance(parameter_sets_after_failure, list)
+
+        # A subsequent replay ("next polling cycle") on the same session, with
+        # scorecards healthy again, is unaffected -- this cycle's failure did
+        # not poison the one after it.
+        _patch_no_scorecards(monkeypatch)
+        third_evidence, third_reason = await _call_aggregator(session)
+        assert third_reason is None
+        assert third_evidence["action"] == first_evidence["action"]
+        assert (
+            third_evidence["source_identity"]["aggregate_decision_id"]
+            == first_evidence["source_identity"]["aggregate_decision_id"]
+        )
+        aggregate_rows_final = (await session.execute(StrategyAggregateDecision.__table__.select())).fetchall()
+        assert len(aggregate_rows_final) == 1
+
+
+@pytest.mark.asyncio
+async def test_scorecard_fetch_failure_during_fresh_computation_triggers_governed_veto_not_a_crash(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Same defect, the other call site: a scorecard-fetch failure on a fresh
+    (non-replay) computation must still isolate cleanly via its own savepoint,
+    be logged, and fall through to the existing governed data-quality veto
+    (fail-closed HOLD) rather than leaving the transaction unusable."""
+    _patch_flat_position(monkeypatch)
+    caplog.set_level(logging.WARNING)
+
+    async def _raise_scorecards(**_kwargs):
+        raise RuntimeError("simulated scorecard fetch failure")
+
+    monkeypatch.setattr(authoritative, "fetch_strategy_scorecards", _raise_scorecards)
+
+    async with _real_session() as session:
+        await _seed_roster_run_and_proposals(
+            session, actions={"ma_crossover": "BUY", "momentum": "BUY", "breakout": "BUY"}
+        )
+
+        evidence, reason = await _call_aggregator(session)
+
+        assert reason is None
+        assert evidence is not None
+        assert evidence["action"] == "HOLD"
+
+        matching = [r for r in caplog.records if r.getMessage().startswith("strategy_scorecard_fetch_failed roster_run_id=")]
+        assert len(matching) == 1
+        assert matching[0].exc_info is not None
+
+        # Exactly one aggregate/decision record was persisted for this veto --
+        # not zero (silently dropped) and not more than one (duplicated).
+        aggregate_rows = (await session.execute(StrategyAggregateDecision.__table__.select())).fetchall()
+        assert len(aggregate_rows) == 1
+
+        # The session recovered enough to serve an unrelated query afterward.
+        parameter_sets_after_failure = (await session.execute(ParameterSet.__table__.select())).fetchall()
+        assert isinstance(parameter_sets_after_failure, list)
+
+
+@pytest.mark.asyncio
+async def test_clean_idempotent_replay_without_error_remains_deterministic(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Control case: no fault injected. Repeated replay of the same scope is
+    byte-identical and creates no duplicate rows -- proves the savepoint
+    added around the healthy path changes nothing about ordinary behavior."""
+    _patch_flat_position(monkeypatch)
+    _patch_no_scorecards(monkeypatch)
+    async with _real_session() as session:
+        await _seed_roster_run_and_proposals(
+            session, actions={"ma_crossover": "BUY", "momentum": "BUY", "breakout": "BUY"}
+        )
+
+        first_evidence, first_reason = await _call_aggregator(session)
+        second_evidence, second_reason = await _call_aggregator(session)
+        third_evidence, third_reason = await _call_aggregator(session)
+
+        assert first_reason is second_reason is third_reason is None
+        for evidence in (first_evidence, second_evidence, third_evidence):
+            assert evidence["action"] == first_evidence["action"]
+            assert evidence["source_identity"]["aggregate_decision_id"] == first_evidence["source_identity"]["aggregate_decision_id"]
+            assert evidence["source_identity"]["decision_record_id"] == first_evidence["source_identity"]["decision_record_id"]
+            assert evidence["aggregate_evidence"]["eligible_strategy_count"] == first_evidence["aggregate_evidence"]["eligible_strategy_count"]
+
+        aggregate_rows = (await session.execute(StrategyAggregateDecision.__table__.select())).fetchall()
+        assert len(aggregate_rows) == 1
