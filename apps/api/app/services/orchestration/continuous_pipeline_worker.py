@@ -682,7 +682,20 @@ async def _has_active_ready_package_for_opportunity(*, db: AsyncSession, decisio
     return row is not None
 
 
-async def _has_active_proving_activation(*, db: AsyncSession, campaign_id: uuid.UUID, campaign_version: int, provider: str, environment: str, product: str) -> bool:
+async def _has_active_proving_activation(
+    *, db: AsyncSession, campaign_id: uuid.UUID, campaign_version: int, provider: str, environment: str, product: str, now: datetime
+) -> bool:
+    # activation_state alone is not sufficient: nothing in this codebase ever
+    # transitions a CanonicalProvingActivation row to EXPIRED/COMPLETED once
+    # its bounded window has elapsed (see canonical_preview_package.py -- only
+    # pause/revoke are ever written), so a row can sit at activation_state=
+    # 'ACTIVE' in the database indefinitely after its expires_at has passed.
+    # The rest of the codebase already treats an activation as usable only
+    # when BOTH conditions hold (operator_cli/service.py::_activation_is_active,
+    # live_crypto_orders.py's order-submission gate) -- this check must match
+    # that same convention, or a long-expired activation from an earlier
+    # bounded proving/commissioning run permanently blocks all future
+    # automatic ready-package creation for this scope.
     row = await db.scalar(
         select(CanonicalProvingActivation.activation_id)
         .where(CanonicalProvingActivation.campaign_id == campaign_id)
@@ -691,6 +704,7 @@ async def _has_active_proving_activation(*, db: AsyncSession, campaign_id: uuid.
         .where(CanonicalProvingActivation.environment == environment)
         .where(CanonicalProvingActivation.product == product)
         .where(CanonicalProvingActivation.activation_state.in_(_ACTIVE_PROVING_STATES))
+        .where(CanonicalProvingActivation.expires_at > now)
         .limit(1)
     )
     return row is not None
@@ -812,6 +826,7 @@ async def _attempt_automatic_ready_package_creation(
                 provider=provider,
                 environment=environment,
                 product=product,
+                now=datetime.now(timezone.utc),
             ):
                 skip_reason = "active_proving_activation_exists"
             elif await _has_open_live_order(db=db, provider=provider, environment=environment, product=product):

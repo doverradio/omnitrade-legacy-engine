@@ -2,7 +2,8 @@ from __future__ import annotations
 
 import logging
 import uuid
-from datetime import datetime, timezone
+from contextlib import contextmanager
+from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 from types import SimpleNamespace
 
@@ -2690,3 +2691,179 @@ async def test_run_forever_persists_startup_failure_event_without_timestamp_name
     assert failure_payload["started_at"] == startup_payload["started_at"]
     started_at = datetime.fromisoformat(failure_payload["started_at"])
     assert started_at.tzinfo is not None
+
+
+# --- _has_active_proving_activation: stale/expired activation lifecycle ---
+#
+# Production evidence: a BUY candidate that cleared the (now-fixed) economic
+# gate was still permanently blocked with active_proving_activation_exists.
+# Root cause -- confirmed by tracing every write site for CanonicalProvingActivation
+# (app/services/canonical_preview_package.py's activate/pause/revoke functions)
+# and every other read site (operator_cli/service.py::_activation_is_active,
+# live_crypto_orders.py's order-submission gate): activation_state is set to
+# 'ACTIVE' at creation and only ever transitions to PAUSED/REVOKED via explicit
+# operator action -- nothing anywhere transitions it to EXPIRED/COMPLETED once
+# its bounded expires_at window elapses (activation windows here are typically
+# minutes, e.g. approval_event renewals use now + 5 minutes). Every OTHER read
+# site in the codebase already guards against this by checking BOTH
+# activation_state == 'ACTIVE' AND expires_at > now; _has_active_proving_activation
+# was the one place that checked activation_state alone, so a long-expired
+# activation left over from an earlier bounded proving/commissioning run
+# permanently blocked all future automatic ready-package creation for that
+# scope. These tests exercise the real SQL query (not a mock) against a real
+# database to prove the fix actually filters at the query level.
+
+
+def _install_sqlite_uuid_compiler() -> None:
+    from sqlalchemy.dialects.postgresql import UUID as PG_UUID
+    from sqlalchemy.ext.compiler import compiles
+
+    @compiles(PG_UUID, "sqlite")
+    def _compile_uuid_sqlite(element, compiler, **kw) -> str:  # noqa: ANN001
+        return "CHAR(36)"
+
+
+_install_sqlite_uuid_compiler()
+
+
+class _AwaitableActivationSession:
+    """Minimal AsyncSession-shaped adapter over a real synchronous ORM Session,
+    scoped to exactly what _has_active_proving_activation needs (db.scalar)."""
+
+    def __init__(self, session) -> None:  # noqa: ANN001
+        self._session = session
+
+    async def scalar(self, statement):
+        return self._session.scalar(statement)
+
+
+@contextmanager
+def _proving_activation_sqlite_session():
+    from sqlalchemy import create_engine, text
+    from sqlalchemy.orm import Session
+    from sqlalchemy.pool import StaticPool
+    from sqlalchemy.schema import DefaultClause
+    from sqlalchemy.sql.elements import TextClause
+
+    from app.models.canonical_proving_activation import CanonicalProvingActivation
+
+    engine = create_engine("sqlite:///:memory:", poolclass=StaticPool)
+    table = CanonicalProvingActivation.__table__
+    # Postgres-only server defaults (gen_random_uuid(), now()) aren't valid
+    # SQLite DEFAULT-clause syntax without parens; every column is supplied
+    # explicitly on insert below so the default is never actually invoked,
+    # but SQLite still parses it at CREATE TABLE time.
+    for column in table.columns:
+        default = column.server_default
+        if isinstance(default, DefaultClause) and isinstance(default.arg, TextClause):
+            raw = default.arg.text.strip()
+            if raw.endswith("()") and not raw.startswith("("):
+                column.server_default = DefaultClause(text(f"({raw})"))
+    CanonicalProvingActivation.metadata.create_all(engine, tables=[table])
+    try:
+        with Session(engine) as session:
+            yield session, _AwaitableActivationSession(session)
+    finally:
+        engine.dispose()
+
+
+def _seed_proving_activation(session, *, activation_state: str, expires_at: datetime, **scope) -> None:  # noqa: ANN001
+    from app.models.canonical_proving_activation import CanonicalProvingActivation
+
+    session.add(
+        CanonicalProvingActivation(
+            activation_id=uuid.uuid4(),
+            package_id=uuid.uuid4(),
+            approval_event_id=uuid.uuid4(),
+            dry_run_live_crypto_order_id=uuid.uuid4(),
+            campaign_id=scope["campaign_id"],
+            campaign_version=scope["campaign_version"],
+            paper_account_id=uuid.uuid4(),
+            live_trading_profile_id=uuid.uuid4(),
+            provider=scope["provider"],
+            environment=scope["environment"],
+            product=scope["product"],
+            max_order_amount=Decimal("5"),
+            max_deployed_capital=Decimal("5"),
+            no_leverage=True,
+            activated_at=expires_at - timedelta(hours=1),
+            expires_at=expires_at,
+            activation_state=activation_state,
+            revoked_at=None,
+            paused_at=None,
+            invalidated_reason=None,
+            created_at=expires_at - timedelta(hours=1),
+            updated_at=expires_at - timedelta(hours=1),
+        )
+    )
+    session.commit()
+
+
+@pytest.mark.asyncio
+async def test_has_active_proving_activation_ignores_expired_row() -> None:
+    """The exact production defect: an ACTIVE-state row whose expires_at has
+    already passed must NOT count as an active proving activation -- it is
+    indistinguishable in the database from a genuinely current one unless
+    expires_at is checked, since nothing ever flips activation_state on
+    expiry."""
+    import app.services.orchestration.continuous_pipeline_worker as worker_module
+
+    scope = dict(campaign_id=uuid.uuid4(), campaign_version=1, provider="kraken_spot", environment="production", product="BTC-USD")
+    now = datetime(2026, 7, 21, 12, 0, tzinfo=timezone.utc)
+
+    with _proving_activation_sqlite_session() as (raw_session, db):
+        _seed_proving_activation(raw_session, activation_state="ACTIVE", expires_at=now - timedelta(days=5), **scope)
+        result = await worker_module._has_active_proving_activation(db=db, now=now, **scope)
+
+    assert result is False
+
+
+@pytest.mark.asyncio
+async def test_has_active_proving_activation_honors_unexpired_row() -> None:
+    """A genuinely current ACTIVE activation (expires_at in the future) must
+    still block -- this is the safety behavior the fix must preserve."""
+    import app.services.orchestration.continuous_pipeline_worker as worker_module
+
+    scope = dict(campaign_id=uuid.uuid4(), campaign_version=1, provider="kraken_spot", environment="production", product="BTC-USD")
+    now = datetime(2026, 7, 21, 12, 0, tzinfo=timezone.utc)
+
+    with _proving_activation_sqlite_session() as (raw_session, db):
+        _seed_proving_activation(raw_session, activation_state="ACTIVE", expires_at=now + timedelta(minutes=5), **scope)
+        result = await worker_module._has_active_proving_activation(db=db, now=now, **scope)
+
+    assert result is True
+
+
+@pytest.mark.asyncio
+async def test_has_active_proving_activation_ignores_revoked_row_regardless_of_expiry() -> None:
+    """A REVOKED activation must never block, even if it hasn't technically
+    reached its expires_at yet -- fail-closed behavior must not be confused
+    with "block forever regardless of operator action"."""
+    import app.services.orchestration.continuous_pipeline_worker as worker_module
+
+    scope = dict(campaign_id=uuid.uuid4(), campaign_version=1, provider="kraken_spot", environment="production", product="BTC-USD")
+    now = datetime(2026, 7, 21, 12, 0, tzinfo=timezone.utc)
+
+    with _proving_activation_sqlite_session() as (raw_session, db):
+        _seed_proving_activation(raw_session, activation_state="REVOKED", expires_at=now + timedelta(minutes=5), **scope)
+        result = await worker_module._has_active_proving_activation(db=db, now=now, **scope)
+
+    assert result is False
+
+
+@pytest.mark.asyncio
+async def test_has_active_proving_activation_scopes_by_campaign_and_market() -> None:
+    """An unexpired ACTIVE activation for a DIFFERENT campaign/version/market
+    scope must not block this campaign's package creation -- the fix must not
+    have widened the match beyond the original scope filters."""
+    import app.services.orchestration.continuous_pipeline_worker as worker_module
+
+    now = datetime(2026, 7, 21, 12, 0, tzinfo=timezone.utc)
+    other_scope = dict(campaign_id=uuid.uuid4(), campaign_version=1, provider="kraken_spot", environment="production", product="BTC-USD")
+    query_scope = dict(campaign_id=uuid.uuid4(), campaign_version=1, provider="kraken_spot", environment="production", product="BTC-USD")
+
+    with _proving_activation_sqlite_session() as (raw_session, db):
+        _seed_proving_activation(raw_session, activation_state="ACTIVE", expires_at=now + timedelta(minutes=5), **other_scope)
+        result = await worker_module._has_active_proving_activation(db=db, now=now, **query_scope)
+
+    assert result is False
