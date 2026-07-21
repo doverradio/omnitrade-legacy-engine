@@ -1528,6 +1528,116 @@ async def test_repeated_research_failures_do_not_corrupt_worker_session(monkeypa
     assert db.snapshot_writes == 2
 
 
+# Regression for production incident: strategy_aggregate_completed correctly
+# resolved a SELL-majority-no-position vote to HOLD, and several minutes
+# later a *different* substage -- the per-(strategy, asset) paper-execution
+# loop -- failed with PendingRollbackError all the way up to run_forever's
+# top-level "Pipeline orchestration cycle failed" handler, losing that
+# cycle's remaining paper-execution work. Root cause: each (strategy, asset)
+# iteration is its own transactional unit delimited by a per-iteration
+# db.commit(), but nothing rolled back on failure -- an exception from
+# orchestrate_paper_signal_execution was caught and handled (log + audit),
+# but if it had already left the session invalid, every following statement
+# in that same iteration (ingest_decision_records, the audit-log add, or the
+# commit itself) failed too, and propagated completely uncaught out of
+# run_orchestration_cycle since no outer handler wrapped this loop.
+@pytest.mark.asyncio
+async def test_paper_execution_iteration_failure_rolls_back_and_cycle_fails_closed(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    db = _RecoveryAwareDB()
+    asset = _asset()
+    strategy = _strategy_row()
+    parameter_set = _parameter_set()
+    account = SimpleNamespace(id=uuid.uuid4())
+
+    async def _raising_orchestrate(*args, **kwargs):
+        db.failed_transaction = True
+        raise RuntimeError("simulated live-execution db failure")
+
+    import app.services.orchestration.continuous_pipeline_worker as worker_module
+
+    monkeypatch.setattr(worker_module, "run_ingestion_cycle", _fake_ingestion_cycle)
+    monkeypatch.setattr(worker_module, "ingest_decision_records", _fake_decision_ingestion)
+    monkeypatch.setattr(worker_module, "_load_decision_record_for_signal", _async_return(None))
+    monkeypatch.setattr(worker_module, "_produce_research_evidence", _async_return(None))
+    monkeypatch.setattr(worker_module, "_load_active_assets", _async_return([asset]))
+    monkeypatch.setattr(worker_module, "_load_active_strategies", _async_return([strategy]))
+    monkeypatch.setattr(worker_module, "_load_latest_parameter_set", _async_return(parameter_set))
+    monkeypatch.setattr(worker_module, "_load_latest_candles", _async_return(_candles(2)))
+    monkeypatch.setattr(worker_module, "_signal_exists", _async_return(False))
+    monkeypatch.setattr(worker_module, "_load_primary_account_by_asset_class", _async_return(account))
+    monkeypatch.setattr(worker_module, "orchestrate_paper_signal_execution", _raising_orchestrate)
+    monkeypatch.setattr(worker_module.strategy_registry, "get", lambda slug: _FixedStrategy("buy"))
+    monkeypatch.setattr(worker_module, "run_deterministic_research_cycle_if_due", _async_return(_not_due_research_result()))
+    monkeypatch.setattr(worker_module, "capture_system_intelligence_snapshot_if_due", _async_return(None))
+
+    caplog.set_level(logging.INFO)
+
+    stats = await run_orchestration_cycle(db=db, client=object(), config=_config())
+
+    # The cycle completed (did not raise / did not surface PendingRollbackError
+    # out of run_orchestration_cycle) and failed this one iteration closed.
+    assert stats.signals_created == 1
+    assert stats.executions_attempted == 1
+    assert db.rollbacks >= 1
+    # _rollback_active_session cleared the poisoned flag -- the session is
+    # usable again, exactly as it must be for later stages/cycles.
+    assert db.failed_transaction is False
+
+    assert "paper_execution_iteration_failed" in caplog.text
+    assert "stage=paper_execution_iteration" in caplog.text
+    assert "RuntimeError" in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_paper_execution_iteration_failure_does_not_poison_next_cycle(monkeypatch: pytest.MonkeyPatch) -> None:
+    db = _RecoveryAwareDB()
+    asset = _asset()
+    strategy = _strategy_row()
+    parameter_set = _parameter_set()
+    account = SimpleNamespace(id=uuid.uuid4())
+
+    call_count = {"value": 0}
+
+    async def _first_fails_then_succeeds(*args, **kwargs):
+        call_count["value"] += 1
+        if call_count["value"] == 1:
+            db.failed_transaction = True
+            raise RuntimeError("simulated live-execution db failure")
+        return SimpleNamespace(execution_status="executed")
+
+    import app.services.orchestration.continuous_pipeline_worker as worker_module
+
+    monkeypatch.setattr(worker_module, "run_ingestion_cycle", _fake_ingestion_cycle)
+    monkeypatch.setattr(worker_module, "ingest_decision_records", _fake_decision_ingestion)
+    monkeypatch.setattr(worker_module, "_load_decision_record_for_signal", _async_return(None))
+    monkeypatch.setattr(worker_module, "_produce_research_evidence", _async_return(None))
+    monkeypatch.setattr(worker_module, "_load_active_assets", _async_return([asset]))
+    monkeypatch.setattr(worker_module, "_load_active_strategies", _async_return([strategy]))
+    monkeypatch.setattr(worker_module, "_load_latest_parameter_set", _async_return(parameter_set))
+    monkeypatch.setattr(worker_module, "_load_latest_candles", _async_return(_candles(2)))
+    monkeypatch.setattr(worker_module, "_signal_exists", _async_return(False))
+    monkeypatch.setattr(worker_module, "_load_primary_account_by_asset_class", _async_return(account))
+    monkeypatch.setattr(worker_module, "orchestrate_paper_signal_execution", _first_fails_then_succeeds)
+    monkeypatch.setattr(worker_module.strategy_registry, "get", lambda slug: _FixedStrategy("buy"))
+    monkeypatch.setattr(worker_module, "run_deterministic_research_cycle_if_due", _async_return(_not_due_research_result()))
+    monkeypatch.setattr(worker_module, "capture_system_intelligence_snapshot_if_due", _async_return(None))
+
+    first_stats = await run_orchestration_cycle(db=db, client=object(), config=_config())
+    assert first_stats.signals_created == 1
+    assert first_stats.executions_attempted == 1
+    assert db.failed_transaction is False
+
+    # A later cycle -- reusing the same (in production, always fresh) session
+    # -- is unaffected by the earlier failure and completes successfully.
+    second_stats = await run_orchestration_cycle(db=db, client=object(), config=_config())
+    assert second_stats.signals_created == 1
+    assert second_stats.executions_attempted == 1
+    assert call_count["value"] == 2
+
+
 @pytest.mark.asyncio
 async def test_research_disabled_mode_leaves_non_research_work_intact(monkeypatch: pytest.MonkeyPatch) -> None:
     db = _FakeDB()

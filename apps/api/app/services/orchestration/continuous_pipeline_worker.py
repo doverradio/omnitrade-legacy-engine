@@ -1062,188 +1062,219 @@ async def run_orchestration_cycle(
             continue
 
         for asset in assets:
-            account = None
-            execution = None
-            candles = await _load_latest_candles(
-                db,
-                asset_id=asset.id,
-                interval=config.candle_interval,
-                limit=config.candle_lookback_limit,
-            )
-            if len(candles) < 2:
-                logger.info(
-                    "paper_execution_skip reason=insufficient_candles strategy_id=%s asset_id=%s candle_count=%s minimum_required=%s",
-                    strategy_row.id,
-                    asset.id,
-                    len(candles),
-                    2,
+            # Each (strategy, asset) pair is its own transactional unit,
+            # delimited by the db.commit() at the end of this block -- that
+            # existing per-iteration commit boundary is what owns this
+            # transaction, so it is also what must own the rollback on
+            # failure. Without this, any exception from ingest_decision_records,
+            # _load_decision_record_for_signal, _emit_execution_rejection_event,
+            # _produce_research_evidence, or the commit itself (including one
+            # triggered by a session already left invalid by the handled
+            # orchestrate_paper_signal_execution failure below) propagated
+            # completely uncaught out of run_orchestration_cycle -- surfacing
+            # only at the top-level "Pipeline orchestration cycle failed"
+            # handler, poisoning nothing else, but losing this cycle's
+            # remaining paper-execution work and leaving the transaction
+            # unrolled until the process-level catch-all called rollback
+            # implicitly by discarding the session.
+            strategy_id_value = strategy_row.id
+            asset_id_value = asset.id
+            signal_id_value: uuid.UUID | None = None
+            try:
+                account = None
+                execution = None
+                candles = await _load_latest_candles(
+                    db,
+                    asset_id=asset.id,
+                    interval=config.candle_interval,
+                    limit=config.candle_lookback_limit,
                 )
-                continue
+                if len(candles) < 2:
+                    logger.info(
+                        "paper_execution_skip reason=insufficient_candles strategy_id=%s asset_id=%s candle_count=%s minimum_required=%s",
+                        strategy_row.id,
+                        asset.id,
+                        len(candles),
+                        2,
+                    )
+                    continue
 
-            signal_time = candles[-1].open_time
-            exists = await _signal_exists(
-                db,
-                strategy_id=strategy_row.id,
-                parameter_set_id=parameter_set.id,
-                asset_id=asset.id,
-                signal_time=signal_time,
-            )
-            if exists:
-                logger.info(
-                    "paper_execution_skip reason=duplicate_existing_signal strategy_id=%s parameter_set_id=%s asset_id=%s signal_time=%s",
-                    strategy_row.id,
-                    parameter_set.id,
-                    asset.id,
-                    signal_time.isoformat(),
+                signal_time = candles[-1].open_time
+                exists = await _signal_exists(
+                    db,
+                    strategy_id=strategy_row.id,
+                    parameter_set_id=parameter_set.id,
+                    asset_id=asset.id,
+                    signal_time=signal_time,
                 )
-                continue
+                if exists:
+                    logger.info(
+                        "paper_execution_skip reason=duplicate_existing_signal strategy_id=%s parameter_set_id=%s asset_id=%s signal_time=%s",
+                        strategy_row.id,
+                        parameter_set.id,
+                        asset.id,
+                        signal_time.isoformat(),
+                    )
+                    continue
 
-            context = _to_strategy_context(
-                candles=candles,
-                asset=asset,
-                interval=config.candle_interval,
-                strategy_params=parameter_set.params,
-            )
-            generated = strategy_impl.generate_signal(context)
+                context = _to_strategy_context(
+                    candles=candles,
+                    asset=asset,
+                    interval=config.candle_interval,
+                    strategy_params=parameter_set.params,
+                )
+                generated = strategy_impl.generate_signal(context)
 
-            signal_model = SignalModel(
-                strategy_id=strategy_row.id,
-                parameter_set_id=parameter_set.id,
-                asset_id=asset.id,
-                signal_time=signal_time,
-                action=generated.action,
-                raw_strength=generated.strength,
-                ai_confidence=generated.strength,
-                regime_tag=None,
-                status="generated",
-            )
-            db.add(signal_model)
-            await db.flush()
+                signal_model = SignalModel(
+                    strategy_id=strategy_row.id,
+                    parameter_set_id=parameter_set.id,
+                    asset_id=asset.id,
+                    signal_time=signal_time,
+                    action=generated.action,
+                    raw_strength=generated.strength,
+                    ai_confidence=generated.strength,
+                    regime_tag=None,
+                    status="generated",
+                )
+                db.add(signal_model)
+                await db.flush()
+                signal_id_value = signal_model.id
 
-            signals_created += 1
+                signals_created += 1
 
-            if generated.action in {"buy", "sell"}:
-                execution_candidates += 1
-                account = await _load_primary_account_by_asset_class(db, asset_class=asset.asset_class)
-                if account is not None:
-                    executions_attempted += 1
-                    try:
-                        execution = await orchestrate_paper_signal_execution(
-                            db=db,
-                            request=SignalExecutionRequest(
-                                signal_id=signal_model.id,
-                                paper_account_id=account.id,
-                                asset_id=asset.id,
-                                side=generated.action,
-                                quantity=config.default_order_quantity,
-                                actor="orchestration_worker",
-                            ),
-                        )
-                    except Exception:
-                        executions_failed += 1
-                        logger.exception(
-                            "paper_execution_failed signal_id=%s asset_id=%s strategy_id=%s action=%s",
-                            signal_model.id,
-                            asset.id,
-                            strategy_row.id,
-                            generated.action,
-                        )
-                        db.add(
-                            AuditLog(
-                                actor="orchestration_worker",
-                                action="orchestration_candidate_failed",
-                                entity_type="signal",
-                                entity_id=signal_model.id,
-                                before_state={
-                                    "strategy_id": str(strategy_row.id),
-                                    "asset_id": str(asset.id),
-                                    "side": generated.action,
-                                },
-                                after_state={
-                                    "outcome": "FAILED",
-                                },
+                if generated.action in {"buy", "sell"}:
+                    execution_candidates += 1
+                    account = await _load_primary_account_by_asset_class(db, asset_class=asset.asset_class)
+                    if account is not None:
+                        executions_attempted += 1
+                        try:
+                            execution = await orchestrate_paper_signal_execution(
+                                db=db,
+                                request=SignalExecutionRequest(
+                                    signal_id=signal_model.id,
+                                    paper_account_id=account.id,
+                                    asset_id=asset.id,
+                                    side=generated.action,
+                                    quantity=config.default_order_quantity,
+                                    actor="orchestration_worker",
+                                ),
                             )
-                        )
-                    else:
-                        signal_model.status = _signal_status_from_execution_status(execution.execution_status)
-                        execution_outcome = getattr(
-                            execution,
-                            "outcome",
-                            "REJECTED"
-                            if execution.execution_status == "rejected"
-                            else "SKIPPED"
-                            if execution.execution_status == "duplicate"
-                            else "EXECUTED"
-                            if execution.execution_status in {"executed", "pending"}
-                            else "FAILED",
-                        )
-                        if execution_outcome == "REJECTED":
-                            executions_rejected += 1
-                        elif execution_outcome == "SKIPPED":
-                            executions_skipped += 1
-                        elif execution_outcome == "FAILED":
+                        except Exception:
                             executions_failed += 1
+                            logger.exception(
+                                "paper_execution_failed signal_id=%s asset_id=%s strategy_id=%s action=%s",
+                                signal_model.id,
+                                asset.id,
+                                strategy_row.id,
+                                generated.action,
+                            )
+                            db.add(
+                                AuditLog(
+                                    actor="orchestration_worker",
+                                    action="orchestration_candidate_failed",
+                                    entity_type="signal",
+                                    entity_id=signal_model.id,
+                                    before_state={
+                                        "strategy_id": str(strategy_row.id),
+                                        "asset_id": str(asset.id),
+                                        "side": generated.action,
+                                    },
+                                    after_state={
+                                        "outcome": "FAILED",
+                                    },
+                                )
+                            )
+                        else:
+                            signal_model.status = _signal_status_from_execution_status(execution.execution_status)
+                            execution_outcome = getattr(
+                                execution,
+                                "outcome",
+                                "REJECTED"
+                                if execution.execution_status == "rejected"
+                                else "SKIPPED"
+                                if execution.execution_status == "duplicate"
+                                else "EXECUTED"
+                                if execution.execution_status in {"executed", "pending"}
+                                else "FAILED",
+                            )
+                            if execution_outcome == "REJECTED":
+                                executions_rejected += 1
+                            elif execution_outcome == "SKIPPED":
+                                executions_skipped += 1
+                            elif execution_outcome == "FAILED":
+                                executions_failed += 1
+                    else:
+                        executions_skipped += 1
+                        logger.info(
+                            "paper_execution_skip reason=no_active_paper_account signal_id=%s action=%s status=%s account_id=%s",
+                            signal_model.id,
+                            generated.action,
+                            signal_model.status,
+                            None,
+                        )
+                        logger.warning(
+                            "No active paper account for asset_class=%s asset=%s; signal persisted without execution",
+                            asset.asset_class,
+                            asset.symbol,
+                        )
                 else:
                     executions_skipped += 1
                     logger.info(
-                        "paper_execution_skip reason=no_active_paper_account signal_id=%s action=%s status=%s account_id=%s",
+                        "paper_execution_skip reason=non_actionable_action signal_id=%s action=%s status=%s account_id=%s",
                         signal_model.id,
                         generated.action,
                         signal_model.status,
                         None,
                     )
-                    logger.warning(
-                        "No active paper account for asset_class=%s asset=%s; signal persisted without execution",
-                        asset.asset_class,
-                        asset.symbol,
-                    )
-            else:
-                executions_skipped += 1
-                logger.info(
-                    "paper_execution_skip reason=non_actionable_action signal_id=%s action=%s status=%s account_id=%s",
-                    signal_model.id,
-                    generated.action,
-                    signal_model.status,
-                    None,
-                )
 
-            decision_result = await ingest_decision_records(db=db, signal_ids=[signal_model.id])
-            decision_inserted_total += decision_result.inserted_records
+                decision_result = await ingest_decision_records(db=db, signal_ids=[signal_model.id])
+                decision_inserted_total += decision_result.inserted_records
 
-            decision_record = await _load_decision_record_for_signal(db=db, signal_id=signal_model.id)
-            if decision_record is not None:
-                if (
-                    account is not None
-                    and execution is not None
-                    and getattr(execution, "outcome", "REJECTED" if execution.execution_status == "rejected" else None) == "REJECTED"
-                    and getattr(execution, "reason_code", None) is not None
-                    and getattr(execution, "reason_text", None) is not None
-                ):
-                    await _emit_execution_rejection_event(
+                decision_record = await _load_decision_record_for_signal(db=db, signal_id=signal_model.id)
+                if decision_record is not None:
+                    if (
+                        account is not None
+                        and execution is not None
+                        and getattr(execution, "outcome", "REJECTED" if execution.execution_status == "rejected" else None) == "REJECTED"
+                        and getattr(execution, "reason_code", None) is not None
+                        and getattr(execution, "reason_text", None) is not None
+                    ):
+                        await _emit_execution_rejection_event(
+                            db=db,
+                            signal_id=signal_model.id,
+                            decision_record_id=decision_record.decision_id,
+                            asset=asset,
+                            side=generated.action,
+                            requested_quantity=config.default_order_quantity,
+                            execution_reason_code=execution.reason_code,
+                            execution_reason_text=execution.reason_text,
+                            execution_available_quantity=(
+                                None
+                                if getattr(execution, "reason_details", None) is None
+                                else str(
+                                    execution.reason_details.get("held_quantity")
+                                    or execution.reason_details.get("cash_balance")
+                                )
+                            ),
+                        )
+                    await _produce_research_evidence(
                         db=db,
-                        signal_id=signal_model.id,
-                        decision_record_id=decision_record.decision_id,
-                        asset=asset,
-                        side=generated.action,
-                        requested_quantity=config.default_order_quantity,
-                        execution_reason_code=execution.reason_code,
-                        execution_reason_text=execution.reason_text,
-                        execution_available_quantity=(
-                            None
-                            if getattr(execution, "reason_details", None) is None
-                            else str(
-                                execution.reason_details.get("held_quantity")
-                                or execution.reason_details.get("cash_balance")
-                            )
-                        ),
+                        decision_package_builder=decision_package_builder,
+                        decision_record=decision_record,
                     )
-                await _produce_research_evidence(
-                    db=db,
-                    decision_package_builder=decision_package_builder,
-                    decision_record=decision_record,
-                )
 
-            await db.commit()
+                await db.commit()
+            except Exception as exc:
+                await _rollback_active_session(db=db)
+                executions_failed += 1
+                logger.exception(
+                    "paper_execution_iteration_failed stage=paper_execution_iteration strategy_id=%s asset_id=%s signal_id=%s exception_type=%s",
+                    strategy_id_value,
+                    asset_id_value,
+                    signal_id_value,
+                    exc.__class__.__name__,
+                )
+                continue
 
     research_cycles_started = 0
     try:
