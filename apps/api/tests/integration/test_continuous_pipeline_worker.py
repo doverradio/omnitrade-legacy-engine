@@ -2728,13 +2728,17 @@ _install_sqlite_uuid_compiler()
 
 class _AwaitableActivationSession:
     """Minimal AsyncSession-shaped adapter over a real synchronous ORM Session,
-    scoped to exactly what _has_active_proving_activation needs (db.scalar)."""
+    scoped to exactly what _has_active_proving_activation and
+    _has_unresolved_reconciliation need (db.scalar, db.execute)."""
 
     def __init__(self, session) -> None:  # noqa: ANN001
         self._session = session
 
     async def scalar(self, statement):
         return self._session.scalar(statement)
+
+    async def execute(self, statement):
+        return self._session.execute(statement)
 
 
 @contextmanager
@@ -2867,3 +2871,226 @@ async def test_has_active_proving_activation_scopes_by_campaign_and_market() -> 
         result = await worker_module._has_active_proving_activation(db=db, now=now, **query_scope)
 
     assert result is False
+
+
+# --- _has_unresolved_reconciliation: diagnostic logging for the blocking gate ---
+#
+# Production evidence: with active_proving_activation_exists eliminated, the
+# worker now blocks on unresolved_reconciliation_exists with no reconciliation
+# ID, order ID, provider order ID, state, or timestamp in the logs -- pure
+# instrumentation task, business logic (which records count as "unresolved")
+# must not change. These tests exercise the real query against a real
+# database and assert on real log output, not mocks, so they would catch a
+# diagnostic query that silently drifted from the boolean gate's own query.
+
+
+def _install_sqlite_jsonb_compiler() -> None:
+    from sqlalchemy.dialects.postgresql import JSONB
+    from sqlalchemy.ext.compiler import compiles
+
+    @compiles(JSONB, "sqlite")
+    def _compile_jsonb_sqlite(element, compiler, **kw) -> str:  # noqa: ANN001
+        return "JSON"
+
+
+_install_sqlite_jsonb_compiler()
+
+
+def _fix_sqlite_server_defaults(table) -> None:  # noqa: ANN001
+    from sqlalchemy import text
+    from sqlalchemy.schema import DefaultClause
+    from sqlalchemy.sql.elements import TextClause
+
+    for column in table.columns:
+        default = column.server_default
+        if isinstance(default, DefaultClause) and isinstance(default.arg, TextClause):
+            raw = default.arg.text.strip().split("::", 1)[0]
+            if raw.endswith("()") and not raw.startswith("("):
+                raw = f"({raw})"
+            column.server_default = DefaultClause(text(raw))
+
+
+@contextmanager
+def _reconciliation_sqlite_session():
+    from sqlalchemy import create_engine
+    from sqlalchemy.orm import Session
+    from sqlalchemy.pool import StaticPool
+
+    from app.models.live_crypto_order import LiveCryptoOrder
+    from app.models.live_reconciliation_event import LiveReconciliationEvent
+
+    engine = create_engine("sqlite:///:memory:", poolclass=StaticPool)
+    tables = [LiveCryptoOrder.__table__, LiveReconciliationEvent.__table__]
+    for table in tables:
+        _fix_sqlite_server_defaults(table)
+    LiveCryptoOrder.metadata.create_all(engine, tables=tables)
+    try:
+        with Session(engine) as session:
+            yield session, _AwaitableActivationSession(session)
+    finally:
+        engine.dispose()
+
+
+def _seed_live_crypto_order(
+    session, *, live_crypto_order_id: uuid.UUID, provider: str, environment: str, product: str, provider_order_id: str | None, status: str = "PARTIALLY_FILLED"  # noqa: ANN001
+):
+    from app.models.live_crypto_order import LiveCryptoOrder
+
+    now = datetime(2026, 7, 21, 12, 0, tzinfo=timezone.utc)
+    session.add(
+        LiveCryptoOrder(
+            live_crypto_order_id=live_crypto_order_id,
+            crypto_order_preview_id=uuid.uuid4(),
+            exchange_connection_id=uuid.uuid4(),
+            provider=provider,
+            environment=environment,
+            product_id=product,
+            side="buy",
+            order_type="market",
+            requested_quote_size=Decimal("5"),
+            client_order_id=f"client-{live_crypto_order_id}",
+            status=status,
+            risk_event_id=None,
+            decision_record_id=None,
+            validation_run_id=None,
+            provider_order_id=provider_order_id,
+            provider_status="partially_filled",
+            submitted_at=now - timedelta(minutes=10),
+            acknowledged_at=now - timedelta(minutes=9),
+            filled_at=None,
+            cancelled_at=None,
+            failure_code=None,
+            failure_reason=None,
+            safe_provider_response={},
+            audit_correlation_id=uuid.uuid4(),
+            operator_confirmation_id=None,
+            created_at=now - timedelta(minutes=10),
+            updated_at=now - timedelta(minutes=10),
+        )
+    )
+    session.commit()
+
+
+def _seed_reconciliation_event(
+    session, *, live_crypto_order_id: uuid.UUID, reconciliation_status: str, provider_order_id: str | None, sequence_number: int = 1  # noqa: ANN001
+) -> uuid.UUID:
+    from app.models.live_reconciliation_event import LiveReconciliationEvent
+
+    now = datetime(2026, 7, 21, 12, 0, tzinfo=timezone.utc)
+    event_id = uuid.uuid4()
+    session.add(
+        LiveReconciliationEvent(
+            id=event_id,
+            idempotency_key=f"idem-{event_id}",
+            event_hash=f"hash-{event_id}",
+            live_trading_profile_id=uuid.uuid4(),
+            live_crypto_order_id=live_crypto_order_id,
+            capital_campaign_id=None,
+            source_execution_event_id=uuid.uuid4(),
+            source_execution_event_type="execution_intent_created",
+            sequence_number=sequence_number,
+            event_type="order_reconciled",
+            reconciliation_status=reconciliation_status,
+            provider_name="kraken_spot",
+            provider_order_id=provider_order_id,
+            provider_fill_id=None,
+            event_payload={},
+            provenance={},
+            immutable_contract_version="1.0.0",
+            provider_recorded_at=now - timedelta(minutes=8),
+            recorded_at=now - timedelta(minutes=8),
+            created_at=now - timedelta(minutes=8),
+        )
+    )
+    session.commit()
+    return event_id
+
+
+@pytest.mark.asyncio
+async def test_has_unresolved_reconciliation_logs_full_diagnostic_detail_for_blocking_record(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    import app.services.orchestration.continuous_pipeline_worker as worker_module
+
+    order_id = uuid.uuid4()
+    scope = dict(provider="kraken_spot", environment="production", product="BTC-USD")
+
+    with _reconciliation_sqlite_session() as (raw_session, db):
+        _seed_live_crypto_order(raw_session, live_crypto_order_id=order_id, provider_order_id="KRAKEN-ORDER-1", **scope)
+        event_id = _seed_reconciliation_event(raw_session, live_crypto_order_id=order_id, reconciliation_status="open", provider_order_id="KRAKEN-ORDER-1")
+
+        with caplog.at_level(logging.INFO, logger="app.services.orchestration.continuous_pipeline_worker"):
+            result = await worker_module._has_unresolved_reconciliation(db=db, **scope)
+
+    assert result is True
+
+    trigger_records = [r for r in caplog.records if r.getMessage().startswith("unresolved_reconciliation_gate_triggered ")]
+    assert len(trigger_records) == 1
+    trigger_message = trigger_records[0].getMessage()
+    assert "provider=kraken_spot" in trigger_message
+    assert "environment=production" in trigger_message
+    assert "product=BTC-USD" in trigger_message
+    assert "matched_record_count=1" in trigger_message
+
+    detail_records = [r for r in caplog.records if r.getMessage().startswith("unresolved_reconciliation_record_detail ")]
+    assert len(detail_records) == 1
+    detail_message = detail_records[0].getMessage()
+    assert f"reconciliation_event_id={event_id}" in detail_message
+    assert f"live_crypto_order_id={order_id}" in detail_message
+    assert "provider_order_id=KRAKEN-ORDER-1" in detail_message
+    assert "reconciliation_status=open" in detail_message
+    assert "unresolved_because=status_in_unresolved_set" in detail_message
+    assert "order_status=PARTIALLY_FILLED" in detail_message
+    # SQLite round-trips DateTime(timezone=True) without an offset suffix;
+    # the value itself (not the tz representation, a SQLite-only artifact)
+    # is what matters here.
+    assert "recorded_at=2026-07-21T11:52:00" in detail_message
+
+
+@pytest.mark.asyncio
+async def test_has_unresolved_reconciliation_logs_nothing_when_all_resolved(caplog: pytest.LogCaptureFixture) -> None:
+    """A reconciliation event in a resolved state (e.g. 'filled') must not
+    trigger the gate or any diagnostic logging -- fail-closed behavior is
+    scoped to genuinely unresolved states only."""
+    import app.services.orchestration.continuous_pipeline_worker as worker_module
+
+    order_id = uuid.uuid4()
+    scope = dict(provider="kraken_spot", environment="production", product="BTC-USD")
+
+    with _reconciliation_sqlite_session() as (raw_session, db):
+        _seed_live_crypto_order(raw_session, live_crypto_order_id=order_id, provider_order_id="KRAKEN-ORDER-2", status="FILLED", **scope)
+        _seed_reconciliation_event(raw_session, live_crypto_order_id=order_id, reconciliation_status="filled", provider_order_id="KRAKEN-ORDER-2")
+
+        with caplog.at_level(logging.INFO, logger="app.services.orchestration.continuous_pipeline_worker"):
+            result = await worker_module._has_unresolved_reconciliation(db=db, **scope)
+
+    assert result is False
+    assert not [r for r in caplog.records if r.getMessage().startswith("unresolved_reconciliation_")]
+
+
+@pytest.mark.asyncio
+async def test_has_unresolved_reconciliation_logs_every_matching_record(caplog: pytest.LogCaptureFixture) -> None:
+    """Multiple unresolved records blocking the same scope must each get
+    their own detail line -- not just the first one the boolean check
+    happened to find via LIMIT 1."""
+    import app.services.orchestration.continuous_pipeline_worker as worker_module
+
+    order_a, order_b = uuid.uuid4(), uuid.uuid4()
+    scope = dict(provider="kraken_spot", environment="production", product="BTC-USD")
+
+    with _reconciliation_sqlite_session() as (raw_session, db):
+        _seed_live_crypto_order(raw_session, live_crypto_order_id=order_a, provider_order_id="KRAKEN-ORDER-A", **scope)
+        _seed_live_crypto_order(raw_session, live_crypto_order_id=order_b, provider_order_id="KRAKEN-ORDER-B", **scope)
+        _seed_reconciliation_event(raw_session, live_crypto_order_id=order_a, reconciliation_status="open", provider_order_id="KRAKEN-ORDER-A")
+        _seed_reconciliation_event(raw_session, live_crypto_order_id=order_b, reconciliation_status="conflict", provider_order_id="KRAKEN-ORDER-B")
+
+        with caplog.at_level(logging.INFO, logger="app.services.orchestration.continuous_pipeline_worker"):
+            result = await worker_module._has_unresolved_reconciliation(db=db, **scope)
+
+    assert result is True
+    trigger_records = [r for r in caplog.records if r.getMessage().startswith("unresolved_reconciliation_gate_triggered ")]
+    assert "matched_record_count=2" in trigger_records[0].getMessage()
+    detail_records = [r for r in caplog.records if r.getMessage().startswith("unresolved_reconciliation_record_detail ")]
+    assert len(detail_records) == 2
+    assert any("reconciliation_status=open" in r.getMessage() for r in detail_records)
+    assert any("reconciliation_status=conflict" in r.getMessage() for r in detail_records)

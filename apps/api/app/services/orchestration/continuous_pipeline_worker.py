@@ -722,6 +722,61 @@ async def _has_open_live_order(*, db: AsyncSession, provider: str, environment: 
     return row is not None
 
 
+async def _log_unresolved_reconciliation_diagnostics(*, db: AsyncSession, provider: str, environment: str, product: str) -> None:
+    # Instrumentation only -- mirrors _has_unresolved_reconciliation's own
+    # query exactly (same join, same scope filters, same unresolved-state
+    # set) so this is guaranteed to explain precisely which record(s) that
+    # function's boolean check is reacting to, never a different or looser
+    # selection. Only called when that check is already about to return True,
+    # so it costs nothing on the common (no unresolved reconciliation) path.
+    result = await db.execute(
+        select(LiveReconciliationEvent, LiveCryptoOrder)
+        .join(
+            LiveCryptoOrder,
+            LiveCryptoOrder.live_crypto_order_id == LiveReconciliationEvent.live_crypto_order_id,
+        )
+        .where(LiveCryptoOrder.provider == provider)
+        .where(LiveCryptoOrder.environment == environment)
+        .where(LiveCryptoOrder.product_id == product)
+        .where(LiveReconciliationEvent.reconciliation_status.in_(_UNRESOLVED_RECONCILIATION_STATES))
+        .order_by(LiveReconciliationEvent.recorded_at.asc())
+    )
+    rows = result.all()
+    logger.info(
+        "unresolved_reconciliation_gate_triggered provider=%s environment=%s product=%s "
+        "matched_record_count=%s unresolved_states=%s",
+        provider,
+        environment,
+        product,
+        len(rows),
+        ",".join(sorted(_UNRESOLVED_RECONCILIATION_STATES)),
+    )
+    for reconciliation_event, live_order in rows:
+        logger.info(
+            "unresolved_reconciliation_record_detail reconciliation_event_id=%s live_crypto_order_id=%s "
+            "provider_order_id=%s order_client_order_id=%s order_status=%s order_provider_status=%s "
+            "reconciliation_status=%s unresolved_because=status_in_unresolved_set event_type=%s "
+            "sequence_number=%s recorded_at=%s provider_recorded_at=%s created_at=%s "
+            "order_submitted_at=%s order_acknowledged_at=%s order_filled_at=%s order_cancelled_at=%s",
+            reconciliation_event.id,
+            reconciliation_event.live_crypto_order_id,
+            reconciliation_event.provider_order_id,
+            live_order.client_order_id,
+            live_order.status,
+            live_order.provider_status,
+            reconciliation_event.reconciliation_status,
+            reconciliation_event.event_type,
+            reconciliation_event.sequence_number,
+            None if reconciliation_event.recorded_at is None else reconciliation_event.recorded_at.isoformat(),
+            None if reconciliation_event.provider_recorded_at is None else reconciliation_event.provider_recorded_at.isoformat(),
+            None if reconciliation_event.created_at is None else reconciliation_event.created_at.isoformat(),
+            None if live_order.submitted_at is None else live_order.submitted_at.isoformat(),
+            None if live_order.acknowledged_at is None else live_order.acknowledged_at.isoformat(),
+            None if live_order.filled_at is None else live_order.filled_at.isoformat(),
+            None if live_order.cancelled_at is None else live_order.cancelled_at.isoformat(),
+        )
+
+
 async def _has_unresolved_reconciliation(*, db: AsyncSession, provider: str, environment: str, product: str) -> bool:
     row = await db.scalar(
         select(LiveReconciliationEvent.id)
@@ -735,6 +790,8 @@ async def _has_unresolved_reconciliation(*, db: AsyncSession, provider: str, env
         .where(LiveReconciliationEvent.reconciliation_status.in_(_UNRESOLVED_RECONCILIATION_STATES))
         .limit(1)
     )
+    if row is not None:
+        await _log_unresolved_reconciliation_diagnostics(db=db, provider=provider, environment=environment, product=product)
     return row is not None
 
 
