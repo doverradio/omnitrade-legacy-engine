@@ -81,6 +81,16 @@ class ExchangeProductSnapshot:
     product_id: str
     available: bool
     trading_enabled: bool
+    # Common, provider-agnostic venue-execution-constraint metadata. Every
+    # provider adapter may populate these from its own real, authoritative
+    # product/pair data (e.g. Kraken's AssetPairs ordermin/costmin, Coinbase's
+    # base_min_size/quote_increment, Binance's LOT_SIZE/MIN_NOTIONAL filters).
+    # None means "this provider has not supplied a value" -- callers must
+    # never guess a number in its place; a missing minimum is a missing
+    # minimum, not a licence to assume zero or fabricate one.
+    min_order_notional: Decimal | None = None
+    min_order_quantity: Decimal | None = None
+    quantity_increment: Decimal | None = None
 
 
 @dataclass(frozen=True, slots=True)

@@ -4,6 +4,8 @@ import uuid
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 
+import pytest
+
 from app.services.risk import (
     RiskDecisionAction,
     RiskEvaluationContext,
@@ -149,6 +151,127 @@ def test_compute_position_sizing_respects_non_fractional_stock_constraints() -> 
 
     assert sizing.approved_quantity == Decimal("2")
     assert sizing.approved_notional == Decimal("100")
+
+
+# Regression for production incident: strategy_aggregate_completed correctly
+# reached BUY consensus, campaign sizing correctly proposed exactly the $5
+# proving amount, but the risk engine rejected it as
+# position_below_minimum_order_size. Root cause: converting a dollar target
+# into a fractional venue quantity and rounding (as every provider requires)
+# can only ever produce a quantity whose notional is equal to or *less than*
+# the target -- never more. A target sized to exactly the venue minimum will
+# therefore almost always recompute a hair short of that minimum after
+# rounding, even though ample campaign/account capital was never the actual
+# constraint. This is not Kraken-specific: it reproduces for any provider
+# whose real minimum is expressed as a notional and/or quantity increment.
+def test_compute_position_sizing_sizes_up_to_minimum_when_capital_permits() -> None:
+    price = Decimal("65320")
+    requested_quantity = Decimal("0.0000765454")  # ~$5.00 worth of BTC, a hair short after rounding
+
+    sizing = compute_position_sizing(
+        requested_quantity=requested_quantity,
+        reference_price=price,
+        account_equity=Decimal("1000"),
+        max_position_size_pct=Decimal("1"),
+        qty_step_size=Decimal("0.00000001"),
+        supports_fractional=True,
+        min_order_notional=Decimal("5"),
+    )
+
+    assert sizing.approved_notional >= Decimal("5")
+    assert sizing.approved_quantity > requested_quantity
+    assert sizing.reason_code == "position_sized_up_to_minimum_viable_order"
+    # Never exceeds authorized capital -- sizing up stays within max_position_notional.
+    assert sizing.approved_notional <= sizing.max_position_notional
+
+
+def test_compute_position_sizing_does_not_size_up_beyond_authorized_capital() -> None:
+    """No silent auto-sizing beyond campaign authority: when even the venue
+    minimum exceeds what's authorized, the order is correctly left short and
+    rejected downstream -- never forced through."""
+    sizing = compute_position_sizing(
+        requested_quantity=Decimal("0.01"),
+        reference_price=Decimal("100"),
+        account_equity=Decimal("25"),
+        max_position_size_pct=Decimal("0.05"),  # max_position_notional = 1.25
+        qty_step_size=Decimal("0.0001"),
+        supports_fractional=True,
+        min_order_notional=Decimal("5"),
+    )
+
+    assert sizing.approved_notional < Decimal("5")
+    assert sizing.approved_notional <= sizing.max_position_notional
+    assert sizing.reason_code != "position_sized_up_to_minimum_viable_order"
+
+    assert not validate_minimum_viable_order(
+        approved_quantity=sizing.approved_quantity,
+        reference_price=Decimal("100"),
+        min_order_notional=Decimal("5"),
+        qty_step_size=Decimal("0.0001"),
+    )
+
+
+@pytest.mark.parametrize(
+    ("provider_label", "requested_quantity", "reference_price", "qty_step_size", "supports_fractional", "min_order_notional"),
+    [
+        ("kraken_like_fractional_crypto", Decimal("0.0000765454"), Decimal("65320"), Decimal("0.00000001"), True, Decimal("5")),
+        ("coinbase_like_fractional_crypto", Decimal("0.00001"), Decimal("65320"), Decimal("0.00000001"), True, Decimal("1")),
+        ("alpaca_like_whole_share_equity", Decimal("0.4"), Decimal("50"), None, False, Decimal("1")),
+    ],
+)
+def test_compute_position_sizing_honors_provider_specific_minimums(
+    provider_label: str,
+    requested_quantity: Decimal,
+    reference_price: Decimal,
+    qty_step_size: Decimal | None,
+    supports_fractional: bool,
+    min_order_notional: Decimal,
+) -> None:
+    """The same, provider-agnostic sizing function must honor whatever
+    minimum a given provider profile supplies -- proving multiple providers
+    behave consistently through one shared mechanism, with no
+    provider-specific branching anywhere in this function."""
+    sizing = compute_position_sizing(
+        requested_quantity=requested_quantity,
+        reference_price=reference_price,
+        account_equity=Decimal("100000"),
+        max_position_size_pct=Decimal("1"),
+        qty_step_size=qty_step_size,
+        supports_fractional=supports_fractional,
+        min_order_notional=min_order_notional,
+    )
+
+    assert sizing.approved_notional >= min_order_notional, provider_label
+    assert sizing.approved_notional <= sizing.max_position_notional, provider_label
+
+
+def test_evaluate_signal_risk_sizes_up_to_minimum_and_approves() -> None:
+    """End-to-end through evaluate_signal_risk (not just the sizing helper):
+    an executable order is produced and approved, not rejected."""
+    result = evaluate_signal_risk(
+        request=RiskEvaluationRequest(
+            signal_id=uuid.uuid4(),
+            paper_account_id=uuid.uuid4(),
+            asset_id=uuid.uuid4(),
+            side="buy",
+            quantity=Decimal("0.0000765454"),
+            account_equity=Decimal("1000"),
+            max_position_size_pct=Decimal("1"),
+            min_order_notional=Decimal("5"),
+            qty_step_size=Decimal("0.00000001"),
+            supports_fractional=True,
+            start_of_day_equity=Decimal("1000"),
+            current_equity=Decimal("1000"),
+            max_daily_loss_pct=Decimal("0.03"),
+            high_water_mark_equity=Decimal("1000"),
+            max_drawdown_pct=Decimal("0.15"),
+        ),
+        reference_price=Decimal("65320"),
+    )
+
+    assert result.action == RiskDecisionAction.RESIZE
+    assert result.reason_code == "position_sized_up_to_minimum_viable_order"
+    assert result.approved_quantity * Decimal("65320") >= Decimal("5")
 
 
 def test_validate_minimum_viable_order_checks_notional_and_step_size() -> None:

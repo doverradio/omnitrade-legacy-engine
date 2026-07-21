@@ -60,6 +60,31 @@ async def test_kraken_product_lookup_supports_btc_usd(monkeypatch: pytest.Monkey
     product = await client.fetch_product(credentials={"api_key": "k", "api_secret": "s"}, environment="production", product_id="BTC-USD")
     assert product.available is True
     assert product.trading_enabled is True
+    # Kraken's own real, per-pair venue minimums (already fetched from
+    # AssetPairs for preview validation elsewhere in this client) must flow
+    # through the common ExchangeProductSnapshot abstraction -- not a
+    # hardcoded, provider-agnostic guess.
+    assert product.min_order_notional == Decimal("0.5")
+    assert product.min_order_quantity == Decimal("0.0001")
+    assert product.quantity_increment == Decimal("0.00000001")
+
+
+@pytest.mark.asyncio
+async def test_kraken_product_lookup_omits_minimums_when_pair_missing(monkeypatch: pytest.MonkeyPatch) -> None:
+    client = KrakenSpotClient()
+
+    async def _public(**_kwargs):
+        return {"error": [], "result": {}}
+
+    monkeypatch.setattr(client, "_public_request", _public)
+    product = await client.fetch_product(credentials={"api_key": "k", "api_secret": "s"}, environment="production", product_id="BTC-USD")
+
+    assert product.available is False
+    # No fabricated minimum when the venue has no data for this pair --
+    # missing means missing, never a guessed number.
+    assert product.min_order_notional is None
+    assert product.min_order_quantity is None
+    assert product.quantity_increment is None
 
 
 @pytest.mark.asyncio

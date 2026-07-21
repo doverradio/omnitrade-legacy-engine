@@ -688,10 +688,16 @@ class KrakenSpotClient:
         status = str(pair_info.get("status") or "").lower()
         available = status != ""
         trading_enabled = status in {"online", "post_only", "limit_only", "reduce_only"}
+        ordermin = _to_decimal(pair_info.get("ordermin"))
+        costmin = _to_decimal(pair_info.get("costmin"))
+        lot_decimals = pair_info.get("lot_decimals")
         return ExchangeProductSnapshot(
             product_id=normalized_product,
             available=available,
             trading_enabled=trading_enabled,
+            min_order_notional=costmin if costmin > Decimal("0") else None,
+            min_order_quantity=ordermin if ordermin > Decimal("0") else None,
+            quantity_increment=Decimal("1").scaleb(-int(lot_decimals)) if lot_decimals is not None else None,
         )
 
     async def fetch_price_evidence(

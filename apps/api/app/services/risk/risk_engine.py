@@ -3,7 +3,7 @@ from __future__ import annotations
 import uuid
 from dataclasses import dataclass, field
 from datetime import datetime
-from decimal import ROUND_DOWN, Decimal
+from decimal import ROUND_DOWN, ROUND_UP, Decimal
 from enum import Enum
 
 
@@ -143,6 +143,14 @@ def _round_down_to_step(value: Decimal, step: Decimal | None) -> Decimal:
     return increments * step
 
 
+def _round_up_to_step(value: Decimal, step: Decimal | None) -> Decimal:
+    if step is None or step <= 0:
+        return value
+
+    increments = (value / step).to_integral_value(rounding=ROUND_UP)
+    return increments * step
+
+
 def compute_position_sizing(
     *,
     requested_quantity: Decimal,
@@ -151,6 +159,7 @@ def compute_position_sizing(
     max_position_size_pct: Decimal,
     qty_step_size: Decimal | None,
     supports_fractional: bool | None,
+    min_order_notional: Decimal | None = None,
 ) -> PositionSizingResult:
     if requested_quantity <= 0:
         return PositionSizingResult(
@@ -204,13 +213,46 @@ def compute_position_sizing(
     approved_quantity = _round_down_to_step(approved_quantity, qty_step_size)
     approved_notional = approved_quantity * reference_price
 
+    # Rounding a dollar-denominated target down to a tradable quantity
+    # increment (or to a whole unit, above) can never be guaranteed to round
+    # back up to exactly that target -- it can only ever come out equal or
+    # short. A target sized to exactly the venue's minimum notional will
+    # therefore, after this unavoidable rounding, almost always land a hair
+    # below that minimum and be rejected as unexecutable, even though
+    # authorized capital was never actually the constraint. When that
+    # happens and there is still enough authorized capital (max_notional) to
+    # cover the venue's real minimum, round up to the smallest quantity that
+    # clears it instead of silently producing an order that can never
+    # execute. This never exceeds max_notional -- if the venue minimum
+    # itself exceeds what's authorized, no rounding happens here and the
+    # order is correctly left short, to be rejected downstream.
+    sized_up_to_minimum = False
+    if (
+        min_order_notional is not None
+        and min_order_notional > 0
+        and approved_notional < min_order_notional
+    ):
+        minimum_quantity = _round_up_to_step(min_order_notional / reference_price, qty_step_size)
+        minimum_notional = minimum_quantity * reference_price
+        if minimum_notional <= max_notional:
+            approved_quantity = minimum_quantity
+            approved_notional = minimum_notional
+            sized_up_to_minimum = True
+
+    if sized_up_to_minimum:
+        reason_code = "position_sized_up_to_minimum_viable_order"
+    elif approved_quantity < requested_quantity:
+        reason_code = "position_resized_by_risk_engine"
+    else:
+        reason_code = None
+
     return PositionSizingResult(
         requested_quantity=requested_quantity,
         approved_quantity=approved_quantity,
-        was_resized=approved_quantity < requested_quantity,
+        was_resized=approved_quantity != requested_quantity,
         max_position_notional=max_notional,
         approved_notional=approved_notional,
-        reason_code="position_resized_by_risk_engine" if approved_quantity < requested_quantity else None,
+        reason_code=reason_code,
     )
 
 
@@ -669,6 +711,7 @@ def evaluate_signal_risk(
         )
 
     resized = False
+    resized_reason_code: str | None = None
     if not resolved_context.bypass_sizing_rule:
         if (
             reference_price is not None
@@ -682,6 +725,7 @@ def evaluate_signal_risk(
                 max_position_size_pct=request.max_position_size_pct,
                 qty_step_size=request.qty_step_size,
                 supports_fractional=request.supports_fractional,
+                min_order_notional=request.min_order_notional,
             )
             if sizing_result.reason_code in {
                 "invalid_requested_quantity",
@@ -697,11 +741,13 @@ def evaluate_signal_risk(
                 )
             approved_quantity = sizing_result.approved_quantity
             resized = sizing_result.was_resized
+            resized_reason_code = sizing_result.reason_code
         elif resolved_context.ai_scaled_quantity is not None and resolved_context.ai_scaled_quantity < approved_quantity:
             approved_quantity = resolved_context.ai_scaled_quantity
             resized = True
+            resized_reason_code = "position_resized_by_risk_engine"
 
-    steps.append(RiskEvaluationStep(step="position_size", status="resize" if resized else "pass", reason_code="position_resized_by_risk_engine" if resized else None))
+    steps.append(RiskEvaluationStep(step="position_size", status="resize" if resized else "pass", reason_code=resized_reason_code if resized else None))
 
     minimum_viable_pre_ai = validate_minimum_viable_order(
         approved_quantity=approved_quantity,
@@ -740,8 +786,17 @@ def evaluate_signal_risk(
             steps=steps,
         )
 
-    final_action = RiskDecisionAction.RESIZE if approved_quantity < request.quantity else RiskDecisionAction.APPROVE
-    final_reason = "position_resized_by_risk_engine" if final_action == RiskDecisionAction.RESIZE else None
+    # approved_quantity can now differ from the originally requested quantity
+    # in either direction -- reduced by the position-size/AI-confidence caps,
+    # or increased (never beyond max_position_notional) to clear a venue's
+    # minimum viable order -- so the final action is keyed on any change, not
+    # just a reduction, and reports whichever resize actually produced that
+    # change rather than collapsing every resize into one generic reason.
+    final_action = RiskDecisionAction.APPROVE if approved_quantity == request.quantity else RiskDecisionAction.RESIZE
+    if final_action == RiskDecisionAction.RESIZE:
+        final_reason = "position_resized_by_ai_confidence" if ai_scaled else resized_reason_code
+    else:
+        final_reason = None
 
     return RiskEvaluationResult(
         action=final_action,
