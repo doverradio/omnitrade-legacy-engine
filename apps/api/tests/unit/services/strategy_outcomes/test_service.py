@@ -274,6 +274,7 @@ def _outcome_row(
     horizon_minutes: int,
     actual_fee_adjusted_return_pct: Decimal,
     actual_action_correct: bool,
+    actual_raw_return_pct: Decimal | None = None,
 ) -> "StrategyRosterProposalOutcome":
     return StrategyRosterProposalOutcome(
         proposal_id=uuid.uuid4(),
@@ -298,7 +299,7 @@ def _outcome_row(
         buy_fee_adjusted_return_pct=Decimal("0"),
         sell_raw_return_pct=Decimal("0"),
         sell_fee_adjusted_return_pct=Decimal("0"),
-        actual_raw_return_pct=actual_fee_adjusted_return_pct,
+        actual_raw_return_pct=actual_fee_adjusted_return_pct if actual_raw_return_pct is None else actual_raw_return_pct,
         actual_fee_adjusted_return_pct=actual_fee_adjusted_return_pct,
         mfe_pct=Decimal("0"),
         mae_pct=Decimal("0"),
@@ -354,6 +355,41 @@ async def test_fetch_strategy_scorecards_action_scoped_averages_do_not_cross_con
     assert aggregate.buy_average_fee_adjusted_return_pct == Decimal("1.5000")
     assert aggregate.sell_average_fee_adjusted_return_pct == Decimal("-10.0000")
     assert aggregate.hold_average_fee_adjusted_return_pct is None
+
+
+@pytest.mark.asyncio
+async def test_fetch_strategy_scorecards_raw_average_does_not_include_outcome_scoring_fee() -> None:
+    """Reproduces the second production defect: average_fee_adjusted_return_pct
+    (and the action-scoped variants) already subtract outcome-scoring's own
+    round-trip fee assumption from the raw historical return. A caller that
+    needs a genuinely pre-fee ("gross") figure -- to which it will apply its
+    OWN cost model exactly once -- must read *_average_raw_return_pct, which
+    must never equal the fee-adjusted figure when raw and fee-adjusted
+    outcomes actually differ."""
+    proposal = _proposal(action="BUY", evaluation_status="EVALUATED")
+    db = _FakeDb(proposals=[proposal])
+
+    db.inserted = [
+        _outcome_row(
+            proposal=proposal, action="BUY", horizon_label="15m", horizon_minutes=15,
+            actual_raw_return_pct=Decimal("0.2"), actual_fee_adjusted_return_pct=Decimal("0.0"),
+            actual_action_correct=False,
+        ),
+        _outcome_row(
+            proposal=proposal, action="BUY", horizon_label="15m", horizon_minutes=15,
+            actual_raw_return_pct=Decimal("0.4"), actual_fee_adjusted_return_pct=Decimal("0.2"),
+            actual_action_correct=True,
+        ),
+    ]
+
+    scorecards = await fetch_strategy_scorecards(db=db, provider="kraken_spot", product_id="BTC-USD", interval="15m")
+    aggregate = scorecards[0].aggregate
+
+    assert aggregate.buy_average_raw_return_pct == Decimal("0.3000")
+    assert aggregate.buy_average_fee_adjusted_return_pct == Decimal("0.1000")
+    assert aggregate.buy_average_raw_return_pct != aggregate.buy_average_fee_adjusted_return_pct
+    assert aggregate.sell_average_raw_return_pct is None
+    assert aggregate.hold_average_raw_return_pct is None
 
 
 @pytest.mark.asyncio

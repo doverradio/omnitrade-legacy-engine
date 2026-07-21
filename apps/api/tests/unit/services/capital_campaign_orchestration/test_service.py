@@ -444,7 +444,7 @@ async def test_authoritative_open_candidate_selects_best(monkeypatch: pytest.Mon
     candle = SimpleNamespace(asset_id=UUID("dddddddd-dddd-dddd-dddd-dddddddddddd"), close=Decimal("100"), close_time=datetime(2026, 7, 15, 0, 15, tzinfo=timezone.utc), interval="15m", open_time=datetime(2026, 7, 15, 0, 0, tzinfo=timezone.utc))
     asset = SimpleNamespace(id=UUID("eeeeeeee-eeee-eeee-eeee-eeeeeeeeeeee"), exchange="kraken_spot", base_currency="USD", min_order_notional=Decimal("5"), qty_step_size=None, supports_fractional=True)
     market = {"authority_class": "AUTHORITATIVE", "reason": "market data resolved from canonical asset and candle tables", "freshness": "fresh", "close_price": "100"}
-    strategy = {"authority_class": "AUTHORITATIVE", "strategy_identity": "ma_crossover@1", "strategy_version": "1", "action": "BUY", "confidence": "0.8", "sample_size": 12, "profitable_after_fees_performance": "4.2", "expected_value": "4.2", "evidence_timestamp": "2026-07-15T00:15:00+00:00", "source_identity": {"decision_record_id": "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa"}}
+    strategy = {"authority_class": "AUTHORITATIVE", "strategy_identity": "ma_crossover@1", "strategy_version": "1", "action": "BUY", "confidence": "0.8", "sample_size": 12, "profitable_after_fees_performance": "4.2", "historical_gross_return_pct": "4.2", "expected_value": "4.2", "evidence_timestamp": "2026-07-15T00:15:00+00:00", "source_identity": {"decision_record_id": "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa"}}
     position = {"authority_class": "AUTHORITATIVE", "position": None, "lifecycle": None, "profitability": None}
     risk_context = SimpleNamespace(
         account_equity=Decimal("25"),
@@ -501,7 +501,7 @@ async def test_authoritative_risk_veto_is_preserved(monkeypatch: pytest.MonkeyPa
     candle = SimpleNamespace(asset_id=UUID("dddddddd-dddd-dddd-dddd-dddddddddddd"), close=Decimal("100"), close_time=datetime(2026, 7, 15, 0, 15, tzinfo=timezone.utc), interval="15m", open_time=datetime(2026, 7, 15, 0, 0, tzinfo=timezone.utc))
     asset = SimpleNamespace(id=UUID("eeeeeeee-eeee-eeee-eeee-eeeeeeeeeeee"), exchange="kraken_spot", base_currency="USD", min_order_notional=Decimal("5"), qty_step_size=None, supports_fractional=True)
     market = {"authority_class": "AUTHORITATIVE", "reason": "market data resolved from canonical asset and candle tables", "freshness": "fresh", "close_price": "100"}
-    strategy = {"authority_class": "AUTHORITATIVE", "strategy_identity": "ma_crossover@1", "strategy_version": "1", "action": "BUY", "confidence": "0.8", "sample_size": 12, "profitable_after_fees_performance": "4.2", "expected_value": "4.2", "evidence_timestamp": "2026-07-15T00:15:00+00:00", "source_identity": {"decision_record_id": "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa"}}
+    strategy = {"authority_class": "AUTHORITATIVE", "strategy_identity": "ma_crossover@1", "strategy_version": "1", "action": "BUY", "confidence": "0.8", "sample_size": 12, "profitable_after_fees_performance": "4.2", "historical_gross_return_pct": "4.2", "expected_value": "4.2", "evidence_timestamp": "2026-07-15T00:15:00+00:00", "source_identity": {"decision_record_id": "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa"}}
     position = {"authority_class": "AUTHORITATIVE", "position": None, "lifecycle": None, "profitability": None}
     risk_context = SimpleNamespace(account_equity=Decimal("25"), start_of_day_equity=Decimal("25"), current_equity=Decimal("25"), max_position_size_pct=Decimal("0.10"), max_daily_loss_pct=Decimal("0.03"), high_water_mark_equity=Decimal("25"), max_drawdown_pct=Decimal("0.10"), consecutive_losses_on_pair=0, cooldown_after_losses=3, last_loss_at=None, cooldown_duration_minutes=Decimal("1440"), evaluation_time=datetime(2026, 7, 15, 0, 16, tzinfo=timezone.utc), data_is_stale=False, data_has_gaps=False, global_kill_switch_engaged_state=False, global_kill_switch_rearm_required=False, account_kill_switch_engaged_state=False, account_kill_switch_rearm_required=False, global_kill_switch_state_observed=True, account_kill_switch_state_observed=True, risk_policy_source="module_fallback_default")
 
@@ -540,7 +540,7 @@ async def test_authoritative_risk_unavailable_fails_closed(monkeypatch: pytest.M
 
     monkeypatch.setattr("app.services.capital_campaign_orchestration.authoritative._load_runtime_campaign", _async_return(runtime_campaign))
     monkeypatch.setattr("app.services.capital_campaign_orchestration.authoritative._load_market_evidence", _async_return((market, asset, candle)))
-    monkeypatch.setattr("app.services.capital_campaign_orchestration.authoritative.resolve_and_persist_strategy_aggregate_evidence", _async_return(({"authority_class": "AUTHORITATIVE", "strategy_identity": "ma_crossover@1", "strategy_version": "1", "action": "BUY", "confidence": "0.8", "sample_size": 12, "profitable_after_fees_performance": "4.2", "expected_value": "4.2", "evidence_timestamp": "2026-07-15T00:15:00+00:00", "source_identity": {"decision_record_id": "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa"}}, None)))
+    monkeypatch.setattr("app.services.capital_campaign_orchestration.authoritative.resolve_and_persist_strategy_aggregate_evidence", _async_return(({"authority_class": "AUTHORITATIVE", "strategy_identity": "ma_crossover@1", "strategy_version": "1", "action": "BUY", "confidence": "0.8", "sample_size": 12, "profitable_after_fees_performance": "4.2", "historical_gross_return_pct": "4.2", "expected_value": "4.2", "evidence_timestamp": "2026-07-15T00:15:00+00:00", "source_identity": {"decision_record_id": "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa"}}, None)))
     monkeypatch.setattr("app.services.capital_campaign_orchestration.authoritative._load_position_evidence", _async_return({"authority_class": "AUTHORITATIVE", "position": None, "lifecycle": None, "profitability": None}))
     monkeypatch.setattr(
         "app.services.capital_campaign_orchestration.authoritative.resolve_execution_risk_context",
@@ -723,7 +723,7 @@ async def test_authoritative_no_action_reason_is_minimum_order_continuity(monkey
     paper_account = SimpleNamespace(id=runtime_campaign.paper_account_id, starting_balance=Decimal("1"))
     candle = SimpleNamespace(asset_id=UUID("dddddddd-dddd-dddd-dddd-dddddddddddd"), close=Decimal("100"), close_time=datetime(2026, 7, 15, 0, 15, tzinfo=timezone.utc), interval="15m", open_time=datetime(2026, 7, 15, 0, 0, tzinfo=timezone.utc))
     asset = SimpleNamespace(id=UUID("eeeeeeee-eeee-eeee-eeee-eeeeeeeeeeee"), exchange="kraken_spot", base_currency="USD", min_order_notional=Decimal("5"), qty_step_size=None, supports_fractional=True)
-    strategy = {"authority_class": "AUTHORITATIVE", "strategy_identity": "ma_crossover@1", "strategy_version": "1", "action": "BUY", "confidence": "0.8", "sample_size": 12, "profitable_after_fees_performance": "4.2", "expected_value": "4.2", "evidence_timestamp": "2026-07-15T00:15:00+00:00", "source_identity": {"decision_record_id": "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa"}}
+    strategy = {"authority_class": "AUTHORITATIVE", "strategy_identity": "ma_crossover@1", "strategy_version": "1", "action": "BUY", "confidence": "0.8", "sample_size": 12, "profitable_after_fees_performance": "4.2", "historical_gross_return_pct": "4.2", "expected_value": "4.2", "evidence_timestamp": "2026-07-15T00:15:00+00:00", "source_identity": {"decision_record_id": "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa"}}
     position = {"authority_class": "AUTHORITATIVE", "position": None, "lifecycle": None, "profitability": None}
 
     class _Db:
@@ -807,7 +807,7 @@ async def test_authoritative_capital_budget_rescues_stale_remaining_unallocated_
     candle = SimpleNamespace(asset_id=UUID("dddddddd-dddd-dddd-dddd-dddddddddddd"), close=Decimal("100"), close_time=datetime(2026, 7, 15, 0, 15, tzinfo=timezone.utc), interval="15m", open_time=datetime(2026, 7, 15, 0, 0, tzinfo=timezone.utc))
     asset = SimpleNamespace(id=UUID("eeeeeeee-eeee-eeee-eeee-eeeeeeeeeeee"), exchange="kraken_spot", base_currency="USD", min_order_notional=Decimal("5"), qty_step_size=None, supports_fractional=True)
     market = {"authority_class": "AUTHORITATIVE", "reason": "market data resolved from canonical asset and candle tables", "freshness": "fresh", "close_price": "100"}
-    strategy = {"authority_class": "AUTHORITATIVE", "strategy_identity": "ma_crossover@1", "strategy_version": "1", "action": "BUY", "confidence": "0.8", "sample_size": 12, "profitable_after_fees_performance": "4.2", "expected_value": "4.2", "evidence_timestamp": "2026-07-15T00:15:00+00:00", "source_identity": {"decision_record_id": "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa"}}
+    strategy = {"authority_class": "AUTHORITATIVE", "strategy_identity": "ma_crossover@1", "strategy_version": "1", "action": "BUY", "confidence": "0.8", "sample_size": 12, "profitable_after_fees_performance": "4.2", "historical_gross_return_pct": "4.2", "expected_value": "4.2", "evidence_timestamp": "2026-07-15T00:15:00+00:00", "source_identity": {"decision_record_id": "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa"}}
     position = {"authority_class": "AUTHORITATIVE", "position": None, "lifecycle": None, "profitability": None}
     risk_context = SimpleNamespace(
         account_equity=Decimal("1000"),
@@ -874,7 +874,7 @@ async def test_authoritative_genuinely_insufficient_capital_budget_still_blocked
     paper_account = SimpleNamespace(id=runtime_campaign.paper_account_id, starting_balance=Decimal("1000"))
     candle = SimpleNamespace(asset_id=UUID("dddddddd-dddd-dddd-dddd-dddddddddddd"), close=Decimal("100"), close_time=datetime(2026, 7, 15, 0, 15, tzinfo=timezone.utc), interval="15m", open_time=datetime(2026, 7, 15, 0, 0, tzinfo=timezone.utc))
     asset = SimpleNamespace(id=UUID("eeeeeeee-eeee-eeee-eeee-eeeeeeeeeeee"), exchange="kraken_spot", base_currency="USD", min_order_notional=Decimal("5"), qty_step_size=None, supports_fractional=True)
-    strategy = {"authority_class": "AUTHORITATIVE", "strategy_identity": "ma_crossover@1", "strategy_version": "1", "action": "BUY", "confidence": "0.8", "sample_size": 12, "profitable_after_fees_performance": "4.2", "expected_value": "4.2", "evidence_timestamp": "2026-07-15T00:15:00+00:00", "source_identity": {"decision_record_id": "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa"}}
+    strategy = {"authority_class": "AUTHORITATIVE", "strategy_identity": "ma_crossover@1", "strategy_version": "1", "action": "BUY", "confidence": "0.8", "sample_size": 12, "profitable_after_fees_performance": "4.2", "historical_gross_return_pct": "4.2", "expected_value": "4.2", "evidence_timestamp": "2026-07-15T00:15:00+00:00", "source_identity": {"decision_record_id": "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa"}}
     position = {"authority_class": "AUTHORITATIVE", "position": None, "lifecycle": None, "profitability": None}
     risk_context = SimpleNamespace(
         account_equity=Decimal("1000"),
@@ -935,7 +935,7 @@ async def test_authoritative_liquid_cash_499_rejects_without_risk_submission(mon
     paper_account = SimpleNamespace(id=runtime_campaign.paper_account_id, starting_balance=Decimal("25"), current_cash_balance=Decimal("4.99"))
     candle = SimpleNamespace(asset_id=UUID("dddddddd-dddd-dddd-dddd-dddddddddddd"), close=Decimal("100"), close_time=datetime(2026, 7, 15, 0, 15, tzinfo=timezone.utc), interval="15m", open_time=datetime(2026, 7, 15, 0, 0, tzinfo=timezone.utc))
     asset = SimpleNamespace(id=UUID("eeeeeeee-eeee-eeee-eeee-eeeeeeeeeeee"), exchange="kraken_spot", base_currency="USD", min_order_notional=Decimal("5"), qty_step_size=None, supports_fractional=True)
-    strategy = {"authority_class": "AUTHORITATIVE", "strategy_identity": "ma_crossover@1", "strategy_version": "1", "action": "BUY", "confidence": "0.8", "sample_size": 12, "profitable_after_fees_performance": "4.2", "expected_value": "4.2", "evidence_timestamp": "2026-07-15T00:15:00+00:00", "source_identity": {"decision_record_id": "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa"}}
+    strategy = {"authority_class": "AUTHORITATIVE", "strategy_identity": "ma_crossover@1", "strategy_version": "1", "action": "BUY", "confidence": "0.8", "sample_size": 12, "profitable_after_fees_performance": "4.2", "historical_gross_return_pct": "4.2", "expected_value": "4.2", "evidence_timestamp": "2026-07-15T00:15:00+00:00", "source_identity": {"decision_record_id": "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa"}}
     position = {"authority_class": "AUTHORITATIVE", "position": None, "lifecycle": None, "profitability": None}
 
     class _Db:
@@ -1013,7 +1013,7 @@ async def test_authoritative_liquid_cash_500_permits_exact_five(monkeypatch: pyt
     paper_account = SimpleNamespace(id=runtime_campaign.paper_account_id, starting_balance=Decimal("25"), current_cash_balance=Decimal("5.00"))
     candle = SimpleNamespace(asset_id=UUID("dddddddd-dddd-dddd-dddd-dddddddddddd"), close=Decimal("100"), close_time=datetime(2026, 7, 15, 0, 15, tzinfo=timezone.utc), interval="15m", open_time=datetime(2026, 7, 15, 0, 0, tzinfo=timezone.utc))
     asset = SimpleNamespace(id=UUID("eeeeeeee-eeee-eeee-eeee-eeeeeeeeeeee"), exchange="kraken_spot", base_currency="USD", min_order_notional=Decimal("5"), qty_step_size=None, supports_fractional=True)
-    strategy = {"authority_class": "AUTHORITATIVE", "strategy_identity": "ma_crossover@1", "strategy_version": "1", "action": "BUY", "confidence": "0.8", "sample_size": 12, "profitable_after_fees_performance": "4.2", "expected_value": "4.2", "evidence_timestamp": "2026-07-15T00:15:00+00:00", "source_identity": {"decision_record_id": "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa"}}
+    strategy = {"authority_class": "AUTHORITATIVE", "strategy_identity": "ma_crossover@1", "strategy_version": "1", "action": "BUY", "confidence": "0.8", "sample_size": 12, "profitable_after_fees_performance": "4.2", "historical_gross_return_pct": "4.2", "expected_value": "4.2", "evidence_timestamp": "2026-07-15T00:15:00+00:00", "source_identity": {"decision_record_id": "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa"}}
     position = {"authority_class": "AUTHORITATIVE", "position": None, "lifecycle": None, "profitability": None}
 
     class _Db:
@@ -1090,7 +1090,7 @@ async def test_authoritative_liquid_cash_cap_wins_over_campaign_and_equity(monke
     paper_account = SimpleNamespace(id=runtime_campaign.paper_account_id, starting_balance=Decimal("25"), current_cash_balance=Decimal("23.7205"))
     candle = SimpleNamespace(asset_id=UUID("dddddddd-dddd-dddd-dddd-dddddddddddd"), close=Decimal("100"), close_time=datetime(2026, 7, 15, 0, 15, tzinfo=timezone.utc), interval="15m", open_time=datetime(2026, 7, 15, 0, 0, tzinfo=timezone.utc))
     asset = SimpleNamespace(id=UUID("eeeeeeee-eeee-eeee-eeee-eeeeeeeeeeee"), exchange="kraken_spot", base_currency="USD", min_order_notional=Decimal("5"), qty_step_size=None, supports_fractional=True)
-    strategy = {"authority_class": "AUTHORITATIVE", "strategy_identity": "ma_crossover@1", "strategy_version": "1", "action": "BUY", "confidence": "0.8", "sample_size": 12, "profitable_after_fees_performance": "4.2", "expected_value": "4.2", "evidence_timestamp": "2026-07-15T00:15:00+00:00", "source_identity": {"decision_record_id": "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa"}}
+    strategy = {"authority_class": "AUTHORITATIVE", "strategy_identity": "ma_crossover@1", "strategy_version": "1", "action": "BUY", "confidence": "0.8", "sample_size": 12, "profitable_after_fees_performance": "4.2", "historical_gross_return_pct": "4.2", "expected_value": "4.2", "evidence_timestamp": "2026-07-15T00:15:00+00:00", "source_identity": {"decision_record_id": "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa"}}
     position = {"authority_class": "AUTHORITATIVE", "position": None, "lifecycle": None, "profitability": None}
 
     class _Db:
@@ -1155,6 +1155,7 @@ async def test_authoritative_hold_preserves_strategy_evidence_in_preview_seriali
         "confidence": "0.8",
         "sample_size": 12,
         "profitable_after_fees_performance": "4.2",
+        "historical_gross_return_pct": "4.2",
         "expected_value": "4.2",
         "evidence_timestamp": "2026-07-15T00:15:00+00:00",
         "source_identity": {"decision_record_id": "280390e3-180c-4247-8d82-56ab51f463cf"},
@@ -1241,6 +1242,7 @@ async def test_authoritative_rejected_candidate_preserves_strategy_evidence(monk
         "confidence": "0.8",
         "sample_size": 12,
         "profitable_after_fees_performance": "4.2",
+        "historical_gross_return_pct": "4.2",
         "expected_value": "4.2",
         "evidence_timestamp": "2026-07-15T00:15:00+00:00",
         "source_identity": {"decision_record_id": "280390e3-180c-4247-8d82-56ab51f463cf"},
@@ -1437,6 +1439,9 @@ async def test_authoritative_historical_package_conflict_fails_closed(monkeypatc
 #   tests/unit/services/capital_campaign_orchestration/test_strategy_decision_aggregator_integration.py
 
 
+_UNSET = object()
+
+
 def _net_edge_authoritative_mocks(
     monkeypatch: pytest.MonkeyPatch,
     *,
@@ -1445,6 +1450,7 @@ def _net_edge_authoritative_mocks(
     approved_quantity: Decimal,
     price: Decimal = Decimal("100"),
     min_order_notional: Decimal = Decimal("5"),
+    historical_gross_return_pct: str | None | object = _UNSET,
 ):
     """Shared fixture for compose_campaign_authoritative_cycle net-edge-gate tests.
 
@@ -1475,6 +1481,15 @@ def _net_edge_authoritative_mocks(
         "confidence": "0.8",
         "sample_size": 12,
         "profitable_after_fees_performance": profitable_after_fees_performance,
+        # historical_gross_return_pct is what the net-edge gate actually
+        # reads as its gross-edge input; by default these tests mirror the
+        # same value passed for profitable_after_fees_performance under the
+        # correct (pre-fee) field name too, unless a test explicitly needs
+        # the two to diverge (the exact scenario that caused the production
+        # double-fee-count defect).
+        "historical_gross_return_pct": (
+            profitable_after_fees_performance if historical_gross_return_pct is _UNSET else historical_gross_return_pct
+        ),
         "expected_value": expected_value,
         "evidence_timestamp": "2026-07-15T00:15:00+00:00",
         "source_identity": {"decision_record_id": "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa"},
@@ -1567,6 +1582,53 @@ async def test_net_edge_missing_expected_edge_fails_closed_with_distinct_reason(
 
 
 @pytest.mark.asyncio
+async def test_net_edge_uses_raw_gross_not_fee_adjusted_avoiding_double_fee_count(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Reproduces the confirmed production defect and its fix: the scorecard's
+    fee-adjusted historical figure (profitable_after_fees_performance) is
+    already net of outcome-scoring's own round-trip fee assumption. Feeding
+    it into the net-edge gate's "gross edge" slot double-charges that cost --
+    the gate's own entry/exit fee constants get subtracted a second time on
+    top of an already fee-adjusted number. This is exactly the production
+    shape: profitable_after_fees_performance is slightly negative (-0.0153),
+    but the true pre-fee (raw) historical return is positive enough that,
+    once the gate's own cost model is applied to the CORRECT (raw) input
+    exactly once, the trade is economically justified."""
+    from app.services.capital_campaign_orchestration.authoritative import compose_campaign_authoritative_cycle
+
+    campaign, db, candle = _net_edge_authoritative_mocks(
+        monkeypatch,
+        profitable_after_fees_performance="-0.0153",  # already fee-adjusted, per production logs
+        historical_gross_return_pct="0.1847",  # the true raw figure (-0.0153 + a 0.20-point historical fee)
+        approved_quantity=Decimal("0.05"),
+    )
+    result = await compose_campaign_authoritative_cycle(db=db, campaign_definition=campaign, trigger="kraken_btc_15m_candle_close", candle=candle)
+
+    # net = 0.1847 (raw) - 0.02 (entry+exit) - 0.01 (slippage) - 0 (buffer) = 0.1547 -- positive.
+    assert result.composition["selected_decision"]["decision_kind"] == "OPEN_POSITION_PROPOSED"
+    candidate = result.composition["eligible_candidates"][0]
+    assert Decimal(candidate["expected_net_edge_pct"]) == Decimal("0.1547")
+
+
+@pytest.mark.asyncio
+async def test_net_edge_does_not_fall_back_to_fee_adjusted_figure_when_raw_is_missing(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Guards against silently re-introducing the double-fee-count defect: if
+    historical_gross_return_pct is unavailable, the gate must fail closed to
+    expected_edge_unavailable, never silently substitute the fee-adjusted
+    profitable_after_fees_performance as a stand-in gross figure."""
+    from app.services.capital_campaign_orchestration.authoritative import compose_campaign_authoritative_cycle
+
+    campaign, db, candle = _net_edge_authoritative_mocks(
+        monkeypatch,
+        profitable_after_fees_performance="4.2",
+        historical_gross_return_pct=None,
+        expected_value=None,
+        approved_quantity=Decimal("0.05"),
+    )
+    result = await compose_campaign_authoritative_cycle(db=db, campaign_definition=campaign, trigger="kraken_btc_15m_candle_close", candle=candle)
+    assert result.composition["selected_decision"]["reason"] == "expected_edge_unavailable"
+
+
+@pytest.mark.asyncio
 async def test_net_edge_five_dollar_notional_arithmetic_is_exact(monkeypatch: pytest.MonkeyPatch) -> None:
     from app.services.capital_campaign_orchestration.authoritative import compose_campaign_authoritative_cycle
 
@@ -1643,7 +1705,7 @@ async def test_net_edge_diagnostic_log_reflects_values_actually_used(monkeypatch
     assert "exit_fee_pct=0.01" in message
     assert "expected_net_edge_pct=4.17" in message
     assert "final_reason_code=accepted" in message
-    assert "edge_provenance=scorecard_profitable_after_fees_performance" in message
+    assert "edge_provenance=scorecard_historical_gross_return_pct" in message
     assert result.composition["selected_decision"]["decision_kind"] == "OPEN_POSITION_PROPOSED"
 
 
@@ -1682,7 +1744,7 @@ async def test_non_positive_net_edge_rejection_explained_log_contains_every_comp
     assert "slippage_pct=0.01" in message
     assert "slippage_dollars=0.0005" in message
     assert "historical_profitability_metric=0.02" in message
-    assert "profitability_source=scorecard_profitable_after_fees_performance" in message
+    assert "profitability_source=scorecard_historical_gross_return_pct" in message
     assert "expected_net_edge_pct=-0.01" in message
     assert "expected_net_dollars=-0.0005" in message
     assert "rejection_threshold_net_dollars=0" in message

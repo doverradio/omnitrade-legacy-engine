@@ -79,14 +79,26 @@ _INTERVAL_INGESTION_GRACE_MINUTES = {
 }
 
 # Net-edge cost assumptions, expressed in percentage POINTS (i.e. "0.01" means
-# 0.01%), commensurable with expected_gross_edge_pct (which is itself a
-# percentage-points figure, e.g. average_fee_adjusted_return_pct). These are
-# conservative placeholder assumptions -- no per-venue live fee schedule or
-# real bid/ask spread is wired into this evaluation yet, so a round-trip
-# (entry + exit) cost is charged explicitly rather than left undocumented.
-# There is currently no approved "required profit buffer" policy anywhere in
-# the codebase, so that term is an explicit, logged zero rather than a hidden
+# 0.01%), commensurable with expected_gross_edge_pct. These are conservative
+# placeholder assumptions -- no per-venue live fee schedule or real bid/ask
+# spread is wired into this evaluation yet, so a round-trip (entry + exit)
+# cost is charged explicitly rather than left undocumented. There is
+# currently no approved "required profit buffer" policy anywhere in the
+# codebase, so that term is an explicit, logged zero rather than a hidden
 # default.
+#
+# IMPORTANT: expected_gross_edge_pct must be a genuinely pre-fee (raw) return
+# figure -- it is sourced from the outcome-scoring scorecard's action-scoped
+# average_RAW_return_pct, never the fee-adjusted one. Confirmed production
+# defect: an earlier version of this gate sourced expected_gross_edge_pct
+# from the scorecard's average_fee_adjusted_return_pct, which already
+# subtracts a round-trip fee (OUTCOME_SCORING_FEE_BPS, doubled for entry+exit)
+# from the raw historical return -- so despite the "gross" name, that figure
+# was already net of a ~0.20%-point cost, and this gate's own
+# ENTRY_FEE_PCT+EXIT_FEE_PCT+SLIPPAGE_PCT were then charged a second time on
+# top of it, systematically biasing every BUY/SELL rejection negative by
+# roughly the historical fee assumption. Fixed by sourcing the raw (pre-fee)
+# average instead, so the full cost model below is applied exactly once.
 _NET_EDGE_ENTRY_FEE_PCT = Decimal("0.01")
 _NET_EDGE_EXIT_FEE_PCT = Decimal("0.01")
 _NET_EDGE_SLIPPAGE_PCT = Decimal("0.01")
@@ -635,6 +647,21 @@ def _build_aggregate_evidence_dict(
             action_scoped_profitability = scorecard_summary.aggregate.sell_average_fee_adjusted_return_pct
         elif final_action == "HOLD":
             action_scoped_profitability = scorecard_summary.aggregate.hold_average_fee_adjusted_return_pct
+    # Confirmed production defect: the net-edge gate previously sourced its
+    # "gross" edge input from action_scoped_profitability above, which is
+    # already net of outcome-scoring's own round-trip fee assumption
+    # (OUTCOME_SCORING_FEE_BPS) -- so a genuinely gross (pre-fee) figure is
+    # computed separately here, from the action-scoped RAW return average,
+    # never the fee-adjusted one, so the net-edge gate's own cost model is
+    # the only cost ever applied to it.
+    action_scoped_raw_profitability = None
+    if scorecard_summary is not None:
+        if final_action == "BUY":
+            action_scoped_raw_profitability = scorecard_summary.aggregate.buy_average_raw_return_pct
+        elif final_action == "SELL":
+            action_scoped_raw_profitability = scorecard_summary.aggregate.sell_average_raw_return_pct
+        elif final_action == "HOLD":
+            action_scoped_raw_profitability = scorecard_summary.aggregate.hold_average_raw_return_pct
     return {
         "authority_class": "AUTHORITATIVE",
         "source_type": "strategy_decision_aggregator",
@@ -657,6 +684,14 @@ def _build_aggregate_evidence_dict(
         "profitable_after_fees_performance": None
         if action_scoped_profitability is None
         else format(action_scoped_profitability, "f"),
+        # historical_gross_return_pct is the genuinely pre-fee figure -- this,
+        # not profitable_after_fees_performance, is what the net-edge gate
+        # must use as its gross-edge input (see the module-level comment on
+        # _NET_EDGE_ENTRY_FEE_PCT for why treating the fee-adjusted figure as
+        # gross double-counted the round-trip cost).
+        "historical_gross_return_pct": None
+        if action_scoped_raw_profitability is None
+        else format(action_scoped_raw_profitability, "f"),
         "expected_value": None,
         "evidence_timestamp": candle_close_time.isoformat(),
         "scorecard": None
@@ -675,6 +710,12 @@ def _build_aggregate_evidence_dict(
             "action_scoped_average_fee_adjusted_return_pct": None
             if action_scoped_profitability is None
             else format(action_scoped_profitability, "f"),
+            "blended_average_raw_return_pct": None
+            if scorecard_summary.aggregate.average_raw_return_pct is None
+            else format(scorecard_summary.aggregate.average_raw_return_pct, "f"),
+            "action_scoped_average_raw_return_pct": None
+            if action_scoped_raw_profitability is None
+            else format(action_scoped_raw_profitability, "f"),
             "aggregate_overall_correct_pct": None
             if scorecard_summary.aggregate.overall_correct_pct is None
             else format(scorecard_summary.aggregate.overall_correct_pct, "f"),
@@ -2240,8 +2281,13 @@ async def compose_campaign_authoritative_cycle(
             position["position"] is not None and position["position"].get("profitability") is not None
         )
 
-        expected_gross_edge_source = strategy.get("profitable_after_fees_performance")
-        edge_provenance = "scorecard_profitable_after_fees_performance"
+        # historical_gross_return_pct, not profitable_after_fees_performance:
+        # the latter is already net of outcome-scoring's own round-trip fee
+        # assumption, so treating it as "gross" here would double-count that
+        # cost against entry_fee_pct/exit_fee_pct below (confirmed production
+        # defect -- see the module-level comment on _NET_EDGE_ENTRY_FEE_PCT).
+        expected_gross_edge_source = strategy.get("historical_gross_return_pct")
+        edge_provenance = "scorecard_historical_gross_return_pct"
         if expected_gross_edge_source is None:
             expected_gross_edge_source = strategy.get("expected_value")
             edge_provenance = "expected_value_field"

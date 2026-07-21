@@ -54,6 +54,15 @@ class StrategyScorecardBucket:
     buy_average_fee_adjusted_return_pct: Decimal | None = None
     sell_average_fee_adjusted_return_pct: Decimal | None = None
     hold_average_fee_adjusted_return_pct: Decimal | None = None
+    # Action-specific RAW (pre-fee) return averages. This is the genuinely
+    # "gross" figure -- callers computing an expected NET edge (i.e. that will
+    # apply their own fee/slippage model on top) must source their gross
+    # input from here, never from the *_average_fee_adjusted_return_pct
+    # fields above, which are already net of outcome-scoring's own round-trip
+    # fee assumption. None when there is no evidence for that action.
+    buy_average_raw_return_pct: Decimal | None = None
+    sell_average_raw_return_pct: Decimal | None = None
+    hold_average_raw_return_pct: Decimal | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -430,6 +439,11 @@ async def fetch_strategy_scorecards(
                     return None
                 return sum((item.actual_fee_adjusted_return_pct or Decimal("0") for item in items), Decimal("0")) / Decimal(len(items))
 
+            def _raw_average(items: list[StrategyRosterProposalOutcome]) -> Decimal | None:
+                if not items:
+                    return None
+                return sum((item.actual_raw_return_pct or Decimal("0") for item in items), Decimal("0")) / Decimal(len(items))
+
             overall_correct_pct = None
             raw_avg = None
             fee_avg = None
@@ -459,6 +473,9 @@ async def fetch_strategy_scorecards(
                 buy_average_fee_adjusted_return_pct=_round(_fee_adjusted_average(buy_items)),
                 sell_average_fee_adjusted_return_pct=_round(_fee_adjusted_average(sell_items)),
                 hold_average_fee_adjusted_return_pct=_round(_fee_adjusted_average(hold_items)),
+                buy_average_raw_return_pct=_round(_raw_average(buy_items)),
+                sell_average_raw_return_pct=_round(_raw_average(sell_items)),
+                hold_average_raw_return_pct=_round(_raw_average(hold_items)),
             )
 
         per_horizon: list[StrategyScorecardBucket] = []
