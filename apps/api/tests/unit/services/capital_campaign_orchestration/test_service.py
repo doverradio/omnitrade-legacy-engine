@@ -1437,6 +1437,216 @@ async def test_authoritative_historical_package_conflict_fails_closed(monkeypatc
 #   tests/unit/services/capital_campaign_orchestration/test_strategy_decision_aggregator_integration.py
 
 
+def _net_edge_authoritative_mocks(
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    profitable_after_fees_performance: str | None,
+    expected_value: str | None = None,
+    approved_quantity: Decimal,
+    price: Decimal = Decimal("100"),
+    min_order_notional: Decimal = Decimal("5"),
+):
+    """Shared fixture for compose_campaign_authoritative_cycle net-edge-gate tests.
+
+    Mirrors test_authoritative_open_candidate_selects_best's mocking style so a
+    single BUY candidate reaches the net-edge gate with a risk-approved
+    quantity supplied directly by the caller (no capital-cap rejection noise).
+    """
+    campaign = SimpleNamespace(
+        campaign_id=UUID("aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa"),
+        version=1,
+        runtime_campaign_uuid=UUID("bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb"),
+        allowed_instruments=["BTC-USD"],
+        remaining_unallocated_capital=Decimal("25"),
+        maximum_position_size=Decimal("10"),
+        minimum_position_size=Decimal("2"),
+        maximum_total_exposure=Decimal("20"),
+    )
+    runtime_campaign = SimpleNamespace(id=17, paper_account_id=UUID("12345678-1234-1234-1234-1234567890ab"), exchange="kraken_spot", current_equity=Decimal("25"), status="READY")
+    paper_account = SimpleNamespace(id=runtime_campaign.paper_account_id, starting_balance=Decimal("25"))
+    candle = SimpleNamespace(asset_id=UUID("dddddddd-dddd-dddd-dddd-dddddddddddd"), close=price, close_time=datetime(2026, 7, 15, 0, 15, tzinfo=timezone.utc), interval="15m", open_time=datetime(2026, 7, 15, 0, 0, tzinfo=timezone.utc))
+    asset = SimpleNamespace(id=UUID("eeeeeeee-eeee-eeee-eeee-eeeeeeeeeeee"), exchange="kraken_spot", base_currency="USD", min_order_notional=min_order_notional, qty_step_size=None, supports_fractional=True)
+    market = {"authority_class": "AUTHORITATIVE", "reason": "market data resolved from canonical asset and candle tables", "freshness": "fresh", "close_price": format(price, "f")}
+    strategy = {
+        "authority_class": "AUTHORITATIVE",
+        "strategy_identity": "ma_crossover@1",
+        "strategy_version": "1",
+        "action": "BUY",
+        "confidence": "0.8",
+        "sample_size": 12,
+        "profitable_after_fees_performance": profitable_after_fees_performance,
+        "expected_value": expected_value,
+        "evidence_timestamp": "2026-07-15T00:15:00+00:00",
+        "source_identity": {"decision_record_id": "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa"},
+    }
+    position = {"authority_class": "AUTHORITATIVE", "position": None, "lifecycle": None, "profitability": None}
+    risk_context = SimpleNamespace(
+        account_equity=Decimal("25"), start_of_day_equity=Decimal("25"), current_equity=Decimal("25"),
+        max_position_size_pct=Decimal("0.10"), max_daily_loss_pct=Decimal("0.03"), high_water_mark_equity=Decimal("25"),
+        max_drawdown_pct=Decimal("0.10"), consecutive_losses_on_pair=0, cooldown_after_losses=3, last_loss_at=None,
+        cooldown_duration_minutes=Decimal("1440"), evaluation_time=datetime(2026, 7, 15, 0, 16, tzinfo=timezone.utc),
+        data_is_stale=False, data_has_gaps=False, global_kill_switch_engaged_state=False, global_kill_switch_rearm_required=False,
+        account_kill_switch_engaged_state=False, account_kill_switch_rearm_required=False, global_kill_switch_state_observed=True,
+        account_kill_switch_state_observed=True, risk_policy_source="module_fallback_default",
+    )
+
+    class _Db:
+        async def scalar(self, _statement):
+            return paper_account
+
+    monkeypatch.setattr("app.services.capital_campaign_orchestration.authoritative._load_runtime_campaign", _async_return(runtime_campaign))
+    monkeypatch.setattr("app.services.capital_campaign_orchestration.authoritative._load_market_evidence", _async_return((market, asset, candle)))
+    monkeypatch.setattr("app.services.capital_campaign_orchestration.authoritative.resolve_and_persist_strategy_aggregate_evidence", _async_return((strategy, None)))
+    monkeypatch.setattr("app.services.capital_campaign_orchestration.authoritative._load_position_evidence", _async_return(position))
+    monkeypatch.setattr("app.services.capital_campaign_orchestration.authoritative.resolve_execution_risk_context", _async_return(risk_context))
+    monkeypatch.setattr("app.services.capital_campaign_orchestration.authoritative.evaluate_signal_risk", lambda **_kwargs: RiskEvaluationResult(action=RiskDecisionAction.APPROVE, reason_code=None, approved_quantity=approved_quantity, steps=[]))
+    monkeypatch.setattr("app.services.capital_campaign_orchestration.authoritative.persist_risk_decision", _async_return(SimpleNamespace(risk_event_id=UUID("ffffffff-ffff-ffff-ffff-ffffffffffff"))))
+    monkeypatch.setattr("app.services.capital_campaign_orchestration.authoritative.build_campaign_preview", lambda **_kwargs: SimpleNamespace(model_dump=lambda **_dump_kwargs: {"no_action": False, "preview": "stub"}))
+    return campaign, _Db(), candle
+
+
+@pytest.mark.asyncio
+async def test_net_edge_positive_gross_but_negative_after_costs_rejects(monkeypatch: pytest.MonkeyPatch) -> None:
+    from app.services.capital_campaign_orchestration.authoritative import compose_campaign_authoritative_cycle
+
+    # gross edge 0.02% < round-trip fees (0.02%) + slippage (0.01%) = 0.03% -> net negative despite positive gross.
+    campaign, db, candle = _net_edge_authoritative_mocks(
+        monkeypatch, profitable_after_fees_performance="0.02", approved_quantity=Decimal("0.05")
+    )
+    result = await compose_campaign_authoritative_cycle(db=db, campaign_definition=campaign, trigger="kraken_btc_15m_candle_close", candle=candle)
+    assert result.composition["selected_decision"]["decision_kind"] == "HOLD"
+    assert result.composition["selected_decision"]["reason"] == "non_positive_net_edge"
+    assert result.composition["eligible_candidates"] == []
+    assert result.composition["rejected_candidates"][0]["reason"] == "non_positive_net_edge"
+
+
+@pytest.mark.asyncio
+async def test_net_edge_positive_above_threshold_permits_continuation(monkeypatch: pytest.MonkeyPatch) -> None:
+    from app.services.capital_campaign_orchestration.authoritative import compose_campaign_authoritative_cycle
+
+    campaign, db, candle = _net_edge_authoritative_mocks(
+        monkeypatch, profitable_after_fees_performance="4.2", approved_quantity=Decimal("0.05")
+    )
+    result = await compose_campaign_authoritative_cycle(db=db, campaign_definition=campaign, trigger="kraken_btc_15m_candle_close", candle=candle)
+    assert result.composition["selected_decision"]["decision_kind"] == "OPEN_POSITION_PROPOSED"
+    assert result.composition["failed_closed"] is False
+    candidate = result.composition["eligible_candidates"][0]
+    assert Decimal(candidate["expected_net_dollars"]) == Decimal("0.2085")
+
+
+@pytest.mark.asyncio
+async def test_net_edge_exactly_zero_rejects(monkeypatch: pytest.MonkeyPatch) -> None:
+    from app.services.capital_campaign_orchestration.authoritative import compose_campaign_authoritative_cycle
+
+    # gross edge 0.03% exactly equals round-trip fees (0.02%) + slippage (0.01%) -> net edge is exactly zero.
+    campaign, db, candle = _net_edge_authoritative_mocks(
+        monkeypatch, profitable_after_fees_performance="0.03", approved_quantity=Decimal("0.05")
+    )
+    result = await compose_campaign_authoritative_cycle(db=db, campaign_definition=campaign, trigger="kraken_btc_15m_candle_close", candle=candle)
+    assert result.composition["selected_decision"]["decision_kind"] == "HOLD"
+    assert result.composition["selected_decision"]["reason"] == "non_positive_net_edge"
+
+
+@pytest.mark.asyncio
+async def test_net_edge_missing_expected_edge_fails_closed_with_distinct_reason(monkeypatch: pytest.MonkeyPatch) -> None:
+    from app.services.capital_campaign_orchestration.authoritative import compose_campaign_authoritative_cycle
+
+    # Brand-new proving campaign: no scorecard history yet for the dominant
+    # contributor, so both expected-edge sources are None. This must fail
+    # closed with a reason distinct from "we evaluated the edge and it was
+    # non-positive" -- silently treating "unknown" as "zero" was the
+    # confirmed production defect.
+    campaign, db, candle = _net_edge_authoritative_mocks(
+        monkeypatch, profitable_after_fees_performance=None, expected_value=None, approved_quantity=Decimal("0.05")
+    )
+    result = await compose_campaign_authoritative_cycle(db=db, campaign_definition=campaign, trigger="kraken_btc_15m_candle_close", candle=candle)
+    assert result.composition["failed_closed"] is True
+    assert result.composition["selected_decision"]["decision_kind"] == "MANUAL_REVIEW_REQUIRED"
+    assert result.composition["selected_decision"]["reason"] == "expected_edge_unavailable"
+    assert result.composition["rejected_candidates"][0]["reason"] == "expected_edge_unavailable"
+
+
+@pytest.mark.asyncio
+async def test_net_edge_five_dollar_notional_arithmetic_is_exact(monkeypatch: pytest.MonkeyPatch) -> None:
+    from app.services.capital_campaign_orchestration.authoritative import compose_campaign_authoritative_cycle
+
+    # Exact production-shape case: $5 notional (0.05 BTC @ $100), 4.2% gross edge.
+    campaign, db, candle = _net_edge_authoritative_mocks(
+        monkeypatch, profitable_after_fees_performance="4.2", approved_quantity=Decimal("0.05"), price=Decimal("100")
+    )
+    result = await compose_campaign_authoritative_cycle(db=db, campaign_definition=campaign, trigger="kraken_btc_15m_candle_close", candle=candle)
+    candidate = result.composition["eligible_candidates"][0]
+    assert Decimal(candidate["expected_net_edge_pct"]) == Decimal("4.17")
+    assert Decimal(candidate["expected_net_dollars"]) == Decimal("0.2085")
+    assert Decimal(candidate["expected_fees"]) == Decimal("0.0010")
+    assert Decimal(candidate["expected_slippage"]) == Decimal("0.0005")
+    assert result.composition["rejected_candidates"] == []
+
+
+@pytest.mark.asyncio
+async def test_net_edge_round_trip_fees_counted_exactly_once(monkeypatch: pytest.MonkeyPatch) -> None:
+    from app.services.capital_campaign_orchestration.authoritative import compose_campaign_authoritative_cycle
+
+    campaign, db, candle = _net_edge_authoritative_mocks(
+        monkeypatch, profitable_after_fees_performance="4.2", approved_quantity=Decimal("0.05")
+    )
+    result = await compose_campaign_authoritative_cycle(db=db, campaign_definition=campaign, trigger="kraken_btc_15m_candle_close", candle=candle)
+    candidate = result.composition["eligible_candidates"][0]
+    approved_notional = Decimal("5")
+    entry_fee = (Decimal("0.01") / Decimal("100")) * approved_notional
+    exit_fee = (Decimal("0.01") / Decimal("100")) * approved_notional
+    # expected_fees must equal ENTRY + EXIT summed once each, not a single
+    # leg doubled and not a full round trip applied twice.
+    assert Decimal(candidate["expected_fees"]) == entry_fee + exit_fee
+    assert Decimal(candidate["expected_fees"]) == Decimal("0.001")
+
+
+@pytest.mark.asyncio
+async def test_non_positive_net_edge_hold_preserves_existing_decision_record_id(monkeypatch: pytest.MonkeyPatch) -> None:
+    from app.services.capital_campaign_orchestration.authoritative import compose_campaign_authoritative_cycle
+
+    # The strategy-roster aggregate's BUY vote already has an immutable
+    # DecisionRecord (created by _persist_strategy_aggregate_decision,
+    # surfaced here as strategy["source_identity"]["decision_record_id"]).
+    # A campaign-level HOLD/rejection on top of that vote must not orphan
+    # this linkage -- production showed decision_record_id=None on every
+    # non_positive_net_edge rejection despite the record existing.
+    campaign, db, candle = _net_edge_authoritative_mocks(
+        monkeypatch, profitable_after_fees_performance="0.02", approved_quantity=Decimal("0.05")
+    )
+    result = await compose_campaign_authoritative_cycle(db=db, campaign_definition=campaign, trigger="kraken_btc_15m_candle_close", candle=candle)
+    assert result.composition["selected_decision"]["reason"] == "non_positive_net_edge"
+    assert result.composition["decision_record_id"] == "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa"
+    assert result.composition["selected_decision"]["decision_record_id"] == "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa"
+    assert result.composition["rejected_candidates"][0]["decision_record_id"] == "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa"
+
+
+@pytest.mark.asyncio
+async def test_net_edge_diagnostic_log_reflects_values_actually_used(monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture) -> None:
+    from app.services.capital_campaign_orchestration.authoritative import compose_campaign_authoritative_cycle
+
+    campaign, db, candle = _net_edge_authoritative_mocks(
+        monkeypatch, profitable_after_fees_performance="4.2", approved_quantity=Decimal("0.05")
+    )
+    with caplog.at_level(logging.INFO, logger="app.services.capital_campaign_orchestration.authoritative"):
+        result = await compose_campaign_authoritative_cycle(db=db, campaign_definition=campaign, trigger="kraken_btc_15m_candle_close", candle=candle)
+
+    net_edge_records = [record for record in caplog.records if record.getMessage().startswith("net_edge_evaluated ")]
+    assert len(net_edge_records) == 1
+    message = net_edge_records[0].getMessage()
+    assert "instrument=BTC-USD" in message
+    assert "side=buy" in message
+    assert "reference_price=100" in message
+    assert "approved_notional=5.00" in message
+    assert "expected_gross_edge_pct=4.2" in message
+    assert "entry_fee_pct=0.01" in message
+    assert "exit_fee_pct=0.01" in message
+    assert "expected_net_edge_pct=4.17" in message
+    assert "final_reason_code=accepted" in message
+    assert "edge_provenance=scorecard_profitable_after_fees_performance" in message
+    assert result.composition["selected_decision"]["decision_kind"] == "OPEN_POSITION_PROPOSED"
+
+
 @pytest.mark.asyncio
 async def test_market_evidence_15m_freshness_boundaries(monkeypatch: pytest.MonkeyPatch) -> None:
     from app.services.capital_campaign_orchestration.authoritative import _load_market_evidence

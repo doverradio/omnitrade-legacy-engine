@@ -78,6 +78,20 @@ _INTERVAL_INGESTION_GRACE_MINUTES = {
     "15m": _DEFAULT_INGESTION_GRACE_MINUTES,
 }
 
+# Net-edge cost assumptions, expressed in percentage POINTS (i.e. "0.01" means
+# 0.01%), commensurable with expected_gross_edge_pct (which is itself a
+# percentage-points figure, e.g. average_fee_adjusted_return_pct). These are
+# conservative placeholder assumptions -- no per-venue live fee schedule or
+# real bid/ask spread is wired into this evaluation yet, so a round-trip
+# (entry + exit) cost is charged explicitly rather than left undocumented.
+# There is currently no approved "required profit buffer" policy anywhere in
+# the codebase, so that term is an explicit, logged zero rather than a hidden
+# default.
+_NET_EDGE_ENTRY_FEE_PCT = Decimal("0.01")
+_NET_EDGE_EXIT_FEE_PCT = Decimal("0.01")
+_NET_EDGE_SLIPPAGE_PCT = Decimal("0.01")
+_NET_EDGE_REQUIRED_PROFIT_BUFFER_PCT = Decimal("0")
+
 
 def _interval_minutes(interval: str | None) -> int | None:
     value = str(interval or "").strip().lower()
@@ -237,6 +251,7 @@ def _primary_rejection_reason(*, rejected_candidates: list[dict[str, Any]], fail
             "asset_mapping_unavailable",
             "provider_product_unsupported",
             "ambiguous_market_source",
+            "expected_edge_unavailable",
         ]
     else:
         priority = [
@@ -1903,7 +1918,7 @@ async def compose_campaign_authoritative_cycle(
                 "availability": "unavailable",
                 "reason": "risk_unavailable",
             }
-            rejected_candidates.append({"instrument": instrument, "reason": "risk_unavailable", "market": market, "strategy": strategy, "position": position})
+            rejected_candidates.append({"instrument": instrument, "reason": "risk_unavailable", "market": market, "strategy": strategy, "position": position, "decision_record_id": decision_record_id})
             continue
 
         risk_context = await resolve_execution_risk_context(db=db, paper_account=paper_account, asset=asset)
@@ -2140,24 +2155,10 @@ async def compose_campaign_authoritative_cycle(
                     "final_amount": "0",
                 },
             }
-            rejected_candidates.append({"instrument": instrument, "reason": "risk_unavailable", "market": market, "strategy": strategy, "position": position, "risk": risk_summary})
+            rejected_candidates.append({"instrument": instrument, "reason": "risk_unavailable", "market": market, "strategy": strategy, "position": position, "risk": risk_summary, "decision_record_id": decision_record_id})
             risk_outputs[instrument] = risk_summary
             continue
         risk_outputs[instrument] = risk_summary
-
-        expected_gross_edge = strategy.get("profitable_after_fees_performance")
-        if expected_gross_edge is None and strategy.get("expected_value") is not None:
-            expected_gross_edge = strategy.get("expected_value")
-        expected_gross_edge_decimal = Decimal(str(expected_gross_edge or "0"))
-        expected_fees = Decimal(str(candle_item.close)) * Decimal("0.0001")
-        expected_slippage = Decimal(str(candle_item.close)) * Decimal("0.0001")
-        expected_net_edge = expected_gross_edge_decimal - expected_fees - expected_slippage
-        expected_net_dollars = expected_net_edge * Decimal(str(candle_item.close)) / Decimal("100")
-        if position["position"] is not None and position["position"].get("profitability") is not None:
-            expected_net_dollars = Decimal(str(position["position"]["expected_net_pnl_if_sold_now"] or "0"))
-            current_market_value = Decimal(str(position["position"]["current_market_value"] or "0"))
-            if current_market_value > 0:
-                expected_net_edge = (expected_net_dollars / current_market_value) * Decimal("100")
 
         if risk_summary["verdict"] == "VETO":
             if risk_summary["reason"] == "position_below_minimum_order_size":
@@ -2201,14 +2202,117 @@ async def compose_campaign_authoritative_cycle(
                     risk_result.reason_code,
                     [f"{step.step}:{step.status}:{step.reason_code}" for step in risk_result.steps],
                 )
-            rejected_candidates.append({"instrument": instrument, "reason": risk_summary["reason"], "market": market, "strategy": strategy, "position": position, "risk": risk_summary})
+            rejected_candidates.append({"instrument": instrument, "reason": risk_summary["reason"], "market": market, "strategy": strategy, "position": position, "risk": risk_summary, "decision_record_id": decision_record_id})
             continue
+
+        # has_position_pnl_override: the CLOSE_CANDIDATE path has its own,
+        # already-computed real dollar P&L from position tracking
+        # (expected_net_pnl_if_sold_now / current_market_value) and is not
+        # subject to the aggregate strategy evidence gap below.
+        has_position_pnl_override = (
+            position["position"] is not None and position["position"].get("profitability") is not None
+        )
+
+        expected_gross_edge_source = strategy.get("profitable_after_fees_performance")
+        edge_provenance = "scorecard_profitable_after_fees_performance"
+        if expected_gross_edge_source is None:
+            expected_gross_edge_source = strategy.get("expected_value")
+            edge_provenance = "expected_value_field"
+        if expected_gross_edge_source is None:
+            edge_provenance = "unavailable"
+        missing_expected_edge = expected_gross_edge_source is None and not has_position_pnl_override
+
+        entry_fee_pct = _NET_EDGE_ENTRY_FEE_PCT
+        exit_fee_pct = _NET_EDGE_EXIT_FEE_PCT
+        round_trip_fee_pct = entry_fee_pct + exit_fee_pct
+        slippage_pct = _NET_EDGE_SLIPPAGE_PCT
+        required_profit_buffer_pct = _NET_EDGE_REQUIRED_PROFIT_BUFFER_PCT
+
+        # approved_notional is the ACTUAL notional the risk engine approved
+        # for this candidate (post-resize), not a hypothetical 1-unit
+        # position -- expected_net_dollars must scale with what is really
+        # being risked, per the $5 proving-campaign notional.
+        approved_quantity_decimal = Decimal(str(risk_summary.get("approved_quantity") or "0"))
+        approved_notional = approved_quantity_decimal * price
+
+        expected_gross_edge_pct: Decimal | None
+        if expected_gross_edge_source is None:
+            expected_gross_edge_pct = None
+            expected_net_edge = None
+            expected_net_dollars = Decimal("0")
+        else:
+            expected_gross_edge_pct = Decimal(str(expected_gross_edge_source))
+            expected_net_edge = expected_gross_edge_pct - round_trip_fee_pct - slippage_pct - required_profit_buffer_pct
+            expected_net_dollars = (expected_net_edge / Decimal("100")) * approved_notional
+
+        entry_fee_amount = (entry_fee_pct / Decimal("100")) * approved_notional
+        exit_fee_amount = (exit_fee_pct / Decimal("100")) * approved_notional
+        round_trip_fee_amount = entry_fee_amount + exit_fee_amount
+        expected_fees = round_trip_fee_amount
+        slippage_amount = (slippage_pct / Decimal("100")) * approved_notional
+        expected_slippage = slippage_amount
+        required_profit_buffer_amount = (required_profit_buffer_pct / Decimal("100")) * approved_notional
+
+        if has_position_pnl_override:
+            expected_net_dollars = Decimal(str(position["position"]["expected_net_pnl_if_sold_now"] or "0"))
+            current_market_value = Decimal(str(position["position"]["current_market_value"] or "0"))
+            if current_market_value > 0:
+                expected_net_edge = (expected_net_dollars / current_market_value) * Decimal("100")
+
+        if transition == "CLOSE_CANDIDATE":
+            final_reason_code = "close_position_proposed" if expected_net_dollars > Decimal("0") else "hold_position"
+        elif missing_expected_edge:
+            final_reason_code = "expected_edge_unavailable"
+        elif expected_net_dollars <= Decimal("0"):
+            final_reason_code = "non_positive_net_edge"
+        else:
+            final_reason_code = "accepted"
+
+        logger.info(
+            "net_edge_evaluated campaign_id=%s campaign_version=%s instrument=%s side=%s strategy_identity=%s "
+            "reference_price=%s bid=%s ask=%s requested_notional=%s approved_notional=%s "
+            "expected_gross_edge_pct=%s expected_gross_profit=%s entry_fee_pct=%s exit_fee_pct=%s "
+            "round_trip_fee_amount=%s spread_pct=%s spread_amount=%s slippage_pct=%s slippage_amount=%s "
+            "required_profit_buffer_pct=%s required_profit_buffer_amount=%s expected_net_edge_pct=%s "
+            "expected_net_profit=%s minimum_required_net_edge_pct=%s final_reason_code=%s edge_provenance=%s "
+            "missing_input_flags=%s",
+            campaign_definition.campaign_id,
+            campaign_definition.version,
+            instrument,
+            side,
+            strategy_identity,
+            price,
+            None,
+            None,
+            quantity * price,
+            approved_notional,
+            None if expected_gross_edge_pct is None else expected_gross_edge_pct,
+            None if expected_gross_edge_pct is None else (expected_gross_edge_pct / Decimal("100")) * approved_notional,
+            entry_fee_pct,
+            exit_fee_pct,
+            round_trip_fee_amount,
+            None,
+            None,
+            slippage_pct,
+            slippage_amount,
+            required_profit_buffer_pct,
+            required_profit_buffer_amount,
+            None if expected_net_edge is None else expected_net_edge,
+            expected_net_dollars,
+            Decimal("0"),
+            final_reason_code,
+            edge_provenance,
+            [] if not missing_expected_edge else ["expected_gross_edge"],
+        )
 
         candidate_kind = "ADD_POSITION_PROPOSED" if transition == "ADD_CANDIDATE" else "OPEN_POSITION_PROPOSED"
         if transition == "CLOSE_CANDIDATE":
             candidate_kind = "CLOSE_POSITION_PROPOSED" if expected_net_dollars > Decimal("0") else "HOLD_POSITION"
+        elif missing_expected_edge:
+            rejected_candidates.append({"instrument": instrument, "reason": "expected_edge_unavailable", "market": market, "strategy": strategy, "position": position, "risk": risk_summary, "decision_record_id": decision_record_id})
+            continue
         elif expected_net_dollars <= Decimal("0"):
-            rejected_candidates.append({"instrument": instrument, "reason": "non_positive_net_edge", "market": market, "strategy": strategy, "position": position, "risk": risk_summary})
+            rejected_candidates.append({"instrument": instrument, "reason": "non_positive_net_edge", "market": market, "strategy": strategy, "position": position, "risk": risk_summary, "decision_record_id": decision_record_id})
             continue
 
         candidate_rows.append(
@@ -2216,7 +2320,7 @@ async def compose_campaign_authoritative_cycle(
                 "instrument": instrument,
                 "decision_kind": candidate_kind,
                 "expected_net_dollars": format(expected_net_dollars, "f"),
-                "expected_net_edge_pct": format(expected_net_edge, "f"),
+                "expected_net_edge_pct": format(expected_net_edge if expected_net_edge is not None else Decimal("0"), "f"),
                 "risk_adjusted_score": format(expected_net_dollars * (Decimal(str(strategy.get("confidence") or "1")) if strategy.get("confidence") is not None else Decimal("1")), "f"),
                 "confidence": strategy.get("confidence"),
                 "sample_size": strategy.get("sample_size"),
@@ -2256,6 +2360,7 @@ async def compose_campaign_authoritative_cycle(
         "asset_mapping_unavailable",
         "provider_product_unsupported",
         "ambiguous_market_source",
+        "expected_edge_unavailable",
     }
     failed_closed = bool(rejected_candidates) and not candidate_rows and any(item.get("reason") in critical_rejections for item in rejected_candidates)
     if selected is None:

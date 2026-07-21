@@ -42,7 +42,7 @@ from app.services.data.ingestion_status import set_last_successful_full_pipeline
 from app.services.decision_quality.deterministic import evaluate_replay_result_v0
 from app.services.decisions.ingestion import build_signal_idempotency_key
 from app.services.decisions.package import DecisionPackageBuilder
-from app.services.data.worker_entrypoint import run_ingestion_cycle
+from app.services.data.worker_entrypoint import KRAKEN_CANDLE_INTERVAL, run_ingestion_cycle
 from app.services.decisions.ingestion import ingest_decision_records
 from app.services.replay.default_agent import ReplayPackageNotFoundError, replay_decision_package_v0
 from app.services.replay.identifiers import build_decision_package_id
@@ -56,6 +56,7 @@ from app.services.capital_campaign_orchestration import run_campaign_orchestrati
 from app.services.orchestration.venue_commissioning_bridge import service as venue_commissioning_service
 from app.services.strategy_outcomes import score_due_strategy_roster_proposal_outcomes
 from app.services.strategy_roster import StrategyRosterRequest, run_strategy_roster_for_candle
+from app.services.strategy_roster.decision_aggregator import AGGREGATE_STRATEGY_SLUG
 
 logger = logging.getLogger(__name__)
 
@@ -133,6 +134,17 @@ class CycleStats:
     decisions_inserted: int
     research_cycles_started: int
     intelligence_snapshots_captured: int
+
+
+def _resolve_candle_interval_for_asset(*, asset: Asset, config: WorkerConfig) -> str:
+    # run_ingestion_cycle (worker_entrypoint.py) always writes Kraken candles
+    # at KRAKEN_CANDLE_INTERVAL regardless of the configured
+    # ORCHESTRATION_CANDLE_INTERVAL default -- querying a Kraken asset with
+    # that default (e.g. "1m") reads a candle interval that is never written,
+    # producing a permanent candle_count=0 for that asset.
+    if asset.exchange == "kraken_spot":
+        return KRAKEN_CANDLE_INTERVAL
+    return config.candle_interval
 
 
 async def _load_active_assets(db: AsyncSession) -> list[Asset]:
@@ -1040,6 +1052,23 @@ async def run_orchestration_cycle(
             )
             continue
 
+        if strategy_row.slug == AGGREGATE_STRATEGY_SLUG:
+            # The aggregate catalog row (app.services.strategy_roster.decision_aggregator)
+            # is a real, active Strategy record purely so canonical package
+            # composition can resolve its identity for binding continuity
+            # (_ensure_aggregate_strategy_catalog_entry in authoritative.py).
+            # It represents the ensemble outcome, not an individually
+            # executable strategy module, so it must never reach the generic
+            # per-strategy paper-execution queue below -- it has no module in
+            # strategy_registry by design, and its Decision Arena/aggregation
+            # role is already fully served by the strategy roster pipeline.
+            logger.info(
+                "paper_execution_skip reason=aggregate_identity_not_executable strategy_id=%s strategy_slug=%s",
+                strategy_row.id,
+                strategy_row.slug,
+            )
+            continue
+
         try:
             strategy_impl = strategy_registry.get(strategy_row.slug)
         except StrategyLookupError:
@@ -1083,19 +1112,21 @@ async def run_orchestration_cycle(
             try:
                 account = None
                 execution = None
+                resolved_candle_interval = _resolve_candle_interval_for_asset(asset=asset, config=config)
                 candles = await _load_latest_candles(
                     db,
                     asset_id=asset.id,
-                    interval=config.candle_interval,
+                    interval=resolved_candle_interval,
                     limit=config.candle_lookback_limit,
                 )
                 if len(candles) < 2:
                     logger.info(
-                        "paper_execution_skip reason=insufficient_candles strategy_id=%s asset_id=%s candle_count=%s minimum_required=%s",
+                        "paper_execution_skip reason=insufficient_candles strategy_id=%s asset_id=%s candle_count=%s minimum_required=%s resolved_candle_interval=%s",
                         strategy_row.id,
                         asset.id,
                         len(candles),
                         2,
+                        resolved_candle_interval,
                     )
                     continue
 
@@ -1120,7 +1151,7 @@ async def run_orchestration_cycle(
                 context = _to_strategy_context(
                     candles=candles,
                     asset=asset,
-                    interval=config.candle_interval,
+                    interval=resolved_candle_interval,
                     strategy_params=parameter_set.params,
                 )
                 generated = strategy_impl.generate_signal(context)

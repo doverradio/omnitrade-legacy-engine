@@ -25,6 +25,14 @@ MVP_POLL_INTERVAL_SECONDS = 300
 MVP_LOOKBACK = timedelta(hours=2)
 MVP_INTERVAL = "1m"
 
+# Kraken candles are always ingested at this fixed interval regardless of the
+# caller-supplied `interval` (see the kraken_spot branch below) -- exported so
+# any other consumer that reads back Kraken candles (e.g. the generic
+# per-strategy paper-execution loop in continuous_pipeline_worker.py) can
+# query with the interval that was actually written, instead of assuming the
+# default MVP_INTERVAL/ORCHESTRATION_CANDLE_INTERVAL applies uniformly.
+KRAKEN_CANDLE_INTERVAL = "15m"
+
 
 @dataclass(slots=True)
 class IngestionCycleResult:
@@ -80,7 +88,7 @@ async def run_ingestion_cycle(
                 continue
 
             source_client = kraken_client
-            source_interval = "15m"
+            source_interval = KRAKEN_CANDLE_INTERVAL
             source_lookback = timedelta(hours=24)
             source_symbol = _kraken_product_symbol(asset)
             provider = "kraken_spot"

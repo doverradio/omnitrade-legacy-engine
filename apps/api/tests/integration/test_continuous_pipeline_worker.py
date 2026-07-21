@@ -12,6 +12,7 @@ from sqlalchemy.exc import PendingRollbackError
 from app.services.orchestration.continuous_pipeline_worker import WorkerConfig, run_orchestration_cycle
 from app.services.strategies.base import Signal
 from app.services.strategies.registry import StrategyLookupError
+from app.services.strategy_roster.decision_aggregator import AGGREGATE_STRATEGY_SLUG
 
 
 class _FakeDB:
@@ -166,6 +167,19 @@ def _strategy_row() -> SimpleNamespace:
 
 def _disabled_strategy_row() -> SimpleNamespace:
     return SimpleNamespace(id=uuid.uuid4(), slug="rsi_mean_reversion", is_active=False)
+
+
+def _aggregate_strategy_row() -> SimpleNamespace:
+    return SimpleNamespace(id=uuid.uuid4(), slug=AGGREGATE_STRATEGY_SLUG, is_active=True)
+
+
+def _kraken_asset() -> SimpleNamespace:
+    return SimpleNamespace(
+        id=uuid.uuid4(),
+        asset_class="crypto",
+        symbol="BTCUSD",
+        exchange="kraken_spot",
+    )
 
 
 def _parameter_set() -> SimpleNamespace:
@@ -776,6 +790,149 @@ async def test_automatic_ready_package_path_never_calls_authorize_activate_dryru
 
 
 @pytest.mark.asyncio
+async def test_bounded_path_shadow_proposal_to_ready_package_without_live_authority(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Task 6: shadow strategy proposals -> authoritative governed aggregate ->
+    risk approval -> positive net edge -> execution-ready package, with
+    exchange submission mocked/disabled throughout.
+
+    Uses the REAL compose_campaign_authoritative_cycle (not a hand-built
+    stand-in composition dict) so the produced OPEN_POSITION_PROPOSED
+    decision genuinely reflects a shadow-mode strategy vote (the roster
+    layer always sets execution_mode=SHADOW/live_submission_allowed=False --
+    see authoritative.py's roster-run/proposal scope check) that clears
+    risk approval and the corrected net-edge gate, then feeds that real
+    composition into _attempt_automatic_ready_package_creation and confirms
+    a READY package is created while authorize/activate/dry_run/provider_submit
+    are never reached.
+    """
+    from decimal import Decimal as _Decimal
+    from datetime import datetime as _datetime, timezone as _timezone
+    from uuid import UUID as _UUID
+
+    import app.services.canonical_preview_package as canonical_package
+    import app.services.live_crypto_orders as live_crypto_orders
+    import app.services.orchestration.continuous_pipeline_worker as worker_module
+    from app.services.capital_campaign_orchestration.authoritative import compose_campaign_authoritative_cycle
+    from app.services.risk import RiskDecisionAction, RiskEvaluationResult
+
+    campaign = SimpleNamespace(
+        campaign_id=_UUID("aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa"),
+        version=3,
+        runtime_campaign_uuid=_UUID("bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb"),
+        allowed_instruments=["BTC-USD"],
+        remaining_unallocated_capital=_Decimal("25"),
+        maximum_position_size=_Decimal("10"),
+        minimum_position_size=_Decimal("2"),
+        maximum_total_exposure=_Decimal("20"),
+    )
+    runtime_campaign = SimpleNamespace(id=17, paper_account_id=_UUID("12345678-1234-1234-1234-1234567890ab"), exchange="kraken_spot", current_equity=_Decimal("25"), status="READY")
+    paper_account = SimpleNamespace(id=runtime_campaign.paper_account_id, starting_balance=_Decimal("25"))
+    candle = SimpleNamespace(asset_id=_UUID("dddddddd-dddd-dddd-dddd-dddddddddddd"), close=_Decimal("100"), close_time=_datetime(2026, 7, 15, 0, 15, tzinfo=_timezone.utc), interval="15m", open_time=_datetime(2026, 7, 15, 0, 0, tzinfo=_timezone.utc))
+    asset = SimpleNamespace(id=_UUID("eeeeeeee-eeee-eeee-eeee-eeeeeeeeeeee"), exchange="kraken_spot", base_currency="USD", min_order_notional=_Decimal("5"), qty_step_size=None, supports_fractional=True)
+    market = {"authority_class": "AUTHORITATIVE", "reason": "market data resolved from canonical asset and candle tables", "freshness": "fresh", "close_price": "100"}
+    # execution_mode/live_submission_allowed here mirror what the strategy
+    # roster layer actually enforces (SHADOW / False) before authoritative.py
+    # will trust a roster run's evidence at all.
+    strategy = {
+        "authority_class": "AUTHORITATIVE",
+        "strategy_identity": "ma_crossover@1",
+        "strategy_version": "1",
+        "action": "BUY",
+        "confidence": "0.8",
+        "sample_size": 12,
+        "profitable_after_fees_performance": "4.2",
+        "expected_value": "4.2",
+        "evidence_timestamp": "2026-07-15T00:15:00+00:00",
+        "source_identity": {"decision_record_id": "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa"},
+        "execution_mode": "SHADOW",
+        "live_submission_allowed": False,
+    }
+    position = {"authority_class": "AUTHORITATIVE", "position": None, "lifecycle": None, "profitability": None}
+    risk_context = SimpleNamespace(
+        account_equity=_Decimal("25"), start_of_day_equity=_Decimal("25"), current_equity=_Decimal("25"),
+        max_position_size_pct=_Decimal("0.10"), max_daily_loss_pct=_Decimal("0.03"), high_water_mark_equity=_Decimal("25"),
+        max_drawdown_pct=_Decimal("0.10"), consecutive_losses_on_pair=0, cooldown_after_losses=3, last_loss_at=None,
+        cooldown_duration_minutes=_Decimal("1440"), evaluation_time=_datetime(2026, 7, 15, 0, 16, tzinfo=_timezone.utc),
+        data_is_stale=False, data_has_gaps=False, global_kill_switch_engaged_state=False, global_kill_switch_rearm_required=False,
+        account_kill_switch_engaged_state=False, account_kill_switch_rearm_required=False, global_kill_switch_state_observed=True,
+        account_kill_switch_state_observed=True, risk_policy_source="module_fallback_default",
+    )
+
+    class _Db:
+        async def scalar(self, _statement):
+            return paper_account
+
+    monkeypatch.setattr("app.services.capital_campaign_orchestration.authoritative._load_runtime_campaign", _async_return(runtime_campaign))
+    monkeypatch.setattr("app.services.capital_campaign_orchestration.authoritative._load_market_evidence", _async_return((market, asset, candle)))
+    monkeypatch.setattr("app.services.capital_campaign_orchestration.authoritative.resolve_and_persist_strategy_aggregate_evidence", _async_return((strategy, None)))
+    monkeypatch.setattr("app.services.capital_campaign_orchestration.authoritative._load_position_evidence", _async_return(position))
+    monkeypatch.setattr("app.services.capital_campaign_orchestration.authoritative.resolve_execution_risk_context", _async_return(risk_context))
+    monkeypatch.setattr("app.services.capital_campaign_orchestration.authoritative.evaluate_signal_risk", lambda **_kwargs: RiskEvaluationResult(action=RiskDecisionAction.APPROVE, reason_code=None, approved_quantity=_Decimal("0.05"), steps=[]))
+    monkeypatch.setattr("app.services.capital_campaign_orchestration.authoritative.persist_risk_decision", _async_return(SimpleNamespace(risk_event_id=_UUID("ffffffff-ffff-ffff-ffff-ffffffffffff"))))
+    monkeypatch.setattr("app.services.capital_campaign_orchestration.authoritative.build_campaign_preview", lambda **_kwargs: SimpleNamespace(model_dump=lambda **_dump_kwargs: {"no_action": False, "preview": "stub"}))
+
+    result = await compose_campaign_authoritative_cycle(db=_Db(), campaign_definition=campaign, trigger="kraken_btc_15m_candle_close", candle=candle)
+    composition = result.composition
+    assert composition["selected_decision"]["decision_kind"] == "OPEN_POSITION_PROPOSED"
+    assert composition["termination_stage"] == "preview_generated"
+    assert composition["failed_closed"] is False
+
+    cycle = SimpleNamespace(
+        cycle_id=uuid.uuid4(),
+        capital_campaign_id=campaign.campaign_id,
+        capital_campaign_version=campaign.version,
+        decision_record_id=_UUID(composition["decision_record_id"]),
+        termination_stage=composition["termination_stage"],
+        proposed_action=composition["proposed_action"],
+        risk_verdict=composition["selected_decision"].get("risk_verdict"),
+        cycle_context={
+            "candle": {"close_time": "2026-07-15T00:15:00+00:00"},
+            "authoritative_composition": composition,
+        },
+    )
+    payload = {"cycles": [{"cycle_id": str(cycle.cycle_id)}]}
+
+    runtime_campaign_for_package = SimpleNamespace(paper_account_id=uuid.uuid4())
+    profile = SimpleNamespace(id=uuid.uuid4())
+    package_calls: list[object] = []
+    live_authority_calls = {"authorize": 0, "activate": 0, "dry_run": 0, "provider_submit": 0}
+
+    async def _fake_create(*, db, request):
+        package_calls.append(request)
+        return {
+            "idempotent": False,
+            "package": {"package_id": str(uuid.uuid4()), "package_state": "READY"},
+            "readiness": {"ready": True, "package_state": "READY"},
+        }
+
+    def _unexpected(name):
+        async def _inner(*args, **kwargs):
+            live_authority_calls[name] += 1
+            raise AssertionError(f"{name} should not be called")
+        return _inner
+
+    monkeypatch.setattr(canonical_package, "authorize_canonical_preview_package", _unexpected("authorize"))
+    monkeypatch.setattr(canonical_package, "activate_canonical_proving_campaign", _unexpected("activate"))
+    monkeypatch.setattr(canonical_package, "run_dry_run_for_canonical_preview_package", _unexpected("dry_run"))
+    monkeypatch.setattr(live_crypto_orders.LiveCryptoOrderService, "submit", _unexpected("provider_submit"))
+
+    monkeypatch.setattr(worker_module, "_load_cycle_by_id", _async_return(cycle))
+    monkeypatch.setattr(worker_module, "_has_active_ready_package_for_opportunity", _async_return(False))
+    monkeypatch.setattr(worker_module, "_has_active_proving_activation", _async_return(False))
+    monkeypatch.setattr(worker_module, "_has_open_live_order", _async_return(False))
+    monkeypatch.setattr(worker_module, "_has_unresolved_reconciliation", _async_return(False))
+    monkeypatch.setattr(worker_module, "_load_runtime_campaign", _async_return(runtime_campaign_for_package))
+    monkeypatch.setattr(worker_module, "_load_live_trading_profile_for_paper_account", _async_return(profile))
+    monkeypatch.setattr(worker_module, "create_canonical_preview_package", _fake_create)
+
+    await worker_module._attempt_automatic_ready_package_creation(db=object(), orchestration_payload=payload)
+
+    assert len(package_calls) == 1
+    assert package_calls[0].max_proposed_order_amount == _Decimal("5")
+    assert live_authority_calls == {"authorize": 0, "activate": 0, "dry_run": 0, "provider_submit": 0}
+
+
+@pytest.mark.asyncio
 async def test_automatic_ready_package_hold_termination_logs_skip_reason(
     monkeypatch: pytest.MonkeyPatch,
     caplog: pytest.LogCaptureFixture,
@@ -1147,6 +1304,139 @@ async def test_disabled_strategy_is_skipped(monkeypatch: pytest.MonkeyPatch) -> 
     generated_signals = [item for item in db.added if item.__class__.__name__ == "Signal"]
     assert len(generated_signals) == 1
     assert generated_signals[0].strategy_id == enabled_strategy.id
+
+
+@pytest.mark.asyncio
+async def test_aggregate_strategy_identity_is_skipped_without_reaching_registry(monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture) -> None:
+    # strategy_roster_aggregate is a real, active Strategy catalog row
+    # (created by _ensure_aggregate_strategy_catalog_entry in authoritative.py
+    # purely for canonical package binding continuity) but is not an
+    # independently executable strategy module. It must be filtered out of
+    # the generic per-strategy paper-execution loop before ever calling
+    # strategy_registry.get, and must never trigger the
+    # "Skipping unregistered strategy" warning -- that warning should be
+    # reserved for genuinely unexpected unregistered slugs.
+    db = _FakeDB()
+    asset = _asset()
+    enabled_strategy = _strategy_row()
+    aggregate_strategy = _aggregate_strategy_row()
+    parameter_set = _parameter_set()
+    registry_lookups: list[str] = []
+
+    def _tracking_get(slug):
+        registry_lookups.append(slug)
+        if slug == AGGREGATE_STRATEGY_SLUG:
+            raise StrategyLookupError(slug)
+        return _FixedStrategy("hold")
+
+    import app.services.orchestration.continuous_pipeline_worker as worker_module
+
+    caplog.set_level(logging.INFO)
+
+    monkeypatch.setattr(worker_module, "run_ingestion_cycle", _fake_ingestion_cycle)
+    monkeypatch.setattr(worker_module, "ingest_decision_records", _fake_decision_ingestion)
+    monkeypatch.setattr(worker_module, "_load_decision_record_for_signal", _async_return(None))
+    monkeypatch.setattr(worker_module, "_produce_research_evidence", _async_return(None))
+    monkeypatch.setattr(worker_module, "_load_active_assets", _async_return([asset]))
+    monkeypatch.setattr(worker_module, "_load_active_strategies", _async_return([enabled_strategy, aggregate_strategy]))
+    monkeypatch.setattr(worker_module, "_load_latest_parameter_set", _async_return(parameter_set))
+    monkeypatch.setattr(worker_module, "_load_latest_candles", _async_return(_candles(2)))
+    monkeypatch.setattr(worker_module, "_signal_exists", _async_return(False))
+    monkeypatch.setattr(worker_module, "_load_primary_account_by_asset_class", _async_return(None))
+    monkeypatch.setattr(worker_module.strategy_registry, "get", _tracking_get)
+
+    stats = await run_orchestration_cycle(db=db, client=object(), config=_config())
+
+    # The genuine strategy still executes normally.
+    assert stats.signals_created == 1
+    generated_signals = [item for item in db.added if item.__class__.__name__ == "Signal"]
+    assert len(generated_signals) == 1
+    assert generated_signals[0].strategy_id == enabled_strategy.id
+
+    # The aggregate identity never reached strategy_registry.get at all.
+    assert AGGREGATE_STRATEGY_SLUG not in registry_lookups
+
+    skip_records = [record for record in caplog.records if "paper_execution_skip reason=aggregate_identity_not_executable" in record.getMessage()]
+    assert len(skip_records) == 1
+    assert AGGREGATE_STRATEGY_SLUG in skip_records[0].getMessage()
+
+    # No "unregistered strategy" warning-spam for the known aggregate identity.
+    warning_records = [record for record in caplog.records if record.levelno >= logging.WARNING]
+    assert not any("unregistered strategy" in record.getMessage().lower() for record in warning_records)
+
+
+@pytest.mark.asyncio
+async def test_kraken_asset_candle_lookup_uses_kraken_ingestion_interval_not_config_default(monkeypatch: pytest.MonkeyPatch) -> None:
+    # run_ingestion_cycle (worker_entrypoint.py) always writes Kraken candles
+    # at KRAKEN_CANDLE_INTERVAL ("15m") regardless of the configured
+    # ORCHESTRATION_CANDLE_INTERVAL default ("1m" in _config() below). Before
+    # the fix, this loop queried every asset with config.candle_interval, so
+    # a Kraken asset's candles were queried at the wrong interval and never
+    # found -- a permanent candle_count=0 for any Kraken proving-campaign
+    # asset. The lookup must resolve interval per-asset by exchange instead.
+    import app.services.orchestration.continuous_pipeline_worker as worker_module
+
+    db = _FakeDB()
+    kraken_asset = _kraken_asset()
+    strategy = _strategy_row()
+    parameter_set = _parameter_set()
+    candle_lookup_calls: list[tuple[uuid.UUID, str]] = []
+
+    async def _tracking_load_latest_candles(_db, *, asset_id, interval, limit):
+        candle_lookup_calls.append((asset_id, interval))
+        return _candles(2)
+
+    monkeypatch.setattr(worker_module, "run_ingestion_cycle", _fake_ingestion_cycle)
+    monkeypatch.setattr(worker_module, "ingest_decision_records", _fake_decision_ingestion)
+    monkeypatch.setattr(worker_module, "_load_decision_record_for_signal", _async_return(None))
+    monkeypatch.setattr(worker_module, "_produce_research_evidence", _async_return(None))
+    monkeypatch.setattr(worker_module, "_load_active_assets", _async_return([kraken_asset]))
+    monkeypatch.setattr(worker_module, "_load_active_strategies", _async_return([strategy]))
+    monkeypatch.setattr(worker_module, "_load_latest_parameter_set", _async_return(parameter_set))
+    monkeypatch.setattr(worker_module, "_load_latest_candles", _tracking_load_latest_candles)
+    monkeypatch.setattr(worker_module, "_signal_exists", _async_return(False))
+    monkeypatch.setattr(worker_module, "_load_primary_account_by_asset_class", _async_return(None))
+    monkeypatch.setattr(worker_module.strategy_registry, "get", lambda slug: _FixedStrategy("hold"))
+
+    config = _config()
+    assert config.candle_interval == "1m"
+
+    stats = await run_orchestration_cycle(db=db, client=object(), config=config)
+
+    assert candle_lookup_calls == [(kraken_asset.id, "15m")]
+    assert stats.signals_created == 1
+
+
+@pytest.mark.asyncio
+async def test_binance_asset_candle_lookup_still_uses_configured_interval(monkeypatch: pytest.MonkeyPatch) -> None:
+    import app.services.orchestration.continuous_pipeline_worker as worker_module
+
+    db = _FakeDB()
+    asset = _asset()
+    strategy = _strategy_row()
+    parameter_set = _parameter_set()
+    candle_lookup_calls: list[tuple[uuid.UUID, str]] = []
+
+    async def _tracking_load_latest_candles(_db, *, asset_id, interval, limit):
+        candle_lookup_calls.append((asset_id, interval))
+        return _candles(2)
+
+    monkeypatch.setattr(worker_module, "run_ingestion_cycle", _fake_ingestion_cycle)
+    monkeypatch.setattr(worker_module, "ingest_decision_records", _fake_decision_ingestion)
+    monkeypatch.setattr(worker_module, "_load_decision_record_for_signal", _async_return(None))
+    monkeypatch.setattr(worker_module, "_produce_research_evidence", _async_return(None))
+    monkeypatch.setattr(worker_module, "_load_active_assets", _async_return([asset]))
+    monkeypatch.setattr(worker_module, "_load_active_strategies", _async_return([strategy]))
+    monkeypatch.setattr(worker_module, "_load_latest_parameter_set", _async_return(parameter_set))
+    monkeypatch.setattr(worker_module, "_load_latest_candles", _tracking_load_latest_candles)
+    monkeypatch.setattr(worker_module, "_signal_exists", _async_return(False))
+    monkeypatch.setattr(worker_module, "_load_primary_account_by_asset_class", _async_return(None))
+    monkeypatch.setattr(worker_module.strategy_registry, "get", lambda slug: _FixedStrategy("hold"))
+
+    stats = await run_orchestration_cycle(db=db, client=object(), config=_config())
+
+    assert candle_lookup_calls == [(asset.id, "1m")]
+    assert stats.signals_created == 1
 
 
 @pytest.mark.asyncio
