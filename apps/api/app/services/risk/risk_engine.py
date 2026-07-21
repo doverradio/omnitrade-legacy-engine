@@ -23,6 +23,10 @@ class RiskEvaluationRequest:
     account_equity: Decimal | None = None
     max_position_size_pct: Decimal | None = None
     min_order_notional: Decimal | None = None
+    # Explicit, separately-governed ceiling for this specific order (e.g. a
+    # campaign's own already-vetted proposed_allocation). None for callers
+    # with no such governed ceiling -- never inferred from quantity/side.
+    campaign_authorized_notional: Decimal | None = None
     qty_step_size: Decimal | None = None
     supports_fractional: bool | None = None
     start_of_day_equity: Decimal | None = None
@@ -160,6 +164,7 @@ def compute_position_sizing(
     qty_step_size: Decimal | None,
     supports_fractional: bool | None,
     min_order_notional: Decimal | None = None,
+    campaign_authorized_notional: Decimal | None = None,
 ) -> PositionSizingResult:
     if requested_quantity <= 0:
         return PositionSizingResult(
@@ -219,13 +224,35 @@ def compute_position_sizing(
     # short. A target sized to exactly the venue's minimum notional will
     # therefore, after this unavoidable rounding, almost always land a hair
     # below that minimum and be rejected as unexecutable, even though
-    # authorized capital was never actually the constraint. When that
-    # happens and there is still enough authorized capital (max_notional) to
-    # cover the venue's real minimum, round up to the smallest quantity that
-    # clears it instead of silently producing an order that can never
-    # execute. This never exceeds max_notional -- if the venue minimum
-    # itself exceeds what's authorized, no rounding happens here and the
-    # order is correctly left short, to be rejected downstream.
+    # authorized capital was never actually the constraint.
+    #
+    # max_notional (account_equity * max_position_size_pct) is a generic,
+    # account-wide concentration heuristic -- it is not the only legitimate
+    # authority for this specific order. campaign_authorized_notional, when
+    # supplied, is an explicit, separately-governed ceiling from the caller
+    # (e.g. authoritative.py's proposed_allocation, itself already bounded
+    # by that campaign's own maximum_position_size, maximum_total_exposure,
+    # and real liquid cash) -- a small account can easily have max_notional
+    # fall below a campaign's own, separately-vetted, smaller proving
+    # allocation, and when that happens the campaign's own authorization is
+    # the more specific and equally valid ceiling for clearing the venue's
+    # minimum. This must be an explicit, separate field from
+    # requested_quantity/requested_notional: a request that is merely large
+    # (and already correctly clipped down to max_notional above for that
+    # reason) is not the same thing as a deliberate, governed authorization,
+    # and must never be treated as one -- only a caller that actually knows
+    # and vouches for a specific ceiling may supply it.
+    #
+    # Quantizing to the venue's tradable increment can push the rescued
+    # notional a hair above that ceiling no matter which quantity you round
+    # from -- there is no way to hit an arbitrary dollar target exactly at a
+    # fixed step size. step_tolerance bounds that unavoidable overshoot to
+    # at most one quantity increment; it is not an open-ended allowance.
+    # Whatever the ceiling, the rescue still never exceeds it by more than
+    # that single, mechanically-necessary step -- and if the venue minimum
+    # exceeds both the account cap and the explicit campaign authorization
+    # (by more than that bound), no rescue happens and the order is
+    # correctly left short, to be rejected downstream.
     sized_up_to_minimum = False
     if (
         min_order_notional is not None
@@ -234,7 +261,11 @@ def compute_position_sizing(
     ):
         minimum_quantity = _round_up_to_step(min_order_notional / reference_price, qty_step_size)
         minimum_notional = minimum_quantity * reference_price
-        if minimum_notional <= max_notional:
+        rescue_ceiling = max_notional
+        if campaign_authorized_notional is not None and campaign_authorized_notional > rescue_ceiling:
+            rescue_ceiling = campaign_authorized_notional
+        step_tolerance = (qty_step_size * reference_price) if (qty_step_size is not None and qty_step_size > 0) else Decimal("0")
+        if minimum_notional <= rescue_ceiling + step_tolerance:
             approved_quantity = minimum_quantity
             approved_notional = minimum_notional
             sized_up_to_minimum = True
@@ -726,6 +757,7 @@ def evaluate_signal_risk(
                 qty_step_size=request.qty_step_size,
                 supports_fractional=request.supports_fractional,
                 min_order_notional=request.min_order_notional,
+                campaign_authorized_notional=request.campaign_authorized_notional,
             )
             if sizing_result.reason_code in {
                 "invalid_requested_quantity",

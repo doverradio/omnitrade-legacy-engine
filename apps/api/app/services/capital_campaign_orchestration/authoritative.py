@@ -2026,6 +2026,7 @@ async def compose_campaign_authoritative_cycle(
                     account_equity=risk_context.account_equity,
                     max_position_size_pct=risk_context.max_position_size_pct,
                     min_order_notional=asset.min_order_notional,
+                    campaign_authorized_notional=proposed_allocation,
                     qty_step_size=asset.qty_step_size,
                     supports_fractional=asset.supports_fractional,
                     start_of_day_equity=risk_context.start_of_day_equity,

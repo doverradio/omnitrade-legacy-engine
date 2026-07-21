@@ -153,44 +153,96 @@ def test_compute_position_sizing_respects_non_fractional_stock_constraints() -> 
     assert sizing.approved_notional == Decimal("100")
 
 
-# Regression for production incident: strategy_aggregate_completed correctly
-# reached BUY consensus, campaign sizing correctly proposed exactly the $5
-# proving amount, but the risk engine rejected it as
-# position_below_minimum_order_size. Root cause: converting a dollar target
-# into a fractional venue quantity and rounding (as every provider requires)
-# can only ever produce a quantity whose notional is equal to or *less than*
-# the target -- never more. A target sized to exactly the venue minimum will
-# therefore almost always recompute a hair short of that minimum after
-# rounding, even though ample campaign/account capital was never the actual
-# constraint. This is not Kraken-specific: it reproduces for any provider
-# whose real minimum is expressed as a notional and/or quantity increment.
-def test_compute_position_sizing_sizes_up_to_minimum_when_capital_permits() -> None:
-    price = Decimal("65320")
-    requested_quantity = Decimal("0.0000765454")  # ~$5.00 worth of BTC, a hair short after rounding
+# Regression for the second production incident: the first fix (sizing up
+# to the venue minimum whenever *account_equity * max_position_size_pct*
+# covered it) never activated in production, because the prior regression
+# tests used unrealistic headroom (account_equity=1000, max_position_size_pct=1)
+# that made the account-level cap irrelevant. The real production account
+# was small (account_equity=23.7205, max_position_size_pct=0.10 -> a generic
+# cap of only ~$2.37), well below both the $5 venue minimum and the
+# campaign's own $5 authorization. compute_position_sizing had no way to
+# know the campaign had already, separately, governed and authorized
+# exactly $5 for this trade -- it only ever saw the generic account-wide
+# heuristic. These tests use the exact production numbers from the VPS log.
+_PRODUCTION_ACCOUNT_EQUITY = Decimal("23.7205")
+_PRODUCTION_MAX_POSITION_SIZE_PCT = Decimal("0.10")  # 10% of equity, not 0.10%
+_PRODUCTION_REFERENCE_PRICE = Decimal("65425.5")
+_PRODUCTION_REQUESTED_QUANTITY = Decimal("0.00007642280150705764571917677358")
+_PRODUCTION_MIN_ORDER_NOTIONAL = Decimal("5")
 
+
+def test_compute_position_sizing_generic_account_cap_alone_still_rejects() -> None:
+    """Demonstrates the exact production failure: account_equity * pct =
+    ~$2.37, below the $5 venue minimum, and with no explicit campaign
+    authorization supplied the generic cap alone is correctly *not* enough
+    to justify sizing up -- confirming the true, current-production root
+    cause is the generic percentage cap, not rounding, and that this
+    (not campaign authority) is what must fail closed on its own."""
     sizing = compute_position_sizing(
-        requested_quantity=requested_quantity,
-        reference_price=price,
-        account_equity=Decimal("1000"),
-        max_position_size_pct=Decimal("1"),
+        requested_quantity=_PRODUCTION_REQUESTED_QUANTITY,
+        reference_price=_PRODUCTION_REFERENCE_PRICE,
+        account_equity=_PRODUCTION_ACCOUNT_EQUITY,
+        max_position_size_pct=_PRODUCTION_MAX_POSITION_SIZE_PCT,
         qty_step_size=Decimal("0.00000001"),
         supports_fractional=True,
-        min_order_notional=Decimal("5"),
+        min_order_notional=_PRODUCTION_MIN_ORDER_NOTIONAL,
+        campaign_authorized_notional=None,
     )
 
-    assert sizing.approved_notional >= Decimal("5")
-    assert sizing.approved_quantity > requested_quantity
-    assert sizing.reason_code == "position_sized_up_to_minimum_viable_order"
-    # Never exceeds authorized capital -- sizing up stays within max_position_notional.
-    assert sizing.approved_notional <= sizing.max_position_notional
+    # compute_position_sizing's ordinary resize-down still produces a
+    # legitimate, non-zero quantity capped at the generic account authority
+    # ($2.37) -- it is the *next* gate, validate_minimum_viable_order, that
+    # correctly refuses it as unexecutable, and evaluate_signal_risk that
+    # then reports the final approved_quantity as exactly 0 for a rejection
+    # (see test_evaluate_signal_risk_without_campaign_authorization_still_rejects).
+    assert sizing.max_position_notional == Decimal("2.37205")
+    assert sizing.approved_notional == Decimal("2.371674375")
+    assert sizing.approved_notional < _PRODUCTION_MIN_ORDER_NOTIONAL
+    assert sizing.reason_code != "position_sized_up_to_minimum_viable_order"
+    assert not validate_minimum_viable_order(
+        approved_quantity=sizing.approved_quantity,
+        reference_price=_PRODUCTION_REFERENCE_PRICE,
+        min_order_notional=_PRODUCTION_MIN_ORDER_NOTIONAL,
+        qty_step_size=Decimal("0.00000001"),
+    )
 
 
-def test_compute_position_sizing_does_not_size_up_beyond_authorized_capital() -> None:
-    """No silent auto-sizing beyond campaign authority: when even the venue
-    minimum exceeds what's authorized, the order is correctly left short and
-    rejected downstream -- never forced through."""
+def test_compute_position_sizing_campaign_authorization_rescues_exact_production_incident() -> None:
+    """The fix: when the caller explicitly supplies the campaign's own,
+    separately-governed authorization for this trade (authoritative.py's
+    proposed_allocation -- exactly $5, matching maximum_position_size and
+    maximum_total_exposure for this proving campaign), it is a valid
+    additional basis -- alongside the generic account cap -- for clearing
+    the venue's minimum. This reproduces the exact VPS log values and must
+    resolve to an executable order."""
     sizing = compute_position_sizing(
-        requested_quantity=Decimal("0.01"),
+        requested_quantity=_PRODUCTION_REQUESTED_QUANTITY,
+        reference_price=_PRODUCTION_REFERENCE_PRICE,
+        account_equity=_PRODUCTION_ACCOUNT_EQUITY,
+        max_position_size_pct=_PRODUCTION_MAX_POSITION_SIZE_PCT,
+        qty_step_size=Decimal("0.00000001"),
+        supports_fractional=True,
+        min_order_notional=_PRODUCTION_MIN_ORDER_NOTIONAL,
+        campaign_authorized_notional=Decimal("5"),
+    )
+
+    assert sizing.approved_quantity > Decimal("0")
+    assert sizing.approved_notional >= Decimal("5")
+    assert sizing.reason_code == "position_sized_up_to_minimum_viable_order"
+    # Never exceeds what the campaign explicitly authorized, beyond the one
+    # quantity increment that is mechanically unavoidable when quantizing an
+    # exact dollar target to a fixed tradable step.
+    assert sizing.approved_notional <= Decimal("5") + (Decimal("0.00000001") * _PRODUCTION_REFERENCE_PRICE)
+
+
+def test_compute_position_sizing_ignores_oversized_request_as_a_fake_authorization() -> None:
+    """Safety guard: a request that is merely large -- and gets correctly
+    clipped down by the generic account cap for that reason -- must never be
+    mistaken for a deliberate authorization. Without an explicit
+    campaign_authorized_notional, an oversized ask does not unlock the
+    minimum-order rescue no matter how large it was."""
+    sizing = compute_position_sizing(
+        requested_quantity=Decimal("0.5"),  # $50 at this price -- far more than the account allows
         reference_price=Decimal("100"),
         account_equity=Decimal("25"),
         max_position_size_pct=Decimal("0.05"),  # max_position_notional = 1.25
@@ -200,7 +252,25 @@ def test_compute_position_sizing_does_not_size_up_beyond_authorized_capital() ->
     )
 
     assert sizing.approved_notional < Decimal("5")
-    assert sizing.approved_notional <= sizing.max_position_notional
+    assert sizing.reason_code != "position_sized_up_to_minimum_viable_order"
+
+
+def test_compute_position_sizing_does_not_size_up_beyond_authorized_capital() -> None:
+    """No silent auto-sizing beyond campaign authority: when even an
+    explicitly-authorized ceiling is below the venue minimum, the order is
+    correctly left short and rejected downstream -- never forced through."""
+    sizing = compute_position_sizing(
+        requested_quantity=Decimal("0.01"),
+        reference_price=Decimal("100"),
+        account_equity=Decimal("25"),
+        max_position_size_pct=Decimal("0.05"),  # max_position_notional = 1.25
+        qty_step_size=Decimal("0.0001"),
+        supports_fractional=True,
+        min_order_notional=Decimal("5"),
+        campaign_authorized_notional=Decimal("1"),  # explicitly authorized, but still below the $5 minimum
+    )
+
+    assert sizing.approved_notional < Decimal("5")
     assert sizing.reason_code != "position_sized_up_to_minimum_viable_order"
 
     assert not validate_minimum_viable_order(
@@ -212,11 +282,14 @@ def test_compute_position_sizing_does_not_size_up_beyond_authorized_capital() ->
 
 
 @pytest.mark.parametrize(
-    ("provider_label", "requested_quantity", "reference_price", "qty_step_size", "supports_fractional", "min_order_notional"),
+    ("provider_label", "requested_quantity", "reference_price", "qty_step_size", "supports_fractional", "min_order_notional", "account_equity", "max_position_size_pct"),
     [
-        ("kraken_like_fractional_crypto", Decimal("0.0000765454"), Decimal("65320"), Decimal("0.00000001"), True, Decimal("5")),
-        ("coinbase_like_fractional_crypto", Decimal("0.00001"), Decimal("65320"), Decimal("0.00000001"), True, Decimal("1")),
-        ("alpaca_like_whole_share_equity", Decimal("0.4"), Decimal("50"), None, False, Decimal("1")),
+        # Small accounts, realistic percentage caps -- not the unrealistic
+        # account_equity=100000/max_position_size_pct=1 used previously,
+        # which made the generic cap irrelevant and masked this exact bug.
+        ("kraken_like_fractional_crypto", _PRODUCTION_REQUESTED_QUANTITY, _PRODUCTION_REFERENCE_PRICE, Decimal("0.00000001"), True, Decimal("5"), Decimal("23.7205"), Decimal("0.10")),
+        ("coinbase_like_fractional_crypto", Decimal("0.00001526"), Decimal("65425.5"), Decimal("0.00000001"), True, Decimal("1"), Decimal("23.7205"), Decimal("0.10")),
+        ("alpaca_like_whole_share_equity", Decimal("0.4"), Decimal("50"), None, False, Decimal("1"), Decimal("25"), Decimal("0.10")),
     ],
 )
 def test_compute_position_sizing_honors_provider_specific_minimums(
@@ -226,52 +299,91 @@ def test_compute_position_sizing_honors_provider_specific_minimums(
     qty_step_size: Decimal | None,
     supports_fractional: bool,
     min_order_notional: Decimal,
+    account_equity: Decimal,
+    max_position_size_pct: Decimal,
 ) -> None:
     """The same, provider-agnostic sizing function must honor whatever
     minimum a given provider profile supplies -- proving multiple providers
     behave consistently through one shared mechanism, with no
-    provider-specific branching anywhere in this function."""
+    provider-specific branching -- once the campaign's own governed
+    authorization (matching requested_quantity's implied notional) is
+    supplied explicitly, exactly as authoritative.py does."""
+    campaign_authorized_notional = requested_quantity * reference_price
     sizing = compute_position_sizing(
         requested_quantity=requested_quantity,
         reference_price=reference_price,
-        account_equity=Decimal("100000"),
-        max_position_size_pct=Decimal("1"),
+        account_equity=account_equity,
+        max_position_size_pct=max_position_size_pct,
         qty_step_size=qty_step_size,
         supports_fractional=supports_fractional,
         min_order_notional=min_order_notional,
+        campaign_authorized_notional=campaign_authorized_notional,
     )
 
     assert sizing.approved_notional >= min_order_notional, provider_label
-    assert sizing.approved_notional <= sizing.max_position_notional, provider_label
 
 
 def test_evaluate_signal_risk_sizes_up_to_minimum_and_approves() -> None:
-    """End-to-end through evaluate_signal_risk (not just the sizing helper):
-    an executable order is produced and approved, not rejected."""
+    """End-to-end through evaluate_signal_risk (not just the sizing helper),
+    using the exact production values: an executable order is produced and
+    approved, not rejected, once the campaign's authorization is passed
+    through RiskEvaluationRequest.campaign_authorized_notional."""
     result = evaluate_signal_risk(
         request=RiskEvaluationRequest(
             signal_id=uuid.uuid4(),
             paper_account_id=uuid.uuid4(),
             asset_id=uuid.uuid4(),
             side="buy",
-            quantity=Decimal("0.0000765454"),
-            account_equity=Decimal("1000"),
-            max_position_size_pct=Decimal("1"),
-            min_order_notional=Decimal("5"),
+            quantity=_PRODUCTION_REQUESTED_QUANTITY,
+            account_equity=_PRODUCTION_ACCOUNT_EQUITY,
+            max_position_size_pct=_PRODUCTION_MAX_POSITION_SIZE_PCT,
+            min_order_notional=_PRODUCTION_MIN_ORDER_NOTIONAL,
+            campaign_authorized_notional=Decimal("5"),
             qty_step_size=Decimal("0.00000001"),
             supports_fractional=True,
-            start_of_day_equity=Decimal("1000"),
-            current_equity=Decimal("1000"),
+            start_of_day_equity=_PRODUCTION_ACCOUNT_EQUITY,
+            current_equity=_PRODUCTION_ACCOUNT_EQUITY,
             max_daily_loss_pct=Decimal("0.03"),
-            high_water_mark_equity=Decimal("1000"),
+            high_water_mark_equity=_PRODUCTION_ACCOUNT_EQUITY,
             max_drawdown_pct=Decimal("0.15"),
         ),
-        reference_price=Decimal("65320"),
+        reference_price=_PRODUCTION_REFERENCE_PRICE,
     )
 
     assert result.action == RiskDecisionAction.RESIZE
     assert result.reason_code == "position_sized_up_to_minimum_viable_order"
-    assert result.approved_quantity * Decimal("65320") >= Decimal("5")
+    assert result.approved_quantity * _PRODUCTION_REFERENCE_PRICE >= Decimal("5")
+
+
+def test_evaluate_signal_risk_without_campaign_authorization_still_rejects() -> None:
+    """Same production numbers, but without an explicit campaign
+    authorization (e.g. a non-campaign caller): the generic account cap
+    alone is not enough, and the order is correctly rejected -- proving the
+    rescue is opt-in per caller, not a blanket behavior change."""
+    result = evaluate_signal_risk(
+        request=RiskEvaluationRequest(
+            signal_id=uuid.uuid4(),
+            paper_account_id=uuid.uuid4(),
+            asset_id=uuid.uuid4(),
+            side="buy",
+            quantity=_PRODUCTION_REQUESTED_QUANTITY,
+            account_equity=_PRODUCTION_ACCOUNT_EQUITY,
+            max_position_size_pct=_PRODUCTION_MAX_POSITION_SIZE_PCT,
+            min_order_notional=_PRODUCTION_MIN_ORDER_NOTIONAL,
+            qty_step_size=Decimal("0.00000001"),
+            supports_fractional=True,
+            start_of_day_equity=_PRODUCTION_ACCOUNT_EQUITY,
+            current_equity=_PRODUCTION_ACCOUNT_EQUITY,
+            max_daily_loss_pct=Decimal("0.03"),
+            high_water_mark_equity=_PRODUCTION_ACCOUNT_EQUITY,
+            max_drawdown_pct=Decimal("0.15"),
+        ),
+        reference_price=_PRODUCTION_REFERENCE_PRICE,
+    )
+
+    assert result.action == RiskDecisionAction.REJECT
+    assert result.reason_code == "position_below_minimum_order_size"
+    assert result.approved_quantity == Decimal("0")
 
 
 def test_validate_minimum_viable_order_checks_notional_and_step_size() -> None:
