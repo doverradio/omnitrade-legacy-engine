@@ -2312,6 +2312,44 @@ async def compose_campaign_authoritative_cycle(
             rejected_candidates.append({"instrument": instrument, "reason": "expected_edge_unavailable", "market": market, "strategy": strategy, "position": position, "risk": risk_summary, "decision_record_id": decision_record_id})
             continue
         elif expected_net_dollars <= Decimal("0"):
+            # Every component of the rejection math, on one line, keyed by
+            # decision_record_id -- so a non_positive_net_edge rejection is
+            # numerically explainable from logs alone, with no need to
+            # re-derive it by reading this function. Deliberately a distinct
+            # event (not folded into net_edge_evaluated above) so it survives
+            # log-level or sampling filters applied to the general-purpose
+            # evaluation trace, and so every field name here is exactly the
+            # vocabulary of the rejection, not the broader evaluation.
+            expected_gross_dollars = (
+                None if expected_gross_edge_pct is None else (expected_gross_edge_pct / Decimal("100")) * approved_notional
+            )
+            logger.info(
+                "non_positive_net_edge_rejection_explained campaign_id=%s campaign_version=%s decision_record_id=%s "
+                "strategy_id=%s asset=%s side=%s approved_notional=%s expected_gross_edge_pct=%s "
+                "expected_gross_dollars=%s fees_pct=%s fees_dollars=%s slippage_pct=%s slippage_dollars=%s "
+                "historical_profitability_metric=%s profitability_source=%s expected_net_edge_pct=%s "
+                "expected_net_dollars=%s rejection_threshold_net_dollars=%s pnl_override_active=%s final_reason_code=%s",
+                campaign_definition.campaign_id,
+                campaign_definition.version,
+                decision_record_id,
+                strategy_identity,
+                instrument,
+                side,
+                approved_notional,
+                expected_gross_edge_pct,
+                expected_gross_dollars,
+                round_trip_fee_pct,
+                round_trip_fee_amount,
+                slippage_pct,
+                slippage_amount,
+                expected_gross_edge_source,
+                edge_provenance,
+                expected_net_edge,
+                expected_net_dollars,
+                Decimal("0"),
+                has_position_pnl_override,
+                "non_positive_net_edge",
+            )
             rejected_candidates.append({"instrument": instrument, "reason": "non_positive_net_edge", "market": market, "strategy": strategy, "position": position, "risk": risk_summary, "decision_record_id": decision_record_id})
             continue
 

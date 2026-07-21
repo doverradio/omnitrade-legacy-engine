@@ -1648,6 +1648,51 @@ async def test_net_edge_diagnostic_log_reflects_values_actually_used(monkeypatch
 
 
 @pytest.mark.asyncio
+async def test_non_positive_net_edge_rejection_explained_log_contains_every_component(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Production showed non_positive_net_edge rejections with no numeric
+    trail: only the final reason code, no decision_record_id, and no visible
+    fee/slippage/edge breakdown. This asserts the dedicated rejection-explain
+    log carries every component of the calculation the rejection reason
+    depends on, so it is explainable from logs alone."""
+    from app.services.capital_campaign_orchestration.authoritative import compose_campaign_authoritative_cycle
+
+    # gross edge 0.02% < round-trip fees (0.02%) + slippage (0.01%) = 0.03% -> net negative.
+    campaign, db, candle = _net_edge_authoritative_mocks(
+        monkeypatch, profitable_after_fees_performance="0.02", approved_quantity=Decimal("0.05")
+    )
+    with caplog.at_level(logging.INFO, logger="app.services.capital_campaign_orchestration.authoritative"):
+        result = await compose_campaign_authoritative_cycle(db=db, campaign_definition=campaign, trigger="kraken_btc_15m_candle_close", candle=candle)
+
+    rejection_records = [
+        record for record in caplog.records if record.getMessage().startswith("non_positive_net_edge_rejection_explained ")
+    ]
+    assert len(rejection_records) == 1
+    message = rejection_records[0].getMessage()
+    assert "decision_record_id=aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa" in message
+    assert "strategy_id=ma_crossover@1" in message
+    assert "asset=BTC-USD" in message
+    assert "side=buy" in message
+    assert "approved_notional=5.00" in message
+    assert "expected_gross_edge_pct=0.02" in message
+    assert "expected_gross_dollars=0.0010" in message
+    assert "fees_pct=0.02" in message
+    assert "fees_dollars=0.0010" in message
+    assert "slippage_pct=0.01" in message
+    assert "slippage_dollars=0.0005" in message
+    assert "historical_profitability_metric=0.02" in message
+    assert "profitability_source=scorecard_profitable_after_fees_performance" in message
+    assert "expected_net_edge_pct=-0.01" in message
+    assert "expected_net_dollars=-0.0005" in message
+    assert "rejection_threshold_net_dollars=0" in message
+    assert "pnl_override_active=False" in message
+    assert "final_reason_code=non_positive_net_edge" in message
+    assert result.composition["selected_decision"]["reason"] == "non_positive_net_edge"
+    assert result.composition["decision_record_id"] == "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa"
+
+
+@pytest.mark.asyncio
 async def test_market_evidence_15m_freshness_boundaries(monkeypatch: pytest.MonkeyPatch) -> None:
     from app.services.capital_campaign_orchestration.authoritative import _load_market_evidence
 
