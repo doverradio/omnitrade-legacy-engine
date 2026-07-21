@@ -616,6 +616,25 @@ def _build_aggregate_evidence_dict(
     score = None
     if primary_strategy_identity is not None:
         score = str(weighted_buy_score if final_action == "BUY" else (weighted_sell_score if final_action == "SELL" else weighted_hold_score))
+    # scorecard_summary.aggregate.average_fee_adjusted_return_pct blends
+    # BUY+SELL+HOLD outcomes for the dominant contributor together. That
+    # blended figure says nothing about whether THIS proposed action
+    # (final_action) has historically been profitable -- a strategy's SELL
+    # track record is not evidence for or against taking its BUY calls, and
+    # vice versa. profitable_after_fees_performance feeds directly into the
+    # net-edge economic gate for final_action specifically, so it must use
+    # the action-scoped average, never the blended one. None (not the
+    # blended figure) when there is no evidence for this specific action --
+    # that correctly surfaces as expected_edge_unavailable downstream rather
+    # than silently substituting an unrelated action's history.
+    action_scoped_profitability = None
+    if scorecard_summary is not None:
+        if final_action == "BUY":
+            action_scoped_profitability = scorecard_summary.aggregate.buy_average_fee_adjusted_return_pct
+        elif final_action == "SELL":
+            action_scoped_profitability = scorecard_summary.aggregate.sell_average_fee_adjusted_return_pct
+        elif final_action == "HOLD":
+            action_scoped_profitability = scorecard_summary.aggregate.hold_average_fee_adjusted_return_pct
     return {
         "authority_class": "AUTHORITATIVE",
         "source_type": "strategy_decision_aggregator",
@@ -636,8 +655,8 @@ def _build_aggregate_evidence_dict(
         "confidence": None,
         "sample_size": scorecard_summary.aggregate.total_evaluated if scorecard_summary is not None else 0,
         "profitable_after_fees_performance": None
-        if scorecard_summary is None or scorecard_summary.aggregate.average_fee_adjusted_return_pct is None
-        else format(scorecard_summary.aggregate.average_fee_adjusted_return_pct, "f"),
+        if action_scoped_profitability is None
+        else format(action_scoped_profitability, "f"),
         "expected_value": None,
         "evidence_timestamp": candle_close_time.isoformat(),
         "scorecard": None
@@ -645,9 +664,17 @@ def _build_aggregate_evidence_dict(
         else {
             "best_strategy_slug": scorecard_summary.strategy_slug,
             "aggregate_total_evaluated": scorecard_summary.aggregate.total_evaluated,
-            "aggregate_average_fee_adjusted_return_pct": None
+            # blended_* retained for observability/debugging only -- never fed
+            # into profitable_after_fees_performance (see action_scoped_profitability
+            # above). action_scoped_average_fee_adjusted_return_pct is the same
+            # value used for profitable_after_fees_performance, surfaced here so
+            # a divergence from the blended figure is visible without re-deriving it.
+            "blended_average_fee_adjusted_return_pct": None
             if scorecard_summary.aggregate.average_fee_adjusted_return_pct is None
             else format(scorecard_summary.aggregate.average_fee_adjusted_return_pct, "f"),
+            "action_scoped_average_fee_adjusted_return_pct": None
+            if action_scoped_profitability is None
+            else format(action_scoped_profitability, "f"),
             "aggregate_overall_correct_pct": None
             if scorecard_summary.aggregate.overall_correct_pct is None
             else format(scorecard_summary.aggregate.overall_correct_pct, "f"),

@@ -44,6 +44,16 @@ class StrategyScorecardBucket:
     average_fee_adjusted_return_pct: Decimal | None
     average_mfe_pct: Decimal | None
     average_mae_pct: Decimal | None
+    # Action-specific fee-adjusted return averages. average_fee_adjusted_return_pct
+    # above blends BUY+SELL+HOLD outcomes together, which is meaningless as an
+    # expected-edge estimate for a specific proposed action (a strategy's
+    # historical SELL outcomes say nothing about whether its BUY calls make
+    # money, and vice versa). Callers estimating the economic edge of a
+    # specific proposed action must use the matching field here instead of
+    # the blended aggregate. None when there is no evidence for that action.
+    buy_average_fee_adjusted_return_pct: Decimal | None = None
+    sell_average_fee_adjusted_return_pct: Decimal | None = None
+    hold_average_fee_adjusted_return_pct: Decimal | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -415,6 +425,11 @@ async def fetch_strategy_scorecards(
             total = len(bucket_items)
             total_correct = buy_correct + sell_correct + hold_correct
 
+            def _fee_adjusted_average(items: list[StrategyRosterProposalOutcome]) -> Decimal | None:
+                if not items:
+                    return None
+                return sum((item.actual_fee_adjusted_return_pct or Decimal("0") for item in items), Decimal("0")) / Decimal(len(items))
+
             overall_correct_pct = None
             raw_avg = None
             fee_avg = None
@@ -441,6 +456,9 @@ async def fetch_strategy_scorecards(
                 average_fee_adjusted_return_pct=_round(fee_avg),
                 average_mfe_pct=_round(mfe_avg),
                 average_mae_pct=_round(mae_avg),
+                buy_average_fee_adjusted_return_pct=_round(_fee_adjusted_average(buy_items)),
+                sell_average_fee_adjusted_return_pct=_round(_fee_adjusted_average(sell_items)),
+                hold_average_fee_adjusted_return_pct=_round(_fee_adjusted_average(hold_items)),
             )
 
         per_horizon: list[StrategyScorecardBucket] = []

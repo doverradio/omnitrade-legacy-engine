@@ -266,6 +266,96 @@ async def test_fetch_strategy_scorecards_aggregates_accuracy_and_returns() -> No
     assert card.regime_min_evidence_required == 50
 
 
+def _outcome_row(
+    *,
+    proposal: SimpleNamespace,
+    action: str,
+    horizon_label: str,
+    horizon_minutes: int,
+    actual_fee_adjusted_return_pct: Decimal,
+    actual_action_correct: bool,
+) -> "StrategyRosterProposalOutcome":
+    return StrategyRosterProposalOutcome(
+        proposal_id=uuid.uuid4(),
+        roster_run_id=proposal.roster_run_id,
+        asset_id=proposal.asset_id,
+        provider="kraken_spot",
+        product_id="BTC-USD",
+        interval="15m",
+        strategy_slug="momentum",
+        strategy_identity="momentum@1.0.0",
+        action=action,
+        proposal_evaluation_status="EVALUATED",
+        horizon_label=horizon_label,
+        horizon_minutes=horizon_minutes,
+        proposal_candle_close_time=proposal.candle_close_time,
+        horizon_time=proposal.candle_close_time + timedelta(minutes=horizon_minutes),
+        evaluated_at=datetime.now(timezone.utc),
+        entry_price=Decimal("100"),
+        exit_price=Decimal("100"),
+        market_return_pct=Decimal("0"),
+        buy_raw_return_pct=Decimal("0"),
+        buy_fee_adjusted_return_pct=Decimal("0"),
+        sell_raw_return_pct=Decimal("0"),
+        sell_fee_adjusted_return_pct=Decimal("0"),
+        actual_raw_return_pct=actual_fee_adjusted_return_pct,
+        actual_fee_adjusted_return_pct=actual_fee_adjusted_return_pct,
+        mfe_pct=Decimal("0"),
+        mae_pct=Decimal("0"),
+        actual_action_correct=actual_action_correct,
+        evaluation_completed=True,
+        evaluation_state="RESOLVED",
+        evaluation_reason=None,
+        market_move="SIDEWAYS",
+        regime_trend="RANGING",
+        regime_volatility="LOW_VOLATILITY",
+        regime_range="COMPRESSION",
+        fee_bps=Decimal("10"),
+        hold_buy_threshold_pct=Decimal("0"),
+        hold_sell_threshold_pct=Decimal("0"),
+        execution_mode="SHADOW",
+        live_submission_allowed=False,
+    )
+
+
+@pytest.mark.asyncio
+async def test_fetch_strategy_scorecards_action_scoped_averages_do_not_cross_contaminate() -> None:
+    """Reproduces the production defect: a strategy with a genuinely
+    profitable BUY track record and a losing SELL track record must not have
+    its BUY-specific edge estimate dragged down by the SELL losses (or vice
+    versa) when the blended aggregate is negative overall. This is what fed
+    profitable_after_fees_performance for a BUY decision from an unrelated
+    SELL loss history in production."""
+    proposal = _proposal(action="BUY", evaluation_status="EVALUATED")
+    db = _FakeDb(proposals=[proposal])
+
+    db.inserted = [
+        _outcome_row(
+            proposal=proposal, action="BUY", horizon_label="15m", horizon_minutes=15,
+            actual_fee_adjusted_return_pct=Decimal("2.0"), actual_action_correct=True,
+        ),
+        _outcome_row(
+            proposal=proposal, action="BUY", horizon_label="15m", horizon_minutes=15,
+            actual_fee_adjusted_return_pct=Decimal("1.0"), actual_action_correct=True,
+        ),
+        _outcome_row(
+            proposal=proposal, action="SELL", horizon_label="15m", horizon_minutes=15,
+            actual_fee_adjusted_return_pct=Decimal("-10.0"), actual_action_correct=False,
+        ),
+    ]
+
+    scorecards = await fetch_strategy_scorecards(db=db, provider="kraken_spot", product_id="BTC-USD", interval="15m")
+    aggregate = scorecards[0].aggregate
+
+    # Blended across all 3 actions: (2.0 + 1.0 - 10.0) / 3 = -2.3333 -- negative,
+    # even though the strategy's actual BUY calls were both profitable.
+    assert aggregate.average_fee_adjusted_return_pct == Decimal("-2.3333")
+    # Action-scoped figures must not cross-contaminate.
+    assert aggregate.buy_average_fee_adjusted_return_pct == Decimal("1.5000")
+    assert aggregate.sell_average_fee_adjusted_return_pct == Decimal("-10.0000")
+    assert aggregate.hold_average_fee_adjusted_return_pct is None
+
+
 @pytest.mark.asyncio
 async def test_fetch_strategy_scorecards_excludes_non_resolved_and_reconciles_hold() -> None:
     proposal = _proposal(action="HOLD", evaluation_status="EVALUATED")

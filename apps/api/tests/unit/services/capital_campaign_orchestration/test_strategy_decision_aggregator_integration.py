@@ -32,6 +32,7 @@ from app.services.capital_campaign_orchestration.authoritative import (
     AGGREGATE_STRATEGY_IDENTITY,
     resolve_and_persist_strategy_aggregate_evidence,
 )
+from app.services.strategy_outcomes.service import StrategyScorecard, StrategyScorecardBucket
 
 
 @compiles(JSONB, "sqlite")
@@ -247,6 +248,119 @@ async def test_authoritative_evidence_reflects_multi_strategy_aggregate_buy(monk
         assert record is not None
         assert record.generated_signals[0]["action"] == "BUY"
         assert len(record.supporting_strategies) == 3
+
+
+def _one_sided_scorecard_bucket(*, buy_avg: Decimal, sell_avg: Decimal, blended_avg: Decimal) -> StrategyScorecardBucket:
+    return StrategyScorecardBucket(
+        horizon_label="aggregate",
+        total_evaluated=3,
+        buy_evaluations=2,
+        buy_correct=2,
+        sell_evaluations=1,
+        sell_correct=0,
+        hold_evaluations=0,
+        hold_correct=0,
+        overall_correct_pct=Decimal("66.6667"),
+        average_raw_return_pct=blended_avg,
+        average_fee_adjusted_return_pct=blended_avg,
+        average_mfe_pct=Decimal("0"),
+        average_mae_pct=Decimal("0"),
+        buy_average_fee_adjusted_return_pct=buy_avg,
+        sell_average_fee_adjusted_return_pct=sell_avg,
+        hold_average_fee_adjusted_return_pct=None,
+    )
+
+
+# Reproduces the production defect where a BUY decision's economic edge
+# estimate (profitable_after_fees_performance) was drawn from a scorecard
+# aggregate that blends the dominant contributor's BUY, SELL, and HOLD
+# outcome history together -- so a strategy with a genuinely profitable BUY
+# track record and an unrelated losing SELL track record surfaced as
+# "historically unprofitable" for a proposed BUY, and the net-edge gate
+# rejected on evidence that had nothing to do with the action being taken.
+@pytest.mark.asyncio
+async def test_buy_evidence_profitability_uses_buy_scoped_history_not_blended_aggregate(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _patch_flat_position(monkeypatch)
+
+    one_sided_bucket = _one_sided_scorecard_bucket(
+        buy_avg=Decimal("1.5000"), sell_avg=Decimal("-10.0000"), blended_avg=Decimal("-2.3333")
+    )
+
+    async def _fake_scorecards(**_kwargs):
+        return [
+            StrategyScorecard(
+                strategy_slug="breakout",
+                per_horizon=[],
+                aggregate=one_sided_bucket,
+                best_regime=None,
+                worst_regime=None,
+                regime_evidence_count=3,
+                regime_min_evidence_required=50,
+            )
+        ]
+
+    monkeypatch.setattr(authoritative, "fetch_strategy_scorecards", _fake_scorecards)
+
+    async with _real_session() as session:
+        # All three equal-weight BUY votes tie; "breakout" wins the
+        # alphabetical tie-break and becomes dominant_contributor_identity,
+        # so its scorecard is the one surfaced into evidence.
+        await _seed_roster_run_and_proposals(session, actions={"ma_crossover": "BUY", "momentum": "BUY", "breakout": "BUY"})
+        evidence, reason = await _call_aggregator(session)
+
+        assert reason is None
+        assert evidence is not None
+        assert evidence["action"] == "BUY"
+        assert evidence["source_identity"]["scorecard_strategy_slug"] == "breakout"
+        # The economic-edge figure must equal the BUY-scoped average, not the
+        # blended (BUY+SELL+HOLD) average, which is negative.
+        assert evidence["profitable_after_fees_performance"] == "1.5000"
+        assert evidence["scorecard"]["blended_average_fee_adjusted_return_pct"] == "-2.3333"
+        assert evidence["scorecard"]["action_scoped_average_fee_adjusted_return_pct"] == "1.5000"
+
+
+@pytest.mark.asyncio
+async def test_hold_evidence_profitability_is_none_when_no_hold_scoped_history_exists(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A dominant contributor with only BUY/SELL history and no HOLD outcomes
+    must not have a HOLD decision's (unused, but should-be-absent) edge figure
+    silently backed by the blended aggregate either."""
+    _patch_flat_position(monkeypatch)
+
+    one_sided_bucket = _one_sided_scorecard_bucket(
+        buy_avg=Decimal("1.5000"), sell_avg=Decimal("-10.0000"), blended_avg=Decimal("-2.3333")
+    )
+
+    async def _fake_scorecards(**_kwargs):
+        return [
+            StrategyScorecard(
+                strategy_slug="breakout",
+                per_horizon=[],
+                aggregate=one_sided_bucket,
+                best_regime=None,
+                worst_regime=None,
+                regime_evidence_count=3,
+                regime_min_evidence_required=50,
+            )
+        ]
+
+    monkeypatch.setattr(authoritative, "fetch_strategy_scorecards", _fake_scorecards)
+
+    async with _real_session() as session:
+        await _seed_roster_run_and_proposals(session, actions={"ma_crossover": "HOLD", "momentum": "HOLD", "breakout": "HOLD"})
+        evidence, reason = await _call_aggregator(session)
+
+        assert reason is None
+        assert evidence is not None
+        assert evidence["action"] == "HOLD"
+        # The scorecard was found (tie-break dominant is "breakout"), but it
+        # has no HOLD-scoped history -- profitability must be None, not
+        # silently backed by the BUY-scoped or blended figures.
+        assert evidence["source_identity"]["scorecard_strategy_slug"] == "breakout"
+        assert evidence["profitable_after_fees_performance"] is None
 
 
 # 14 (partial -- proves the aggregate never bypasses HOLD classification when
