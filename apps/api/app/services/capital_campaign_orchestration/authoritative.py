@@ -1938,12 +1938,21 @@ async def compose_campaign_authoritative_cycle(
     candidate_rows: list[dict[str, Any]] = []
     rejected_candidates: list[dict[str, Any]] = []
 
+    # Snapshotted once, before the loop: with more than one instrument in
+    # scope, an earlier instrument's scorecard-fetch timeout (inside
+    # resolve_and_persist_strategy_aggregate_evidence, called per instrument
+    # below) can expire `candle` -- the caller's ORM instance, loaded before
+    # this function was ever called -- for the rest of this session. A later
+    # instrument's iteration re-reading candle.interval would then hit the
+    # same MissingGreenlet class of failure this snapshot prevents.
+    candle_interval = candle.interval
+
     for instrument in allowed_instruments:
         market, asset, candle_item = await _load_market_evidence(
             db=db,
             symbol=instrument,
             exchange=runtime_campaign.exchange or "kraken_spot",
-            candle_interval=candle.interval,
+            candle_interval=candle_interval,
             now=now,
         )
         market_evidence[instrument] = market
@@ -1955,7 +1964,7 @@ async def compose_campaign_authoritative_cycle(
             db=db,
             asset_id=asset.id,
             product_id=instrument,
-            interval=candle.interval,
+            interval=candle_interval,
             campaign_id=campaign_definition.campaign_id,
             campaign_version=campaign_definition.version,
             environment="production",

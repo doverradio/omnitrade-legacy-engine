@@ -375,6 +375,27 @@ async def run_campaign_orchestration_preview_for_candle(
             "skipped_campaigns": [],
         }
 
+    # Snapshot every candle field this function itself needs into plain
+    # values now, before the per-campaign loop. compose_campaign_authoritative_cycle
+    # (called per campaign below) can trigger a scorecard-fetch timeout deep
+    # inside strategy aggregate resolution; if that timeout's health probe
+    # also fails, _recover_session_after_scorecard_failure's escalation path
+    # runs a real session rollback, which expires every ORM instance still
+    # tracked by this session -- including `candle`, loaded earlier in this
+    # same session by _resolve_latest_btc_candle, well before that call.
+    # Confirmed production defect: candle.close_time (idempotency key) and
+    # candle.asset_id/.open_time/.close_time (cycle_context) are read AFTER
+    # the composition call returns, in plain synchronous code -- an implicit
+    # lazy-reload of an expired attribute there raises MissingGreenlet
+    # outside SQLAlchemy's asyncio greenlet bridge. The earlier proposal/
+    # aggregate_row/decision_record snapshot fixes did not cover this: they
+    # are scoped inside authoritative.py's aggregate-evidence functions,
+    # while `candle` is loaded a level up, in this function, before
+    # compose_campaign_authoritative_cycle is ever called.
+    candle_asset_id = candle.asset_id
+    candle_open_time = candle.open_time
+    candle_close_time = candle.close_time
+
     considered_campaigns: list[dict[str, Any]] = []
     eligible_campaigns: list[dict[str, Any]] = []
     skipped_campaigns: list[dict[str, Any]] = []
@@ -429,7 +450,7 @@ async def run_campaign_orchestration_preview_for_candle(
             campaign_id=campaign.campaign_id,
             version=campaign.version,
             trigger=trigger,
-            candle_close_time=candle.close_time,
+            candle_close_time=candle_close_time,
             eligible_instruments=list(composition.get("candidate_instruments") or list(campaign.allowed_instruments)),
             execution_mode="preview",
         )
@@ -455,9 +476,9 @@ async def run_campaign_orchestration_preview_for_candle(
                 "campaign_version": campaign.version,
                 "trigger": trigger,
                 "candle": {
-                    "asset_id": str(candle.asset_id),
-                    "open_time": candle.open_time.isoformat(),
-                    "close_time": candle.close_time.isoformat(),
+                    "asset_id": str(candle_asset_id),
+                    "open_time": candle_open_time.isoformat(),
+                    "close_time": candle_close_time.isoformat(),
                 },
                 "campaign_preview": composition_result.preview.model_dump(mode="json") if composition_result.preview is not None else None,
                 "authoritative_composition": composition,

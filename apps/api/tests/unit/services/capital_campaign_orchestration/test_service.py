@@ -5,9 +5,12 @@ from contextlib import asynccontextmanager
 from decimal import Decimal
 from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
+from typing import Any
 from uuid import UUID, uuid4
 
 import pytest
+from sqlalchemy import inspect as sa_inspect
+from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.models.audit_log import AuditLog
 from app.services.capital_campaign_orchestration.service import build_campaign_orchestration_idempotency_key, fetch_campaign_orchestration_history, fetch_campaign_orchestration_readiness, fetch_campaign_orchestration_status
@@ -326,7 +329,11 @@ async def test_worker_preview_ignores_draft_campaign(monkeypatch: pytest.MonkeyP
             self.scalar_calls += 1
             if self.scalar_calls == 1:
                 return SimpleNamespace(id=UUID("12345678-1234-1234-1234-1234567890ab"))
-            return SimpleNamespace(open_time=datetime(2026, 7, 15, 0, 0, tzinfo=timezone.utc), close_time=datetime(2026, 7, 15, 0, 15, tzinfo=timezone.utc))
+            return SimpleNamespace(
+                asset_id=UUID("12345678-1234-1234-1234-1234567890ab"),
+                open_time=datetime(2026, 7, 15, 0, 0, tzinfo=timezone.utc),
+                close_time=datetime(2026, 7, 15, 0, 15, tzinfo=timezone.utc),
+            )
 
         async def execute(self, _statement):
             return SimpleNamespace(scalars=lambda: SimpleNamespace(all=lambda: []))
@@ -423,6 +430,231 @@ async def test_worker_preview_persists_null_mandate_and_campaign_identity(monkey
     assert db.added.capital_campaign_id == campaign.campaign_id
     assert db.added.capital_campaign_version == campaign.version
     assert str(db.added.decision_record_id) == "11111111-1111-1111-1111-111111111111"
+
+
+# --- candle ORM expiration across the scorecard-timeout rollback boundary ---
+#
+# Production evidence: after the proposal/aggregate_row/decision_record
+# snapshot fixes in authoritative.py, a later cycle still crashed with
+# MissingGreenlet, one step further out. Root cause: `candle`
+# (_resolve_latest_btc_candle, a real Candle ORM row) is loaded in THIS
+# module, in run_campaign_orchestration_preview_for_candle, before the
+# per-campaign loop -- and compose_campaign_authoritative_cycle can trigger
+# a scorecard-fetch timeout deep inside strategy aggregate resolution whose
+# recovery, if the health probe also fails, runs a real session rollback.
+# That expires every ORM instance the session still tracks, including
+# `candle`, loaded well before compose_campaign_authoritative_cycle was ever
+# called. candle.close_time (idempotency key) and candle.asset_id/
+# .open_time/.close_time (cycle_context) were read AFTER the composition
+# call returns, in plain synchronous code -- exactly the shape that raises
+# MissingGreenlet outside SQLAlchemy's asyncio greenlet bridge. These tests
+# use a real SQLAlchemy session (SQLite) so the expiration is genuine, not
+# assumed, and directly fake only compose_campaign_authoritative_cycle
+# (forcing the real rollback it would trigger deep inside) to isolate this
+# function's own bug from the already-covered authoritative.py internals.
+
+
+def _install_sqlite_uuid_and_jsonb_compilers() -> None:
+    from sqlalchemy.dialects.postgresql import JSONB
+    from sqlalchemy.dialects.postgresql import UUID as PG_UUID
+    from sqlalchemy.ext.compiler import compiles
+
+    @compiles(PG_UUID, "sqlite")
+    def _compile_uuid_sqlite(element, compiler, **kw) -> str:  # noqa: ANN001
+        return "CHAR(36)"
+
+    @compiles(JSONB, "sqlite")
+    def _compile_jsonb_sqlite(element, compiler, **kw) -> str:  # noqa: ANN001
+        return "JSON"
+
+
+_install_sqlite_uuid_and_jsonb_compilers()
+
+
+def _fix_sqlite_server_defaults(table) -> None:  # noqa: ANN001
+    from sqlalchemy import text as _text
+    from sqlalchemy.schema import DefaultClause
+    from sqlalchemy.sql.elements import TextClause
+
+    for column in table.columns:
+        default = column.server_default
+        if isinstance(default, DefaultClause) and isinstance(default.arg, TextClause):
+            raw = default.arg.text.strip().split("::", 1)[0]
+            if raw.endswith("()") and not raw.startswith("("):
+                raw = f"({raw})"
+            column.server_default = DefaultClause(_text(raw))
+
+
+@asynccontextmanager
+async def _real_candle_session():
+    """A genuinely async SQLAlchemy session (AsyncSession + aiosqlite), not a
+    sync Session wrapped in async-shaped methods. This matters: a sync
+    Session has no greenlet bridge, so touching an expired attribute after
+    rollback() just triggers an ordinary synchronous re-SELECT and silently
+    succeeds either way -- it cannot reproduce MissingGreenlet, which is
+    specifically raised when SQLAlchemy's asyncio bridge tries to run an
+    implicit lazy-load outside of an awaited/greenlet_spawn context. Only a
+    real AsyncSession can prove this regression test actually fails without
+    the fix and passes with it."""
+    from sqlalchemy import event
+    from sqlalchemy.ext.asyncio import create_async_engine
+    from sqlalchemy.pool import StaticPool
+
+    from app.models.asset import Asset as AssetModel
+    from app.models.autonomous_cycle_run import AutonomousCycleRun as AutonomousCycleRunModel
+    from app.models.candle import Candle as CandleModel
+
+    engine = create_async_engine("sqlite+aiosqlite:///:memory:", poolclass=StaticPool)
+
+    @event.listens_for(engine.sync_engine, "connect")
+    def _register_now(dbapi_conn, _record) -> None:  # noqa: ANN001
+        dbapi_conn.create_function("now", 0, lambda: datetime.now(timezone.utc).isoformat())
+        dbapi_conn.create_function("gen_random_uuid", 0, lambda: uuid4().hex)
+
+    tables = [AssetModel.__table__, CandleModel.__table__, AutonomousCycleRunModel.__table__]
+    for table in tables:
+        _fix_sqlite_server_defaults(table)
+
+    async with engine.begin() as conn:
+        await conn.run_sync(lambda sync_conn: AssetModel.metadata.create_all(sync_conn, tables=tables))
+
+    try:
+        yield engine
+    finally:
+        await engine.dispose()
+
+
+class _CountingAsyncSession(AsyncSession):
+    """A real AsyncSession that counts rollback() calls, so the test can
+    assert the escalation path's real rollback actually ran."""
+
+    rollback_calls: int
+
+    def __init__(self, *args, **kwargs) -> None:  # noqa: ANN002, ANN003
+        super().__init__(*args, **kwargs)
+        object.__setattr__(self, "rollback_calls", 0)
+
+    async def rollback(self) -> None:
+        object.__setattr__(self, "rollback_calls", self.rollback_calls + 1)
+        await super().rollback()
+
+
+async def _seed_asset_and_candle(engine, *, asset_id: UUID, candle_id: int = 1) -> None:  # noqa: ANN001
+    from app.models.asset import Asset as AssetModel
+    from app.models.candle import Candle as CandleModel
+
+    now = datetime(2026, 7, 21, 12, 0, tzinfo=timezone.utc)
+    async with AsyncSession(engine) as session:
+        session.add(
+            AssetModel(
+                id=asset_id,
+                symbol="BTC",
+                asset_class="crypto",
+                exchange="kraken_spot",
+                base_currency="USD",
+                supports_fractional=True,
+                min_order_notional=Decimal("5"),
+                qty_step_size=Decimal("0.0001"),
+                is_active=True,
+                created_at=now,
+            )
+        )
+        session.add(
+            CandleModel(
+                id=candle_id,
+                asset_id=asset_id,
+                interval="15m",
+                open_time=now - timedelta(minutes=15),
+                close_time=now,
+                open=Decimal("66000"),
+                high=Decimal("66100"),
+                low=Decimal("65900"),
+                close=Decimal("66050"),
+                volume=Decimal("1.5"),
+                source="kraken",
+                created_at=now,
+            )
+        )
+        await session.commit()
+
+
+def _hold_veto_composition() -> dict[str, Any]:
+    return {
+        "failed_closed": False,
+        "decision_record_id": None,
+        "termination_stage": "hold_no_package_created",
+        "failure_reason": None,
+        "proposed_action": "HOLD",
+        "selected_decision": {"decision_kind": "HOLD", "reason": "data_quality_veto", "risk_verdict": "NOT_APPLICABLE"},
+        "deterministic_explanation": ["data_quality_veto"],
+        "candidate_instruments": ["BTC-USD"],
+        "risk_outputs": {},
+    }
+
+
+@pytest.mark.asyncio
+async def test_candle_survives_real_orm_expiration_after_scorecard_timeout_rollback(monkeypatch: pytest.MonkeyPatch) -> None:
+    from app.services.capital_campaign_orchestration.service import run_campaign_orchestration_preview_for_candle
+
+    asset_id = UUID("eeeeeeee-eeee-eeee-eeee-eeeeeeeeeeee")
+    campaign = SimpleNamespace(
+        campaign_id=UUID("aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa"),
+        version=1,
+        status="READY",
+        runtime_campaign_uuid=UUID("bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb"),
+        allowed_instruments=["BTC-USD"],
+        allowed_venues=["kraken_spot"],
+        campaign_modes=[],
+        aggression_mode="BALANCED",
+        accounting_state=SimpleNamespace(model_dump=lambda **_kwargs: {}),
+        remaining_unallocated_capital=Decimal("5"),
+    )
+
+    async def _get_campaign_definition(**_kwargs):
+        return campaign
+
+    holder: dict[str, Any] = {}
+
+    async def _compose_campaign_authoritative_cycle(*, db, campaign_definition, trigger, candle):
+        # Reproduces exactly what _recover_session_after_scorecard_failure's
+        # escalation path does deep inside strategy aggregate resolution
+        # when a scorecard-fetch timeout's health probe also fails: a real
+        # session rollback, expiring every ORM instance the session tracks
+        # -- including `candle`, held by the caller of this function.
+        holder["candle"] = candle
+        await db.rollback()
+        return SimpleNamespace(composition=_hold_veto_composition(), preview=None)
+
+    monkeypatch.setattr("app.services.capital_campaign_orchestration.service.get_campaign_definition", _get_campaign_definition)
+    monkeypatch.setattr("app.services.capital_campaign_orchestration.service.compose_campaign_authoritative_cycle", _compose_campaign_authoritative_cycle)
+
+    async with _real_candle_session() as engine:
+        await _seed_asset_and_candle(engine, asset_id=asset_id)
+
+        async with _CountingAsyncSession(engine) as db:
+            payload = await run_campaign_orchestration_preview_for_candle(
+                db=db, campaign_id=campaign.campaign_id, version=campaign.version, allow_draft_preview=False,
+            )
+
+            # The escalation path really did run a real rollback...
+            assert db.rollback_calls == 1
+            # ...which really did expire the candle instance compose_campaign_authoritative_cycle held.
+            assert sa_inspect(holder["candle"]).expired is True
+
+            # And yet the cycle completed correctly: fail-closed HOLD veto,
+            # not a crash. This only holds because
+            # run_campaign_orchestration_preview_for_candle snapshots
+            # candle.asset_id/.open_time/.close_time into plain values
+            # before compose_campaign_authoritative_cycle is ever called --
+            # without that, the idempotency-key build and cycle_context
+            # construction below would touch the now-expired candle
+            # instance through SQLAlchemy's asyncio greenlet bridge outside
+            # of an awaited context, raising the real
+            # sqlalchemy.exc.MissingGreenlet this test guards against (this
+            # uses a genuine AsyncSession over aiosqlite specifically so
+            # that bridge is exercised for real, not simulated).
+            assert payload["cycle_count"] == 1
+            assert payload["cycles"][0]["termination_stage"] == "hold_no_package_created"
 
 
 @pytest.mark.asyncio
