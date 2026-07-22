@@ -64,18 +64,28 @@ def _format_time(hour: str, minute: str) -> str:
     return f"{hour12}:{minute} {period}"
 
 
-def parse_line(line: str) -> tuple[str, str, dict[str, str]] | None:
+def parse_line(line: str) -> tuple[str, str, dict[str, str | None]] | None:
     """Return (time_of_day, event_name, fields), or None if this line isn't
     one of EVENT_NAMES. Tolerant of whatever prefix journalctl/python
     logging put in front of the message -- only the event keyword and what
-    follows it are used, so the log format can change without breaking this."""
+    follows it are used, so the log format can change without breaking this.
+
+    OmniTrade logs Python None values via %s formatting, so an absent field
+    shows up as the literal text "None" (e.g. "underlying_reason=None"), not
+    as a missing key. Left as a string, that text is truthy and defeats every
+    `a or b` fallback chain downstream -- it must be normalized back to real
+    None here, once, at the parsing boundary, rather than special-cased at
+    every call site that reads a field."""
     match = _EVENT_RE.search(line)
     if match is None:
         return None
     event_name, payload = match.group(1), match.group(2)
     time_match = _TIME_RE.match(line)
     time_str = _format_time(*time_match.groups()) if time_match else _format_time(*datetime.now().strftime("%H %M").split())
-    fields = {key: value.strip('"') for key, value in _KV_RE.findall(payload)}
+    fields: dict[str, str | None] = {}
+    for key, raw_value in _KV_RE.findall(payload):
+        value = raw_value.strip('"')
+        fields[key] = None if value == "None" else value
     return time_str, event_name, fields
 
 
@@ -105,45 +115,54 @@ class Cycle:
     decision_record_id: str | None = None
     package_id: str | None = None
     package_created: bool = False
+    package_skipped: bool = False
     skip_reason: str | None = None
     underlying_reason: str | None = None
+    rejection_reasons: str | None = None
     reconciliation_triggered: bool = False
     reconciliation_records: int = 0
 
     def has_content(self) -> bool:
         return self.action is not None or self.cycle_id is not None
 
-    def absorb(self, event: str, f: dict[str, str], time_str: str) -> None:
+    def absorb(self, event: str, f: dict[str, str | None], time_str: str) -> None:
+        # f.get(key) is used everywhere below, never f.get(key, default) --
+        # a field logged as the literal text "None" is normalized to real
+        # None by parse_line, and dict.get's default only applies when the
+        # key is absent, not when its value is None. Using `or` instead
+        # treats both cases the same way: "no value here, keep what we had."
         if not self.time_str:
             self.time_str = time_str
         if event == "strategy_aggregate_completed":
-            self.action = f.get("action", self.action)
-            self.selected_decision_reason = f.get("reason", self.selected_decision_reason)
+            self.action = f.get("action") or self.action
+            self.selected_decision_reason = f.get("reason") or self.selected_decision_reason
         elif event in ("net_edge_evaluated", "non_positive_net_edge_rejection_explained"):
             self.instrument = f.get("instrument") or f.get("asset") or self.instrument
             self.strategy_identity = f.get("strategy_identity") or f.get("strategy_id") or self.strategy_identity
-            self.expected_gross_edge_pct = f.get("expected_gross_edge_pct", self.expected_gross_edge_pct)
-            self.expected_net_edge_pct = f.get("expected_net_edge_pct", self.expected_net_edge_pct)
+            self.expected_gross_edge_pct = f.get("expected_gross_edge_pct") or self.expected_gross_edge_pct
+            self.expected_net_edge_pct = f.get("expected_net_edge_pct") or self.expected_net_edge_pct
             self.expected_net_profit = f.get("expected_net_profit") or f.get("expected_net_dollars") or self.expected_net_profit
             self.fees_amount = f.get("round_trip_fee_amount") or f.get("fees_dollars") or self.fees_amount
-            self.final_reason_code = f.get("final_reason_code", self.final_reason_code)
+            self.final_reason_code = f.get("final_reason_code") or self.final_reason_code
         elif event == "campaign_cycle_termination_resolved":
-            self.decision_kind = f.get("decision_kind", self.decision_kind)
-            self.proposed_action = f.get("proposed_action", self.proposed_action)
+            self.decision_kind = f.get("decision_kind") or self.decision_kind
+            self.proposed_action = f.get("proposed_action") or self.proposed_action
             self.selected_decision_reason = f.get("selected_decision_reason") or self.selected_decision_reason
         elif event == "automatic_ready_package_created":
-            self.cycle_id = f.get("cycle_id", self.cycle_id)
-            self.decision_record_id = f.get("decision_record_id", self.decision_record_id)
-            self.package_id = f.get("package_id", self.package_id)
+            self.cycle_id = f.get("cycle_id") or self.cycle_id
+            self.decision_record_id = f.get("decision_record_id") or self.decision_record_id
+            self.package_id = f.get("package_id") or self.package_id
             self.package_created = True
         elif event == "automatic_ready_package_skipped":
-            self.cycle_id = f.get("cycle_id", self.cycle_id)
-            self.decision_record_id = f.get("decision_record_id", self.decision_record_id)
-            self.skip_reason = f.get("reason", self.skip_reason)
-            self.underlying_reason = f.get("underlying_reason", self.underlying_reason)
+            self.cycle_id = f.get("cycle_id") or self.cycle_id
+            self.decision_record_id = f.get("decision_record_id") or self.decision_record_id
+            self.skip_reason = f.get("reason") or self.skip_reason
+            self.underlying_reason = f.get("underlying_reason") or self.underlying_reason
+            self.rejection_reasons = f.get("rejection_reasons") or self.rejection_reasons
+            self.package_skipped = True
         elif event == "unresolved_reconciliation_gate_triggered":
             self.reconciliation_triggered = True
-            self.reconciliation_records = int(f.get("matched_record_count", "0") or 0)
+            self.reconciliation_records = int(f.get("matched_record_count") or 0)
         elif event == "unresolved_reconciliation_record_detail":
             self.reconciliation_triggered = True
 
@@ -169,12 +188,42 @@ def _money(value: str | None) -> str | None:
     return f"{sign}${text}"
 
 
+_UNKNOWN_REASON = "Unknown (reason not present in log)"
+
+
+def _clean_reason_list(value: str | None) -> str | None:
+    """rejection_reasons/rejected_candidates arrive as a bracketed list
+    string, e.g. ["non_positive_net_edge"] or [('BTC-USD', 'reason')].
+    Strip the brackets/quotes for a readable last-resort display; None if
+    the list was empty."""
+    if not value:
+        return None
+    cleaned = value.strip("[]").replace('"', "").replace("'", "").strip()
+    return cleaned or None
+
+
 def _final_reason(cycle: Cycle) -> str | None:
-    """Why this cycle didn't end in a ready package. None if a package WAS
-    created (nothing left to explain)."""
+    """Best available reason this cycle didn't end in a ready package,
+    falling back across every field that might carry it -- underlying_reason
+    is the most specific, skip_reason the gate-level cause, final_reason_code
+    the net-edge verdict, selected_decision_reason the roster-level signal,
+    rejection_reasons the last-resort raw list. None only if a package WAS
+    created (nothing to explain) or truly nothing was ever logged."""
     if cycle.package_created:
         return None
-    return cycle.underlying_reason or cycle.skip_reason
+    return (
+        cycle.underlying_reason
+        or cycle.skip_reason
+        or cycle.final_reason_code
+        or cycle.selected_decision_reason
+        or _clean_reason_list(cycle.rejection_reasons)
+    )
+
+
+def _display_reason(cycle: Cycle) -> str:
+    """Like _final_reason, but never returns None/empty -- always something
+    human-readable to print, even when the logs genuinely carried no reason."""
+    return _final_reason(cycle) or _UNKNOWN_REASON
 
 
 def _is_reconciliation_blocked(cycle: Cycle) -> bool:
@@ -204,7 +253,7 @@ def render_card(cycle: Cycle) -> str:
     action = (cycle.action or "").upper()
 
     if action == "HOLD":
-        out += [c("🟡 HOLD", YELLOW), "", "Reason", "", cycle.selected_decision_reason or cycle.underlying_reason or "unknown", "", "No package created."]
+        out += [c("🟡 HOLD", YELLOW), "", "Reason", "", _display_reason(cycle), "", "No package created."]
     elif action == "SELL":
         out += [c("🔴 SELL", BRIGHT_RED), ""]
         if cycle.expected_net_profit is not None:
@@ -220,9 +269,8 @@ def render_card(cycle: Cycle) -> str:
         if cycle.expected_net_edge_pct is not None:
             out += ["Expected Edge", c(f"{cycle.expected_net_edge_pct}%", MAGENTA), ""]
         out += ["Status", ""] + _status_lines(cycle)
-        reason = _final_reason(cycle)
-        if reason:
-            out += ["", "Reason", "", reason]
+        if cycle.package_skipped:
+            out += ["", "Reason", "", _display_reason(cycle)]
         if cycle.cycle_id or cycle.decision_record_id:
             out.append("")
             if cycle.cycle_id:
@@ -243,9 +291,8 @@ def banner_for(cycle: Cycle) -> str:
     if action == "BUY":
         if cycle.package_created:
             return c("🟣 Ready package created", MAGENTA)
-        reason = _final_reason(cycle)
-        if reason:
-            return c(f"🔴 BUY blocked by {reason}", BRIGHT_RED)
+        if cycle.package_skipped:
+            return c(f"🔴 BUY blocked by {_display_reason(cycle)}", BRIGHT_RED)
         return c("🟢 BUY signal seen, awaiting resolution...", BRIGHT_GREEN)
     return c("🟢 Waiting for BUY signal...", BRIGHT_GREEN)
 
