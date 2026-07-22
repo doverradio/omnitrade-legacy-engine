@@ -6,6 +6,7 @@ import logging
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
+from types import SimpleNamespace
 from typing import Any
 from uuid import UUID
 
@@ -900,6 +901,40 @@ async def load_strategy_aggregate_evidence(
     ):
         return None, "decision_snapshot_aggregate_mismatch"
 
+    # Snapshot everything the evidence-builder call below needs from
+    # aggregate_row/decision_record into plain values now, before the
+    # scorecard fetch. Same reasoning as the fresh-computation path in
+    # resolve_or_create_strategy_aggregate_evidence: if that fetch times out
+    # badly enough to require _recover_session_after_scorecard_failure's
+    # escalation path, the session rollback it performs expires both of
+    # these ORM instances, and any attribute access on them afterward (as
+    # the _build_aggregate_evidence_dict call below used to do directly)
+    # attempts an implicit lazy-reload outside of SQLAlchemy's asyncio
+    # greenlet bridge, raising MissingGreenlet. decision_record_snapshot
+    # duck-types DecisionRecord (_build_aggregate_evidence_dict only ever
+    # reads plain attributes off it, never anything ORM-specific).
+    aggregate_decision_id = aggregate_row.aggregate_decision_id
+    final_action = aggregate_row.final_action
+    primary_strategy_identity = aggregate_row.primary_strategy_identity
+    primary_strategy_version = aggregate_row.primary_strategy_version
+    dominant_contributor_identity = aggregate_row.dominant_contributor_identity
+    eligible_strategy_count = aggregate_row.eligible_strategy_count
+    weighted_buy_score = Decimal(str(aggregate_row.weighted_buy_score))
+    weighted_sell_score = Decimal(str(aggregate_row.weighted_sell_score))
+    weighted_hold_score = Decimal(str(aggregate_row.weighted_hold_score))
+    thresholds_applied = aggregate_row.thresholds_applied
+    deterministic_explanation = aggregate_row.deterministic_explanation
+    decision_record_snapshot = SimpleNamespace(
+        decision_id=decision_record.decision_id,
+        trade_accepted=decision_record.trade_accepted,
+        trade_rejected_reason=decision_record.trade_rejected_reason,
+        supporting_strategies=decision_record.supporting_strategies,
+        opposing_strategies=decision_record.opposing_strategies,
+        expected_risk=decision_record.expected_risk,
+        expected_reward=decision_record.expected_reward,
+        generated_signals=decision_record.generated_signals,
+    )
+
     # Scorecard enrichment is best-effort and must never leave the caller's
     # transaction unusable: this read runs in its own savepoint so that any
     # failure here -- of any kind, including a database-level error -- rolls
@@ -927,18 +962,18 @@ async def load_strategy_aggregate_evidence(
     evidence = _build_aggregate_evidence_dict(
         roster_run_id=roster_run_id,
         candle_close_time=candle_close_time,
-        aggregate_decision_id=aggregate_row.aggregate_decision_id,
-        decision_record=decision_record,
-        final_action=aggregate_row.final_action,
-        primary_strategy_identity=aggregate_row.primary_strategy_identity,
-        primary_strategy_version=aggregate_row.primary_strategy_version,
-        dominant_contributor_identity=aggregate_row.dominant_contributor_identity,
-        eligible_strategy_count=aggregate_row.eligible_strategy_count,
-        weighted_buy_score=Decimal(str(aggregate_row.weighted_buy_score)),
-        weighted_sell_score=Decimal(str(aggregate_row.weighted_sell_score)),
-        weighted_hold_score=Decimal(str(aggregate_row.weighted_hold_score)),
-        thresholds_applied=aggregate_row.thresholds_applied,
-        deterministic_explanation=aggregate_row.deterministic_explanation,
+        aggregate_decision_id=aggregate_decision_id,
+        decision_record=decision_record_snapshot,
+        final_action=final_action,
+        primary_strategy_identity=primary_strategy_identity,
+        primary_strategy_version=primary_strategy_version,
+        dominant_contributor_identity=dominant_contributor_identity,
+        eligible_strategy_count=eligible_strategy_count,
+        weighted_buy_score=weighted_buy_score,
+        weighted_sell_score=weighted_sell_score,
+        weighted_hold_score=weighted_hold_score,
+        thresholds_applied=thresholds_applied,
+        deterministic_explanation=deterministic_explanation,
         strategy_contributions=contributions,
         scorecard_by_slug=scorecard_by_slug,
     )
@@ -994,8 +1029,39 @@ async def resolve_or_create_strategy_aggregate_evidence(
         )
         return None, selection_reason or "strategy_evidence_unavailable"
 
-    roster_run_id = proposals[0].roster_run_id
-    candle_close_time = proposals[0].candle_close_time
+    # Snapshot every field this function needs from `proposals` into plain
+    # values now, before the scorecard fetch below. If that fetch times out
+    # badly enough to require _recover_session_after_scorecard_failure's
+    # escalation path, the session rollback it performs expires every ORM
+    # instance still tracked in this session -- including every proposal in
+    # this list, loaded earlier in the same session by
+    # _load_latest_roster_proposal_group. Any attribute access on an expired
+    # instance afterward attempts an implicit lazy-reload, which requires
+    # SQLAlchemy's asyncio greenlet bridge; a plain `for proposal in
+    # proposals: proposal.strategy_slug` loop is not inside one, so it raises
+    # MissingGreenlet instead of silently refetching -- the confirmed
+    # production defect. Snapshotting once, up front, means nothing below
+    # ever touches the ORM objects again regardless of what happens to the
+    # session in between.
+    proposal_snapshots = [
+        SimpleNamespace(
+            strategy_slug=proposal.strategy_slug,
+            strategy_identity=proposal.strategy_identity,
+            strategy_version=proposal.strategy_version,
+            action=proposal.action,
+            confidence=proposal.confidence,
+            strength=proposal.strength,
+            evaluation_status=proposal.evaluation_status,
+            evaluated_at=proposal.evaluated_at,
+            roster_run_id=proposal.roster_run_id,
+            asset_id=proposal.asset_id,
+            candle_close_time=proposal.candle_close_time,
+        )
+        for proposal in proposals
+    ]
+
+    roster_run_id = proposal_snapshots[0].roster_run_id
+    candle_close_time = proposal_snapshots[0].candle_close_time
 
     # Pure-read fast path: if this exact scope was already resolved (e.g. a
     # prior cycle, or a retry after a downstream failure earlier in the same
@@ -1041,7 +1107,7 @@ async def resolve_or_create_strategy_aggregate_evidence(
         await _recover_session_after_scorecard_failure(db=db)
 
     proposal_inputs: list[StrategyProposalInput] = []
-    for proposal in proposals:
+    for proposal in proposal_snapshots:
         outcome_evidence = None
         scorecard = scorecard_by_slug.get(proposal.strategy_slug)
         if scorecard is not None:

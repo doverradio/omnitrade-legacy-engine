@@ -11,6 +11,7 @@ from typing import Any, AsyncIterator
 
 import pytest
 from sqlalchemy import create_engine, event, text, update
+from sqlalchemy import inspect as sa_inspect
 from sqlalchemy.dialects.postgresql import JSONB, UUID as PG_UUID
 from sqlalchemy.ext.compiler import compiles
 from sqlalchemy.orm import Session
@@ -941,6 +942,90 @@ async def test_recover_session_after_scorecard_failure_escalates_when_probe_stil
     assert calls["execute"] == 1
     assert calls["invalidate"] == 1
     assert calls["rollback"] == 1
+
+
+# Production evidence, second incident: after the probe-gated recovery above
+# shipped, a later production cycle hit fetch_strategy_scorecards() timing
+# out AGAIN, this time with the probe ALSO failing (the savepoint's own
+# rollback did not fully recover the connection) -- so
+# _recover_session_after_scorecard_failure's escalation path ran a real
+# session.rollback(). That expires every ORM instance still tracked by the
+# session, including every `proposal` in resolve_or_create_strategy_aggregate_evidence's
+# `proposals` list, loaded earlier in the same session. The very next line,
+# `scorecard_by_slug.get(proposal.strategy_slug)`, touched an expired
+# attribute on a plain (non-awaited) for-loop iteration -- outside
+# SQLAlchemy's asyncio greenlet bridge, this raises MissingGreenlet instead
+# of transparently refetching. This test reproduces the full chain against a
+# REAL SQLAlchemy Session (not a mock), so the expiration -- and the fix's
+# avoidance of it -- is genuine, not asserted by assumption.
+@pytest.mark.asyncio
+async def test_scorecard_timeout_with_unrecovered_probe_survives_real_orm_expiration(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    _patch_flat_position(monkeypatch)
+    caplog.set_level(logging.WARNING)
+
+    probe_state = {"armed": False, "raised": False}
+
+    async def _raise_scorecards(**_kwargs):
+        # Fires exactly where production's TimeoutError fired. Arms the
+        # probe-failure so the very next db.execute() (the health probe
+        # inside _recover_session_after_scorecard_failure) also fails,
+        # forcing the escalation path -- a real session.rollback() -- to run.
+        probe_state["armed"] = True
+        raise TimeoutError("simulated fetch_strategy_scorecards command timeout")
+
+    monkeypatch.setattr(authoritative, "fetch_strategy_scorecards", _raise_scorecards)
+
+    async with _real_session() as session:
+        await _seed_roster_run_and_proposals(
+            session, actions={"ma_crossover": "BUY", "momentum": "BUY", "breakout": "BUY"}
+        )
+
+        original_execute = session.execute
+
+        async def _flaky_execute(statement):
+            if probe_state["armed"] and not probe_state["raised"]:
+                probe_state["raised"] = True
+                raise RuntimeError("simulated: connection still broken after savepoint's own rollback")
+            return await original_execute(statement)
+
+        session.execute = _flaky_execute
+
+        # Load the exact same ORM instances the aggregator will use
+        # internally (same session identity map, same primary keys) so we
+        # can prove, independently, that they really were expired.
+        proposal_rows = list((await original_execute(StrategyRosterProposal.__table__.select())).fetchall())
+        assert len(proposal_rows) == 3
+        held_proposals = [
+            await session.get(StrategyRosterProposal, row.proposal_id) for row in proposal_rows
+        ]
+        assert all(sa_inspect(p).expired is False for p in held_proposals)
+
+        evidence, reason = await _call_aggregator(session)
+
+        # The probe really did fail once, proving the escalation path ran.
+        assert probe_state["raised"] is True
+
+        # The escalation path's session.rollback() really did expire the
+        # proposals this function loaded earlier in the same session --
+        # confirming the mechanism, not assuming it.
+        assert all(sa_inspect(p).expired is True for p in held_proposals)
+
+        # And yet the function completed correctly: fail-closed veto, not a
+        # crash. This only holds because the fix snapshots every proposal
+        # field into plain values before the scorecard fetch -- without it,
+        # `scorecard_by_slug.get(proposal.strategy_slug)` below would touch
+        # one of the now-expired instances above and raise MissingGreenlet
+        # (in real production) or ObjectDeletedError (here, since the seeded
+        # rows were only flushed, never committed, so the rollback actually
+        # removed them).
+        assert reason is None
+        assert evidence is not None
+        assert evidence["action"] == "HOLD"
+
+        matching = [r for r in caplog.records if r.getMessage().startswith("strategy_scorecard_fetch_failed roster_run_id=")]
+        assert len(matching) == 1
 
 
 @pytest.mark.asyncio
