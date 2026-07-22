@@ -14,14 +14,21 @@ Standard library only, no external dependencies.
 """
 from __future__ import annotations
 
+import os
 import re
 import subprocess
 import time
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import datetime, timezone
+from zoneinfo import ZoneInfo
 
 SERVICE_UNIT = "omnitrade-orchestration.service"
-JOURNAL_CMD = ["sudo", "journalctl", "-u", SERVICE_UNIT, "-f", "-o", "short-iso"]
+# --utc pins journalctl's timestamps to UTC regardless of this VPS's system
+# timezone -- without it, journalctl renders in whatever local tz the box
+# happens to be configured with (commonly UTC on cloud images), and that
+# ambiguity was the actual root cause of the display bug: there was no way
+# to tell, from the line alone, what tz its digits were already in.
+JOURNAL_CMD = ["sudo", "journalctl", "-u", SERVICE_UNIT, "-f", "-o", "short-iso", "--utc"]
 
 # --- Colors ---
 RESET, BOLD, DIM = "\033[0m", "\033[1m", "\033[2m"
@@ -50,18 +57,41 @@ EVENT_NAMES = (
     "unresolved_reconciliation_record_detail",
 )
 _EVENT_RE = re.compile(r"\b(" + "|".join(EVENT_NAMES) + r")\b(.*)$")
-_TIME_RE = re.compile(r"^\S*?T(\d{2}):(\d{2})")
+_TIMESTAMP_RE = re.compile(r"^(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2})")
 # key=value, where value may be a bracketed/parenthesized/quoted group
 # (handles rejected_candidates=[('BTC-USD', 'reason')], rejection_reasons=["x"]).
 _KV_RE = re.compile(r'(\w+)=(\[[^\]]*\]|\([^)]*\)|"[^"]*"|\S+)')
 _TERMINAL_EVENTS = {"automatic_ready_package_created", "automatic_ready_package_skipped"}
 
 
-def _format_time(hour: str, minute: str) -> str:
-    hour_int = int(hour)
-    period = "AM" if hour_int < 12 else "PM"
-    hour12 = hour_int % 12 or 12
-    return f"{hour12}:{minute} {period}"
+def _display_timezone() -> ZoneInfo | None:
+    """The timezone timestamps are converted to for display, resolved fresh
+    on every call so a long-running console session stays correct across a
+    DST transition. Prefers the operator's explicitly configured TZ (e.g.
+    TZ=America/New_York); None signals "use the OS's local timezone",
+    which datetime.astimezone(None) resolves DST-correctly for the specific
+    instant being converted -- never the VPS/journalctl system timezone,
+    which is what previously leaked into the display unconverted."""
+    tz_name = os.environ.get("TZ")
+    if tz_name:
+        try:
+            return ZoneInfo(tz_name)
+        except Exception:
+            pass
+    return None
+
+
+def _format_time(dt_utc: datetime) -> str:
+    """Converts a UTC-aware datetime (journalctl is invoked with --utc, so
+    every timestamp parsed from its output is unambiguously UTC) to the
+    display timezone and renders it as 12-hour wall-clock time. Conversion
+    to local time happens only here, at the point of display -- everywhere
+    else timestamps stay UTC -- so DST and any non-UTC operator timezone are
+    handled correctly without a hardcoded offset."""
+    local_dt = dt_utc.astimezone(_display_timezone())
+    hour12 = local_dt.hour % 12 or 12
+    period = "AM" if local_dt.hour < 12 else "PM"
+    return f"{hour12}:{local_dt.minute:02d} {period}"
 
 
 def parse_line(line: str) -> tuple[str, str, dict[str, str | None]] | None:
@@ -80,8 +110,13 @@ def parse_line(line: str) -> tuple[str, str, dict[str, str | None]] | None:
     if match is None:
         return None
     event_name, payload = match.group(1), match.group(2)
-    time_match = _TIME_RE.match(line)
-    time_str = _format_time(*time_match.groups()) if time_match else _format_time(*datetime.now().strftime("%H %M").split())
+    time_match = _TIMESTAMP_RE.match(line)
+    dt_utc = (
+        datetime.strptime(time_match.group(1), "%Y-%m-%dT%H:%M:%S").replace(tzinfo=timezone.utc)
+        if time_match
+        else datetime.now(timezone.utc)
+    )
+    time_str = _format_time(dt_utc)
     fields: dict[str, str | None] = {}
     for key, raw_value in _KV_RE.findall(payload):
         value = raw_value.strip('"')
