@@ -31,6 +31,15 @@ class StrategyRosterProposalOutcome(Base):
         Index("ix_roster_outcomes_strategy_horizon", "strategy_slug", "horizon_minutes", "evaluated_at"),
         Index("ix_roster_outcomes_proposal", "proposal_id"),
         Index("ix_roster_outcomes_roster_run", "roster_run_id"),
+        # Covers both the filter and the ORDER BY of
+        # app.services.strategy_outcomes.service.fetch_strategy_scorecards --
+        # without it, every scorecard fetch is a full sequential scan plus a
+        # sort that gets slower as this table grows. See migration
+        # 20260721_0044 for the confirmed production timeout this caused.
+        Index(
+            "ix_roster_outcomes_scorecard_lookup",
+            "provider", "product_id", "interval", "evaluation_state", "strategy_slug", "evaluated_at", "outcome_id",
+        ),
     )
 
     outcome_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, server_default=text("gen_random_uuid()"))
