@@ -5,7 +5,9 @@ from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 import hashlib
 import json
+import logging
 import statistics
+import time
 import uuid
 
 from sqlalchemy import select
@@ -18,6 +20,8 @@ from app.models.strategy_roster_proposal_outcome import StrategyRosterProposalOu
 
 
 HORIZONS: tuple[tuple[str, int], ...] = (("15m", 15), ("1h", 60), ("4h", 240), ("24h", 1440))
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True, slots=True)
@@ -395,6 +399,15 @@ async def fetch_strategy_scorecards(
         getattr(settings, "outcome_scorecards_regime_min_evaluations", 50)
     )
 
+    # Phase-timed diagnostic instrumentation (production performance
+    # investigation into fetch_strategy_scorecards() timeouts). Each phase
+    # is measured with perf_counter() around exactly the work it names, with
+    # no behavior change to the query, hydration, or scoring logic below --
+    # this is pure measurement, not an optimization. Logged unconditionally:
+    # this function runs at most once per campaign per 15-minute candle, so
+    # log volume is trivial relative to the diagnostic value while the
+    # timeout is still being characterized.
+    t_query_start = time.perf_counter()
     result = await db.execute(
         select(StrategyRosterProposalOutcome)
         .where(StrategyRosterProposalOutcome.provider == provider)
@@ -407,15 +420,19 @@ async def fetch_strategy_scorecards(
             StrategyRosterProposalOutcome.outcome_id.asc(),
         )
     )
+    t_query_done = time.perf_counter()
+
     rows = [
         row
         for row in result.scalars().all()
         if row.evaluation_state == "RESOLVED"
     ]
+    t_hydration_done = time.perf_counter()
 
     grouped: dict[str, list[StrategyRosterProposalOutcome]] = {}
     for row in rows:
         grouped.setdefault(row.strategy_slug, []).append(row)
+    t_grouping_done = time.perf_counter()
 
     scorecards: list[StrategyScorecard] = []
     for strategy_slug in sorted(grouped):
@@ -512,4 +529,17 @@ async def fetch_strategy_scorecards(
             )
         )
 
+    t_scoring_done = time.perf_counter()
+    logger.info(
+        "strategy_scorecard_fetch_timing provider=%s product_id=%s interval=%s "
+        "row_count=%d strategy_count=%d "
+        "query_ms=%.1f hydration_ms=%.1f grouping_ms=%.1f scoring_ms=%.1f total_ms=%.1f",
+        provider, product_id, interval,
+        len(rows), len(grouped),
+        (t_query_done - t_query_start) * 1000,
+        (t_hydration_done - t_query_done) * 1000,
+        (t_grouping_done - t_hydration_done) * 1000,
+        (t_scoring_done - t_grouping_done) * 1000,
+        (t_scoring_done - t_query_start) * 1000,
+    )
     return scorecards
