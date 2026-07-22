@@ -590,7 +590,7 @@ async def _resolve_strategy_and_parameter_binding(
     return strategy, parameter_set
 
 
-async def _create_forced_commissioning_preview(
+async def _create_crypto_order_preview_for_package(
     *,
     db: AsyncSession,
     request: CanonicalPreviewPackageCreateRequest,
@@ -924,7 +924,6 @@ async def create_canonical_preview_package(
     proposed_action = str(composition.get("proposed_action") or cycle.proposed_action or "").strip().upper()
     selected_decision = composition.get("selected_decision") if isinstance(composition.get("selected_decision"), dict) else {}
     decision_kind = str(selected_decision.get("decision_kind") or "").strip().upper()
-    forced_hold_bypass_active = False
 
     if cycle.failure_reason == "runtime_campaign_or_paper_account_unavailable":
         diagnostics = [
@@ -962,7 +961,6 @@ async def create_canonical_preview_package(
 
         # Initial operator-commissioned proving entry can bypass strategy HOLD only.
         proposed_action = "OPEN_POSITION_PROPOSED"
-        forced_hold_bypass_active = True
 
     if proposed_action and proposed_action not in _EXECUTABLE_ACTIONS:
         raise _preview_evidence_error(
@@ -975,9 +973,24 @@ async def create_canonical_preview_package(
             ]
         )
 
+    # _load_preview_for_package only ever finds a CryptoOrderPreview row that
+    # some OTHER flow already created (e.g. a manual/API preview, or a prior
+    # canonical package's own preview). For the capital-campaign orchestration
+    # path there is no such upstream creator for a normal, already-validated
+    # executable decision (BUY/OPEN_POSITION_PROPOSED/CLOSE_POSITION_PROPOSED)
+    # -- by this point proposed_action has already been confirmed executable
+    # (line 967 above) and, for a hold cycle, confirmed to be a legitimate
+    # forced-commissioning bypass (the early-return above exits for every
+    # other hold case) -- so it is always safe to create the preview
+    # ourselves here rather than only for the forced-commissioning bypass.
+    # Confirmed production defect: a genuine, economically-accepted,
+    # non-forced OPEN_POSITION_PROPOSED decision had no code path that ever
+    # persisted its CryptoOrderPreview, so this lookup always returned None
+    # and the cycle crashed with canonical_crypto_order_preview_id_missing
+    # instead of completing.
     preview = await _load_preview_for_package(db=db, request=request, observed_after=cycle.started_at)
-    if preview is None and forced_hold_bypass_active:
-        preview = await _create_forced_commissioning_preview(
+    if preview is None:
+        preview = await _create_crypto_order_preview_for_package(
             db=db,
             request=request,
             profile=profile,

@@ -726,7 +726,7 @@ async def test_forced_commissioning_mode_creates_preview_when_missing(monkeypatc
     monkeypatch.setattr(cpp, "run_campaign_orchestration_preview_for_candle", _async_return({"cycles": [{"cycle_id": str(cycle.cycle_id)}]}))
     monkeypatch.setattr(cpp, "_load_campaign_cycle", _async_return(cycle))
     monkeypatch.setattr(cpp, "_load_preview_for_package", _async_return(None))
-    monkeypatch.setattr(cpp, "_create_forced_commissioning_preview", _fake_create_forced_preview)
+    monkeypatch.setattr(cpp, "_create_crypto_order_preview_for_package", _fake_create_forced_preview)
     monkeypatch.setattr(cpp, "_load_decision_record", _async_return(SimpleNamespace(decision_id=preview.decision_record_id)))
     monkeypatch.setattr(cpp, "_load_risk_event", _async_return(SimpleNamespace(id=preview.risk_event_id)))
 
@@ -1244,7 +1244,7 @@ async def test_create_forced_commissioning_preview_reuses_create_crypto_order_pr
     monkeypatch.setattr(cpp, "_load_preview_by_id", _async_return(preview))
 
     db = _FakeDb()
-    resolved = await cpp._create_forced_commissioning_preview(
+    resolved = await cpp._create_crypto_order_preview_for_package(
         db=db,
         request=request,
         profile=profile,
@@ -1286,7 +1286,7 @@ async def test_create_forced_commissioning_preview_not_ready_fails_closed(monkey
     monkeypatch.setattr(cpp, "_load_preview_by_id", _async_return(preview))
 
     with pytest.raises(LookupError) as exc_info:
-        await cpp._create_forced_commissioning_preview(
+        await cpp._create_crypto_order_preview_for_package(
             db=_FakeDb(),
             request=request,
             profile=profile,
@@ -1347,7 +1347,7 @@ async def test_forced_commissioning_idempotent_retry_does_not_recreate_preview(m
         raise AssertionError("forced preview creation must not run during idempotent replay")
 
     monkeypatch.setattr(cpp, "_load_package_by_idempotency", _async_return(existing))
-    monkeypatch.setattr(cpp, "_create_forced_commissioning_preview", _should_not_run)
+    monkeypatch.setattr(cpp, "_create_crypto_order_preview_for_package", _should_not_run)
 
     result = await cpp.create_canonical_preview_package(db=_FakeDb(), request=request)
 
@@ -1397,6 +1397,109 @@ async def test_create_canonical_preview_package_executable_candidate_links_all_i
 
 
 @pytest.mark.asyncio
+async def test_create_canonical_preview_package_creates_preview_for_normal_executable_decision_when_none_exists(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Regression test for the confirmed production defect: a genuine,
+    economically-accepted, non-forced OPEN_POSITION_PROPOSED decision had no
+    code path that ever persisted its CryptoOrderPreview -- _load_preview_for_package
+    only ever finds a preview some OTHER flow already created, and the only
+    creation fallback was gated on forced_hold_bypass_active (the
+    forced-commissioning HOLD-bypass case), which a normal, non-hold
+    executable decision never sets. Production symptom: net_edge_evaluated
+    accepted, campaign_cycle_termination_resolved with proposed_action=
+    OPEN_POSITION_PROPOSED, then LookupError: canonical_crypto_order_preview_id_missing.
+    This proves the fix -- removing the forced_hold_bypass_active gate -- makes
+    package creation succeed for this exact scenario."""
+    campaign_id = uuid4()
+    package_id = uuid4()
+    profile = _profile()
+    runtime_campaign = _runtime_campaign(campaign_id=campaign_id)
+    definition = _definition(campaign_id=campaign_id, campaign_version=1)
+    decision_id = uuid4()
+    preview = _preview(package_id=package_id)
+    preview.status = "PREVIEW_READY"
+    preview.parameter_set_id = None
+    strategy = SimpleNamespace(id=preview.strategy_id, module_version="strategy-v1", slug="ma_crossover")
+    parameter_set = SimpleNamespace(id=preview.parameter_set_id or uuid4(), label="ps-v1")
+
+    cycle = _cycle()  # proposed_action="OPEN_POSITION_PROPOSED", NOT a hold cycle
+    cycle.cycle_context["authoritative_composition"]["selected_decision"] = {
+        "decision_kind": "BUY",
+        "reason": None,
+        "decision_record_id": str(decision_id),
+        "strategy_identity": "ma_crossover@1.0.0",
+    }
+    request = _create_request(campaign_id=campaign_id, profile=profile, idempotency_key="pkg-normal-preview-create")
+
+    create_calls = {"count": 0}
+
+    async def _fake_create_crypto_order_preview(*, db, request, actor):
+        create_calls["count"] += 1
+        return SimpleNamespace(crypto_order_preview_id=package_id)
+
+    monkeypatch.setattr(cpp, "_load_package_by_idempotency", _async_return(None))
+    monkeypatch.setattr(cpp, "_load_profile", _async_return(profile))
+    monkeypatch.setattr(cpp, "_load_runtime_campaign", _async_return(runtime_campaign))
+    monkeypatch.setattr(cpp, "_load_campaign_definition", _async_return(definition))
+    monkeypatch.setattr(cpp, "run_campaign_orchestration_preview_for_candle", _async_return({"cycles": [{"cycle_id": str(cycle.cycle_id)}]}))
+    monkeypatch.setattr(cpp, "_load_campaign_cycle", _async_return(cycle))
+    # The bug: no upstream flow ever created a preview for this decision.
+    monkeypatch.setattr(cpp, "_load_preview_for_package", _async_return(None))
+    monkeypatch.setattr(cpp, "_load_exchange_connection_for_scope", _async_return(SimpleNamespace(exchange_connection_id=uuid4())))
+    monkeypatch.setattr(cpp, "_resolve_strategy_and_parameter_binding", _async_return((strategy, parameter_set)))
+    monkeypatch.setattr(cpp, "create_crypto_order_preview", _fake_create_crypto_order_preview)
+    monkeypatch.setattr(cpp, "_load_preview_by_id", _async_return(preview))
+    monkeypatch.setattr(cpp, "_load_decision_record", _async_return(SimpleNamespace(decision_id=decision_id)))
+    monkeypatch.setattr(cpp, "_load_risk_event", _async_return(SimpleNamespace(id=uuid4())))
+
+    db = _FakeDb(scalar_values=[strategy, parameter_set])
+    result = await cpp.create_canonical_preview_package(db=db, request=request)
+
+    assert create_calls["count"] == 1
+    assert result["package"]["crypto_order_preview_id"] == str(package_id)
+    assert result["readiness"]["ready"] is True
+
+
+@pytest.mark.asyncio
+async def test_create_canonical_preview_package_still_fails_closed_when_creation_is_impossible(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Confirms the fix does not weaken fail-closed behavior: when no preview
+    exists AND creating one is genuinely impossible (no exchange connection
+    for this provider/environment), the cycle must still raise a LookupError
+    -- never silently proceed, never crash with an unrelated error."""
+    campaign_id = uuid4()
+    profile = _profile()
+    runtime_campaign = _runtime_campaign(campaign_id=campaign_id)
+    definition = _definition(campaign_id=campaign_id, campaign_version=1)
+    decision_id = uuid4()
+
+    cycle = _cycle()
+    cycle.cycle_context["authoritative_composition"]["selected_decision"] = {
+        "decision_kind": "BUY",
+        "reason": None,
+        "decision_record_id": str(decision_id),
+        "strategy_identity": "ma_crossover@1.0.0",
+    }
+    request = _create_request(campaign_id=campaign_id, profile=profile, idempotency_key="pkg-normal-preview-impossible")
+
+    monkeypatch.setattr(cpp, "_load_package_by_idempotency", _async_return(None))
+    monkeypatch.setattr(cpp, "_load_profile", _async_return(profile))
+    monkeypatch.setattr(cpp, "_load_runtime_campaign", _async_return(runtime_campaign))
+    monkeypatch.setattr(cpp, "_load_campaign_definition", _async_return(definition))
+    monkeypatch.setattr(cpp, "run_campaign_orchestration_preview_for_candle", _async_return({"cycles": [{"cycle_id": str(cycle.cycle_id)}]}))
+    monkeypatch.setattr(cpp, "_load_campaign_cycle", _async_return(cycle))
+    monkeypatch.setattr(cpp, "_load_preview_for_package", _async_return(None))
+    monkeypatch.setattr(cpp, "_load_exchange_connection_for_scope", _async_return(None))
+
+    with pytest.raises(LookupError) as exc_info:
+        await cpp.create_canonical_preview_package(db=_FakeDb(scalar_values=[0]), request=request)
+
+    assert "canonical_exchange_connection_missing" in str(exc_info.value)
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize(
     ("code", "mode"),
     [
@@ -1407,7 +1510,6 @@ async def test_create_canonical_preview_package_executable_candidate_links_all_i
         ("canonical_parameter_set_version_missing", "parameter_set_missing"),
         ("canonical_decision_record_id_missing", "decision_missing"),
         ("canonical_risk_event_id_missing", "risk_missing"),
-        ("canonical_crypto_order_preview_id_missing", "preview_missing"),
         ("canonical_price_evidence_missing", "price_missing"),
         ("canonical_price_evidence_stale", "price_stale"),
         ("canonical_preview_expiration_missing", "preview_expiry_missing"),
@@ -1447,8 +1549,6 @@ async def test_create_canonical_preview_package_deterministic_failure_code_matri
         monkeypatch.setattr(cpp, "_load_decision_record", _async_return(None))
     elif mode == "risk_missing":
         monkeypatch.setattr(cpp, "_load_risk_event", _async_return(None))
-    elif mode == "preview_missing":
-        monkeypatch.setattr(cpp, "_load_preview_for_package", _async_return(None))
     elif mode == "price_missing":
         monkeypatch.setattr(cpp, "_load_preview_for_package", _async_return(SimpleNamespace(**{**preview.__dict__, "created_at": None})))
     elif mode == "price_stale":
