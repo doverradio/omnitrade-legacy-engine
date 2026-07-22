@@ -17,6 +17,7 @@ from app.models.autonomous_capital_mandate_evaluation import AutonomousCapitalMa
 from app.models.autonomous_capital_mandate_version import AutonomousCapitalMandateVersion
 from app.models.capital_campaign import CapitalCampaign
 from app.models.crypto_order_preview import CryptoOrderPreview
+from app.models.decision_record import DecisionRecord
 from app.models.decision_snapshot import DecisionSnapshot
 from app.models.live_trading_profile import LiveTradingProfile
 from app.models.paper_account import PaperAccount
@@ -48,6 +49,7 @@ async def _real_session() -> AsyncIterator[AsyncSession]:
             AutonomousCapitalMandateEvaluation.__table__,
             AuditLog.__table__,
             CryptoOrderPreview.__table__,
+            DecisionRecord.__table__,
             DecisionSnapshot.__table__,
             RiskEvent.__table__,
             LiveTradingProfile.__table__,
@@ -184,11 +186,26 @@ async def _seed_active_level2_mandate(
     return mandate
 
 
-async def _seed_scope(session: AsyncSession, *, paper_account_id: uuid.UUID) -> tuple[uuid.UUID, uuid.UUID, uuid.UUID]:
+async def _seed_scope(
+    session: AsyncSession,
+    *,
+    paper_account_id: uuid.UUID,
+    canonical_strategy_identity: str | None = _STRATEGY_IDENTITY,
+) -> tuple[uuid.UUID, uuid.UUID, uuid.UUID, uuid.UUID]:
     """Seeds the real chain _evaluate_level2_mandate_authorization actually
     resolves scope through: CryptoOrderPreview -> RiskEvent (via
-    live_order.risk_event_id) -> LiveTradingProfile (via paper_account_id).
-    Returns (exchange_connection_id, live_trading_profile_id, preview_id)."""
+    live_order.risk_event_id) -> LiveTradingProfile (via paper_account_id);
+    and the real chain it resolves the canonical strategy identity through:
+    CryptoOrderPreview.decision_record_id -> DecisionRecord.generated_signals[0]
+    ["strategy_identity"]. The sibling DecisionSnapshot.strategy_version is
+    deliberately seeded as the bare AGGREGATE_STRATEGY_VERSION ("1.0.0", never
+    a "slug@version" identity) matching real production campaign decisions
+    (see capital_campaign_orchestration/authoritative.py), to prove the
+    mandate path no longer reads that field.
+    canonical_strategy_identity=None seeds a DecisionRecord with no
+    "strategy_identity" key in generated_signals[0], for testing the
+    unresolvable-identity fallback.
+    Returns (exchange_connection_id, live_trading_profile_id, preview_id, risk_event_id)."""
     exchange_connection_id = uuid.uuid4()
     session.add(
         PaperAccount(
@@ -234,10 +251,32 @@ async def _seed_scope(session: AsyncSession, *, paper_account_id: uuid.UUID) -> 
             open_trades={},
             portfolio_exposure={},
             parameter_set_version="baseline",
-            strategy_version=_STRATEGY_IDENTITY,
+            strategy_version="1.0.0",
             ai_model_version="n/a",
             decision_engine_version="n/a",
             configuration_version="n/a",
+        )
+    )
+    generated_signal: dict[str, Any] = {"action": "BUY"}
+    if canonical_strategy_identity is not None:
+        generated_signal["strategy_identity"] = canonical_strategy_identity
+    session.add(
+        DecisionRecord(
+            decision_id=decision_record_id,
+            idempotency_key=f"decision-{decision_record_id}",
+            source_lineage={},
+            field_provenance={},
+            version="1.0.0",
+            timestamp=datetime.now(timezone.utc),
+            asset={},
+            timeframe="15m",
+            market_regime={},
+            indicators={},
+            generated_signals=[generated_signal],
+            supporting_strategies=[],
+            opposing_strategies=[],
+            risk_adjustments={},
+            trade_accepted=True,
         )
     )
     preview = CryptoOrderPreview(
@@ -407,10 +446,11 @@ async def test_strategy_mismatch_is_blocked() -> None:
         exchange_connection_id, live_trading_profile_id, preview_id, risk_event_id = await _seed_scope(
             session, paper_account_id=paper_account_id,
         )
-        # _seed_scope links a real DecisionSnapshot with strategy_version=
-        # _STRATEGY_IDENTITY ("ma_crossover@1.0.0"); authorizing only a
-        # DIFFERENT, validly-formatted identity proves a genuine mismatch is
-        # rejected, not a vacuous pass.
+        # _seed_scope links a real DecisionRecord with generated_signals[0]
+        # ["strategy_identity"] = _STRATEGY_IDENTITY ("ma_crossover@1.0.0"),
+        # the canonical source _evaluate_level2_mandate_authorization now
+        # reads; authorizing only a DIFFERENT, validly-formatted identity
+        # proves a genuine mismatch is rejected, not a vacuous pass.
         other_strategy_identity = build_strategy_identity(slug="momentum", module_version="2.0.0")
         await _seed_active_level2_mandate(
             session,
@@ -418,6 +458,61 @@ async def test_strategy_mismatch_is_blocked() -> None:
             live_trading_profile_id=live_trading_profile_id,
             key_prefix="strategy-mismatch",
             allowed_strategy_versions=(other_strategy_identity,),
+        )
+        await session.commit()
+
+        live_order = _live_order(preview_id=preview_id, risk_event_id=risk_event_id, exchange_connection_id=exchange_connection_id)
+        authorized, mandate_id = await _evaluate_level2_mandate_authorization(db=session, live_order=live_order, actor="system:level2")
+
+        assert authorized is False
+        assert mandate_id is not None
+
+
+@pytest.mark.asyncio
+async def test_canonical_strategy_identity_from_decision_record_authorizes() -> None:
+    """Proves the comparison is genuinely sourced from DecisionRecord.
+    generated_signals[0]["strategy_identity"] -- not merely reusing the
+    module-level default _STRATEGY_IDENTITY by coincidence -- by seeding a
+    distinct identity shaped like the real production aggregate identity
+    (see strategy_roster/decision_aggregator.py's AGGREGATE_STRATEGY_IDENTITY)
+    and requiring an exact match against the mandate's allowed_strategy_versions."""
+    async with _real_session() as session:
+        paper_account_id = uuid.uuid4()
+        production_shaped_identity = build_strategy_identity(slug="strategy_roster_aggregate", module_version="1.0.0")
+        exchange_connection_id, live_trading_profile_id, preview_id, risk_event_id = await _seed_scope(
+            session, paper_account_id=paper_account_id, canonical_strategy_identity=production_shaped_identity,
+        )
+        await _seed_active_level2_mandate(
+            session,
+            exchange_connection_id=exchange_connection_id,
+            live_trading_profile_id=live_trading_profile_id,
+            key_prefix="canonical-identity",
+            allowed_strategy_versions=(production_shaped_identity,),
+        )
+        await session.commit()
+
+        live_order = _live_order(preview_id=preview_id, risk_event_id=risk_event_id, exchange_connection_id=exchange_connection_id)
+        authorized, mandate_id = await _evaluate_level2_mandate_authorization(db=session, live_order=live_order, actor="system:level2")
+
+        assert authorized is True
+        assert mandate_id is not None
+
+
+@pytest.mark.asyncio
+async def test_unresolvable_strategy_identity_is_blocked() -> None:
+    """When DecisionRecord.generated_signals[0] has no usable "strategy_identity"
+    (e.g. malformed or missing upstream data), the mandate check must fail
+    closed to MANUAL rather than authorize against a fabricated identity."""
+    async with _real_session() as session:
+        paper_account_id = uuid.uuid4()
+        exchange_connection_id, live_trading_profile_id, preview_id, risk_event_id = await _seed_scope(
+            session, paper_account_id=paper_account_id, canonical_strategy_identity=None,
+        )
+        await _seed_active_level2_mandate(
+            session,
+            exchange_connection_id=exchange_connection_id,
+            live_trading_profile_id=live_trading_profile_id,
+            key_prefix="unresolvable-identity",
         )
         await session.commit()
 

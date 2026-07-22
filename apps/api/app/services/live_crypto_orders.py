@@ -23,6 +23,7 @@ from app.models.live_crypto_order import LiveCryptoOrder
 from app.models.live_approval_event import LiveApprovalEvent
 from app.models.live_trading_event import LiveTradingEvent
 from app.models.live_trading_profile import LiveTradingProfile
+from app.models.decision_record import DecisionRecord
 from app.models.decision_snapshot import DecisionSnapshot
 from app.models.paper_account import PaperAccount
 from app.models.risk_kill_switch import RiskKillSwitch
@@ -56,6 +57,7 @@ from app.services.risk.risk_engine import RiskDecisionAction, RiskEvaluationCont
 from app.services.risk.risk_persistence import RiskDecisionPersistenceRequest, persist_risk_decision
 from app.services.mandates.contracts import AUTONOMY_LEVEL_2, MANDATE_APPROVAL_RESULT_ACTIVE_MANDATE
 from app.services.mandates.evidence import MandateEvaluationWriteRequest, evaluate_and_record_mandate
+from app.services.strategies.identity import parse_strategy_identity
 
 
 logger = logging.getLogger(__name__)
@@ -338,6 +340,42 @@ async def _load_preview_decision_identity(*, db: AsyncSession, preview_id: uuid.
         "strategy_version": str(getattr(decision_snapshot, "strategy_version", "unknown") or "unknown"),
         "parameter_set_version": str(getattr(decision_snapshot, "parameter_set_version", "unknown") or "unknown"),
     }
+
+
+async def _load_canonical_strategy_identity_for_decision(
+    *, db: AsyncSession, decision_record_id: uuid.UUID,
+) -> str | None:
+    """Resolves the canonical "slug@version" strategy identity for a decision,
+    for callers (the LEVEL_2 mandate path) that need a value comparable
+    against AutonomousCapitalMandateVersion.allowed_strategy_versions --
+    which is_strategy_identity()/validate_mandate_version() require to be in
+    that exact format. DecisionSnapshot.strategy_version is NOT that value:
+    for a campaign-orchestration decision it is always the bare
+    AGGREGATE_STRATEGY_VERSION constant ("1.0.0", see
+    capital_campaign_orchestration/authoritative.py's fail-closed
+    aggregate_row.primary_strategy_version check), never a "slug@version"
+    identity -- it exists for an unrelated purpose (matching
+    LiveApprovalEvent.approval_scope["strategy_version"] inside
+    _validate_campaign_scoped_submission_authority) and must not be reused
+    here. The real canonical identity lives on the sibling DecisionRecord
+    row instead, in generated_signals[0]["strategy_identity"] (populated
+    from result.primary_strategy_identity at authoritative.py's decision
+    construction). This mirrors canonical_preview_package.py's existing
+    _selected_strategy_identity() exactly -- same source field, same
+    parse_strategy_identity() validation -- rather than inventing a new
+    resolution rule."""
+    decision_record = await db.scalar(
+        select(DecisionRecord).where(DecisionRecord.decision_id == decision_record_id).limit(1)
+    )
+    if decision_record is None:
+        return None
+    generated_signals = decision_record.generated_signals if isinstance(decision_record.generated_signals, list) else []
+    if not generated_signals or not isinstance(generated_signals[0], dict):
+        return None
+    candidate = str(generated_signals[0].get("strategy_identity") or "").strip()
+    if candidate and parse_strategy_identity(candidate) is not None:
+        return candidate
+    return None
 
 
 async def _load_kill_switch_state(*, db: AsyncSession, scope: str, account_id: uuid.UUID | None) -> RiskKillSwitch:
@@ -1261,7 +1299,19 @@ async def _evaluate_level2_mandate_authorization(
     # manual confirmation-phrase requirement.
     try:
         campaign = await _load_active_campaign_for_account(db=db, paper_account_id=paper_account_id)
-        preview_identity = await _load_preview_decision_identity(db=db, preview_id=live_order.crypto_order_preview_id)
+        # Not DecisionSnapshot.strategy_version (via _load_preview_decision_identity):
+        # for a campaign-orchestration decision that is always the bare
+        # AGGREGATE_STRATEGY_VERSION constant ("1.0.0"), never a "slug@version"
+        # identity, and can never match AutonomousCapitalMandateVersion.
+        # allowed_strategy_versions (which is_strategy_identity() requires to be
+        # in that exact format). The canonical identity lives on the sibling
+        # DecisionRecord row instead -- see
+        # _load_canonical_strategy_identity_for_decision's docstring.
+        canonical_strategy_identity = None
+        if scope_preview.decision_record_id is not None:
+            canonical_strategy_identity = await _load_canonical_strategy_identity_for_decision(
+                db=db, decision_record_id=scope_preview.decision_record_id,
+            )
         global_switch = await _load_kill_switch_state(db=db, scope="global", account_id=None)
         account_switch = await _load_kill_switch_state(db=db, scope="account", account_id=paper_account_id)
 
@@ -1276,7 +1326,7 @@ async def _evaluate_level2_mandate_authorization(
             request=MandateEvaluationWriteRequest(
                 mandate_id=mandate.mandate_id,
                 actor=actor,
-                strategy_version=(preview_identity or {}).get("strategy_version", "unknown"),
+                strategy_version=canonical_strategy_identity or "unknown",
                 product=live_order.product_id,
                 side=live_order.side,
                 proposed_notional_usd=_decimal(live_order.requested_quote_size),
