@@ -388,6 +388,124 @@ async def score_due_strategy_roster_proposal_outcomes(
     )
 
 
+class _StrategyBucketAccumulator:
+    """Collects everything a StrategyScorecardBucket needs (counts, correctness,
+    and the four full-bucket sums plus the six action-scoped sums) in a single
+    linear scan. fetch_strategy_scorecards() previously ran, per bucket: 3
+    action-partition passes, 3 correctness-sum passes, 4 full-bucket average
+    passes, and 6 action-scoped average passes -- 5 buckets (4 horizons +
+    aggregate) per strategy, all re-scanning largely the same rows. Every one
+    of those sums/counts is order-independent (Decimal addition is exact and
+    associative here -- no precision is lost by accumulating one row at a time
+    instead of via sum() over a pre-built list), so a single .add(item) call
+    per row, per bucket the row belongs to, produces identical totals."""
+
+    __slots__ = (
+        "total", "buy_count", "buy_correct", "sell_count", "sell_correct",
+        "hold_count", "hold_correct",
+        "sum_raw", "sum_fee", "sum_mfe", "sum_mae",
+        "buy_sum_raw", "buy_sum_fee",
+        "sell_sum_raw", "sell_sum_fee",
+        "hold_sum_raw", "hold_sum_fee",
+    )
+
+    def __init__(self) -> None:
+        self.total = 0
+        self.buy_count = 0
+        self.buy_correct = 0
+        self.sell_count = 0
+        self.sell_correct = 0
+        self.hold_count = 0
+        self.hold_correct = 0
+        self.sum_raw = Decimal("0")
+        self.sum_fee = Decimal("0")
+        self.sum_mfe = Decimal("0")
+        self.sum_mae = Decimal("0")
+        self.buy_sum_raw = Decimal("0")
+        self.buy_sum_fee = Decimal("0")
+        self.sell_sum_raw = Decimal("0")
+        self.sell_sum_fee = Decimal("0")
+        self.hold_sum_raw = Decimal("0")
+        self.hold_sum_fee = Decimal("0")
+
+    def add(self, item: Any) -> None:
+        raw = item.actual_raw_return_pct or Decimal("0")
+        fee = item.actual_fee_adjusted_return_pct or Decimal("0")
+
+        self.total += 1
+        self.sum_raw += raw
+        self.sum_fee += fee
+        self.sum_mfe += (item.mfe_pct or Decimal("0"))
+        self.sum_mae += (item.mae_pct or Decimal("0"))
+
+        action = item.action
+        # scored_items (the only caller) already filters out
+        # actual_action_correct is None, so this is always a real bool here --
+        # same guarantee the original `if item.actual_action_correct` relied on.
+        correct = bool(item.actual_action_correct)
+        if action == "BUY":
+            self.buy_count += 1
+            self.buy_sum_raw += raw
+            self.buy_sum_fee += fee
+            if correct:
+                self.buy_correct += 1
+        elif action == "SELL":
+            self.sell_count += 1
+            self.sell_sum_raw += raw
+            self.sell_sum_fee += fee
+            if correct:
+                self.sell_correct += 1
+        elif action == "HOLD":
+            self.hold_count += 1
+            self.hold_sum_raw += raw
+            self.hold_sum_fee += fee
+            if correct:
+                self.hold_correct += 1
+
+    def to_bucket(self, horizon_label: str) -> StrategyScorecardBucket:
+        total = self.total
+        total_correct = self.buy_correct + self.sell_correct + self.hold_correct
+
+        overall_correct_pct = None
+        raw_avg = None
+        fee_avg = None
+        mfe_avg = None
+        mae_avg = None
+        if total > 0:
+            overall_correct_pct = (Decimal(total_correct) * Decimal("100")) / Decimal(total)
+            raw_avg = self.sum_raw / Decimal(total)
+            fee_avg = self.sum_fee / Decimal(total)
+            mfe_avg = self.sum_mfe / Decimal(total)
+            mae_avg = self.sum_mae / Decimal(total)
+
+        def _avg(total_value: Decimal, count: int) -> Decimal | None:
+            if count == 0:
+                return None
+            return total_value / Decimal(count)
+
+        return StrategyScorecardBucket(
+            horizon_label=horizon_label,
+            total_evaluated=total,
+            buy_evaluations=self.buy_count,
+            buy_correct=self.buy_correct,
+            sell_evaluations=self.sell_count,
+            sell_correct=self.sell_correct,
+            hold_evaluations=self.hold_count,
+            hold_correct=self.hold_correct,
+            overall_correct_pct=_round(overall_correct_pct),
+            average_raw_return_pct=_round(raw_avg),
+            average_fee_adjusted_return_pct=_round(fee_avg),
+            average_mfe_pct=_round(mfe_avg),
+            average_mae_pct=_round(mae_avg),
+            buy_average_fee_adjusted_return_pct=_round(_avg(self.buy_sum_fee, self.buy_count)),
+            sell_average_fee_adjusted_return_pct=_round(_avg(self.sell_sum_fee, self.sell_count)),
+            hold_average_fee_adjusted_return_pct=_round(_avg(self.hold_sum_fee, self.hold_count)),
+            buy_average_raw_return_pct=_round(_avg(self.buy_sum_raw, self.buy_count)),
+            sell_average_raw_return_pct=_round(_avg(self.sell_sum_raw, self.sell_count)),
+            hold_average_raw_return_pct=_round(_avg(self.hold_sum_raw, self.hold_count)),
+        )
+
+
 async def fetch_strategy_scorecards(
     *,
     db: AsyncSession,
@@ -457,80 +575,36 @@ async def fetch_strategy_scorecards(
         items = grouped[strategy_slug]
         scored_items = [item for item in items if item.actual_action_correct is not None]
 
-        def _bucket(horizon_label: str, bucket_items: list[Any]) -> StrategyScorecardBucket:
-            buy_items = [item for item in bucket_items if item.action == "BUY"]
-            sell_items = [item for item in bucket_items if item.action == "SELL"]
-            hold_items = [item for item in bucket_items if item.action == "HOLD"]
+        horizon_accumulators: dict[str, _StrategyBucketAccumulator] = {
+            horizon_label: _StrategyBucketAccumulator() for horizon_label, _horizon_minutes in HORIZONS
+        }
+        aggregate_accumulator = _StrategyBucketAccumulator()
+        regime_sums: dict[str, Decimal] = {}
+        regime_counts: dict[str, int] = {}
 
-            buy_correct = sum(1 for item in buy_items if item.actual_action_correct)
-            sell_correct = sum(1 for item in sell_items if item.actual_action_correct)
-            hold_correct = sum(1 for item in hold_items if item.actual_action_correct)
-
-            total = len(bucket_items)
-            total_correct = buy_correct + sell_correct + hold_correct
-
-            def _fee_adjusted_average(items: list[Any]) -> Decimal | None:
-                if not items:
-                    return None
-                return sum((item.actual_fee_adjusted_return_pct or Decimal("0") for item in items), Decimal("0")) / Decimal(len(items))
-
-            def _raw_average(items: list[Any]) -> Decimal | None:
-                if not items:
-                    return None
-                return sum((item.actual_raw_return_pct or Decimal("0") for item in items), Decimal("0")) / Decimal(len(items))
-
-            overall_correct_pct = None
-            raw_avg = None
-            fee_avg = None
-            mfe_avg = None
-            mae_avg = None
-            if total > 0:
-                overall_correct_pct = (Decimal(total_correct) * Decimal("100")) / Decimal(total)
-                raw_avg = sum((item.actual_raw_return_pct or Decimal("0") for item in bucket_items), Decimal("0")) / Decimal(total)
-                fee_avg = sum((item.actual_fee_adjusted_return_pct or Decimal("0") for item in bucket_items), Decimal("0")) / Decimal(total)
-                mfe_avg = sum((item.mfe_pct or Decimal("0") for item in bucket_items), Decimal("0")) / Decimal(total)
-                mae_avg = sum((item.mae_pct or Decimal("0") for item in bucket_items), Decimal("0")) / Decimal(total)
-
-            return StrategyScorecardBucket(
-                horizon_label=horizon_label,
-                total_evaluated=total,
-                buy_evaluations=len(buy_items),
-                buy_correct=buy_correct,
-                sell_evaluations=len(sell_items),
-                sell_correct=sell_correct,
-                hold_evaluations=len(hold_items),
-                hold_correct=hold_correct,
-                overall_correct_pct=_round(overall_correct_pct),
-                average_raw_return_pct=_round(raw_avg),
-                average_fee_adjusted_return_pct=_round(fee_avg),
-                average_mfe_pct=_round(mfe_avg),
-                average_mae_pct=_round(mae_avg),
-                buy_average_fee_adjusted_return_pct=_round(_fee_adjusted_average(buy_items)),
-                sell_average_fee_adjusted_return_pct=_round(_fee_adjusted_average(sell_items)),
-                hold_average_fee_adjusted_return_pct=_round(_fee_adjusted_average(hold_items)),
-                buy_average_raw_return_pct=_round(_raw_average(buy_items)),
-                sell_average_raw_return_pct=_round(_raw_average(sell_items)),
-                hold_average_raw_return_pct=_round(_raw_average(hold_items)),
-            )
-
-        per_horizon: list[StrategyScorecardBucket] = []
-        for horizon_label, _horizon_minutes in HORIZONS:
-            horizon_items = [item for item in scored_items if item.horizon_label == horizon_label]
-            per_horizon.append(_bucket(horizon_label, horizon_items))
-
-        aggregate = _bucket("aggregate", scored_items)
-
-        regime_groups: dict[str, list[Decimal]] = {}
         for item in scored_items:
-            regime_groups.setdefault(item.regime_trend, []).append(item.actual_fee_adjusted_return_pct or Decimal("0"))
+            aggregate_accumulator.add(item)
+            horizon_accumulator = horizon_accumulators.get(item.horizon_label)
+            if horizon_accumulator is not None:
+                horizon_accumulator.add(item)
+
+            regime = item.regime_trend
+            regime_sums[regime] = regime_sums.get(regime, Decimal("0")) + (item.actual_fee_adjusted_return_pct or Decimal("0"))
+            regime_counts[regime] = regime_counts.get(regime, 0) + 1
+
+        per_horizon: list[StrategyScorecardBucket] = [
+            horizon_accumulators[horizon_label].to_bucket(horizon_label)
+            for horizon_label, _horizon_minutes in HORIZONS
+        ]
+        aggregate = aggregate_accumulator.to_bucket("aggregate")
 
         best_regime = None
         worst_regime = None
         regime_evidence_count = len(scored_items)
-        if regime_groups and regime_evidence_count >= regime_min_evidence_required:
+        if regime_sums and regime_evidence_count >= regime_min_evidence_required:
             regime_avg = {
-                regime: (sum(values, Decimal("0")) / Decimal(len(values)))
-                for regime, values in regime_groups.items()
+                regime: (regime_sums[regime] / Decimal(regime_counts[regime]))
+                for regime in regime_sums
             }
             best_regime = max(regime_avg, key=lambda key: regime_avg[key])
             worst_regime = min(regime_avg, key=lambda key: regime_avg[key])

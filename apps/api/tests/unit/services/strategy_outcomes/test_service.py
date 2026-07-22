@@ -833,3 +833,218 @@ async def test_narrow_column_select_matches_full_entity_select_byte_for_byte(mon
 
         assert len(reference_result) == 2
         assert reference_result == optimized_result
+
+
+async def _reference_fetch_strategy_scorecards_multi_pass(
+    *, db: Any, provider: str, product_id: str, interval: str,
+):
+    """Frozen copy of fetch_strategy_scorecards() as it read at the start of
+    this round: narrow-column select (already optimized in the prior round)
+    but still the original multi-pass scoring -- per bucket, 3 action-
+    partition passes, 3 correctness-sum passes, 4 full-bucket average passes,
+    and 6 action-scoped average passes, x 5 buckets (4 horizons + aggregate)
+    per strategy, plus a separate horizon-partition pass and a separate
+    regime-grouping pass. Kept only in this test file as "the current
+    implementation" for a byte-for-byte comparison against the single-pass
+    _StrategyBucketAccumulator rewrite -- production code must never import
+    this."""
+    from sqlalchemy import select
+
+    from app.services.strategy_outcomes.service import (
+        HORIZONS,
+        StrategyScorecard,
+        StrategyScorecardBucket,
+        _round,
+        get_settings,
+    )
+
+    settings = get_settings()
+    regime_min_evidence_required = int(getattr(settings, "outcome_scorecards_regime_min_evaluations", 50))
+
+    result = await db.execute(
+        select(
+            StrategyRosterProposalOutcome.strategy_slug,
+            StrategyRosterProposalOutcome.action,
+            StrategyRosterProposalOutcome.actual_action_correct,
+            StrategyRosterProposalOutcome.actual_raw_return_pct,
+            StrategyRosterProposalOutcome.actual_fee_adjusted_return_pct,
+            StrategyRosterProposalOutcome.mfe_pct,
+            StrategyRosterProposalOutcome.mae_pct,
+            StrategyRosterProposalOutcome.horizon_label,
+            StrategyRosterProposalOutcome.regime_trend,
+            StrategyRosterProposalOutcome.evaluation_state,
+        )
+        .where(StrategyRosterProposalOutcome.provider == provider)
+        .where(StrategyRosterProposalOutcome.product_id == product_id)
+        .where(StrategyRosterProposalOutcome.interval == interval)
+        .where(StrategyRosterProposalOutcome.evaluation_state == "RESOLVED")
+        .order_by(
+            StrategyRosterProposalOutcome.strategy_slug.asc(),
+            StrategyRosterProposalOutcome.evaluated_at.asc(),
+            StrategyRosterProposalOutcome.outcome_id.asc(),
+        )
+    )
+    rows = [row for row in result.all() if row.evaluation_state == "RESOLVED"]
+
+    grouped: dict[str, list[Any]] = {}
+    for row in rows:
+        grouped.setdefault(row.strategy_slug, []).append(row)
+
+    scorecards: list[StrategyScorecard] = []
+    for strategy_slug in sorted(grouped):
+        items = grouped[strategy_slug]
+        scored_items = [item for item in items if item.actual_action_correct is not None]
+
+        def _bucket(horizon_label: str, bucket_items: list[Any]) -> StrategyScorecardBucket:
+            buy_items = [item for item in bucket_items if item.action == "BUY"]
+            sell_items = [item for item in bucket_items if item.action == "SELL"]
+            hold_items = [item for item in bucket_items if item.action == "HOLD"]
+
+            buy_correct = sum(1 for item in buy_items if item.actual_action_correct)
+            sell_correct = sum(1 for item in sell_items if item.actual_action_correct)
+            hold_correct = sum(1 for item in hold_items if item.actual_action_correct)
+
+            total = len(bucket_items)
+            total_correct = buy_correct + sell_correct + hold_correct
+
+            def _fee_adjusted_average(items: list[Any]) -> Decimal | None:
+                if not items:
+                    return None
+                return sum((item.actual_fee_adjusted_return_pct or Decimal("0") for item in items), Decimal("0")) / Decimal(len(items))
+
+            def _raw_average(items: list[Any]) -> Decimal | None:
+                if not items:
+                    return None
+                return sum((item.actual_raw_return_pct or Decimal("0") for item in items), Decimal("0")) / Decimal(len(items))
+
+            overall_correct_pct = None
+            raw_avg = None
+            fee_avg = None
+            mfe_avg = None
+            mae_avg = None
+            if total > 0:
+                overall_correct_pct = (Decimal(total_correct) * Decimal("100")) / Decimal(total)
+                raw_avg = sum((item.actual_raw_return_pct or Decimal("0") for item in bucket_items), Decimal("0")) / Decimal(total)
+                fee_avg = sum((item.actual_fee_adjusted_return_pct or Decimal("0") for item in bucket_items), Decimal("0")) / Decimal(total)
+                mfe_avg = sum((item.mfe_pct or Decimal("0") for item in bucket_items), Decimal("0")) / Decimal(total)
+                mae_avg = sum((item.mae_pct or Decimal("0") for item in bucket_items), Decimal("0")) / Decimal(total)
+
+            return StrategyScorecardBucket(
+                horizon_label=horizon_label,
+                total_evaluated=total,
+                buy_evaluations=len(buy_items),
+                buy_correct=buy_correct,
+                sell_evaluations=len(sell_items),
+                sell_correct=sell_correct,
+                hold_evaluations=len(hold_items),
+                hold_correct=hold_correct,
+                overall_correct_pct=_round(overall_correct_pct),
+                average_raw_return_pct=_round(raw_avg),
+                average_fee_adjusted_return_pct=_round(fee_avg),
+                average_mfe_pct=_round(mfe_avg),
+                average_mae_pct=_round(mae_avg),
+                buy_average_fee_adjusted_return_pct=_round(_fee_adjusted_average(buy_items)),
+                sell_average_fee_adjusted_return_pct=_round(_fee_adjusted_average(sell_items)),
+                hold_average_fee_adjusted_return_pct=_round(_fee_adjusted_average(hold_items)),
+                buy_average_raw_return_pct=_round(_raw_average(buy_items)),
+                sell_average_raw_return_pct=_round(_raw_average(sell_items)),
+                hold_average_raw_return_pct=_round(_raw_average(hold_items)),
+            )
+
+        per_horizon: list[StrategyScorecardBucket] = []
+        for horizon_label, _horizon_minutes in HORIZONS:
+            horizon_items = [item for item in scored_items if item.horizon_label == horizon_label]
+            per_horizon.append(_bucket(horizon_label, horizon_items))
+
+        aggregate = _bucket("aggregate", scored_items)
+
+        regime_groups: dict[str, list[Decimal]] = {}
+        for item in scored_items:
+            regime_groups.setdefault(item.regime_trend, []).append(item.actual_fee_adjusted_return_pct or Decimal("0"))
+
+        best_regime = None
+        worst_regime = None
+        regime_evidence_count = len(scored_items)
+        if regime_groups and regime_evidence_count >= regime_min_evidence_required:
+            regime_avg = {
+                regime: (sum(values, Decimal("0")) / Decimal(len(values)))
+                for regime, values in regime_groups.items()
+            }
+            best_regime = max(regime_avg, key=lambda key: regime_avg[key])
+            worst_regime = min(regime_avg, key=lambda key: regime_avg[key])
+
+        scorecards.append(
+            StrategyScorecard(
+                strategy_slug=strategy_slug,
+                per_horizon=per_horizon,
+                aggregate=aggregate,
+                best_regime=best_regime,
+                worst_regime=worst_regime,
+                regime_evidence_count=regime_evidence_count,
+                regime_min_evidence_required=regime_min_evidence_required,
+            )
+        )
+
+    return scorecards
+
+
+@pytest.mark.asyncio
+async def test_single_pass_accumulator_matches_multi_pass_reference_byte_for_byte(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Proves the single-pass _StrategyBucketAccumulator rewrite (replacing
+    ~10 full passes per bucket x 5 buckets per strategy, plus a separate
+    horizon-partition pass and a separate regime-grouping pass, with one scan
+    over scored_items) produces IDENTICAL StrategyScorecard output to the
+    original multi-pass scoring logic, against a real SQLite-backed SQL round
+    trip -- not the hand-rolled _FakeDb/_Result fakes elsewhere in this file."""
+    monkeypatch.setattr(
+        "app.services.strategy_outcomes.service.get_settings",
+        lambda: SimpleNamespace(outcome_scorecards_regime_min_evaluations=3),
+    )
+
+    async with _real_outcomes_session() as raw_session:
+        # Wider and messier than the narrow-column test's fixture: uneven
+        # action distribution, a regime with only one member, multiple
+        # strategies with different scored-item counts, and both action-
+        # scoped averages that would diverge if buy/sell/hold sums were ever
+        # cross-contaminated by the accumulator rewrite.
+        for i in range(11):
+            _seed_outcome_row(
+                raw_session,
+                strategy_slug="momentum",
+                action=("BUY", "BUY", "SELL", "HOLD")[i % 4],
+                horizon_label=HORIZONS[i % len(HORIZONS)][0],
+                horizon_minutes=HORIZONS[i % len(HORIZONS)][1],
+                regime_trend=("TRENDING", "RANGING", "TRENDING")[i % 3],
+                actual_action_correct=None if i == 10 else (i % 3 != 0),
+                actual_raw_return_pct=Decimal(i) - Decimal("4.5"),
+                actual_fee_adjusted_return_pct=Decimal(i) - Decimal("5.0"),
+                mfe_pct=Decimal("0.5") * Decimal(i),
+                mae_pct=Decimal("-0.25") * Decimal(i),
+            )
+        for i in range(4):
+            _seed_outcome_row(
+                raw_session,
+                strategy_slug="breakout",
+                action=("SELL", "HOLD")[i % 2],
+                horizon_label="15m",
+                horizon_minutes=15,
+                regime_trend="RANGING",
+                actual_action_correct=(i % 2 == 0),
+                actual_raw_return_pct=Decimal("-1.0") - Decimal(i),
+                actual_fee_adjusted_return_pct=Decimal("-1.5") - Decimal(i),
+                mfe_pct=Decimal("0.2"),
+                mae_pct=Decimal("-2.0"),
+            )
+        raw_session.commit()
+
+        db = _AwaitableOutcomesSession(raw_session)
+
+        reference_result = await _reference_fetch_strategy_scorecards_multi_pass(
+            db=db, provider="kraken_spot", product_id="BTC-USD", interval="15m",
+        )
+        optimized_result = await fetch_strategy_scorecards(
+            db=db, provider="kraken_spot", product_id="BTC-USD", interval="15m",
+        )
+
+        assert len(reference_result) == 2
+        assert reference_result == optimized_result
