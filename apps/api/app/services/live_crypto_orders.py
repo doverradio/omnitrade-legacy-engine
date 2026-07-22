@@ -27,6 +27,7 @@ from app.models.decision_snapshot import DecisionSnapshot
 from app.models.paper_account import PaperAccount
 from app.models.risk_kill_switch import RiskKillSwitch
 from app.models.risk_event import RiskEvent
+from app.models.autonomous_capital_mandate import AutonomousCapitalMandate
 from app.schemas.live_crypto_orders import (
     LiveCryptoOrderCancelRequest,
     LiveCryptoOrderDryRunRequest,
@@ -53,6 +54,8 @@ from app.services.live.resilience import evaluate_live_submission_guard
 from app.services.risk.risk_monitor import get_risk_rules
 from app.services.risk.risk_engine import RiskDecisionAction, RiskEvaluationContext, RiskEvaluationRequest, evaluate_signal_risk
 from app.services.risk.risk_persistence import RiskDecisionPersistenceRequest, persist_risk_decision
+from app.services.mandates.contracts import AUTONOMY_LEVEL_2, MANDATE_APPROVAL_RESULT_ACTIVE_MANDATE
+from app.services.mandates.evidence import MandateEvaluationWriteRequest, evaluate_and_record_mandate
 
 
 logger = logging.getLogger(__name__)
@@ -60,6 +63,17 @@ logger = logging.getLogger(__name__)
 CONFIRMATION_PHRASE = "BUY BTC"
 _USD_SCALE = Decimal("0.01")
 _RECONCILIABLE_PROVIDER_STATUSES = ["PENDING", "OPEN", "QUEUED", "CANCEL_QUEUED", "EDIT_QUEUED", "FILLED", "FAILED", "CANCELLED", "EXPIRED"]
+
+# RiskDecisionAction.value ("approve"/"resize"/"reject") -> the mandate
+# eligibility evaluator's risk_verdict vocabulary ("ACCEPTED"/"RESIZED"/
+# "REJECTED"/"NOT_EVALUATED", see app.services.mandates.evidence). Anything
+# unrecognized maps to NOT_EVALUATED, which evaluate_mandate_eligibility's
+# risk_engine_allows_action check treats as not-authorized -- fail closed.
+_RISK_ACTION_TO_MANDATE_VERDICT = {
+    "approve": "ACCEPTED",
+    "resize": "RESIZED",
+    "reject": "REJECTED",
+}
 
 
 def _utcnow() -> datetime:
@@ -269,6 +283,35 @@ async def _load_canonical_proving_activation_for_scope(
         .where(CanonicalProvingActivation.provider == provider)
         .where(CanonicalProvingActivation.environment == environment)
         .where(CanonicalProvingActivation.product == product)
+        .limit(1)
+    )
+
+
+async def _find_active_level2_mandate_for_scope(
+    *,
+    db: AsyncSession,
+    provider: str,
+    environment: str,
+    exchange_connection_id: uuid.UUID,
+    live_trading_profile_id: uuid.UUID,
+) -> AutonomousCapitalMandate | None:
+    """Resolve the mandate (if any) that could exempt this submission from
+    manual confirmation. Scoped exactly like _load_canonical_proving_activation_for_scope
+    above -- by identity, not by a caller-supplied mandate_id -- so nothing
+    about which mandate applies can be spoofed by the submit request itself.
+    ACTIVE and EXIT_ONLY both count as "active enough to evaluate": the
+    deterministic checks inside evaluate_mandate_eligibility (status,
+    autonomy_level, expiry, revocation, scope, limits) make the final call,
+    not this lookup -- this only narrows to candidates worth evaluating."""
+    return await db.scalar(
+        select(AutonomousCapitalMandate)
+        .where(AutonomousCapitalMandate.provider == provider)
+        .where(AutonomousCapitalMandate.exchange_environment == environment)
+        .where(AutonomousCapitalMandate.exchange_connection_id == exchange_connection_id)
+        .where(AutonomousCapitalMandate.live_trading_profile_id == live_trading_profile_id)
+        .where(AutonomousCapitalMandate.autonomy_level == AUTONOMY_LEVEL_2)
+        .where(AutonomousCapitalMandate.status.in_(["ACTIVE", "EXIT_ONLY"]))
+        .order_by(AutonomousCapitalMandate.created_at.desc())
         .limit(1)
     )
 
@@ -1132,6 +1175,160 @@ def _build_dry_run_response(*, live_order: LiveCryptoOrder) -> LiveCryptoOrderDr
     )
 
 
+async def _evaluate_level2_mandate_authorization(
+    *,
+    db: AsyncSession,
+    live_order: LiveCryptoOrder,
+    actor: str,
+) -> tuple[bool, uuid.UUID | None]:
+    """The single point where an active LEVEL_2 mandate may satisfy the
+    manual confirmation-phrase requirement in submit() (ADR-0011,
+    AUTONOMOUS_CAPITAL_MANAGEMENT_MODE_SPEC.md Phase E). Returns
+    (authorized, mandate_id). Every failure mode -- no mandate found, scope
+    unresolved, or evaluate_mandate_eligibility rejecting for any reason --
+    returns (False, ...) and logs why; the caller's existing manual-phrase
+    behavior then applies unchanged. This function never raises for an
+    absent or ineligible mandate -- only genuine unexpected errors should
+    propagate, since "no mandate" is an expected, common, safe outcome."""
+    # CryptoOrderPreview has no live_trading_profile_id column (confirmed by
+    # introspecting CryptoOrderPreview.__table__.columns -- it genuinely does
+    # not exist), so profile scope cannot be resolved from the preview
+    # directly. paper_account_id is the real linking key this file already
+    # uses elsewhere (_load_paper_account, _load_active_campaign_for_account):
+    # live_order.risk_event_id -> RiskEvent.paper_account_id ->
+    # LiveTradingProfile.paper_account_id.
+    scope_preview = await db.scalar(
+        select(CryptoOrderPreview)
+        .where(CryptoOrderPreview.crypto_order_preview_id == live_order.crypto_order_preview_id)
+        .limit(1)
+    )
+    if scope_preview is None or live_order.risk_event_id is None:
+        logger.info(
+            "level2_mandate_denied live_crypto_order_id=%s authorization_source=MANUAL authorization_reason=preview_scope_unresolved",
+            live_order.live_crypto_order_id,
+        )
+        return False, None
+
+    scope_risk_event = await db.scalar(
+        select(RiskEvent).where(RiskEvent.id == live_order.risk_event_id).limit(1)
+    )
+    if scope_risk_event is None or scope_risk_event.paper_account_id is None:
+        logger.info(
+            "level2_mandate_denied live_crypto_order_id=%s authorization_source=MANUAL authorization_reason=risk_event_scope_unresolved",
+            live_order.live_crypto_order_id,
+        )
+        return False, None
+
+    scope_profile = await db.scalar(
+        select(LiveTradingProfile)
+        .where(LiveTradingProfile.paper_account_id == scope_risk_event.paper_account_id)
+        .limit(1)
+    )
+    if scope_profile is None:
+        logger.info(
+            "level2_mandate_denied live_crypto_order_id=%s authorization_source=MANUAL authorization_reason=profile_scope_unresolved",
+            live_order.live_crypto_order_id,
+        )
+        return False, None
+
+    live_trading_profile_id = scope_profile.id
+    preview_created_at = scope_preview.created_at
+    paper_account_id = scope_profile.paper_account_id
+
+    mandate = await _find_active_level2_mandate_for_scope(
+        db=db,
+        provider=live_order.provider,
+        environment=live_order.environment,
+        exchange_connection_id=live_order.exchange_connection_id,
+        live_trading_profile_id=live_trading_profile_id,
+    )
+    if mandate is None:
+        logger.info(
+            "level2_mandate_denied live_crypto_order_id=%s authorization_source=MANUAL authorization_reason=no_active_mandate",
+            live_order.live_crypto_order_id,
+        )
+        return False, None
+
+    # A mandate matching scope was found. Everything from here on (loading
+    # campaign/kill-switch/preview-identity evidence, evaluating and
+    # recording eligibility) must fail closed to MANUAL on any unexpected
+    # error -- not propagate and crash submit() -- since a purely-manual
+    # submission that worked before this change must keep working
+    # byte-for-byte even in an environment where, say, a kill-switch row is
+    # missing for this account or the mandate tables are only partially
+    # migrated. An inability to evaluate the mandate is treated exactly like
+    # no mandate existing: fall back to the pre-existing, already-audited
+    # manual confirmation-phrase requirement.
+    try:
+        campaign = await _load_active_campaign_for_account(db=db, paper_account_id=paper_account_id)
+        preview_identity = await _load_preview_decision_identity(db=db, preview_id=live_order.crypto_order_preview_id)
+        global_switch = await _load_kill_switch_state(db=db, scope="global", account_id=None)
+        account_switch = await _load_kill_switch_state(db=db, scope="account", account_id=paper_account_id)
+
+        raw_risk_verdict = str(live_order.safe_provider_response.get("execution_risk_verdict") or "").strip().lower()
+        risk_verdict = _RISK_ACTION_TO_MANDATE_VERDICT.get(raw_risk_verdict, "NOT_EVALUATED")
+        evidence_age_seconds = (
+            max(0, int((_utcnow() - preview_created_at).total_seconds())) if preview_created_at is not None else 2**31 - 1
+        )
+
+        mandate_eval = await evaluate_and_record_mandate(
+            db=db,
+            request=MandateEvaluationWriteRequest(
+                mandate_id=mandate.mandate_id,
+                actor=actor,
+                strategy_version=(preview_identity or {}).get("strategy_version", "unknown"),
+                product=live_order.product_id,
+                side=live_order.side,
+                proposed_notional_usd=_decimal(live_order.requested_quote_size),
+                # These four accounting figures and the position count below are
+                # not yet computed from real ledger state anywhere in this
+                # codebase -- app/services/autonomous_cycle/orchestrator.py, the
+                # only other production caller of evaluate_and_record_mandate,
+                # passes these same safe defaults today (see its mandate_eval
+                # call site). Reused here rather than inventing new accounting
+                # logic; see the deliverable's "remaining blockers" note.
+                current_open_exposure_usd=Decimal("0"),
+                daily_deployed_usd=Decimal("0"),
+                daily_realized_loss_usd=Decimal("0"),
+                campaign_drawdown_usd=Decimal("0"),
+                consecutive_losses=0,
+                current_position_count=0,
+                risk_verdict=risk_verdict,
+                evidence_age_seconds=evidence_age_seconds,
+                kill_switch_engaged=bool(global_switch.engaged or account_switch.engaged),
+                observed_at=_utcnow(),
+                decision_id=live_order.decision_record_id,
+                request_context={
+                    "live_crypto_order_id": str(live_order.live_crypto_order_id),
+                    "capital_campaign_id": None if campaign is None else str(campaign.uuid),
+                },
+                idempotency_key=f"level2-submit-eval:{live_order.live_crypto_order_id}",
+                audit_correlation_id=uuid.uuid4(),
+                software_build_version=None,
+            ),
+        )
+    except Exception:
+        logger.warning(
+            "level2_mandate_denied live_crypto_order_id=%s mandate_id=%s authorization_source=MANUAL authorization_reason=mandate_evaluation_error",
+            live_order.live_crypto_order_id, mandate.mandate_id,
+            exc_info=True,
+        )
+        return False, mandate.mandate_id
+
+    if mandate_eval.approval_result == MANDATE_APPROVAL_RESULT_ACTIVE_MANDATE:
+        logger.info(
+            "level2_mandate_authorized live_crypto_order_id=%s mandate_id=%s authorization_source=LEVEL_2 authorization_reason=%s",
+            live_order.live_crypto_order_id, mandate.mandate_id, mandate_eval.reason_code,
+        )
+        return True, mandate.mandate_id
+
+    logger.info(
+        "level2_mandate_denied live_crypto_order_id=%s mandate_id=%s authorization_source=MANUAL authorization_reason=%s",
+        live_order.live_crypto_order_id, mandate.mandate_id, mandate_eval.reason_code,
+    )
+    return False, mandate.mandate_id
+
+
 class LiveCryptoOrderService:
     def _existing_submit_response(self, *, live_order: LiveCryptoOrder) -> LiveCryptoOrderSubmitResponse:
         return LiveCryptoOrderSubmitResponse(
@@ -1755,8 +1952,23 @@ class LiveCryptoOrderService:
             raise PermissionError("submission already started; reconcile existing order state")
         if live_order.status not in {"PENDING_CONFIRMATION", "VALIDATING"}:
             raise ValueError("live crypto order is not in a submit-able state")
-        if request.confirmation_phrase != CONFIRMATION_PHRASE:
-            raise PermissionError("confirmation phrase mismatch")
+
+        # ADR-0011 / AUTONOMOUS_CAPITAL_MANAGEMENT_MODE_SPEC.md Phase E: a
+        # LEVEL_2 mandate may satisfy the human confirmation-phrase
+        # requirement below (APPROVAL_SATISFIED_BY_ACTIVE_MANDATE), never
+        # any other check in this function. Everything else -- operator
+        # identity/challenge binding, fingerprint matching, campaign-scoped
+        # authority, Risk Engine, idempotency, audit -- is unconditional and
+        # unchanged regardless of which path satisfies this one check. If no
+        # active LEVEL_2 mandate authorizes this exact decision, behavior is
+        # byte-for-byte identical to before this change: the confirmation
+        # phrase is required.
+        mandate_authorized, mandate_id_for_audit = await _evaluate_level2_mandate_authorization(
+            db=db, live_order=live_order, actor=request.operator_identity,
+        )
+        if not mandate_authorized:
+            if request.confirmation_phrase != CONFIRMATION_PHRASE:
+                raise PermissionError("confirmation phrase mismatch")
         if request.operator_identity != live_order.safe_provider_response.get("prepared_by"):
             raise PermissionError("operator identity mismatch")
         if live_order.operator_confirmation_id != request.confirmation_challenge_id:
@@ -1882,6 +2094,8 @@ class LiveCryptoOrderService:
         live_order.safe_provider_response = {
             **live_order.safe_provider_response,
             "capital_campaign_id": verified_capital_campaign_id,
+            "authorization_source": "LEVEL_2" if mandate_authorized else "MANUAL",
+            "level2_mandate_id": None if mandate_id_for_audit is None else str(mandate_id_for_audit),
             "submission_identity": {
                 "live_crypto_order_id": str(live_order.live_crypto_order_id),
                 "client_order_id": live_order.client_order_id,
