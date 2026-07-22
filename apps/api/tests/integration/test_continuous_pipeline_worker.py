@@ -3094,3 +3094,114 @@ async def test_has_unresolved_reconciliation_logs_every_matching_record(caplog: 
     assert len(detail_records) == 2
     assert any("reconciliation_status=open" in r.getMessage() for r in detail_records)
     assert any("reconciliation_status=conflict" in r.getMessage() for r in detail_records)
+
+
+# --- _has_unresolved_reconciliation: latest-per-order semantics ---
+#
+# Production evidence: a BUY that cleared every other gate was permanently
+# blocked with unresolved_reconciliation_exists. Diagnostics showed 3
+# matched records for one order (partially_filled, partially_filled,
+# reconciliation_required) from July 18th, while the order's OWN status
+# fields already read FILLED. Root cause: live_reconciliation_events is
+# append-only -- reconcile_live_order_and_fills() (accounting_reconciliation.py)
+# never updates or deletes a prior row, it appends a new one as the order's
+# state evolves, and the SAME function call that observes a provider status
+# of FILLED both sets LiveCryptoOrder.status="FILLED" and appends a new
+# reconciliation_status="filled" event with a higher sequence_number. The
+# gate was written to match ANY historical row in an unresolved state,
+# which is permanently true for any order that was ever partially filled
+# even after it fully resolved. app.services.risk.equity_evidence already
+# had the correct fix for the identical status vocabulary (latest event per
+# order, by max sequence_number) -- these tests prove the worker's gate now
+# applies that same rule.
+
+
+@pytest.mark.asyncio
+async def test_has_unresolved_reconciliation_ignores_superseded_history_once_order_resolves(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """The exact production shape: an order accumulates partially_filled and
+    reconciliation_required events over time, then a later reconciliation
+    pass observes the provider's true FILLED state and appends a resolving
+    event with a higher sequence_number. The gate must follow the order to
+    its current (resolved) state, not get stuck on its own superseded
+    history."""
+    import app.services.orchestration.continuous_pipeline_worker as worker_module
+
+    order_id = uuid.uuid4()
+    scope = dict(provider="kraken_spot", environment="production", product="BTC-USD")
+
+    with _reconciliation_sqlite_session() as (raw_session, db):
+        _seed_live_crypto_order(raw_session, live_crypto_order_id=order_id, provider_order_id="OAXUZJ-7WRL5-NPFWYA", status="FILLED", **scope)
+        _seed_reconciliation_event(raw_session, live_crypto_order_id=order_id, reconciliation_status="partially_filled", provider_order_id="OAXUZJ-7WRL5-NPFWYA", sequence_number=1)
+        _seed_reconciliation_event(raw_session, live_crypto_order_id=order_id, reconciliation_status="partially_filled", provider_order_id="OAXUZJ-7WRL5-NPFWYA", sequence_number=2)
+        _seed_reconciliation_event(raw_session, live_crypto_order_id=order_id, reconciliation_status="reconciliation_required", provider_order_id="OAXUZJ-7WRL5-NPFWYA", sequence_number=3)
+        # The later, resolving pass -- this is what LiveCryptoOrder.status
+        # ending up "FILLED" implies must have happened in production.
+        _seed_reconciliation_event(raw_session, live_crypto_order_id=order_id, reconciliation_status="filled", provider_order_id="OAXUZJ-7WRL5-NPFWYA", sequence_number=4)
+
+        with caplog.at_level(logging.INFO, logger="app.services.orchestration.continuous_pipeline_worker"):
+            result = await worker_module._has_unresolved_reconciliation(db=db, **scope)
+
+    assert result is False
+    assert not [r for r in caplog.records if r.getMessage().startswith("unresolved_reconciliation_")]
+
+
+@pytest.mark.asyncio
+async def test_has_unresolved_reconciliation_still_blocks_when_latest_event_is_genuinely_unresolved(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Fail-closed behavior must be preserved: if the LATEST event for an
+    order is still unresolved (no later resolving pass has ever run), the
+    gate must keep blocking exactly as before."""
+    import app.services.orchestration.continuous_pipeline_worker as worker_module
+
+    order_id = uuid.uuid4()
+    scope = dict(provider="kraken_spot", environment="production", product="BTC-USD")
+
+    with _reconciliation_sqlite_session() as (raw_session, db):
+        _seed_live_crypto_order(raw_session, live_crypto_order_id=order_id, provider_order_id="K-STUCK-1", **scope)
+        _seed_reconciliation_event(raw_session, live_crypto_order_id=order_id, reconciliation_status="partially_filled", provider_order_id="K-STUCK-1", sequence_number=1)
+        _seed_reconciliation_event(raw_session, live_crypto_order_id=order_id, reconciliation_status="reconciliation_required", provider_order_id="K-STUCK-1", sequence_number=2)
+
+        with caplog.at_level(logging.INFO, logger="app.services.orchestration.continuous_pipeline_worker"):
+            result = await worker_module._has_unresolved_reconciliation(db=db, **scope)
+
+    assert result is True
+    trigger_records = [r for r in caplog.records if r.getMessage().startswith("unresolved_reconciliation_gate_triggered ")]
+    assert "matched_record_count=1" in trigger_records[0].getMessage()
+    detail_records = [r for r in caplog.records if r.getMessage().startswith("unresolved_reconciliation_record_detail ")]
+    assert len(detail_records) == 1
+    # Only the LATEST (sequence_number=2) record should be reported, not the
+    # superseded sequence_number=1 one.
+    assert "reconciliation_status=reconciliation_required" in detail_records[0].getMessage()
+    assert "sequence_number=2" in detail_records[0].getMessage()
+
+
+@pytest.mark.asyncio
+async def test_has_unresolved_reconciliation_one_resolved_order_does_not_mask_another_stuck_order(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """One order resolving must not hide a genuinely different, still-stuck
+    order in the same scope -- latest-per-order must be evaluated
+    independently for every order, not collapsed across the whole scope."""
+    import app.services.orchestration.continuous_pipeline_worker as worker_module
+
+    resolved_order, stuck_order = uuid.uuid4(), uuid.uuid4()
+    scope = dict(provider="kraken_spot", environment="production", product="BTC-USD")
+
+    with _reconciliation_sqlite_session() as (raw_session, db):
+        _seed_live_crypto_order(raw_session, live_crypto_order_id=resolved_order, provider_order_id="K-RESOLVED", status="FILLED", **scope)
+        _seed_reconciliation_event(raw_session, live_crypto_order_id=resolved_order, reconciliation_status="partially_filled", provider_order_id="K-RESOLVED", sequence_number=1)
+        _seed_reconciliation_event(raw_session, live_crypto_order_id=resolved_order, reconciliation_status="filled", provider_order_id="K-RESOLVED", sequence_number=2)
+
+        _seed_live_crypto_order(raw_session, live_crypto_order_id=stuck_order, provider_order_id="K-STUCK-2", **scope)
+        _seed_reconciliation_event(raw_session, live_crypto_order_id=stuck_order, reconciliation_status="open", provider_order_id="K-STUCK-2", sequence_number=1)
+
+        with caplog.at_level(logging.INFO, logger="app.services.orchestration.continuous_pipeline_worker"):
+            result = await worker_module._has_unresolved_reconciliation(db=db, **scope)
+
+    assert result is True
+    detail_records = [r for r in caplog.records if r.getMessage().startswith("unresolved_reconciliation_record_detail ")]
+    assert len(detail_records) == 1
+    assert f"live_crypto_order_id={stuck_order}" in detail_records[0].getMessage()

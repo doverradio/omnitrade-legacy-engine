@@ -10,7 +10,7 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from decimal import Decimal
 
-from sqlalchemy import select
+from sqlalchemy import and_, func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.models.audit_log import AuditLog
@@ -722,22 +722,57 @@ async def _has_open_live_order(*, db: AsyncSession, provider: str, environment: 
     return row is not None
 
 
+def _latest_reconciliation_event_per_order(*, provider: str, environment: str, product: str):
+    """(order_id, max sequence_number) for every order in scope.
+
+    live_reconciliation_events is append-only (immutable audit log): an
+    order accumulates a new row every time it is re-reconciled (e.g.
+    partially_filled, then later filled once the provider confirms full
+    execution) -- existing rows are never updated or deleted (see the
+    before_update/before_delete guards on LiveReconciliationEvent). Only the
+    LATEST row per order reflects its current effective state. Confirmed
+    production defect: an order whose LiveCryptoOrder.status had already
+    reached FILLED was still reported unresolved forever, purely because of
+    its own earlier partially_filled/reconciliation_required rows from days
+    earlier -- superseded history, not current state. This mirrors the
+    "latest per order" rule already applied for the identical
+    reconciliation_status vocabulary in
+    app.services.risk.equity_evidence._count_reconciliation_uncertainty;
+    that existing, correct pattern was simply never applied here too.
+    """
+    return (
+        select(
+            LiveReconciliationEvent.live_crypto_order_id.label("order_id"),
+            func.max(LiveReconciliationEvent.sequence_number).label("max_seq"),
+        )
+        .join(LiveCryptoOrder, LiveCryptoOrder.live_crypto_order_id == LiveReconciliationEvent.live_crypto_order_id)
+        .where(LiveCryptoOrder.provider == provider)
+        .where(LiveCryptoOrder.environment == environment)
+        .where(LiveCryptoOrder.product_id == product)
+        .where(LiveReconciliationEvent.live_crypto_order_id.is_not(None))
+        .group_by(LiveReconciliationEvent.live_crypto_order_id)
+        .subquery()
+    )
+
+
 async def _log_unresolved_reconciliation_diagnostics(*, db: AsyncSession, provider: str, environment: str, product: str) -> None:
     # Instrumentation only -- mirrors _has_unresolved_reconciliation's own
-    # query exactly (same join, same scope filters, same unresolved-state
+    # query exactly (same latest-per-order scoping, same unresolved-state
     # set) so this is guaranteed to explain precisely which record(s) that
     # function's boolean check is reacting to, never a different or looser
     # selection. Only called when that check is already about to return True,
     # so it costs nothing on the common (no unresolved reconciliation) path.
+    latest = _latest_reconciliation_event_per_order(provider=provider, environment=environment, product=product)
     result = await db.execute(
         select(LiveReconciliationEvent, LiveCryptoOrder)
         .join(
-            LiveCryptoOrder,
-            LiveCryptoOrder.live_crypto_order_id == LiveReconciliationEvent.live_crypto_order_id,
+            latest,
+            and_(
+                LiveReconciliationEvent.live_crypto_order_id == latest.c.order_id,
+                LiveReconciliationEvent.sequence_number == latest.c.max_seq,
+            ),
         )
-        .where(LiveCryptoOrder.provider == provider)
-        .where(LiveCryptoOrder.environment == environment)
-        .where(LiveCryptoOrder.product_id == product)
+        .join(LiveCryptoOrder, LiveCryptoOrder.live_crypto_order_id == LiveReconciliationEvent.live_crypto_order_id)
         .where(LiveReconciliationEvent.reconciliation_status.in_(_UNRESOLVED_RECONCILIATION_STATES))
         .order_by(LiveReconciliationEvent.recorded_at.asc())
     )
@@ -778,15 +813,16 @@ async def _log_unresolved_reconciliation_diagnostics(*, db: AsyncSession, provid
 
 
 async def _has_unresolved_reconciliation(*, db: AsyncSession, provider: str, environment: str, product: str) -> bool:
+    latest = _latest_reconciliation_event_per_order(provider=provider, environment=environment, product=product)
     row = await db.scalar(
         select(LiveReconciliationEvent.id)
         .join(
-            LiveCryptoOrder,
-            LiveCryptoOrder.live_crypto_order_id == LiveReconciliationEvent.live_crypto_order_id,
+            latest,
+            and_(
+                LiveReconciliationEvent.live_crypto_order_id == latest.c.order_id,
+                LiveReconciliationEvent.sequence_number == latest.c.max_seq,
+            ),
         )
-        .where(LiveCryptoOrder.provider == provider)
-        .where(LiveCryptoOrder.environment == environment)
-        .where(LiveCryptoOrder.product_id == product)
         .where(LiveReconciliationEvent.reconciliation_status.in_(_UNRESOLVED_RECONCILIATION_STATES))
         .limit(1)
     )
