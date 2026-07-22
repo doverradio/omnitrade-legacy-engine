@@ -988,6 +988,27 @@ async def _attempt_automatic_ready_package_creation(
                             package_id,
                             idempotency_key,
                         )
+                    # A READY package is not an executed one. Authorization
+                    # (authorize_canonical_preview_package), the dry run
+                    # (run_dry_run_for_canonical_preview_package), and
+                    # activation (activate_canonical_proving_campaign) are
+                    # each operator_cli-only today -- no automatic caller
+                    # exists in this codebase, and none should be added here:
+                    # authorization requires a human approver_id/rationale
+                    # and activation requires a matching approval event, so
+                    # nothing downstream of package creation can be safely
+                    # driven by this worker without fabricating that human
+                    # evidence. This line makes that boundary explicit in
+                    # the logs every cycle, rather than leaving
+                    # executions_attempted=0 unexplained.
+                    logger.info(
+                        "automatic_ready_package_execution_skipped campaign_id=%s campaign_version=%s cycle_id=%s decision_record_id=%s package_id=%s reason=operator_authorization_required failed_closed=False",
+                        campaign_id,
+                        campaign_version,
+                        cycle_id,
+                        decision_record_id,
+                        package_id,
+                    )
 
         if skip_reason is not None:
             logger.info(

@@ -730,7 +730,10 @@ async def test_automatic_ready_package_skip_conditions_create_no_package(
 
 
 @pytest.mark.asyncio
-async def test_automatic_ready_package_path_never_calls_authorize_activate_dryrun_or_provider_submit(monkeypatch: pytest.MonkeyPatch) -> None:
+async def test_automatic_ready_package_path_never_calls_authorize_activate_dryrun_or_provider_submit(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
     import app.services.canonical_preview_package as canonical_package
     import app.services.live_crypto_orders as live_crypto_orders
     import app.services.orchestration.continuous_pipeline_worker as worker_module
@@ -782,12 +785,17 @@ async def test_automatic_ready_package_path_never_calls_authorize_activate_dryru
     monkeypatch.setattr(worker_module, "_load_live_trading_profile_for_paper_account", _async_return(profile))
     monkeypatch.setattr(worker_module, "create_canonical_preview_package", _fake_create)
 
+    caplog.set_level(logging.INFO)
     await worker_module._attempt_automatic_ready_package_creation(db=object(), orchestration_payload=_automatic_payload(cycle))
 
     assert called["authorize"] == 0
     assert called["activate"] == 0
     assert called["dry_run"] == 0
     assert called["provider_submit"] == 0
+    # The worker must make this boundary explicit in the logs every cycle,
+    # not just leave executions_attempted=0 unexplained.
+    assert "automatic_ready_package_execution_skipped" in caplog.text
+    assert "reason=operator_authorization_required" in caplog.text
 
 
 @pytest.mark.asyncio

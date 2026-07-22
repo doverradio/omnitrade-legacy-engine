@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 import uuid
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal, ROUND_DOWN
@@ -53,6 +54,8 @@ from app.services.risk.risk_monitor import get_risk_rules
 from app.services.risk.risk_engine import RiskDecisionAction, RiskEvaluationContext, RiskEvaluationRequest, evaluate_signal_risk
 from app.services.risk.risk_persistence import RiskDecisionPersistenceRequest, persist_risk_decision
 
+
+logger = logging.getLogger(__name__)
 
 CONFIRMATION_PHRASE = "BUY BTC"
 _USD_SCALE = Decimal("0.01")
@@ -1407,6 +1410,10 @@ class LiveCryptoOrderService:
             )
             raise PermissionError("live crypto order submission is disabled")
 
+        logger.info(
+            "canonical_execution_started live_trading_profile_id=%s crypto_order_preview_id=%s actor=%s",
+            request.live_trading_profile_id, request.crypto_order_preview_id, request.operator_identity,
+        )
         preflight = await _evaluate_live_preflight_guards(
             db=db,
             live_trading_profile_id=request.live_trading_profile_id,
@@ -1461,6 +1468,10 @@ class LiveCryptoOrderService:
         )
         await _commit_if_supported(db=db)
 
+        logger.info(
+            "live_crypto_order_created live_crypto_order_id=%s risk_event_id=%s decision_record_id=%s crypto_order_preview_id=%s status=%s",
+            live_crypto_order.live_crypto_order_id, risk_event_id, live_crypto_order.decision_record_id, preview.crypto_order_preview_id, live_crypto_order.status,
+        )
         return LiveCryptoOrderPrepareResponse(
             live_crypto_order=self._to_response(live_crypto_order),
             confirmation_challenge_id=confirmation_challenge_id,
@@ -1894,6 +1905,10 @@ class LiveCryptoOrderService:
         await db.flush()
         await _commit_if_supported(db=db)
 
+        logger.info(
+            "kraken_order_submission_started live_crypto_order_id=%s provider=%s environment=%s product_id=%s side=%s client_order_id=%s risk_event_id=%s",
+            live_order.live_crypto_order_id, live_order.provider, live_order.environment, live_order.product_id, live_order.side, live_order.client_order_id, risk_event_id,
+        )
         connection_credentials = _load_decrypted_credentials(connection)
         require_provider_capabilities(
             provider=live_order.provider,
@@ -2023,6 +2038,10 @@ class LiveCryptoOrderService:
             live_order.updated_at = _utcnow()
             await db.flush()
             await _commit_if_supported(db=db)
+            logger.info(
+                "kraken_order_rejected live_crypto_order_id=%s risk_event_id=%s failure_code=%s failed_closed=True",
+                live_order.live_crypto_order_id, risk_event_id, live_order.failure_code,
+            )
             return self._existing_submit_response(live_order=live_order)
 
         if submission.classification == "ambiguous" and (submission.order is None or submission.order.provider_order_id is None):
@@ -2094,6 +2113,10 @@ class LiveCryptoOrderService:
                 before_state=None,
                 after_state={"status": live_order.status, "provider_order_id": provider_order_id},
             )
+            logger.info(
+                "kraken_order_submitted live_crypto_order_id=%s risk_event_id=%s provider_order_id=%s",
+                live_order.live_crypto_order_id, risk_event_id, provider_order_id,
+            )
         else:
             live_order.status = "RECONCILIATION_REQUIRED"
             live_order.failure_code = "provider_response_ambiguous"
@@ -2139,6 +2162,10 @@ class LiveCryptoOrderService:
         )
         if live_order is None:
             raise LookupError("live crypto order not found")
+        logger.info(
+            "reconciliation_started live_crypto_order_id=%s risk_event_id=%s decision_record_id=%s",
+            live_crypto_order_id, live_order.risk_event_id, live_order.decision_record_id,
+        )
         outcome = await reconcile_live_order_and_fills(
             db=db,
             live_crypto_order_id=live_crypto_order_id,
@@ -2147,6 +2174,10 @@ class LiveCryptoOrderService:
         await _commit_if_supported(db=db)
         if hasattr(db, "refresh"):
             await db.refresh(live_order)
+        logger.info(
+            "reconciliation_completed live_crypto_order_id=%s reconciliation_status=%s provider_fill_observed=%s",
+            live_crypto_order_id, outcome.get("reconciliation_status"), outcome.get("provider_fill_observed"),
+        )
 
         return LiveCryptoOrderReconcileResponse(
             live_crypto_order=self._to_response(live_order),

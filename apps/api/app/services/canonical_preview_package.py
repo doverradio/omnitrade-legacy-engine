@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 import uuid
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -33,6 +34,8 @@ from app.schemas.crypto_order_previews import CryptoOrderPreviewCreateRequest
 from app.services.live.approval import record_live_approval_checkpoint
 from app.services.live.contracts import LiveApprovalCheckpointRequest
 from app.services.strategies.identity import parse_strategy_identity
+
+logger = logging.getLogger(__name__)
 
 _PACKAGE_STATES = {
     "CREATED",
@@ -1181,6 +1184,11 @@ async def authorize_canonical_preview_package(
     package.approval_event_id = checkpoint.approval_event_id
     await db.flush()
 
+    logger.info(
+        "automatic_ready_package_activation_started campaign_id=%s campaign_version=%s package_id=%s decision_record_id=%s approval_event_id=%s actor=%s",
+        package.campaign_id, package.campaign_version, package.package_id, package.decision_record_id, checkpoint.approval_event_id, request.actor,
+    )
+
     payload = _package_payload(package)
     payload["approval_event_id"] = str(checkpoint.approval_event_id)
     payload["readiness"] = _package_readiness(package)
@@ -1313,6 +1321,10 @@ async def activate_canonical_proving_campaign(
         if package.package_state != "ACTIVATED":
             package.package_state = "ACTIVATED"
             await db.flush()
+        logger.info(
+            "automatic_ready_package_activated campaign_id=%s campaign_version=%s package_id=%s activation_id=%s reused=True",
+            package.campaign_id, package.campaign_version, package.package_id, existing.activation_id,
+        )
         return {"activation": _activation_payload(existing), "package": _package_payload(package)}
 
     activation_id = uuid.uuid4()
@@ -1353,6 +1365,10 @@ async def activate_canonical_proving_campaign(
     package.dry_run_live_crypto_order_id = request.dry_run_live_crypto_order_id
     await db.flush()
 
+    logger.info(
+        "automatic_ready_package_activated campaign_id=%s campaign_version=%s package_id=%s activation_id=%s reused=False",
+        package.campaign_id, package.campaign_version, package.package_id, activation_id,
+    )
     return {"activation": _activation_payload(activation), "package": _package_payload(package)}
 
 
