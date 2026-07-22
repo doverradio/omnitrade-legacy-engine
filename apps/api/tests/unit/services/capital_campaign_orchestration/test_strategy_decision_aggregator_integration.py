@@ -878,6 +878,71 @@ async def test_scorecard_fetch_failure_during_fresh_computation_triggers_governe
         assert isinstance(parameter_sets_after_failure, list)
 
 
+# Production evidence: a fetch_strategy_scorecards() command timeout left the
+# session unable to serve the NEXT unrelated statement (PendingRollbackError,
+# surfacing as campaign_orchestration_failed) despite the begin_nested()
+# savepoint that is supposed to isolate scorecard-fetch failures. Root cause:
+# a driver-level timeout can leave the underlying connection's wire protocol
+# desynced, which the savepoint's own ROLLBACK TO SAVEPOINT -- sent over that
+# same broken connection -- cannot always recover from. These two tests
+# exercise _recover_session_after_scorecard_failure directly (not through the
+# full aggregator) to prove it: (a) does nothing when the savepoint already
+# fully recovered the session (the common case, and the exact case the two
+# tests above already cover end-to-end), and (b) escalates to invalidating
+# the connection and rolling back the session ONLY when a cheap probe proves
+# the session is still broken after the savepoint's own attempt.
+@pytest.mark.asyncio
+async def test_recover_session_after_scorecard_failure_is_a_noop_when_probe_succeeds() -> None:
+    from app.services.capital_campaign_orchestration.authoritative import _recover_session_after_scorecard_failure
+
+    calls = {"execute": 0, "rollback": 0, "connection": 0}
+
+    class _HealthySession:
+        async def execute(self, _statement):
+            calls["execute"] += 1
+
+        async def connection(self):
+            calls["connection"] += 1
+            raise AssertionError("connection() must not be reached when the probe already succeeds")
+
+        async def rollback(self):
+            calls["rollback"] += 1
+
+    await _recover_session_after_scorecard_failure(db=_HealthySession())
+
+    assert calls["execute"] == 1
+    assert calls["connection"] == 0
+    assert calls["rollback"] == 0
+
+
+@pytest.mark.asyncio
+async def test_recover_session_after_scorecard_failure_escalates_when_probe_still_fails() -> None:
+    from app.services.capital_campaign_orchestration.authoritative import _recover_session_after_scorecard_failure
+
+    calls = {"execute": 0, "invalidate": 0, "rollback": 0}
+
+    class _BrokenConnection:
+        async def invalidate(self):
+            calls["invalidate"] += 1
+
+    class _BrokenSession:
+        async def execute(self, _statement):
+            calls["execute"] += 1
+            raise RuntimeError("This Session's transaction has been rolled back due to a previous exception")
+
+        async def connection(self):
+            return _BrokenConnection()
+
+        async def rollback(self):
+            calls["rollback"] += 1
+
+    await _recover_session_after_scorecard_failure(db=_BrokenSession())
+
+    assert calls["execute"] == 1
+    assert calls["invalidate"] == 1
+    assert calls["rollback"] == 1
+
+
 @pytest.mark.asyncio
 async def test_clean_idempotent_replay_without_error_remains_deterministic(monkeypatch: pytest.MonkeyPatch) -> None:
     """Control case: no fault injected. Repeated replay of the same scope is

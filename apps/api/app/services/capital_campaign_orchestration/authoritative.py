@@ -758,6 +758,56 @@ def _build_aggregate_evidence_dict(
     }
 
 
+async def _recover_session_after_scorecard_failure(*, db: AsyncSession) -> None:
+    """Called after fetch_strategy_scorecards fails inside its own SAVEPOINT
+    (db.begin_nested()). That savepoint's automatic ROLLBACK TO SAVEPOINT
+    correctly isolates ordinary application/DB errors -- confirmed by the
+    fact that both callers already work fine for those. A driver-level
+    command timeout is a different class of failure: asyncpg's
+    command_timeout cancels the in-flight query client-side while the server
+    may still be mid-response, which can leave the underlying connection's
+    wire protocol desynced -- unable to safely process even the ROLLBACK TO
+    SAVEPOINT the exiting `async with` block just attempted. When that
+    happens, the session is left in a state where the NEXT unrelated
+    statement (not this one) raises PendingRollbackError -- exactly the
+    confirmed production sequence (strategy_scorecard_fetch_failed_during_replay,
+    then a later, unrelated statement fails with PendingRollbackError,
+    surfacing as campaign_orchestration_failed).
+
+    This must NOT unconditionally roll back the whole session: the ambient
+    transaction may legitimately hold flushed-but-uncommitted work from
+    earlier in the same request that has nothing to do with scorecards, and
+    discarding it would trade one bug for a worse one. So: probe with a
+    trivial, side-effect-free statement first. If the savepoint's own
+    rollback already fully recovered the session (the common case), the
+    probe succeeds and nothing more happens. Only if the probe ITSELF fails
+    -- proving the connection is genuinely broken, not just the savepoint's
+    logical transaction state -- do we escalate to invalidating the
+    connection and rolling back the session, which is the only way to
+    recover a connection in that state (and is unavoidable at that point:
+    a truly broken connection cannot preserve unflushed work regardless of
+    what this function does or doesn't do).
+    """
+    try:
+        await db.execute(select(1))
+        return
+    except Exception:
+        pass
+    try:
+        connection = await db.connection()
+    except Exception:
+        connection = None
+    if connection is not None:
+        try:
+            await connection.invalidate()
+        except Exception:
+            logger.debug("Unable to invalidate connection after scorecard fetch failure", exc_info=True)
+    try:
+        await db.rollback()
+    except Exception:
+        logger.debug("Unable to roll back session after scorecard fetch failure", exc_info=True)
+
+
 async def load_strategy_aggregate_evidence(
     *,
     db: AsyncSession,
@@ -872,6 +922,7 @@ async def load_strategy_aggregate_evidence(
             exc_info=True,
         )
         scorecard_by_slug = {}
+        await _recover_session_after_scorecard_failure(db=db)
 
     evidence = _build_aggregate_evidence_dict(
         roster_run_id=roster_run_id,
@@ -987,6 +1038,7 @@ async def resolve_or_create_strategy_aggregate_evidence(
             exc_info=True,
         )
         data_quality_failed = True
+        await _recover_session_after_scorecard_failure(db=db)
 
     proposal_inputs: list[StrategyProposalInput] = []
     for proposal in proposals:
