@@ -1,8 +1,11 @@
 from __future__ import annotations
 
+from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
+from itertools import count
 from types import SimpleNamespace
+from typing import Any
 import uuid
 
 import pytest
@@ -497,3 +500,336 @@ async def test_fetch_strategy_scorecards_excludes_non_resolved_and_reconciles_ho
     assert aggregate.hold_evaluations == 1
     assert aggregate.hold_correct == 1
     assert aggregate.buy_evaluations + aggregate.sell_evaluations + aggregate.hold_evaluations == aggregate.total_evaluated
+
+
+def _install_sqlite_uuid_compiler() -> None:
+    from sqlalchemy.dialects.postgresql import UUID as PG_UUID
+    from sqlalchemy.ext.compiler import compiles
+
+    @compiles(PG_UUID, "sqlite")
+    def _compile_uuid_sqlite(element, compiler, **kw) -> str:  # noqa: ANN001
+        return "CHAR(32)"
+
+
+_install_sqlite_uuid_compiler()
+
+
+def _fix_sqlite_server_defaults(table) -> None:  # noqa: ANN001
+    from sqlalchemy import text as _text
+    from sqlalchemy.schema import DefaultClause
+    from sqlalchemy.sql.elements import TextClause
+
+    for column in table.columns:
+        default = column.server_default
+        if isinstance(default, DefaultClause) and isinstance(default.arg, TextClause):
+            raw = default.arg.text.strip().split("::", 1)[0]
+            if raw.endswith("()") and not raw.startswith("("):
+                raw = f"({raw})"
+            column.server_default = DefaultClause(_text(raw))
+
+
+@asynccontextmanager
+async def _real_outcomes_session():
+    from sqlalchemy import create_engine, event
+    from sqlalchemy.orm import Session
+    from sqlalchemy.pool import StaticPool
+
+    engine = create_engine("sqlite:///:memory:", poolclass=StaticPool)
+
+    @event.listens_for(engine, "connect")
+    def _register_functions(dbapi_conn, _record) -> None:  # noqa: ANN001
+        dbapi_conn.create_function("now", 0, lambda: datetime.now(timezone.utc).isoformat())
+        dbapi_conn.create_function("gen_random_uuid", 0, lambda: uuid.uuid4().hex)
+
+    _fix_sqlite_server_defaults(StrategyRosterProposalOutcome.__table__)
+    StrategyRosterProposalOutcome.metadata.create_all(engine, tables=[StrategyRosterProposalOutcome.__table__])
+    session = Session(engine)
+    try:
+        yield session
+    finally:
+        session.close()
+        engine.dispose()
+
+
+class _AwaitableOutcomesSession:
+    """Minimal AsyncSession-shaped adapter over a real synchronous ORM
+    Session, scoped to exactly what fetch_strategy_scorecards() needs
+    (db.execute). A real SQLite engine is used so both implementations
+    below run genuine, independently-compiled SQL against the same seeded
+    rows -- this is not a hand-rolled fake that echoes back whatever list it
+    was given regardless of the query shape (unlike _FakeDb/_Result above,
+    which don't distinguish a full-entity select from a narrow-column
+    select), so it can actually prove the two query shapes produce
+    identical scoring output."""
+
+    def __init__(self, session) -> None:  # noqa: ANN001
+        self._session = session
+
+    async def execute(self, statement):
+        return self._session.execute(statement)
+
+
+_proposal_id_counter = count()
+
+
+def _seed_outcome_row(
+    session,  # noqa: ANN001
+    *,
+    strategy_slug: str,
+    action: str,
+    horizon_label: str,
+    horizon_minutes: int,
+    regime_trend: str,
+    actual_action_correct: bool | None,
+    actual_raw_return_pct: Decimal,
+    actual_fee_adjusted_return_pct: Decimal,
+    mfe_pct: Decimal,
+    mae_pct: Decimal,
+) -> None:
+    now = datetime(2026, 7, 21, 12, 0, tzinfo=timezone.utc)
+    proposal_id = uuid.uuid4()
+    session.add(
+        StrategyRosterProposalOutcome(
+            outcome_id=uuid.uuid4(),
+            idempotency_key=f"idem-{next(_proposal_id_counter)}",
+            proposal_id=proposal_id,
+            roster_run_id=uuid.uuid4(),
+            asset_id=uuid.uuid4(),
+            provider="kraken_spot",
+            product_id="BTC-USD",
+            interval="15m",
+            strategy_slug=strategy_slug,
+            strategy_identity=f"{strategy_slug}@1.0.0",
+            action=action,
+            proposal_evaluation_status="EVALUATED",
+            horizon_label=horizon_label,
+            horizon_minutes=horizon_minutes,
+            proposal_candle_close_time=now,
+            horizon_time=now + timedelta(minutes=horizon_minutes),
+            evaluated_at=now + timedelta(seconds=horizon_minutes),
+            entry_price=Decimal("100"),
+            exit_price=Decimal("101"),
+            market_return_pct=Decimal("1.0"),
+            buy_raw_return_pct=Decimal("1.0"),
+            buy_fee_adjusted_return_pct=Decimal("0.8"),
+            sell_raw_return_pct=Decimal("-1.0"),
+            sell_fee_adjusted_return_pct=Decimal("-1.2"),
+            actual_raw_return_pct=actual_raw_return_pct,
+            actual_fee_adjusted_return_pct=actual_fee_adjusted_return_pct,
+            mfe_pct=mfe_pct,
+            mae_pct=mae_pct,
+            actual_action_correct=actual_action_correct,
+            evaluation_completed=True,
+            evaluation_state="RESOLVED",
+            evaluation_reason=None,
+            market_move="UP",
+            regime_trend=regime_trend,
+            regime_volatility="HIGH_VOLATILITY",
+            regime_range="EXPANSION",
+            fee_bps=Decimal("10"),
+            hold_buy_threshold_pct=Decimal("0"),
+            hold_sell_threshold_pct=Decimal("0"),
+            execution_mode="SHADOW",
+            live_submission_allowed=False,
+        )
+    )
+
+
+async def _reference_fetch_strategy_scorecards_full_entity(
+    *, db: Any, provider: str, product_id: str, interval: str,
+):
+    """Frozen copy of fetch_strategy_scorecards() exactly as it read before
+    the column-narrowing optimization: select(StrategyRosterProposalOutcome)
+    (all 39 mapped columns) + result.scalars().all(), followed by the
+    unmodified grouping/scoring logic. Kept only in this test file as "the
+    current implementation" for a byte-for-byte comparison against the
+    optimized narrow-column select -- production code must never import
+    this."""
+    from sqlalchemy import select
+
+    from app.services.strategy_outcomes.service import (
+        HORIZONS,
+        StrategyScorecard,
+        StrategyScorecardBucket,
+        _round,
+        get_settings,
+    )
+
+    settings = get_settings()
+    regime_min_evidence_required = int(getattr(settings, "outcome_scorecards_regime_min_evaluations", 50))
+
+    result = await db.execute(
+        select(StrategyRosterProposalOutcome)
+        .where(StrategyRosterProposalOutcome.provider == provider)
+        .where(StrategyRosterProposalOutcome.product_id == product_id)
+        .where(StrategyRosterProposalOutcome.interval == interval)
+        .where(StrategyRosterProposalOutcome.evaluation_state == "RESOLVED")
+        .order_by(
+            StrategyRosterProposalOutcome.strategy_slug.asc(),
+            StrategyRosterProposalOutcome.evaluated_at.asc(),
+            StrategyRosterProposalOutcome.outcome_id.asc(),
+        )
+    )
+    rows = [row for row in result.scalars().all() if row.evaluation_state == "RESOLVED"]
+
+    grouped: dict[str, list[Any]] = {}
+    for row in rows:
+        grouped.setdefault(row.strategy_slug, []).append(row)
+
+    scorecards: list[StrategyScorecard] = []
+    for strategy_slug in sorted(grouped):
+        items = grouped[strategy_slug]
+        scored_items = [item for item in items if item.actual_action_correct is not None]
+
+        def _bucket(horizon_label: str, bucket_items: list[Any]) -> StrategyScorecardBucket:
+            buy_items = [item for item in bucket_items if item.action == "BUY"]
+            sell_items = [item for item in bucket_items if item.action == "SELL"]
+            hold_items = [item for item in bucket_items if item.action == "HOLD"]
+
+            buy_correct = sum(1 for item in buy_items if item.actual_action_correct)
+            sell_correct = sum(1 for item in sell_items if item.actual_action_correct)
+            hold_correct = sum(1 for item in hold_items if item.actual_action_correct)
+
+            total = len(bucket_items)
+            total_correct = buy_correct + sell_correct + hold_correct
+
+            def _fee_adjusted_average(items: list[Any]) -> Decimal | None:
+                if not items:
+                    return None
+                return sum((item.actual_fee_adjusted_return_pct or Decimal("0") for item in items), Decimal("0")) / Decimal(len(items))
+
+            def _raw_average(items: list[Any]) -> Decimal | None:
+                if not items:
+                    return None
+                return sum((item.actual_raw_return_pct or Decimal("0") for item in items), Decimal("0")) / Decimal(len(items))
+
+            overall_correct_pct = None
+            raw_avg = None
+            fee_avg = None
+            mfe_avg = None
+            mae_avg = None
+            if total > 0:
+                overall_correct_pct = (Decimal(total_correct) * Decimal("100")) / Decimal(total)
+                raw_avg = sum((item.actual_raw_return_pct or Decimal("0") for item in bucket_items), Decimal("0")) / Decimal(total)
+                fee_avg = sum((item.actual_fee_adjusted_return_pct or Decimal("0") for item in bucket_items), Decimal("0")) / Decimal(total)
+                mfe_avg = sum((item.mfe_pct or Decimal("0") for item in bucket_items), Decimal("0")) / Decimal(total)
+                mae_avg = sum((item.mae_pct or Decimal("0") for item in bucket_items), Decimal("0")) / Decimal(total)
+
+            return StrategyScorecardBucket(
+                horizon_label=horizon_label,
+                total_evaluated=total,
+                buy_evaluations=len(buy_items),
+                buy_correct=buy_correct,
+                sell_evaluations=len(sell_items),
+                sell_correct=sell_correct,
+                hold_evaluations=len(hold_items),
+                hold_correct=hold_correct,
+                overall_correct_pct=_round(overall_correct_pct),
+                average_raw_return_pct=_round(raw_avg),
+                average_fee_adjusted_return_pct=_round(fee_avg),
+                average_mfe_pct=_round(mfe_avg),
+                average_mae_pct=_round(mae_avg),
+                buy_average_fee_adjusted_return_pct=_round(_fee_adjusted_average(buy_items)),
+                sell_average_fee_adjusted_return_pct=_round(_fee_adjusted_average(sell_items)),
+                hold_average_fee_adjusted_return_pct=_round(_fee_adjusted_average(hold_items)),
+                buy_average_raw_return_pct=_round(_raw_average(buy_items)),
+                sell_average_raw_return_pct=_round(_raw_average(sell_items)),
+                hold_average_raw_return_pct=_round(_raw_average(hold_items)),
+            )
+
+        per_horizon: list[StrategyScorecardBucket] = []
+        for horizon_label, _horizon_minutes in HORIZONS:
+            horizon_items = [item for item in scored_items if item.horizon_label == horizon_label]
+            per_horizon.append(_bucket(horizon_label, horizon_items))
+
+        aggregate = _bucket("aggregate", scored_items)
+
+        regime_groups: dict[str, list[Decimal]] = {}
+        for item in scored_items:
+            regime_groups.setdefault(item.regime_trend, []).append(item.actual_fee_adjusted_return_pct or Decimal("0"))
+
+        best_regime = None
+        worst_regime = None
+        regime_evidence_count = len(scored_items)
+        if regime_groups and regime_evidence_count >= regime_min_evidence_required:
+            regime_avg = {
+                regime: (sum(values, Decimal("0")) / Decimal(len(values)))
+                for regime, values in regime_groups.items()
+            }
+            best_regime = max(regime_avg, key=lambda key: regime_avg[key])
+            worst_regime = min(regime_avg, key=lambda key: regime_avg[key])
+
+        scorecards.append(
+            StrategyScorecard(
+                strategy_slug=strategy_slug,
+                per_horizon=per_horizon,
+                aggregate=aggregate,
+                best_regime=best_regime,
+                worst_regime=worst_regime,
+                regime_evidence_count=regime_evidence_count,
+                regime_min_evidence_required=regime_min_evidence_required,
+            )
+        )
+
+    return scorecards
+
+
+@pytest.mark.asyncio
+async def test_narrow_column_select_matches_full_entity_select_byte_for_byte(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Proves the column-narrowing optimization (real production timeout
+    fix: query_ms was ~2.5-3.3s in production despite PostgreSQL executing
+    the indexed query in ~76ms, because the full-entity select transfers
+    and decodes all 39 mapped columns x ~18k rows instead of only the ~10
+    the scoring logic reads) produces IDENTICAL StrategyScorecard output to
+    the pre-optimization full-entity select, against a real SQLite-backed
+    SQL round trip -- not the hand-rolled _FakeDb/_Result fakes used
+    elsewhere in this file, which echo back whatever object list they were
+    given regardless of the query's actual column shape and therefore
+    cannot distinguish these two implementations at all."""
+    monkeypatch.setattr(
+        "app.services.strategy_outcomes.service.get_settings",
+        lambda: SimpleNamespace(outcome_scorecards_regime_min_evaluations=3),
+    )
+
+    async with _real_outcomes_session() as raw_session:
+        for i in range(6):
+            _seed_outcome_row(
+                raw_session,
+                strategy_slug="momentum",
+                action=("BUY", "SELL", "HOLD")[i % 3],
+                horizon_label=HORIZONS[i % len(HORIZONS)][0],
+                horizon_minutes=HORIZONS[i % len(HORIZONS)][1],
+                regime_trend="TRENDING" if i % 2 == 0 else "RANGING",
+                actual_action_correct=None if i == 5 else (i % 2 == 0),
+                actual_raw_return_pct=Decimal(i) - Decimal("2.5"),
+                actual_fee_adjusted_return_pct=Decimal(i) - Decimal("3.0"),
+                mfe_pct=Decimal("1.5") + Decimal(i),
+                mae_pct=Decimal("-0.5") - Decimal(i),
+            )
+        for i in range(5):
+            _seed_outcome_row(
+                raw_session,
+                strategy_slug="breakout",
+                action=("BUY", "SELL", "HOLD")[i % 3],
+                horizon_label=HORIZONS[i % len(HORIZONS)][0],
+                horizon_minutes=HORIZONS[i % len(HORIZONS)][1],
+                regime_trend="RANGING",
+                actual_action_correct=(i % 3 != 0),
+                actual_raw_return_pct=Decimal("2.0") + Decimal(i),
+                actual_fee_adjusted_return_pct=Decimal("1.5") + Decimal(i),
+                mfe_pct=Decimal("3.0"),
+                mae_pct=Decimal("-1.0"),
+            )
+        raw_session.commit()
+
+        db = _AwaitableOutcomesSession(raw_session)
+
+        reference_result = await _reference_fetch_strategy_scorecards_full_entity(
+            db=db, provider="kraken_spot", product_id="BTC-USD", interval="15m",
+        )
+        optimized_result = await fetch_strategy_scorecards(
+            db=db, provider="kraken_spot", product_id="BTC-USD", interval="15m",
+        )
+
+        assert len(reference_result) == 2
+        assert reference_result == optimized_result

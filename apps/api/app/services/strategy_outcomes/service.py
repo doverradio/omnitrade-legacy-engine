@@ -3,6 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
+from typing import Any
 import hashlib
 import json
 import logging
@@ -401,15 +402,32 @@ async def fetch_strategy_scorecards(
 
     # Phase-timed diagnostic instrumentation (production performance
     # investigation into fetch_strategy_scorecards() timeouts). Each phase
-    # is measured with perf_counter() around exactly the work it names, with
-    # no behavior change to the query, hydration, or scoring logic below --
-    # this is pure measurement, not an optimization. Logged unconditionally:
-    # this function runs at most once per campaign per 15-minute candle, so
-    # log volume is trivial relative to the diagnostic value while the
-    # timeout is still being characterized.
+    # is measured with perf_counter() around exactly the work it names.
+    # Confirmed via production EXPLAIN (ANALYZE, BUFFERS) that PostgreSQL
+    # itself executes this query in ~76ms fully served from shared_buffers
+    # (no sequential scan, no disk I/O) -- the multi-second query_ms actually
+    # observed in production is network transfer + asyncpg decoding of the
+    # full-entity result set (all 39 mapped columns x ~18k rows, ~389 bytes/
+    # row per Postgres's own width estimate, ~7MB total), which EXPLAIN
+    # ANALYZE's server-side "Execution Time" never measures. The SELECT
+    # below was narrowed from the full entity to only the columns the
+    # scoring logic beneath it actually reads, specifically to shrink that
+    # payload; it does not change the query's WHERE/ORDER BY or the scoring
+    # math in any way.
     t_query_start = time.perf_counter()
     result = await db.execute(
-        select(StrategyRosterProposalOutcome)
+        select(
+            StrategyRosterProposalOutcome.strategy_slug,
+            StrategyRosterProposalOutcome.action,
+            StrategyRosterProposalOutcome.actual_action_correct,
+            StrategyRosterProposalOutcome.actual_raw_return_pct,
+            StrategyRosterProposalOutcome.actual_fee_adjusted_return_pct,
+            StrategyRosterProposalOutcome.mfe_pct,
+            StrategyRosterProposalOutcome.mae_pct,
+            StrategyRosterProposalOutcome.horizon_label,
+            StrategyRosterProposalOutcome.regime_trend,
+            StrategyRosterProposalOutcome.evaluation_state,
+        )
         .where(StrategyRosterProposalOutcome.provider == provider)
         .where(StrategyRosterProposalOutcome.product_id == product_id)
         .where(StrategyRosterProposalOutcome.interval == interval)
@@ -424,12 +442,12 @@ async def fetch_strategy_scorecards(
 
     rows = [
         row
-        for row in result.scalars().all()
+        for row in result.all()
         if row.evaluation_state == "RESOLVED"
     ]
     t_hydration_done = time.perf_counter()
 
-    grouped: dict[str, list[StrategyRosterProposalOutcome]] = {}
+    grouped: dict[str, list[Any]] = {}
     for row in rows:
         grouped.setdefault(row.strategy_slug, []).append(row)
     t_grouping_done = time.perf_counter()
@@ -439,7 +457,7 @@ async def fetch_strategy_scorecards(
         items = grouped[strategy_slug]
         scored_items = [item for item in items if item.actual_action_correct is not None]
 
-        def _bucket(horizon_label: str, bucket_items: list[StrategyRosterProposalOutcome]) -> StrategyScorecardBucket:
+        def _bucket(horizon_label: str, bucket_items: list[Any]) -> StrategyScorecardBucket:
             buy_items = [item for item in bucket_items if item.action == "BUY"]
             sell_items = [item for item in bucket_items if item.action == "SELL"]
             hold_items = [item for item in bucket_items if item.action == "HOLD"]
@@ -451,12 +469,12 @@ async def fetch_strategy_scorecards(
             total = len(bucket_items)
             total_correct = buy_correct + sell_correct + hold_correct
 
-            def _fee_adjusted_average(items: list[StrategyRosterProposalOutcome]) -> Decimal | None:
+            def _fee_adjusted_average(items: list[Any]) -> Decimal | None:
                 if not items:
                     return None
                 return sum((item.actual_fee_adjusted_return_pct or Decimal("0") for item in items), Decimal("0")) / Decimal(len(items))
 
-            def _raw_average(items: list[StrategyRosterProposalOutcome]) -> Decimal | None:
+            def _raw_average(items: list[Any]) -> Decimal | None:
                 if not items:
                     return None
                 return sum((item.actual_raw_return_pct or Decimal("0") for item in items), Decimal("0")) / Decimal(len(items))
