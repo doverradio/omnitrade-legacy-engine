@@ -1,0 +1,270 @@
+from __future__ import annotations
+
+import os
+import uuid
+from datetime import datetime, timezone
+from typing import Any
+
+from sqlalchemy import func, select
+from sqlalchemy.ext.asyncio import AsyncSession
+
+from app.config import get_settings
+from app.models.audit_log import AuditLog
+from app.models.autonomous_capital_mandate import AutonomousCapitalMandate
+from app.models.autonomous_capital_mandate_authorization import AutonomousCapitalMandateAuthorization
+from app.models.autonomous_capital_mandate_evaluation import AutonomousCapitalMandateEvaluation
+from app.models.autonomous_capital_mandate_version import AutonomousCapitalMandateVersion
+from app.models.canonical_preview_package import CanonicalPreviewPackage
+from app.models.canonical_proving_activation import CanonicalProvingActivation
+from app.models.live_crypto_order import LiveCryptoOrder
+from app.models.live_accounting_record import LiveAccountingRecord
+from app.models.live_reconciliation_event import LiveReconciliationEvent
+
+_PACKAGE_STATES = {"READY", "AUTHORIZED", "DRY_RUN_PASSED", "ACTIVATED"}
+
+
+def _iso(value: datetime | None) -> str | None:
+    return None if value is None else value.isoformat()
+
+
+def _package_item(package: CanonicalPreviewPackage, *, now: datetime) -> dict[str, Any]:
+    return {
+        "package_id": str(package.package_id),
+        "campaign_id": str(package.campaign_id),
+        "campaign_version": package.campaign_version,
+        "decision_record_id": str(package.decision_record_id),
+        "state": package.package_state,
+        "authority_source": package.authorization_source,
+        "mandate_id": None if package.mandate_id is None else str(package.mandate_id),
+        "created_at": _iso(package.created_at),
+        "preview_expires_at": _iso(package.preview_expires_at),
+        "authorization_expires_at": _iso(package.authorization_expires_at),
+        "stale": package.preview_expires_at <= now,
+        "superseded": package.package_state == "SUPERSEDED" or package.superseded_at is not None,
+    }
+
+
+async def inspect_automatic_mandate_activation_readiness(
+    *, db: AsyncSession, provider: str, environment: str, product: str,
+) -> dict[str, Any]:
+    now = datetime.now(timezone.utc)
+    settings = get_settings()
+    reasons: list[dict[str, str]] = []
+    packages = list((await db.scalars(
+        select(CanonicalPreviewPackage)
+        .where(
+            CanonicalPreviewPackage.provider == provider,
+            CanonicalPreviewPackage.environment == environment,
+            CanonicalPreviewPackage.product == product,
+            CanonicalPreviewPackage.package_state.in_(_PACKAGE_STATES),
+        )
+        .order_by(CanonicalPreviewPackage.generated_at.desc())
+    )).all())
+    eligible_packages = [p for p in packages if p.preview_expires_at > now and p.package_state != "SUPERSEDED"]
+    if not packages:
+        reasons.append({"code": "no_package_available", "action": "Wait for an executable decision to create a READY package."})
+    elif len(eligible_packages) != 1:
+        reasons.append({"code": "ambiguous_eligible_packages" if eligible_packages else "stale_package", "action": "Resolve stale or conflicting canonical packages before enablement."})
+    if any(p.authorization_source == "HUMAN" for p in eligible_packages):
+        reasons.append({"code": "conflicting_human_authority", "action": "Use a mandate-authorized package; do not convert human evidence."})
+
+    mandates = list((await db.scalars(
+        select(AutonomousCapitalMandate)
+        .where(
+            AutonomousCapitalMandate.status == "ACTIVE",
+            AutonomousCapitalMandate.autonomy_level == "LEVEL_2",
+            AutonomousCapitalMandate.provider == provider,
+            AutonomousCapitalMandate.exchange_environment == environment,
+        )
+        .order_by(AutonomousCapitalMandate.created_at.asc()).limit(2)
+    )).all())
+    if len(mandates) != 1:
+        reasons.append({"code": "missing_active_level2_mandate" if not mandates else "ambiguous_active_level2_mandates", "action": "Commission exactly one matching ACTIVE LEVEL_2 mandate."})
+
+    mandate_payload = None
+    if len(mandates) == 1:
+        mandate = mandates[0]
+        authorization = await db.scalar(
+            select(AutonomousCapitalMandateAuthorization)
+            .where(
+                AutonomousCapitalMandateAuthorization.mandate_id == mandate.mandate_id,
+                AutonomousCapitalMandateAuthorization.authorization_state == "AUTHORIZED",
+                AutonomousCapitalMandateAuthorization.revoked_at.is_(None),
+            ).order_by(AutonomousCapitalMandateAuthorization.recorded_at.desc()).limit(1)
+        )
+        version = None if authorization is None else await db.scalar(
+            select(AutonomousCapitalMandateVersion).where(
+                AutonomousCapitalMandateVersion.mandate_version_id == authorization.mandate_version_id
+            ).limit(1)
+        )
+        package = eligible_packages[0] if len(eligible_packages) == 1 else None
+        evaluation = None if package is None else await db.scalar(
+            select(AutonomousCapitalMandateEvaluation).where(
+                AutonomousCapitalMandateEvaluation.mandate_id == mandate.mandate_id,
+                AutonomousCapitalMandateEvaluation.decision_id == package.decision_record_id,
+            ).order_by(AutonomousCapitalMandateEvaluation.created_at.desc()).limit(1)
+        )
+        if mandate.revoked_at is not None or (mandate.expires_at is not None and mandate.expires_at <= now):
+            reasons.append({"code": "mandate_expired_or_revoked", "action": "Renew or replace the mandate through governed lifecycle commands."})
+        if mandate.status != "ACTIVE" or mandate.autonomy_level != "LEVEL_2":
+            reasons.append({"code": "mandate_not_active_level2", "action": "Commission an ACTIVE LEVEL_2 mandate for unattended progression."})
+        if authorization is None or (authorization.expires_at is not None and authorization.expires_at <= now):
+            reasons.append({"code": "mandate_authorization_inactive", "action": "Restore valid owner authorization."})
+        if version is None or not version.is_active or not version.is_authorized:
+            reasons.append({"code": "mandate_version_inactive", "action": "Activate the authorized mandate version."})
+        if package is not None and (
+            evaluation is None or evaluation.authorization_result != "AUTHORIZED" or evaluation.approval_result != "APPROVAL_SATISFIED_BY_ACTIVE_MANDATE"
+        ):
+            reasons.append({"code": "matching_mandate_evaluation_missing", "action": "Do not enable until package mandate evidence is complete."})
+        if package is not None and (
+            package.paper_account_id != mandate.paper_account_id
+            or package.live_trading_profile_id != mandate.live_trading_profile_id
+            or package.provider != mandate.provider
+            or package.environment != mandate.exchange_environment
+            or version is None
+            or package.product not in version.allowed_products
+            or package.side not in version.allowed_order_sides
+            or package.strategy_version not in version.allowed_strategy_versions
+            or package.risk_approved_amount > version.max_order_notional_usd
+        ):
+            reasons.append({"code": "package_identity_mismatch", "action": "Generate a package whose account, profile, venue, strategy, side, product, and capital scope match the mandate."})
+        mandate_payload = {
+            "mandate_id": str(mandate.mandate_id), "status": mandate.status,
+            "autonomy_level": mandate.autonomy_level, "expires_at": _iso(mandate.expires_at),
+            "revoked": mandate.revoked_at is not None,
+            "authorization_active": authorization is not None,
+            "mandate_version_id": None if version is None else str(version.mandate_version_id),
+            "mandate_version": None if version is None else version.version_number,
+            "matching_evaluation_id": None if evaluation is None else str(evaluation.evaluation_id),
+            "campaign_runtime_id": None if mandate.capital_campaign_id is None else mandate.capital_campaign_id,
+            "paper_account_id": None if mandate.paper_account_id is None else str(mandate.paper_account_id),
+            "live_trading_profile_id": str(mandate.live_trading_profile_id),
+            "exchange_connection_id": str(mandate.exchange_connection_id),
+            "provider": mandate.provider,
+            "environment": mandate.exchange_environment,
+            "allowed_products": None if version is None else version.allowed_products,
+            "allowed_sides": None if version is None else version.allowed_order_sides,
+            "allowed_strategy_versions": None if version is None else version.allowed_strategy_versions,
+            "authorized_capital_usd": None if version is None else str(version.authorized_capital_usd),
+            "max_order_notional_usd": None if version is None else str(version.max_order_notional_usd),
+        }
+
+    activations = list((await db.scalars(select(CanonicalProvingActivation).where(
+        CanonicalProvingActivation.provider == provider,
+        CanonicalProvingActivation.environment == environment,
+        CanonicalProvingActivation.product == product,
+        CanonicalProvingActivation.activation_state == "ACTIVE",
+        CanonicalProvingActivation.expires_at > now,
+    ).limit(2))).all())
+    if len(activations) > 1:
+        reasons.append({"code": "conflicting_active_activations", "action": "Resolve conflicting proving activations."})
+
+    latest_pipeline = await db.scalar(select(AuditLog).where(
+        AuditLog.action == "orchestration_worker_full_pipeline_completed"
+    ).order_by(AuditLog.created_at.desc()).limit(1))
+    enabled = settings.automatic_mandate_package_activation_enabled
+    if reasons:
+        verdict = "NOT_READY"
+    elif enabled:
+        verdict = "ALREADY_ENABLED_AND_HEALTHY"
+    else:
+        verdict = "READY_TO_ENABLE"
+    return {
+        "verdict": verdict,
+        "reason_codes": reasons,
+        "configuration": {
+            "automatic_mandate_package_activation_enabled": enabled,
+            "live_crypto_preparation_enabled": settings.live_crypto_preparation_enabled,
+            "live_crypto_order_submission_enabled": settings.live_crypto_order_submission_enabled,
+            "provider": provider, "environment": environment, "product": product,
+        },
+        "worker": {
+            "deployed_application_version": os.getenv("DEPLOYED_GIT_SHA") or os.getenv("GIT_SHA"),
+            "latest_completed_pipeline_at": None if latest_pipeline is None else _iso(latest_pipeline.created_at),
+            "automatic_activation_service_present": True,
+        },
+        "mandate": mandate_payload,
+        "packages": [_package_item(item, now=now) for item in packages],
+        "package_inventory": {
+            state: [str(item.package_id) for item in packages if item.package_state == state]
+            for state in ("READY", "AUTHORIZED", "DRY_RUN_PASSED", "ACTIVATED")
+        },
+        "eligible_package_count": len(eligible_packages),
+        "active_activation_count": len(activations),
+        "submission_boundary": {
+            "activation_implies_submission": False,
+            "live_submission_flag_enabled": settings.live_crypto_order_submission_enabled,
+            "submission_callable_reachable": False,
+            "provider_submission_callable_reachable": False,
+        },
+        "read_only": True,
+    }
+
+
+async def inspect_automatic_mandate_activation_proof(*, db: AsyncSession, package_id: uuid.UUID) -> dict[str, Any]:
+    reasons: list[str] = []
+    package = await db.scalar(select(CanonicalPreviewPackage).where(CanonicalPreviewPackage.package_id == package_id).limit(1))
+    if package is None:
+        return {"verdict": "NOT_PROVEN", "package_id": str(package_id), "reason_codes": ["package_missing"], "read_only": True}
+    evaluation = None if package.mandate_evaluation_id is None else await db.scalar(
+        select(AutonomousCapitalMandateEvaluation).where(AutonomousCapitalMandateEvaluation.evaluation_id == package.mandate_evaluation_id).limit(1)
+    )
+    dry_order = None if package.dry_run_live_crypto_order_id is None else await db.scalar(
+        select(LiveCryptoOrder).where(LiveCryptoOrder.live_crypto_order_id == package.dry_run_live_crypto_order_id).limit(1)
+    )
+    activation = await db.scalar(select(CanonicalProvingActivation).where(CanonicalProvingActivation.package_id == package_id).limit(1))
+    if package.authorization_source != "MANDATE" or package.approval_event_id is not None:
+        reasons.append("human_authority_contamination")
+    if evaluation is None or evaluation.approval_result != "APPROVAL_SATISFIED_BY_ACTIVE_MANDATE" or evaluation.authorization_result != "AUTHORIZED":
+        reasons.append("mandate_authorization_evidence_missing")
+    dry_evidence = {} if dry_order is None or not isinstance(dry_order.safe_provider_response, dict) else dry_order.safe_provider_response
+    if dry_order is None or dry_order.status != "DRY_RUN_READY": reasons.append("dry_run_evidence_missing")
+    if dry_evidence.get("dry_run") is not True or dry_evidence.get("submission_skipped") is not True: reasons.append("dry_run_boundary_violated")
+    if activation is None or activation.authority_source != "MANDATE" or activation.approval_event_id is not None: reasons.append("mandate_activation_evidence_missing")
+    correlation = None if package.authority_audit_correlation_id is None else str(package.authority_audit_correlation_id)
+    if dry_evidence.get("authority_audit_correlation_id") != correlation or activation is None or str(activation.authority_audit_correlation_id) != correlation:
+        reasons.append("audit_correlation_mismatch")
+    if activation is not None and (
+        activation.campaign_id != package.campaign_id
+        or activation.campaign_version != package.campaign_version
+        or activation.paper_account_id != package.paper_account_id
+        or activation.live_trading_profile_id != package.live_trading_profile_id
+        or activation.provider != package.provider
+        or activation.environment != package.environment
+        or activation.product != package.product
+        or activation.dry_run_live_crypto_order_id != package.dry_run_live_crypto_order_id
+        or activation.mandate_evaluation_id != package.mandate_evaluation_id
+    ): reasons.append("package_identity_mismatch")
+    if dry_order is not None and (
+        dry_order.decision_record_id != package.decision_record_id
+        or dry_order.provider != package.provider
+        or dry_order.environment != package.environment
+        or dry_order.product_id != package.product
+        or dry_order.side != package.side
+        or (activation is not None and dry_order.exchange_connection_id != activation.exchange_connection_id)
+    ): reasons.append("package_identity_mismatch")
+    if dry_order is not None and (dry_order.provider_order_id is not None or dry_order.submitted_at is not None): reasons.append("live_submission_evidence_present")
+    recon_count = 0 if dry_order is None else int(await db.scalar(select(func.count(LiveReconciliationEvent.id)).where(
+        LiveReconciliationEvent.live_crypto_order_id == dry_order.live_crypto_order_id
+    )) or 0)
+    if recon_count: reasons.append("reconciliation_evidence_present")
+    position_count = 0 if dry_order is None else int(await db.scalar(select(func.count(LiveAccountingRecord.id)).where(
+        LiveAccountingRecord.live_crypto_order_id == dry_order.live_crypto_order_id
+    )) or 0)
+    if position_count: reasons.append("position_evidence_present")
+    verdict = "PROVEN" if not reasons else ("CONFLICT" if any("contamination" in r or "present" in r or "mismatch" in r for r in reasons) else "NOT_PROVEN")
+    return {
+        "verdict": verdict, "reason_codes": reasons, "package_id": str(package.package_id),
+        "campaign_id": str(package.campaign_id), "campaign_version": package.campaign_version,
+        "decision_record_id": str(package.decision_record_id), "mandate_id": None if package.mandate_id is None else str(package.mandate_id),
+        "mandate_evaluation_id": None if evaluation is None else str(evaluation.evaluation_id),
+        "dry_run_live_crypto_order_id": None if dry_order is None else str(dry_order.live_crypto_order_id),
+        "activation_id": None if activation is None else str(activation.activation_id),
+        "authority_audit_correlation_id": correlation,
+        "human_live_approval_event_used": package.approval_event_id is not None or (activation is not None and activation.approval_event_id is not None),
+        "live_submission_record_exists": dry_order is not None and dry_order.status != "DRY_RUN_READY",
+        "provider_order_id": None if dry_order is None else dry_order.provider_order_id,
+        "position_exists": position_count > 0,
+        "reconciliation_count": recon_count,
+        "read_only": True,
+    }

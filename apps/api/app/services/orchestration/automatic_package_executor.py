@@ -47,6 +47,7 @@ class AutomaticPackageExecutionOutcome:
     replayed: bool
     final_reason_code: str
     failed_closed: bool
+    starting_state: str
 
 
 def _phase_key(*, package_id: uuid.UUID, phase: str) -> str:
@@ -60,6 +61,7 @@ def _outcome(
     reason: str,
     replayed: bool = False,
     failed_closed: bool = False,
+    starting_state: str = "UNKNOWN",
 ) -> AutomaticPackageExecutionOutcome:
     state = "MISSING" if package is None else package.package_state
     return AutomaticPackageExecutionOutcome(
@@ -75,6 +77,7 @@ def _outcome(
         replayed=replayed,
         final_reason_code=reason,
         failed_closed=failed_closed,
+        starting_state=starting_state,
     )
 
 
@@ -107,6 +110,7 @@ async def execute_automatic_ready_package_through_activation(
         )
         return _outcome(request=request, package=None, reason=reason, failed_closed=True)
     package = rows[0]
+    starting_state = package.package_state
 
     try:
         if (
@@ -124,7 +128,7 @@ async def execute_automatic_ready_package_through_activation(
                 "automatic_package_activated campaign_id=%s campaign_version=%s decision_record_id=%s package_id=%s mandate_id=%s replayed=True",
                 request.campaign_id, request.campaign_version, request.decision_record_id, package.package_id, package.mandate_id,
             )
-            return _outcome(request=request, package=package, reason="already_activated", replayed=True)
+            return _outcome(request=request, package=package, reason="already_activated", replayed=True, starting_state=starting_state)
 
         if package.package_state == "READY":
             logger.info(
@@ -182,11 +186,11 @@ async def execute_automatic_ready_package_through_activation(
 
         if package.package_state != "ACTIVATED":
             raise PermissionError(f"automatic package progression stopped in unexpected state: {package.package_state}")
-        return _outcome(request=request, package=package, reason="activated_under_mandate")
+        return _outcome(request=request, package=package, reason="activated_under_mandate", starting_state=starting_state)
     except (LookupError, PermissionError, ValueError) as exc:
         logger.warning(
             "automatic_package_progression_failed_closed campaign_id=%s campaign_version=%s decision_record_id=%s package_id=%s mandate_id=%s state=%s reason=%s failed_closed=True",
             request.campaign_id, request.campaign_version, request.decision_record_id, package.package_id,
             package.mandate_id, package.package_state, str(exc),
         )
-        return _outcome(request=request, package=package, reason=str(exc), failed_closed=True)
+        return _outcome(request=request, package=package, reason=str(exc), failed_closed=True, starting_state=starting_state)

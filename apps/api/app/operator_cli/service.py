@@ -9769,6 +9769,39 @@ async def canonical_proving_commission_status(
         return _to_json_compatible(payload)
 
 
+async def automatic_mandate_activation_readiness(*, provider: str, environment: str, product: str) -> dict[str, Any]:
+    from app.services.orchestration.automatic_package_inspection import inspect_automatic_mandate_activation_readiness
+
+    try:
+        async with AsyncSessionLocal() as db:
+            return await inspect_automatic_mandate_activation_readiness(
+                db=db, provider=provider, environment=environment, product=product,
+            )
+    except Exception as exc:
+        return {
+            "verdict": "FAILED_CLOSED",
+            "reason_codes": [{"code": "readiness_inspection_failed", "action": "Inspect operator and database logs; do not enable automatic activation."}],
+            "error_type": type(exc).__name__,
+            "read_only": True,
+        }
+
+
+async def automatic_mandate_activation_proof(*, package_id: UUID) -> dict[str, Any]:
+    from app.services.orchestration.automatic_package_inspection import inspect_automatic_mandate_activation_proof
+
+    try:
+        async with AsyncSessionLocal() as db:
+            return await inspect_automatic_mandate_activation_proof(db=db, package_id=package_id)
+    except Exception as exc:
+        return {
+            "verdict": "FAILED_CLOSED",
+            "package_id": str(package_id),
+            "reason_codes": ["proof_inspection_failed"],
+            "error_type": type(exc).__name__,
+            "read_only": True,
+        }
+
+
 async def inspect_legacy_campaign_transition(
     *,
     legacy_campaign_id: UUID,

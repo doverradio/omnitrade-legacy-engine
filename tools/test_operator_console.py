@@ -121,3 +121,31 @@ def test_cards_and_totals_reuse_the_same_converted_event_time(monkeypatch: pytes
     assert time_str == "6:09 PM"
     assert "6:09 PM" in oc.render_card(cycle)
     assert "last_cycle=6:09 PM" in totals.render()
+
+
+@pytest.mark.parametrize(
+    ("event", "expected"),
+    [
+        ("automatic_package_authorized_under_mandate", "Mandate Authorized"),
+        ("automatic_package_dry_run_passed", "Dry Run Passed"),
+        ("automatic_package_activated", "Package Activated"),
+    ],
+)
+def test_ep3_progression_events_render_without_execution_claims(event: str, expected: str) -> None:
+    line = f"2024-01-15T23:09:00+0000 host proc[1]: {event} package_id=11111111-1111-1111-1111-111111111111 decision_record_id=22222222-2222-2222-2222-222222222222"
+    time_str, parsed_event, fields = oc.parse_line(line)
+    cycle = oc.Cycle()
+    cycle.absorb(parsed_event, fields, time_str)
+    rendered = oc.render_card(cycle)
+    assert expected in rendered
+    assert "submitted" not in rendered.lower()
+    assert "filled" not in rendered.lower()
+    assert "position opened" not in rendered.lower()
+
+
+def test_ep3_failed_closed_reason_is_displayed() -> None:
+    line = "2024-01-15T23:09:00+0000 host proc[1]: automatic_package_progression_failed_closed package_id=11111111-1111-1111-1111-111111111111 reason=mandate_expired failed_closed=True"
+    time_str, event, fields = oc.parse_line(line)
+    cycle = oc.Cycle()
+    cycle.absorb(event, fields, time_str)
+    assert "mandate_expired" in oc.render_card(cycle)

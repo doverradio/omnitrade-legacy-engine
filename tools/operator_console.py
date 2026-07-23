@@ -58,6 +58,12 @@ EVENT_NAMES = (
     "campaign_cycle_termination_resolved",
     "automatic_ready_package_created",
     "automatic_ready_package_skipped",
+    "automatic_package_authorization_started",
+    "automatic_package_authorized_under_mandate",
+    "automatic_package_dry_run_passed",
+    "automatic_package_activated",
+    "automatic_package_progression_skipped",
+    "automatic_package_progression_failed_closed",
     "unresolved_reconciliation_gate_triggered",
     "unresolved_reconciliation_record_detail",
 )
@@ -66,7 +72,10 @@ _TIMESTAMP_RE = re.compile(r"^(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:Z|[+-]\d{2}
 # key=value, where value may be a bracketed/parenthesized/quoted group
 # (handles rejected_candidates=[('BTC-USD', 'reason')], rejection_reasons=["x"]).
 _KV_RE = re.compile(r'(\w+)=(\[[^\]]*\]|\([^)]*\)|"[^"]*"|\S+)')
-_TERMINAL_EVENTS = {"automatic_ready_package_created", "automatic_ready_package_skipped"}
+_TERMINAL_EVENTS = {
+    "automatic_ready_package_skipped", "automatic_package_activated",
+    "automatic_package_progression_skipped", "automatic_package_progression_failed_closed",
+}
 
 
 def _display_timezone() -> ZoneInfo | None:
@@ -184,9 +193,13 @@ class Cycle:
     rejection_reasons: str | None = None
     reconciliation_triggered: bool = False
     reconciliation_records: int = 0
+    mandate_authorized: bool = False
+    dry_run_passed: bool = False
+    package_activated: bool = False
+    progression_failed: bool = False
 
     def has_content(self) -> bool:
-        return self.action is not None or self.cycle_id is not None
+        return self.action is not None or self.cycle_id is not None or self.package_id is not None
 
     def absorb(self, event: str, f: dict[str, str | None], time_str: str) -> None:
         # f.get(key) is used everywhere below, never f.get(key, default) --
@@ -223,6 +236,22 @@ class Cycle:
             self.underlying_reason = f.get("underlying_reason") or self.underlying_reason
             self.rejection_reasons = f.get("rejection_reasons") or self.rejection_reasons
             self.package_skipped = True
+        elif event in {
+            "automatic_package_authorization_started", "automatic_package_authorized_under_mandate",
+            "automatic_package_dry_run_passed", "automatic_package_activated",
+            "automatic_package_progression_skipped", "automatic_package_progression_failed_closed",
+        }:
+            self.decision_record_id = f.get("decision_record_id") or self.decision_record_id
+            self.package_id = f.get("package_id") or self.package_id
+            self.skip_reason = f.get("reason") or f.get("reason_code") or self.skip_reason
+            if event == "automatic_package_authorized_under_mandate":
+                self.mandate_authorized = True
+            elif event == "automatic_package_dry_run_passed":
+                self.dry_run_passed = True
+            elif event == "automatic_package_activated":
+                self.package_activated = True
+            elif event in {"automatic_package_progression_skipped", "automatic_package_progression_failed_closed"}:
+                self.progression_failed = True
         elif event == "unresolved_reconciliation_gate_triggered":
             self.reconciliation_triggered = True
             self.reconciliation_records = int(f.get("matched_record_count") or 0)
@@ -307,6 +336,14 @@ def _status_lines(cycle: Cycle) -> list[str]:
         lines.append(c("❌ Reconciliation Blocked", BRIGHT_RED))
     elif _final_reason(cycle):
         lines.append(c(f"❌ {_final_reason(cycle)}", BRIGHT_RED))
+    if cycle.mandate_authorized:
+        lines.append(c("✅ Mandate Authorized", BRIGHT_GREEN))
+    if cycle.dry_run_passed:
+        lines.append(c("✅ Dry Run Passed", BRIGHT_GREEN))
+    if cycle.package_activated:
+        lines.append(c("✅ Package Activated", BRIGHT_GREEN))
+    if cycle.progression_failed:
+        lines.append(c(f"❌ Package Progression: {cycle.skip_reason or _UNKNOWN_REASON}", BRIGHT_RED))
     return lines
 
 

@@ -997,7 +997,7 @@ async def _attempt_automatic_ready_package_creation(
 
         if skip_reason in {None, "active_ready_package_exists"} and campaign_id is not None and campaign_version is not None and decision_record_id is not None:
             try:
-                await execute_automatic_ready_package_through_activation(
+                progression = await execute_automatic_ready_package_through_activation(
                     db=db,
                     request=AutomaticPackageExecutionRequest(
                         campaign_id=campaign_id,
@@ -1006,10 +1006,23 @@ async def _attempt_automatic_ready_package_creation(
                         package_id=None if package_id is None else uuid.UUID(package_id),
                     ),
                 )
+                logger.info(
+                    "automatic_package_progression_result package_id=%s campaign_id=%s campaign_version=%s decision_record_id=%s mandate_id=%s starting_state=%s final_state=%s authority_source=%s authorization_result=%s dry_run_result=%s activation_result=%s replayed=%s reason_code=%s failed_closed=%s live_submission_called=false provider_submission_called=false",
+                    progression.package_id, progression.campaign_id, progression.campaign_version,
+                    progression.decision_record_id, progression.mandate_id, progression.starting_state,
+                    progression.activation_state if progression.activation_state == "ACTIVATED" else progression.authorization_state,
+                    progression.authority_source, progression.authorization_state, progression.dry_run_state,
+                    progression.activation_state, progression.replayed, progression.final_reason_code,
+                    progression.failed_closed,
+                )
             except Exception:
                 logger.exception(
                     "automatic_package_progression_failed_closed campaign_id=%s campaign_version=%s cycle_id=%s decision_record_id=%s package_id=%s reason=unexpected_executor_failure failed_closed=True",
                     campaign_id, campaign_version, cycle_id, decision_record_id, package_id,
+                )
+                logger.info(
+                    "automatic_package_progression_result package_id=%s campaign_id=%s campaign_version=%s decision_record_id=%s mandate_id=None starting_state=UNKNOWN final_state=FAILED_CLOSED authority_source=None authorization_result=NOT_ATTEMPTED dry_run_result=NOT_ATTEMPTED activation_result=NOT_ATTEMPTED replayed=false reason_code=unexpected_executor_failure failed_closed=true live_submission_called=false provider_submission_called=false",
+                    package_id, campaign_id, campaign_version, decision_record_id,
                 )
 
         if skip_reason is not None:

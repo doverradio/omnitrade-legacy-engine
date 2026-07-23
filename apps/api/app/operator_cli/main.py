@@ -27,7 +27,9 @@ from app.operator_cli.formatting import (
     render_venue_commission_text,
 )
 from app.operator_cli.service import (
-        buy_opportunity_diagnostic,
+    automatic_mandate_activation_proof,
+    automatic_mandate_activation_readiness,
+    buy_opportunity_diagnostic,
     hold_decision_diagnostic,
     activate_canonical_proving_campaign_bundle,
     bind_canonical_campaign_runtime,
@@ -839,6 +841,23 @@ def _build_parser() -> argparse.ArgumentParser:
     proving_commission_status.add_argument("--product", type=str, required=True)
     proving_commission_status.add_argument("--json", action="store_true", dest="json_output")
 
+    automatic_activation_readiness = subparsers.add_parser(
+        "automatic-mandate-activation-readiness", parents=[common],
+        help="Read-only EP-3 automatic mandate activation readiness",
+        description="Inspects configuration, worker evidence, mandates, packages, conflicts, and the no-submission boundary.",
+    )
+    automatic_activation_readiness.add_argument("--provider", default="kraken_spot")
+    automatic_activation_readiness.add_argument("--environment", default="production")
+    automatic_activation_readiness.add_argument("--product", default="BTC-USD")
+    automatic_activation_readiness.add_argument("--json", action="store_true", dest="json_output")
+
+    automatic_activation_proof = subparsers.add_parser(
+        "automatic-mandate-activation-proof", parents=[common],
+        help="Read-only persisted proof for one mandate-activated package",
+    )
+    automatic_activation_proof.add_argument("--package-id", type=UUID, required=True)
+    automatic_activation_proof.add_argument("--json", action="store_true", dest="json_output")
+
     mandate_diagnosis = subparsers.add_parser(
         "mandate-identity-diagnosis",
         parents=[common],
@@ -1497,6 +1516,16 @@ async def _run_async(args: argparse.Namespace) -> tuple[int, dict[str, Any], str
         )
         text = render_json(payload) if args.json_output else render_canonical_proving_commission_status_text(payload, options)
         return 0, payload, text
+
+    if args.command == "automatic-mandate-activation-readiness":
+        payload = await automatic_mandate_activation_readiness(
+            provider=args.provider, environment=args.environment, product=args.product,
+        )
+        return (0 if payload.get("verdict") in {"READY_TO_ENABLE", "ALREADY_ENABLED_AND_HEALTHY"} else 1), payload, render_json(payload)
+
+    if args.command == "automatic-mandate-activation-proof":
+        payload = await automatic_mandate_activation_proof(package_id=args.package_id)
+        return (0 if payload.get("verdict") == "PROVEN" else 1), payload, render_json(payload)
 
     if args.command == "mandate-identity-diagnosis":
         payload = await mandate_identity_diagnosis(
