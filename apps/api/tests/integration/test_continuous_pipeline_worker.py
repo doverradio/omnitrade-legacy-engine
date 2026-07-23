@@ -759,6 +759,75 @@ async def test_automatic_ready_package_skip_conditions_create_no_package(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("existing_ready", [False, True])
+async def test_worker_delegates_new_or_existing_ready_package_to_bounded_executor(
+    monkeypatch: pytest.MonkeyPatch, existing_ready: bool,
+) -> None:
+    import app.services.orchestration.continuous_pipeline_worker as worker_module
+
+    cycle = _automatic_cycle()
+    package_id = uuid.uuid4()
+    executor_requests = []
+    create_calls = {"count": 0}
+
+    async def _create(*, db, request):
+        create_calls["count"] += 1
+        return {"idempotent": False, "package": {"package_id": str(package_id), "package_state": "READY"}}
+
+    async def _execute(*, db, request):
+        executor_requests.append(request)
+        return SimpleNamespace(final_reason_code="activated_under_mandate")
+
+    monkeypatch.setattr(worker_module, "_load_cycle_by_id", _async_return(cycle))
+    monkeypatch.setattr(worker_module, "_has_active_ready_package_for_opportunity", _async_return(existing_ready))
+    monkeypatch.setattr(worker_module, "_has_active_proving_activation", _async_return(False))
+    monkeypatch.setattr(worker_module, "_has_open_live_order", _async_return(False))
+    monkeypatch.setattr(worker_module, "_has_unresolved_reconciliation", _async_return(False))
+    monkeypatch.setattr(worker_module, "_load_runtime_campaign", _async_return(SimpleNamespace(paper_account_id=uuid.uuid4())))
+    monkeypatch.setattr(worker_module, "_load_live_trading_profile_for_paper_account", _async_return(SimpleNamespace(id=uuid.uuid4())))
+    monkeypatch.setattr(worker_module, "create_canonical_preview_package", _create)
+    monkeypatch.setattr(worker_module, "execute_automatic_ready_package_through_activation", _execute)
+
+    await worker_module._attempt_automatic_ready_package_creation(db=object(), orchestration_payload=_automatic_payload(cycle))
+
+    assert len(executor_requests) == 1
+    assert create_calls["count"] == (0 if existing_ready else 1)
+    assert executor_requests[0].package_id == (None if existing_ready else package_id)
+    assert executor_requests[0].decision_record_id == cycle.decision_record_id
+
+
+@pytest.mark.asyncio
+async def test_worker_contains_unexpected_automatic_package_executor_failure(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture,
+) -> None:
+    import app.services.orchestration.continuous_pipeline_worker as worker_module
+
+    cycle = _automatic_cycle()
+
+    async def _create(*, db, request):
+        return {"idempotent": False, "package": {"package_id": str(uuid.uuid4()), "package_state": "READY"}}
+
+    async def _explode(*, db, request):
+        raise RuntimeError("unexpected executor defect")
+
+    monkeypatch.setattr(worker_module, "_load_cycle_by_id", _async_return(cycle))
+    monkeypatch.setattr(worker_module, "_has_active_ready_package_for_opportunity", _async_return(False))
+    monkeypatch.setattr(worker_module, "_has_active_proving_activation", _async_return(False))
+    monkeypatch.setattr(worker_module, "_has_open_live_order", _async_return(False))
+    monkeypatch.setattr(worker_module, "_has_unresolved_reconciliation", _async_return(False))
+    monkeypatch.setattr(worker_module, "_load_runtime_campaign", _async_return(SimpleNamespace(paper_account_id=uuid.uuid4())))
+    monkeypatch.setattr(worker_module, "_load_live_trading_profile_for_paper_account", _async_return(SimpleNamespace(id=uuid.uuid4())))
+    monkeypatch.setattr(worker_module, "create_canonical_preview_package", _create)
+    monkeypatch.setattr(worker_module, "execute_automatic_ready_package_through_activation", _explode)
+    caplog.set_level(logging.ERROR)
+
+    await worker_module._attempt_automatic_ready_package_creation(db=object(), orchestration_payload=_automatic_payload(cycle))
+
+    assert "reason=unexpected_executor_failure" in caplog.text
+    assert "failed_closed=True" in caplog.text
+
+
+@pytest.mark.asyncio
 async def test_automatic_ready_package_path_never_calls_authorize_activate_dryrun_or_provider_submit(
     monkeypatch: pytest.MonkeyPatch,
     caplog: pytest.LogCaptureFixture,
@@ -821,10 +890,9 @@ async def test_automatic_ready_package_path_never_calls_authorize_activate_dryru
     assert called["activate"] == 0
     assert called["dry_run"] == 0
     assert called["provider_submit"] == 0
-    # The worker must make this boundary explicit in the logs every cycle,
-    # not just leave executions_attempted=0 unexplained.
-    assert "automatic_ready_package_execution_skipped" in caplog.text
-    assert "reason=operator_authorization_required" in caplog.text
+    # Automatic mandate progression remains independently disabled by default.
+    assert "automatic_package_progression_skipped" in caplog.text
+    assert "reason=feature_disabled" in caplog.text
 
 
 @pytest.mark.asyncio

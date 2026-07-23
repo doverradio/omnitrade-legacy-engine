@@ -55,6 +55,10 @@ from app.services.autonomous_cycle import AutonomousCycleRequest, run_autonomous
 from app.services.capital_campaign_orchestration import run_campaign_orchestration_preview_for_candle
 from app.services.mandates.contracts import AUTONOMY_LEVEL_2
 from app.services.orchestration.venue_commissioning_bridge import service as venue_commissioning_service
+from app.services.orchestration.automatic_package_executor import (
+    AutomaticPackageExecutionRequest,
+    execute_automatic_ready_package_through_activation,
+)
 from app.services.strategy_outcomes import score_due_strategy_roster_proposal_outcomes
 from app.services.strategy_roster import StrategyRosterRequest, run_strategy_roster_for_candle
 from app.services.strategy_roster.decision_aggregator import AGGREGATE_STRATEGY_SLUG
@@ -990,27 +994,23 @@ async def _attempt_automatic_ready_package_creation(
                             package_id,
                             idempotency_key,
                         )
-                    # A READY package is not an executed one. Authorization
-                    # (authorize_canonical_preview_package), the dry run
-                    # (run_dry_run_for_canonical_preview_package), and
-                    # activation (activate_canonical_proving_campaign) are
-                    # each operator_cli-only today -- no automatic caller
-                    # exists in this codebase, and none should be added here:
-                    # authorization requires a human approver_id/rationale
-                    # and activation requires a matching approval event, so
-                    # nothing downstream of package creation can be safely
-                    # driven by this worker without fabricating that human
-                    # evidence. This line makes that boundary explicit in
-                    # the logs every cycle, rather than leaving
-                    # executions_attempted=0 unexplained.
-                    logger.info(
-                        "automatic_ready_package_execution_skipped campaign_id=%s campaign_version=%s cycle_id=%s decision_record_id=%s package_id=%s reason=operator_authorization_required failed_closed=False",
-                        campaign_id,
-                        campaign_version,
-                        cycle_id,
-                        decision_record_id,
-                        package_id,
-                    )
+
+        if skip_reason in {None, "active_ready_package_exists"} and campaign_id is not None and campaign_version is not None and decision_record_id is not None:
+            try:
+                await execute_automatic_ready_package_through_activation(
+                    db=db,
+                    request=AutomaticPackageExecutionRequest(
+                        campaign_id=campaign_id,
+                        campaign_version=campaign_version,
+                        decision_record_id=decision_record_id,
+                        package_id=None if package_id is None else uuid.UUID(package_id),
+                    ),
+                )
+            except Exception:
+                logger.exception(
+                    "automatic_package_progression_failed_closed campaign_id=%s campaign_version=%s cycle_id=%s decision_record_id=%s package_id=%s reason=unexpected_executor_failure failed_closed=True",
+                    campaign_id, campaign_version, cycle_id, decision_record_id, package_id,
+                )
 
         if skip_reason is not None:
             logger.info(

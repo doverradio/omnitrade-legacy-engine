@@ -72,3 +72,19 @@ def test_live_crypto_settings_load_from_explicit_environment_variables(monkeypat
     assert settings.live_crypto_balance_max_age_seconds == 50
     assert settings.live_crypto_readiness_max_age_seconds == 70
     assert settings.live_crypto_price_max_age_seconds == 80
+
+
+def test_automatic_mandate_package_activation_is_independent_and_disabled_by_default(monkeypatch) -> None:
+    monkeypatch.delenv("AUTOMATIC_MANDATE_PACKAGE_ACTIVATION_ENABLED", raising=False)
+    monkeypatch.setenv("LIVE_CRYPTO_PREPARATION_ENABLED", "true")
+    monkeypatch.setenv("LIVE_CRYPTO_ORDER_SUBMISSION_ENABLED", "true")
+    settings = Settings(_env_file=None)
+    assert settings.automatic_mandate_package_activation_enabled is False
+
+    monkeypatch.setenv("AUTOMATIC_MANDATE_PACKAGE_ACTIVATION_ENABLED", "true")
+    monkeypatch.setenv("LIVE_CRYPTO_PREPARATION_ENABLED", "false")
+    monkeypatch.setenv("LIVE_CRYPTO_ORDER_SUBMISSION_ENABLED", "false")
+    settings = Settings(_env_file=None)
+    assert settings.automatic_mandate_package_activation_enabled is True
+    assert settings.live_crypto_preparation_enabled is False
+    assert settings.live_crypto_order_submission_enabled is False
