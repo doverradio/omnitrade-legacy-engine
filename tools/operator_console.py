@@ -8,19 +8,24 @@ human-readable summary of what it reads. Safe to run alongside production
 at any time; killing it (Ctrl-C) has zero effect on the orchestration worker.
 
 Run:
-    python tools/operator_console.py
+    python tools/operator_console.py --timezone America/New_York
+
+The display timezone may also be supplied with
+OMNITRADE_OPERATOR_TIMEZONE (preferred) or the standard TZ environment
+variable. If none is configured, the VPS operating-system timezone is used.
 
 Standard library only, no external dependencies.
 """
 from __future__ import annotations
 
+import argparse
 import os
 import re
 import subprocess
 import time
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
-from zoneinfo import ZoneInfo
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 SERVICE_UNIT = "omnitrade-orchestration.service"
 # --utc pins journalctl's timestamps to UTC regardless of this VPS's system
@@ -57,7 +62,7 @@ EVENT_NAMES = (
     "unresolved_reconciliation_record_detail",
 )
 _EVENT_RE = re.compile(r"\b(" + "|".join(EVENT_NAMES) + r")\b(.*)$")
-_TIMESTAMP_RE = re.compile(r"^(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2})")
+_TIMESTAMP_RE = re.compile(r"^(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:Z|[+-]\d{2}:?\d{2}))")
 # key=value, where value may be a bracketed/parenthesized/quoted group
 # (handles rejected_candidates=[('BTC-USD', 'reason')], rejection_reasons=["x"]).
 _KV_RE = re.compile(r'(\w+)=(\[[^\]]*\]|\([^)]*\)|"[^"]*"|\S+)')
@@ -67,28 +72,51 @@ _TERMINAL_EVENTS = {"automatic_ready_package_created", "automatic_ready_package_
 def _display_timezone() -> ZoneInfo | None:
     """The timezone timestamps are converted to for display, resolved fresh
     on every call so a long-running console session stays correct across a
-    DST transition. Prefers the operator's explicitly configured TZ (e.g.
-    TZ=America/New_York); None signals "use the OS's local timezone",
-    which datetime.astimezone(None) resolves DST-correctly for the specific
-    instant being converted -- never the VPS/journalctl system timezone,
-    which is what previously leaked into the display unconverted."""
-    tz_name = os.environ.get("TZ")
-    if tz_name:
+    DST transition. Precedence: OMNITRADE_OPERATOR_TIMEZONE (an explicit
+    OmniTrade-level operator setting, so it wins even if TZ is set to
+    something else for unrelated reasons) -- there is no other existing
+    OmniTrade configuration value for this (checked app/config.py and
+    .env.example); then the standard TZ env var; then None, which signals
+    "use the VPS OS timezone" and which datetime.astimezone(None) resolves
+    DST-correctly for the specific instant being converted. An operator
+    connected to a UTC VPS must configure their own IANA timezone explicitly;
+    an SSH session cannot infer the remote operator's workstation timezone."""
+    for variable in ("OMNITRADE_OPERATOR_TIMEZONE", "TZ"):
+        tz_name = os.environ.get(variable)
+        if not tz_name:
+            continue
         try:
             return ZoneInfo(tz_name)
-        except Exception:
-            pass
+        except ZoneInfoNotFoundError as exc:
+            raise ValueError(f"Invalid IANA timezone in {variable}: {tz_name}") from exc
     return None
 
 
-def _format_time(dt_utc: datetime) -> str:
-    """Converts a UTC-aware datetime (journalctl is invoked with --utc, so
-    every timestamp parsed from its output is unambiguously UTC) to the
-    display timezone and renders it as 12-hour wall-clock time. Conversion
-    to local time happens only here, at the point of display -- everywhere
-    else timestamps stay UTC -- so DST and any non-UTC operator timezone are
-    handled correctly without a hardcoded offset."""
-    local_dt = dt_utc.astimezone(_display_timezone())
+def _configure_display_timezone(tz_name: str | None) -> None:
+    """Apply and validate the command-line timezone override before the
+    journal stream starts. Environment-based configuration remains dynamic
+    so a long-running process retains the existing DST-correct behavior."""
+    if tz_name:
+        os.environ["OMNITRADE_OPERATOR_TIMEZONE"] = tz_name
+    _display_timezone()
+
+
+def _display_timezone_label() -> str:
+    configured = os.environ.get("OMNITRADE_OPERATOR_TIMEZONE") or os.environ.get("TZ")
+    if configured:
+        return configured
+    local = datetime.now().astimezone().tzinfo
+    return str(local or "OS local")
+
+
+def _format_time(dt_source: datetime) -> str:
+    """Converts an aware journal datetime to the configured display timezone.
+    journalctl is invoked with --utc, but the numeric offset is still parsed
+    from every line rather than discarded or assumed. Conversion happens
+    exactly once, here at the display boundary."""
+    if dt_source.tzinfo is None:
+        raise ValueError("journal timestamp must be timezone-aware")
+    local_dt = dt_source.astimezone(_display_timezone())
     hour12 = local_dt.hour % 12 or 12
     period = "AM" if local_dt.hour < 12 else "PM"
     return f"{hour12}:{local_dt.minute:02d} {period}"
@@ -111,12 +139,12 @@ def parse_line(line: str) -> tuple[str, str, dict[str, str | None]] | None:
         return None
     event_name, payload = match.group(1), match.group(2)
     time_match = _TIMESTAMP_RE.match(line)
-    dt_utc = (
-        datetime.strptime(time_match.group(1), "%Y-%m-%dT%H:%M:%S").replace(tzinfo=timezone.utc)
+    dt_source = (
+        datetime.strptime(time_match.group(1).replace("Z", "+0000"), "%Y-%m-%dT%H:%M:%S%z")
         if time_match
         else datetime.now(timezone.utc)
     )
-    time_str = _format_time(dt_utc)
+    time_str = _format_time(dt_source)
     fields: dict[str, str | None] = {}
     for key, raw_value in _KV_RE.findall(payload):
         value = raw_value.strip('"')
@@ -393,6 +421,7 @@ def print_startup_banner() -> None:
     print()
     print("Status:")
     print(c("🟢 Connected", BRIGHT_GREEN))
+    print(f"Display timezone: {_display_timezone_label()}")
     print()
     print("Waiting for next trading cycle...")
     print()
@@ -462,5 +491,20 @@ def run() -> None:
         print(c("Operator Console stopped. No OmniTrade state was modified.", DIM))
 
 
-if __name__ == "__main__":
+def main(argv: list[str] | None = None) -> None:
+    parser = argparse.ArgumentParser(description="Read-only OmniTrade orchestration journal console")
+    parser.add_argument(
+        "--timezone",
+        metavar="IANA_ZONE",
+        help="display timezone, e.g. America/New_York (overrides OMNITRADE_OPERATOR_TIMEZONE and TZ)",
+    )
+    args = parser.parse_args(argv)
+    try:
+        _configure_display_timezone(args.timezone)
+    except ValueError as exc:
+        parser.error(str(exc))
     run()
+
+
+if __name__ == "__main__":
+    main()

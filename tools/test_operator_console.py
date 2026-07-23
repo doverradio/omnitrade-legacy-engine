@@ -14,11 +14,13 @@ import operator_console as oc  # noqa: E402
 
 _LINE = "2024-01-15T23:09:00+0000 host proc[1]: strategy_aggregate_completed action=HOLD reason=strategy_hold_signal"
 _LINE_SUMMER = "2024-07-15T23:09:00+0000 host proc[1]: strategy_aggregate_completed action=HOLD reason=strategy_hold_signal"
+_LINE_EQUIVALENT_OFFSET = "2024-01-16T04:09:00+0500 host proc[1]: strategy_aggregate_completed action=HOLD reason=strategy_hold_signal"
 
 
 @pytest.fixture(autouse=True)
 def _clean_tz_env(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.delenv("TZ", raising=False)
+    monkeypatch.delenv("OMNITRADE_OPERATOR_TIMEZONE", raising=False)
 
 
 def test_journalctl_invoked_with_utc_flag() -> None:
@@ -32,6 +34,39 @@ def test_respects_operator_configured_tz_env_var(monkeypatch: pytest.MonkeyPatch
     monkeypatch.setenv("TZ", "America/New_York")
     time_str, _event, _fields = oc.parse_line(_LINE)
     assert time_str == "6:09 PM"  # 23:09 UTC -> EST (UTC-5) in January
+
+
+def test_omnitrade_operator_timezone_takes_precedence_over_tz(monkeypatch: pytest.MonkeyPatch) -> None:
+    """OMNITRADE_OPERATOR_TIMEZONE is the OmniTrade-level operator setting;
+    it must win even if TZ happens to be set to something else."""
+    monkeypatch.setenv("TZ", "Asia/Kolkata")
+    monkeypatch.setenv("OMNITRADE_OPERATOR_TIMEZONE", "America/New_York")
+    time_str, _event, _fields = oc.parse_line(_LINE)
+    assert time_str == "6:09 PM"  # America/New_York wins, not Asia/Kolkata
+
+
+def test_command_line_timezone_configures_operator_override(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("TZ", "UTC")
+    oc._configure_display_timezone("America/New_York")
+    time_str, _event, _fields = oc.parse_line(_LINE)
+    assert time_str == "6:09 PM"
+    assert oc._display_timezone_label() == "America/New_York"
+
+
+def test_invalid_explicit_timezone_fails_instead_of_silently_using_vps_time(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("OMNITRADE_OPERATOR_TIMEZONE", "Not/A_Real_Zone")
+    with pytest.raises(ValueError, match="Invalid IANA timezone in OMNITRADE_OPERATOR_TIMEZONE"):
+        oc._display_timezone()
+
+
+def test_source_numeric_offset_is_parsed_not_assumed_utc(monkeypatch: pytest.MonkeyPatch) -> None:
+    """04:09 at +05:00 and 23:09 at +00:00 are the same instant. Both
+    must render identically, proving the parser honors the journal offset
+    and the display layer converts exactly once."""
+    monkeypatch.setenv("OMNITRADE_OPERATOR_TIMEZONE", "America/New_York")
+    utc_time, _event, _fields = oc.parse_line(_LINE)
+    offset_time, _event, _fields = oc.parse_line(_LINE_EQUIVALENT_OFFSET)
+    assert utc_time == offset_time == "6:09 PM"
 
 
 def test_dst_is_handled_without_a_hardcoded_offset(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -71,3 +106,18 @@ def test_unparseable_timestamp_falls_back_to_utc_now_not_a_crash() -> None:
     assert result is not None
     time_str, _event, _fields = result
     assert time_str.endswith("AM") or time_str.endswith("PM")
+
+
+def test_cards_and_totals_reuse_the_same_converted_event_time(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The card and every last-cycle summary are the console's only timestamp
+    displays; they must reuse parse_line's single conversion policy."""
+    monkeypatch.setenv("OMNITRADE_OPERATOR_TIMEZONE", "America/New_York")
+    time_str, event, fields = oc.parse_line(_LINE)
+    cycle = oc.Cycle()
+    cycle.absorb(event, fields, time_str)
+    totals = oc.Totals()
+    totals.record(cycle)
+
+    assert time_str == "6:09 PM"
+    assert "6:09 PM" in oc.render_card(cycle)
+    assert "last_cycle=6:09 PM" in totals.render()
