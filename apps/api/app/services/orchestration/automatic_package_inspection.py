@@ -16,9 +16,16 @@ from app.models.autonomous_capital_mandate_evaluation import AutonomousCapitalMa
 from app.models.autonomous_capital_mandate_version import AutonomousCapitalMandateVersion
 from app.models.canonical_preview_package import CanonicalPreviewPackage
 from app.models.canonical_proving_activation import CanonicalProvingActivation
+from app.models.capital_campaign import CapitalCampaign
+from app.models.crypto_order_preview import CryptoOrderPreview
+from app.models.decision_record import DecisionRecord
+from app.models.exchange_connection import ExchangeConnection
 from app.models.live_crypto_order import LiveCryptoOrder
 from app.models.live_accounting_record import LiveAccountingRecord
 from app.models.live_reconciliation_event import LiveReconciliationEvent
+from app.models.live_trading_profile import LiveTradingProfile
+from app.models.strategy import Strategy
+from app.services.strategies.identity import build_strategy_identity
 
 _PACKAGE_STATES = {"READY", "AUTHORIZED", "DRY_RUN_PASSED", "ACTIVATED"}
 
@@ -41,6 +48,20 @@ def _package_item(package: CanonicalPreviewPackage, *, now: datetime) -> dict[st
         "authorization_expires_at": _iso(package.authorization_expires_at),
         "stale": package.preview_expires_at <= now,
         "superseded": package.package_state == "SUPERSEDED" or package.superseded_at is not None,
+    }
+
+
+def _comparison(
+    *, field: str, mandate: Any, package: Any, source: str, reason: str, match: bool | None = None,
+) -> dict[str, Any]:
+    passed = mandate == package if match is None else match
+    return {
+        "field": field,
+        "mandate_value": None if mandate is None else str(mandate),
+        "package_value": None if package is None else str(package),
+        "match": passed,
+        "canonical_source": source,
+        "reason_code": None if passed else reason,
     }
 
 
@@ -98,12 +119,75 @@ async def inspect_automatic_mandate_activation_readiness(
             ).limit(1)
         )
         package = eligible_packages[0] if len(eligible_packages) == 1 else None
-        evaluation = None if package is None else await db.scalar(
-            select(AutonomousCapitalMandateEvaluation).where(
-                AutonomousCapitalMandateEvaluation.mandate_id == mandate.mandate_id,
-                AutonomousCapitalMandateEvaluation.decision_id == package.decision_record_id,
-            ).order_by(AutonomousCapitalMandateEvaluation.created_at.desc()).limit(1)
+        evaluation = None if package is None or package.mandate_evaluation_id is None else await db.scalar(
+            select(AutonomousCapitalMandateEvaluation)
+            .where(AutonomousCapitalMandateEvaluation.evaluation_id == package.mandate_evaluation_id)
+            .limit(1)
         )
+        runtime_campaign = None if package is None else await db.scalar(
+            select(CapitalCampaign).where(CapitalCampaign.uuid == package.runtime_campaign_id).limit(1)
+        )
+        strategy = None if package is None else await db.scalar(
+            select(Strategy).where(Strategy.id == package.strategy_id).limit(1)
+        )
+        preview = None if package is None else await db.scalar(
+            select(CryptoOrderPreview).where(CryptoOrderPreview.crypto_order_preview_id == package.crypto_order_preview_id).limit(1)
+        )
+        decision = None if package is None else await db.scalar(
+            select(DecisionRecord).where(DecisionRecord.decision_id == package.decision_record_id).limit(1)
+        )
+        profile = None if package is None else await db.scalar(
+            select(LiveTradingProfile).where(LiveTradingProfile.id == package.live_trading_profile_id).limit(1)
+        )
+        strategy_identity = None if strategy is None else build_strategy_identity(
+            slug=strategy.slug, module_version=package.strategy_version,
+        )
+        connection_raw = None if package is None else (package.market_evidence_identity or {}).get("exchange_connection_id")
+        try:
+            connection_id = None if connection_raw is None else uuid.UUID(str(connection_raw))
+        except ValueError:
+            connection_id = None
+        connection = None if connection_id is None else await db.scalar(
+            select(ExchangeConnection).where(ExchangeConnection.exchange_connection_id == connection_id).limit(1)
+        )
+        comparisons = [] if package is None else [
+            _comparison(field="package_mandate", mandate=mandate.mandate_id, package=package.mandate_id, source="autonomous_capital_mandates.mandate_id ↔ canonical_preview_packages.mandate_id", reason="package_mandate_mismatch"),
+            _comparison(field="package_mandate_version", mandate=None if version is None else version.mandate_version_id, package=package.mandate_version_id, source="autonomous_capital_mandate_versions.mandate_version_id ↔ canonical_preview_packages.mandate_version_id", reason="package_mandate_version_mismatch"),
+            _comparison(field="evaluation_mandate", mandate=mandate.mandate_id, package=None if evaluation is None else evaluation.mandate_id, source="autonomous_capital_mandate_evaluations.mandate_id ↔ autonomous_capital_mandates.mandate_id", reason="matching_mandate_evaluation_missing"),
+            _comparison(field="evaluation_version", mandate=None if version is None else version.mandate_version_id, package=None if evaluation is None else evaluation.mandate_version_id, source="autonomous_capital_mandate_evaluations.mandate_version_id ↔ autonomous_capital_mandate_versions.mandate_version_id", reason="mandate_evaluation_version_mismatch"),
+            _comparison(field="evaluation_decision", mandate=package.decision_record_id, package=None if evaluation is None else evaluation.decision_id, source="autonomous_capital_mandate_evaluations.decision_id ↔ canonical_preview_packages.decision_record_id", reason="mandate_evaluation_decision_mismatch"),
+            _comparison(field="evaluation_action", mandate=package.side, package=None if evaluation is None else evaluation.proposed_action, source="autonomous_capital_mandate_evaluations.proposed_action ↔ canonical_preview_packages.side", reason="mandate_evaluation_side_mismatch"),
+            _comparison(field="evaluation_authorization", mandate="AUTHORIZED", package=None if evaluation is None else evaluation.authorization_result, source="autonomous_capital_mandate_evaluations.authorization_result", reason="mandate_evaluation_not_authorized"),
+            _comparison(field="evaluation_approval", mandate="APPROVAL_SATISFIED_BY_ACTIVE_MANDATE", package=None if evaluation is None else evaluation.approval_result, source="autonomous_capital_mandate_evaluations.approval_result", reason="mandate_evaluation_approval_mismatch"),
+            _comparison(field="mandate_version_owner", mandate=mandate.mandate_id, package=None if version is None else version.mandate_id, source="autonomous_capital_mandate_versions.mandate_id ↔ autonomous_capital_mandates.mandate_id", reason="mandate_version_mismatch"),
+            _comparison(field="campaign_runtime", mandate=mandate.capital_campaign_id, package=None if runtime_campaign is None else runtime_campaign.id, source="autonomous_capital_mandates.capital_campaign_id ↔ capital_campaigns.id", reason="campaign_identity_mismatch"),
+            _comparison(field="campaign_uuid", mandate=None if runtime_campaign is None else runtime_campaign.definition_campaign_id, package=package.campaign_id, source="capital_campaigns.definition_campaign_id ↔ canonical_preview_packages.campaign_id", reason="campaign_identity_mismatch"),
+            _comparison(field="campaign_version", mandate=None if runtime_campaign is None else runtime_campaign.definition_version, package=package.campaign_version, source="capital_campaigns.definition_version ↔ canonical_preview_packages.campaign_version", reason="campaign_version_mismatch"),
+            _comparison(field="paper_account_id", mandate=mandate.paper_account_id, package=package.paper_account_id, source="autonomous_capital_mandates ↔ canonical_preview_packages", reason="paper_account_mismatch"),
+            _comparison(field="live_trading_profile_id", mandate=mandate.live_trading_profile_id, package=package.live_trading_profile_id, source="autonomous_capital_mandates ↔ canonical_preview_packages", reason="profile_mismatch"),
+            _comparison(field="exchange_connection_id", mandate=mandate.exchange_connection_id, package=connection_id, source="autonomous_capital_mandates.exchange_connection_id ↔ canonical_preview_packages.market_evidence_identity", reason="connection_mismatch"),
+            _comparison(field="provider", mandate=mandate.provider, package=package.provider, source="autonomous_capital_mandates ↔ canonical_preview_packages", reason="provider_mismatch"),
+            _comparison(field="environment", mandate=mandate.exchange_environment, package=package.environment, source="autonomous_capital_mandates ↔ canonical_preview_packages", reason="environment_mismatch"),
+            _comparison(field="product", mandate=None if version is None else version.allowed_products, package=package.product, match=version is not None and package.product in version.allowed_products, source="autonomous_capital_mandate_versions.allowed_products ↔ canonical_preview_packages.product", reason="product_mismatch"),
+            _comparison(field="side", mandate=None if version is None else version.allowed_order_sides, package=package.side, match=version is not None and package.side in version.allowed_order_sides, source="autonomous_capital_mandate_versions.allowed_order_sides ↔ canonical_preview_packages.side", reason="side_mismatch"),
+            _comparison(field="strategy_identity", mandate=None if version is None else version.allowed_strategy_versions, package=strategy_identity, match=version is not None and strategy_identity in version.allowed_strategy_versions, source="strategies.slug+module_version ↔ autonomous_capital_mandate_versions.allowed_strategy_versions", reason="strategy_identity_mismatch"),
+            _comparison(field="max_order_notional", mandate=None if version is None else version.max_order_notional_usd, package=package.risk_approved_amount, match=version is not None and package.risk_approved_amount <= version.max_order_notional_usd, source="autonomous_capital_mandate_versions.max_order_notional_usd ↔ canonical_preview_packages.risk_approved_amount", reason="capital_limit_mismatch"),
+            _comparison(field="authorized_capital", mandate=None if version is None else version.authorized_capital_usd, package=package.risk_approved_amount, match=version is not None and package.risk_approved_amount <= version.authorized_capital_usd, source="autonomous_capital_mandate_versions.authorized_capital_usd ↔ canonical_preview_packages.risk_approved_amount", reason="capital_limit_mismatch"),
+            _comparison(field="max_open_exposure", mandate=None if version is None else version.max_open_exposure_usd, package=package.risk_approved_amount, match=version is not None and package.risk_approved_amount <= version.max_open_exposure_usd, source="autonomous_capital_mandate_versions.max_open_exposure_usd ↔ canonical_preview_packages.risk_approved_amount", reason="capital_limit_mismatch"),
+            _comparison(field="max_daily_deployed", mandate=None if version is None else version.max_daily_deployed_usd, package=package.risk_approved_amount, match=version is not None and package.risk_approved_amount <= version.max_daily_deployed_usd, source="autonomous_capital_mandate_versions.max_daily_deployed_usd ↔ canonical_preview_packages.risk_approved_amount", reason="capital_limit_mismatch"),
+            _comparison(field="approval_policy", mandate="MANDATE_ALLOWED", package=None if version is None else version.approval_policy, source="autonomous_capital_mandate_versions.approval_policy", reason="mandate_approval_policy_mismatch"),
+            _comparison(field="profile_paper_account", mandate=package.paper_account_id, package=None if profile is None else profile.paper_account_id, source="canonical_preview_packages.paper_account_id ↔ live_trading_profiles.paper_account_id", reason="profile_paper_account_mismatch"),
+            _comparison(field="connection_provider", mandate=package.provider, package=None if connection is None else connection.provider, source="canonical_preview_packages.provider ↔ exchange_connections.provider", reason="connection_provider_mismatch"),
+            _comparison(field="connection_environment", mandate=package.environment, package=None if connection is None else connection.environment, source="canonical_preview_packages.environment ↔ exchange_connections.environment", reason="connection_environment_mismatch"),
+            _comparison(field="preview_decision_record", mandate=package.decision_record_id, package=None if preview is None else preview.decision_record_id, source="canonical_preview_packages.decision_record_id ↔ crypto_order_previews.decision_record_id", reason="preview_decision_mismatch"),
+            _comparison(field="decision_record_exists", mandate=package.decision_record_id, package=None if decision is None else decision.decision_id, source="canonical_preview_packages.decision_record_id ↔ decision_records.decision_id", reason="decision_record_missing"),
+            _comparison(field="preview_provider", mandate=package.provider, package=None if preview is None else preview.provider, source="canonical_preview_packages.provider ↔ crypto_order_previews.provider", reason="preview_provider_mismatch"),
+            _comparison(field="preview_environment", mandate=package.environment, package=None if preview is None else preview.environment, source="canonical_preview_packages.environment ↔ crypto_order_previews.environment", reason="preview_environment_mismatch"),
+            _comparison(field="preview_product", mandate=package.product, package=None if preview is None else preview.product_id, source="canonical_preview_packages.product ↔ crypto_order_previews.product_id", reason="preview_product_mismatch"),
+            _comparison(field="preview_side", mandate=package.side, package=None if preview is None else preview.side, source="canonical_preview_packages.side ↔ crypto_order_previews.side", reason="preview_side_mismatch"),
+            _comparison(field="preview_strategy", mandate=package.strategy_id, package=None if preview is None else preview.strategy_id, source="canonical_preview_packages.strategy_id ↔ crypto_order_previews.strategy_id", reason="preview_strategy_mismatch"),
+            _comparison(field="preview_notional", mandate=package.proposed_order_amount, package=None if preview is None else preview.requested_amount, source="canonical_preview_packages.proposed_order_amount ↔ crypto_order_previews.requested_amount", reason="preview_notional_mismatch"),
+        ]
         if mandate.revoked_at is not None or (mandate.expires_at is not None and mandate.expires_at <= now):
             reasons.append({"code": "mandate_expired_or_revoked", "action": "Renew or replace the mandate through governed lifecycle commands."})
         if mandate.status != "ACTIVE" or mandate.autonomy_level != "LEVEL_2":
@@ -112,21 +196,11 @@ async def inspect_automatic_mandate_activation_readiness(
             reasons.append({"code": "mandate_authorization_inactive", "action": "Restore valid owner authorization."})
         if version is None or not version.is_active or not version.is_authorized:
             reasons.append({"code": "mandate_version_inactive", "action": "Activate the authorized mandate version."})
-        if package is not None and (
-            evaluation is None or evaluation.authorization_result != "AUTHORIZED" or evaluation.approval_result != "APPROVAL_SATISFIED_BY_ACTIVE_MANDATE"
-        ):
-            reasons.append({"code": "matching_mandate_evaluation_missing", "action": "Do not enable until package mandate evidence is complete."})
-        if package is not None and (
-            package.paper_account_id != mandate.paper_account_id
-            or package.live_trading_profile_id != mandate.live_trading_profile_id
-            or package.provider != mandate.provider
-            or package.environment != mandate.exchange_environment
-            or version is None
-            or package.product not in version.allowed_products
-            or package.side not in version.allowed_order_sides
-            or package.strategy_version not in version.allowed_strategy_versions
-            or package.risk_approved_amount > version.max_order_notional_usd
-        ):
+        evaluation_comparisons = [item for item in comparisons if item["field"].startswith("evaluation_")]
+        identity_comparisons = [item for item in comparisons if not item["field"].startswith("evaluation_")]
+        if package is not None and any(not item["match"] for item in evaluation_comparisons):
+            reasons.append({"code": "matching_mandate_evaluation_missing", "action": "Generate a fresh package from a successfully mandate-evaluated autonomous cycle."})
+        if any(not item["match"] for item in identity_comparisons):
             reasons.append({"code": "package_identity_mismatch", "action": "Generate a package whose account, profile, venue, strategy, side, product, and capital scope match the mandate."})
         mandate_payload = {
             "mandate_id": str(mandate.mandate_id), "status": mandate.status,
@@ -136,6 +210,12 @@ async def inspect_automatic_mandate_activation_readiness(
             "mandate_version_id": None if version is None else str(version.mandate_version_id),
             "mandate_version": None if version is None else version.version_number,
             "matching_evaluation_id": None if evaluation is None else str(evaluation.evaluation_id),
+            "evaluation_readiness": {
+                "status": "SUCCESSFUL_MATCH" if evaluation_comparisons and all(item["match"] for item in evaluation_comparisons) else "PREFLIGHT_BLOCKED",
+                "canonical_operation": "evaluate_and_record_mandate",
+                "package_ready_state_requires_persisted_evaluation": True,
+            },
+            "identity_comparisons": comparisons,
             "campaign_runtime_id": None if mandate.capital_campaign_id is None else mandate.capital_campaign_id,
             "paper_account_id": None if mandate.paper_account_id is None else str(mandate.paper_account_id),
             "live_trading_profile_id": str(mandate.live_trading_profile_id),

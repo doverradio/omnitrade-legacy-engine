@@ -77,6 +77,27 @@ class _ResumeCapableDB(_FakeDB):
         self.pending.clear()
 
 
+@pytest.mark.asyncio
+async def test_active_ready_package_check_excludes_expired_preview() -> None:
+    import app.services.orchestration.continuous_pipeline_worker as worker_module
+
+    class _CaptureDb:
+        statement = None
+
+        async def scalar(self, statement):
+            self.statement = statement
+            return None
+
+    db = _CaptureDb()
+    observed_at = datetime.now(timezone.utc)
+    assert await worker_module._has_active_ready_package_for_opportunity(
+        db=db, decision_record_id=uuid.uuid4(), now=observed_at,
+    ) is False
+    sql = str(db.statement.compile(compile_kwargs={"literal_binds": True}))
+    assert "preview_expires_at" in sql
+    assert ">" in sql
+
+
 class _CampaignPreviewCapableDB(_FakeDB):
     async def scalar(self, *_args, **_kwargs):
         return None
@@ -296,6 +317,9 @@ def _automatic_cycle(
         capital_campaign_id=campaign_id,
         capital_campaign_version=3,
         decision_record_id=decision_record_id,
+        mandate_id=uuid.uuid4(),
+        mandate_version_id=uuid.uuid4(),
+        mandate_evaluation_id=uuid.uuid4(),
         termination_stage=termination_stage,
         proposed_action=proposed_action,
         risk_verdict=risk_verdict,
@@ -308,6 +332,28 @@ def _automatic_cycle(
 
 def _automatic_payload(cycle: SimpleNamespace) -> dict[str, object]:
     return {"cycles": [{"cycle_id": str(cycle.cycle_id)}]}
+
+
+@pytest.mark.asyncio
+async def test_ready_package_creation_requires_cycle_mandate_evaluation(monkeypatch: pytest.MonkeyPatch) -> None:
+    import app.services.orchestration.continuous_pipeline_worker as worker_module
+
+    cycle = _automatic_cycle()
+    cycle.mandate_evaluation_id = None
+    create_calls = 0
+
+    async def _create(**_kwargs):
+        nonlocal create_calls
+        create_calls += 1
+
+    monkeypatch.setattr(worker_module, "_load_cycle_by_id", _async_return(cycle))
+    monkeypatch.setattr(worker_module, "create_canonical_preview_package", _create)
+
+    await worker_module._attempt_automatic_ready_package_creation(
+        db=object(), orchestration_payload=_automatic_payload(cycle),
+    )
+
+    assert create_calls == 0
 
 
 def _not_due_research_result() -> SimpleNamespace:
@@ -506,6 +552,10 @@ async def test_automatic_ready_package_executable_buy_creates_one_ready_package(
 
     assert len(calls) == 1
     assert calls[0].max_proposed_order_amount == Decimal("5")
+    assert calls[0].expected_decision_record_id == cycle.decision_record_id
+    assert calls[0].mandate_id == cycle.mandate_id
+    assert calls[0].mandate_version_id == cycle.mandate_version_id
+    assert calls[0].mandate_evaluation_id == cycle.mandate_evaluation_id
 
 
 # Regression for production-readiness gap: a fully computed, risk-checked
@@ -794,6 +844,8 @@ async def test_worker_delegates_new_or_existing_ready_package_to_bounded_executo
     assert create_calls["count"] == (0 if existing_ready else 1)
     assert executor_requests[0].package_id == (None if existing_ready else package_id)
     assert executor_requests[0].decision_record_id == cycle.decision_record_id
+    if not existing_ready:
+        assert create_calls["count"] == 1
 
 
 @pytest.mark.asyncio
@@ -987,7 +1039,10 @@ async def test_bounded_path_shadow_proposal_to_ready_package_without_live_author
         cycle_id=uuid.uuid4(),
         capital_campaign_id=campaign.campaign_id,
         capital_campaign_version=campaign.version,
-        decision_record_id=_UUID(composition["decision_record_id"]),
+            decision_record_id=_UUID(composition["decision_record_id"]),
+            mandate_id=uuid.uuid4(),
+            mandate_version_id=uuid.uuid4(),
+            mandate_evaluation_id=uuid.uuid4(),
         termination_stage=composition["termination_stage"],
         proposed_action=composition["proposed_action"],
         risk_verdict=composition["selected_decision"].get("risk_verdict"),

@@ -678,11 +678,15 @@ async def _load_live_trading_profile_for_paper_account(*, db: AsyncSession, pape
     )
 
 
-async def _has_active_ready_package_for_opportunity(*, db: AsyncSession, decision_record_id: uuid.UUID) -> bool:
+async def _has_active_ready_package_for_opportunity(
+    *, db: AsyncSession, decision_record_id: uuid.UUID, now: datetime | None = None,
+) -> bool:
+    observed_at = now or datetime.now(timezone.utc)
     row = await db.scalar(
         select(CanonicalPreviewPackage.package_id)
         .where(CanonicalPreviewPackage.decision_record_id == decision_record_id)
         .where(CanonicalPreviewPackage.package_state.in_(_CANONICAL_READY_STATES))
+        .where(CanonicalPreviewPackage.preview_expires_at > observed_at)
         .limit(1)
     )
     return row is not None
@@ -894,6 +898,8 @@ async def _attempt_automatic_ready_package_creation(
             skip_reason = "non_executable_action"
         elif decision_record_id is None:
             skip_reason = "missing_decision_record_id"
+        elif any(getattr(cycle, field, None) is None for field in ("mandate_id", "mandate_version_id", "mandate_evaluation_id")):
+            skip_reason = "missing_mandate_evaluation_identity"
         elif evidence_freshness and evidence_freshness != "fresh":
             skip_reason = "stale_market_data"
         elif risk_verdict != "ALLOW":
@@ -968,6 +974,10 @@ async def _attempt_automatic_ready_package_creation(
                             max_proposed_order_amount=_CANONICAL_READY_PACKAGE_AMOUNT,
                             actor=_CANONICAL_READY_PACKAGE_ACTOR,
                             idempotency_key=idempotency_key,
+                            expected_decision_record_id=decision_record_id,
+                            mandate_id=getattr(cycle, "mandate_id", None),
+                            mandate_version_id=getattr(cycle, "mandate_version_id", None),
+                            mandate_evaluation_id=getattr(cycle, "mandate_evaluation_id", None),
                         ),
                     )
                     package = payload.get("package") if isinstance(payload, dict) else None

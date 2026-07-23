@@ -89,6 +89,10 @@ class CanonicalPreviewPackageCreateRequest:
     actor: str
     idempotency_key: str
     commissioning_entry_mode: str | None = None
+    expected_decision_record_id: uuid.UUID | None = None
+    mandate_id: uuid.UUID | None = None
+    mandate_version_id: uuid.UUID | None = None
+    mandate_evaluation_id: uuid.UUID | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -198,6 +202,10 @@ def _input_fingerprint(request: CanonicalPreviewPackageCreateRequest) -> str:
             "product": request.product,
             "max_proposed_order_amount": _serialize_decimal(request.max_proposed_order_amount),
             "commissioning_entry_mode": request.commissioning_entry_mode,
+            "expected_decision_record_id": _serialize_uuid(request.expected_decision_record_id),
+            "mandate_id": _serialize_uuid(request.mandate_id),
+            "mandate_version_id": _serialize_uuid(request.mandate_version_id),
+            "mandate_evaluation_id": _serialize_uuid(request.mandate_evaluation_id),
         },
         sort_keys=True,
         separators=(",", ":"),
@@ -523,6 +531,8 @@ async def _load_preview_for_package(
     )
     if observed_after is not None:
         statement = statement.where(CryptoOrderPreview.created_at >= observed_after)
+    if request.expected_decision_record_id is not None:
+        statement = statement.where(CryptoOrderPreview.decision_record_id == request.expected_decision_record_id)
     result = await db.execute(statement)
     return result.scalars().first()
 
@@ -1077,6 +1087,35 @@ async def create_canonical_preview_package(
         raise _preview_evidence_error(
             diagnostics=[_diagnostic(code="canonical_decision_record_id_missing", stage="decision_resolution")]
         )
+    if request.expected_decision_record_id is not None and decision.decision_id != request.expected_decision_record_id:
+        raise _preview_evidence_error(
+            diagnostics=[_diagnostic(code="canonical_decision_record_identity_mismatch", stage="decision_resolution")]
+        )
+
+    mandate_evaluation = None
+    supplied_mandate_evidence = (request.mandate_id, request.mandate_version_id, request.mandate_evaluation_id)
+    if any(item is not None for item in supplied_mandate_evidence):
+        if not all(item is not None for item in supplied_mandate_evidence):
+            raise _preview_evidence_error(
+                diagnostics=[_diagnostic(code="canonical_mandate_evidence_incomplete", stage="mandate_evaluation")]
+            )
+        mandate_evaluation = await db.scalar(
+            select(AutonomousCapitalMandateEvaluation)
+            .where(AutonomousCapitalMandateEvaluation.evaluation_id == request.mandate_evaluation_id)
+            .limit(1)
+        )
+        if (
+            mandate_evaluation is None
+            or mandate_evaluation.mandate_id != request.mandate_id
+            or mandate_evaluation.mandate_version_id != request.mandate_version_id
+            or mandate_evaluation.decision_id != decision.decision_id
+            or mandate_evaluation.proposed_action != preview.side
+            or mandate_evaluation.authorization_result != "AUTHORIZED"
+            or mandate_evaluation.approval_result != MANDATE_APPROVAL_RESULT_ACTIVE_MANDATE
+        ):
+            raise _preview_evidence_error(
+                diagnostics=[_diagnostic(code="canonical_mandate_evaluation_mismatch", stage="mandate_evaluation")]
+            )
 
     risk_event = await _load_risk_event(db=db, risk_event_id=preview.risk_event_id)
     if risk_event is None:
@@ -1143,6 +1182,9 @@ async def create_canonical_preview_package(
         generated_at=_utcnow(),
         idempotency_key=request.idempotency_key,
         input_fingerprint=_input_fingerprint(request),
+        mandate_id=None if mandate_evaluation is None else mandate_evaluation.mandate_id,
+        mandate_version_id=None if mandate_evaluation is None else mandate_evaluation.mandate_version_id,
+        mandate_evaluation_id=None if mandate_evaluation is None else mandate_evaluation.evaluation_id,
     )
 
     db.add(package)
@@ -1392,16 +1434,38 @@ async def authorize_canonical_preview_package_under_mandate(
         raise PermissionError(static_failures[0])
 
     correlation_id = uuid.uuid4()
-    evaluation = await db.scalar(
-        select(AutonomousCapitalMandateEvaluation)
-        .where(AutonomousCapitalMandateEvaluation.idempotency_key == request.idempotency_key)
-        .limit(1)
-    )
-    if evaluation is not None:
+    evaluation = None
+    package_supplied_evaluation = package.mandate_evaluation_id is not None
+    if package_supplied_evaluation:
+        evaluation = await db.scalar(
+            select(AutonomousCapitalMandateEvaluation)
+            .where(AutonomousCapitalMandateEvaluation.evaluation_id == package.mandate_evaluation_id)
+            .limit(1)
+        )
+        if (
+            evaluation is None
+            or package.mandate_id != mandate.mandate_id
+            or package.mandate_version_id != version.mandate_version_id
+            or evaluation.mandate_id != mandate.mandate_id
+            or evaluation.mandate_version_id != version.mandate_version_id
+            or evaluation.decision_id != package.decision_record_id
+            or evaluation.proposed_action != package.side
+            or evaluation.authorization_result != "AUTHORIZED"
+            or evaluation.approval_result != MANDATE_APPROVAL_RESULT_ACTIVE_MANDATE
+        ):
+            raise PermissionError("package mandate evaluation is missing, failed, or mismatched")
+        correlation_id = evaluation.audit_correlation_id
+    else:
+        evaluation = await db.scalar(
+            select(AutonomousCapitalMandateEvaluation)
+            .where(AutonomousCapitalMandateEvaluation.idempotency_key == request.idempotency_key)
+            .limit(1)
+        )
+    if evaluation is not None and not package_supplied_evaluation:
         context = evaluation.request_context if isinstance(evaluation.request_context, dict) else {}
         if evaluation.mandate_id != mandate.mandate_id or context.get("package_id") != str(package.package_id):
             raise PermissionError("mandate package authorization idempotency conflict")
-    else:
+    elif evaluation is None:
         evaluation = AutonomousCapitalMandateEvaluation(
             evaluation_id=uuid.uuid4(),
             mandate_id=mandate.mandate_id,

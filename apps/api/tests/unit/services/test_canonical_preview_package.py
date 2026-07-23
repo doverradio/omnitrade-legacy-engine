@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
+from dataclasses import replace
 from decimal import Decimal
 from types import SimpleNamespace
 from uuid import UUID, uuid4
@@ -246,6 +247,53 @@ async def test_create_canonical_preview_package_persists_authoritative_row(monke
     assert result["package"]["package_state"] == "READY"
     assert db.flush_calls == 1
     assert db.added[0].package_state == "READY"
+
+
+@pytest.mark.asyncio
+async def test_automatic_ready_package_pins_successful_cycle_mandate_evaluation(monkeypatch: pytest.MonkeyPatch) -> None:
+    campaign_id = uuid4()
+    profile = _profile()
+    runtime_campaign = _runtime_campaign(campaign_id=campaign_id)
+    definition = _definition(campaign_id=campaign_id, campaign_version=1)
+    preview = _preview(package_id=uuid4(), requested_amount=Decimal("5"))
+    decision = SimpleNamespace(decision_id=preview.decision_record_id)
+    strategy = SimpleNamespace(id=preview.strategy_id, module_version="1.0.0")
+    parameter_set = SimpleNamespace(id=preview.parameter_set_id, label="baseline")
+    cycle = _cycle()
+    mandate_id, version_id, evaluation_id = uuid4(), uuid4(), uuid4()
+    evaluation = SimpleNamespace(
+        evaluation_id=evaluation_id, mandate_id=mandate_id, mandate_version_id=version_id,
+        decision_id=decision.decision_id, proposed_action=preview.side, authorization_result="AUTHORIZED",
+        approval_result="APPROVAL_SATISFIED_BY_ACTIVE_MANDATE",
+    )
+    request = replace(
+        _create_request(campaign_id=campaign_id, profile=profile),
+        expected_decision_record_id=decision.decision_id,
+        mandate_id=mandate_id,
+        mandate_version_id=version_id,
+        mandate_evaluation_id=evaluation_id,
+    )
+
+    monkeypatch.setattr(cpp, "_load_package_by_idempotency", _async_return(None))
+    monkeypatch.setattr(cpp, "_load_profile", _async_return(profile))
+    monkeypatch.setattr(cpp, "_load_runtime_campaign", _async_return(runtime_campaign))
+    monkeypatch.setattr(cpp, "_load_campaign_definition", _async_return(definition))
+    monkeypatch.setattr(cpp, "run_campaign_orchestration_preview_for_candle", _async_return({"cycles": [{"cycle_id": str(cycle.cycle_id)}]}))
+    monkeypatch.setattr(cpp, "_load_campaign_cycle", _async_return(cycle))
+    monkeypatch.setattr(cpp, "_load_preview_for_package", _async_return(preview))
+    monkeypatch.setattr(cpp, "_load_decision_record", _async_return(decision))
+    monkeypatch.setattr(cpp, "_load_risk_event", _async_return(SimpleNamespace(id=preview.risk_event_id)))
+
+    db = _FakeDb(scalar_values=[0, evaluation, strategy, parameter_set])
+    result = await cpp.create_canonical_preview_package(db=db, request=request)
+    package = db.added[0]
+
+    assert result["package"]["package_state"] == "READY"
+    assert package.authorization_source is None
+    assert package.approval_event_id is None
+    assert package.mandate_id == mandate_id
+    assert package.mandate_version_id == version_id
+    assert package.mandate_evaluation_id == evaluation_id
 
 
 @pytest.mark.asyncio
@@ -1862,6 +1910,54 @@ async def test_authorize_canonical_preview_package_under_mandate_records_truthfu
     mandate_audit = next(item for item in db.added if getattr(item, "action", None) == "canonical_preview_package_authorized_mandate")
     assert mandate_audit.entity_type == "canonical_preview_package"
     assert mandate_audit.after_state["authorization_source"] == "MANDATE"
+
+
+@pytest.mark.asyncio
+async def test_mandate_authorization_reuses_pinned_service_evaluation(monkeypatch: pytest.MonkeyPatch) -> None:
+    package, runtime, mandate, authorization, version, strategy, evaluation = _mandate_authority_fixture()
+    package.mandate_id = mandate.mandate_id
+    package.mandate_version_id = version.mandate_version_id
+    package.mandate_evaluation_id = evaluation.evaluation_id
+    evaluation.proposed_action = package.side
+    evaluation.audit_correlation_id = uuid4()
+    monkeypatch.setattr(cpp, "_load_package", _async_return(package))
+    db = _FakeDb(scalar_values=[runtime, authorization, version, strategy, evaluation], execute_rows=[mandate])
+
+    await cpp.authorize_canonical_preview_package_under_mandate(
+        db=db,
+        request=cpp.CanonicalPreviewPackageMandateAuthorizeRequest(
+            package_id=package.package_id, idempotency_key="pinned-evaluation-reuse",
+        ),
+    )
+
+    assert package.package_state == "AUTHORIZED"
+    assert package.mandate_evaluation_id == evaluation.evaluation_id
+    assert package.authority_audit_correlation_id == evaluation.audit_correlation_id
+    assert not any(isinstance(item, cpp.AutonomousCapitalMandateEvaluation) for item in db.added)
+
+
+@pytest.mark.asyncio
+async def test_mandate_authorization_rejects_pinned_evaluation_under_wrong_version(monkeypatch: pytest.MonkeyPatch) -> None:
+    package, runtime, mandate, authorization, version, strategy, evaluation = _mandate_authority_fixture()
+    package.mandate_id = mandate.mandate_id
+    package.mandate_version_id = version.mandate_version_id
+    package.mandate_evaluation_id = evaluation.evaluation_id
+    evaluation.mandate_version_id = uuid4()
+    evaluation.proposed_action = package.side
+    evaluation.audit_correlation_id = uuid4()
+    monkeypatch.setattr(cpp, "_load_package", _async_return(package))
+    db = _FakeDb(scalar_values=[runtime, authorization, version, strategy, evaluation], execute_rows=[mandate])
+
+    with pytest.raises(PermissionError, match="package mandate evaluation is missing, failed, or mismatched"):
+        await cpp.authorize_canonical_preview_package_under_mandate(
+            db=db,
+            request=cpp.CanonicalPreviewPackageMandateAuthorizeRequest(
+                package_id=package.package_id, idempotency_key="pinned-evaluation-wrong-version",
+            ),
+        )
+
+    assert package.package_state == "READY"
+    assert not any(isinstance(item, cpp.AutonomousCapitalMandateEvaluation) for item in db.added)
 
 
 @pytest.mark.asyncio

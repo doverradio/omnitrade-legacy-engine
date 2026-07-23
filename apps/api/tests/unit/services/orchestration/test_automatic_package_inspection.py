@@ -36,13 +36,16 @@ def _package(state="READY", *, authority=None):
     return SimpleNamespace(
         package_id=uuid.uuid4(), campaign_id=uuid.uuid4(), campaign_version=2,
         decision_record_id=uuid.uuid4(), package_state=state,
-        authorization_source=authority, mandate_id=None, mandate_evaluation_id=None,
+        authorization_source=authority, mandate_id=None, mandate_version_id=None, mandate_evaluation_id=None,
         created_at=now, generated_at=now, preview_expires_at=now + timedelta(hours=1),
         authorization_expires_at=None, superseded_at=None, approval_event_id=None,
         authority_audit_correlation_id=None, dry_run_live_crypto_order_id=None,
         paper_account_id=None, live_trading_profile_id=None, provider="kraken_spot",
         environment="production", product="BTC-USD", side="BUY", strategy_version="v1",
         risk_approved_amount=5,
+        runtime_campaign_id=uuid.uuid4(), strategy_id=uuid.uuid4(),
+        crypto_order_preview_id=uuid.uuid4(), proposed_order_amount=5,
+        market_evidence_identity={},
     )
 
 
@@ -61,17 +64,40 @@ def _authorization(mandate):
     return SimpleNamespace(mandate_version_id=uuid.uuid4(), expires_at=datetime.now(timezone.utc) + timedelta(days=1))
 
 
-def _version(auth):
+def _version(auth, mandate=None):
     return SimpleNamespace(
         mandate_version_id=auth.mandate_version_id, version_number=1, is_active=True, is_authorized=True,
-        allowed_products=["BTC-USD"], allowed_order_sides=["BUY"], allowed_strategy_versions=["v1"],
+        mandate_id=None if mandate is None else mandate.mandate_id,
+        allowed_products=["BTC-USD"], allowed_order_sides=["BUY"], allowed_strategy_versions=["strategy@v1"],
         authorized_capital_usd=5, max_order_notional_usd=5,
+        max_open_exposure_usd=5, max_daily_deployed_usd=5, approval_policy="MANDATE_ALLOWED",
     )
 
 
-def _evaluation(mandate):
+def _identity_rows(package, mandate):
+    package.market_evidence_identity = {"exchange_connection_id": str(mandate.exchange_connection_id)}
+    return (
+        SimpleNamespace(id=mandate.capital_campaign_id, definition_campaign_id=package.campaign_id, definition_version=package.campaign_version),
+        SimpleNamespace(id=package.strategy_id, slug="strategy"),
+        SimpleNamespace(
+            crypto_order_preview_id=package.crypto_order_preview_id, decision_record_id=package.decision_record_id,
+            provider=package.provider, environment=package.environment, product_id=package.product,
+            side=package.side, strategy_id=package.strategy_id, requested_amount=package.proposed_order_amount,
+        ),
+        SimpleNamespace(decision_id=package.decision_record_id),
+        SimpleNamespace(id=package.live_trading_profile_id, paper_account_id=package.paper_account_id),
+        SimpleNamespace(exchange_connection_id=mandate.exchange_connection_id, provider=package.provider, environment=package.environment),
+    )
+
+
+def _evaluation(package, mandate, version):
+    package.mandate_id = mandate.mandate_id
+    package.mandate_version_id = version.mandate_version_id
+    package.mandate_evaluation_id = uuid.uuid4()
     return SimpleNamespace(
-        evaluation_id=uuid.uuid4(), authorization_result="AUTHORIZED",
+        evaluation_id=package.mandate_evaluation_id, mandate_id=mandate.mandate_id,
+        mandate_version_id=version.mandate_version_id, decision_id=package.decision_record_id,
+        proposed_action=package.side, authorization_result="AUTHORIZED",
         approval_result="APPROVAL_SATISFIED_BY_ACTIVE_MANDATE",
     )
 
@@ -83,13 +109,27 @@ async def test_readiness_ready_verdicts(monkeypatch, enabled, expected):
     package.paper_account_id = mandate.paper_account_id
     package.live_trading_profile_id = mandate.live_trading_profile_id
     auth = _authorization(mandate)
+    version = _version(auth, mandate)
+    evaluation = _evaluation(package, mandate, version)
+    identity_rows = _identity_rows(package, mandate)
+    stale_packages = [_package(), _package()]
+    for stale in stale_packages:
+        stale.preview_expires_at = datetime.now(timezone.utc) - timedelta(minutes=1)
     monkeypatch.setattr(inspection, "get_settings", lambda: _settings(enabled))
-    db = _Db(rows=[[package], [mandate], []], scalars=[auth, _version(auth), _evaluation(mandate), None])
+    db = _Db(rows=[[package, *stale_packages], [mandate], []], scalars=[auth, version, evaluation, *identity_rows, None])
     result = await inspection.inspect_automatic_mandate_activation_readiness(
         db=db, provider="kraken_spot", environment="production", product="BTC-USD",
     )
     assert result["verdict"] == expected
     assert result["read_only"] is True
+    assert result["eligible_package_count"] == 1
+    assert all(item["match"] for item in result["mandate"]["identity_comparisons"])
+    assert {item["field"] for item in result["mandate"]["identity_comparisons"]} >= {
+        "campaign_runtime", "campaign_uuid", "campaign_version", "paper_account_id",
+        "live_trading_profile_id", "exchange_connection_id", "provider", "environment",
+        "product", "side", "strategy_identity", "max_order_notional",
+        "preview_decision_record", "preview_product", "preview_side", "preview_notional",
+    }
     assert result["submission_boundary"] == {
         "activation_implies_submission": False,
         "live_submission_flag_enabled": False,
@@ -111,13 +151,15 @@ async def test_readiness_fails_closed_with_precise_reasons(monkeypatch, mandates
         for package in packages:
             package.paper_account_id = mandates[0].paper_account_id
             package.live_trading_profile_id = mandates[0].live_trading_profile_id
+            _identity_rows(package, mandates[0])
     monkeypatch.setattr(inspection, "get_settings", lambda: _settings())
     scalar_values = []
     if len(mandates) == 1:
         auth = _authorization(mandates[0])
-        scalar_values.extend([auth, _version(auth)])
+        version = _version(auth, mandates[0])
+        scalar_values.extend([auth, version])
         if len(packages) == 1:
-            scalar_values.append(_evaluation(mandates[0]))
+            scalar_values.extend([_evaluation(packages[0], mandates[0], version), *_identity_rows(packages[0], mandates[0])])
     scalar_values.append(None)
     result = await inspection.inspect_automatic_mandate_activation_readiness(
         db=_Db(rows=[packages, mandates, []], scalars=scalar_values),
@@ -128,17 +170,21 @@ async def test_readiness_fails_closed_with_precise_reasons(monkeypatch, mandates
 
 
 @pytest.mark.asyncio
-async def test_readiness_rejects_missing_mandate_evaluation(monkeypatch):
+async def test_readiness_requires_successful_persisted_evaluation(monkeypatch):
     package, mandate = _package(), _mandate()
     package.paper_account_id = mandate.paper_account_id
     package.live_trading_profile_id = mandate.live_trading_profile_id
     auth = _authorization(mandate)
+    version = _version(auth, mandate)
+    identity_rows = _identity_rows(package, mandate)
     monkeypatch.setattr(inspection, "get_settings", lambda: _settings())
     result = await inspection.inspect_automatic_mandate_activation_readiness(
-        db=_Db(rows=[[package], [mandate], []], scalars=[auth, _version(auth), None, None]),
+        db=_Db(rows=[[package], [mandate], []], scalars=[auth, version, *identity_rows, None]),
         provider="kraken_spot", environment="production", product="BTC-USD",
     )
-    assert "matching_mandate_evaluation_missing" in {item["code"] for item in result["reason_codes"]}
+    assert result["verdict"] == "NOT_READY"
+    assert result["mandate"]["matching_evaluation_id"] is None
+    assert result["mandate"]["evaluation_readiness"]["status"] == "PREFLIGHT_BLOCKED"
 
 
 @pytest.mark.asyncio
