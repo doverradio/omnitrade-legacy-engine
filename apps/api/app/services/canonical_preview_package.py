@@ -114,18 +114,18 @@ class CanonicalPreviewPackageMandateAuthorizeRequest:
 @dataclass(frozen=True, slots=True)
 class CanonicalPreviewPackageDryRunRequest:
     package_id: uuid.UUID
-    approval_event_id: uuid.UUID
-    operator_identity: str
+    approval_event_id: uuid.UUID | None
+    operator_identity: str | None
     idempotency_token: str
 
 
 @dataclass(frozen=True, slots=True)
 class CanonicalPreviewPackageActivationRequest:
     package_id: uuid.UUID
-    approval_event_id: uuid.UUID
+    approval_event_id: uuid.UUID | None
     dry_run_live_crypto_order_id: uuid.UUID
-    actor: str
-    expires_at: datetime
+    actor: str | None
+    expires_at: datetime | None
     idempotency_key: str
 
 
@@ -158,6 +158,16 @@ class ForcedSupersessionContext:
     replacement_package_id: uuid.UUID
     audit_correlation_id: uuid.UUID
     rationale: str
+
+
+@dataclass(frozen=True, slots=True)
+class CanonicalPackageAuthority:
+    source: str
+    actor: str
+    expires_at: datetime
+    approval_event_id: uuid.UUID | None
+    mandate_evaluation_id: uuid.UUID | None
+    audit_correlation_id: uuid.UUID
 
 
 def _utcnow() -> datetime:
@@ -798,7 +808,10 @@ def _activation_payload(activation: CanonicalProvingActivation) -> dict[str, Any
     return {
         "activation_id": str(activation.activation_id),
         "package_id": str(activation.package_id),
-        "approval_event_id": str(activation.approval_event_id),
+        "approval_event_id": _serialize_uuid(activation.approval_event_id),
+        "authority_source": getattr(activation, "authority_source", "HUMAN"),
+        "mandate_evaluation_id": _serialize_uuid(getattr(activation, "mandate_evaluation_id", None)),
+        "authority_audit_correlation_id": _serialize_uuid(getattr(activation, "authority_audit_correlation_id", None)),
         "dry_run_live_crypto_order_id": str(activation.dry_run_live_crypto_order_id),
         "campaign_id": str(activation.campaign_id),
         "campaign_version": activation.campaign_version,
@@ -1484,6 +1497,168 @@ async def authorize_canonical_preview_package_under_mandate(
     }
 
 
+async def _validate_canonical_package_authority(
+    *,
+    db: AsyncSession,
+    package: CanonicalPreviewPackage,
+    requested_approval_event_id: uuid.UUID | None,
+) -> CanonicalPackageAuthority:
+    now = _utcnow()
+    source = str(getattr(package, "authorization_source", None) or ("HUMAN" if package.approval_event_id else "")).upper()
+    if source == "HUMAN":
+        if package.approval_event_id is None or package.approval_event_id != requested_approval_event_id:
+            raise PermissionError("approval event mismatch")
+        approval_event = await db.scalar(
+            select(LiveApprovalEvent).where(LiveApprovalEvent.id == package.approval_event_id).limit(1)
+        )
+        if approval_event is None:
+            raise LookupError("approval event not found")
+        if approval_event.approval_state != "approved":
+            raise PermissionError("approval is not active")
+        if approval_event.checkpoint_type != "bounded_proving_entry":
+            raise PermissionError("approval checkpoint boundary violated")
+        if approval_event.approval_scope.get("canonical_preview_package_id") != str(package.package_id):
+            raise PermissionError("approval scope package mismatch")
+        if approval_event.expires_at is not None and approval_event.expires_at <= now:
+            raise PermissionError("approval expired")
+        expires_at = approval_event.expires_at or getattr(package, "authorization_expires_at", None) or package.preview_expires_at
+        return CanonicalPackageAuthority(
+            source="HUMAN",
+            actor=str(approval_event.approver_id),
+            expires_at=expires_at,
+            approval_event_id=approval_event.id,
+            mandate_evaluation_id=None,
+            audit_correlation_id=getattr(package, "authority_audit_correlation_id", None) or uuid.uuid4(),
+        )
+
+    if source != "MANDATE":
+        raise PermissionError("package authorization source missing or unsupported")
+    if requested_approval_event_id is not None or package.approval_event_id is not None:
+        raise PermissionError("mandate authority cannot use a human approval event")
+    required_evidence = {
+        "mandate_id": getattr(package, "mandate_id", None),
+        "mandate_version_id": getattr(package, "mandate_version_id", None),
+        "mandate_evaluation_id": getattr(package, "mandate_evaluation_id", None),
+        "authorization_expires_at": getattr(package, "authorization_expires_at", None),
+        "authority_audit_correlation_id": getattr(package, "authority_audit_correlation_id", None),
+    }
+    missing = [key for key, value in required_evidence.items() if value is None]
+    if missing:
+        raise PermissionError(f"mandate package authority evidence incomplete: {','.join(missing)}")
+    if package.authorization_expires_at <= now:
+        raise PermissionError("mandate package authorization expired")
+
+    mandate = await db.scalar(
+        select(AutonomousCapitalMandate).where(AutonomousCapitalMandate.mandate_id == package.mandate_id).limit(1)
+    )
+    if mandate is None:
+        raise PermissionError("mandate authority evidence missing")
+    if mandate.status != "ACTIVE" or mandate.autonomy_level != "LEVEL_2":
+        raise PermissionError("mandate is not an active LEVEL_2 mandate")
+    if mandate.revoked_at is not None:
+        raise PermissionError("mandate is revoked")
+    if mandate.expires_at is not None and mandate.expires_at <= now:
+        raise PermissionError("mandate is expired")
+
+    authorization = await db.scalar(
+        select(AutonomousCapitalMandateAuthorization)
+        .where(
+            AutonomousCapitalMandateAuthorization.mandate_id == package.mandate_id,
+            AutonomousCapitalMandateAuthorization.mandate_version_id == package.mandate_version_id,
+            AutonomousCapitalMandateAuthorization.authorization_state == "AUTHORIZED",
+            AutonomousCapitalMandateAuthorization.revoked_at.is_(None),
+        )
+        .order_by(AutonomousCapitalMandateAuthorization.recorded_at.desc())
+        .limit(1)
+    )
+    if authorization is None:
+        raise PermissionError("mandate authorization is not active")
+    if authorization.expires_at is not None and authorization.expires_at <= now:
+        raise PermissionError("mandate authorization is expired")
+
+    version = await db.scalar(
+        select(AutonomousCapitalMandateVersion)
+        .where(AutonomousCapitalMandateVersion.mandate_version_id == package.mandate_version_id)
+        .limit(1)
+    )
+    if version is None or version.mandate_id != mandate.mandate_id or not version.is_authorized or not version.is_active:
+        raise PermissionError("mandate version is not active and authorized")
+    evaluation = await db.scalar(
+        select(AutonomousCapitalMandateEvaluation)
+        .where(AutonomousCapitalMandateEvaluation.evaluation_id == package.mandate_evaluation_id)
+        .limit(1)
+    )
+    if (
+        evaluation is None
+        or evaluation.mandate_id != mandate.mandate_id
+        or evaluation.mandate_version_id != version.mandate_version_id
+        or evaluation.decision_id != package.decision_record_id
+        or evaluation.authorization_result != "AUTHORIZED"
+        or evaluation.approval_result != MANDATE_APPROVAL_RESULT_ACTIVE_MANDATE
+    ):
+        raise PermissionError("mandate evaluation is missing, failed, or mismatched")
+    evaluation_context = evaluation.request_context if isinstance(evaluation.request_context, dict) else {}
+    if evaluation_context.get("package_id") != str(package.package_id):
+        raise PermissionError("mandate evaluation package mismatch")
+
+    runtime_campaign = await db.scalar(
+        select(CapitalCampaign).where(CapitalCampaign.uuid == package.runtime_campaign_id).limit(1)
+    )
+    if runtime_campaign is None or runtime_campaign.id != mandate.capital_campaign_id:
+        raise PermissionError("campaign mismatch")
+    if runtime_campaign.definition_campaign_id != package.campaign_id:
+        raise PermissionError("campaign identity mismatch")
+    if runtime_campaign.definition_version != package.campaign_version:
+        raise PermissionError("campaign version mismatch")
+    connection_id_raw = (package.market_evidence_identity or {}).get("exchange_connection_id")
+    try:
+        connection_id = uuid.UUID(str(connection_id_raw))
+    except (TypeError, ValueError) as exc:
+        raise PermissionError("package connection identity missing or invalid") from exc
+    exact_checks = (
+        (mandate.paper_account_id == package.paper_account_id, "account mismatch"),
+        (mandate.live_trading_profile_id == package.live_trading_profile_id, "profile mismatch"),
+        (mandate.exchange_connection_id == connection_id, "connection mismatch"),
+        (mandate.provider == package.provider, "provider mismatch"),
+        (mandate.exchange_environment == package.environment, "environment mismatch"),
+        (package.product in version.allowed_products, "product mismatch"),
+        (package.side in version.allowed_order_sides, "side mismatch"),
+    )
+    for passed, reason in exact_checks:
+        if not passed:
+            raise PermissionError(reason)
+    strategy = await db.scalar(select(Strategy).where(Strategy.id == package.strategy_id).limit(1))
+    if strategy is None:
+        raise PermissionError("package strategy identity missing")
+    strategy_identity = build_strategy_identity(slug=strategy.slug, module_version=package.strategy_version)
+    if strategy_identity not in version.allowed_strategy_versions:
+        raise PermissionError("strategy mismatch")
+    amount = _decimal(package.risk_approved_amount)
+    if any(
+        amount > _decimal(limit)
+        for limit in (
+            version.authorized_capital_usd,
+            version.max_order_notional_usd,
+            version.max_open_exposure_usd,
+            version.max_daily_deployed_usd,
+        )
+    ):
+        raise PermissionError("capital scope mismatch")
+    if version.approval_policy != "MANDATE_ALLOWED":
+        raise PermissionError("mandate approval policy requires human approval")
+    effective_expiration = min(
+        item for item in (package.authorization_expires_at, mandate.expires_at, authorization.expires_at) if item is not None
+    )
+    return CanonicalPackageAuthority(
+        source="MANDATE",
+        actor=_MANDATE_PACKAGE_AUTHORITY_ACTOR,
+        expires_at=effective_expiration,
+        approval_event_id=None,
+        mandate_evaluation_id=evaluation.evaluation_id,
+        audit_correlation_id=package.authority_audit_correlation_id,
+    )
+
+
 async def run_dry_run_for_canonical_preview_package(
     *,
     db: AsyncSession,
@@ -1492,25 +1667,26 @@ async def run_dry_run_for_canonical_preview_package(
     package = await _load_package(db=db, package_id=request.package_id)
     if package is None:
         raise LookupError("canonical preview package not found")
-    if package.approval_event_id is None or package.approval_event_id != request.approval_event_id:
-        raise PermissionError("approval event mismatch")
     if _decimal(package.risk_approved_amount) > Decimal("5"):
         raise PermissionError("bounded proving amount exceeds canonical cap")
-
-    approval_event = await db.scalar(select(LiveApprovalEvent).where(LiveApprovalEvent.id == request.approval_event_id).limit(1))
-    if approval_event is None:
-        raise LookupError("approval event not found")
-    if approval_event.approval_state != "approved":
-        raise PermissionError("approval is not active")
-    if approval_event.checkpoint_type != "bounded_proving_entry":
-        raise PermissionError("approval checkpoint boundary violated")
-    if approval_event.approval_scope.get("canonical_preview_package_id") != str(package.package_id):
-        raise PermissionError("approval scope package mismatch")
-    if approval_event.expires_at is not None and approval_event.expires_at <= _utcnow():
-        raise PermissionError("approval expired")
+    if package.package_state != "AUTHORIZED":
+        raise PermissionError("package is not AUTHORIZED for dry run")
+    if not request.idempotency_token.strip():
+        raise PermissionError("idempotency token is required for dry run")
+    if package.preview_expires_at <= _utcnow():
+        raise PermissionError("canonical preview package is stale")
+    authority = await _validate_canonical_package_authority(
+        db=db, package=package, requested_approval_event_id=request.approval_event_id,
+    )
+    if authority.source == "HUMAN" and not str(request.operator_identity or "").strip():
+        raise PermissionError("operator identity is required for human-authorized dry run")
+    if authority.source == "MANDATE" and request.operator_identity is not None:
+        raise PermissionError("mandate-backed dry run must not claim an operator identity")
     profile = await _load_profile(db=db, live_trading_profile_id=package.live_trading_profile_id)
     if profile is None:
         raise LookupError("live trading profile not found")
+    if profile.id != package.live_trading_profile_id or profile.paper_account_id != package.paper_account_id:
+        raise PermissionError("package profile or account mismatch")
 
     dry_run_order = LiveCryptoOrder(
         crypto_order_preview_id=package.crypto_order_preview_id,
@@ -1534,7 +1710,16 @@ async def run_dry_run_for_canonical_preview_package(
         cancelled_at=None,
         failure_code=None,
         failure_reason=None,
-        safe_provider_response={"submission_skipped": True, "dry_run": True},
+        safe_provider_response={
+            "submission_skipped": True,
+            "dry_run": True,
+            "canonical_preview_package_id": str(package.package_id),
+            "authority_source": authority.source,
+            "approval_event_id": None if authority.approval_event_id is None else str(authority.approval_event_id),
+            "mandate_evaluation_id": None if authority.mandate_evaluation_id is None else str(authority.mandate_evaluation_id),
+            "authority_audit_correlation_id": str(authority.audit_correlation_id),
+            "idempotency_token": request.idempotency_token,
+        },
         audit_correlation_id=uuid.uuid4(),
         operator_confirmation_id=None,
     )
@@ -1543,6 +1728,23 @@ async def run_dry_run_for_canonical_preview_package(
 
     package.package_state = "DRY_RUN_PASSED"
     package.dry_run_live_crypto_order_id = dry_run_order.live_crypto_order_id
+    db.add(
+        _record_audit_entry(
+            actor=authority.actor,
+            action="canonical_preview_package_dry_run_recorded",
+            entity_id=package.package_id,
+            entity_type="canonical_preview_package",
+            after_state={
+                "package_state": "DRY_RUN_PASSED",
+                "dry_run_live_crypto_order_id": str(dry_run_order.live_crypto_order_id),
+                "authority_source": authority.source,
+                "approval_event_id": None if authority.approval_event_id is None else str(authority.approval_event_id),
+                "mandate_evaluation_id": None if authority.mandate_evaluation_id is None else str(authority.mandate_evaluation_id),
+                "authority_audit_correlation_id": str(authority.audit_correlation_id),
+                "provider_submission_called": False,
+            },
+        )
+    )
     await db.flush()
 
     package_payload = _package_payload(package)
@@ -1554,8 +1756,10 @@ async def run_dry_run_for_canonical_preview_package(
         "dry_run_message": "dry run recorded against authoritative bounded proving package",
         "safe_request_summary": {
             "package_id": str(package.package_id),
-            "approval_event_id": str(request.approval_event_id),
-            "operator_identity": request.operator_identity,
+            "authority_source": authority.source,
+            "approval_event_id": None if authority.approval_event_id is None else str(authority.approval_event_id),
+            "mandate_evaluation_id": None if authority.mandate_evaluation_id is None else str(authority.mandate_evaluation_id),
+            "operator_identity": request.operator_identity if authority.source == "HUMAN" else None,
         },
         "provider_create_order_called": False,
         "order_submitted": False,
@@ -1572,20 +1776,28 @@ async def activate_canonical_proving_campaign(
     package = await _load_package(db=db, package_id=request.package_id)
     if package is None:
         raise LookupError("canonical preview package not found")
-    if package.approval_event_id is None or package.approval_event_id != request.approval_event_id:
-        raise PermissionError("approval event mismatch")
-    if package.dry_run_live_crypto_order_id is None or package.dry_run_live_crypto_order_id != request.dry_run_live_crypto_order_id:
-        raise PermissionError("dry run order mismatch")
     if _decimal(package.risk_approved_amount) > Decimal("5"):
         raise PermissionError("bounded proving amount exceeds canonical cap")
-
-    approval_event = await db.scalar(select(LiveApprovalEvent).where(LiveApprovalEvent.id == request.approval_event_id).limit(1))
-    if approval_event is None:
-        raise LookupError("approval event not found")
-    if approval_event.approval_state != "approved":
-        raise PermissionError("approval is not active")
-    if approval_event.checkpoint_type != "bounded_proving_entry":
-        raise PermissionError("approval checkpoint boundary violated")
+    source = str(getattr(package, "authorization_source", None) or ("HUMAN" if package.approval_event_id else "")).upper()
+    if source == "MANDATE" and package.package_state != "DRY_RUN_PASSED":
+        raise PermissionError("mandate-authorized package must pass dry run before activation")
+    if source != "MANDATE" and package.package_state not in {"DRY_RUN_PASSED", "ACTIVATED"}:
+        raise PermissionError("package must pass dry run before activation")
+    if package.dry_run_live_crypto_order_id is None or package.dry_run_live_crypto_order_id != request.dry_run_live_crypto_order_id:
+        raise PermissionError("dry run order mismatch")
+    authority = await _validate_canonical_package_authority(
+        db=db, package=package, requested_approval_event_id=request.approval_event_id,
+    )
+    if authority.source == "HUMAN":
+        if not str(request.actor or "").strip() or request.expires_at is None:
+            raise PermissionError("human activation actor and expiration are required")
+        activation_actor = request.actor
+        activation_expires_at = request.expires_at
+    else:
+        if request.actor is not None:
+            raise PermissionError("mandate activation must not claim a human actor")
+        activation_actor = authority.actor
+        activation_expires_at = authority.expires_at
 
     dry_run_order = await db.scalar(
         select(LiveCryptoOrder).where(LiveCryptoOrder.live_crypto_order_id == request.dry_run_live_crypto_order_id).limit(1)
@@ -1594,16 +1806,26 @@ async def activate_canonical_proving_campaign(
         raise LookupError("dry run live crypto order not found")
     if dry_run_order.status != "DRY_RUN_READY":
         raise PermissionError("dry run submission boundary violated")
+    dry_run_evidence = dry_run_order.safe_provider_response if isinstance(getattr(dry_run_order, "safe_provider_response", None), dict) else {}
+    if authority.source == "MANDATE":
+        if dry_run_evidence.get("authority_source") != "MANDATE":
+            raise PermissionError("mandate dry run authority evidence missing")
+        if dry_run_evidence.get("canonical_preview_package_id") != str(package.package_id):
+            raise PermissionError("dry run package identity mismatch")
+        if dry_run_evidence.get("mandate_evaluation_id") != str(authority.mandate_evaluation_id):
+            raise PermissionError("dry run mandate evaluation mismatch")
 
     existing = await db.scalar(
         select(CanonicalProvingActivation).where(CanonicalProvingActivation.package_id == package.package_id).limit(1)
     )
     if existing is not None:
+        if authority.source == "MANDATE":
+            raise PermissionError("duplicate mandate-backed activation")
         if existing.activation_state != "ACTIVE":
             raise PermissionError("canonical proving activation is not active and cannot be renewed")
         if existing.approval_event_id != request.approval_event_id:
             existing.approval_event_id = request.approval_event_id
-            existing.expires_at = request.expires_at
+            existing.expires_at = activation_expires_at
             await db.flush()
         if package.package_state != "ACTIVATED":
             package.package_state = "ACTIVATED"
@@ -1614,11 +1836,30 @@ async def activate_canonical_proving_campaign(
         )
         return {"activation": _activation_payload(existing), "package": _package_payload(package)}
 
+    if authority.source == "MANDATE":
+        conflicting = await db.scalar(
+            select(CanonicalProvingActivation)
+            .where(
+                CanonicalProvingActivation.package_id != package.package_id,
+                CanonicalProvingActivation.paper_account_id == package.paper_account_id,
+                CanonicalProvingActivation.provider == package.provider,
+                CanonicalProvingActivation.environment == package.environment,
+                CanonicalProvingActivation.product == package.product,
+                CanonicalProvingActivation.activation_state == "ACTIVE",
+            )
+            .limit(1)
+        )
+        if conflicting is not None:
+            raise PermissionError("conflicting active canonical proving package")
+
     activation_id = uuid.uuid4()
     activation = CanonicalProvingActivation(
         activation_id=activation_id,
         package_id=package.package_id,
-        approval_event_id=request.approval_event_id,
+        approval_event_id=authority.approval_event_id,
+        authority_source=authority.source,
+        mandate_evaluation_id=authority.mandate_evaluation_id,
+        authority_audit_correlation_id=authority.audit_correlation_id,
         dry_run_live_crypto_order_id=request.dry_run_live_crypto_order_id,
         campaign_id=package.campaign_id,
         campaign_version=package.campaign_version,
@@ -1631,7 +1872,7 @@ async def activate_canonical_proving_campaign(
         max_deployed_capital=_decimal(package.risk_approved_amount),
         no_leverage=True,
         activated_at=_utcnow(),
-        expires_at=request.expires_at,
+        expires_at=activation_expires_at,
         activation_state="ACTIVE",
         revoked_at=None,
         paused_at=None,
@@ -1640,10 +1881,17 @@ async def activate_canonical_proving_campaign(
     db.add(activation)
     db.add(
         _record_audit_entry(
-            actor=request.actor,
+            actor=activation_actor,
             action="canonical_proving_activation_created",
             entity_id=activation_id,
-            after_state={"package_id": str(package.package_id), "activation_state": "ACTIVE"},
+            after_state={
+                "package_id": str(package.package_id),
+                "activation_state": "ACTIVE",
+                "activation_authority_source": authority.source,
+                "approval_event_id": None if authority.approval_event_id is None else str(authority.approval_event_id),
+                "mandate_evaluation_id": None if authority.mandate_evaluation_id is None else str(authority.mandate_evaluation_id),
+                "authority_audit_correlation_id": str(authority.audit_correlation_id),
+            },
         )
     )
     await db.flush()

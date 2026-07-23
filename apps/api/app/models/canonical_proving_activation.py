@@ -33,6 +33,12 @@ class CanonicalProvingActivation(Base):
             "activation_state IN ('ACTIVE','PAUSED','REVOKED','EXPIRED','INVALIDATED','COMPLETED')",
             name="ck_cpa_state",
         ),
+        CheckConstraint("authority_source IN ('HUMAN','MANDATE')", name="ck_cpa_authority_source"),
+        CheckConstraint(
+            "(authority_source = 'HUMAN' AND approval_event_id IS NOT NULL AND mandate_evaluation_id IS NULL) OR "
+            "(authority_source = 'MANDATE' AND approval_event_id IS NULL AND mandate_evaluation_id IS NOT NULL)",
+            name="ck_cpa_authority_evidence",
+        ),
         Index("ix_cpa_state", "activation_state"),
         Index("ix_cpa_expires", "expires_at"),
         Index("ix_cpa_scope", "paper_account_id", "provider", "environment", "product"),
@@ -40,7 +46,10 @@ class CanonicalProvingActivation(Base):
 
     activation_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, server_default=text("gen_random_uuid()"))
     package_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), ForeignKey("canonical_preview_packages.package_id", ondelete="RESTRICT"), nullable=False)
-    approval_event_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), ForeignKey("live_approval_events.id", ondelete="RESTRICT"), nullable=False)
+    approval_event_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), ForeignKey("live_approval_events.id", ondelete="RESTRICT"), nullable=True)
+    authority_source: Mapped[str] = mapped_column(Text, nullable=False, server_default=text("'HUMAN'"))
+    mandate_evaluation_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), ForeignKey("autonomous_capital_mandate_evaluations.evaluation_id", ondelete="RESTRICT"), nullable=True)
+    authority_audit_correlation_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), nullable=True)
     dry_run_live_crypto_order_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), ForeignKey("live_crypto_orders.live_crypto_order_id", ondelete="RESTRICT"), nullable=False)
     campaign_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), ForeignKey("capital_campaign_definitions.campaign_id", ondelete="RESTRICT"), nullable=False)
     campaign_version: Mapped[int] = mapped_column(nullable=False)

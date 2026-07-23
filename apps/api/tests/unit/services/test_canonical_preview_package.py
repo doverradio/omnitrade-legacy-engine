@@ -114,6 +114,7 @@ def _approval_event(
 ) -> SimpleNamespace:
     return SimpleNamespace(
         id=uuid4(),
+        approver_id="operator:human",
         live_trading_profile_id=live_trading_profile_id or uuid4(),
         sequence_number=1,
         approval_state=approval_state,
@@ -1742,7 +1743,7 @@ async def test_authorize_canonical_preview_package_records_bounded_proving_check
         crypto_order_preview_id=uuid4(),
         market_evidence_identity={},
         market_evidence_observed_at=datetime.now(timezone.utc),
-        preview_expires_at=datetime.now(timezone.utc),
+        preview_expires_at=datetime.now(timezone.utc) + timedelta(minutes=5),
         package_state="READY",
         generated_at=datetime.now(timezone.utc),
         idempotency_key="pkg-1",
@@ -1832,7 +1833,8 @@ def _mandate_authority_fixture() -> tuple[SimpleNamespace, ...]:
     evaluation = SimpleNamespace(
         authorization_result="AUTHORIZED", approval_result="APPROVAL_SATISFIED_BY_ACTIVE_MANDATE",
         reason_code="authorized_under_active_mandate", mandate_version_id=version.mandate_version_id,
-        evaluation_id=uuid4(),
+        evaluation_id=uuid4(), mandate_id=mandate.mandate_id, decision_id=package.decision_record_id,
+        request_context={"package_id": str(package.package_id)},
     )
     return package, runtime, mandate, authorization, version, strategy, evaluation
 
@@ -1933,6 +1935,231 @@ async def test_mandate_package_authority_requires_exactly_one_match(monkeypatch:
     assert package.package_state == "READY"
 
 
+def _mark_package_mandate_authorized(
+    package: SimpleNamespace, mandate: SimpleNamespace, version: SimpleNamespace, evaluation: SimpleNamespace,
+) -> None:
+    package.package_state = "AUTHORIZED"
+    package.authorization_source = "MANDATE"
+    package.approval_event_id = None
+    package.mandate_id = mandate.mandate_id
+    package.mandate_version_id = version.mandate_version_id
+    package.mandate_evaluation_id = evaluation.evaluation_id
+    package.authorization_expires_at = datetime.now(timezone.utc) + timedelta(minutes=20)
+    package.authority_audit_correlation_id = uuid4()
+
+
+@pytest.mark.asyncio
+async def test_mandate_authorized_package_dry_runs_and_activates_without_human_approval(monkeypatch: pytest.MonkeyPatch) -> None:
+    package, runtime, mandate, authorization, version, strategy, evaluation = _mandate_authority_fixture()
+    _mark_package_mandate_authorized(package, mandate, version, evaluation)
+    monkeypatch.setattr(cpp, "_load_package", _async_return(package))
+    monkeypatch.setattr(
+        cpp, "_load_profile",
+        _async_return(SimpleNamespace(id=package.live_trading_profile_id, paper_account_id=package.paper_account_id)),
+    )
+    dry_db = _FakeDb(
+        scalar_values=[mandate, authorization, version, evaluation, runtime, strategy],
+    )
+    dry_result = await cpp.run_dry_run_for_canonical_preview_package(
+        db=dry_db,
+        request=cpp.CanonicalPreviewPackageDryRunRequest(
+            package_id=package.package_id, approval_event_id=None, operator_identity=None, idempotency_token="mandate-dry-1",
+        ),
+    )
+    dry_order = next(item for item in dry_db.added if isinstance(item, cpp.LiveCryptoOrder))
+    assert dry_result["safe_request_summary"]["authority_source"] == "MANDATE"
+    assert dry_result["order_submitted"] is False
+    assert dry_order.safe_provider_response["authority_source"] == "MANDATE"
+    assert package.package_state == "DRY_RUN_PASSED"
+    assert not any(item.__class__.__name__ == "LiveApprovalEvent" for item in dry_db.added)
+
+    activation_db = _FakeDb(
+        scalar_values=[mandate, authorization, version, evaluation, runtime, strategy, dry_order, None, None],
+    )
+    activation_result = await cpp.activate_canonical_proving_campaign(
+        db=activation_db,
+        request=cpp.CanonicalPreviewPackageActivationRequest(
+            package_id=package.package_id,
+            approval_event_id=None,
+            dry_run_live_crypto_order_id=dry_order.live_crypto_order_id,
+            actor=None,
+            expires_at=None,
+            idempotency_key="mandate-activation-1",
+        ),
+    )
+    assert package.package_state == "ACTIVATED"
+    assert activation_result["activation"]["authority_source"] == "MANDATE"
+    assert activation_result["activation"]["approval_event_id"] is None
+    assert activation_result["activation"]["mandate_evaluation_id"] == str(evaluation.evaluation_id)
+    mandate_audits = [item for item in activation_db.added if getattr(item, "action", None) == "canonical_proving_activation_created"]
+    assert mandate_audits[0].after_state["activation_authority_source"] == "MANDATE"
+    assert not any(item.__class__.__name__ == "LiveApprovalEvent" for item in activation_db.added)
+    with pytest.raises(PermissionError, match="must pass dry run"):
+        await cpp.activate_canonical_proving_campaign(
+            db=_FakeDb(),
+            request=cpp.CanonicalPreviewPackageActivationRequest(
+                package_id=package.package_id, approval_event_id=None,
+                dry_run_live_crypto_order_id=dry_order.live_crypto_order_id,
+                actor=None, expires_at=None, idempotency_key="duplicate-mandate-activation",
+            ),
+        )
+
+
+@pytest.mark.asyncio
+async def test_mandate_dry_run_fails_closed_for_incomplete_or_failed_authority(monkeypatch: pytest.MonkeyPatch) -> None:
+    package, runtime, mandate, authorization, version, strategy, evaluation = _mandate_authority_fixture()
+    _mark_package_mandate_authorized(package, mandate, version, evaluation)
+    package.mandate_evaluation_id = None
+    monkeypatch.setattr(cpp, "_load_package", _async_return(package))
+    with pytest.raises(PermissionError, match="evidence incomplete"):
+        await cpp.run_dry_run_for_canonical_preview_package(
+            db=_FakeDb(),
+            request=cpp.CanonicalPreviewPackageDryRunRequest(
+                package_id=package.package_id, approval_event_id=None, operator_identity=None, idempotency_token="missing-evidence",
+            ),
+        )
+
+    package.mandate_evaluation_id = evaluation.evaluation_id
+    evaluation.authorization_result = "REJECTED"
+    db = _FakeDb(scalar_values=[mandate, authorization, version, evaluation, runtime, strategy])
+    with pytest.raises(PermissionError, match="evaluation is missing, failed, or mismatched"):
+        await cpp.run_dry_run_for_canonical_preview_package(
+            db=db,
+            request=cpp.CanonicalPreviewPackageDryRunRequest(
+                package_id=package.package_id, approval_event_id=None, operator_identity=None, idempotency_token="failed-evaluation",
+            ),
+        )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("mutation", "expected"),
+    [
+        ("authority_expired", "package authorization expired"),
+        ("mandate_expired", "mandate is expired"),
+        ("mandate_revoked", "mandate is revoked"),
+        ("mandate_inactive", "not an active LEVEL_2"),
+        ("authorization_missing", "authorization is not active"),
+        ("version_unauthorized", "version is not active and authorized"),
+        ("evaluation_missing", "evaluation is missing, failed, or mismatched"),
+        ("campaign", "campaign mismatch"),
+        ("campaign_version", "campaign version mismatch"),
+        ("account", "account mismatch"),
+        ("profile", "profile mismatch"),
+        ("connection", "connection mismatch"),
+        ("provider", "provider mismatch"),
+        ("environment", "environment mismatch"),
+        ("product", "product mismatch"),
+        ("side", "side mismatch"),
+        ("strategy", "strategy mismatch"),
+        ("capital", "capital scope mismatch"),
+    ],
+)
+async def test_mandate_authority_is_fully_revalidated_before_dry_run(
+    monkeypatch: pytest.MonkeyPatch, mutation: str, expected: str,
+) -> None:
+    package, runtime, mandate, authorization, version, strategy, evaluation = _mandate_authority_fixture()
+    _mark_package_mandate_authorized(package, mandate, version, evaluation)
+    if mutation == "authority_expired": package.authorization_expires_at = datetime.now(timezone.utc) - timedelta(seconds=1)
+    elif mutation == "mandate_expired": mandate.expires_at = datetime.now(timezone.utc) - timedelta(seconds=1)
+    elif mutation == "mandate_revoked": mandate.revoked_at = datetime.now(timezone.utc)
+    elif mutation == "mandate_inactive": mandate.status = "PAUSED"
+    elif mutation == "authorization_missing": authorization = None
+    elif mutation == "version_unauthorized": version.is_authorized = False
+    elif mutation == "evaluation_missing": evaluation = None
+    elif mutation == "campaign": runtime.id += 1
+    elif mutation == "campaign_version": runtime.definition_version += 1
+    elif mutation == "account": mandate.paper_account_id = uuid4()
+    elif mutation == "profile": mandate.live_trading_profile_id = uuid4()
+    elif mutation == "connection": mandate.exchange_connection_id = uuid4()
+    elif mutation == "provider": mandate.provider = "coinbase"
+    elif mutation == "environment": mandate.exchange_environment = "sandbox"
+    elif mutation == "product": version.allowed_products = ["ETH-USD"]
+    elif mutation == "side": version.allowed_order_sides = ["SELL"]
+    elif mutation == "strategy": version.allowed_strategy_versions = ["other@1.0.0"]
+    elif mutation == "capital": version.max_order_notional_usd = Decimal("4")
+    monkeypatch.setattr(cpp, "_load_package", _async_return(package))
+    scalars = [mandate, authorization]
+    if authorization is not None:
+        scalars.extend([version, evaluation])
+        if evaluation is not None:
+            scalars.extend([runtime, strategy])
+    db = _FakeDb(scalar_values=scalars)
+    with pytest.raises(PermissionError, match=expected):
+        await cpp.run_dry_run_for_canonical_preview_package(
+            db=db,
+            request=cpp.CanonicalPreviewPackageDryRunRequest(
+                package_id=package.package_id, approval_event_id=None, operator_identity=None,
+                idempotency_token=f"revalidate-{mutation}",
+            ),
+        )
+    assert package.package_state == "AUTHORIZED"
+    assert not any(isinstance(item, cpp.LiveCryptoOrder) for item in db.added)
+
+
+@pytest.mark.asyncio
+async def test_human_dry_run_missing_live_approval_event_fails_closed(monkeypatch: pytest.MonkeyPatch) -> None:
+    package, _runtime, _mandate, _authorization, _version, _strategy, _evaluation = _mandate_authority_fixture()
+    package.package_state = "AUTHORIZED"
+    package.authorization_source = "HUMAN"
+    package.approval_event_id = uuid4()
+    monkeypatch.setattr(cpp, "_load_package", _async_return(package))
+    with pytest.raises(LookupError, match="approval event not found"):
+        await cpp.run_dry_run_for_canonical_preview_package(
+            db=_FakeDb(scalar_values=[None]),
+            request=cpp.CanonicalPreviewPackageDryRunRequest(
+                package_id=package.package_id, approval_event_id=package.approval_event_id,
+                operator_identity="operator:human", idempotency_token="human-missing-event",
+            ),
+        )
+
+
+@pytest.mark.asyncio
+async def test_mandate_expiration_between_dry_run_and_activation_fails_closed(monkeypatch: pytest.MonkeyPatch) -> None:
+    package, runtime, mandate, authorization, version, strategy, evaluation = _mandate_authority_fixture()
+    _mark_package_mandate_authorized(package, mandate, version, evaluation)
+    package.package_state = "DRY_RUN_PASSED"
+    dry_order_id = uuid4()
+    package.dry_run_live_crypto_order_id = dry_order_id
+    mandate.expires_at = datetime.now(timezone.utc) - timedelta(seconds=1)
+    monkeypatch.setattr(cpp, "_load_package", _async_return(package))
+    db = _FakeDb(scalar_values=[mandate])
+    with pytest.raises(PermissionError, match="mandate is expired"):
+        await cpp.activate_canonical_proving_campaign(
+            db=db,
+            request=cpp.CanonicalPreviewPackageActivationRequest(
+                package_id=package.package_id, approval_event_id=None, dry_run_live_crypto_order_id=dry_order_id,
+                actor=None, expires_at=None, idempotency_key="expired-between-stages",
+            ),
+        )
+
+
+@pytest.mark.asyncio
+async def test_mandate_duplicate_dry_run_and_activation_before_dry_run_are_blocked(monkeypatch: pytest.MonkeyPatch) -> None:
+    package, _runtime, mandate, _authorization, version, _strategy, evaluation = _mandate_authority_fixture()
+    _mark_package_mandate_authorized(package, mandate, version, evaluation)
+    monkeypatch.setattr(cpp, "_load_package", _async_return(package))
+    package.package_state = "DRY_RUN_PASSED"
+    with pytest.raises(PermissionError, match="not AUTHORIZED"):
+        await cpp.run_dry_run_for_canonical_preview_package(
+            db=_FakeDb(),
+            request=cpp.CanonicalPreviewPackageDryRunRequest(
+                package_id=package.package_id, approval_event_id=None, operator_identity=None, idempotency_token="duplicate-dry",
+            ),
+        )
+    package.package_state = "AUTHORIZED"
+    package.dry_run_live_crypto_order_id = uuid4()
+    with pytest.raises(PermissionError, match="must pass dry run"):
+        await cpp.activate_canonical_proving_campaign(
+            db=_FakeDb(),
+            request=cpp.CanonicalPreviewPackageActivationRequest(
+                package_id=package.package_id, approval_event_id=None,
+                dry_run_live_crypto_order_id=package.dry_run_live_crypto_order_id,
+                actor=None, expires_at=None, idempotency_key="activation-before-dry",
+            ),
+        )
+
+
 @pytest.mark.asyncio
 async def test_dry_run_records_package_link_and_rejects_scope_mismatch(monkeypatch: pytest.MonkeyPatch) -> None:
     package_id = uuid4()
@@ -1958,7 +2185,7 @@ async def test_dry_run_records_package_link_and_rejects_scope_mismatch(monkeypat
         crypto_order_preview_id=uuid4(),
         market_evidence_identity={"exchange_connection_id": str(uuid4())},
         market_evidence_observed_at=datetime.now(timezone.utc),
-        preview_expires_at=datetime.now(timezone.utc),
+        preview_expires_at=datetime.now(timezone.utc) + timedelta(minutes=5),
         package_state="AUTHORIZED",
         generated_at=datetime.now(timezone.utc),
         idempotency_key="pkg-1",
@@ -1989,6 +2216,8 @@ async def test_dry_run_records_package_link_and_rejects_scope_mismatch(monkeypat
     assert db.flush_calls == 2
 
     mismatched = _approval_event(package_id=uuid4())
+    package.package_state = "AUTHORIZED"
+    package.dry_run_live_crypto_order_id = None
     db = _FakeDb(scalar_values=[mismatched])
     with pytest.raises(PermissionError, match="approval scope package mismatch"):
         await cpp.run_dry_run_for_canonical_preview_package(db=db, request=request)
