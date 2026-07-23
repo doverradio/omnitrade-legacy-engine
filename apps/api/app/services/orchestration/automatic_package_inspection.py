@@ -14,6 +14,7 @@ from app.models.autonomous_capital_mandate import AutonomousCapitalMandate
 from app.models.autonomous_capital_mandate_authorization import AutonomousCapitalMandateAuthorization
 from app.models.autonomous_capital_mandate_evaluation import AutonomousCapitalMandateEvaluation
 from app.models.autonomous_capital_mandate_version import AutonomousCapitalMandateVersion
+from app.models.autonomous_cycle_run import AutonomousCycleRun
 from app.models.canonical_preview_package import CanonicalPreviewPackage
 from app.models.canonical_proving_activation import CanonicalProvingActivation
 from app.models.capital_campaign import CapitalCampaign
@@ -25,9 +26,90 @@ from app.models.live_accounting_record import LiveAccountingRecord
 from app.models.live_reconciliation_event import LiveReconciliationEvent
 from app.models.live_trading_profile import LiveTradingProfile
 from app.models.strategy import Strategy
+from app.models.strategy_roster_run import StrategyRosterRun
 from app.services.strategies.identity import build_strategy_identity
 
 _PACKAGE_STATES = {"READY", "AUTHORIZED", "DRY_RUN_PASSED", "ACTIVATED"}
+
+
+async def inspect_mandate_evaluation_identity_propagation(
+    *, db: AsyncSession, cycle_id: uuid.UUID, decision_record_id: uuid.UUID,
+) -> dict[str, Any]:
+    cycle = await db.scalar(
+        select(AutonomousCycleRun).where(AutonomousCycleRun.cycle_id == cycle_id).limit(1)
+    )
+    campaign_cycle = cycle if cycle is not None and cycle.cycle_kind == "campaign" else None
+    autonomous_cycle = cycle if cycle is not None and cycle.cycle_kind == "autonomous" else None
+    roster_run = None
+    if campaign_cycle is not None:
+        context = campaign_cycle.cycle_context if isinstance(campaign_cycle.cycle_context, dict) else {}
+        candle = context.get("candle") if isinstance(context.get("candle"), dict) else {}
+        close_raw = candle.get("close_time")
+        trigger = str(context.get("trigger") or "")
+        if close_raw and trigger:
+            close_time = datetime.fromisoformat(str(close_raw).replace("Z", "+00:00"))
+            roster_run = await db.scalar(
+                select(StrategyRosterRun).where(
+                    StrategyRosterRun.candle_close_time == close_time,
+                    StrategyRosterRun.trigger == trigger,
+                ).limit(1)
+            )
+        if roster_run is not None and roster_run.scheduled_cycle_id is not None:
+            autonomous_cycle = await db.scalar(
+                select(AutonomousCycleRun).where(
+                    AutonomousCycleRun.cycle_id == roster_run.scheduled_cycle_id,
+                    AutonomousCycleRun.cycle_kind == "autonomous",
+                ).limit(1)
+            )
+    evaluation_id = None if campaign_cycle is None else campaign_cycle.mandate_evaluation_id
+    evaluation = None if evaluation_id is None else await db.scalar(
+        select(AutonomousCapitalMandateEvaluation)
+        .where(AutonomousCapitalMandateEvaluation.evaluation_id == evaluation_id)
+        .limit(1)
+    )
+    missing_at = []
+    if autonomous_cycle is None: missing_at.append("autonomous_cycle_resolution")
+    if campaign_cycle is None: missing_at.append("campaign_cycle_resolution")
+    if campaign_cycle is not None and campaign_cycle.mandate_id is None: missing_at.append("campaign_cycle.mandate_id")
+    if campaign_cycle is not None and campaign_cycle.mandate_version_id is None: missing_at.append("campaign_cycle.mandate_version_id")
+    if campaign_cycle is not None and campaign_cycle.mandate_evaluation_id is None: missing_at.append("campaign_cycle.mandate_evaluation_id")
+    if campaign_cycle is not None and campaign_cycle.decision_record_id != decision_record_id: missing_at.append("campaign_cycle.decision_record_id_mismatch")
+    return {
+        "verdict": "COMPLETE" if not missing_at and evaluation is not None else "INCOMPLETE",
+        "requested_cycle_id": str(cycle_id),
+        "requested_decision_record_id": str(decision_record_id),
+        "autonomous_cycle_exists": autonomous_cycle is not None,
+        "campaign_cycle_exists": campaign_cycle is not None,
+        "autonomous_cycle": None if autonomous_cycle is None else {
+            "exists": True, "cycle_id": str(autonomous_cycle.cycle_id),
+            "mandate_id": None if autonomous_cycle.mandate_id is None else str(autonomous_cycle.mandate_id),
+            "mandate_version_id": None if autonomous_cycle.mandate_version_id is None else str(autonomous_cycle.mandate_version_id),
+            "mandate_evaluation_id": None if autonomous_cycle.mandate_evaluation_id is None else str(autonomous_cycle.mandate_evaluation_id),
+            "decision_record_id": None if autonomous_cycle.decision_record_id is None else str(autonomous_cycle.decision_record_id),
+            "proposed_action": autonomous_cycle.proposed_action,
+        },
+        "campaign_cycle": None if campaign_cycle is None else {
+            "exists": True, "cycle_id": str(campaign_cycle.cycle_id),
+            "campaign_id": None if campaign_cycle.capital_campaign_id is None else str(campaign_cycle.capital_campaign_id),
+            "campaign_version": campaign_cycle.capital_campaign_version,
+            "mandate_id": None if campaign_cycle.mandate_id is None else str(campaign_cycle.mandate_id),
+            "mandate_version_id": None if campaign_cycle.mandate_version_id is None else str(campaign_cycle.mandate_version_id),
+            "mandate_evaluation_id": None if campaign_cycle.mandate_evaluation_id is None else str(campaign_cycle.mandate_evaluation_id),
+            "decision_record_id": None if campaign_cycle.decision_record_id is None else str(campaign_cycle.decision_record_id),
+            "preview_id": None if campaign_cycle.preview_id is None else str(campaign_cycle.preview_id),
+            "proposed_action": campaign_cycle.proposed_action,
+        },
+        "evaluation": None if evaluation is None else {
+            "evaluation_id": str(evaluation.evaluation_id),
+            "decision_record_id": None if evaluation.decision_id is None else str(evaluation.decision_id),
+            "proposed_action": evaluation.proposed_action,
+            "authorization_result": evaluation.authorization_result,
+            "approval_result": evaluation.approval_result,
+        },
+        "roster_run_id": None if roster_run is None else str(roster_run.roster_run_id),
+        "missing_at": missing_at,
+        "read_only": True,
+    }
 
 
 def _iso(value: datetime | None) -> str | None:

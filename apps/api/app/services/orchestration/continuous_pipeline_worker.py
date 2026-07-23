@@ -54,6 +54,7 @@ from app.services.strategies.registry import StrategyLookupError
 from app.services.autonomous_cycle import AutonomousCycleRequest, run_autonomous_preview_cycle
 from app.services.capital_campaign_orchestration import run_campaign_orchestration_preview_for_candle
 from app.services.mandates.contracts import AUTONOMY_LEVEL_2
+from app.services.mandates.evidence import MandateEvaluationWriteRequest, evaluate_and_record_mandate
 from app.services.orchestration.venue_commissioning_bridge import service as venue_commissioning_service
 from app.services.orchestration.automatic_package_executor import (
     AutomaticPackageExecutionRequest,
@@ -665,6 +666,98 @@ async def _load_cycle_by_id(*, db: AsyncSession, cycle_id: uuid.UUID) -> Autonom
     return await db.scalar(select(AutonomousCycleRun).where(AutonomousCycleRun.cycle_id == cycle_id).limit(1))
 
 
+async def _load_originating_autonomous_cycle(
+    *, db: AsyncSession, cycle_id: uuid.UUID | None,
+) -> AutonomousCycleRun | None:
+    if cycle_id is None:
+        return None
+    return await db.scalar(
+        select(AutonomousCycleRun).where(
+            AutonomousCycleRun.cycle_id == cycle_id,
+            AutonomousCycleRun.cycle_kind == "autonomous",
+        ).limit(1)
+    )
+
+
+async def _ensure_campaign_cycle_mandate_evaluation(
+    *,
+    db: AsyncSession,
+    campaign_cycle: AutonomousCycleRun,
+    autonomous_cycle: AutonomousCycleRun | None,
+    strategy_identity: str,
+    product: str,
+    side: str,
+    proposed_notional: Decimal,
+) -> str | None:
+    if all(
+        getattr(campaign_cycle, field, None) is not None
+        for field in ("mandate_id", "mandate_version_id", "mandate_evaluation_id")
+    ):
+        return None
+    if autonomous_cycle is None:
+        return "originating_autonomous_cycle_missing"
+    autonomous_context = autonomous_cycle.cycle_context if isinstance(autonomous_cycle.cycle_context, dict) else {}
+    campaign_context = campaign_cycle.cycle_context if isinstance(campaign_cycle.cycle_context, dict) else {}
+    if (
+        str(autonomous_context.get("trigger") or "") != str(campaign_context.get("trigger") or "")
+        or str(autonomous_context.get("product_id") or "").upper() != product.upper()
+    ):
+        return "autonomous_campaign_cycle_correlation_mismatch"
+    if autonomous_cycle.mandate_id is None or autonomous_cycle.mandate_version_id is None:
+        return "originating_autonomous_mandate_identity_missing"
+    if campaign_cycle.cycle_kind != "campaign" or campaign_cycle.decision_record_id is None:
+        return "campaign_cycle_identity_invalid"
+    evaluation = await evaluate_and_record_mandate(
+        db=db,
+        request=MandateEvaluationWriteRequest(
+            mandate_id=autonomous_cycle.mandate_id,
+            actor="orchestration_worker",
+            strategy_version=strategy_identity,
+            product=product,
+            side=side,
+            proposed_notional_usd=proposed_notional,
+            current_open_exposure_usd=Decimal("0"),
+            daily_deployed_usd=Decimal("0"),
+            daily_realized_loss_usd=Decimal("0"),
+            campaign_drawdown_usd=Decimal("0"),
+            consecutive_losses=0,
+            current_position_count=0,
+            risk_verdict="ACCEPTED",
+            evidence_age_seconds=0,
+            kill_switch_engaged=False,
+            observed_at=datetime.now(timezone.utc),
+            decision_id=campaign_cycle.decision_record_id,
+            request_context={
+                "purpose": "automatic_ready_package_campaign_authority",
+                "autonomous_cycle_id": str(autonomous_cycle.cycle_id),
+                "campaign_orchestration_cycle_id": str(campaign_cycle.cycle_id),
+                "campaign_id": None if campaign_cycle.capital_campaign_id is None else str(campaign_cycle.capital_campaign_id),
+                "campaign_version": campaign_cycle.capital_campaign_version,
+            },
+            idempotency_key=f"campaign-cycle-mandate-eval:{campaign_cycle.cycle_id}",
+            audit_correlation_id=campaign_cycle.audit_correlation_id,
+            software_build_version=campaign_cycle.software_build_version,
+        ),
+    )
+    if (
+        evaluation.mandate_id != autonomous_cycle.mandate_id
+        or evaluation.mandate_version_id != autonomous_cycle.mandate_version_id
+        or evaluation.decision_id != campaign_cycle.decision_record_id
+        or evaluation.authorization_result != "AUTHORIZED"
+        or evaluation.approval_result != "APPROVAL_SATISFIED_BY_ACTIVE_MANDATE"
+    ):
+        return "campaign_mandate_evaluation_mismatched_or_rejected"
+    campaign_cycle.mandate_id = evaluation.mandate_id
+    campaign_cycle.mandate_version_id = evaluation.mandate_version_id
+    campaign_cycle.mandate_evaluation_id = evaluation.evaluation_id
+    campaign_cycle.cycle_context = {
+        **(campaign_cycle.cycle_context or {}),
+        "originating_autonomous_cycle_id": str(autonomous_cycle.cycle_id),
+    }
+    await db.flush()
+    return None
+
+
 async def _load_runtime_campaign(*, db: AsyncSession, campaign_id: uuid.UUID) -> CapitalCampaign | None:
     return await db.scalar(select(CapitalCampaign).where(CapitalCampaign.uuid == campaign_id).limit(1))
 
@@ -845,6 +938,7 @@ async def _attempt_automatic_ready_package_creation(
     *,
     db: AsyncSession,
     orchestration_payload: dict[str, object] | None,
+    originating_autonomous_cycle_id: uuid.UUID | None = None,
 ) -> None:
     cycles = [] if not isinstance(orchestration_payload, dict) else list(orchestration_payload.get("cycles") or [])
     for cycle_summary in cycles:
@@ -898,8 +992,6 @@ async def _attempt_automatic_ready_package_creation(
             skip_reason = "non_executable_action"
         elif decision_record_id is None:
             skip_reason = "missing_decision_record_id"
-        elif any(getattr(cycle, field, None) is None for field in ("mandate_id", "mandate_version_id", "mandate_evaluation_id")):
-            skip_reason = "missing_mandate_evaluation_identity"
         elif evidence_freshness and evidence_freshness != "fresh":
             skip_reason = "stale_market_data"
         elif risk_verdict != "ALLOW":
@@ -918,6 +1010,50 @@ async def _attempt_automatic_ready_package_creation(
                 for item in rejected_candidates
                 if isinstance(item, dict) and item.get("reason")
             ]
+
+        autonomous_cycle = None
+        if skip_reason is None:
+            bundle_complete = all(
+                getattr(cycle, field, None) is not None
+                for field in ("mandate_id", "mandate_version_id", "mandate_evaluation_id")
+            )
+            if bundle_complete:
+                skip_reason = None
+            else:
+                autonomous_cycle = await _load_originating_autonomous_cycle(
+                    db=db, cycle_id=originating_autonomous_cycle_id,
+                )
+                strategy_identity = str(selected_decision.get("strategy_identity") or "").strip()
+                side = "SELL" if is_close_action else "BUY"
+                if not strategy_identity:
+                    skip_reason = "campaign_strategy_identity_missing"
+                elif final_amount is None or final_amount <= 0:
+                    skip_reason = "campaign_notional_missing"
+                else:
+                    skip_reason = await _ensure_campaign_cycle_mandate_evaluation(
+                        db=db,
+                        campaign_cycle=cycle,
+                        autonomous_cycle=autonomous_cycle,
+                        strategy_identity=strategy_identity,
+                        product=product,
+                        side=side,
+                        proposed_notional=final_amount,
+                    )
+
+        missing_evidence_fields = [
+            field for field in ("mandate_id", "mandate_version_id", "mandate_evaluation_id")
+            if getattr(cycle, field, None) is None
+        ]
+        logger.info(
+            "automatic_package_identity_bundle autonomous_cycle_id=%s campaign_orchestration_cycle_id=%s decision_record_id=%s mandate_id=%s mandate_version_id=%s mandate_evaluation_id=%s preview_id=%s action=%s evidence_complete=%s missing_evidence_fields=%s package_creation_eligible=%s",
+            None if autonomous_cycle is None else autonomous_cycle.cycle_id,
+            cycle.cycle_id, decision_record_id, cycle.mandate_id, cycle.mandate_version_id,
+            cycle.mandate_evaluation_id, getattr(cycle, "preview_id", None), proposed_action or decision_kind,
+            not missing_evidence_fields, json.dumps(missing_evidence_fields),
+            skip_reason is None and not missing_evidence_fields,
+        )
+        if skip_reason is None and missing_evidence_fields:
+            skip_reason = "missing_mandate_evaluation_identity"
 
         package_id: str | None = None
         idempotency_key: str | None = None
@@ -1164,6 +1300,7 @@ async def run_orchestration_cycle(
             await _attempt_automatic_ready_package_creation(
                 db=db,
                 orchestration_payload=orchestration_payload,
+                originating_autonomous_cycle_id=autonomous_cycle_id,
             )
             await db.commit()
         except Exception:

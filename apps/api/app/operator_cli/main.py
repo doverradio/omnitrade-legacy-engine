@@ -29,6 +29,7 @@ from app.operator_cli.formatting import (
 from app.operator_cli.service import (
     automatic_mandate_activation_proof,
     automatic_mandate_activation_readiness,
+    mandate_evaluation_identity_diagnostic,
     buy_opportunity_diagnostic,
     hold_decision_diagnostic,
     activate_canonical_proving_campaign_bundle,
@@ -858,6 +859,14 @@ def _build_parser() -> argparse.ArgumentParser:
     automatic_activation_proof.add_argument("--package-id", type=UUID, required=True)
     automatic_activation_proof.add_argument("--json", action="store_true", dest="json_output")
 
+    mandate_identity_trace = subparsers.add_parser(
+        "mandate-evaluation-identity-diagnostic", parents=[common],
+        help="Read-only autonomous/campaign cycle mandate evidence trace",
+    )
+    mandate_identity_trace.add_argument("--cycle-id", type=UUID, required=True)
+    mandate_identity_trace.add_argument("--decision-record-id", type=UUID, required=True)
+    mandate_identity_trace.add_argument("--json", action="store_true", dest="json_output")
+
     mandate_diagnosis = subparsers.add_parser(
         "mandate-identity-diagnosis",
         parents=[common],
@@ -1526,6 +1535,12 @@ async def _run_async(args: argparse.Namespace) -> tuple[int, dict[str, Any], str
     if args.command == "automatic-mandate-activation-proof":
         payload = await automatic_mandate_activation_proof(package_id=args.package_id)
         return (0 if payload.get("verdict") == "PROVEN" else 1), payload, render_json(payload)
+
+    if args.command == "mandate-evaluation-identity-diagnostic":
+        payload = await mandate_evaluation_identity_diagnostic(
+            cycle_id=args.cycle_id, decision_record_id=args.decision_record_id,
+        )
+        return (0 if payload.get("verdict") == "COMPLETE" else 1), payload, render_json(payload)
 
     if args.command == "mandate-identity-diagnosis":
         payload = await mandate_identity_diagnosis(

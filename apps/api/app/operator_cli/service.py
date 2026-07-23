@@ -9786,6 +9786,23 @@ async def automatic_mandate_activation_readiness(*, provider: str, environment: 
         }
 
 
+async def mandate_evaluation_identity_diagnostic(*, cycle_id: UUID, decision_record_id: UUID) -> dict[str, Any]:
+    from app.services.orchestration.automatic_package_inspection import inspect_mandate_evaluation_identity_propagation
+
+    try:
+        async with AsyncSessionLocal() as db:
+            return await inspect_mandate_evaluation_identity_propagation(
+                db=db, cycle_id=cycle_id, decision_record_id=decision_record_id,
+            )
+    except Exception as exc:
+        return {
+            "verdict": "FAILED_CLOSED", "requested_cycle_id": str(cycle_id),
+            "requested_decision_record_id": str(decision_record_id),
+            "reason_codes": ["identity_diagnostic_failed"], "error_type": type(exc).__name__,
+            "read_only": True,
+        }
+
+
 async def automatic_mandate_activation_proof(*, package_id: UUID) -> dict[str, Any]:
     from app.services.orchestration.automatic_package_inspection import inspect_automatic_mandate_activation_proof
 

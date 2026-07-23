@@ -188,6 +188,31 @@ async def test_readiness_requires_successful_persisted_evaluation(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_identity_diagnostic_finds_null_boundary_between_campaign_and_autonomous_cycles():
+    campaign_cycle_id, autonomous_cycle_id, decision_id = uuid.uuid4(), uuid.uuid4(), uuid.uuid4()
+    campaign_cycle = SimpleNamespace(
+        cycle_id=campaign_cycle_id, cycle_kind="campaign", mandate_id=None,
+        mandate_version_id=None, mandate_evaluation_id=None, decision_record_id=decision_id,
+        preview_id=None, proposed_action="OPEN_POSITION_PROPOSED", capital_campaign_id=uuid.uuid4(),
+        capital_campaign_version=2,
+        cycle_context={"trigger": "kraken_btc_15m_candle_close", "candle": {"close_time": datetime.now(timezone.utc).isoformat()}},
+    )
+    roster = SimpleNamespace(roster_run_id=uuid.uuid4(), scheduled_cycle_id=autonomous_cycle_id)
+    autonomous_cycle = SimpleNamespace(
+        cycle_id=autonomous_cycle_id, cycle_kind="autonomous", mandate_id=uuid.uuid4(),
+        mandate_version_id=uuid.uuid4(), mandate_evaluation_id=uuid.uuid4(),
+        decision_record_id=uuid.uuid4(), proposed_action="BUY",
+    )
+    result = await inspection.inspect_mandate_evaluation_identity_propagation(
+        db=_Db(scalars=[campaign_cycle, roster, autonomous_cycle]),
+        cycle_id=campaign_cycle_id, decision_record_id=decision_id,
+    )
+    assert result["verdict"] == "INCOMPLETE"
+    assert result["autonomous_cycle"]["cycle_id"] == str(autonomous_cycle_id)
+    assert "campaign_cycle.mandate_evaluation_id" in result["missing_at"]
+
+
+@pytest.mark.asyncio
 async def test_proof_complete_mandate_evidence_is_proven():
     package = _package("ACTIVATED", authority="MANDATE")
     package.mandate_id = uuid.uuid4()

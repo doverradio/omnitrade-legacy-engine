@@ -356,6 +356,96 @@ async def test_ready_package_creation_requires_cycle_mandate_evaluation(monkeypa
     assert create_calls == 0
 
 
+@pytest.mark.asyncio
+async def test_production_shape_correlates_autonomous_and_campaign_cycles_before_ready_package(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import app.services.orchestration.continuous_pipeline_worker as worker_module
+
+    campaign_cycle = _automatic_cycle()
+    campaign_cycle.cycle_kind = "campaign"
+    campaign_cycle.mandate_id = None
+    campaign_cycle.mandate_version_id = None
+    campaign_cycle.mandate_evaluation_id = None
+    campaign_cycle.audit_correlation_id = uuid.uuid4()
+    campaign_cycle.software_build_version = "test"
+    campaign_cycle.cycle_context["trigger"] = "kraken_btc_15m_candle_close"
+    campaign_cycle.cycle_context["authoritative_composition"]["selected_decision"]["strategy_identity"] = "strategy_roster_aggregate@1.0.0"
+    autonomous_cycle = SimpleNamespace(
+        cycle_id=uuid.uuid4(), cycle_kind="autonomous", mandate_id=uuid.uuid4(),
+        mandate_version_id=uuid.uuid4(), mandate_evaluation_id=uuid.uuid4(),
+        cycle_context={"trigger": "kraken_btc_15m_candle_close", "product_id": "BTC-USD"},
+    )
+    campaign_evaluation_id = uuid.uuid4()
+    create_requests = []
+    evaluation_requests = []
+
+    class _Db:
+        async def flush(self): return None
+
+    async def _evaluate(*, db, request):
+        evaluation_requests.append(request)
+        return SimpleNamespace(
+            evaluation_id=campaign_evaluation_id,
+            mandate_id=autonomous_cycle.mandate_id,
+            mandate_version_id=autonomous_cycle.mandate_version_id,
+            decision_id=campaign_cycle.decision_record_id,
+            authorization_result="AUTHORIZED",
+            approval_result="APPROVAL_SATISFIED_BY_ACTIVE_MANDATE",
+        )
+
+    async def _create(*, db, request):
+        create_requests.append(request)
+        return {"idempotent": False, "package": {"package_id": str(uuid.uuid4()), "package_state": "READY"}}
+
+    monkeypatch.setattr(worker_module, "_load_cycle_by_id", _async_return(campaign_cycle))
+    monkeypatch.setattr(worker_module, "_load_originating_autonomous_cycle", _async_return(autonomous_cycle))
+    monkeypatch.setattr(worker_module, "evaluate_and_record_mandate", _evaluate)
+    monkeypatch.setattr(worker_module, "_has_active_ready_package_for_opportunity", _async_return(False))
+    monkeypatch.setattr(worker_module, "_has_active_proving_activation", _async_return(False))
+    monkeypatch.setattr(worker_module, "_has_open_live_order", _async_return(False))
+    monkeypatch.setattr(worker_module, "_has_unresolved_reconciliation", _async_return(False))
+    monkeypatch.setattr(worker_module, "_load_runtime_campaign", _async_return(SimpleNamespace(paper_account_id=uuid.uuid4())))
+    monkeypatch.setattr(worker_module, "_load_live_trading_profile_for_paper_account", _async_return(SimpleNamespace(id=uuid.uuid4())))
+    monkeypatch.setattr(worker_module, "create_canonical_preview_package", _create)
+
+    await worker_module._attempt_automatic_ready_package_creation(
+        db=_Db(), orchestration_payload=_automatic_payload(campaign_cycle),
+        originating_autonomous_cycle_id=autonomous_cycle.cycle_id,
+    )
+
+    assert len(evaluation_requests) == 1
+    assert evaluation_requests[0].decision_id == campaign_cycle.decision_record_id
+    assert evaluation_requests[0].request_context["autonomous_cycle_id"] == str(autonomous_cycle.cycle_id)
+    assert evaluation_requests[0].request_context["campaign_orchestration_cycle_id"] == str(campaign_cycle.cycle_id)
+    assert len(create_requests) == 1
+    assert create_requests[0].expected_decision_record_id == campaign_cycle.decision_record_id
+    assert create_requests[0].mandate_id == autonomous_cycle.mandate_id
+    assert create_requests[0].mandate_version_id == autonomous_cycle.mandate_version_id
+    assert create_requests[0].mandate_evaluation_id == campaign_evaluation_id
+
+
+@pytest.mark.asyncio
+async def test_campaign_evaluation_rejects_mismatched_autonomous_cycle_correlation() -> None:
+    import app.services.orchestration.continuous_pipeline_worker as worker_module
+
+    campaign_cycle = _automatic_cycle()
+    campaign_cycle.cycle_kind = "campaign"
+    campaign_cycle.mandate_id = campaign_cycle.mandate_version_id = campaign_cycle.mandate_evaluation_id = None
+    campaign_cycle.audit_correlation_id = uuid.uuid4()
+    campaign_cycle.software_build_version = None
+    autonomous_cycle = SimpleNamespace(
+        cycle_id=uuid.uuid4(), mandate_id=uuid.uuid4(), mandate_version_id=uuid.uuid4(),
+        cycle_context={"trigger": "different_trigger", "product_id": "BTC-USD"},
+    )
+    reason = await worker_module._ensure_campaign_cycle_mandate_evaluation(
+        db=object(), campaign_cycle=campaign_cycle, autonomous_cycle=autonomous_cycle,
+        strategy_identity="strategy_roster_aggregate@1.0.0", product="BTC-USD", side="BUY",
+        proposed_notional=Decimal("5"),
+    )
+    assert reason == "autonomous_campaign_cycle_correlation_mismatch"
+
+
 def _not_due_research_result() -> SimpleNamespace:
     return SimpleNamespace(
         started=False,
@@ -2596,7 +2686,7 @@ async def test_worker_survives_a_prior_rollback_without_touching_expired_candle_
     async def _campaign_preview(*, db, trigger):
         return {"cycle_count": 0, "reason": "no_campaign_candidates", "considered_campaigns": [], "eligible_campaigns": [], "skipped_campaigns": []}
 
-    async def _ready_package_attempted(*, db, orchestration_payload):
+    async def _ready_package_attempted(*, db, orchestration_payload, originating_autonomous_cycle_id=None):
         # Only reached if campaign_orchestration's try body -- including its
         # logging, which reads the candle's id/close_time -- ran to
         # completion without raising. A stale direct attribute touch on the
