@@ -144,6 +144,35 @@ def _async_return(value):
     return _inner
 
 
+class _MandateResolverDB:
+    def __init__(self, rows: list[SimpleNamespace]) -> None:
+        self.rows = rows
+        self.compiled_sql = ""
+
+    async def execute(self, statement):
+        self.compiled_sql = str(statement.compile(compile_kwargs={"literal_binds": True}))
+        matches = [
+            row
+            for row in self.rows
+            if row.status == "ACTIVE"
+            and row.provider == "kraken_spot"
+            and row.autonomy_level == "LEVEL_2"
+        ]
+        matches.sort(key=lambda row: row.updated_at, reverse=True)
+        limited = matches[:2]
+        return SimpleNamespace(scalars=lambda: SimpleNamespace(all=lambda: limited))
+
+
+def _active_kraken_mandate(*, autonomy_level: str, updated_at: datetime | None = None) -> SimpleNamespace:
+    return SimpleNamespace(
+        mandate_id=uuid.uuid4(),
+        status="ACTIVE",
+        provider="kraken_spot",
+        autonomy_level=autonomy_level,
+        updated_at=updated_at or datetime.now(timezone.utc),
+    )
+
+
 def _config() -> WorkerConfig:
     return WorkerConfig(
         poll_interval_seconds=300,
@@ -2035,6 +2064,52 @@ async def test_worker_continues_after_structured_execution_rejection(monkeypatch
     assert stats.executions_attempted == 2
     assert stats.executions_rejected == 1
     assert stats.executions_failed == 0
+
+
+@pytest.mark.asyncio
+async def test_active_level1_and_level2_resolver_selects_level2() -> None:
+    import app.services.orchestration.continuous_pipeline_worker as worker_module
+
+    level1 = _active_kraken_mandate(autonomy_level="LEVEL_1")
+    level2 = _active_kraken_mandate(autonomy_level="LEVEL_2")
+    db = _MandateResolverDB([level1, level2])
+
+    resolved = await worker_module._load_single_active_kraken_mandate(db)
+
+    assert resolved is level2
+    assert "autonomous_capital_mandates.autonomy_level = 'LEVEL_2'" in db.compiled_sql
+    assert "LIMIT 2" in db.compiled_sql
+
+
+@pytest.mark.asyncio
+async def test_only_active_level1_resolver_safely_skips(caplog: pytest.LogCaptureFixture) -> None:
+    import app.services.orchestration.continuous_pipeline_worker as worker_module
+
+    db = _MandateResolverDB([_active_kraken_mandate(autonomy_level="LEVEL_1")])
+    caplog.set_level(logging.INFO)
+
+    resolved = await worker_module._load_single_active_kraken_mandate(db)
+
+    assert resolved is None
+    assert "autonomous_cycle_skip reason=no_active_kraken_mandate" in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_two_active_level2_mandates_remain_ambiguous_and_fail_closed(caplog: pytest.LogCaptureFixture) -> None:
+    import app.services.orchestration.continuous_pipeline_worker as worker_module
+
+    db = _MandateResolverDB(
+        [
+            _active_kraken_mandate(autonomy_level="LEVEL_2", updated_at=datetime(2026, 7, 22, 2, tzinfo=timezone.utc)),
+            _active_kraken_mandate(autonomy_level="LEVEL_2", updated_at=datetime(2026, 7, 22, 1, tzinfo=timezone.utc)),
+        ]
+    )
+    caplog.set_level(logging.WARNING)
+
+    resolved = await worker_module._load_single_active_kraken_mandate(db)
+
+    assert resolved is None
+    assert "autonomous_cycle_skip reason=ambiguous_active_kraken_mandates mandate_count=2" in caplog.text
 
 
 @pytest.mark.asyncio

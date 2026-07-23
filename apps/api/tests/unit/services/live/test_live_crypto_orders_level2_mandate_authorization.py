@@ -364,6 +364,42 @@ async def test_no_mandate_falls_back_to_manual_confirmation_required() -> None:
 
 
 @pytest.mark.asyncio
+async def test_active_level1_mandate_still_falls_back_to_manual_confirmation() -> None:
+    async with _real_session() as session:
+        paper_account_id = uuid.uuid4()
+        exchange_connection_id, live_trading_profile_id, preview_id, risk_event_id = await _seed_scope(
+            session, paper_account_id=paper_account_id,
+        )
+        session.add(
+            AutonomousCapitalMandate(
+                mandate_id=uuid.uuid4(),
+                owner_actor_id="operator:owner",
+                status="ACTIVE",
+                autonomy_level="LEVEL_1",
+                provider=_PROVIDER,
+                exchange_environment=_ENVIRONMENT,
+                exchange_connection_id=exchange_connection_id,
+                live_trading_profile_id=live_trading_profile_id,
+                paper_account_id=paper_account_id,
+                capital_campaign_id=None,
+            )
+        )
+        await session.commit()
+
+        live_order = _live_order(
+            preview_id=preview_id,
+            risk_event_id=risk_event_id,
+            exchange_connection_id=exchange_connection_id,
+        )
+        authorized, mandate_id = await _evaluate_level2_mandate_authorization(
+            db=session, live_order=live_order, actor="operator:owner",
+        )
+
+        assert authorized is False
+        assert mandate_id is None
+
+
+@pytest.mark.asyncio
 async def test_expired_mandate_is_blocked() -> None:
     async with _real_session() as session:
         paper_account_id = uuid.uuid4()

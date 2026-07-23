@@ -37,6 +37,7 @@ from app.services.exchange_connections.readiness import supports_autonomous_prev
 from app.services.exchange_connections.providers.registry import get_exchange_provider
 from app.services.exchange_connections.service import get_decrypted_credentials_for_connection
 from app.services.mandates.contracts import (
+    AUTONOMY_LEVEL_2,
     MANDATE_APPROVAL_RESULT_ACTIVE_MANDATE,
     MANDATE_AUTHORIZATION_ALLOWED,
     MANDATE_AUTHORIZATION_REJECTED,
@@ -251,6 +252,22 @@ async def run_autonomous_preview_cycle(
         await _transition_cycle(db=db, cycle=cycle, to_state="LOADING", stage="load_mandate")
 
         mandate = await get_mandate(db=db, mandate_id=request.mandate_id)
+        if mandate.autonomy_level != AUTONOMY_LEVEL_2:
+            cycle.cycle_context = {
+                **cycle.cycle_context,
+                "autonomy_level": mandate.autonomy_level,
+                "mandate_status": mandate.status,
+            }
+            await db.flush()
+            return await _finish_hold(
+                db=db,
+                cycle=cycle,
+                stage="validate_mandate",
+                reason="autonomy_level_does_not_allow_autonomous_execution",
+                explanation=("CHECK_FAILED:autonomy_level_does_not_allow_autonomous_execution",),
+                started_monotonic=started_monotonic,
+            )
+
         versions = await list_mandate_versions(db=db, mandate_id=mandate.mandate_id)
         if not versions:
             return await _finish_hold(
@@ -515,6 +532,16 @@ async def run_autonomous_preview_cycle(
         )
         cycle.mandate_evaluation_id = mandate_eval.evaluation_id
         await db.flush()
+
+        if mandate_eval.approval_result != MANDATE_APPROVAL_RESULT_ACTIVE_MANDATE:
+            return await _finish_hold(
+                db=db,
+                cycle=cycle,
+                stage="mandate_evaluation",
+                reason=mandate_eval.reason_code or "mandate_not_approved_for_autonomous_execution",
+                explanation=tuple(mandate_eval.deterministic_explanation or ("CHECK_FAILED:mandate_not_approved_for_autonomous_execution",)),
+                started_monotonic=started_monotonic,
+            )
 
         preview_id: uuid.UUID | None = None
         if proposal.action in {"BUY", "SELL"} and risk_summary.risk_verdict in {"ACCEPTED", "RESIZED"}:

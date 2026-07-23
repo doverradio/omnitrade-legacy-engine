@@ -24,7 +24,14 @@ from app.services.autonomous_cycle.orchestrator import (
     run_autonomous_preview_cycle,
 )
 from app.services.decisions.replay_context import REPLAY_CONTEXT_KEYS
-from app.services.mandates.contracts import MANDATE_APPROVAL_POLICY_HUMAN_REQUIRED, MANDATE_APPROVAL_POLICY_MANDATE_ALLOWED
+from app.services.mandates.contracts import (
+    AUTONOMY_LEVEL_1,
+    AUTONOMY_LEVEL_2,
+    MANDATE_APPROVAL_POLICY_HUMAN_REQUIRED,
+    MANDATE_APPROVAL_POLICY_MANDATE_ALLOWED,
+    MANDATE_APPROVAL_RESULT_ACTIVE_MANDATE,
+    MANDATE_APPROVAL_RESULT_REQUIRED_HUMAN,
+)
 from app.services.strategies.base import Signal
 from app.services.strategies.identity import build_strategy_identity
 
@@ -105,11 +112,11 @@ def _async_return(value):
     return _inner
 
 
-def _mandate(*, status: str = "ACTIVE") -> SimpleNamespace:
+def _mandate(*, status: str = "ACTIVE", autonomy_level: str = AUTONOMY_LEVEL_2) -> SimpleNamespace:
     return SimpleNamespace(
         mandate_id=uuid.uuid4(),
         status=status,
-        autonomy_level="FULL",
+        autonomy_level=autonomy_level,
         provider="kraken_spot",
         exchange_environment="production",
         exchange_connection_id=uuid.uuid4(),
@@ -207,7 +214,17 @@ def _patch_happy_path(monkeypatch: pytest.MonkeyPatch, mandate: SimpleNamespace,
             )
         ),
     )
-    monkeypatch.setattr("app.services.autonomous_cycle.orchestrator.evaluate_and_record_mandate", _async_return(SimpleNamespace(evaluation_id=uuid.uuid4())))
+    monkeypatch.setattr(
+        "app.services.autonomous_cycle.orchestrator.evaluate_and_record_mandate",
+        _async_return(
+            SimpleNamespace(
+                evaluation_id=uuid.uuid4(),
+                approval_result=MANDATE_APPROVAL_RESULT_ACTIVE_MANDATE,
+                reason_code="authorized_under_active_mandate",
+                deterministic_explanation=("CHECK_PASSED:authorized_under_active_mandate",),
+            )
+        ),
+    )
     monkeypatch.setattr("app.services.autonomous_cycle.orchestrator.create_crypto_order_preview", _async_return(SimpleNamespace(crypto_order_preview_id=uuid.uuid4())))
     monkeypatch.setattr("app.services.autonomous_cycle.orchestrator.get_exchange_provider", lambda _provider: object())
     monkeypatch.setattr("app.services.autonomous_cycle.orchestrator.get_decrypted_credentials_for_connection", lambda _c: {"x": "y"})
@@ -504,7 +521,17 @@ async def test_cycle_selects_latest_canonical_governing_version_and_keeps_legacy
         _async_return(SimpleNamespace(id=uuid.uuid4(), asset_id=uuid.uuid4())),
     )
     monkeypatch.setattr("app.services.autonomous_cycle.orchestrator._persist_decision_intelligence", _async_return(uuid.uuid4()))
-    monkeypatch.setattr("app.services.autonomous_cycle.orchestrator.evaluate_and_record_mandate", _async_return(SimpleNamespace(evaluation_id=uuid.uuid4())))
+    monkeypatch.setattr(
+        "app.services.autonomous_cycle.orchestrator.evaluate_and_record_mandate",
+        _async_return(
+            SimpleNamespace(
+                evaluation_id=uuid.uuid4(),
+                approval_result=MANDATE_APPROVAL_RESULT_ACTIVE_MANDATE,
+                reason_code="authorized_under_active_mandate",
+                deterministic_explanation=("CHECK_PASSED:authorized_under_active_mandate",),
+            )
+        ),
+    )
     monkeypatch.setattr("app.services.autonomous_cycle.orchestrator.create_crypto_order_preview", _async_return(SimpleNamespace(crypto_order_preview_id=uuid.uuid4())))
     monkeypatch.setattr("app.services.autonomous_cycle.orchestrator.get_exchange_provider", lambda _provider: object())
     monkeypatch.setattr("app.services.autonomous_cycle.orchestrator.get_decrypted_credentials_for_connection", lambda _c: {"x": "y"})
@@ -650,6 +677,96 @@ async def test_cycle_non_active_mandate_finishes_hold(monkeypatch: pytest.Monkey
     assert result.proposed_action == "HOLD"
     assert result.preview_id is None
     assert "mandate_status" in (result.diagnostics.failure_reason or "")
+
+
+@pytest.mark.asyncio
+async def test_level1_mandate_finishes_hold_before_preview_or_paper_execution(monkeypatch: pytest.MonkeyPatch) -> None:
+    db = _FakeDb()
+    mandate = _mandate(autonomy_level=AUTONOMY_LEVEL_1)
+    calls = {"versions": 0, "preview": 0, "paper_execution": 0}
+
+    monkeypatch.setattr("app.services.autonomous_cycle.orchestrator.get_mandate", _async_return(mandate))
+
+    async def _versions(*_args, **_kwargs):
+        calls["versions"] += 1
+        return [_version()]
+
+    async def _preview(*_args, **_kwargs):
+        calls["preview"] += 1
+        raise AssertionError("LEVEL_1 must not create an autonomous preview")
+
+    async def _paper_execution(*_args, **_kwargs):
+        calls["paper_execution"] += 1
+        raise AssertionError("LEVEL_1 must not execute an autonomous paper trade")
+
+    monkeypatch.setattr("app.services.autonomous_cycle.orchestrator.list_mandate_versions", _versions)
+    monkeypatch.setattr("app.services.autonomous_cycle.orchestrator.create_crypto_order_preview", _preview)
+    monkeypatch.setattr("app.services.autonomous_cycle.orchestrator.orchestrate_paper_signal_execution", _paper_execution)
+
+    result = await run_autonomous_preview_cycle(
+        db=db,
+        request=AutonomousCycleRequest(
+            mandate_id=mandate.mandate_id,
+            actor="orchestration_worker",
+            forced_action="BUY",
+            idempotency_seed="level1-central-guard",
+        ),
+    )
+
+    assert result.state == "COMPLETE"
+    assert result.preview_id is None
+    assert result.diagnostics.termination_stage == "validate_mandate"
+    assert result.diagnostics.failure_reason == "autonomy_level_does_not_allow_autonomous_execution"
+    assert calls == {"versions": 0, "preview": 0, "paper_execution": 0}
+
+
+@pytest.mark.asyncio
+async def test_failed_level2_mandate_evaluation_blocks_preview_and_paper_execution(monkeypatch: pytest.MonkeyPatch) -> None:
+    db = _FakeDb()
+    mandate = _mandate(autonomy_level=AUTONOMY_LEVEL_2)
+    version = _version()
+    db.connection = SimpleNamespace(last_readiness_verdict="READY_FOR_PREVIEW", provider="kraken_spot", environment="production")
+    calls = {"preview": 0, "paper_execution": 0}
+
+    _patch_happy_path(monkeypatch, mandate, version, action="BUY")
+    monkeypatch.setattr(
+        "app.services.autonomous_cycle.orchestrator.evaluate_and_record_mandate",
+        _async_return(
+            SimpleNamespace(
+                evaluation_id=uuid.uuid4(),
+                approval_result=MANDATE_APPROVAL_RESULT_REQUIRED_HUMAN,
+                reason_code="strategy_not_allowed_by_mandate",
+                deterministic_explanation=("CHECK_FAILED:strategy_not_allowed_by_mandate",),
+            )
+        ),
+    )
+
+    async def _preview(*_args, **_kwargs):
+        calls["preview"] += 1
+        raise AssertionError("failed mandate evaluation must not create a preview")
+
+    async def _paper_execution(*_args, **_kwargs):
+        calls["paper_execution"] += 1
+        raise AssertionError("failed mandate evaluation must not execute a paper trade")
+
+    monkeypatch.setattr("app.services.autonomous_cycle.orchestrator.create_crypto_order_preview", _preview)
+    monkeypatch.setattr("app.services.autonomous_cycle.orchestrator.orchestrate_paper_signal_execution", _paper_execution)
+
+    result = await run_autonomous_preview_cycle(
+        db=db,
+        request=AutonomousCycleRequest(
+            mandate_id=mandate.mandate_id,
+            actor="orchestration_worker",
+            forced_action="BUY",
+            idempotency_seed="level2-failed-evaluation-guard",
+        ),
+    )
+
+    assert result.state == "COMPLETE"
+    assert result.preview_id is None
+    assert result.diagnostics.termination_stage == "mandate_evaluation"
+    assert result.diagnostics.failure_reason == "strategy_not_allowed_by_mandate"
+    assert calls == {"preview": 0, "paper_execution": 0}
 
 
 @pytest.mark.asyncio
@@ -1356,7 +1473,12 @@ async def test_cycle_propagates_canonical_strategy_identity_into_mandate_evaluat
 
     async def _capture_mandate_eval(*, db, request):
         captured["strategy_version"] = request.strategy_version
-        return SimpleNamespace(evaluation_id=uuid.uuid4())
+        return SimpleNamespace(
+            evaluation_id=uuid.uuid4(),
+            approval_result=MANDATE_APPROVAL_RESULT_ACTIVE_MANDATE,
+            reason_code="authorized_under_active_mandate",
+            deterministic_explanation=("CHECK_PASSED:authorized_under_active_mandate",),
+        )
 
     monkeypatch.setattr("app.services.autonomous_cycle.orchestrator.evaluate_and_record_mandate", _capture_mandate_eval)
 

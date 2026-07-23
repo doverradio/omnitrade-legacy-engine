@@ -53,6 +53,7 @@ from app.services.strategies import StrategyContext, strategy_registry
 from app.services.strategies.registry import StrategyLookupError
 from app.services.autonomous_cycle import AutonomousCycleRequest, run_autonomous_preview_cycle
 from app.services.capital_campaign_orchestration import run_campaign_orchestration_preview_for_candle
+from app.services.mandates.contracts import AUTONOMY_LEVEL_2
 from app.services.orchestration.venue_commissioning_bridge import service as venue_commissioning_service
 from app.services.strategy_outcomes import score_due_strategy_roster_proposal_outcomes
 from app.services.strategy_roster import StrategyRosterRequest, run_strategy_roster_for_candle
@@ -246,6 +247,7 @@ async def _load_single_active_kraken_mandate(db: AsyncSession) -> AutonomousCapi
         select(AutonomousCapitalMandate)
         .where(AutonomousCapitalMandate.status == "ACTIVE")
         .where(AutonomousCapitalMandate.provider == _AUTONOMOUS_CYCLE_PROVIDER)
+        .where(AutonomousCapitalMandate.autonomy_level == AUTONOMY_LEVEL_2)
         .order_by(AutonomousCapitalMandate.updated_at.desc())
         .limit(2)
     )
