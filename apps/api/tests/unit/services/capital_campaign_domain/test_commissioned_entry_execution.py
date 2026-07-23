@@ -19,7 +19,7 @@ from app.schemas.capital_campaign_domain import (
     CommissionedReadinessResponse,
 )
 from app.services.capital_campaign_domain import commissioned_entry_execution as cee
-from app.services.risk.risk_engine import RiskDecisionAction, RiskEvaluationResult
+from app.services.risk.risk_engine import RiskDecisionAction, RiskEvaluationResult, evaluate_signal_risk
 
 
 class _FakeDb:
@@ -247,6 +247,36 @@ def _ownership_request(campaign_id, version: int, live_crypto_order_id) -> Commi
         idempotency_key="ownership-reconcile-1",
         live_crypto_order_id=live_crypto_order_id,
     )
+
+
+def test_commissioned_buy_risk_request_propagates_authorized_quote_amount() -> None:
+    campaign_id = uuid4()
+    request = _execution_request(campaign_id, 1, _readiness_request(campaign_id, 1))
+
+    risk_request = cee._build_risk_request(request)
+
+    assert risk_request.side == "buy"
+    assert risk_request.campaign_authorized_notional == Decimal("5")
+
+
+def test_commissioned_buy_risk_request_uses_campaign_authority_for_minimum_rescue() -> None:
+    campaign_id = uuid4()
+    request = _execution_request(campaign_id, 1, _readiness_request(campaign_id, 1)).model_copy(
+        update={
+            "requested_base_quantity": Decimal("0.00007642280150705764571917677358"),
+            "reference_price": Decimal("65425.5"),
+            "account_equity": Decimal("23.7205"),
+            "max_position_size_pct": Decimal("0.10"),
+        }
+    )
+
+    risk_request = cee._build_risk_request(request)
+    result = evaluate_signal_risk(request=risk_request, reference_price=request.reference_price)
+
+    assert risk_request.campaign_authorized_notional > request.account_equity * request.max_position_size_pct
+    assert result.action == RiskDecisionAction.RESIZE
+    assert result.reason_code == "position_sized_up_to_minimum_viable_order"
+    assert result.approved_quantity * request.reference_price >= request.min_order_notional
 
 
 def _exit_request(campaign_id, version: int) -> CommissionedExitRecommendationRequest:
@@ -1033,6 +1063,9 @@ async def test_exit_recommendation_profitable_sell_and_risk_called(monkeypatch: 
 
     def _risk(**_kwargs):
         calls["risk"] += 1
+        risk_request = _kwargs["request"]
+        assert risk_request.side == "sell"
+        assert risk_request.campaign_authorized_notional is None
         return RiskEvaluationResult(action=RiskDecisionAction.APPROVE, reason_code=None, approved_quantity=Decimal("0.0002"), steps=[])
 
     monkeypatch.setattr(cee, "evaluate_signal_risk", _risk)

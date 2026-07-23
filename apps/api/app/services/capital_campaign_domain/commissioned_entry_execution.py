@@ -568,6 +568,7 @@ def _build_risk_request(request: CommissionedEntryExecutionRequest) -> RiskEvalu
         account_equity=request.account_equity,
         max_position_size_pct=request.max_position_size_pct,
         min_order_notional=request.min_order_notional,
+        campaign_authorized_notional=request.readiness_request.requested_quote_amount,
         qty_step_size=request.qty_step_size,
         supports_fractional=request.supports_fractional,
         actor=request.actor,
