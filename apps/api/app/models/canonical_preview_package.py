@@ -38,6 +38,18 @@ class CanonicalPreviewPackage(Base):
             "package_state IN ('CREATED','READY','AUTHORIZED','DRY_RUN_PASSED','ACTIVATED','EXPIRED','INVALIDATED','SUPERSEDED','COMPLETED','FAILED_CLOSED')",
             name="ck_cpp_package_state",
         ),
+        CheckConstraint(
+            "authorization_source IS NULL OR authorization_source IN ('HUMAN','MANDATE')",
+            name="ck_cpp_authorization_source",
+        ),
+        CheckConstraint(
+            "(authorization_source IS NULL) OR "
+            "(authorization_source = 'HUMAN' AND approval_event_id IS NOT NULL "
+            "AND mandate_id IS NULL AND mandate_version_id IS NULL AND mandate_evaluation_id IS NULL) OR "
+            "(authorization_source = 'MANDATE' AND approval_event_id IS NULL "
+            "AND mandate_id IS NOT NULL AND mandate_version_id IS NOT NULL AND mandate_evaluation_id IS NOT NULL)",
+            name="ck_cpp_authorization_evidence",
+        ),
         Index("ix_cpp_campaign_version", "campaign_id", "campaign_version"),
         Index("ix_cpp_state", "package_state"),
         Index("ix_cpp_preview_expires", "preview_expires_at"),
@@ -74,6 +86,12 @@ class CanonicalPreviewPackage(Base):
     idempotency_key: Mapped[str] = mapped_column(Text, nullable=False)
     input_fingerprint: Mapped[str] = mapped_column(Text, nullable=False)
     approval_event_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), ForeignKey("live_approval_events.id", ondelete="SET NULL"), nullable=True)
+    authorization_source: Mapped[str | None] = mapped_column(Text, nullable=True)
+    mandate_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), ForeignKey("autonomous_capital_mandates.mandate_id", ondelete="RESTRICT"), nullable=True)
+    mandate_version_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), ForeignKey("autonomous_capital_mandate_versions.mandate_version_id", ondelete="RESTRICT"), nullable=True)
+    mandate_evaluation_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), ForeignKey("autonomous_capital_mandate_evaluations.evaluation_id", ondelete="RESTRICT"), nullable=True)
+    authorization_expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    authority_audit_correlation_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), nullable=True)
     dry_run_live_crypto_order_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), ForeignKey("live_crypto_orders.live_crypto_order_id", ondelete="SET NULL"), nullable=True)
     superseded_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     invalidated_reason: Mapped[str | None] = mapped_column(Text, nullable=True)

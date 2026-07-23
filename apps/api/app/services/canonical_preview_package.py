@@ -13,6 +13,10 @@ from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.models.autonomous_cycle_run import AutonomousCycleRun
+from app.models.autonomous_capital_mandate import AutonomousCapitalMandate
+from app.models.autonomous_capital_mandate_authorization import AutonomousCapitalMandateAuthorization
+from app.models.autonomous_capital_mandate_evaluation import AutonomousCapitalMandateEvaluation
+from app.models.autonomous_capital_mandate_version import AutonomousCapitalMandateVersion
 from app.models.capital_campaign import CapitalCampaign
 from app.models.capital_campaign_definition import CapitalCampaignDefinition
 from app.models.audit_log import AuditLog
@@ -33,7 +37,8 @@ from app.services.crypto_order_previews.service import create_crypto_order_previ
 from app.schemas.crypto_order_previews import CryptoOrderPreviewCreateRequest
 from app.services.live.approval import record_live_approval_checkpoint
 from app.services.live.contracts import LiveApprovalCheckpointRequest
-from app.services.strategies.identity import parse_strategy_identity
+from app.services.mandates.contracts import MANDATE_APPROVAL_RESULT_ACTIVE_MANDATE
+from app.services.strategies.identity import build_strategy_identity, parse_strategy_identity
 
 logger = logging.getLogger(__name__)
 
@@ -56,6 +61,7 @@ _EXECUTABLE_ACTIONS = {"OPEN_POSITION_PROPOSED", "CLOSE_POSITION_PROPOSED"}
 _FORCED_COMMISSIONING_MODE = "initial_proving_entry"
 _TERMINAL_PACKAGE_STATES = {"EXPIRED", "INVALIDATED", "SUPERSEDED", "COMPLETED", "FAILED_CLOSED"}
 _FORCED_REISSUE_RATIONALE = "expired_unused_initial_proving_entry_reissued"
+_MANDATE_PACKAGE_AUTHORITY_ACTOR = "system:mandate-package-authority"
 
 
 def _diagnostic(*, code: str, stage: str, detail: str | None = None) -> dict[str, str]:
@@ -96,6 +102,13 @@ class CanonicalPreviewPackageAuthorizeRequest:
     max_total_deployed_campaign_capital_usd: Decimal
     no_leverage: bool
     idempotency_key: str
+
+
+@dataclass(frozen=True, slots=True)
+class CanonicalPreviewPackageMandateAuthorizeRequest:
+    package_id: uuid.UUID
+    idempotency_key: str
+    software_build_version: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -713,11 +726,18 @@ async def _load_campaign_cycle(*, db: AsyncSession, cycle_id: uuid.UUID) -> Auto
     return await db.scalar(select(AutonomousCycleRun).where(AutonomousCycleRun.cycle_id == cycle_id).limit(1))
 
 
-def _record_audit_entry(*, actor: str, action: str, entity_id: uuid.UUID, after_state: dict[str, Any]) -> AuditLog:
+def _record_audit_entry(
+    *,
+    actor: str,
+    action: str,
+    entity_id: uuid.UUID,
+    after_state: dict[str, Any],
+    entity_type: str = "canonical_proving_activation",
+) -> AuditLog:
     return AuditLog(
         actor=actor,
         action=action,
-        entity_type="canonical_proving_activation",
+        entity_type=entity_type,
         entity_id=entity_id,
         before_state=None,
         after_state=after_state,
@@ -758,6 +778,16 @@ def _package_payload(package: CanonicalPreviewPackage) -> dict[str, Any]:
         "idempotency_key": package.idempotency_key,
         "input_fingerprint": package.input_fingerprint,
         "approval_event_id": _serialize_uuid(package.approval_event_id),
+        "authorization_source": getattr(package, "authorization_source", None),
+        "mandate_id": _serialize_uuid(getattr(package, "mandate_id", None)),
+        "mandate_version_id": _serialize_uuid(getattr(package, "mandate_version_id", None)),
+        "mandate_evaluation_id": _serialize_uuid(getattr(package, "mandate_evaluation_id", None)),
+        "authorization_expires_at": (
+            getattr(package, "authorization_expires_at", None).isoformat()
+            if getattr(package, "authorization_expires_at", None) is not None
+            else None
+        ),
+        "authority_audit_correlation_id": _serialize_uuid(getattr(package, "authority_audit_correlation_id", None)),
         "dry_run_live_crypto_order_id": _serialize_uuid(package.dry_run_live_crypto_order_id),
         "superseded_at": package.superseded_at.isoformat() if package.superseded_at else None,
         "invalidated_reason": package.invalidated_reason,
@@ -1182,6 +1212,26 @@ async def authorize_canonical_preview_package(
 
     package.package_state = "AUTHORIZED"
     package.approval_event_id = checkpoint.approval_event_id
+    package.authorization_source = "HUMAN"
+    package.mandate_id = None
+    package.mandate_version_id = None
+    package.mandate_evaluation_id = None
+    package.authorization_expires_at = request.expires_at
+    package.authority_audit_correlation_id = uuid.uuid4()
+    db.add(
+        _record_audit_entry(
+            actor=request.actor,
+            action="canonical_preview_package_authorized_human",
+            entity_id=package.package_id,
+            entity_type="canonical_preview_package",
+            after_state={
+                "package_state": "AUTHORIZED",
+                "authorization_source": "HUMAN",
+                "approval_event_id": str(checkpoint.approval_event_id),
+                "authority_audit_correlation_id": str(package.authority_audit_correlation_id),
+            },
+        )
+    )
     await db.flush()
 
     logger.info(
@@ -1195,6 +1245,243 @@ async def authorize_canonical_preview_package(
     payload["approval_scope"] = approval_scope
     payload["checkpoint_type"] = checkpoint.checkpoint_type
     return payload
+
+
+async def authorize_canonical_preview_package_under_mandate(
+    *,
+    db: AsyncSession,
+    request: CanonicalPreviewPackageMandateAuthorizeRequest,
+) -> dict[str, Any]:
+    """Authorize one READY package using one exact, active LEVEL_2 mandate.
+
+    This establishes package authority only. It deliberately does not create a
+    LiveApprovalEvent and does not dry-run, activate, prepare, or submit an
+    order.
+    """
+    if not request.idempotency_key.strip():
+        raise PermissionError("idempotency key is required")
+
+    package = await _load_package(db=db, package_id=request.package_id)
+    if package is None:
+        raise LookupError("canonical preview package not found")
+    if package.package_state == "AUTHORIZED" and getattr(package, "authorization_source", None) == "MANDATE":
+        return {
+            "idempotent": True,
+            "package": _package_payload(package),
+            "approval_result": MANDATE_APPROVAL_RESULT_ACTIVE_MANDATE,
+        }
+    if package.package_state != "READY":
+        raise PermissionError("package is not READY for mandate authorization")
+
+    now = _utcnow()
+    if package.preview_expires_at <= now:
+        raise PermissionError("canonical preview package expired")
+    runtime_campaign = await db.scalar(
+        select(CapitalCampaign).where(CapitalCampaign.uuid == package.runtime_campaign_id).limit(1)
+    )
+    if runtime_campaign is None:
+        raise PermissionError("runtime campaign missing")
+    if runtime_campaign.definition_campaign_id != package.campaign_id or runtime_campaign.definition_version != package.campaign_version:
+        raise PermissionError("campaign identity or version mismatch")
+
+    connection_id_raw = (package.market_evidence_identity or {}).get("exchange_connection_id")
+    if not connection_id_raw:
+        raise PermissionError("package exchange connection identity missing")
+    try:
+        connection_id = uuid.UUID(str(connection_id_raw))
+    except ValueError as exc:
+        raise PermissionError("package exchange connection identity invalid") from exc
+
+    statement = (
+        select(AutonomousCapitalMandate)
+        .where(
+            AutonomousCapitalMandate.status == "ACTIVE",
+            AutonomousCapitalMandate.autonomy_level == "LEVEL_2",
+            AutonomousCapitalMandate.provider == package.provider,
+            AutonomousCapitalMandate.exchange_environment == package.environment,
+            AutonomousCapitalMandate.exchange_connection_id == connection_id,
+            AutonomousCapitalMandate.live_trading_profile_id == package.live_trading_profile_id,
+            AutonomousCapitalMandate.paper_account_id == package.paper_account_id,
+            AutonomousCapitalMandate.capital_campaign_id == runtime_campaign.id,
+        )
+        .order_by(AutonomousCapitalMandate.created_at.asc())
+        .limit(2)
+    )
+    mandates = list((await db.execute(statement)).scalars().all())
+    if not mandates:
+        raise PermissionError("no matching ACTIVE LEVEL_2 mandate")
+    if len(mandates) != 1:
+        raise PermissionError("ambiguous matching ACTIVE LEVEL_2 mandates")
+    mandate = mandates[0]
+    if mandate.status != "ACTIVE" or mandate.autonomy_level != "LEVEL_2":
+        raise PermissionError("matching mandate does not permit unattended authorization")
+    if mandate.revoked_at is not None:
+        raise PermissionError("matching mandate is revoked")
+    if mandate.expires_at is not None and mandate.expires_at <= now:
+        raise PermissionError("matching mandate is expired")
+    exact_identity_checks = (
+        (mandate.provider == package.provider, "provider mismatch"),
+        (mandate.exchange_environment == package.environment, "environment mismatch"),
+        (mandate.exchange_connection_id == connection_id, "connection mismatch"),
+        (mandate.live_trading_profile_id == package.live_trading_profile_id, "profile mismatch"),
+        (mandate.paper_account_id == package.paper_account_id, "paper account mismatch"),
+        (mandate.capital_campaign_id == runtime_campaign.id, "campaign mismatch"),
+    )
+    for passed, reason in exact_identity_checks:
+        if not passed:
+            raise PermissionError(reason)
+
+    authorization = await db.scalar(
+        select(AutonomousCapitalMandateAuthorization)
+        .where(
+            AutonomousCapitalMandateAuthorization.mandate_id == mandate.mandate_id,
+            AutonomousCapitalMandateAuthorization.authorization_state == "AUTHORIZED",
+            AutonomousCapitalMandateAuthorization.revoked_at.is_(None),
+        )
+        .order_by(AutonomousCapitalMandateAuthorization.recorded_at.desc())
+        .limit(1)
+    )
+    if authorization is None:
+        raise PermissionError("matching mandate is unauthorized")
+    if authorization.expires_at is not None and authorization.expires_at <= now:
+        raise PermissionError("matching mandate authorization is expired")
+
+    version = await db.scalar(
+        select(AutonomousCapitalMandateVersion)
+        .where(
+            AutonomousCapitalMandateVersion.mandate_version_id == authorization.mandate_version_id,
+            AutonomousCapitalMandateVersion.mandate_id == mandate.mandate_id,
+        )
+        .limit(1)
+    )
+    if version is None or not version.is_authorized or not version.is_active:
+        raise PermissionError("matching mandate version is not authorized and active")
+
+    strategy = await db.scalar(select(Strategy).where(Strategy.id == package.strategy_id).limit(1))
+    if strategy is None:
+        raise PermissionError("package strategy identity missing")
+    strategy_identity = build_strategy_identity(slug=strategy.slug, module_version=package.strategy_version)
+    amount = _decimal(package.risk_approved_amount)
+    static_failures: list[str] = []
+    if package.product not in version.allowed_products:
+        static_failures.append("product mismatch")
+    if package.side not in version.allowed_order_sides:
+        static_failures.append("side mismatch")
+    if strategy_identity not in version.allowed_strategy_versions:
+        static_failures.append("strategy identity mismatch")
+    if amount > _decimal(version.authorized_capital_usd) or amount > _decimal(version.max_order_notional_usd):
+        static_failures.append("capital scope mismatch")
+    if amount > _decimal(version.max_open_exposure_usd) or amount > _decimal(version.max_daily_deployed_usd):
+        static_failures.append("capital scope mismatch")
+    if version.approval_policy != "MANDATE_ALLOWED":
+        static_failures.append("mandate approval policy requires human approval")
+    if static_failures:
+        raise PermissionError(static_failures[0])
+
+    correlation_id = uuid.uuid4()
+    evaluation = await db.scalar(
+        select(AutonomousCapitalMandateEvaluation)
+        .where(AutonomousCapitalMandateEvaluation.idempotency_key == request.idempotency_key)
+        .limit(1)
+    )
+    if evaluation is not None:
+        context = evaluation.request_context if isinstance(evaluation.request_context, dict) else {}
+        if evaluation.mandate_id != mandate.mandate_id or context.get("package_id") != str(package.package_id):
+            raise PermissionError("mandate package authorization idempotency conflict")
+    else:
+        evaluation = AutonomousCapitalMandateEvaluation(
+            evaluation_id=uuid.uuid4(),
+            mandate_id=mandate.mandate_id,
+            mandate_version_id=version.mandate_version_id,
+            mandate_version_number=version.version_number,
+            decision_id=package.decision_record_id,
+            autonomy_level=mandate.autonomy_level,
+            proposed_action=package.side,
+            authorization_result="AUTHORIZED",
+            approval_result=MANDATE_APPROVAL_RESULT_ACTIVE_MANDATE,
+            risk_verdict="ACCEPTED",
+            risk_evaluated=True,
+            checks_passed=[
+                "mandate_status", "autonomy_level_supports_autonomous_execution", "mandate_not_revoked",
+                "mandate_not_expired", "authorization_active", "authorization_not_expired",
+                "version_authorized", "version_active", "campaign_match", "campaign_version_match",
+                "profile_match", "paper_account_match", "provider_match", "environment_match",
+                "connection_match", "product_allowed", "side_allowed", "strategy_allowed",
+                "capital_scope", "risk_approved_package",
+            ],
+            checks_failed=[],
+            deterministic_explanation=["CHECK_PASSED:canonical_package_authorized_under_active_level2_mandate"],
+            reason_code="authorized_under_active_mandate",
+            human_approval_required=False,
+            active_mandate_exemption_eligible=True,
+            request_context={
+                "purpose": "canonical_preview_package_authorization",
+                "package_id": str(package.package_id),
+                "campaign_id": str(package.campaign_id),
+                "campaign_version": package.campaign_version,
+                "live_trading_profile_id": str(package.live_trading_profile_id),
+                "exchange_connection_id": str(connection_id),
+                "risk_event_id": str(package.risk_event_id),
+                "risk_approved_amount": _serialize_decimal(amount),
+                "scope": "PACKAGE_AUTHORIZATION_ONLY",
+            },
+            actor=_MANDATE_PACKAGE_AUTHORITY_ACTOR,
+            audit_correlation_id=correlation_id,
+            software_build_version=request.software_build_version,
+            idempotency_key=request.idempotency_key,
+        )
+        db.add(evaluation)
+        db.add(
+            _record_audit_entry(
+                actor=_MANDATE_PACKAGE_AUTHORITY_ACTOR,
+                action="MANDATE_EVALUATION_RECORDED",
+                entity_id=mandate.mandate_id,
+                entity_type="autonomous_capital_mandate",
+                after_state={
+                    "evaluation_id": str(evaluation.evaluation_id),
+                    "package_id": str(package.package_id),
+                    "approval_result": MANDATE_APPROVAL_RESULT_ACTIVE_MANDATE,
+                    "authorization_result": "AUTHORIZED",
+                    "scope": "PACKAGE_AUTHORIZATION_ONLY",
+                    "audit_correlation_id": str(correlation_id),
+                },
+            )
+        )
+        await db.flush()
+
+    effective_expirations = [item for item in (mandate.expires_at, authorization.expires_at, package.preview_expires_at) if item is not None]
+    package.package_state = "AUTHORIZED"
+    package.approval_event_id = None
+    package.authorization_source = "MANDATE"
+    package.mandate_id = mandate.mandate_id
+    package.mandate_version_id = evaluation.mandate_version_id
+    package.mandate_evaluation_id = evaluation.evaluation_id
+    package.authorization_expires_at = min(effective_expirations)
+    package.authority_audit_correlation_id = correlation_id
+    db.add(
+        _record_audit_entry(
+            actor=_MANDATE_PACKAGE_AUTHORITY_ACTOR,
+            action="canonical_preview_package_authorized_mandate",
+            entity_id=package.package_id,
+            entity_type="canonical_preview_package",
+            after_state={
+                "package_state": "AUTHORIZED",
+                "authorization_source": "MANDATE",
+                "approval_result": evaluation.approval_result,
+                "mandate_id": str(mandate.mandate_id),
+                "mandate_version_id": str(evaluation.mandate_version_id),
+                "mandate_evaluation_id": str(evaluation.evaluation_id),
+                "authority_audit_correlation_id": str(correlation_id),
+            },
+        )
+    )
+    await db.flush()
+    return {
+        "idempotent": False,
+        "package": _package_payload(package),
+        "approval_result": evaluation.approval_result,
+        "mandate_evaluation_id": str(evaluation.evaluation_id),
+    }
 
 
 async def run_dry_run_for_canonical_preview_package(

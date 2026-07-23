@@ -1784,7 +1784,153 @@ async def test_authorize_canonical_preview_package_records_bounded_proving_check
     assert result["approval_scope"]["campaign_version"] == str(package.campaign_version)
     assert result["approval_scope"]["capital_campaign_version"] == str(package.campaign_version)
     assert captured["request"].checkpoint_type == "bounded_proving_entry"
+    assert package.authorization_source == "HUMAN"
+    assert package.mandate_evaluation_id is None
+    human_audit = next(item for item in db.added if getattr(item, "action", None) == "canonical_preview_package_authorized_human")
+    assert human_audit.entity_type == "canonical_preview_package"
     assert db.flush_calls == 1
+
+
+def _mandate_authority_fixture() -> tuple[SimpleNamespace, ...]:
+    now = datetime.now(timezone.utc)
+    connection_id = uuid4()
+    runtime = SimpleNamespace(id=41, uuid=uuid4(), definition_campaign_id=uuid4(), definition_version=7)
+    package = SimpleNamespace(
+        package_id=uuid4(), campaign_id=runtime.definition_campaign_id, campaign_version=7,
+        runtime_campaign_id=runtime.uuid, paper_account_id=uuid4(), live_trading_profile_id=uuid4(),
+        provider="kraken_spot", environment="production", product="BTC-USD", side="BUY",
+        proposed_order_amount=Decimal("5"), risk_approved_amount=Decimal("5"), strategy_id=uuid4(),
+        strategy_version="1.0.0", parameter_set_id=uuid4(), parameter_set_version="baseline",
+        decision_record_id=uuid4(), risk_event_id=uuid4(), crypto_order_preview_id=uuid4(),
+        market_evidence_identity={"exchange_connection_id": str(connection_id)},
+        market_evidence_observed_at=now, preview_expires_at=now + timedelta(minutes=5),
+        package_state="READY", generated_at=now, idempotency_key="pkg-mandate", input_fingerprint="fp",
+        approval_event_id=None, authorization_source=None, mandate_id=None, mandate_version_id=None,
+        mandate_evaluation_id=None, authorization_expires_at=None, authority_audit_correlation_id=None,
+        dry_run_live_crypto_order_id=None, superseded_at=None, invalidated_reason=None,
+    )
+    mandate = SimpleNamespace(
+        mandate_id=uuid4(), status="ACTIVE", autonomy_level="LEVEL_2", provider=package.provider,
+        exchange_environment=package.environment, exchange_connection_id=connection_id,
+        live_trading_profile_id=package.live_trading_profile_id, paper_account_id=package.paper_account_id,
+        capital_campaign_id=runtime.id, revoked_at=None, expires_at=now + timedelta(hours=1),
+        created_at=now,
+    )
+    authorization = SimpleNamespace(
+        mandate_version_id=uuid4(), authorization_state="AUTHORIZED", revoked_at=None,
+        expires_at=now + timedelta(minutes=30), recorded_at=now,
+    )
+    version = SimpleNamespace(
+        mandate_version_id=authorization.mandate_version_id, mandate_id=mandate.mandate_id,
+        version_number=1,
+        is_authorized=True, is_active=True, allowed_products=["BTC-USD"], allowed_order_sides=["BUY"],
+        allowed_strategy_versions=["ma_crossover@1.0.0"], authorized_capital_usd=Decimal("25"),
+        max_order_notional_usd=Decimal("5"), max_open_exposure_usd=Decimal("25"),
+        max_daily_deployed_usd=Decimal("25"), approval_policy="MANDATE_ALLOWED",
+    )
+    strategy = SimpleNamespace(id=package.strategy_id, slug="ma_crossover")
+    evaluation = SimpleNamespace(
+        authorization_result="AUTHORIZED", approval_result="APPROVAL_SATISFIED_BY_ACTIVE_MANDATE",
+        reason_code="authorized_under_active_mandate", mandate_version_id=version.mandate_version_id,
+        evaluation_id=uuid4(),
+    )
+    return package, runtime, mandate, authorization, version, strategy, evaluation
+
+
+@pytest.mark.asyncio
+async def test_authorize_canonical_preview_package_under_mandate_records_truthful_authority(monkeypatch: pytest.MonkeyPatch) -> None:
+    package, runtime, mandate, authorization, version, strategy, evaluation = _mandate_authority_fixture()
+    monkeypatch.setattr(cpp, "_load_package", _async_return(package))
+    db = _FakeDb(scalar_values=[runtime, authorization, version, strategy], execute_rows=[mandate])
+
+    result = await cpp.authorize_canonical_preview_package_under_mandate(
+        db=db,
+        request=cpp.CanonicalPreviewPackageMandateAuthorizeRequest(package_id=package.package_id, idempotency_key="pkg-auth-mandate-1"),
+    )
+
+    assert result["approval_result"] == "APPROVAL_SATISFIED_BY_ACTIVE_MANDATE"
+    assert package.package_state == "AUTHORIZED"
+    assert package.authorization_source == "MANDATE"
+    assert package.approval_event_id is None
+    assert package.mandate_id == mandate.mandate_id
+    assert package.mandate_version_id == version.mandate_version_id
+    recorded_evaluations = [item for item in db.added if isinstance(item, cpp.AutonomousCapitalMandateEvaluation)]
+    assert len(recorded_evaluations) == 1
+    assert package.mandate_evaluation_id == recorded_evaluations[0].evaluation_id
+    mandate_audit = next(item for item in db.added if getattr(item, "action", None) == "canonical_preview_package_authorized_mandate")
+    assert mandate_audit.entity_type == "canonical_preview_package"
+    assert mandate_audit.after_state["authorization_source"] == "MANDATE"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("mutation", "expected"),
+    [
+        ("level1", "does not permit unattended"),
+        ("expired", "mandate is expired"),
+        ("revoked", "mandate is revoked"),
+        ("campaign", "campaign mismatch"),
+        ("provider", "provider mismatch"),
+        ("profile", "profile mismatch"),
+        ("connection", "connection mismatch"),
+        ("environment", "environment mismatch"),
+        ("product", "product mismatch"),
+        ("side", "side mismatch"),
+        ("strategy", "strategy identity mismatch"),
+        ("capital", "capital scope mismatch"),
+        ("authorization_expired", "authorization is expired"),
+        ("authorization_revoked", "unauthorized"),
+        ("version_unauthorized", "version is not authorized"),
+    ],
+)
+async def test_mandate_package_authority_failures_are_closed(
+    monkeypatch: pytest.MonkeyPatch, mutation: str, expected: str,
+) -> None:
+    package, runtime, mandate, authorization, version, strategy, evaluation = _mandate_authority_fixture()
+    if mutation == "level1": mandate.autonomy_level = "LEVEL_1"
+    elif mutation == "expired": mandate.expires_at = datetime.now(timezone.utc) - timedelta(seconds=1)
+    elif mutation == "revoked": mandate.revoked_at = datetime.now(timezone.utc)
+    elif mutation == "campaign": mandate.capital_campaign_id += 1
+    elif mutation == "provider": mandate.provider = "coinbase"
+    elif mutation == "profile": mandate.live_trading_profile_id = uuid4()
+    elif mutation == "connection": mandate.exchange_connection_id = uuid4()
+    elif mutation == "environment": mandate.exchange_environment = "sandbox"
+    elif mutation == "product": version.allowed_products = ["ETH-USD"]
+    elif mutation == "side": version.allowed_order_sides = ["SELL"]
+    elif mutation == "strategy": version.allowed_strategy_versions = ["other@1.0.0"]
+    elif mutation == "capital": version.max_order_notional_usd = Decimal("4")
+    elif mutation == "authorization_expired": authorization.expires_at = datetime.now(timezone.utc) - timedelta(seconds=1)
+    elif mutation == "authorization_revoked": authorization = None
+    elif mutation == "version_unauthorized": version.is_authorized = False
+    monkeypatch.setattr(cpp, "_load_package", _async_return(package))
+    scalars = [runtime, authorization]
+    if authorization is not None:
+        scalars.extend([version, strategy])
+    db = _FakeDb(scalar_values=scalars, execute_rows=[mandate])
+
+    with pytest.raises(PermissionError, match=expected):
+        await cpp.authorize_canonical_preview_package_under_mandate(
+            db=db,
+            request=cpp.CanonicalPreviewPackageMandateAuthorizeRequest(package_id=package.package_id, idempotency_key=f"fail-{mutation}"),
+        )
+    assert package.package_state == "READY"
+    assert package.authorization_source is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("mandate_count", [0, 2])
+async def test_mandate_package_authority_requires_exactly_one_match(monkeypatch: pytest.MonkeyPatch, mandate_count: int) -> None:
+    package, runtime, mandate, authorization, version, strategy, _evaluation = _mandate_authority_fixture()
+    monkeypatch.setattr(cpp, "_load_package", _async_return(package))
+    rows = [] if mandate_count == 0 else [mandate, SimpleNamespace(**vars(mandate))]
+    db = _FakeDb(scalar_values=[runtime, authorization, version, strategy], execute_rows=rows)
+    expected = "no matching" if mandate_count == 0 else "ambiguous matching"
+    with pytest.raises(PermissionError, match=expected):
+        await cpp.authorize_canonical_preview_package_under_mandate(
+            db=db,
+            request=cpp.CanonicalPreviewPackageMandateAuthorizeRequest(package_id=package.package_id, idempotency_key=f"count-{mandate_count}"),
+        )
+    assert package.package_state == "READY"
 
 
 @pytest.mark.asyncio
