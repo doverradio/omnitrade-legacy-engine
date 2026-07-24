@@ -12,6 +12,15 @@ from app.services.orchestration import autonomous_order_preparation as subject
 from app.services.orchestration.autonomous_order_preparation import prepare_autonomous_claimed_buy
 
 
+@pytest.fixture(autouse=True)
+def _canonical_identity(monkeypatch: pytest.MonkeyPatch, request: pytest.FixtureRequest):
+    if request.node.name == "test_identity_derivation_reuses_commissioned_preview_generator":
+        return
+    async def _identity(**_kwargs):
+        return SimpleNamespace(), SimpleNamespace(preview_identity_hash="canonical-preview-hash")
+    monkeypatch.setattr(subject, "_canonical_preview_identity", _identity)
+
+
 def _evidence():
     now = datetime.now(timezone.utc)
     claim = SimpleNamespace(
@@ -42,21 +51,23 @@ def _evidence():
         live_crypto_order_id=order_id, crypto_order_preview_id=package.crypto_order_preview_id,
         exchange_connection_id=claim.connection_id, provider=claim.provider, environment=claim.environment,
         product_id=claim.product, side="BUY", status="DRY_RUN_READY", safe_provider_response={}, updated_at=now,
+        order_type="MARKET",
     )
-    return now, claim, package, activation, risk, order
+    preview = SimpleNamespace(estimated_base_size=0.05)
+    return now, claim, package, activation, risk, order, preview
 
 
-def _db(claim, package, activation, risk, order):
+def _db(claim, package, activation, risk, order, preview):
     return SimpleNamespace(
-        scalar=AsyncMock(side_effect=[claim, package, activation, risk, None, None, 0, order]),
+        scalar=AsyncMock(side_effect=[claim, package, activation, risk, None, None, 0, order, preview]),
         add=Mock(), flush=AsyncMock(),
     )
 
 
 @pytest.mark.asyncio
 async def test_submission_off_foundation_prepares_exactly_one_canonical_order() -> None:
-    now, claim, package, activation, risk, order = _evidence()
-    db = _db(claim, package, activation, risk, order)
+    now, claim, package, activation, risk, order, preview = _evidence()
+    db = _db(claim, package, activation, risk, order, preview)
     result = await prepare_autonomous_claimed_buy(db=db, claim_id=claim.claim_id, now=now)
     assert result.order is order
     assert order.status == "PENDING_CONFIRMATION"
@@ -64,18 +75,23 @@ async def test_submission_off_foundation_prepares_exactly_one_canonical_order() 
     assert order.safe_provider_response["autonomous_execution_claim_id"] == str(claim.claim_id)
     assert claim.live_order_id == order.live_crypto_order_id
     assert claim.claim_status == "EXECUTION_STARTED"
+    assert order.safe_provider_response["commissioned_preview_identity_hash"] == "canonical-preview-hash"
 
 
 @pytest.mark.asyncio
 async def test_restart_reuses_same_order_without_mutation() -> None:
-    now, claim, package, activation, risk, order = _evidence()
+    now, claim, package, activation, risk, order, preview = _evidence()
     claim.live_order_id = order.live_crypto_order_id
     claim.claim_status = "SAFETY_DISABLED"
     order.status = "PENDING_CONFIRMATION"
     order.safe_provider_response = {
         "autonomous_execution_claim_id": str(claim.claim_id), "autonomous_prepared": True,
+        "commissioned_preview_identity_hash": "canonical-preview-hash",
+        "commissioned_preview_identity_binding": subject._identity_binding(
+            claim=claim, package=package, activation=activation, order=order, preview=preview,
+        ),
     }
-    db = _db(claim, package, activation, risk, order)
+    db = _db(claim, package, activation, risk, order, preview)
     result = await prepare_autonomous_claimed_buy(db=db, claim_id=claim.claim_id, now=now)
     assert result.replayed
     assert result.order.live_crypto_order_id == claim.live_order_id
@@ -84,16 +100,16 @@ async def test_restart_reuses_same_order_without_mutation() -> None:
 
 @pytest.mark.asyncio
 async def test_identity_mismatch_fails_closed() -> None:
-    now, claim, package, activation, risk, order = _evidence()
+    now, claim, package, activation, risk, order, preview = _evidence()
     package.provider = "coinbase_advanced"
     with pytest.raises(InvalidRequestError) as exc:
-        await prepare_autonomous_claimed_buy(db=_db(claim, package, activation, risk, order), claim_id=claim.claim_id, now=now)
+        await prepare_autonomous_claimed_buy(db=_db(claim, package, activation, risk, order, preview), claim_id=claim.claim_id, now=now)
     assert exc.value.details["blocker"] == "claim_package_identity_mismatch"
 
 
 @pytest.mark.asyncio
 async def test_missing_risk_evidence_fails_closed() -> None:
-    now, claim, package, activation, _risk, order = _evidence()
+    now, claim, package, activation, _risk, order, _preview = _evidence()
     db = SimpleNamespace(scalar=AsyncMock(side_effect=[claim, package, activation, None]), add=Mock(), flush=AsyncMock())
     with pytest.raises(InvalidRequestError) as exc:
         await prepare_autonomous_claimed_buy(db=db, claim_id=claim.claim_id, now=now)
@@ -102,9 +118,15 @@ async def test_missing_risk_evidence_fails_closed() -> None:
 
 @pytest.mark.asyncio
 async def test_enabled_execution_uses_persisted_exact_package_and_order(monkeypatch: pytest.MonkeyPatch) -> None:
-    _now, claim, package, activation, _risk, order = _evidence()
+    _now, claim, package, activation, _risk, order, _preview = _evidence()
     prepared = subject.AutonomousOrderPreparationResult(claim=claim, order=order, replayed=False)
     preview = SimpleNamespace(estimated_average_price=100, estimated_base_size=0.05)
+    order.safe_provider_response = {
+        "commissioned_preview_identity_hash": "canonical-preview-hash",
+        "commissioned_preview_identity_binding": subject._identity_binding(
+            claim=claim, package=package, activation=activation, order=order, preview=preview,
+        ),
+    }
     account = SimpleNamespace(current_cash_balance=25)
     asset = SimpleNamespace(id=uuid4(), min_order_notional=1, qty_step_size=0.00001, supports_fractional=True)
     db = SimpleNamespace(scalar=AsyncMock(side_effect=[package, activation, preview, account, asset]))
@@ -117,3 +139,63 @@ async def test_enabled_execution_uses_persisted_exact_package_and_order(monkeypa
     assert kwargs["package_id"] == claim.package_id
     assert kwargs["request"].live_crypto_order_id == order.live_crypto_order_id
     assert kwargs["request"].confirmation_challenge_id is None
+    assert kwargs["request"].expected_preview_identity_hash == "canonical-preview-hash"
+
+
+@pytest.mark.asyncio
+async def test_input_fingerprint_is_rejected_as_preview_identity(monkeypatch: pytest.MonkeyPatch) -> None:
+    _now, claim, package, activation, _risk, order, _preview = _evidence()
+    order.safe_provider_response = {"commissioned_preview_identity_hash": package.input_fingerprint}
+    prepared = subject.AutonomousOrderPreparationResult(claim=claim, order=order, replayed=True)
+    preview = SimpleNamespace(estimated_average_price=100, estimated_base_size=0.05)
+    account = SimpleNamespace(current_cash_balance=25)
+    asset = SimpleNamespace(id=uuid4(), min_order_notional=1, qty_step_size=0.00001, supports_fractional=True)
+    db = SimpleNamespace(scalar=AsyncMock(side_effect=[package, activation, preview, account, asset]))
+    monkeypatch.setattr(
+        subject, "_canonical_preview_identity",
+        AsyncMock(return_value=(SimpleNamespace(), SimpleNamespace(preview_identity_hash=package.input_fingerprint))),
+    )
+    with pytest.raises(InvalidRequestError) as exc:
+        await subject.execute_prepared_autonomous_claim(db=db, prepared=prepared)
+    assert exc.value.details["blocker"] == "input_fingerprint_substitution_rejected"
+
+
+@pytest.mark.asyncio
+async def test_historical_replayed_order_without_canonical_identity_fails_closed() -> None:
+    now, claim, package, activation, risk, order, preview = _evidence()
+    claim.live_order_id = order.live_crypto_order_id
+    claim.claim_status = "SAFETY_DISABLED"
+    order.status = "PENDING_CONFIRMATION"
+    order.safe_provider_response = {"autonomous_execution_claim_id": str(claim.claim_id)}
+    with pytest.raises(InvalidRequestError) as exc:
+        await prepare_autonomous_claimed_buy(
+            db=_db(claim, package, activation, risk, order, preview), claim_id=claim.claim_id, now=now,
+        )
+    assert exc.value.details["blocker"] == "canonical_preview_identity_missing"
+
+
+@pytest.mark.asyncio
+async def test_identity_derivation_reuses_commissioned_preview_generator(monkeypatch: pytest.MonkeyPatch) -> None:
+    now, claim, package, activation, _risk, _order, _preview = _evidence()
+    definition = SimpleNamespace(risk_policy_id="risk-1", risk_policy_version="v1")
+    connection = SimpleNamespace(
+        last_verified_at=now, last_successful_sync_at=now, last_heartbeat_at=now,
+        balances=[{"currency": "USD", "available": "25"}], credentials_valid=True, status="connected",
+    )
+    mandate = SimpleNamespace(mandate_id=claim.mandate_id)
+    mandate_version = SimpleNamespace(version_number=3, entry_policy={"minimum_base_quantity": "0.00001"})
+    preview = SimpleNamespace(
+        created_at=now, estimated_average_price=100, best_ask=None, best_bid=None,
+        estimated_fee=0.01, estimated_slippage=0.01,
+    )
+    db = SimpleNamespace(scalar=AsyncMock(side_effect=[definition, connection, mandate, mandate_version]))
+    canonical = SimpleNamespace(preview_identity_hash="manual-canonical-hash")
+    generator = AsyncMock(return_value=canonical)
+    monkeypatch.setattr(subject, "generate_commissioned_campaign_preview", generator)
+    request, result = await subject._canonical_preview_identity(
+        db=db, claim=claim, package=package, activation=activation, preview=preview,
+    )
+    assert result.preview_identity_hash == "manual-canonical-hash"
+    generator.assert_awaited_once_with(db=db, request=request)
+    assert request.mandate_version_id == claim.mandate_version_id
+    assert request.requested_quote_amount == package.risk_approved_amount
