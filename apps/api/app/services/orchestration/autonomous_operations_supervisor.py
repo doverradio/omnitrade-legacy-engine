@@ -34,6 +34,7 @@ def resolve_autonomous_profit_snapshot(evidence: dict[str, Any]) -> dict[str, An
     now = evidence.get("now") or datetime.now(timezone.utc)
     cycle = evidence.get("cycle")
     package = evidence.get("package")
+    historical_package = evidence.get("historical_package") or package
     activation = evidence.get("activation")
     order = evidence.get("order")
     position = evidence.get("position")
@@ -41,6 +42,7 @@ def resolve_autonomous_profit_snapshot(evidence: dict[str, Any]) -> dict[str, An
     readiness = evidence.get("readiness") or {}
     action = str(getattr(cycle, "proposed_action", "") or "").upper()
     failure = str(getattr(cycle, "failure_reason", "") or "").strip()
+    expected_hold_reason = action == "HOLD" and failure in {"", "strategy_hold_signal", "hold_no_package_created"}
     package_state = str(getattr(package, "package_state", "") or "").upper()
     order_side = str(getattr(order, "side", "") or "").upper()
     order_status = str(getattr(order, "status", "") or "").upper()
@@ -89,7 +91,7 @@ def resolve_autonomous_profit_snapshot(evidence: dict[str, Any]) -> dict[str, An
         stage = "NET_PROFIT_CONFIRMED"
 
     reason_codes: list[str] = []
-    if failure:
+    if failure and not expected_hold_reason:
         lower = failure.lower()
         if "scorecard" in lower and "timeout" in lower:
             reason_codes.append("scorecard_fetch_timeout")
@@ -104,6 +106,12 @@ def resolve_autonomous_profit_snapshot(evidence: dict[str, Any]) -> dict[str, An
         code = item.get("code") if isinstance(item, dict) else item
         if code and code not in {"no_package_available"} and str(code) not in reason_codes:
             reason_codes.append(str(code))
+
+    # Activation readiness is intentionally NOT_READY when only expired history
+    # exists. During a canonical HOLD there is no package that should advance,
+    # so that readiness reason describes inventory, not an operational blocker.
+    if expected_hold_reason and package is None:
+        reason_codes = [code for code in reason_codes if code != "stale_package"]
 
     automatic_activation = bool(evidence.get("automatic_activation_enabled"))
     live_submission = bool(evidence.get("live_submission_enabled"))
@@ -126,7 +134,7 @@ def resolve_autonomous_profit_snapshot(evidence: dict[str, Any]) -> dict[str, An
         overall = "STALLED" if stalled and hard_blockers == ["pipeline_stalled"] else "BLOCKED"
     elif "automatic_activation_disabled" in reason_codes or "live_submission_disabled" in reason_codes:
         overall = "SAFETY_DISABLED"
-    elif action == "HOLD" and package is None and not failure:
+    elif expected_hold_reason and package is None:
         overall = "HEALTHY_WAITING"
         reason_codes = ["healthy_hold", "no_actionable_signal"]
     else:
@@ -141,6 +149,12 @@ def resolve_autonomous_profit_snapshot(evidence: dict[str, Any]) -> dict[str, An
         "BLOCKED": "Inspect the first reason code and its canonical audit evidence.",
         "FIRST_AUTONOMOUS_PROFIT_COMPLETE": "Preserve the completed reconciliation and profit evidence.",
     }[overall]
+    if "stale_package" in reason_codes and historical_package is not None:
+        package_id = _id(historical_package, "package_id")
+        recommendation = (
+            f"Inspect canonical package {package_id}; it is past preview_expires_at. "
+            "Preserve it as history and wait for or verify a newer eligible package."
+        )
 
     return {
         "generated_at": _iso(now),
@@ -154,8 +168,9 @@ def resolve_autonomous_profit_snapshot(evidence: dict[str, Any]) -> dict[str, An
         "latest_autonomous_cycle_id": _id(cycle, "cycle_id"),
         "latest_orchestration_cycle_id": _id(cycle, "cycle_id"),
         "latest_decision_record_id": _id(package, "decision_record_id") or _id(cycle, "decision_record_id"),
-        "latest_package_id": _id(package, "package_id"),
-        "latest_package_state": package_state or None,
+        "latest_package_id": _id(historical_package, "package_id"),
+        "latest_package_state": None if historical_package is None else str(getattr(historical_package, "package_state", "") or "").upper() or None,
+        "active_package_id": _id(package, "package_id"),
         "latest_activation_id": _id(activation, "activation_id"),
         "latest_order_id": _id(order, "live_crypto_order_id"),
         "latest_position_id": _id(position, "id"),
@@ -177,4 +192,11 @@ def resolve_autonomous_profit_snapshot(evidence: dict[str, Any]) -> dict[str, An
         "automatic_activation_enabled": automatic_activation,
         "provider_submission_reachable": provider_reachable,
         "read_only": True,
+        "stale_package": None if "stale_package" not in reason_codes or historical_package is None else {
+            "package_id": _id(historical_package, "package_id"),
+            "state": getattr(historical_package, "package_state", None),
+            "preview_expires_at": _iso(getattr(historical_package, "preview_expires_at", None)),
+            "age_seconds": max(0, int((now - historical_package.preview_expires_at.astimezone(timezone.utc)).total_seconds())),
+            "reason": "preview window expired while package remained in a nonterminal lifecycle state",
+        },
     }

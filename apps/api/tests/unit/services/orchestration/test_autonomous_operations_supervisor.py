@@ -36,7 +36,7 @@ def package(state="READY", age=timedelta()):
     return SimpleNamespace(
         package_id=uuid4(), campaign_id=uuid4(), campaign_version=1, mandate_id=uuid4(),
         mandate_version_id=uuid4(), decision_record_id=uuid4(), package_state=state,
-        generated_at=now, updated_at=now,
+        generated_at=now, updated_at=now, preview_expires_at=now + timedelta(minutes=5),
     )
 
 
@@ -62,8 +62,42 @@ def test_session_failure_is_blocked_and_resolution_is_pure():
 
 
 def test_stale_package_is_blocked():
-    result = resolve_autonomous_profit_snapshot(evidence(readiness={"reason_codes": [{"code": "stale_package"}]}))
+    item = evidence(readiness={"reason_codes": [{"code": "stale_package"}]}, historical_package=package(age=timedelta(minutes=10)))
+    item["cycle"].proposed_action = "BUY"
+    result = resolve_autonomous_profit_snapshot(item)
     assert result["overall_status"] == "BLOCKED"
+    assert result["stale_package"]["package_id"] == str(item["historical_package"].package_id)
+    assert "past preview_expires_at" in result["recommended_action"]
+
+
+def test_historical_stale_package_does_not_block_healthy_hold():
+    item = evidence(
+        readiness={"reason_codes": [{"code": "stale_package"}]},
+        historical_package=package("AUTHORIZED", age=timedelta(minutes=10)),
+    )
+    item["cycle"].failure_reason = "strategy_hold_signal"
+    result = resolve_autonomous_profit_snapshot(item)
+    assert result["overall_status"] == "HEALTHY_WAITING"
+    assert result["current_stage"] == "MANDATE_EVALUATED"
+    assert "stale_package" not in result["reason_codes"]
+    assert result["latest_package_id"] == str(item["historical_package"].package_id)
+
+
+def test_stale_history_does_not_block_newer_fresh_package():
+    old = package("AUTHORIZED", age=timedelta(minutes=10))
+    current = package("READY")
+    result = resolve_autonomous_profit_snapshot(evidence(package=current, historical_package=current, readiness={}))
+    assert result["current_stage"] == "PACKAGE_READY"
+    assert result["active_package_id"] == str(current.package_id)
+    assert str(old.package_id) not in result["reason_codes"]
+
+
+def test_old_campaign_package_identity_is_not_selected_as_active():
+    old = package("AUTHORIZED", age=timedelta(minutes=10))
+    item = evidence(historical_package=old)
+    result = resolve_autonomous_profit_snapshot(item)
+    assert result["campaign_id"] == str(item["cycle"].capital_campaign_id)
+    assert result["active_package_id"] is None
 
 
 def test_activation_disabled_is_safety_disabled():
@@ -134,3 +168,11 @@ def test_operator_status_and_report_commands_parse():
     assert status.command == "autonomous-profit-status"
     assert report.command == "autonomous-profit-report"
     assert report.since == "12h"
+
+
+def test_stale_package_inspect_command_is_read_only_and_scoped():
+    args = parse_args(["stale-package-inspect", "--provider", "kraken_spot", "--environment", "production", "--product", "BTC-USD", "--json"])
+    assert args.command == "stale-package-inspect"
+    assert args.provider == "kraken_spot"
+    assert args.environment == "production"
+    assert args.product == "BTC-USD"

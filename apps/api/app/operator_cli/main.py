@@ -31,6 +31,7 @@ from app.operator_cli.formatting import (
 from app.operator_cli.service import (
     autonomous_profit_report,
     autonomous_profit_status,
+    stale_package_inspect,
     automatic_mandate_activation_proof,
     automatic_mandate_activation_readiness,
     mandate_evaluation_identity_diagnostic,
@@ -1259,6 +1260,15 @@ def _build_parser() -> argparse.ArgumentParser:
     supervisor_report.add_argument("--since", default="12h", help="Lookback such as 30m, 12h, or 2d")
     supervisor_report.add_argument("--json", action="store_true", dest="json_output")
 
+    stale_inspect = subparsers.add_parser(
+        "stale-package-inspect", parents=[common],
+        help="Read-only inspection of expired nonterminal canonical package history",
+    )
+    stale_inspect.add_argument("--provider", required=True)
+    stale_inspect.add_argument("--environment", required=True)
+    stale_inspect.add_argument("--product", required=True)
+    stale_inspect.add_argument("--json", action="store_true", dest="json_output")
+
     unattended_eligibility = subparsers.add_parser(
         "campaign-unattended-eligibility-audit",
         parents=[common],
@@ -2023,6 +2033,12 @@ async def _run_async(args: argparse.Namespace) -> tuple[int, dict[str, Any], str
         )
         text = render_json(payload) if args.json_output else render_autonomous_profit_report_text(payload, options)
         return 0, payload, text
+
+    if args.command == "stale-package-inspect":
+        payload = await stale_package_inspect(
+            provider=args.provider, environment=args.environment, product=args.product,
+        )
+        return 0, payload, render_json(payload)
 
     if args.command == "campaign-unattended-eligibility-audit":
         payload = await campaign_unattended_eligibility_audit(

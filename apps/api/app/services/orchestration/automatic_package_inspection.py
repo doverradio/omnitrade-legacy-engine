@@ -152,7 +152,7 @@ async def inspect_automatic_mandate_activation_readiness(
 ) -> dict[str, Any]:
     now = datetime.now(timezone.utc)
     settings = get_settings()
-    reasons: list[dict[str, str]] = []
+    reasons: list[dict[str, Any]] = []
     packages = list((await db.scalars(
         select(CanonicalPreviewPackage)
         .where(
@@ -167,7 +167,18 @@ async def inspect_automatic_mandate_activation_readiness(
     if not packages:
         reasons.append({"code": "no_package_available", "action": "Wait for an executable decision to create a READY package."})
     elif len(eligible_packages) != 1:
-        reasons.append({"code": "ambiguous_eligible_packages" if eligible_packages else "stale_package", "action": "Resolve stale or conflicting canonical packages before enablement."})
+        if eligible_packages:
+            reasons.append({"code": "ambiguous_eligible_packages", "action": "Resolve conflicting fresh canonical packages before enablement."})
+        else:
+            stale = packages[0]
+            reasons.append({
+                "code": "stale_package",
+                "package_id": str(stale.package_id),
+                "state": stale.package_state,
+                "preview_expires_at": _iso(stale.preview_expires_at),
+                "age_seconds": max(0, int((now - stale.preview_expires_at).total_seconds())),
+                "action": "Wait for the next actionable cycle to create one fresh canonical package; expired history is preserved and is not repairable by readiness.",
+            })
     if any(p.authorization_source == "HUMAN" for p in eligible_packages):
         reasons.append({"code": "conflicting_human_authority", "action": "Use a mandate-authorized package; do not convert human evidence."})
 

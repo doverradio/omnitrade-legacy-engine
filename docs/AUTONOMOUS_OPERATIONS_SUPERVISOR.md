@@ -22,12 +22,16 @@ The supervisor is a read-only projection over canonical trading records. It does
 
 Normal HOLD cycles never enter stall evaluation. `SAFETY_DISABLED` names the effective activation or live-submission flag only when the lifecycle has reached the boundary controlled by that flag. Other canonical failures are `BLOCKED`; advancing states are `PIPELINE_PROGRESSING`.
 
+Expired nonterminal package rows remain immutable historical evidence. Activation readiness reports them as `stale_package` when no fresh package exists because there is nothing safe to activate. The supervisor does not turn that inventory-only condition into an operational blocker during a healthy HOLD. A fresh package is selected only when its preview window is unexpired and its campaign/version matches the latest campaign cycle.
+
 ## Operator commands
 
 ```bash
 ./operator autonomous-profit-status --provider kraken_spot --environment production --product BTC-USD
 
 ./operator autonomous-profit-report --provider kraken_spot --environment production --product BTC-USD --since 12h
+
+./operator stale-package-inspect --provider kraken_spot --environment production --product BTC-USD --json
 
 ```
 

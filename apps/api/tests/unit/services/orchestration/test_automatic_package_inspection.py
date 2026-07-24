@@ -157,6 +157,10 @@ async def test_readiness_all_stale_ready_history_is_preserved_and_reports_stale_
     assert result["verdict"] == "NOT_READY"
     assert result["eligible_package_count"] == 0
     assert "stale_package" in {item["code"] for item in result["reason_codes"]}
+    stale_reason = next(item for item in result["reason_codes"] if item["code"] == "stale_package")
+    assert stale_reason["package_id"] == str(stale_packages[0].package_id)
+    assert stale_reason["state"] == "READY"
+    assert stale_reason["age_seconds"] >= 0
     assert result["mandate"]["matching_evaluation_id"] is None
     assert result["mandate"]["evaluation_readiness"]["status"] == "PREFLIGHT_BLOCKED"
     assert all(item.package_state == "READY" for item in stale_packages)

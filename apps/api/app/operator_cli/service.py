@@ -9794,16 +9794,35 @@ async def _gather_autonomous_supervisor_evidence(
     now = datetime.now(timezone.utc)
     settings = get_settings()
     async with AsyncSessionLocal() as db:
-        package = await db.scalar(
+        cycle = await db.scalar(
+            select(AutonomousCycleRun)
+            .where(AutonomousCycleRun.cycle_kind == "campaign")
+            .order_by(desc(AutonomousCycleRun.started_at), desc(AutonomousCycleRun.cycle_id)).limit(1)
+        )
+        package_scope = [
+            CanonicalPreviewPackage.provider == provider,
+            CanonicalPreviewPackage.environment == environment,
+            CanonicalPreviewPackage.product == product,
+        ]
+        if cycle is not None and cycle.capital_campaign_id is not None:
+            package_scope.extend([
+                CanonicalPreviewPackage.campaign_id == cycle.capital_campaign_id,
+                CanonicalPreviewPackage.campaign_version == cycle.capital_campaign_version,
+            ])
+        historical_package = await db.scalar(
             select(CanonicalPreviewPackage)
-            .where(CanonicalPreviewPackage.provider == provider, CanonicalPreviewPackage.environment == environment, CanonicalPreviewPackage.product == product)
+            .where(*package_scope)
             .order_by(desc(CanonicalPreviewPackage.generated_at), desc(CanonicalPreviewPackage.package_id)).limit(1)
         )
-        campaign_id = None if package is None else package.campaign_id
-        cycle_query = select(AutonomousCycleRun).where(AutonomousCycleRun.cycle_kind == "campaign")
-        if campaign_id is not None:
-            cycle_query = cycle_query.where(AutonomousCycleRun.capital_campaign_id == campaign_id)
-        cycle = await db.scalar(cycle_query.order_by(desc(AutonomousCycleRun.started_at), desc(AutonomousCycleRun.cycle_id)).limit(1))
+        package = await db.scalar(
+            select(CanonicalPreviewPackage)
+            .where(
+                *package_scope,
+                CanonicalPreviewPackage.package_state.in_(["READY", "AUTHORIZED", "DRY_RUN_PASSED", "ACTIVATED"]),
+                CanonicalPreviewPackage.preview_expires_at > now,
+            )
+            .order_by(desc(CanonicalPreviewPackage.generated_at), desc(CanonicalPreviewPackage.package_id)).limit(1)
+        )
         activation = None if package is None else await db.scalar(
             select(CanonicalProvingActivation).where(CanonicalProvingActivation.package_id == package.package_id).limit(1)
         )
@@ -9854,7 +9873,8 @@ async def _gather_autonomous_supervisor_evidence(
         runtime = None if package is None else await db.scalar(select(CapitalCampaign).where(CapitalCampaign.uuid == package.runtime_campaign_id).limit(1))
         evidence = {
             "now": now, "environment": environment, "provider": provider, "product": product,
-            "cycle": cycle, "package": package, "activation": activation, "order": order,
+            "cycle": cycle, "package": package, "historical_package": historical_package,
+            "activation": activation, "order": order,
             "position": latest_position, "position_open": position_open,
             "position_updated_at": None if latest_position is None else latest_position.executed_at,
             "reconciliation": reconciliation, "readiness": readiness,
@@ -9918,6 +9938,71 @@ async def autonomous_profit_report(*, provider: str, environment: str, product: 
         "first_autonomous_profit_achieved": snapshot["overall_status"] == "FIRST_AUTONOMOUS_PROFIT_COMPLETE",
         "current": snapshot, "read_only": True,
     }
+
+
+async def stale_package_inspect(*, provider: str, environment: str, product: str) -> dict[str, Any]:
+    """Return exact stale canonical inventory without performing lifecycle mutation."""
+    now = datetime.now(timezone.utc)
+    async with AsyncSessionLocal() as db:
+        fresh_count = int((await db.scalar(
+            select(func.count()).select_from(CanonicalPreviewPackage).where(
+                CanonicalPreviewPackage.provider == provider,
+                CanonicalPreviewPackage.environment == environment,
+                CanonicalPreviewPackage.product == product,
+                CanonicalPreviewPackage.package_state.in_(["READY", "AUTHORIZED", "DRY_RUN_PASSED", "ACTIVATED"]),
+                CanonicalPreviewPackage.preview_expires_at > now,
+            )
+        )) or 0)
+        packages = list((await db.scalars(
+            select(CanonicalPreviewPackage).where(
+                CanonicalPreviewPackage.provider == provider,
+                CanonicalPreviewPackage.environment == environment,
+                CanonicalPreviewPackage.product == product,
+                CanonicalPreviewPackage.package_state.in_(["READY", "AUTHORIZED", "DRY_RUN_PASSED", "ACTIVATED"]),
+                CanonicalPreviewPackage.preview_expires_at <= now,
+            ).order_by(desc(CanonicalPreviewPackage.generated_at), desc(CanonicalPreviewPackage.package_id))
+        )).all())
+        rows = []
+        for package in packages:
+            activation = await db.scalar(
+                select(CanonicalProvingActivation).where(CanonicalProvingActivation.package_id == package.package_id).limit(1)
+            )
+            audit = await db.scalar(
+                select(AuditLog).where(
+                    AuditLog.entity_type == "canonical_preview_package",
+                    AuditLog.entity_id == package.package_id,
+                ).order_by(desc(AuditLog.created_at), desc(AuditLog.id)).limit(1)
+            )
+            rows.append({
+                "package_id": str(package.package_id), "campaign_id": str(package.campaign_id),
+                "campaign_version": package.campaign_version,
+                "mandate_id": None if package.mandate_id is None else str(package.mandate_id),
+                "mandate_version_id": None if package.mandate_version_id is None else str(package.mandate_version_id),
+                "provider": package.provider, "environment": package.environment, "product": package.product,
+                "state": package.package_state, "created_at": package.created_at.isoformat(),
+                "generated_at": package.generated_at.isoformat(),
+                "preview_expires_at": package.preview_expires_at.isoformat(),
+                "age_seconds": max(0, int((now - package.preview_expires_at).total_seconds())),
+                "authorization_expires_at": None if package.authorization_expires_at is None else package.authorization_expires_at.isoformat(),
+                "activation_id": None if activation is None else str(activation.activation_id),
+                "activation_state": None if activation is None else activation.activation_state,
+                "terminal": package.package_state in _TERMINAL_PACKAGE_STATES,
+                "superseded": package.package_state == "SUPERSEDED" or package.superseded_at is not None,
+                "latest_lifecycle_event": None if audit is None else {
+                    "audit_id": audit.id, "action": audit.action, "actor": audit.actor,
+                    "created_at": audit.created_at.isoformat(),
+                },
+                "blocks_fresh_package_creation": False,
+                "blocks_activation_readiness": fresh_count == 0,
+                "classification": "expired_nonterminal_history",
+            })
+        return {
+            "generated_at": now.isoformat(), "provider": provider, "environment": environment,
+            "product": product, "stale_package_count": len(rows), "fresh_eligible_package_count": fresh_count, "packages": rows,
+            "repair_required": False,
+            "explanation": "Expired package history is ineligible for activation but does not prevent creation or selection of a newer unexpired package.",
+            "read_only": True,
+        }
 
 
 async def mandate_evaluation_identity_diagnostic(*, cycle_id: UUID, decision_record_id: UUID) -> dict[str, Any]:
