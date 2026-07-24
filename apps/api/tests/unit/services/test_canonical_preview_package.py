@@ -2048,6 +2048,12 @@ def _mark_package_mandate_authorized(
 async def test_mandate_authorized_package_dry_runs_and_activates_without_human_approval(monkeypatch: pytest.MonkeyPatch) -> None:
     package, runtime, mandate, authorization, version, strategy, evaluation = _mandate_authority_fixture()
     _mark_package_mandate_authorized(package, mandate, version, evaluation)
+    evaluation.request_context = {
+        "purpose": "automatic_ready_package_campaign_authority",
+        "campaign_orchestration_cycle_id": str(uuid4()),
+        "campaign_id": str(package.campaign_id),
+        "campaign_version": package.campaign_version,
+    }
     monkeypatch.setattr(cpp, "_load_package", _async_return(package))
     monkeypatch.setattr(
         cpp, "_load_profile",
@@ -2097,6 +2103,30 @@ async def test_mandate_authorized_package_dry_runs_and_activates_without_human_a
                 package_id=package.package_id, approval_event_id=None,
                 dry_run_live_crypto_order_id=dry_order.live_crypto_order_id,
                 actor=None, expires_at=None, idempotency_key="duplicate-mandate-activation",
+            ),
+        )
+
+
+@pytest.mark.asyncio
+async def test_mandate_dry_run_rejects_present_mismatched_evaluation_package_id(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    package, runtime, mandate, authorization, version, strategy, evaluation = _mandate_authority_fixture()
+    _mark_package_mandate_authorized(package, mandate, version, evaluation)
+    evaluation.request_context = {
+        "purpose": "automatic_ready_package_campaign_authority",
+        "package_id": str(uuid4()),
+    }
+    monkeypatch.setattr(cpp, "_load_package", _async_return(package))
+
+    with pytest.raises(PermissionError, match="mandate evaluation package mismatch"):
+        await cpp.run_dry_run_for_canonical_preview_package(
+            db=_FakeDb(scalar_values=[mandate, authorization, version, evaluation, runtime]),
+            request=cpp.CanonicalPreviewPackageDryRunRequest(
+                package_id=package.package_id,
+                approval_event_id=None,
+                operator_identity=None,
+                idempotency_token="mismatched-evaluation-package",
             ),
         )
 

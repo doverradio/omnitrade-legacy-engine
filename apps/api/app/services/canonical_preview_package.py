@@ -1662,7 +1662,16 @@ async def _validate_canonical_package_authority(
     ):
         raise PermissionError("mandate evaluation is missing, failed, or mismatched")
     evaluation_context = evaluation.request_context if isinstance(evaluation.request_context, dict) else {}
-    if evaluation_context.get("package_id") != str(package.package_id):
+    evaluation_package_id = evaluation_context.get("package_id")
+    if evaluation_package_id is None:
+        # The authoritative campaign-cycle evaluation is persisted before the
+        # canonical package exists, so it cannot contain a package_id.  The
+        # package later pins that exact evaluation by primary key and all
+        # mandate/decision identities above are still revalidated.  Only this
+        # canonical pre-package provenance may omit the package identity.
+        if evaluation_context.get("purpose") != "automatic_ready_package_campaign_authority":
+            raise PermissionError("mandate evaluation package mismatch")
+    elif evaluation_package_id != str(package.package_id):
         raise PermissionError("mandate evaluation package mismatch")
 
     runtime_campaign = await db.scalar(
