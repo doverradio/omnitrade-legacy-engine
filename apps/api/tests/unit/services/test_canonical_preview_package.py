@@ -2138,6 +2138,7 @@ class _ActivationConflictDb(_FakeDb):
         self._conflicting_activation = conflicting_activation
         self._scalar_call = 0
         self.conflict_statement = None
+        self.execute_statements = []
 
     async def scalar(self, statement):
         self._scalar_call += 1
@@ -2145,10 +2146,14 @@ class _ActivationConflictDb(_FakeDb):
             return self._dry_run_order
         if self._scalar_call == 2:
             return None
-        self.conflict_statement = statement
-        params = statement.compile().params
-        cutoff = next(value for key, value in params.items() if key.startswith("expires_at_"))
-        return self._conflicting_activation if self._conflicting_activation.expires_at > cutoff else None
+        return None
+
+    async def execute(self, statement):
+        self.execute_statements.append(statement)
+        if "canonical_proving_activations" in str(statement):
+            self.conflict_statement = statement
+            return _FakeResult([self._conflicting_activation])
+        return _FakeResult([])
 
 
 def _activation_conflict_fixture(
@@ -2175,7 +2180,10 @@ def _activation_conflict_fixture(
             "mandate_evaluation_id": str(evaluation.evaluation_id),
         },
     )
-    conflicting = SimpleNamespace(expires_at=expires_at)
+    conflicting = SimpleNamespace(
+        activation_id=uuid4(), package_id=uuid4(), expires_at=expires_at,
+        activation_state="ACTIVE", invalidated_reason=None,
+    )
     return package, dry_run_order, authority, conflicting
 
 
@@ -2202,8 +2210,14 @@ async def test_mandate_activation_ignores_expired_active_conflict(monkeypatch: p
 
     assert result["activation"]["activation_state"] == "ACTIVE"
     assert package.package_state == "ACTIVATED"
-    assert "canonical_proving_activations.expires_at" in str(db.conflict_statement)
+    assert conflicting.activation_state == "EXPIRED"
+    assert "canonical_proving_activations.activation_state" in str(db.conflict_statement)
+    assert any(getattr(item, "action", None) == "canonical_proving_activation_expired" for item in db.added)
     assert any(getattr(item, "action", None) == "canonical_proving_activation_created" for item in db.added)
+    assert "paper_accounts" in str(db.execute_statements[0])
+    assert "FOR UPDATE" in str(db.execute_statements[0]).upper()
+    assert "canonical_proving_activations" in str(db.execute_statements[1])
+    assert "FOR UPDATE" in str(db.execute_statements[1]).upper()
 
 
 @pytest.mark.asyncio
@@ -2229,6 +2243,7 @@ async def test_mandate_activation_rejects_unexpired_active_conflict(monkeypatch:
         )
 
     assert package.package_state == "DRY_RUN_PASSED"
+    assert conflicting.activation_state == "ACTIVE"
     assert not db.added
 
 

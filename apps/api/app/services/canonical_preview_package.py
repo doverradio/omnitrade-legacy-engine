@@ -1889,6 +1889,16 @@ async def activate_canonical_proving_campaign(
         if dry_run_evidence.get("mandate_evaluation_id") != str(authority.mandate_evaluation_id):
             raise PermissionError("dry run mandate evaluation mismatch")
 
+    # Serialize every activation decision for the durable account scope.  The
+    # database's partial unique index is state-based (ACTIVE), while expiration
+    # is time-based; expired rows therefore have to leave ACTIVE before a
+    # replacement can be inserted.
+    await db.execute(
+        select(PaperAccount.id)
+        .where(PaperAccount.id == package.paper_account_id)
+        .with_for_update()
+    )
+
     existing = await db.scalar(
         select(CanonicalProvingActivation).where(CanonicalProvingActivation.package_id == package.package_id).limit(1)
     )
@@ -1910,22 +1920,40 @@ async def activate_canonical_proving_campaign(
         )
         return {"activation": _activation_payload(existing), "package": _package_payload(package)}
 
-    if authority.source == "MANDATE":
-        conflicting = await db.scalar(
-            select(CanonicalProvingActivation)
-            .where(
-                CanonicalProvingActivation.package_id != package.package_id,
-                CanonicalProvingActivation.paper_account_id == package.paper_account_id,
-                CanonicalProvingActivation.provider == package.provider,
-                CanonicalProvingActivation.environment == package.environment,
-                CanonicalProvingActivation.product == package.product,
-                CanonicalProvingActivation.activation_state == "ACTIVE",
-                CanonicalProvingActivation.expires_at > now,
-            )
-            .limit(1)
+    active_scope_rows = list((await db.execute(
+        select(CanonicalProvingActivation)
+        .where(
+            CanonicalProvingActivation.package_id != package.package_id,
+            CanonicalProvingActivation.paper_account_id == package.paper_account_id,
+            CanonicalProvingActivation.provider == package.provider,
+            CanonicalProvingActivation.environment == package.environment,
+            CanonicalProvingActivation.product == package.product,
+            CanonicalProvingActivation.activation_state == "ACTIVE",
         )
-        if conflicting is not None:
-            raise PermissionError("conflicting active canonical proving package")
+        .with_for_update()
+    )).scalars().all())
+    expired_scope_rows = [item for item in active_scope_rows if item.expires_at <= now]
+    live_scope_rows = [item for item in active_scope_rows if item.expires_at > now]
+    if live_scope_rows:
+        raise PermissionError("conflicting active canonical proving package")
+    for expired in expired_scope_rows:
+        expired.activation_state = "EXPIRED"
+        expired.invalidated_reason = "effective activation expiration materialized before replacement"
+        db.add(
+            _record_audit_entry(
+                actor="system:canonical-activation-lifecycle",
+                action="canonical_proving_activation_expired",
+                entity_id=expired.activation_id,
+                after_state={
+                    "package_id": str(expired.package_id),
+                    "activation_state": "EXPIRED",
+                    "expires_at": expired.expires_at.isoformat(),
+                    "replacement_package_id": str(package.package_id),
+                },
+            )
+        )
+    if expired_scope_rows:
+        await db.flush()
 
     activation_id = uuid.uuid4()
     activation = CanonicalProvingActivation(
