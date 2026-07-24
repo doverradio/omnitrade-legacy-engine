@@ -3501,3 +3501,71 @@ async def test_has_unresolved_reconciliation_one_resolved_order_does_not_mask_an
     detail_records = [r for r in caplog.records if r.getMessage().startswith("unresolved_reconciliation_record_detail ")]
     assert len(detail_records) == 1
     assert f"live_crypto_order_id={stuck_order}" in detail_records[0].getMessage()
+
+
+@pytest.mark.asyncio
+async def test_claim_guard_blocks_when_latest_reconciliation_is_unresolved() -> None:
+    from app.services.orchestration.reconciliation_guard import claim_blocking_reconciliation_statement
+
+    order_id = uuid.uuid4()
+    scope = dict(provider="kraken_spot", environment="production", product="BTC-USD")
+    with _reconciliation_sqlite_session() as (raw_session, db):
+        _seed_live_crypto_order(raw_session, live_crypto_order_id=order_id, provider_order_id="K-STUCK", **scope)
+        _seed_reconciliation_event(raw_session, live_crypto_order_id=order_id, reconciliation_status="partially_filled", provider_order_id="K-STUCK", sequence_number=1)
+        latest_id = _seed_reconciliation_event(raw_session, live_crypto_order_id=order_id, reconciliation_status="reconciliation_required", provider_order_id="K-STUCK", sequence_number=2)
+        result = await db.scalar(claim_blocking_reconciliation_statement(**scope))
+
+    assert result == latest_id
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("resolved_status", ["filled", "canceled", "rejected"])
+async def test_claim_guard_ignores_superseded_unresolved_history(resolved_status: str) -> None:
+    from app.services.orchestration.reconciliation_guard import claim_blocking_reconciliation_statement
+
+    order_id = uuid.uuid4()
+    scope = dict(provider="kraken_spot", environment="production", product="BTC-USD")
+    with _reconciliation_sqlite_session() as (raw_session, db):
+        _seed_live_crypto_order(raw_session, live_crypto_order_id=order_id, provider_order_id="K-RESOLVED", status=resolved_status.upper(), **scope)
+        _seed_reconciliation_event(raw_session, live_crypto_order_id=order_id, reconciliation_status="partially_filled", provider_order_id="K-RESOLVED", sequence_number=1)
+        _seed_reconciliation_event(raw_session, live_crypto_order_id=order_id, reconciliation_status="reconciliation_required", provider_order_id="K-RESOLVED", sequence_number=2)
+        _seed_reconciliation_event(raw_session, live_crypto_order_id=order_id, reconciliation_status=resolved_status, provider_order_id="K-RESOLVED", sequence_number=3)
+        result = await db.scalar(claim_blocking_reconciliation_statement(**scope))
+
+    assert result is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "other_scope",
+    [
+        {"provider": "kraken_spot", "environment": "sandbox", "product": "BTC-USD"},
+        {"provider": "kraken_spot", "environment": "production", "product": "ETH-USD"},
+        {"provider": "coinbase", "environment": "production", "product": "BTC-USD"},
+    ],
+)
+async def test_claim_guard_isolates_provider_environment_and_product(other_scope: dict[str, str]) -> None:
+    from app.services.orchestration.reconciliation_guard import claim_blocking_reconciliation_statement
+
+    order_id = uuid.uuid4()
+    target = dict(provider="kraken_spot", environment="production", product="BTC-USD")
+    with _reconciliation_sqlite_session() as (raw_session, db):
+        _seed_live_crypto_order(raw_session, live_crypto_order_id=order_id, provider_order_id="OTHER-SCOPE", **other_scope)
+        _seed_reconciliation_event(raw_session, live_crypto_order_id=order_id, reconciliation_status="unknown", provider_order_id="OTHER-SCOPE")
+        result = await db.scalar(claim_blocking_reconciliation_statement(**target))
+
+    assert result is None
+
+
+@pytest.mark.asyncio
+async def test_claim_guard_blocks_unscopable_orphaned_current_state() -> None:
+    from app.services.orchestration.reconciliation_guard import claim_blocking_reconciliation_statement
+
+    scope = dict(provider="kraken_spot", environment="production", product="BTC-USD")
+    with _reconciliation_sqlite_session() as (raw_session, db):
+        event_id = _seed_reconciliation_event(
+            raw_session, live_crypto_order_id=None, reconciliation_status="unknown", provider_order_id="K-ORPHAN",
+        )
+        result = await db.scalar(claim_blocking_reconciliation_statement(**scope))
+
+    assert result == event_id

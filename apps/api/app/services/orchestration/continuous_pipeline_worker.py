@@ -71,6 +71,10 @@ from app.services.orchestration.autonomous_order_preparation import (
     execute_prepared_autonomous_claim,
     prepare_autonomous_claimed_buy,
 )
+from app.services.orchestration.reconciliation_guard import (
+    UNRESOLVED_RECONCILIATION_STATES,
+    latest_reconciliation_event_per_order,
+)
 from app.services.strategy_outcomes import score_due_strategy_roster_proposal_outcomes
 from app.services.strategy_roster import StrategyRosterRequest, run_strategy_roster_for_candle
 from app.services.strategy_roster.decision_aggregator import AGGREGATE_STRATEGY_SLUG
@@ -107,7 +111,7 @@ _CANONICAL_READY_PACKAGE_ACTOR = "orchestration_worker:auto_ready_package"
 _CANONICAL_READY_STATES = {"READY", "AUTHORIZED", "DRY_RUN_PASSED", "ACTIVATED"}
 _ACTIVE_PROVING_STATES = {"ACTIVE"}
 _OPEN_LIVE_ORDER_STATES = {"SUBMISSION_PENDING", "ACKNOWLEDGED", "SUBMITTED", "PARTIALLY_FILLED", "RECONCILIATION_REQUIRED"}
-_UNRESOLVED_RECONCILIATION_STATES = {"open", "partially_filled", "reconciliation_required", "unknown", "conflict", "balance_mismatch"}
+_UNRESOLVED_RECONCILIATION_STATES = UNRESOLVED_RECONCILIATION_STATES
 
 
 @dataclass(frozen=True, slots=True)
@@ -854,18 +858,8 @@ def _latest_reconciliation_event_per_order(*, provider: str, environment: str, p
     app.services.risk.equity_evidence._count_reconciliation_uncertainty;
     that existing, correct pattern was simply never applied here too.
     """
-    return (
-        select(
-            LiveReconciliationEvent.live_crypto_order_id.label("order_id"),
-            func.max(LiveReconciliationEvent.sequence_number).label("max_seq"),
-        )
-        .join(LiveCryptoOrder, LiveCryptoOrder.live_crypto_order_id == LiveReconciliationEvent.live_crypto_order_id)
-        .where(LiveCryptoOrder.provider == provider)
-        .where(LiveCryptoOrder.environment == environment)
-        .where(LiveCryptoOrder.product_id == product)
-        .where(LiveReconciliationEvent.live_crypto_order_id.is_not(None))
-        .group_by(LiveReconciliationEvent.live_crypto_order_id)
-        .subquery()
+    return latest_reconciliation_event_per_order(
+        provider=provider, environment=environment, product=product,
     )
 
 

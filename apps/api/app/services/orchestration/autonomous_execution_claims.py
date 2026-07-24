@@ -20,11 +20,10 @@ from app.models.canonical_preview_package import CanonicalPreviewPackage
 from app.models.canonical_proving_activation import CanonicalProvingActivation
 from app.models.live_accounting_record import LiveAccountingRecord
 from app.models.live_crypto_order import LiveCryptoOrder
-from app.models.live_reconciliation_event import LiveReconciliationEvent
 from app.models.risk_kill_switch import RiskKillSwitch
+from app.services.orchestration.reconciliation_guard import claim_blocking_reconciliation_statement
 
 _OPEN_ORDER_STATES = {"PENDING_CONFIRMATION", "VALIDATING", "SUBMISSION_PENDING", "ACKNOWLEDGED", "SUBMITTED", "PARTIALLY_FILLED", "RECONCILIATION_REQUIRED", "UNKNOWN"}
-_UNRESOLVED_RECONCILIATION = {"open", "partially_filled", "reconciliation_required", "unknown", "conflict", "balance_mismatch"}
 _TERMINAL_CLAIMS = {"COMPLETED", "CANCELLED"}
 
 
@@ -120,12 +119,11 @@ async def claim_activated_buy_package(
     )
     if open_order is not None:
         return AutonomousClaimOutcome(None, False, "unresolved_order_exists")
-    unresolved = await db.scalar(
-        select(LiveReconciliationEvent.id).where(
-            LiveReconciliationEvent.provider_name == package.provider,
-            LiveReconciliationEvent.reconciliation_status.in_(_UNRESOLVED_RECONCILIATION),
-        ).limit(1)
-    )
+    unresolved = await db.scalar(claim_blocking_reconciliation_statement(
+        provider=package.provider,
+        environment=package.environment,
+        product=package.product,
+    ))
     if unresolved is not None:
         return AutonomousClaimOutcome(None, False, "unresolved_reconciliation_exists")
     net_quantity = await db.scalar(
