@@ -12,38 +12,43 @@ python -m app.operator_cli.main automatic-mandate-activation-readiness --provide
 
 Proceed only for `READY_TO_ENABLE`. Resolve every reason reported by `NOT_READY`; treat `FAILED_CLOSED` as a stop condition.
 
+## Pre-stage the fail-closed selector
+
+The selector uses a later `EnvironmentFile` so its three safety values override the
+application `.env` as one unit. Pre-stage it before waiting for a fresh package:
+
+```bash
+cd /home/eric/omnitrade-legacy-engine && \
+sudo ./scripts/activation_only_environment_selector.sh prepare && \
+sudo ./scripts/activation_only_environment_selector.sh inspect
+
+```
+
+Both commands must report automatic activation `false`, live submission `false`,
+and live preparation `true`. `prepare` is idempotent and refuses to replace any
+unexpected content at its managed paths.
+
 ## Enable
 
-The production worker is `omnitrade-orchestration.service`. Create its systemd drop-in:
+After the readiness command reports exactly one fresh eligible package and
+`READY_TO_ENABLE`, switch the complete environment atomically:
 
 ```bash
-sudo systemctl edit omnitrade-orchestration.service
+cd /home/eric/omnitrade-legacy-engine && \
+sudo ./scripts/activation_only_environment_selector.sh on
+
 ```
 
-Enter exactly:
+The command restarts only `omnitrade-orchestration.service`, reads the new
+worker's `/proc/<MainPID>/environ`, and succeeds only when all three values are:
 
-```ini
-[Service]
-Environment=AUTOMATIC_MANDATE_PACKAGE_ACTIVATION_ENABLED=true
-```
+- `AUTOMATIC_MANDATE_PACKAGE_ACTIVATION_ENABLED=true`
+- `LIVE_CRYPTO_ORDER_SUBMISSION_ENABLED=false`
+- `LIVE_CRYPTO_PREPARATION_ENABLED=true`
 
-Reload and restart only that service:
-
-```bash
-sudo systemctl daemon-reload
-sudo systemctl restart omnitrade-orchestration.service
-```
-
-Verify the effective environment and health:
-
-```bash
-systemctl show omnitrade-orchestration.service --property=Environment --value
-systemctl is-active omnitrade-orchestration.service
-systemctl show omnitrade-orchestration.service --property=NRestarts --value
-journalctl -u omnitrade-orchestration.service -n 200 --no-pager
-```
-
-The environment must contain `AUTOMATIC_MANDATE_PACKAGE_ACTIVATION_ENABLED=true`. Do not enable `LIVE_CRYPTO_ORDER_SUBMISSION_ENABLED` in this procedure.
+If verification fails, the command immediately selects the explicit OFF file,
+restarts the same service, verifies rollback, and exits nonzero. Do not continue
+after any nonzero result.
 
 After a package advances, prove its persisted evidence:
 
@@ -55,19 +60,15 @@ python -m app.operator_cli.main automatic-mandate-activation-proof --package-id 
 
 ## Rollback
 
-Run `sudo systemctl edit omnitrade-orchestration.service`, delete the feature's `Environment` line, then:
+Select and verify the pre-staged OFF state:
 
 ```bash
-sudo systemctl daemon-reload
-sudo systemctl restart omnitrade-orchestration.service
-systemctl show omnitrade-orchestration.service --property=Environment --value
-systemctl is-active omnitrade-orchestration.service
+cd /home/eric/omnitrade-legacy-engine && \
+sudo ./scripts/activation_only_environment_selector.sh off && \
+sudo ./scripts/activation_only_environment_selector.sh inspect
+
 ```
 
-If `/etc/systemd/system/omnitrade-orchestration.service.d/override.conf` contains only this setting, the equivalent explicit rollback is:
-
-```bash
-sudo rm /etc/systemd/system/omnitrade-orchestration.service.d/override.conf
-sudo systemctl daemon-reload
-sudo systemctl restart omnitrade-orchestration.service
-```
+Rollback must report automatic activation `false`, live submission `false`, and
+live preparation `true`. Retain the selector files for deterministic inspection
+and reuse; they contain no secrets.
