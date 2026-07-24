@@ -64,6 +64,22 @@ class Settings(BaseSettings):
         default=None,
         validation_alias="AUTOMATIC_MANDATE_PACKAGE_ACTIVATION_PACKAGE_ID",
     )
+    automatic_mandate_package_activation_campaign_id: UUID | None = Field(
+        default=None,
+        validation_alias="AUTOMATIC_MANDATE_PACKAGE_ACTIVATION_CAMPAIGN_ID",
+    )
+    automatic_mandate_package_activation_campaign_version: int | None = Field(
+        default=None,
+        validation_alias="AUTOMATIC_MANDATE_PACKAGE_ACTIVATION_CAMPAIGN_VERSION",
+    )
+    automatic_mandate_package_activation_mandate_id: UUID | None = Field(
+        default=None,
+        validation_alias="AUTOMATIC_MANDATE_PACKAGE_ACTIVATION_MANDATE_ID",
+    )
+    automatic_mandate_package_activation_mandate_version_id: UUID | None = Field(
+        default=None,
+        validation_alias="AUTOMATIC_MANDATE_PACKAGE_ACTIVATION_MANDATE_VERSION_ID",
+    )
     default_production_crypto_paper_account_id: UUID | None = Field(
         default=None,
         validation_alias="DEFAULT_PRODUCTION_CRYPTO_PAPER_ACCOUNT_ID",

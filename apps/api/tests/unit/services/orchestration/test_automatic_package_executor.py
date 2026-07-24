@@ -37,6 +37,7 @@ def _package(state: str = "READY") -> SimpleNamespace:
         campaign_version=3,
         decision_record_id=uuid.uuid4(),
         mandate_id=None if state == "READY" else uuid.uuid4(),
+        mandate_version_id=None if state == "READY" else uuid.uuid4(),
         authorization_source=None if state == "READY" else "MANDATE",
         package_state=state,
         dry_run_live_crypto_order_id=uuid.uuid4() if state in {"DRY_RUN_PASSED", "ACTIVATED"} else None,
@@ -186,6 +187,64 @@ async def test_executor_proof_package_pin_rejects_every_other_package(monkeypatc
     assert outcome.final_reason_code == "proof_package_pin_mismatch"
     assert outcome.failed_closed is True
     assert outcome.package_id is None
+
+
+@pytest.mark.asyncio
+async def test_executor_canonical_scope_is_complete_and_exact(monkeypatch: pytest.MonkeyPatch) -> None:
+    package = _package("DRY_RUN_PASSED")
+
+    def settings(**overrides):
+        values = {
+            "automatic_mandate_package_activation_enabled": True,
+            "automatic_mandate_package_activation_package_id": None,
+            "automatic_mandate_package_activation_campaign_id": package.campaign_id,
+            "automatic_mandate_package_activation_campaign_version": package.campaign_version,
+            "automatic_mandate_package_activation_mandate_id": package.mandate_id,
+            "automatic_mandate_package_activation_mandate_version_id": package.mandate_version_id,
+        }
+        values.update(overrides)
+        return SimpleNamespace(**values)
+
+    monkeypatch.setattr(executor, "get_settings", settings)
+
+    async def _activate(*, db, request):
+        package.package_state = "ACTIVATED"
+
+    monkeypatch.setattr(executor, "activate_canonical_proving_campaign", _activate)
+    allowed = await executor.execute_automatic_ready_package_through_activation(db=_Db([package]), request=_request(package))
+    assert allowed.activation_state == "ACTIVATED"
+
+    package.package_state = "DRY_RUN_PASSED"
+    monkeypatch.setattr(executor, "get_settings", lambda: settings(automatic_mandate_package_activation_mandate_id=uuid.uuid4()))
+    denied = await executor.execute_automatic_ready_package_through_activation(db=_Db([package]), request=_request(package))
+    assert denied.final_reason_code == "automatic_activation_mandate_scope_mismatch"
+    assert denied.failed_closed is True
+
+
+@pytest.mark.asyncio
+async def test_executor_incomplete_or_wrong_campaign_scope_fails_before_mutation(monkeypatch: pytest.MonkeyPatch) -> None:
+    package = _package("DRY_RUN_PASSED")
+    base = {
+        "automatic_mandate_package_activation_enabled": True,
+        "automatic_mandate_package_activation_package_id": None,
+        "automatic_mandate_package_activation_campaign_id": package.campaign_id,
+        "automatic_mandate_package_activation_campaign_version": None,
+        "automatic_mandate_package_activation_mandate_id": None,
+        "automatic_mandate_package_activation_mandate_version_id": None,
+    }
+    monkeypatch.setattr(executor, "get_settings", lambda: SimpleNamespace(**base))
+    incomplete = await executor.execute_automatic_ready_package_through_activation(db=_Db([package]), request=_request(package))
+    assert incomplete.final_reason_code == "automatic_activation_scope_incomplete"
+
+    base.update({
+        "automatic_mandate_package_activation_campaign_version": package.campaign_version,
+        "automatic_mandate_package_activation_mandate_id": package.mandate_id,
+        "automatic_mandate_package_activation_mandate_version_id": package.mandate_version_id,
+        "automatic_mandate_package_activation_campaign_id": uuid.uuid4(),
+    })
+    wrong = await executor.execute_automatic_ready_package_through_activation(db=_Db([package]), request=_request(package))
+    assert wrong.final_reason_code == "automatic_activation_campaign_scope_mismatch"
+    assert wrong.failed_closed is True
 
 
 @pytest.mark.asyncio

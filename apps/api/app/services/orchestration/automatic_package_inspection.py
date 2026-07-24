@@ -322,15 +322,17 @@ async def inspect_automatic_mandate_activation_readiness(
             "max_order_notional_usd": None if version is None else str(version.max_order_notional_usd),
         }
 
-    activations = list((await db.scalars(select(CanonicalProvingActivation).where(
+    activation_rows = list((await db.scalars(select(CanonicalProvingActivation).where(
         CanonicalProvingActivation.provider == provider,
         CanonicalProvingActivation.environment == environment,
         CanonicalProvingActivation.product == product,
         CanonicalProvingActivation.activation_state == "ACTIVE",
-        CanonicalProvingActivation.expires_at > now,
     ).limit(2))).all())
+    activations = [item for item in activation_rows if item.expires_at > now]
     if len(activations) > 1:
         reasons.append({"code": "conflicting_active_activations", "action": "Resolve conflicting proving activations."})
+
+    expired_active_count = sum(1 for item in activation_rows if item.expires_at <= now)
 
     latest_pipeline = await db.scalar(select(AuditLog).where(
         AuditLog.action == "orchestration_worker_full_pipeline_completed"
@@ -347,6 +349,14 @@ async def inspect_automatic_mandate_activation_readiness(
         "reason_codes": reasons,
         "configuration": {
             "automatic_mandate_package_activation_enabled": enabled,
+            "automatic_activation_source": "AUTOMATIC_MANDATE_PACKAGE_ACTIVATION_ENABLED",
+            "activation_scope": {
+                "campaign_id": None if getattr(settings, "automatic_mandate_package_activation_campaign_id", None) is None else str(settings.automatic_mandate_package_activation_campaign_id),
+                "campaign_version": getattr(settings, "automatic_mandate_package_activation_campaign_version", None),
+                "mandate_id": None if getattr(settings, "automatic_mandate_package_activation_mandate_id", None) is None else str(settings.automatic_mandate_package_activation_mandate_id),
+                "mandate_version_id": None if getattr(settings, "automatic_mandate_package_activation_mandate_version_id", None) is None else str(settings.automatic_mandate_package_activation_mandate_version_id),
+                "package_id": None if getattr(settings, "automatic_mandate_package_activation_package_id", None) is None else str(settings.automatic_mandate_package_activation_package_id),
+            },
             "live_crypto_preparation_enabled": settings.live_crypto_preparation_enabled,
             "live_crypto_order_submission_enabled": settings.live_crypto_order_submission_enabled,
             "provider": provider, "environment": environment, "product": product,
@@ -364,6 +374,13 @@ async def inspect_automatic_mandate_activation_readiness(
         },
         "eligible_package_count": len(eligible_packages),
         "active_activation_count": len(activations),
+        "expired_active_activation_count": expired_active_count,
+        "existing_activation": None if not activations else {
+            "activation_id": str(activations[0].activation_id),
+            "package_id": str(activations[0].package_id),
+            "state": activations[0].activation_state,
+            "expires_at": _iso(activations[0].expires_at),
+        },
         "submission_boundary": {
             "activation_implies_submission": False,
             "live_submission_flag_enabled": settings.live_crypto_order_submission_enabled,

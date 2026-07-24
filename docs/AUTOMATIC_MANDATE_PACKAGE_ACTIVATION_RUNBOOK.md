@@ -28,14 +28,16 @@ Both commands must report automatic activation `false`, live submission `false`,
 and live preparation `true`. `prepare` is idempotent and refuses to replace any
 unexpected content at its managed paths.
 
-## Enable
+## Enable the exact commissioned campaign and mandate scope
 
-After the readiness command reports exactly one fresh eligible package and
-`READY_TO_ENABLE`, switch the complete environment atomically:
+After readiness reports exactly one fresh eligible package and `READY_TO_ENABLE`,
+copy the four canonical identities from that output and switch the complete
+environment atomically. Do not use the broad `on` selector for production proving.
 
 ```bash
 cd /home/eric/omnitrade-legacy-engine && \
-sudo ./scripts/activation_only_environment_selector.sh on
+sudo ./scripts/activation_only_environment_selector.sh on-scope \
+  CAMPAIGN_UUID CAMPAIGN_VERSION MANDATE_UUID MANDATE_VERSION_UUID
 
 ```
 
@@ -45,6 +47,10 @@ worker's `/proc/<MainPID>/environ`, and succeeds only when all three values are:
 - `AUTOMATIC_MANDATE_PACKAGE_ACTIVATION_ENABLED=true`
 - `LIVE_CRYPTO_ORDER_SUBMISSION_ENABLED=false`
 - `LIVE_CRYPTO_PREPARATION_ENABLED=true`
+- all four canonical campaign/mandate scope values exactly match the process environment
+
+The executor refuses incomplete scope and rejects any package whose campaign,
+campaign version, mandate, or mandate version differs. No UUID is embedded in source.
 
 If verification fails, the command immediately selects the explicit OFF file,
 restarts the same service, verifies rollback, and exits nonzero. Do not continue

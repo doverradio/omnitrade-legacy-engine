@@ -21,9 +21,13 @@ case "$1" in
     submission="$(sed -n 's/^LIVE_CRYPTO_ORDER_SUBMISSION_ENABLED=//p' "${OMNITRADE_ACTIVATION_STATE_DIR}/current.env")"
     preparation="$(sed -n 's/^LIVE_CRYPTO_PREPARATION_ENABLED=//p' "${OMNITRADE_ACTIVATION_STATE_DIR}/current.env")"
     package_id="$(sed -n 's/^AUTOMATIC_MANDATE_PACKAGE_ACTIVATION_PACKAGE_ID=//p' "${OMNITRADE_ACTIVATION_STATE_DIR}/current.env")"
+    campaign_id="$(sed -n 's/^AUTOMATIC_MANDATE_PACKAGE_ACTIVATION_CAMPAIGN_ID=//p' "${OMNITRADE_ACTIVATION_STATE_DIR}/current.env")"
+    campaign_version="$(sed -n 's/^AUTOMATIC_MANDATE_PACKAGE_ACTIVATION_CAMPAIGN_VERSION=//p' "${OMNITRADE_ACTIVATION_STATE_DIR}/current.env")"
+    mandate_id="$(sed -n 's/^AUTOMATIC_MANDATE_PACKAGE_ACTIVATION_MANDATE_ID=//p' "${OMNITRADE_ACTIVATION_STATE_DIR}/current.env")"
+    mandate_version_id="$(sed -n 's/^AUTOMATIC_MANDATE_PACKAGE_ACTIVATION_MANDATE_VERSION_ID=//p' "${OMNITRADE_ACTIVATION_STATE_DIR}/current.env")"
     if [[ "${FAKE_UNSAFE_ON_RESTART:-}" == "1" && "${activation}" == "true" ]]; then submission=true; fi
-    printf 'AUTOMATIC_MANDATE_PACKAGE_ACTIVATION_ENABLED=%s\\0LIVE_CRYPTO_ORDER_SUBMISSION_ENABLED=%s\\0LIVE_CRYPTO_PREPARATION_ENABLED=%s\\0AUTOMATIC_MANDATE_PACKAGE_ACTIVATION_PACKAGE_ID=%s\\0' \
-      "${activation}" "${submission}" "${preparation}" "${package_id}" >"${OMNITRADE_PROC_ROOT}/4242/environ"
+    printf 'AUTOMATIC_MANDATE_PACKAGE_ACTIVATION_ENABLED=%s\\0LIVE_CRYPTO_ORDER_SUBMISSION_ENABLED=%s\\0LIVE_CRYPTO_PREPARATION_ENABLED=%s\\0AUTOMATIC_MANDATE_PACKAGE_ACTIVATION_PACKAGE_ID=%s\\0AUTOMATIC_MANDATE_PACKAGE_ACTIVATION_CAMPAIGN_ID=%s\\0AUTOMATIC_MANDATE_PACKAGE_ACTIVATION_CAMPAIGN_VERSION=%s\\0AUTOMATIC_MANDATE_PACKAGE_ACTIVATION_MANDATE_ID=%s\\0AUTOMATIC_MANDATE_PACKAGE_ACTIVATION_MANDATE_VERSION_ID=%s\\0' \
+      "${activation}" "${submission}" "${preparation}" "${package_id}" "${campaign_id}" "${campaign_version}" "${mandate_id}" "${mandate_version_id}" >"${OMNITRADE_PROC_ROOT}/4242/environ"
     ;;
   is-active) ;;
   show) printf '4242\\n' ;;
@@ -166,3 +170,28 @@ def test_prepare_preserves_unexpected_existing_selector(tmp_path: Path) -> None:
     assert result.returncode != 0
     assert "refusing to overwrite" in result.stderr
     assert current.read_text() == "OPERATOR_OWNED_VALUE=preserve\n"
+
+
+def test_scoped_on_atomically_pins_canonical_campaign_and_mandate(tmp_path: Path) -> None:
+    environment = _environment(tmp_path)
+    campaign_id = "11111111-1111-4111-8111-111111111111"
+    mandate_id = "22222222-2222-4222-8222-222222222222"
+    mandate_version_id = "33333333-3333-4333-8333-333333333333"
+    assert _run("prepare", environment).returncode == 0
+
+    enabled = _run_args(["on-scope", campaign_id, "3", mandate_id, mandate_version_id], environment)
+
+    assert enabled.returncode == 0
+    assert "selector=SCOPED_ON" in enabled.stdout
+    assert f"activation_scope={campaign_id}:3:{mandate_id}:{mandate_version_id}" in enabled.stdout
+    current = (tmp_path / "state" / "current.env").read_text()
+    assert "LIVE_CRYPTO_ORDER_SUBMISSION_ENABLED=false" in current
+    assert f"AUTOMATIC_MANDATE_PACKAGE_ACTIVATION_CAMPAIGN_ID={campaign_id}" in current
+
+
+def test_scoped_on_rejects_invalid_identity(tmp_path: Path) -> None:
+    environment = _environment(tmp_path)
+    assert _run("prepare", environment).returncode == 0
+    result = _run_args(["on-scope", "bad", "0", "bad", "bad"], environment)
+    assert result.returncode != 0
+    assert "canonical UUID" in result.stderr

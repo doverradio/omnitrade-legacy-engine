@@ -94,6 +94,21 @@ async def execute_automatic_ready_package_through_activation(
         )
         return _outcome(request=request, package=None, reason="automatic_mandate_package_activation_disabled")
 
+    scope_values = {
+        "campaign_id": getattr(settings, "automatic_mandate_package_activation_campaign_id", None),
+        "campaign_version": getattr(settings, "automatic_mandate_package_activation_campaign_version", None),
+        "mandate_id": getattr(settings, "automatic_mandate_package_activation_mandate_id", None),
+        "mandate_version_id": getattr(settings, "automatic_mandate_package_activation_mandate_version_id", None),
+    }
+    configured_scope = [value is not None for value in scope_values.values()]
+    if any(configured_scope) and not all(configured_scope):
+        return _outcome(request=request, package=None, reason="automatic_activation_scope_incomplete", failed_closed=True)
+    if all(configured_scope) and (
+        request.campaign_id != scope_values["campaign_id"]
+        or request.campaign_version != scope_values["campaign_version"]
+    ):
+        return _outcome(request=request, package=None, reason="automatic_activation_campaign_scope_mismatch", failed_closed=True)
+
     pinned_package_id = getattr(settings, "automatic_mandate_package_activation_package_id", None)
     if pinned_package_id is not None and request.package_id not in {None, pinned_package_id}:
         logger.warning(
@@ -127,6 +142,15 @@ async def execute_automatic_ready_package_through_activation(
         return _outcome(request=request, package=None, reason=reason, failed_closed=True)
     package = rows[0]
     starting_state = package.package_state
+
+    if all(configured_scope) and (
+        package.mandate_id != scope_values["mandate_id"]
+        or package.mandate_version_id != scope_values["mandate_version_id"]
+    ):
+        return _outcome(
+            request=request, package=package, reason="automatic_activation_mandate_scope_mismatch",
+            failed_closed=True, starting_state=starting_state,
+        )
 
     try:
         if (
