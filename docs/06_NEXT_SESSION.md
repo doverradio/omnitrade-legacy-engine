@@ -9,6 +9,30 @@ Update it at the end of every major work session.
 
 ---
 
+GOLDEN RULES
+
+1. Read the governing documents first.
+
+2. Believe runtime evidence over assumptions.
+
+3. Preserve the Constitution.
+
+4. Preserve Risk Engine authority.
+
+5. Small deterministic changes.
+
+6. Validate before commit.
+
+7. Commit → Push → VPS Pull whenever implementation is complete.
+
+8. Local commands first.
+
+9. VPS commands second.
+
+10. Every command block ends with one blank line.
+
+---
+
 # Current Status
 
 The architecture documents are considered stable.
@@ -33,28 +57,187 @@ The next session should execute the read-only production proving-window evidence
 
 ---
 
+# Operator Preferences (Permanent)
+
+These preferences are considered part of the OmniTrade operator workflow.
+
+Every future ChatGPT session should follow them automatically.
+
+## Command Formatting
+
+Whenever providing development commands:
+
+1. Always provide LOCAL commands first.
+
+2. Always provide VPS commands second.
+
+3. Combine related commands into a single copy block whenever practical.
+
+4. Prefer fail-fast command chains using:
+
+&&
+
+Use ";" only when later commands should continue even if an earlier command fails.
+
+5. Every command block MUST end with one completely blank line.
+
+This allows the operator to paste once and immediately execute.
+
+Never omit the trailing blank line.
+
+Example:
+
+```bash
+git add .
+git commit -m "Commit message"
+git push
+
+```
+
+(the blank line after the last command is intentional)
+
+## Git Workflow
+
+Whenever recommending a commit, always include BOTH:
+
+LOCAL
+
+```bash
+git add .
+git commit -m "Descriptive message"
+git push
+
+```
+
+VPS
+
+```bash
+cd ~/omnitrade-legacy-engine && \
+git pull
+
+```
+
+Do not wait for the operator to ask for these.
+
+Assume they are wanted every time a commit is recommended.
+
+After every implementation recommendation:
+
+1. Validate
+
+2. Commit
+
+3. Push
+
+4. Pull on VPS
+
+Do not stop after the code change.
+
+Assume deployment is part of the task unless explicitly stated otherwise.
+
+## Editing
+
+Always use:
+
+vi
+
+Never recommend nano.
+
+## Migrations
+
+Never recommend:
+
+alembic upgrade head
+
+unless the implementation actually introduced a new Alembic migration.
+
+If no migration exists, explicitly state:
+
+"No Alembic upgrade is required."
+
+## Engineering Style
+
+Prefer:
+
+• deterministic implementations
+
+• small bounded implementation tasks
+
+• evidence before assumptions
+
+• runtime proof before new features
+
+Avoid giant speculative prompts.
+
+
+## Evidence Hierarchy
+
+When runtime evidence conflicts with assumptions,
+always trust runtime evidence.
+
+Never attempt to "fix" behavior until the actual
+runtime cause has been identified.
+
+Prefer investigation over implementation.
+
+
+## Reasoning
+
+Never omit the reasoning.
+
+Whenever recommending a change, briefly explain:
+
+• why this is the next step
+
+• what evidence supports it
+
+• what success will look like
+
+before providing commands.
+
+
+## Production
+
+Never recommend bypassing:
+
+• Risk Engine
+
+• audit logging
+
+• campaign identity
+
+• safety gates
+
+• explainability
+
+• replay evidence
+
+Production evidence is more valuable than speculative architecture.
+---
+
 # Next Task
 
-Run the commissioned-campaign production proving window exactly as documented in:
+Investigate the Risk Engine rejection path.
 
-COMMISSIONED_AUTONOMOUS_SEED_CAMPAIGN_ARCHITECTURE.md
+Determine why production BUY proposals are rejected.
 
-Do not activate a campaign during the proving window.
+Collect:
 
-Collect and preserve:
+• Risk rejection reasons
+• Risk rule identifiers
+• Position sizing calculations
+• Minimum order calculations
+• Campaign authorization state
+• Account balance
+• Existing position state
+• Cooldown status
+• Drawdown status
 
-- service health evidence for omnitrade-api.service;
-- service health evidence for omnitrade-orchestration.service;
-- stable NRestarts and worker PID evidence;
-- clean startup-log evidence proving no _STARTED_AT or _RUN_ID failure;
-- evidence that no runpy/sys.modules preload warning exists;
-- current candle-ingestion evidence;
-- commissioned control-plane status evidence;
-- Decision Record and Risk Engine evidence visibility;
-- reconciliation coherence evidence;
-- audit visibility for control-plane mutations.
+Determine whether the rejection is expected
+or caused by configuration.
 
-If the proving window passes, prepare a single explicit operator approval decision for later commissioning.
+Do not loosen any production safety rule until
+the exact rejection reason is proven.
 
 ---
 
@@ -126,15 +309,15 @@ Before ending a work session:
 
 # First Prompt For Next Chat
 
-Read:
+Read in this order:
 
-PROJECT_STATE.md
+1. PROJECT_STATE.md
+2. DECISIONS.md
+3. NEXT_SESSION.md
+4. PROJECT_STATUS.md
+5. PROJECT_CONSTITUTION.md
 
-DECISIONS.md
-
-PROJECT_STATUS.md
-
-PROJECT_CONSTITUTION.md
+Treat these documents as authoritative unless runtime evidence clearly supersedes them.
 
 Then continue implementation from the Next Task section above.
 

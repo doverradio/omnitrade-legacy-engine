@@ -329,6 +329,38 @@ def render_preview_text(payload: dict[str, Any], options: RenderOptions) -> str:
     return "\n".join(lines)
 
 
+def render_autonomous_profit_status_text(payload: dict[str, Any], _options: RenderOptions) -> str:
+    reasons = payload.get("reason_codes") or []
+    return "\n".join([
+        "OmniTrade Autonomous Proving Status", "",
+        f"Overall: {payload.get('overall_status')}",
+        f"Current stage: {payload.get('current_stage')}",
+        f"Latest decision: {payload.get('latest_decision') or 'none'}",
+        f"Last progress: {payload.get('last_progress_at') or 'unavailable'}",
+        f"Human action required: {'yes' if payload.get('human_action_required') else 'no'}", "",
+        f"Reasons: {', '.join(str(item) for item in reasons) if reasons else 'none'}",
+        f"Recommended action: {payload.get('recommended_action')}", "",
+        f"Automatic activation: {'enabled' if payload.get('automatic_activation_enabled') else 'disabled'}",
+        f"Live submission: {'enabled' if payload.get('live_submission_enabled') else 'disabled'}",
+        f"Provider submission reachable: {'yes' if payload.get('provider_submission_reachable') else 'no'}",
+    ])
+
+
+def render_autonomous_profit_report_text(payload: dict[str, Any], options: RenderOptions) -> str:
+    counts = payload.get("counts") or {}
+    current = payload.get("current") or {}
+    lines = [
+        "OmniTrade Autonomous Profit Report", "", f"Window start: {payload.get('since')}",
+        f"Current status: {current.get('overall_status')}", f"Current stage: {current.get('current_stage')}",
+        f"First Autonomous Profit achieved: {'yes' if payload.get('first_autonomous_profit_achieved') else 'no'}",
+        f"Net realized profit: {payload.get('net_realized_profit') or 'unavailable'}", "", "Activity:",
+    ]
+    lines.extend(f"- {name.replace('_', ' ')}: {value}" for name, value in counts.items())
+    blockers = payload.get("unresolved_blockers") or []
+    lines.extend(["", f"Unresolved blockers: {', '.join(str(item) for item in blockers) if blockers else 'none'}", "", render_autonomous_profit_status_text(current, options)])
+    return "\n".join(lines)
+
+
 def render_preview_show_text(payload: dict[str, Any], options: RenderOptions) -> str:
     preview = payload.get("preview") or {}
     decision = payload.get("decision_record") or {}

@@ -231,3 +231,27 @@ The knowledge compounds.
 The capital compounds.
 
 Both improve together.
+
+
+---
+
+# Current Proven Runtime Behavior
+
+✓ Autonomous worker cycles execute repeatedly.
+
+✓ Multiple strategies generate BUY and SELL proposals.
+
+✓ Decision Records continue to be generated.
+
+✓ Risk Engine evaluates candidate trades.
+
+✓ Current production blocker:
+
+Risk Engine is rejecting BUY candidates before execution.
+
+The immediate engineering objective is to determine whether these
+rejections are caused by intentional risk policy,
+position sizing,
+minimum order limits,
+campaign constraints,
+or a configuration defect.

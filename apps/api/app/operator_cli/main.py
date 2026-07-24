@@ -4,13 +4,15 @@ import argparse
 import asyncio
 import json
 import sys
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 from pathlib import Path
 from typing import Any
 from uuid import UUID, uuid4
 
 from app.operator_cli.formatting import (
+    render_autonomous_profit_report_text,
+    render_autonomous_profit_status_text,
     render_buy_opportunity_diagnostic_text,
     render_canonical_proving_commission_status_text,
     render_hold_decision_diagnostic_text,
@@ -27,6 +29,8 @@ from app.operator_cli.formatting import (
     render_venue_commission_text,
 )
 from app.operator_cli.service import (
+    autonomous_profit_report,
+    autonomous_profit_status,
     automatic_mandate_activation_proof,
     automatic_mandate_activation_readiness,
     mandate_evaluation_identity_diagnostic,
@@ -1236,6 +1240,25 @@ def _build_parser() -> argparse.ArgumentParser:
     first_profit.add_argument("--product", type=str, required=True)
     first_profit.add_argument("--json", action="store_true", dest="json_output")
 
+    supervisor_status = subparsers.add_parser(
+        "autonomous-profit-status", parents=[common],
+        help="Read-only autonomous golden-path supervisor snapshot",
+    )
+    supervisor_status.add_argument("--provider", required=True)
+    supervisor_status.add_argument("--environment", required=True)
+    supervisor_status.add_argument("--product", required=True)
+    supervisor_status.add_argument("--json", action="store_true", dest="json_output")
+
+    supervisor_report = subparsers.add_parser(
+        "autonomous-profit-report", parents=[common],
+        help="Read-only autonomous golden-path activity report",
+    )
+    supervisor_report.add_argument("--provider", required=True)
+    supervisor_report.add_argument("--environment", required=True)
+    supervisor_report.add_argument("--product", required=True)
+    supervisor_report.add_argument("--since", default="12h", help="Lookback such as 30m, 12h, or 2d")
+    supervisor_report.add_argument("--json", action="store_true", dest="json_output")
+
     unattended_eligibility = subparsers.add_parser(
         "campaign-unattended-eligibility-audit",
         parents=[common],
@@ -1981,6 +2004,25 @@ async def _run_async(args: argparse.Namespace) -> tuple[int, dict[str, Any], str
             product_id=args.product,
         )
         return 0, payload, render_json(payload)
+
+    if args.command == "autonomous-profit-status":
+        payload = await autonomous_profit_status(
+            provider=args.provider, environment=args.environment, product=args.product,
+        )
+        text = render_json(payload) if args.json_output else render_autonomous_profit_status_text(payload, options)
+        return 0, payload, text
+
+    if args.command == "autonomous-profit-report":
+        raw = args.since.strip().lower()
+        units = {"m": 60, "h": 3600, "d": 86400}
+        if len(raw) < 2 or raw[-1] not in units or not raw[:-1].isdigit() or int(raw[:-1]) <= 0:
+            raise ValueError("--since must be a positive duration such as 30m, 12h, or 2d")
+        payload = await autonomous_profit_report(
+            provider=args.provider, environment=args.environment, product=args.product,
+            since=timedelta(seconds=int(raw[:-1]) * units[raw[-1]]),
+        )
+        text = render_json(payload) if args.json_output else render_autonomous_profit_report_text(payload, options)
+        return 0, payload, text
 
     if args.command == "campaign-unattended-eligibility-audit":
         payload = await campaign_unattended_eligibility_audit(

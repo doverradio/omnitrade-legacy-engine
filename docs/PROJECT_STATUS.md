@@ -1,6 +1,6 @@
 # OmniTrade Decision Intelligence Platform — Project Status
 
-Last Updated: 2026-07-10
+Last Updated: 2026-07-23
 
 ---
 
@@ -10,21 +10,39 @@ Project Stage:
 Pre-MVP
 
 Current Phase:
-Operational Resilience + Research/Evolution Activation + Intelligence Timeline v1 (In Progress)
+Autonomous Production Proving (In Progress)
+
+Current engineering effort is focused on demonstrating the First Autonomous Profit milestone through evidence-driven runtime validation rather than new feature development.
 
 Autonomous Capital Management:
-Phase 1 Capital Campaigns Foundation (Complete)
-Phase 2 Capital Campaign Profit Policies + Compounding Foundation v1 (Implemented, validation in progress)
+
+Commissioned Autonomous Capital Campaign Architecture:
+COMPLETE
+
+Campaign Governance:
+COMPLETE
+
+Campaign Identity Propagation:
+COMPLETE
+
+Autonomous Worker Cycles:
+Operational
+
+Current Objective:
+
+Successfully complete one fully autonomous commissioned production campaign resulting in verified positive net profit.
 
 Current Prompt:
-Paper-proving resilience hardening, deterministic research/evolution activation, and intelligence evidence improvements
+
+Autonomous production proving, runtime evidence collection, Risk Engine rejection analysis, and First Autonomous Profit.
 
 Overall Completion:
-Approximately 94%
+Approximately 98%
 
-Capital Campaigns Foundation adds campaign CRUD, lifecycle controls, Mission Control managed-capital integration, and optional Capital Ledger campaign linkage without changing live-trading safety boundaries.
+The remaining work is no longer architectural.
 
-Phase 2 adds campaign-level profit policy and cycle recommendation modeling, approval workflows, and recommendation-only ledger/timeline intelligence integration while keeping live submission disabled and fund movement out of scope.
+The remaining work is proving one complete unattended production lifecycle that results in a verified positive net profit while preserving every existing safety boundary.
+
 
 ## Execution Provider Status
 
@@ -40,23 +58,24 @@ Execution providers are interchangeable implementations of the Execution Provide
 Kraken
 
 Status:
-Primary production execution provider.
 
-Reason:
+Primary Production Execution Provider
 
-- Active verified operator account.
-- API credentials configured.
-- Current implementation target.
-- Critical path to first live trade.
+Production Status:
 
-Current Progress:
+✓ Live authentication proven
 
-- Provider registered.
-- Provider abstraction implemented.
-- Initialization work in progress.
-- Readiness work in progress.
-- Production dry-run path in progress.
-- Live submission implementation in progress.
+✓ Live BUY proven
+
+✓ Live SELL proven
+
+✓ Production reconciliation proven
+
+✓ Provider-neutral execution architecture validated
+
+Current Role:
+
+Primary production provider used during autonomous proving.
 
 Coinbase
 
@@ -76,13 +95,23 @@ Current Progress:
 - Existing Coinbase integration preserved.
 - Future production account onboarding deferred.
 
+### Execution Layer Status
+
+The Execution Provider Layer is now production-proven.
+
+Provider abstraction has successfully demonstrated live production execution while remaining independent of exchange-specific implementation details.
+
+Future providers inherit the same execution contracts without requiring architectural redesign.
+
 ### Architecture Decision
 
 Execution providers are now first-class architectural components.
 
 No exchange may become a permanent single point of failure.
 
-The first successful production trade may execute through whichever provider reaches production readiness first.
+The first successful production trade has been demonstrated through Kraken.
+
+Future providers inherit the same provider-neutral execution architecture.
 
 ### Future Providers
 
@@ -145,11 +174,11 @@ Risk Engine remains the final authority for candidate action evaluation before a
 
 Live Trading Foundation operational surfaces now exist under controlled, governance-gated boundaries.
 
-Live submission remains disabled.
-
 Research activation remains paper-only.
 
-Paper Trading remains the default operating mode.
+Paper Trading remains the default proving environment.
+
+Commissioned autonomous production proving is now active under controlled governance using bounded production campaigns.
 
 Human approval remains mandatory for live-mode activation paths.
 
@@ -161,7 +190,11 @@ No autonomous capital allocation exists.
 
 No autonomous strategy evolution exists.
 
-Broker adapters remain contracts/interfaces unless future explicit connectivity work is approved.
+Execution providers remain interchangeable implementations behind the provider-neutral execution layer.
+
+Kraken is the first production-proven provider.
+
+Future providers inherit identical execution contracts and governance.
 
 No automatic promotion to live capital exists.
 
@@ -169,20 +202,96 @@ No automatic promotion to live capital exists.
 
 # Current Goal
 
-Harden the active paper proving pipeline while keeping live trading disabled.
+Achieve the platform's First Autonomous Profit.
 
-Current operator priorities:
+Definition:
 
-- graceful SELL rejection handling for no-position cases
-- transient database disconnect recovery for read paths and worker cycles
-- deterministic research/evolution activation without OpenAI dependency
-- more evidence-backed validation and intelligence surfaces
+One commissioned autonomous capital campaign performs:
 
-Phase progression remains gated by validation, documentation updates, and regression-free handoff before advancing.
+Campaign Selection
 
-Governance boundary:
-- MVP safety restrictions remain fully active and controlled live operation remains optional and approval-gated.
-- Future phase implementation may begin only after completion of prior phases, explicit human approval, preserved Risk Engine final authority, and explicit governance approval.
+↓
+
+Strategy Selection
+
+↓
+
+Risk Approval
+
+↓
+
+Production BUY
+
+↓
+
+Autonomous Position Management
+
+↓
+
+Production SELL
+
+↓
+
+Production Reconciliation
+
+↓
+
+Accounting Completion
+
+↓
+
+Verified Positive Net Profit
+
+without operator intervention during execution.
+
+Engineering effort is now focused on proving the existing architecture rather than expanding it.
+
+---
+
+# Current Milestone
+
+FIRST AUTONOMOUS PROFIT
+
+The remaining engineering work is focused on proving one complete autonomous production lifecycle from campaign selection through verified profitable reconciliation.
+
+No architectural redesign is currently planned.
+
+Evidence-driven runtime validation is the governing engineering activity.
+
+---
+
+# Current Runtime Blocker
+
+Runtime evidence demonstrates:
+
+✓ Autonomous worker cycles are operating.
+
+✓ Multiple strategies generate BUY and SELL proposals.
+
+✓ Decision Records continue to be generated.
+
+✓ Campaign identity remains intact.
+
+✓ Risk Engine evaluates every candidate proposal.
+
+Current blocker:
+
+The Risk Engine is rejecting valid BUY proposals before production execution.
+
+Current engineering objective:
+
+Determine whether the rejection is caused by:
+
+- intentional risk policy
+- position sizing
+- minimum order calculations
+- campaign authorization
+- account state
+- cooldown logic
+- drawdown limits
+- configuration defects
+
+No production safety boundary should be weakened until the precise rejection cause is identified through runtime evidence.
 
 ---
 
@@ -307,7 +416,8 @@ Completed highlights:
 - Live Trading remains optional; paper remains default.
 - Human approval remains mandatory; Risk Engine remains mandatory final authority.
 - No autonomous live enablement, autonomous capital allocation, or autonomous strategy evolution implemented.
-- Broker adapters remain contracts/interfaces only; no direct broker connectivity implementation was added in this phase.
+- Phase 9 established the governance and operational foundation for controlled live execution.
+- Subsequent engineering has successfully demonstrated production Kraken connectivity, live BUY, live SELL, and reconciliation while preserving provider-neutral architecture.
 - Phase 9 validation completed successfully (`cd apps/api && pytest -v`, `cd apps/web && pnpm test`, `cd apps/web && pnpm lint`).
 
 ## ⬜ Future — Post-Phase 9 Roadmap Planning
@@ -371,7 +481,7 @@ Live Trading Foundation implementation exists in current scope under controlled,
 
 No automatic promotion to live capital exists in current scope.
 
-Future roadmap planning is the next activity.
+Current engineering effort is focused on achieving the First Autonomous Profit milestone through evidence-driven runtime validation.
 
 ---
 

@@ -260,6 +260,27 @@ Future AI-assisted development remains incremental, verifiable, and maintainable
 
 ---
 
+## 2026-07
+
+### Runtime Evidence Before Expansion
+
+Decision
+
+Operational evidence takes precedence over new feature work.
+
+Reason
+
+The production runtime has reached the point where engineering effort
+produces more value by explaining runtime behavior than by adding
+additional capabilities.
+
+Future Impact
+
+Engineering remains focused on achieving the first autonomous profit
+through evidence-based debugging instead of speculative feature growth.
+
+---
+
 ## Future Decisions
 
 Append only.

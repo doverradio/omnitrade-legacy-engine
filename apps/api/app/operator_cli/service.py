@@ -9786,6 +9786,140 @@ async def automatic_mandate_activation_readiness(*, provider: str, environment: 
         }
 
 
+async def _gather_autonomous_supervisor_evidence(
+    *, provider: str, environment: str, product: str, since: datetime | None = None,
+) -> tuple[dict[str, Any], dict[str, int]]:
+    from app.services.orchestration.automatic_package_inspection import inspect_automatic_mandate_activation_readiness
+
+    now = datetime.now(timezone.utc)
+    settings = get_settings()
+    async with AsyncSessionLocal() as db:
+        package = await db.scalar(
+            select(CanonicalPreviewPackage)
+            .where(CanonicalPreviewPackage.provider == provider, CanonicalPreviewPackage.environment == environment, CanonicalPreviewPackage.product == product)
+            .order_by(desc(CanonicalPreviewPackage.generated_at), desc(CanonicalPreviewPackage.package_id)).limit(1)
+        )
+        campaign_id = None if package is None else package.campaign_id
+        cycle_query = select(AutonomousCycleRun).where(AutonomousCycleRun.cycle_kind == "campaign")
+        if campaign_id is not None:
+            cycle_query = cycle_query.where(AutonomousCycleRun.capital_campaign_id == campaign_id)
+        cycle = await db.scalar(cycle_query.order_by(desc(AutonomousCycleRun.started_at), desc(AutonomousCycleRun.cycle_id)).limit(1))
+        activation = None if package is None else await db.scalar(
+            select(CanonicalProvingActivation).where(CanonicalProvingActivation.package_id == package.package_id).limit(1)
+        )
+        order = None if package is None else await db.scalar(
+            select(LiveCryptoOrder).where(LiveCryptoOrder.crypto_order_preview_id == package.crypto_order_preview_id).limit(1)
+        )
+        reconciliation = None if order is None else await db.scalar(
+            select(LiveReconciliationEvent).where(LiveReconciliationEvent.live_crypto_order_id == order.live_crypto_order_id)
+            .order_by(desc(LiveReconciliationEvent.recorded_at), desc(LiveReconciliationEvent.id)).limit(1)
+        )
+        asset = await db.scalar(select(Asset).where(Asset.symbol == _product_symbol(product), Asset.exchange == provider).limit(1))
+        trades: list[Trade] = []
+        if asset is not None and package is not None:
+            trades = list((await db.scalars(
+                select(Trade).where(Trade.asset_id == asset.id, Trade.paper_account_id == package.paper_account_id)
+                .order_by(Trade.executed_at.asc(), Trade.id.asc())
+            )).all())
+        quantity = Decimal("0")
+        for trade in trades:
+            quantity += Decimal(str(trade.quantity)) if trade.side == "buy" else -Decimal(str(trade.quantity))
+        position_open = quantity > 0
+        latest_position = next((item for item in reversed(trades) if item.side == "buy"), None) if position_open else None
+        campaign_packages = [] if package is None else list((await db.scalars(
+            select(CanonicalPreviewPackage).where(
+                CanonicalPreviewPackage.campaign_id == package.campaign_id,
+                CanonicalPreviewPackage.campaign_version == package.campaign_version,
+                CanonicalPreviewPackage.provider == provider,
+                CanonicalPreviewPackage.environment == environment,
+                CanonicalPreviewPackage.product == product,
+            )
+        )).all())
+        preview_ids = [item.crypto_order_preview_id for item in campaign_packages]
+        reconciliations = [] if package is None else list((await db.scalars(
+            select(LiveReconciliationEvent)
+            .where(LiveReconciliationEvent.provider_name == provider, LiveReconciliationEvent.live_trading_profile_id == package.live_trading_profile_id)
+            .order_by(LiveReconciliationEvent.recorded_at.asc())
+        )).all())
+        reconciled_ids = {str(item.live_crypto_order_id) for item in reconciliations if item.reconciliation_status == "filled"}
+        orders = [] if not preview_ids else list((await db.scalars(
+            select(LiveCryptoOrder)
+            .where(LiveCryptoOrder.provider == provider, LiveCryptoOrder.environment == environment, LiveCryptoOrder.product_id == product)
+            .where(LiveCryptoOrder.crypto_order_preview_id.in_(preview_ids))
+            .order_by(LiveCryptoOrder.created_at.asc())
+        )).all())
+        buy_orders = [item for item in orders if str(item.side).upper() == "BUY" and item.submitted_at is not None]
+        sell_orders = [item for item in orders if str(item.side).upper() == "SELL" and item.submitted_at is not None]
+        readiness = await inspect_automatic_mandate_activation_readiness(db=db, provider=provider, environment=environment, product=product)
+        runtime = None if package is None else await db.scalar(select(CapitalCampaign).where(CapitalCampaign.uuid == package.runtime_campaign_id).limit(1))
+        evidence = {
+            "now": now, "environment": environment, "provider": provider, "product": product,
+            "cycle": cycle, "package": package, "activation": activation, "order": order,
+            "position": latest_position, "position_open": position_open,
+            "position_updated_at": None if latest_position is None else latest_position.executed_at,
+            "reconciliation": reconciliation, "readiness": readiness,
+            "buy_reconciled": any(str(item.live_crypto_order_id) in reconciled_ids for item in buy_orders),
+            "sell_reconciled": any(str(item.live_crypto_order_id) in reconciled_ids for item in sell_orders),
+            "autonomous_buy_provenance": any(item.decision_record_id is not None for item in buy_orders),
+            "autonomous_sell_provenance": any(item.decision_record_id is not None for item in sell_orders),
+            "net_profit": None if runtime is None else runtime.realized_profit,
+            "automatic_activation_enabled": settings.automatic_mandate_package_activation_enabled,
+            "live_submission_enabled": settings.live_crypto_order_submission_enabled,
+            "provider_available": readiness.get("verdict") != "FAILED_CLOSED",
+        }
+        counts: dict[str, int] = {}
+        if since is not None:
+            counts["completed_cycles"] = int(await db.scalar(select(func.count()).select_from(AutonomousCycleRun).where(AutonomousCycleRun.completed_at >= since)) or 0)
+            counts["healthy_hold_cycles"] = int(await db.scalar(select(func.count()).select_from(AutonomousCycleRun).where(AutonomousCycleRun.completed_at >= since, AutonomousCycleRun.proposed_action == "HOLD", AutonomousCycleRun.failure_reason.is_(None))) or 0)
+            for side in ("BUY", "SELL"):
+                counts[f"{side.lower()}_proposals"] = int(await db.scalar(select(func.count()).select_from(StrategyRosterProposal).where(StrategyRosterProposal.created_at >= since, StrategyRosterProposal.provider == provider, StrategyRosterProposal.product_id == product, StrategyRosterProposal.action == side)) or 0)
+            counts["packages_created"] = int(await db.scalar(select(func.count()).select_from(CanonicalPreviewPackage).where(CanonicalPreviewPackage.generated_at >= since, CanonicalPreviewPackage.provider == provider, CanonicalPreviewPackage.environment == environment, CanonicalPreviewPackage.product == product)) or 0)
+            counts["activations"] = int(await db.scalar(select(func.count()).select_from(CanonicalProvingActivation).where(CanonicalProvingActivation.activated_at >= since, CanonicalProvingActivation.provider == provider, CanonicalProvingActivation.environment == environment, CanonicalProvingActivation.product == product)) or 0)
+            counts["orders"] = sum(1 for item in orders if item.created_at >= since)
+            counts["positions_opened"] = sum(1 for item in trades if item.executed_at >= since and item.side == "buy")
+            counts["positions_closed"] = sum(1 for item in trades if item.executed_at >= since and item.side == "sell")
+            counts["reconciliations"] = sum(1 for item in reconciliations if item.recorded_at >= since)
+            failed_cycles = list((await db.scalars(
+                select(AutonomousCycleRun)
+                .where(AutonomousCycleRun.started_at >= since, AutonomousCycleRun.failure_reason.is_not(None))
+                .order_by(AutonomousCycleRun.started_at.asc())
+            )).all())
+            occurrences: dict[str, dict[str, Any]] = {}
+            for item in failed_cycles:
+                code = str(item.failure_reason)
+                row = occurrences.setdefault(code, {"reason_code": code, "count": 0, "first_occurred_at": item.started_at.isoformat(), "most_recent_at": item.started_at.isoformat()})
+                row["count"] += 1
+                row["most_recent_at"] = item.started_at.isoformat()
+            evidence["blocker_occurrences"] = list(occurrences.values())
+        return evidence, counts
+
+
+async def autonomous_profit_status(*, provider: str, environment: str, product: str) -> dict[str, Any]:
+    from app.services.orchestration.autonomous_operations_supervisor import resolve_autonomous_profit_snapshot
+
+    evidence, _ = await _gather_autonomous_supervisor_evidence(provider=provider, environment=environment, product=product)
+    return resolve_autonomous_profit_snapshot(evidence)
+
+
+async def autonomous_profit_report(*, provider: str, environment: str, product: str, since: timedelta) -> dict[str, Any]:
+    from app.services.orchestration.autonomous_operations_supervisor import resolve_autonomous_profit_snapshot
+
+    now = datetime.now(timezone.utc)
+    evidence, counts = await _gather_autonomous_supervisor_evidence(
+        provider=provider, environment=environment, product=product, since=now - since,
+    )
+    snapshot = resolve_autonomous_profit_snapshot(evidence)
+    return {
+        "generated_at": now.isoformat(), "since": (now - since).isoformat(), "scope": {"provider": provider, "environment": environment, "product": product},
+        "counts": counts, "net_realized_profit": snapshot["latest_net_profit"],
+        "unresolved_blockers": snapshot["reason_codes"] if snapshot["human_action_required"] else [],
+        "blocker_occurrences": evidence.get("blocker_occurrences", []),
+        "human_action_required": snapshot["human_action_required"],
+        "first_autonomous_profit_achieved": snapshot["overall_status"] == "FIRST_AUTONOMOUS_PROFIT_COMPLETE",
+        "current": snapshot, "read_only": True,
+    }
+
+
 async def mandate_evaluation_identity_diagnostic(*, cycle_id: UUID, decision_record_id: UUID) -> dict[str, Any]:
     from app.services.orchestration.automatic_package_inspection import inspect_mandate_evaluation_identity_propagation
 
