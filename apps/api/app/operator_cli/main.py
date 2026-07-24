@@ -1578,7 +1578,7 @@ async def _run_async(args: argparse.Namespace) -> tuple[int, dict[str, Any], str
 
     if args.command == "autonomous-execution-status":
         payload = await autonomous_execution_status(package_id=args.package_id)
-        return 0, payload, render_json(payload)
+        return (0 if payload.get("verdict") == "READY_FOR_ONE_SHOT_LIVE_BUY" else 1), payload, render_json(payload)
 
     if args.command == "mandate-evaluation-identity-diagnostic":
         payload = await mandate_evaluation_identity_diagnostic(

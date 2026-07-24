@@ -21,7 +21,7 @@ from uuid import UUID
 import uuid
 
 from pydantic import BaseModel
-from sqlalchemy import desc, func, select
+from sqlalchemy import case, desc, func, select, text
 
 from app.config import get_settings
 from app.db.session import AsyncSessionLocal
@@ -42,11 +42,13 @@ from app.models.decision_record import DecisionRecord
 from app.models.decision_snapshot import DecisionSnapshot
 from app.models.exchange_connection import ExchangeConnection
 from app.models.live_crypto_order import LiveCryptoOrder
+from app.models.live_accounting_record import LiveAccountingRecord
 from app.models.live_approval_event import LiveApprovalEvent
 from app.models.live_reconciliation_event import LiveReconciliationEvent
 from app.models.live_trading_profile import LiveTradingProfile
 from app.models.paper_account import PaperAccount
 from app.models.risk_event import RiskEvent
+from app.models.risk_kill_switch import RiskKillSwitch
 from app.models.signal import Signal
 from app.models.venue_commissioning_run import VenueCommissioningRun
 from app.models.strategy import Strategy
@@ -10054,6 +10056,104 @@ async def autonomous_execution_status(*, package_id: UUID) -> dict[str, Any]:
         order = None if claim is None or claim.live_order_id is None else await db.scalar(
             select(LiveCryptoOrder).where(LiveCryptoOrder.live_crypto_order_id == claim.live_order_id).limit(1)
         )
+        try:
+            migration = await db.scalar(text("SELECT version_num FROM alembic_version WHERE version_num = '20260724_0048'"))
+        except Exception:
+            # A missing/unreadable migration ledger is itself a failed preflight
+            # gate.  The read-only command must report BLOCKED, never proceed on
+            # an inability to prove the schema boundary.
+            migration = None
+        campaign = None if package is None else await db.scalar(select(CapitalCampaign).where(
+            CapitalCampaign.uuid == package.campaign_id,
+            CapitalCampaign.definition_version == package.campaign_version,
+            CapitalCampaign.paper_account_id == package.paper_account_id,
+        ).limit(1))
+        mandate = None if package is None or package.mandate_id is None else await db.scalar(select(AutonomousCapitalMandate).where(
+            AutonomousCapitalMandate.mandate_id == package.mandate_id,
+        ).limit(1))
+        mandate_version = None if package is None or package.mandate_version_id is None else await db.scalar(select(AutonomousCapitalMandateVersion).where(
+            AutonomousCapitalMandateVersion.mandate_version_id == package.mandate_version_id,
+        ).limit(1))
+        profile = None if package is None else await db.scalar(select(LiveTradingProfile).where(
+            LiveTradingProfile.id == package.live_trading_profile_id,
+        ).limit(1))
+        connection = None if claim is None else await db.scalar(select(ExchangeConnection).where(
+            ExchangeConnection.exchange_connection_id == claim.connection_id,
+        ).limit(1))
+        risk = None if package is None else await db.scalar(select(RiskEvent).where(RiskEvent.id == package.risk_event_id).limit(1))
+        switch = None if package is None else await db.scalar(select(RiskKillSwitch.id).where(
+            RiskKillSwitch.engaged.is_(True),
+            (RiskKillSwitch.scope == "global") | ((RiskKillSwitch.scope == "account") & (RiskKillSwitch.paper_account_id == package.paper_account_id)),
+        ).limit(1))
+        reconciliation = None if order is None else await db.scalar(select(LiveReconciliationEvent).where(
+            LiveReconciliationEvent.live_crypto_order_id == order.live_crypto_order_id,
+        ).order_by(LiveReconciliationEvent.sequence_number.desc()).limit(1))
+        open_quantity = Decimal("0") if claim is None else Decimal(str((await db.scalar(select(func.coalesce(func.sum(case(
+            (LiveAccountingRecord.side == "buy", LiveAccountingRecord.filled_quantity),
+            else_=-LiveAccountingRecord.filled_quantity,
+        )), Decimal("0"))).where(
+            LiveAccountingRecord.live_trading_profile_id == claim.profile_id,
+            LiveAccountingRecord.symbol == claim.product,
+        ))) or 0))
+
+        configured_scope = (
+            settings.automatic_mandate_package_activation_campaign_id,
+            settings.automatic_mandate_package_activation_campaign_version,
+            settings.automatic_mandate_package_activation_mandate_id,
+            settings.automatic_mandate_package_activation_mandate_version_id,
+        )
+        package_scope = None if package is None else (
+            package.campaign_id, package.campaign_version, package.mandate_id, package.mandate_version_id,
+        )
+        binding = None if order is None or not isinstance(order.safe_provider_response, dict) else order.safe_provider_response.get("commissioned_preview_identity_binding")
+        expected_binding = None
+        if claim is not None and package is not None and activation is not None and order is not None:
+            expected_binding = {
+                "package_id": str(package.package_id), "activation_id": str(activation.activation_id),
+                "claim_id": str(claim.claim_id), "live_order_id": str(order.live_crypto_order_id),
+                "campaign_id": str(claim.campaign_id), "campaign_version": claim.campaign_version,
+                "mandate_id": str(claim.mandate_id), "mandate_version_id": str(claim.mandate_version_id),
+                "account_id": str(claim.account_id), "profile_id": str(claim.profile_id),
+                "connection_id": str(claim.connection_id), "provider": claim.provider,
+                "environment": claim.environment, "product": claim.product,
+                "side": order.side,
+                "quantity": None if binding is None else binding.get("quantity"),
+                "order_type": order.order_type,
+                "crypto_order_preview_id": str(package.crypto_order_preview_id),
+            }
+        unresolved_states = {"open", "partially_filled", "reconciliation_required", "unknown", "conflict", "balance_mismatch"}
+        risk_max_age = None if mandate_version is None else mandate_version.price_evidence_max_age_seconds
+        risk_fresh = bool(risk is not None and risk.created_at is not None and risk_max_age is not None and (now - risk.created_at).total_seconds() <= risk_max_age)
+        gates = [
+            ("migration_0048_applied", migration == "20260724_0048", "apply_migration_20260724_0048"),
+            ("configured_campaign_mandate_scope", package_scope is not None and configured_scope == package_scope, "correct_activation_scope_configuration"),
+            ("campaign_active", campaign is not None and campaign.status in {"READY", "RUNNING"}, "restore_exact_campaign_to_active_state"),
+            ("mandate_active", mandate is not None and mandate.status == "ACTIVE" and (mandate.expires_at is None or mandate.expires_at > now), "restore_or_replace_governing_mandate"),
+            ("mandate_version_active", mandate_version is not None and mandate_version.is_active and mandate_version.is_authorized, "activate_exact_authorized_mandate_version"),
+            ("activation_active", activation is not None and activation.activation_state == "ACTIVE" and activation.activated_at <= now < activation.expires_at, "create_fresh_exact_activation"),
+            ("one_shot_available", claim is not None and claim.claim_status in {"CLAIMED", "EXECUTION_STARTED", "SAFETY_DISABLED"}, "inspect_consumed_or_blocked_one_shot"),
+            ("buy_only", package is not None and package.side == "BUY" and order is not None and order.side == "BUY", "use_exact_buy_package"),
+            ("bounded_notional", package is not None and activation is not None and order is not None and max(Decimal(package.risk_approved_amount), Decimal(activation.max_order_amount), Decimal(order.requested_quote_size)) <= Decimal("5"), "reduce_authorized_notional_to_five_or_less"),
+            ("no_leverage", activation is not None and activation.no_leverage is True, "require_no_leverage_activation"),
+            ("identity_binding", bool(order is not None and order.safe_provider_response.get("commissioned_preview_identity_hash") and binding == expected_binding), "recreate_fresh_canonical_prepared_order"),
+            ("no_previous_submission", order is not None and order.submitted_at is None and order.provider_order_id is None and order.status not in {"SUBMISSION_PENDING", "RECONCILIATION_REQUIRED"}, "do_not_retry_submit;_reconcile_existing_order"),
+            ("no_reconciliation_obligation", reconciliation is None or reconciliation.reconciliation_status not in unresolved_states, "reconcile_existing_provider_obligation"),
+            ("no_open_position", open_quantity <= 0, "manage_or_close_existing_owned_position"),
+            ("kill_switch_clear", switch is None, "clear_kill_switch_only_after_operator_review"),
+            ("risk_evidence_fresh", risk_fresh and risk.paper_account_id == package.paper_account_id, "generate_fresh_authoritative_risk_evidence"),
+            ("profile_connection_scope", bool(
+                profile is not None and connection is not None and claim is not None
+                and mandate is not None and package is not None and activation is not None and order is not None
+                and package.paper_account_id == activation.paper_account_id == claim.account_id == profile.paper_account_id == mandate.paper_account_id
+                and package.live_trading_profile_id == activation.live_trading_profile_id == claim.profile_id == profile.id == mandate.live_trading_profile_id
+                and claim.connection_id == connection.exchange_connection_id == mandate.exchange_connection_id == order.exchange_connection_id
+                and package.provider == activation.provider == claim.provider == connection.provider == mandate.provider == order.provider
+                and package.environment == activation.environment == claim.environment == connection.environment == mandate.exchange_environment == order.environment
+                and package.product == activation.product == claim.product == order.product_id
+            ), "restore_exact_profile_connection_scope"),
+            ("live_submission_currently_disabled", settings.live_crypto_order_submission_enabled is False, "disable_live_submission_before_preflight"),
+        ]
+        failed = [{"gate": name, "recommended_action": action} for name, passed, action in gates if not passed]
         reason_codes = [] if claim is None or claim.last_error_code is None else [claim.last_error_code]
         safety_disabled = claim is not None and claim.claim_status == "SAFETY_DISABLED"
         consumed_states = {"SUBMISSION_PENDING", "RECONCILIATION_REQUIRED", "BUY_RECONCILED", "POSITION_OPENED", "COMPLETED"}
@@ -10064,6 +10164,9 @@ async def autonomous_execution_status(*, package_id: UUID) -> dict[str, Any]:
             else "BLOCKED"
         )
         return {
+            "verdict": "READY_FOR_ONE_SHOT_LIVE_BUY" if not failed else "BLOCKED",
+            "failed_gates": failed,
+            "recommended_action": "enable_one_shot_live_submission" if not failed else failed[0]["recommended_action"],
             "campaign_id": None if package is None else str(package.campaign_id),
             "campaign_version": None if package is None else package.campaign_version,
             "mandate_id": None if package is None or package.mandate_id is None else str(package.mandate_id),
@@ -10094,7 +10197,7 @@ async def autonomous_execution_status(*, package_id: UUID) -> dict[str, Any]:
             "open_position_state": "BLOCKED" if claim is not None and claim.claim_status == "POSITION_OPENED" else "NONE_RECORDED",
             "human_action_required": safety_disabled,
             "reason_codes": reason_codes,
-            "recommended_action": "enable_bounded_live_submission_when_ready" if safety_disabled else "inspect_claim_state",
+            "gates": [{"gate": name, "status": "PASS" if passed else "FAIL"} for name, passed, _action in gates],
             "read_only": True,
         }
 
