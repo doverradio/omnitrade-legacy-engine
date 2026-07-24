@@ -10056,6 +10056,13 @@ async def autonomous_execution_status(*, package_id: UUID) -> dict[str, Any]:
         )
         reason_codes = [] if claim is None or claim.last_error_code is None else [claim.last_error_code]
         safety_disabled = claim is not None and claim.claim_status == "SAFETY_DISABLED"
+        consumed_states = {"SUBMISSION_PENDING", "RECONCILIATION_REQUIRED", "BUY_RECONCILED", "POSITION_OPENED", "COMPLETED"}
+        one_shot_state = (
+            "UNAVAILABLE" if claim is None
+            else "CONSUMED" if claim.claim_status in consumed_states
+            else "AVAILABLE" if claim.claim_status in {"CLAIMED", "EXECUTION_STARTED", "SAFETY_DISABLED"}
+            else "BLOCKED"
+        )
         return {
             "campaign_id": None if package is None else str(package.campaign_id),
             "campaign_version": None if package is None else package.campaign_version,
@@ -10082,6 +10089,9 @@ async def autonomous_execution_status(*, package_id: UUID) -> dict[str, Any]:
             "live_submission_enabled": settings.live_crypto_order_submission_enabled,
             "provider_call_reachable": bool(settings.live_crypto_order_submission_enabled and claim is not None and not safety_disabled),
             "provider_call_made": bool(order is not None and order.submitted_at is not None),
+            "one_shot_buy_authorization": one_shot_state,
+            "maximum_authorized_notional": None if activation is None else str(activation.max_order_amount),
+            "open_position_state": "BLOCKED" if claim is not None and claim.claim_status == "POSITION_OPENED" else "NONE_RECORDED",
             "human_action_required": safety_disabled,
             "reason_codes": reason_codes,
             "recommended_action": "enable_bounded_live_submission_when_ready" if safety_disabled else "inspect_claim_state",

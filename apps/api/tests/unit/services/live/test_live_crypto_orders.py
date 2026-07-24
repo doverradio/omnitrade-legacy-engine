@@ -3,6 +3,7 @@ from __future__ import annotations
 import uuid
 from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
+from unittest.mock import AsyncMock
 
 import pytest
 
@@ -1809,6 +1810,45 @@ async def test_submit_allows_exact_campaign_scoped_authority_and_calls_provider_
     assert service.Decimal(str(calls["payload_quote_size"])) == live_order.requested_quote_size
     assert response.live_crypto_order.status == "ACKNOWLEDGED"
     assert response.live_crypto_order.safe_provider_response["capital_campaign_id"] == _campaign.id
+
+
+@pytest.mark.asyncio
+async def test_autonomous_one_shot_reaches_mocked_provider_exactly_once(monkeypatch: pytest.MonkeyPatch) -> None:
+    profile, live_order, _preview, _connection, campaign, _approval_event, db = _submit_authority_fixture()
+    live_order.safe_provider_response.update({
+        "autonomous_prepared": True,
+        "autonomous_execution_claim_id": str(uuid.uuid4()),
+        "canonical_preview_package_id": str(uuid.uuid4()),
+        "commissioned_preview_identity_binding": {"profile_id": str(profile.id)},
+    })
+    claim = SimpleNamespace(claim_status="SAFETY_DISABLED", last_error_code="live_submission_disabled", updated_at=None)
+    calls = {"create_order": 0}
+
+    async def _create_order(*_args, **_kwargs):
+        calls["create_order"] += 1
+        return {"success": True, "success_response": {"order_id": "provider-order-auto-1", "status": "OPEN"}}, {}
+
+    monkeypatch.setattr(service, "get_settings", _submit_settings)
+    monkeypatch.setattr(service, "_utcnow", lambda: datetime(2026, 7, 9, 12, 0, tzinfo=timezone.utc))
+    monkeypatch.setattr(service, "_evaluate_level2_mandate_authorization", AsyncMock(return_value=(True, uuid.uuid4())))
+    monkeypatch.setattr(service, "_validate_autonomous_one_shot_submission", AsyncMock(return_value=(campaign.id, claim)))
+    monkeypatch.setattr(service, "_load_decrypted_credentials", lambda _connection: {"api_key": "key", "api_secret": "secret"})
+    monkeypatch.setattr(service, "get_exchange_provider", lambda *_args, **_kwargs: _provider_stub(create_order=_create_order))
+
+    response = await service.service.submit(
+        db=db,
+        request=service.LiveCryptoOrderSubmitRequest(
+            live_crypto_order_id=live_order.live_crypto_order_id,
+            confirmation_challenge_id=None,
+            confirmation_phrase=None,
+            operator_identity="orchestration:test",
+            idempotency_token="autonomous-one-shot-submit",
+        ),
+    )
+
+    assert calls["create_order"] == 1
+    assert claim.claim_status == "SUBMISSION_PENDING"
+    assert response.live_crypto_order.status == "ACKNOWLEDGED"
 
 
 @pytest.mark.asyncio

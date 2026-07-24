@@ -145,7 +145,7 @@ async def claim_activated_buy_package(
         connection_id=connection_id, provider=package.provider, environment=package.environment,
         product=package.product, side="BUY", claim_status="CLAIMED", claimed_at=observed_at,
         claim_owner=owner, recover_after=observed_at + timedelta(minutes=2), attempt_count=1,
-    ).on_conflict_do_nothing(index_elements=[AutonomousExecutionClaim.package_id]).returning(AutonomousExecutionClaim.claim_id)
+    ).on_conflict_do_nothing().returning(AutonomousExecutionClaim.claim_id)
     inserted_id = await db.scalar(statement)
     claim = await db.scalar(
         select(AutonomousExecutionClaim).where(AutonomousExecutionClaim.package_id == package.package_id).with_for_update().limit(1)

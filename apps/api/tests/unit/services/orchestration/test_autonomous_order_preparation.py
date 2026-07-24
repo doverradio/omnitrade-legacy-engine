@@ -39,6 +39,7 @@ def _evidence():
         product=claim.product, risk_event_id=uuid4(), dry_run_live_crypto_order_id=order_id,
         crypto_order_preview_id=uuid4(),
         risk_approved_amount=5, input_fingerprint="persisted-package-fingerprint",
+        decision_record_id=uuid4(),
     )
     activation = SimpleNamespace(
         activation_id=claim.activation_id, package_id=claim.package_id, activation_state="ACTIVE",

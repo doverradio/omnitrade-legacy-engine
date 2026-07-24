@@ -15,6 +15,7 @@ class AutonomousExecutionClaim(Base):
     __table_args__ = (
         UniqueConstraint("package_id", name="uq_autonomous_execution_claim_package"),
         UniqueConstraint("activation_id", name="uq_autonomous_execution_claim_activation"),
+        UniqueConstraint("campaign_id", "campaign_version", name="uq_autonomous_execution_claim_campaign_version"),
         ForeignKeyConstraint(
             ["campaign_id", "campaign_version"],
             ["capital_campaign_definitions.campaign_id", "capital_campaign_definitions.version"],

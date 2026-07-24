@@ -8,7 +8,7 @@ from datetime import datetime, timedelta, timezone
 from decimal import Decimal, ROUND_DOWN
 from typing import Any
 
-from sqlalchemy import func, select
+from sqlalchemy import and_, func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import get_settings
@@ -29,6 +29,8 @@ from app.models.paper_account import PaperAccount
 from app.models.risk_kill_switch import RiskKillSwitch
 from app.models.risk_event import RiskEvent
 from app.models.autonomous_capital_mandate import AutonomousCapitalMandate
+from app.models.autonomous_capital_mandate_version import AutonomousCapitalMandateVersion
+from app.models.autonomous_execution_claim import AutonomousExecutionClaim
 from app.schemas.live_crypto_orders import (
     LiveCryptoOrderCancelRequest,
     LiveCryptoOrderDryRunRequest,
@@ -84,6 +86,79 @@ _RISK_ACTION_TO_MANDATE_VERDICT = {
 
 def _utcnow() -> datetime:
     return datetime.now(timezone.utc)
+
+
+async def _validate_autonomous_one_shot_submission(
+    *, db: AsyncSession, live_order: LiveCryptoOrder, preview: CryptoOrderPreview,
+) -> tuple[int, AutonomousExecutionClaim]:
+    evidence = live_order.safe_provider_response if isinstance(live_order.safe_provider_response, dict) else {}
+    try:
+        claim_id = uuid.UUID(str(evidence.get("autonomous_execution_claim_id")))
+        package_id = uuid.UUID(str(evidence.get("canonical_preview_package_id")))
+    except (TypeError, ValueError):
+        raise PermissionError("autonomous one-shot identity missing") from None
+    claim = await db.scalar(
+        select(AutonomousExecutionClaim).where(AutonomousExecutionClaim.claim_id == claim_id).with_for_update().limit(1)
+    )
+    package = await db.scalar(
+        select(CanonicalPreviewPackage).where(CanonicalPreviewPackage.package_id == package_id).with_for_update().limit(1)
+    )
+    if claim is None or package is None or claim.package_id != package.package_id:
+        raise PermissionError("autonomous one-shot claim mismatch")
+    if claim.live_order_id != live_order.live_crypto_order_id or package.crypto_order_preview_id != preview.crypto_order_preview_id:
+        raise PermissionError("autonomous one-shot order mismatch")
+    if claim.claim_status not in {"EXECUTION_STARTED", "SAFETY_DISABLED"}:
+        raise PermissionError("autonomous one-shot authorization consumed or blocked")
+    activation = await db.scalar(
+        select(CanonicalProvingActivation).where(CanonicalProvingActivation.activation_id == claim.activation_id).with_for_update().limit(1)
+    )
+    now = _utcnow()
+    if (
+        activation is None or activation.package_id != package.package_id
+        or activation.activation_state != "ACTIVE" or activation.activated_at > now or activation.expires_at <= now
+    ):
+        raise PermissionError("autonomous one-shot activation inactive")
+    if package.package_state != "ACTIVATED" or package.side != "BUY" or package.authorization_source != "MANDATE":
+        raise PermissionError("autonomous one-shot package ineligible")
+    if (
+        claim.campaign_id, claim.campaign_version, claim.mandate_id, claim.mandate_version_id,
+        claim.account_id, claim.profile_id, claim.connection_id, claim.provider, claim.environment, claim.product,
+    ) != (
+        package.campaign_id, package.campaign_version, package.mandate_id, package.mandate_version_id,
+        package.paper_account_id, package.live_trading_profile_id, live_order.exchange_connection_id,
+        live_order.provider, live_order.environment, live_order.product_id,
+    ):
+        raise PermissionError("autonomous one-shot scope mismatch")
+    if live_order.side != "BUY" or _decimal(live_order.requested_quote_size) > _decimal(package.risk_approved_amount):
+        raise PermissionError("autonomous one-shot notional exceeded")
+    if _decimal(live_order.requested_quote_size) > _decimal(activation.max_order_amount):
+        raise PermissionError("autonomous one-shot activation cap exceeded")
+    mandate = await db.scalar(select(AutonomousCapitalMandate).where(
+        AutonomousCapitalMandate.mandate_id == claim.mandate_id,
+    ).limit(1))
+    version = await db.scalar(select(AutonomousCapitalMandateVersion).where(
+        AutonomousCapitalMandateVersion.mandate_version_id == claim.mandate_version_id,
+    ).limit(1))
+    if mandate is None or mandate.status != "ACTIVE" or mandate.expires_at is not None and mandate.expires_at <= now:
+        raise PermissionError("autonomous one-shot mandate inactive")
+    if version is None or not version.is_active or not version.is_authorized or version.mandate_id != mandate.mandate_id:
+        raise PermissionError("autonomous one-shot mandate version inactive")
+    switch = await db.scalar(select(RiskKillSwitch.id).where(
+        RiskKillSwitch.engaged.is_(True),
+        (RiskKillSwitch.scope == "global") | and_(
+            RiskKillSwitch.scope == "account", RiskKillSwitch.paper_account_id == claim.account_id,
+        ),
+    ).limit(1))
+    if switch is not None:
+        raise PermissionError("autonomous one-shot kill switch engaged")
+    campaign = await db.scalar(select(CapitalCampaign).where(
+        CapitalCampaign.uuid == claim.campaign_id,
+        CapitalCampaign.definition_version == claim.campaign_version,
+        CapitalCampaign.paper_account_id == claim.account_id,
+    ).limit(1))
+    if campaign is None or campaign.id is None or campaign.status not in {"READY", "RUNNING"}:
+        raise PermissionError("autonomous one-shot campaign inactive")
+    return campaign.id, claim
 
 
 def _serialize_payload(payload: dict[str, Any]) -> str:
@@ -2064,8 +2139,17 @@ class LiveCryptoOrderService:
             raise LookupError("linked preview not found")
 
         connection = await _load_exchange_connection(db=db, exchange_connection_id=live_order.exchange_connection_id)
+        if autonomous_prepared:
+            binding = live_order.safe_provider_response.get("commissioned_preview_identity_binding")
+            profile_id = None if not isinstance(binding, dict) else binding.get("profile_id")
+            try:
+                resolved_profile_id = uuid.UUID(str(profile_id))
+            except (TypeError, ValueError):
+                raise PermissionError("autonomous profile binding missing") from None
+        else:
+            resolved_profile_id = preview.live_trading_profile_id
         profile = await db.scalar(
-            select(LiveTradingProfile).where(LiveTradingProfile.id == preview.live_trading_profile_id).limit(1)
+            select(LiveTradingProfile).where(LiveTradingProfile.id == resolved_profile_id).limit(1)
         )
         if profile is None:
             raise LookupError("linked live trading profile not found")
@@ -2116,31 +2200,37 @@ class LiveCryptoOrderService:
             max_order_usd=settings.live_crypto_max_order_usd,
         )
 
+        autonomous_claim: AutonomousExecutionClaim | None = None
         approval_event_id = live_order.safe_provider_response.get("approval_event_id")
-        if approval_event_id is None:
-            raise PermissionError("approval binding missing")
-        approval_event_uuid = uuid.UUID(str(approval_event_id))
-        approved_intent_fingerprint = live_order.safe_provider_response.get("approved_intent_fingerprint")
-        expected_intent_fingerprint = _build_intent_fingerprint(
-            preview=preview,
-            operator_identity=request.operator_identity,
-            requested_quote_size=live_order.requested_quote_size,
-            approval_event_id=approval_event_uuid,
-        )
-        if approved_intent_fingerprint != expected_intent_fingerprint:
-            raise PermissionError("approved intent fingerprint mismatch")
-        if live_order.safe_provider_response.get("evidence_fingerprint") != _build_evidence_fingerprint(preview=preview, connection=connection):
-            raise PermissionError("approval evidence fingerprint mismatch")
+        if mandate_authorized and autonomous_prepared:
+            verified_capital_campaign_id, autonomous_claim = await _validate_autonomous_one_shot_submission(
+                db=db, live_order=live_order, preview=preview,
+            )
+        else:
+            if approval_event_id is None:
+                raise PermissionError("approval binding missing")
+            approval_event_uuid = uuid.UUID(str(approval_event_id))
+            approved_intent_fingerprint = live_order.safe_provider_response.get("approved_intent_fingerprint")
+            expected_intent_fingerprint = _build_intent_fingerprint(
+                preview=preview,
+                operator_identity=request.operator_identity,
+                requested_quote_size=live_order.requested_quote_size,
+                approval_event_id=approval_event_uuid,
+            )
+            if approved_intent_fingerprint != expected_intent_fingerprint:
+                raise PermissionError("approved intent fingerprint mismatch")
+            if live_order.safe_provider_response.get("evidence_fingerprint") != _build_evidence_fingerprint(preview=preview, connection=connection):
+                raise PermissionError("approval evidence fingerprint mismatch")
 
-        verified_capital_campaign_id = await _validate_campaign_scoped_submission_authority(
-            db=db,
-            approval_event_id=approval_event_uuid,
-            profile=profile,
-            preview=preview,
-            connection=connection,
-            requested_quote_size=live_order.requested_quote_size,
-            side=live_order.side,
-        )
+            verified_capital_campaign_id = await _validate_campaign_scoped_submission_authority(
+                db=db,
+                approval_event_id=approval_event_uuid,
+                profile=profile,
+                preview=preview,
+                connection=connection,
+                requested_quote_size=live_order.requested_quote_size,
+                side=live_order.side,
+            )
 
         prepared_preview_id = str(live_order.safe_provider_response.get("crypto_order_preview_id") or "")
         if prepared_preview_id != str(live_order.crypto_order_preview_id):
@@ -2185,6 +2275,10 @@ class LiveCryptoOrderService:
                 "evidence_fingerprint": live_order.safe_provider_response.get("evidence_fingerprint"),
             },
         }
+        if autonomous_claim is not None:
+            autonomous_claim.claim_status = "SUBMISSION_PENDING"
+            autonomous_claim.last_error_code = None
+            autonomous_claim.updated_at = live_order.submitted_at
         await _record_audit(
             db=db,
             action="SUBMISSION_STARTED",

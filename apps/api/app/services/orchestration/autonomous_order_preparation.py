@@ -307,6 +307,11 @@ async def prepare_autonomous_claimed_buy(
             "prepared_by": claim.claim_owner,
             "autonomous_prepared": True,
             "provider_call_made": False,
+            "confirmation_expires_at": activation.expires_at.isoformat(),
+            "crypto_order_preview_id": str(package.crypto_order_preview_id),
+            "decision_record_id": str(package.decision_record_id),
+            "risk_event_id": str(package.risk_event_id),
+            "approved_quote_size": str(package.risk_approved_amount),
             "commissioned_preview_identity_hash": canonical_hash,
             "commissioned_preview_identity_binding": binding,
         })
