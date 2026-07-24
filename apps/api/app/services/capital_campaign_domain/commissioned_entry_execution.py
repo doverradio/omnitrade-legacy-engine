@@ -963,7 +963,7 @@ async def execute_commissioned_entry(
                     idempotency_token=request.submit_idempotency_token,
                 ),
             )
-        except (TimeoutError, ServiceUnavailableError, InvalidRequestError) as exc:
+        except (TimeoutError, ServiceUnavailableError) as exc:
             submit_error = exc
 
         final_classification = "submitted"

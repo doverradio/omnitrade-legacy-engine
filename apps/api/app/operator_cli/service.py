@@ -144,8 +144,10 @@ from app.services.capital_campaign_domain.commissioned_control_plane import (
 )
 from app.services.capital_campaign_domain.commissioned_entry_execution import (
     commission_commissioned_campaign,
-    execute_commissioned_entry,
     reconcile_commissioned_buy_ownership,
+)
+from app.services.capital_campaign_domain.activated_commissioned_entry import (
+    execute_activated_commissioned_entry as execute_commissioned_entry,
 )
 from app.services.capital_campaign_domain.commissioned_readiness_preview import (
     generate_commissioned_campaign_preview,
@@ -9557,6 +9559,7 @@ async def canonical_proving_commission_bundle(
             policy = await resolve_effective_risk_policy(db=db, paper_account_id=paper_account_id)
             execution_response = await execute_commissioned_entry(
                 db=db,
+                package_id=package.package_id,
                 request=CommissionedEntryExecutionRequest(
                     campaign_id=campaign_id,
                     version=campaign_version,
@@ -9612,6 +9615,7 @@ async def canonical_proving_commission_bundle(
             _log_commission_stage(stage="provider_submission_boundary", status="started", root_idempotency_key=root_idempotency_key)
             execution_response = await execute_commissioned_entry(
                 db=db,
+                package_id=package.package_id,
                 request=CommissionedEntryExecutionRequest(
                     campaign_id=campaign_id,
                     version=campaign_version,

@@ -50,6 +50,10 @@ from app.services.exchange_connections.providers.registry import (
     require_provider_capabilities,
 )
 from app.services.live.accounting_reconciliation import reconcile_live_order_and_fills
+from app.services.live.risk_accounting_snapshot import (
+    RiskAccountingUnavailableError,
+    build_risk_accounting_snapshot,
+)
 from app.services.live.approval import evaluate_live_approval_gate
 from app.services.live.resilience import evaluate_live_submission_guard
 from app.services.risk.risk_monitor import get_risk_rules
@@ -1320,6 +1324,20 @@ async def _evaluate_level2_mandate_authorization(
         evidence_age_seconds = (
             max(0, int((_utcnow() - preview_created_at).total_seconds())) if preview_created_at is not None else 2**31 - 1
         )
+        if campaign is None or campaign.definition_version is None:
+            raise RiskAccountingUnavailableError(
+                "risk_accounting_incomplete", details={"missing": "pinned_capital_campaign"}
+            )
+        accounting_snapshot = await build_risk_accounting_snapshot(
+            db=db,
+            campaign_id=campaign.uuid,
+            campaign_version=campaign.definition_version,
+            account_id=paper_account_id,
+            live_trading_profile_id=live_trading_profile_id,
+            provider=live_order.provider,
+            environment=live_order.environment,
+            product=live_order.product_id,
+        )
 
         mandate_eval = await evaluate_and_record_mandate(
             db=db,
@@ -1330,19 +1348,12 @@ async def _evaluate_level2_mandate_authorization(
                 product=live_order.product_id,
                 side=live_order.side,
                 proposed_notional_usd=_decimal(live_order.requested_quote_size),
-                # These four accounting figures and the position count below are
-                # not yet computed from real ledger state anywhere in this
-                # codebase -- app/services/autonomous_cycle/orchestrator.py, the
-                # only other production caller of evaluate_and_record_mandate,
-                # passes these same safe defaults today (see its mandate_eval
-                # call site). Reused here rather than inventing new accounting
-                # logic; see the deliverable's "remaining blockers" note.
-                current_open_exposure_usd=Decimal("0"),
-                daily_deployed_usd=Decimal("0"),
-                daily_realized_loss_usd=Decimal("0"),
-                campaign_drawdown_usd=Decimal("0"),
+                current_open_exposure_usd=accounting_snapshot.current_open_exposure_usd,
+                daily_deployed_usd=accounting_snapshot.daily_deployed_usd,
+                daily_realized_loss_usd=accounting_snapshot.daily_realized_loss_usd,
+                campaign_drawdown_usd=accounting_snapshot.campaign_drawdown_usd,
                 consecutive_losses=0,
-                current_position_count=0,
+                current_position_count=accounting_snapshot.current_position_count,
                 risk_verdict=risk_verdict,
                 evidence_age_seconds=evidence_age_seconds,
                 kill_switch_engaged=bool(global_switch.engaged or account_switch.engaged),
@@ -1351,12 +1362,30 @@ async def _evaluate_level2_mandate_authorization(
                 request_context={
                     "live_crypto_order_id": str(live_order.live_crypto_order_id),
                     "capital_campaign_id": None if campaign is None else str(campaign.uuid),
+                    "risk_accounting_snapshot": {
+                        "as_of": accounting_snapshot.as_of.isoformat(),
+                        "evidence_ids": accounting_snapshot.evidence_ids,
+                        "campaign_version": accounting_snapshot.campaign_version,
+                        "account_id": str(accounting_snapshot.account_id),
+                        "provider": accounting_snapshot.provider,
+                        "environment": accounting_snapshot.environment,
+                        "product": accounting_snapshot.product,
+                    },
                 },
                 idempotency_key=f"level2-submit-eval:{live_order.live_crypto_order_id}",
                 audit_correlation_id=uuid.uuid4(),
                 software_build_version=None,
             ),
         )
+    except RiskAccountingUnavailableError as exc:
+        logger.error(
+            "level2_mandate_blocked live_crypto_order_id=%s mandate_id=%s authorization_reason=%s details=%s",
+            live_order.live_crypto_order_id, mandate.mandate_id, exc.reason_code, exc.details,
+        )
+        raise InvalidRequestError(
+            message="Authoritative Risk accounting is unavailable",
+            details={"blocker": exc.reason_code, **exc.details},
+        ) from exc
     except Exception:
         logger.warning(
             "level2_mandate_denied live_crypto_order_id=%s mandate_id=%s authorization_source=MANUAL authorization_reason=mandate_evaluation_error",
