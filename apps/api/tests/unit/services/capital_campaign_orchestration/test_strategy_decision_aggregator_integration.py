@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import inspect
 import logging
 import uuid
@@ -879,6 +880,56 @@ async def test_scorecard_fetch_failure_during_fresh_computation_triggers_governe
         assert isinstance(parameter_sets_after_failure, list)
 
 
+@pytest.mark.asyncio
+async def test_scorecard_fetch_cancellation_propagates_and_savepoint_cleans_up(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _patch_flat_position(monkeypatch)
+
+    async def _cancel_scorecards(**_kwargs):
+        raise asyncio.CancelledError()
+
+    monkeypatch.setattr(authoritative, "fetch_strategy_scorecards", _cancel_scorecards)
+    async with _real_session() as session:
+        await _seed_roster_run_and_proposals(
+            session, actions={"ma_crossover": "BUY", "momentum": "SELL", "breakout": "HOLD"},
+        )
+
+        with pytest.raises(asyncio.CancelledError):
+            await _call_aggregator(session)
+
+        assert isinstance((await session.execute(ParameterSet.__table__.select())).fetchall(), list)
+
+
+@pytest.mark.asyncio
+async def test_unrecoverable_scorecard_session_aborts_instead_of_poisoning_later_stages(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _patch_flat_position(monkeypatch)
+
+    async def _timeout(**_kwargs):
+        raise TimeoutError("simulated command timeout")
+
+    async def _unrecoverable(**_kwargs):
+        return authoritative._ScorecardSessionRecovery(
+            probe_succeeded=False,
+            connection_invalidated=True,
+            rollback_attempted=True,
+            rollback_succeeded=False,
+            session_usable=False,
+        )
+
+    monkeypatch.setattr(authoritative, "fetch_strategy_scorecards", _timeout)
+    monkeypatch.setattr(authoritative, "_recover_session_after_scorecard_failure", _unrecoverable)
+    async with _real_session() as session:
+        await _seed_roster_run_and_proposals(
+            session, actions={"ma_crossover": "BUY", "momentum": "SELL", "breakout": "HOLD"},
+        )
+
+        with pytest.raises(authoritative.ScorecardSessionRecoveryError):
+            await _call_aggregator(session)
+
+
 # Production evidence: a fetch_strategy_scorecards() command timeout left the
 # session unable to serve the NEXT unrelated statement (PendingRollbackError,
 # surfacing as campaign_orchestration_failed) despite the begin_nested()
@@ -909,11 +960,13 @@ async def test_recover_session_after_scorecard_failure_is_a_noop_when_probe_succ
         async def rollback(self):
             calls["rollback"] += 1
 
-    await _recover_session_after_scorecard_failure(db=_HealthySession())
+    recovery = await _recover_session_after_scorecard_failure(db=_HealthySession())
 
     assert calls["execute"] == 1
     assert calls["connection"] == 0
     assert calls["rollback"] == 0
+    assert recovery.session_usable is True
+    assert recovery.rollback_attempted is False
 
 
 @pytest.mark.asyncio
@@ -937,11 +990,14 @@ async def test_recover_session_after_scorecard_failure_escalates_when_probe_stil
         async def rollback(self):
             calls["rollback"] += 1
 
-    await _recover_session_after_scorecard_failure(db=_BrokenSession())
+    recovery = await _recover_session_after_scorecard_failure(db=_BrokenSession())
 
-    assert calls["execute"] == 1
+    assert calls["execute"] == 2
     assert calls["invalidate"] == 1
     assert calls["rollback"] == 1
+    assert recovery.connection_invalidated is True
+    assert recovery.rollback_succeeded is True
+    assert recovery.session_usable is False
 
 
 # Production evidence, second incident: after the probe-gated recovery above
@@ -1026,6 +1082,13 @@ async def test_scorecard_timeout_with_unrecovered_probe_survives_real_orm_expira
 
         matching = [r for r in caplog.records if r.getMessage().startswith("strategy_scorecard_fetch_failed roster_run_id=")]
         assert len(matching) == 1
+        message = matching[0].getMessage()
+        assert "stage=fetch_strategy_scorecards" in message
+        assert "provider=kraken_spot product=BTC-USD interval=15m" in message
+        assert "timeout=True" in message
+        assert "rollback_attempted=True" in message
+        assert "rollback_succeeded=True" in message
+        assert "session_usable=True" in message
 
 
 @pytest.mark.asyncio

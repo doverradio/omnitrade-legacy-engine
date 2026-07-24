@@ -3,6 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
+from collections.abc import Collection
 from typing import Any
 import hashlib
 import json
@@ -11,7 +12,7 @@ import statistics
 import time
 import uuid
 
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import get_settings
@@ -512,11 +513,16 @@ async def fetch_strategy_scorecards(
     provider: str,
     product_id: str,
     interval: str,
+    strategy_slugs: Collection[str] | None = None,
 ) -> list[StrategyScorecard]:
     settings = get_settings()
     regime_min_evidence_required = int(
         getattr(settings, "outcome_scorecards_regime_min_evaluations", 50)
     )
+    max_samples_per_bucket = int(
+        getattr(settings, "outcome_scorecards_max_samples_per_action_horizon", 100)
+    )
+    normalized_strategy_slugs = sorted({str(item).strip() for item in (strategy_slugs or ()) if str(item).strip()})
 
     # Phase-timed diagnostic instrumentation (production performance
     # investigation into fetch_strategy_scorecards() timeouts). Each phase
@@ -528,12 +534,14 @@ async def fetch_strategy_scorecards(
     # full-entity result set (all 39 mapped columns x ~18k rows, ~389 bytes/
     # row per Postgres's own width estimate, ~7MB total), which EXPLAIN
     # ANALYZE's server-side "Execution Time" never measures. The SELECT
-    # below was narrowed from the full entity to only the columns the
-    # scoring logic beneath it actually reads, specifically to shrink that
-    # payload; it does not change the query's WHERE/ORDER BY or the scoring
-    # math in any way.
+    # query below therefore both selects only the fields scoring reads and
+    # ranks outcomes per current-strategy/action/horizon bucket.  The hard
+    # per-bucket cap bounds transfer and decoding without allowing one action
+    # or horizon to starve BUY, SELL, HOLD, or another horizon. Missing
+    # evidence remains missing and is handled by the existing fail-closed
+    # aggregator rules.
     t_query_start = time.perf_counter()
-    result = await db.execute(
+    ranked_outcomes = (
         select(
             StrategyRosterProposalOutcome.strategy_slug,
             StrategyRosterProposalOutcome.action,
@@ -545,15 +553,48 @@ async def fetch_strategy_scorecards(
             StrategyRosterProposalOutcome.horizon_label,
             StrategyRosterProposalOutcome.regime_trend,
             StrategyRosterProposalOutcome.evaluation_state,
+            StrategyRosterProposalOutcome.evaluated_at,
+            StrategyRosterProposalOutcome.outcome_id,
+            func.row_number().over(
+                partition_by=(
+                    StrategyRosterProposalOutcome.strategy_slug,
+                    StrategyRosterProposalOutcome.action,
+                    StrategyRosterProposalOutcome.horizon_label,
+                ),
+                order_by=(
+                    StrategyRosterProposalOutcome.evaluated_at.desc(),
+                    StrategyRosterProposalOutcome.outcome_id.desc(),
+                ),
+            ).label("scorecard_rank"),
         )
         .where(StrategyRosterProposalOutcome.provider == provider)
         .where(StrategyRosterProposalOutcome.product_id == product_id)
         .where(StrategyRosterProposalOutcome.interval == interval)
         .where(StrategyRosterProposalOutcome.evaluation_state == "RESOLVED")
+    )
+    if normalized_strategy_slugs:
+        ranked_outcomes = ranked_outcomes.where(
+            StrategyRosterProposalOutcome.strategy_slug.in_(normalized_strategy_slugs)
+        )
+    ranked_outcomes = ranked_outcomes.subquery()
+    result = await db.execute(
+        select(
+            ranked_outcomes.c.strategy_slug,
+            ranked_outcomes.c.action,
+            ranked_outcomes.c.actual_action_correct,
+            ranked_outcomes.c.actual_raw_return_pct,
+            ranked_outcomes.c.actual_fee_adjusted_return_pct,
+            ranked_outcomes.c.mfe_pct,
+            ranked_outcomes.c.mae_pct,
+            ranked_outcomes.c.horizon_label,
+            ranked_outcomes.c.regime_trend,
+            ranked_outcomes.c.evaluation_state,
+        )
+        .where(ranked_outcomes.c.scorecard_rank <= max_samples_per_bucket)
         .order_by(
-            StrategyRosterProposalOutcome.strategy_slug.asc(),
-            StrategyRosterProposalOutcome.evaluated_at.asc(),
-            StrategyRosterProposalOutcome.outcome_id.asc(),
+            ranked_outcomes.c.strategy_slug.asc(),
+            ranked_outcomes.c.evaluated_at.asc(),
+            ranked_outcomes.c.outcome_id.asc(),
         )
     )
     t_query_done = time.perf_counter()
@@ -624,10 +665,10 @@ async def fetch_strategy_scorecards(
     t_scoring_done = time.perf_counter()
     logger.info(
         "strategy_scorecard_fetch_timing provider=%s product_id=%s interval=%s "
-        "row_count=%d strategy_count=%d "
+        "row_count=%d strategy_count=%d requested_strategy_count=%d max_samples_per_action_horizon=%d "
         "query_ms=%.1f hydration_ms=%.1f grouping_ms=%.1f scoring_ms=%.1f total_ms=%.1f",
         provider, product_id, interval,
-        len(rows), len(grouped),
+        len(rows), len(grouped), len(normalized_strategy_slugs), max_samples_per_bucket,
         (t_query_done - t_query_start) * 1000,
         (t_hydration_done - t_query_done) * 1000,
         (t_grouping_done - t_hydration_done) * 1000,

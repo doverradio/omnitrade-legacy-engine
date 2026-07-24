@@ -149,6 +149,12 @@ class Settings(BaseSettings):
         default=50,
         validation_alias="OUTCOME_SCORECARDS_REGIME_MIN_EVALUATIONS",
     )
+    outcome_scorecards_max_samples_per_action_horizon: int = Field(
+        default=100,
+        ge=1,
+        le=1000,
+        validation_alias="OUTCOME_SCORECARDS_MAX_SAMPLES_PER_ACTION_HORIZON",
+    )
     strategy_aggregator_config_version: str = Field(
         default="v1", validation_alias="STRATEGY_AGGREGATOR_CONFIG_VERSION"
     )

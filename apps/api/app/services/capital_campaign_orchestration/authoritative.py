@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
+import time
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
@@ -759,7 +760,20 @@ def _build_aggregate_evidence_dict(
     }
 
 
-async def _recover_session_after_scorecard_failure(*, db: AsyncSession) -> None:
+@dataclass(frozen=True, slots=True)
+class _ScorecardSessionRecovery:
+    probe_succeeded: bool
+    connection_invalidated: bool
+    rollback_attempted: bool
+    rollback_succeeded: bool
+    session_usable: bool
+
+
+class ScorecardSessionRecoveryError(RuntimeError):
+    """The scorecard stage failed and its database session could not be recovered."""
+
+
+async def _recover_session_after_scorecard_failure(*, db: AsyncSession) -> _ScorecardSessionRecovery:
     """Called after fetch_strategy_scorecards fails inside its own SAVEPOINT
     (db.begin_nested()). That savepoint's automatic ROLLBACK TO SAVEPOINT
     correctly isolates ordinary application/DB errors -- confirmed by the
@@ -791,9 +805,10 @@ async def _recover_session_after_scorecard_failure(*, db: AsyncSession) -> None:
     """
     try:
         await db.execute(select(1))
-        return
+        return _ScorecardSessionRecovery(True, False, False, False, True)
     except Exception:
         pass
+    connection_invalidated = False
     try:
         connection = await db.connection()
     except Exception:
@@ -801,12 +816,29 @@ async def _recover_session_after_scorecard_failure(*, db: AsyncSession) -> None:
     if connection is not None:
         try:
             await connection.invalidate()
+            connection_invalidated = True
         except Exception:
             logger.debug("Unable to invalidate connection after scorecard fetch failure", exc_info=True)
+    rollback_succeeded = False
     try:
         await db.rollback()
+        rollback_succeeded = True
     except Exception:
         logger.debug("Unable to roll back session after scorecard fetch failure", exc_info=True)
+    session_usable = False
+    if rollback_succeeded:
+        try:
+            await db.execute(select(1))
+            session_usable = True
+        except Exception:
+            logger.debug("Session remains unusable after scorecard rollback", exc_info=True)
+    return _ScorecardSessionRecovery(
+        probe_succeeded=False,
+        connection_invalidated=connection_invalidated,
+        rollback_attempted=True,
+        rollback_succeeded=rollback_succeeded,
+        session_usable=session_usable,
+    )
 
 
 async def load_strategy_aggregate_evidence(
@@ -946,18 +978,36 @@ async def load_strategy_aggregate_evidence(
     # scorecards at all (e.g. the next idempotency lookup in campaign
     # orchestration), surfacing there as an unexplained PendingRollbackError.
     scorecard_by_slug: dict[str, Any] = {}
+    scorecard_started = time.perf_counter()
     try:
         async with db.begin_nested():
-            scorecards = await fetch_strategy_scorecards(db=db, provider=provider, product_id=product_id, interval=interval)
+            scorecards = await fetch_strategy_scorecards(
+                db=db,
+                provider=provider,
+                product_id=product_id,
+                interval=interval,
+                strategy_slugs=[str(item.get("strategy_slug")) for item in contributions],
+            )
             scorecard_by_slug = {item.strategy_slug: item for item in scorecards}
-    except Exception:
+    except Exception as exc:
+        recovery = await _recover_session_after_scorecard_failure(db=db)
         logger.warning(
-            "strategy_scorecard_fetch_failed_during_replay roster_run_id=%s campaign_id=%s candle_close=%s",
-            roster_run_id, campaign_id, candle_close_time.isoformat(),
+            "strategy_scorecard_fetch_failed_during_replay roster_run_id=%s campaign_id=%s "
+            "stage=fetch_strategy_scorecards provider=%s product=%s interval=%s "
+            "elapsed_ms=%.1f timeout=%s rollback_attempted=%s rollback_succeeded=%s "
+            "connection_invalidated=%s session_usable=%s candle_close=%s",
+            roster_run_id, campaign_id, provider, product_id, interval,
+            (time.perf_counter() - scorecard_started) * 1000,
+            isinstance(exc, TimeoutError), recovery.rollback_attempted,
+            recovery.rollback_succeeded, recovery.connection_invalidated,
+            recovery.session_usable, candle_close_time.isoformat(),
             exc_info=True,
         )
         scorecard_by_slug = {}
-        await _recover_session_after_scorecard_failure(db=db)
+        if not recovery.session_usable:
+            raise ScorecardSessionRecoveryError(
+                "scorecard fetch failed and database session remained unusable"
+            ) from exc
 
     evidence = _build_aggregate_evidence_dict(
         roster_run_id=roster_run_id,
@@ -1093,18 +1143,36 @@ async def resolve_or_create_strategy_aggregate_evidence(
     # that follow.
     data_quality_failed = False
     scorecard_by_slug: dict[str, Any] = {}
+    scorecard_started = time.perf_counter()
     try:
         async with db.begin_nested():
-            scorecards = await fetch_strategy_scorecards(db=db, provider=provider, product_id=product_id, interval=interval)
+            scorecards = await fetch_strategy_scorecards(
+                db=db,
+                provider=provider,
+                product_id=product_id,
+                interval=interval,
+                strategy_slugs=[proposal.strategy_slug for proposal in proposal_snapshots],
+            )
             scorecard_by_slug = {item.strategy_slug: item for item in scorecards}
-    except Exception:
+    except Exception as exc:
+        recovery = await _recover_session_after_scorecard_failure(db=db)
         logger.warning(
-            "strategy_scorecard_fetch_failed roster_run_id=%s campaign_id=%s candle_close=%s",
-            roster_run_id, campaign_id, candle_close_time.isoformat(),
+            "strategy_scorecard_fetch_failed roster_run_id=%s campaign_id=%s "
+            "stage=fetch_strategy_scorecards provider=%s product=%s interval=%s "
+            "elapsed_ms=%.1f timeout=%s rollback_attempted=%s rollback_succeeded=%s "
+            "connection_invalidated=%s session_usable=%s candle_close=%s",
+            roster_run_id, campaign_id, provider, product_id, interval,
+            (time.perf_counter() - scorecard_started) * 1000,
+            isinstance(exc, TimeoutError), recovery.rollback_attempted,
+            recovery.rollback_succeeded, recovery.connection_invalidated,
+            recovery.session_usable, candle_close_time.isoformat(),
             exc_info=True,
         )
         data_quality_failed = True
-        await _recover_session_after_scorecard_failure(db=db)
+        if not recovery.session_usable:
+            raise ScorecardSessionRecoveryError(
+                "scorecard fetch failed and database session remained unusable"
+            ) from exc
 
     proposal_inputs: list[StrategyProposalInput] = []
     for proposal in proposal_snapshots:

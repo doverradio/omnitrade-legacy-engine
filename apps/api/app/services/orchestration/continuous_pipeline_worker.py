@@ -53,6 +53,7 @@ from app.services.strategies import StrategyContext, strategy_registry
 from app.services.strategies.registry import StrategyLookupError
 from app.services.autonomous_cycle import AutonomousCycleRequest, run_autonomous_preview_cycle
 from app.services.capital_campaign_orchestration import run_campaign_orchestration_preview_for_candle
+from app.services.capital_campaign_orchestration.authoritative import ScorecardSessionRecoveryError
 from app.services.mandates.contracts import AUTONOMY_LEVEL_2
 from app.services.mandates.evidence import MandateEvaluationWriteRequest, evaluate_and_record_mandate
 from app.services.orchestration.venue_commissioning_bridge import service as venue_commissioning_service
@@ -1303,6 +1304,13 @@ async def run_orchestration_cycle(
                 originating_autonomous_cycle_id=autonomous_cycle_id,
             )
             await db.commit()
+        except ScorecardSessionRecoveryError:
+            await _rollback_active_session(db=db)
+            logger.exception(
+                "campaign_orchestration_session_unrecoverable trigger=%s session_replaced_next_cycle=true",
+                _AUTONOMOUS_CYCLE_TRIGGER,
+            )
+            raise
         except Exception:
             await _rollback_active_session(db=db)
             logger.exception("campaign_orchestration_failed trigger=%s", _AUTONOMOUS_CYCLE_TRIGGER)

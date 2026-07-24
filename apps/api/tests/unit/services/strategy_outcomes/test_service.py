@@ -835,6 +835,52 @@ async def test_narrow_column_select_matches_full_entity_select_byte_for_byte(mon
         assert reference_result == optimized_result
 
 
+@pytest.mark.asyncio
+async def test_scorecard_query_bounds_each_current_strategy_action_horizon_bucket(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        "app.services.strategy_outcomes.service.get_settings",
+        lambda: SimpleNamespace(
+            outcome_scorecards_regime_min_evaluations=3,
+            outcome_scorecards_max_samples_per_action_horizon=2,
+        ),
+    )
+    async with _real_outcomes_session() as raw_session:
+        for strategy_slug in ("momentum", "historical_unused"):
+            for action in ("BUY", "SELL", "HOLD"):
+                for index in range(3):
+                    _seed_outcome_row(
+                        raw_session,
+                        strategy_slug=strategy_slug,
+                        action=action,
+                        horizon_label="15m",
+                        horizon_minutes=15,
+                        regime_trend="TRENDING",
+                        actual_action_correct=True,
+                        actual_raw_return_pct=Decimal(index),
+                        actual_fee_adjusted_return_pct=Decimal(index),
+                        mfe_pct=Decimal("1"),
+                        mae_pct=Decimal("-1"),
+                    )
+        raw_session.commit()
+
+        scorecards = await fetch_strategy_scorecards(
+            db=_AwaitableOutcomesSession(raw_session),
+            provider="kraken_spot",
+            product_id="BTC-USD",
+            interval="15m",
+            strategy_slugs=["momentum"],
+        )
+
+    assert [item.strategy_slug for item in scorecards] == ["momentum"]
+    aggregate = scorecards[0].aggregate
+    assert aggregate.total_evaluated == 6
+    assert aggregate.buy_evaluations == 2
+    assert aggregate.sell_evaluations == 2
+    assert aggregate.hold_evaluations == 2
+
+
 async def _reference_fetch_strategy_scorecards_multi_pass(
     *, db: Any, provider: str, product_id: str, interval: str,
 ):
