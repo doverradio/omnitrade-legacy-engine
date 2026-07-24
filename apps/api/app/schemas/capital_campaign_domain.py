@@ -523,8 +523,8 @@ class CommissionedEntryExecutionRequest(BaseModel):
     readiness_request: CommissionedReadinessRequest
     expected_preview_identity_hash: str
     live_crypto_order_id: UUID
-    confirmation_challenge_id: UUID
-    confirmation_phrase: str
+    confirmation_challenge_id: UUID | None = None
+    confirmation_phrase: str | None = None
     submit_idempotency_token: str
     risk_signal_id: UUID
     paper_account_id: UUID

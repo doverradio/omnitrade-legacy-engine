@@ -64,7 +64,12 @@ from app.services.orchestration.automatic_package_executor import (
 )
 from app.services.orchestration.autonomous_execution_claims import (
     claim_activated_buy_package,
+    mark_pre_provider_blocked,
     mark_submission_safety_disabled,
+)
+from app.services.orchestration.autonomous_order_preparation import (
+    execute_prepared_autonomous_claim,
+    prepare_autonomous_claimed_buy,
 )
 from app.services.strategy_outcomes import score_due_strategy_roster_proposal_outcomes
 from app.services.strategy_roster import StrategyRosterRequest, run_strategy_roster_for_candle
@@ -1172,13 +1177,39 @@ async def _attempt_automatic_ready_package_creation(
                         db=db,
                         package_id=progression.package_id,
                     )
-                    if claim_outcome.claim is not None and not get_settings().live_crypto_order_submission_enabled:
-                        await mark_submission_safety_disabled(db=db, claim=claim_outcome.claim)
+                    if claim_outcome.claim is not None:
+                        prepared = await prepare_autonomous_claimed_buy(
+                            db=db, claim_id=claim_outcome.claim.claim_id,
+                        )
+                    else:
+                        prepared = None
+                    if prepared is not None and not get_settings().live_crypto_order_submission_enabled:
+                        await mark_submission_safety_disabled(db=db, claim=prepared.claim)
                         logger.info(
-                            "autonomous_execution_safety_disabled claim_id=%s package_id=%s campaign_id=%s campaign_version=%s reason=live_submission_disabled provider_call_made=false provider_call_reachable=false recoverable=true",
-                            claim_outcome.claim.claim_id, progression.package_id,
+                            "autonomous_execution_safety_disabled claim_id=%s package_id=%s live_order_id=%s campaign_id=%s campaign_version=%s reason=live_submission_disabled provider_call_made=false provider_call_reachable=false recoverable=true",
+                            prepared.claim.claim_id, progression.package_id, prepared.order.live_crypto_order_id,
                             progression.campaign_id, progression.campaign_version,
                         )
+                    elif prepared is not None:
+                        try:
+                            execution = await execute_prepared_autonomous_claim(db=db, prepared=prepared)
+                            prepared.claim.claim_status = (
+                                "RECONCILIATION_REQUIRED"
+                                if execution.current_state == "RECONCILIATION_REQUIRED"
+                                else "SUBMISSION_PENDING"
+                            )
+                            prepared.claim.reconciliation_state = execution.current_state
+                            prepared.claim.updated_at = datetime.now(timezone.utc)
+                            await db.flush()
+                        except Exception:
+                            await mark_pre_provider_blocked(
+                                db=db, claim=prepared.claim,
+                                reason_code="commissioned_execution_request_evidence_unavailable",
+                            )
+                            logger.exception(
+                                "autonomous_execution_failed_pre_provider claim_id=%s package_id=%s live_order_id=%s reason=commissioned_execution_request_evidence_unavailable provider_call_made=false",
+                                prepared.claim.claim_id, progression.package_id, prepared.order.live_crypto_order_id,
+                            )
                     elif claim_outcome.claim is None:
                         logger.info(
                             "autonomous_execution_claim_skipped package_id=%s campaign_id=%s campaign_version=%s reason=%s provider_call_made=false",

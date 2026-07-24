@@ -2045,13 +2045,15 @@ class LiveCryptoOrderService:
         mandate_authorized, mandate_id_for_audit = await _evaluate_level2_mandate_authorization(
             db=db, live_order=live_order, actor=request.operator_identity,
         )
+        autonomous_prepared = bool(live_order.safe_provider_response.get("autonomous_prepared"))
         if not mandate_authorized:
             if request.confirmation_phrase != CONFIRMATION_PHRASE:
                 raise PermissionError("confirmation phrase mismatch")
-        if request.operator_identity != live_order.safe_provider_response.get("prepared_by"):
-            raise PermissionError("operator identity mismatch")
-        if live_order.operator_confirmation_id != request.confirmation_challenge_id:
-            raise PermissionError("confirmation challenge mismatch")
+        if not (mandate_authorized and autonomous_prepared):
+            if request.operator_identity != live_order.safe_provider_response.get("prepared_by"):
+                raise PermissionError("operator identity mismatch")
+            if live_order.operator_confirmation_id != request.confirmation_challenge_id:
+                raise PermissionError("confirmation challenge mismatch")
 
         preview = await db.scalar(
             select(CryptoOrderPreview).where(

@@ -67,8 +67,8 @@ class LiveCryptoOrderDryRunRequest(BaseModel):
 
 class LiveCryptoOrderSubmitRequest(BaseModel):
     live_crypto_order_id: UUID
-    confirmation_challenge_id: UUID
-    confirmation_phrase: str = Field(min_length=1, max_length=64)
+    confirmation_challenge_id: UUID | None = None
+    confirmation_phrase: str | None = Field(default=None, min_length=1, max_length=64)
     operator_identity: str = Field(min_length=1, max_length=120)
     idempotency_token: str = Field(min_length=1, max_length=120)
 
@@ -195,4 +195,3 @@ class LiveCryptoOrderReconcileResponse(BaseModel):
     provider_fees: str | None = None
     net_quote_capital_effect: str | None = None
     safe_provider_response: dict[str, Any]
-

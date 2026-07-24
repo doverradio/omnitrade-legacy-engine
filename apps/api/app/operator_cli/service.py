@@ -10070,8 +10070,14 @@ async def autonomous_execution_status(*, package_id: UUID) -> dict[str, Any]:
             "claim_age_seconds": None if claim is None else max(0, int((now - claim.claimed_at).total_seconds())),
             "attempt_count": None if claim is None else claim.attempt_count,
             "live_order_id": None if claim is None or claim.live_order_id is None else str(claim.live_order_id),
+            "prepared_order_id": None if claim is None or claim.live_order_id is None else str(claim.live_order_id),
+            "client_order_id": None if order is None else order.client_order_id,
             "live_order_state": None if order is None else order.status,
+            "submission_flag": settings.live_crypto_order_submission_enabled,
             "reconciliation_state": None if claim is None else claim.reconciliation_state,
+            "reconciliation_obligation": bool(
+                claim is not None and claim.claim_status in {"RECONCILIATION_REQUIRED", "RECOVERY_REQUIRED"}
+            ),
             "current_blocker": None if claim is None else claim.last_error_code,
             "live_submission_enabled": settings.live_crypto_order_submission_enabled,
             "provider_call_reachable": bool(settings.live_crypto_order_submission_enabled and claim is not None and not safety_disabled),

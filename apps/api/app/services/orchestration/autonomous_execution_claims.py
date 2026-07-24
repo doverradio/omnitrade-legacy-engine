@@ -177,3 +177,22 @@ async def mark_submission_safety_disabled(*, db: AsyncSession, claim: Autonomous
         before_state={"claim_status": before}, after_state={"claim_status": claim.claim_status, "reason_code": claim.last_error_code},
     ))
     await db.flush()
+
+
+async def mark_pre_provider_blocked(
+    *, db: AsyncSession, claim: AutonomousExecutionClaim, reason_code: str,
+) -> None:
+    if claim.claim_status in _TERMINAL_CLAIMS:
+        return
+    before = claim.claim_status
+    claim.claim_status = "FAILED_PRE_PROVIDER"
+    claim.last_error_code = reason_code
+    claim.recover_after = None
+    claim.updated_at = _utcnow()
+    db.add(AuditLog(
+        actor=claim.claim_owner, action="autonomous_execution_claim.failed_pre_provider",
+        entity_type="autonomous_execution_claim", entity_id=claim.claim_id,
+        before_state={"claim_status": before},
+        after_state={"claim_status": claim.claim_status, "reason_code": reason_code, "provider_call_made": False},
+    ))
+    await db.flush()
