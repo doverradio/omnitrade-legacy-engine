@@ -31,6 +31,7 @@ from app.models.autonomous_capital_mandate import AutonomousCapitalMandate
 from app.models.autonomous_capital_mandate_authorization import AutonomousCapitalMandateAuthorization
 from app.models.autonomous_capital_mandate_version import AutonomousCapitalMandateVersion
 from app.models.autonomous_cycle_run import AutonomousCycleRun
+from app.models.autonomous_execution_claim import AutonomousExecutionClaim
 from app.models.candle import Candle
 from app.models.capital_campaign import CapitalCampaign
 from app.models.capital_campaign_definition import CapitalCampaignDefinition
@@ -10038,6 +10039,46 @@ async def automatic_mandate_activation_proof(*, package_id: UUID) -> dict[str, A
             "package_id": str(package_id),
             "reason_codes": ["proof_inspection_failed"],
             "error_type": type(exc).__name__,
+            "read_only": True,
+        }
+
+
+async def autonomous_execution_status(*, package_id: UUID) -> dict[str, Any]:
+    """Read-only post-activation claim and provider-boundary status."""
+    now = datetime.now(timezone.utc)
+    settings = get_settings()
+    async with AsyncSessionLocal() as db:
+        package = await db.scalar(select(CanonicalPreviewPackage).where(CanonicalPreviewPackage.package_id == package_id).limit(1))
+        activation = await db.scalar(select(CanonicalProvingActivation).where(CanonicalProvingActivation.package_id == package_id).limit(1))
+        claim = await db.scalar(select(AutonomousExecutionClaim).where(AutonomousExecutionClaim.package_id == package_id).limit(1))
+        order = None if claim is None or claim.live_order_id is None else await db.scalar(
+            select(LiveCryptoOrder).where(LiveCryptoOrder.live_crypto_order_id == claim.live_order_id).limit(1)
+        )
+        reason_codes = [] if claim is None or claim.last_error_code is None else [claim.last_error_code]
+        safety_disabled = claim is not None and claim.claim_status == "SAFETY_DISABLED"
+        return {
+            "campaign_id": None if package is None else str(package.campaign_id),
+            "campaign_version": None if package is None else package.campaign_version,
+            "mandate_id": None if package is None or package.mandate_id is None else str(package.mandate_id),
+            "mandate_version_id": None if package is None or package.mandate_version_id is None else str(package.mandate_version_id),
+            "package_id": str(package_id), "package_state": None if package is None else package.package_state,
+            "activation_id": None if activation is None else str(activation.activation_id),
+            "activation_state": None if activation is None else activation.activation_state,
+            "claim_id": None if claim is None else str(claim.claim_id),
+            "claim_state": None if claim is None else claim.claim_status,
+            "claim_owner": None if claim is None else claim.claim_owner,
+            "claim_age_seconds": None if claim is None else max(0, int((now - claim.claimed_at).total_seconds())),
+            "attempt_count": None if claim is None else claim.attempt_count,
+            "live_order_id": None if claim is None or claim.live_order_id is None else str(claim.live_order_id),
+            "live_order_state": None if order is None else order.status,
+            "reconciliation_state": None if claim is None else claim.reconciliation_state,
+            "current_blocker": None if claim is None else claim.last_error_code,
+            "live_submission_enabled": settings.live_crypto_order_submission_enabled,
+            "provider_call_reachable": bool(settings.live_crypto_order_submission_enabled and claim is not None and not safety_disabled),
+            "provider_call_made": bool(order is not None and order.submitted_at is not None),
+            "human_action_required": safety_disabled,
+            "reason_codes": reason_codes,
+            "recommended_action": "enable_bounded_live_submission_when_ready" if safety_disabled else "inspect_claim_state",
             "read_only": True,
         }
 

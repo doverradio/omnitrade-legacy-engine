@@ -1984,13 +1984,14 @@ async def test_reconcile_accepts_provider_statuses_kraken_legitimately_reports(
     assert db.commits == 1
 
 
-def test_reconcile_endpoint_returns_http_200_for_partially_filled_provider_status(monkeypatch: pytest.MonkeyPatch) -> None:
+@pytest.mark.asyncio
+async def test_reconcile_endpoint_returns_http_200_for_partially_filled_provider_status(monkeypatch: pytest.MonkeyPatch) -> None:
     """End-to-end HTTP regression for the same defect: drives the real
     /live-crypto-orders/{id}/reconcile route (auth, routing, response
     serialization included) and asserts it returns 200, not a 500 from a
     ValidationError while building LiveCryptoOrderResponse.
     """
-    from fastapi.testclient import TestClient
+    import httpx
 
     from app.db.session import get_db
     from app.main import create_app
@@ -2036,8 +2037,9 @@ def test_reconcile_endpoint_returns_http_200_for_partially_filled_provider_statu
 
     app.dependency_overrides[get_db] = override_get_db
 
-    with TestClient(app, raise_server_exceptions=False) as client:
-        response = client.post(
+    transport = httpx.ASGITransport(app=app, raise_app_exceptions=False)
+    async with httpx.AsyncClient(transport=transport, base_url="http://testserver") as client:
+        response = await client.post(
             f"/live-crypto-orders/{live_order.live_crypto_order_id}/reconcile",
             json={"operator_identity": "operator:human"},
             headers={"Authorization": "Bearer operator:human"},

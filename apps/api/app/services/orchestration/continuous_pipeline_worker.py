@@ -13,6 +13,7 @@ from decimal import Decimal
 from sqlalchemy import and_, func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.config import get_settings
 from app.models.audit_log import AuditLog
 from app.models.autonomous_capital_mandate import AutonomousCapitalMandate
 from app.models.autonomous_cycle_run import AutonomousCycleRun
@@ -60,6 +61,10 @@ from app.services.orchestration.venue_commissioning_bridge import service as ven
 from app.services.orchestration.automatic_package_executor import (
     AutomaticPackageExecutionRequest,
     execute_automatic_ready_package_through_activation,
+)
+from app.services.orchestration.autonomous_execution_claims import (
+    claim_activated_buy_package,
+    mark_submission_safety_disabled,
 )
 from app.services.strategy_outcomes import score_due_strategy_roster_proposal_outcomes
 from app.services.strategy_roster import StrategyRosterRequest, run_strategy_roster_for_candle
@@ -1162,6 +1167,24 @@ async def _attempt_automatic_ready_package_creation(
                     progression.activation_state, progression.replayed, progression.final_reason_code,
                     progression.failed_closed,
                 )
+                if progression.activation_state == "ACTIVATED" and progression.package_id is not None:
+                    claim_outcome = await claim_activated_buy_package(
+                        db=db,
+                        package_id=progression.package_id,
+                    )
+                    if claim_outcome.claim is not None and not get_settings().live_crypto_order_submission_enabled:
+                        await mark_submission_safety_disabled(db=db, claim=claim_outcome.claim)
+                        logger.info(
+                            "autonomous_execution_safety_disabled claim_id=%s package_id=%s campaign_id=%s campaign_version=%s reason=live_submission_disabled provider_call_made=false provider_call_reachable=false recoverable=true",
+                            claim_outcome.claim.claim_id, progression.package_id,
+                            progression.campaign_id, progression.campaign_version,
+                        )
+                    elif claim_outcome.claim is None:
+                        logger.info(
+                            "autonomous_execution_claim_skipped package_id=%s campaign_id=%s campaign_version=%s reason=%s provider_call_made=false",
+                            progression.package_id, progression.campaign_id,
+                            progression.campaign_version, claim_outcome.reason_code,
+                        )
             except Exception:
                 logger.exception(
                     "automatic_package_progression_failed_closed campaign_id=%s campaign_version=%s cycle_id=%s decision_record_id=%s package_id=%s reason=unexpected_executor_failure failed_closed=True",

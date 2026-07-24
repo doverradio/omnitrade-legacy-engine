@@ -34,6 +34,7 @@ from app.operator_cli.service import (
     stale_package_inspect,
     automatic_mandate_activation_proof,
     automatic_mandate_activation_readiness,
+    autonomous_execution_status,
     mandate_evaluation_identity_diagnostic,
     buy_opportunity_diagnostic,
     hold_decision_diagnostic,
@@ -864,6 +865,12 @@ def _build_parser() -> argparse.ArgumentParser:
     automatic_activation_proof.add_argument("--package-id", type=UUID, required=True)
     automatic_activation_proof.add_argument("--json", action="store_true", dest="json_output")
 
+    autonomous_execution = subparsers.add_parser(
+        "autonomous-execution-status", parents=[common], help="Read-only durable autonomous BUY claim status",
+    )
+    autonomous_execution.add_argument("--package-id", type=UUID, required=True)
+    autonomous_execution.add_argument("--json", action="store_true", dest="json_output")
+
     mandate_identity_trace = subparsers.add_parser(
         "mandate-evaluation-identity-diagnostic", parents=[common],
         help="Read-only autonomous/campaign cycle mandate evidence trace",
@@ -1568,6 +1575,10 @@ async def _run_async(args: argparse.Namespace) -> tuple[int, dict[str, Any], str
     if args.command == "automatic-mandate-activation-proof":
         payload = await automatic_mandate_activation_proof(package_id=args.package_id)
         return (0 if payload.get("verdict") == "PROVEN" else 1), payload, render_json(payload)
+
+    if args.command == "autonomous-execution-status":
+        payload = await autonomous_execution_status(package_id=args.package_id)
+        return 0, payload, render_json(payload)
 
     if args.command == "mandate-evaluation-identity-diagnostic":
         payload = await mandate_evaluation_identity_diagnostic(
