@@ -20,9 +20,10 @@ case "$1" in
     activation="$(sed -n 's/^AUTOMATIC_MANDATE_PACKAGE_ACTIVATION_ENABLED=//p' "${OMNITRADE_ACTIVATION_STATE_DIR}/current.env")"
     submission="$(sed -n 's/^LIVE_CRYPTO_ORDER_SUBMISSION_ENABLED=//p' "${OMNITRADE_ACTIVATION_STATE_DIR}/current.env")"
     preparation="$(sed -n 's/^LIVE_CRYPTO_PREPARATION_ENABLED=//p' "${OMNITRADE_ACTIVATION_STATE_DIR}/current.env")"
+    package_id="$(sed -n 's/^AUTOMATIC_MANDATE_PACKAGE_ACTIVATION_PACKAGE_ID=//p' "${OMNITRADE_ACTIVATION_STATE_DIR}/current.env")"
     if [[ "${FAKE_UNSAFE_ON_RESTART:-}" == "1" && "${activation}" == "true" ]]; then submission=true; fi
-    printf 'AUTOMATIC_MANDATE_PACKAGE_ACTIVATION_ENABLED=%s\\0LIVE_CRYPTO_ORDER_SUBMISSION_ENABLED=%s\\0LIVE_CRYPTO_PREPARATION_ENABLED=%s\\0' \
-      "${activation}" "${submission}" "${preparation}" >"${OMNITRADE_PROC_ROOT}/4242/environ"
+    printf 'AUTOMATIC_MANDATE_PACKAGE_ACTIVATION_ENABLED=%s\\0LIVE_CRYPTO_ORDER_SUBMISSION_ENABLED=%s\\0LIVE_CRYPTO_PREPARATION_ENABLED=%s\\0AUTOMATIC_MANDATE_PACKAGE_ACTIVATION_PACKAGE_ID=%s\\0' \
+      "${activation}" "${submission}" "${preparation}" "${package_id}" >"${OMNITRADE_PROC_ROOT}/4242/environ"
     ;;
   is-active) ;;
   show) printf '4242\\n' ;;
@@ -56,6 +57,12 @@ def _run(action: str, environment: dict[str, str]) -> subprocess.CompletedProces
     )
 
 
+def _run_args(arguments: list[str], environment: dict[str, str]) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(
+        [str(SCRIPT), *arguments], env=environment, check=False, capture_output=True, text=True,
+    )
+
+
 def test_prepare_stages_explicit_safe_state_and_is_idempotent(tmp_path: Path) -> None:
     environment = _environment(tmp_path)
 
@@ -84,6 +91,39 @@ def test_on_and_off_are_atomic_verified_selections(tmp_path: Path) -> None:
     assert disabled.returncode == 0
     assert "selector=OFF" in disabled.stdout
     assert "automatic_activation=false" in disabled.stdout
+
+
+def test_pinned_on_allows_exactly_one_package_and_off_removes_pin(tmp_path: Path) -> None:
+    environment = _environment(tmp_path)
+    package_id = "11111111-1111-4111-8111-111111111111"
+    assert _run("prepare", environment).returncode == 0
+
+    enabled = _run_args(["on-package", package_id], environment)
+
+    assert enabled.returncode == 0
+    assert "selector=PINNED_ON" in enabled.stdout
+    assert f"activation_package_id={package_id}" in enabled.stdout
+    assert f"AUTOMATIC_MANDATE_PACKAGE_ACTIVATION_PACKAGE_ID={package_id}" in (
+        tmp_path / "state" / "current.env"
+    ).read_text()
+    disabled = _run("off", environment)
+    assert disabled.returncode == 0
+    assert "AUTOMATIC_MANDATE_PACKAGE_ACTIVATION_PACKAGE_ID" not in (
+        tmp_path / "state" / "current.env"
+    ).read_text()
+
+
+def test_pinned_on_rejects_invalid_package_identity(tmp_path: Path) -> None:
+    environment = _environment(tmp_path)
+    assert _run("prepare", environment).returncode == 0
+
+    result = _run_args(["on-package", "not-a-package"], environment)
+
+    assert result.returncode != 0
+    assert "canonical UUID" in result.stderr
+    assert "AUTOMATIC_MANDATE_PACKAGE_ACTIVATION_ENABLED=false" in (
+        tmp_path / "state" / "current.env"
+    ).read_text()
 
 
 def test_on_rolls_back_when_process_environment_is_unsafe(tmp_path: Path) -> None:

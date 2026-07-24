@@ -58,7 +58,10 @@ def _enable(monkeypatch: pytest.MonkeyPatch, enabled: bool = True) -> None:
     monkeypatch.setattr(
         executor,
         "get_settings",
-        lambda: SimpleNamespace(automatic_mandate_package_activation_enabled=enabled),
+        lambda: SimpleNamespace(
+            automatic_mandate_package_activation_enabled=enabled,
+            automatic_mandate_package_activation_package_id=None,
+        ),
     )
 
 
@@ -161,6 +164,78 @@ async def test_executor_feature_flag_and_package_resolution_fail_closed(monkeypa
     assert missing.failed_closed is True
     assert ambiguous.final_reason_code == "ambiguous_eligible_packages"
     assert ambiguous.failed_closed is True
+
+
+@pytest.mark.asyncio
+async def test_executor_proof_package_pin_rejects_every_other_package(monkeypatch: pytest.MonkeyPatch) -> None:
+    package = _package()
+    pinned_package_id = uuid.uuid4()
+    monkeypatch.setattr(
+        executor,
+        "get_settings",
+        lambda: SimpleNamespace(
+            automatic_mandate_package_activation_enabled=True,
+            automatic_mandate_package_activation_package_id=pinned_package_id,
+        ),
+    )
+
+    outcome = await executor.execute_automatic_ready_package_through_activation(
+        db=_Db([package]), request=_request(package),
+    )
+
+    assert outcome.final_reason_code == "proof_package_pin_mismatch"
+    assert outcome.failed_closed is True
+    assert outcome.package_id is None
+
+
+@pytest.mark.asyncio
+async def test_executor_proof_package_pin_allows_only_the_captured_package(monkeypatch: pytest.MonkeyPatch) -> None:
+    package = _package("DRY_RUN_PASSED")
+    monkeypatch.setattr(
+        executor,
+        "get_settings",
+        lambda: SimpleNamespace(
+            automatic_mandate_package_activation_enabled=True,
+            automatic_mandate_package_activation_package_id=package.package_id,
+        ),
+    )
+
+    async def _activate(*, db, request):
+        package.package_state = "ACTIVATED"
+        return {}
+
+    monkeypatch.setattr(executor, "activate_canonical_proving_campaign", _activate)
+    outcome = await executor.execute_automatic_ready_package_through_activation(
+        db=_Db([package]), request=_request(package),
+    )
+
+    assert outcome.activation_state == "ACTIVATED"
+    assert outcome.failed_closed is False
+
+
+@pytest.mark.asyncio
+async def test_executor_proof_package_pin_resolves_captured_package_after_worker_restart(monkeypatch: pytest.MonkeyPatch) -> None:
+    package = _package("DRY_RUN_PASSED")
+    monkeypatch.setattr(
+        executor,
+        "get_settings",
+        lambda: SimpleNamespace(
+            automatic_mandate_package_activation_enabled=True,
+            automatic_mandate_package_activation_package_id=package.package_id,
+        ),
+    )
+
+    async def _activate(*, db, request):
+        package.package_state = "ACTIVATED"
+        return {}
+
+    monkeypatch.setattr(executor, "activate_canonical_proving_campaign", _activate)
+    outcome = await executor.execute_automatic_ready_package_through_activation(
+        db=_Db([package]), request=_request(package, include_package_id=False),
+    )
+
+    assert outcome.package_id == package.package_id
+    assert outcome.activation_state == "ACTIVATED"
 
 
 @pytest.mark.asyncio

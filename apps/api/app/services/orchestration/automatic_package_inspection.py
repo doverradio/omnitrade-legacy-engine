@@ -375,6 +375,18 @@ async def inspect_automatic_mandate_activation_proof(*, db: AsyncSession, packag
         select(LiveCryptoOrder).where(LiveCryptoOrder.live_crypto_order_id == package.dry_run_live_crypto_order_id).limit(1)
     )
     activation = await db.scalar(select(CanonicalProvingActivation).where(CanonicalProvingActivation.package_id == package_id).limit(1))
+    package_audits = list((await db.scalars(
+        select(AuditLog).where(
+            AuditLog.entity_type == "canonical_preview_package",
+            AuditLog.entity_id == package_id,
+        ).order_by(AuditLog.created_at.asc(), AuditLog.id.asc())
+    )).all())
+    activation_audits = [] if activation is None else list((await db.scalars(
+        select(AuditLog).where(
+            AuditLog.entity_type == "canonical_proving_activation",
+            AuditLog.entity_id == activation.activation_id,
+        ).order_by(AuditLog.created_at.asc(), AuditLog.id.asc())
+    )).all())
     if package.authorization_source != "MANDATE" or package.approval_event_id is not None:
         reasons.append("human_authority_contamination")
     if evaluation is None or evaluation.approval_result != "APPROVAL_SATISFIED_BY_ACTIVE_MANDATE" or evaluation.authorization_result != "AUTHORIZED":
@@ -414,18 +426,55 @@ async def inspect_automatic_mandate_activation_proof(*, db: AsyncSession, packag
         LiveAccountingRecord.live_crypto_order_id == dry_order.live_crypto_order_id
     )) or 0)
     if position_count: reasons.append("position_evidence_present")
+    transition_actions = {
+        "canonical_preview_package_authorized_mandate": "AUTHORIZED",
+        "canonical_preview_package_dry_run_recorded": "DRY_RUN_PASSED",
+        "canonical_proving_activation_created": "ACTIVATED",
+    }
+    transitions = [{"state": "READY", "at": _iso(package.generated_at), "source": "canonical_preview_packages.generated_at"}]
+    transitions.extend(
+        {
+            "state": transition_actions[item.action],
+            "at": _iso(item.created_at),
+            "source": f"audit_log:{item.action}",
+        }
+        for item in [*package_audits, *activation_audits]
+        if item.action in transition_actions
+    )
+    expected_transition_states = ["READY", "AUTHORIZED", "DRY_RUN_PASSED", "ACTIVATED"]
+    if [item["state"] for item in transitions] != expected_transition_states:
+        reasons.append("lifecycle_transition_evidence_incomplete")
     verdict = "PROVEN" if not reasons else ("CONFLICT" if any("contamination" in r or "present" in r or "mismatch" in r for r in reasons) else "NOT_PROVEN")
     return {
         "verdict": verdict, "reason_codes": reasons, "package_id": str(package.package_id),
         "campaign_id": str(package.campaign_id), "campaign_version": package.campaign_version,
+        "campaign_runtime_id": str(package.runtime_campaign_id),
         "decision_record_id": str(package.decision_record_id), "mandate_id": None if package.mandate_id is None else str(package.mandate_id),
+        "mandate_version_id": None if package.mandate_version_id is None else str(package.mandate_version_id),
         "mandate_evaluation_id": None if evaluation is None else str(evaluation.evaluation_id),
+        "paper_account_id": str(package.paper_account_id),
+        "live_trading_profile_id": str(package.live_trading_profile_id),
+        "exchange_connection_id": None if dry_order is None else str(dry_order.exchange_connection_id),
+        "provider": package.provider, "environment": package.environment,
+        "product": package.product, "side": package.side,
+        "strategy_id": str(package.strategy_id), "strategy_version": package.strategy_version,
+        "requested_notional": str(package.proposed_order_amount),
+        "risk_approved_notional": str(package.risk_approved_amount),
+        "package_created_at": _iso(package.generated_at),
+        "preview_expires_at": _iso(package.preview_expires_at),
+        "authorization_expires_at": _iso(package.authorization_expires_at),
+        "transitions": transitions,
         "dry_run_live_crypto_order_id": None if dry_order is None else str(dry_order.live_crypto_order_id),
         "activation_id": None if activation is None else str(activation.activation_id),
         "authority_audit_correlation_id": correlation,
         "human_live_approval_event_used": package.approval_event_id is not None or (activation is not None and activation.approval_event_id is not None),
         "live_submission_record_exists": dry_order is not None and dry_order.status != "DRY_RUN_READY",
         "provider_order_id": None if dry_order is None else dry_order.provider_order_id,
+        "submitted_at": None if dry_order is None else _iso(dry_order.submitted_at),
+        "live_submission_called": False,
+        "provider_submission_called": False,
+        "submission_callable_reachable": False,
+        "provider_submission_callable_reachable": False,
         "position_exists": position_count > 0,
         "reconciliation_count": recon_count,
         "read_only": True,

@@ -86,12 +86,27 @@ async def execute_automatic_ready_package_through_activation(
     db: AsyncSession,
     request: AutomaticPackageExecutionRequest,
 ) -> AutomaticPackageExecutionOutcome:
-    if not get_settings().automatic_mandate_package_activation_enabled:
+    settings = get_settings()
+    if not settings.automatic_mandate_package_activation_enabled:
         logger.info(
             "automatic_package_progression_skipped campaign_id=%s campaign_version=%s decision_record_id=%s package_id=%s reason=feature_disabled failed_closed=False",
             request.campaign_id, request.campaign_version, request.decision_record_id, request.package_id,
         )
         return _outcome(request=request, package=None, reason="automatic_mandate_package_activation_disabled")
+
+    pinned_package_id = getattr(settings, "automatic_mandate_package_activation_package_id", None)
+    if pinned_package_id is not None and request.package_id not in {None, pinned_package_id}:
+        logger.warning(
+            "automatic_package_progression_failed_closed campaign_id=%s campaign_version=%s decision_record_id=%s package_id=%s pinned_package_id=%s reason=proof_package_pin_mismatch failed_closed=True",
+            request.campaign_id, request.campaign_version, request.decision_record_id,
+            request.package_id, pinned_package_id,
+        )
+        return _outcome(
+            request=request,
+            package=None,
+            reason="proof_package_pin_mismatch",
+            failed_closed=True,
+        )
 
     statement = select(CanonicalPreviewPackage).where(
         CanonicalPreviewPackage.campaign_id == request.campaign_id,
@@ -99,8 +114,9 @@ async def execute_automatic_ready_package_through_activation(
         CanonicalPreviewPackage.decision_record_id == request.decision_record_id,
         CanonicalPreviewPackage.package_state.in_(_PROGRESSABLE_STATES),
     )
-    if request.package_id is not None:
-        statement = statement.where(CanonicalPreviewPackage.package_id == request.package_id)
+    resolved_package_id = request.package_id or pinned_package_id
+    if resolved_package_id is not None:
+        statement = statement.where(CanonicalPreviewPackage.package_id == resolved_package_id)
     rows = list((await db.execute(statement.order_by(CanonicalPreviewPackage.generated_at.desc()).limit(2).with_for_update())).scalars().all())
     if len(rows) != 1:
         reason = "eligible_package_missing" if not rows else "ambiguous_eligible_packages"
@@ -117,7 +133,7 @@ async def execute_automatic_ready_package_through_activation(
             package.campaign_id != request.campaign_id
             or package.campaign_version != request.campaign_version
             or package.decision_record_id != request.decision_record_id
-            or (request.package_id is not None and package.package_id != request.package_id)
+            or (resolved_package_id is not None and package.package_id != resolved_package_id)
         ):
             raise PermissionError("resolved package identity mismatch")
         if package.package_state == "ACTIVATED":

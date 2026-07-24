@@ -264,10 +264,30 @@ async def test_proof_complete_mandate_evidence_is_proven():
         dry_run_live_crypto_order_id=package.dry_run_live_crypto_order_id,
         mandate_evaluation_id=package.mandate_evaluation_id, exchange_connection_id=dry.exchange_connection_id,
     )
+    authorized_at = datetime.now(timezone.utc)
+    dry_run_at = authorized_at + timedelta(seconds=1)
+    activated_at = dry_run_at + timedelta(seconds=1)
+    package_audits = [
+        SimpleNamespace(id=1, action="canonical_preview_package_authorized_mandate", created_at=authorized_at),
+        SimpleNamespace(id=2, action="canonical_preview_package_dry_run_recorded", created_at=dry_run_at),
+    ]
+    activation_audits = [
+        SimpleNamespace(id=3, action="canonical_proving_activation_created", created_at=activated_at),
+    ]
     result = await inspection.inspect_automatic_mandate_activation_proof(
-        db=_Db(scalars=[package, evaluation, dry, activation, 0, 0]), package_id=package.package_id,
+        db=_Db(rows=[package_audits, activation_audits], scalars=[package, evaluation, dry, activation, 0, 0]),
+        package_id=package.package_id,
     )
     assert result["verdict"] == "PROVEN"
+    assert [item["state"] for item in result["transitions"]] == [
+        "READY", "AUTHORIZED", "DRY_RUN_PASSED", "ACTIVATED",
+    ]
+    assert result["campaign_runtime_id"] == str(package.runtime_campaign_id)
+    assert result["paper_account_id"] == str(package.paper_account_id)
+    assert result["live_submission_called"] is False
+    assert result["provider_submission_called"] is False
+    assert result["provider_order_id"] is None
+    assert result["submitted_at"] is None
     assert result["live_submission_record_exists"] is False
     assert result["provider_order_id"] is None
     assert result["reconciliation_count"] == 0
@@ -296,6 +316,8 @@ async def test_proof_rejects_conflicting_or_incomplete_evidence(mutation, reason
     if package.dry_run_live_crypto_order_id is not None: values.append(dry)
     values.extend([activation, 1 if mutation == "reconciliation" else 0])
     if dry is not None: values.append(1 if mutation == "position" else 0)
-    result = await inspection.inspect_automatic_mandate_activation_proof(db=_Db(scalars=values), package_id=package.package_id)
+    result = await inspection.inspect_automatic_mandate_activation_proof(
+        db=_Db(rows=[[], []], scalars=values), package_id=package.package_id,
+    )
     assert reason in result["reason_codes"]
     assert result["verdict"] != "PROVEN"

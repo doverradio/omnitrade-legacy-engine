@@ -60,6 +60,10 @@ class Settings(BaseSettings):
         default=False,
         validation_alias="AUTOMATIC_MANDATE_PACKAGE_ACTIVATION_ENABLED",
     )
+    automatic_mandate_package_activation_package_id: UUID | None = Field(
+        default=None,
+        validation_alias="AUTOMATIC_MANDATE_PACKAGE_ACTIVATION_PACKAGE_ID",
+    )
     default_production_crypto_paper_account_id: UUID | None = Field(
         default=None,
         validation_alias="DEFAULT_PRODUCTION_CRYPTO_PAPER_ACCOUNT_ID",
