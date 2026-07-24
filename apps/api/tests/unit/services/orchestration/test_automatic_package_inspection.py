@@ -123,6 +123,7 @@ async def test_readiness_ready_verdicts(monkeypatch, enabled, expected):
     assert result["verdict"] == expected
     assert result["read_only"] is True
     assert result["eligible_package_count"] == 1
+    assert all(item.package_state == "READY" for item in stale_packages)
     assert all(item["match"] for item in result["mandate"]["identity_comparisons"])
     assert {item["field"] for item in result["mandate"]["identity_comparisons"]} >= {
         "campaign_runtime", "campaign_uuid", "campaign_version", "paper_account_id",
@@ -136,6 +137,29 @@ async def test_readiness_ready_verdicts(monkeypatch, enabled, expected):
         "submission_callable_reachable": False,
         "provider_submission_callable_reachable": False,
     }
+
+
+@pytest.mark.asyncio
+async def test_readiness_all_stale_ready_history_is_preserved_and_reports_stale_package(monkeypatch):
+    stale_packages = [_package(), _package()]
+    for stale in stale_packages:
+        stale.preview_expires_at = datetime.now(timezone.utc) - timedelta(minutes=1)
+    mandate = _mandate()
+    auth = _authorization(mandate)
+    version = _version(auth, mandate)
+    monkeypatch.setattr(inspection, "get_settings", lambda: _settings())
+
+    result = await inspection.inspect_automatic_mandate_activation_readiness(
+        db=_Db(rows=[stale_packages, [mandate], []], scalars=[auth, version, None]),
+        provider="kraken_spot", environment="production", product="BTC-USD",
+    )
+
+    assert result["verdict"] == "NOT_READY"
+    assert result["eligible_package_count"] == 0
+    assert "stale_package" in {item["code"] for item in result["reason_codes"]}
+    assert result["mandate"]["matching_evaluation_id"] is None
+    assert result["mandate"]["evaluation_readiness"]["status"] == "PREFLIGHT_BLOCKED"
+    assert all(item.package_state == "READY" for item in stale_packages)
 
 
 @pytest.mark.asyncio

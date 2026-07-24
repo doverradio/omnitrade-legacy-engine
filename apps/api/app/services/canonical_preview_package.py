@@ -1837,6 +1837,7 @@ async def activate_canonical_proving_campaign(
     db: AsyncSession,
     request: CanonicalPreviewPackageActivationRequest,
 ) -> dict[str, Any]:
+    now = _utcnow()
     package = await _load_package(db=db, package_id=request.package_id)
     if package is None:
         raise LookupError("canonical preview package not found")
@@ -1910,6 +1911,7 @@ async def activate_canonical_proving_campaign(
                 CanonicalProvingActivation.environment == package.environment,
                 CanonicalProvingActivation.product == package.product,
                 CanonicalProvingActivation.activation_state == "ACTIVE",
+                CanonicalProvingActivation.expires_at > now,
             )
             .limit(1)
         )

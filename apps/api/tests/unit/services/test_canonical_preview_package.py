@@ -2101,6 +2101,107 @@ async def test_mandate_authorized_package_dry_runs_and_activates_without_human_a
         )
 
 
+class _ActivationConflictDb(_FakeDb):
+    def __init__(self, *, dry_run_order: object, conflicting_activation: object) -> None:
+        super().__init__()
+        self._dry_run_order = dry_run_order
+        self._conflicting_activation = conflicting_activation
+        self._scalar_call = 0
+        self.conflict_statement = None
+
+    async def scalar(self, statement):
+        self._scalar_call += 1
+        if self._scalar_call == 1:
+            return self._dry_run_order
+        if self._scalar_call == 2:
+            return None
+        self.conflict_statement = statement
+        params = statement.compile().params
+        cutoff = next(value for key, value in params.items() if key.startswith("expires_at_"))
+        return self._conflicting_activation if self._conflicting_activation.expires_at > cutoff else None
+
+
+def _activation_conflict_fixture(
+    *, expires_at: datetime,
+) -> tuple[SimpleNamespace, SimpleNamespace, cpp.CanonicalPackageAuthority, SimpleNamespace]:
+    package, _runtime, mandate, _authorization, version, _strategy, evaluation = _mandate_authority_fixture()
+    _mark_package_mandate_authorized(package, mandate, version, evaluation)
+    package.package_state = "DRY_RUN_PASSED"
+    package.dry_run_live_crypto_order_id = uuid4()
+    authority = cpp.CanonicalPackageAuthority(
+        source="MANDATE",
+        actor="system:mandate-package-executor",
+        expires_at=datetime.now(timezone.utc) + timedelta(minutes=5),
+        approval_event_id=None,
+        mandate_evaluation_id=evaluation.evaluation_id,
+        audit_correlation_id=package.authority_audit_correlation_id,
+    )
+    dry_run_order = SimpleNamespace(
+        live_crypto_order_id=package.dry_run_live_crypto_order_id,
+        status="DRY_RUN_READY",
+        safe_provider_response={
+            "authority_source": "MANDATE",
+            "canonical_preview_package_id": str(package.package_id),
+            "mandate_evaluation_id": str(evaluation.evaluation_id),
+        },
+    )
+    conflicting = SimpleNamespace(expires_at=expires_at)
+    return package, dry_run_order, authority, conflicting
+
+
+@pytest.mark.asyncio
+async def test_mandate_activation_ignores_expired_active_conflict(monkeypatch: pytest.MonkeyPatch) -> None:
+    package, dry_run_order, authority, conflicting = _activation_conflict_fixture(
+        expires_at=datetime.now(timezone.utc) - timedelta(minutes=1),
+    )
+    monkeypatch.setattr(cpp, "_load_package", _async_return(package))
+    monkeypatch.setattr(cpp, "_validate_canonical_package_authority", _async_return(authority))
+    db = _ActivationConflictDb(dry_run_order=dry_run_order, conflicting_activation=conflicting)
+
+    result = await cpp.activate_canonical_proving_campaign(
+        db=db,
+        request=cpp.CanonicalPreviewPackageActivationRequest(
+            package_id=package.package_id,
+            approval_event_id=None,
+            dry_run_live_crypto_order_id=package.dry_run_live_crypto_order_id,
+            actor=None,
+            expires_at=None,
+            idempotency_key="expired-conflict-ignored",
+        ),
+    )
+
+    assert result["activation"]["activation_state"] == "ACTIVE"
+    assert package.package_state == "ACTIVATED"
+    assert "canonical_proving_activations.expires_at" in str(db.conflict_statement)
+    assert any(getattr(item, "action", None) == "canonical_proving_activation_created" for item in db.added)
+
+
+@pytest.mark.asyncio
+async def test_mandate_activation_rejects_unexpired_active_conflict(monkeypatch: pytest.MonkeyPatch) -> None:
+    package, dry_run_order, authority, conflicting = _activation_conflict_fixture(
+        expires_at=datetime.now(timezone.utc) + timedelta(minutes=5),
+    )
+    monkeypatch.setattr(cpp, "_load_package", _async_return(package))
+    monkeypatch.setattr(cpp, "_validate_canonical_package_authority", _async_return(authority))
+    db = _ActivationConflictDb(dry_run_order=dry_run_order, conflicting_activation=conflicting)
+
+    with pytest.raises(PermissionError, match="conflicting active canonical proving package"):
+        await cpp.activate_canonical_proving_campaign(
+            db=db,
+            request=cpp.CanonicalPreviewPackageActivationRequest(
+                package_id=package.package_id,
+                approval_event_id=None,
+                dry_run_live_crypto_order_id=package.dry_run_live_crypto_order_id,
+                actor=None,
+                expires_at=None,
+                idempotency_key="unexpired-conflict-rejected",
+            ),
+        )
+
+    assert package.package_state == "DRY_RUN_PASSED"
+    assert not db.added
+
+
 @pytest.mark.asyncio
 async def test_mandate_dry_run_fails_closed_for_incomplete_or_failed_authority(monkeypatch: pytest.MonkeyPatch) -> None:
     package, runtime, mandate, authorization, version, strategy, evaluation = _mandate_authority_fixture()
