@@ -129,7 +129,16 @@ def _market_move(*, market_return_pct: Decimal, sideways_threshold_pct: Decimal)
     return "SIDEWAYS"
 
 
-def _regime_labels(*, closes: list[Decimal], highs: list[Decimal], lows: list[Decimal]) -> tuple[str, str, str]:
+def classify_regime_labels(*, closes: list[Decimal], highs: list[Decimal], lows: list[Decimal]) -> tuple[str, str, str]:
+    """Deterministic (trend, volatility, range) regime classification from a
+    plain OHLC window. Public: also used to classify the CURRENT market
+    regime at strategy-roster time (app.services.strategy_roster.service),
+    so that regime -- compared against the historical regime_trend this same
+    function assigns to every persisted outcome row -- is always measured on
+    an identical scale. Order-sensitive: callers must pass a
+    chronologically-ordered (oldest first) window; historical callers pass
+    the realized entry-to-exit path, live callers pass a backward-looking
+    trailing window (the only one available before an outcome exists)."""
     if len(closes) < 2:
         return "RANGING", "LOW_VOLATILITY", "COMPRESSION"
 
@@ -321,7 +330,7 @@ async def score_due_strategy_roster_proposal_outcomes(
                 mfe_pct = _to_pct((max(highs) - entry_price) / entry_price)
                 mae_pct = _to_pct((min(lows) - entry_price) / entry_price)
 
-            regime_trend, regime_volatility, regime_range = _regime_labels(
+            regime_trend, regime_volatility, regime_range = classify_regime_labels(
                 closes=closes,
                 highs=highs,
                 lows=lows,

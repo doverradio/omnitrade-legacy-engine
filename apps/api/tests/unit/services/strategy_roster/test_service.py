@@ -11,7 +11,7 @@ from app.models.strategy_roster_proposal import StrategyRosterProposal
 from app.models.strategy_roster_run import StrategyRosterRun
 from app.services.strategy_roster.contracts import StrategyRosterRequest
 from app.services.strategy_roster.registry import ENABLED_PHASE1_ROSTER
-from app.services.strategy_roster.service import run_strategy_roster_for_candle
+from app.services.strategy_roster.service import _classify_current_regime_trend, run_strategy_roster_for_candle
 
 
 class _Result:
@@ -219,3 +219,54 @@ async def test_roster_strategy_exception_does_not_block_other_proposals(monkeypa
 
     non_failing = [item for item in db.proposals if item.strategy_slug != "momentum"]
     assert all(item.evaluation_status in {"EVALUATED", "INSUFFICIENT_CONTEXT"} for item in non_failing)
+
+
+# --- Current-regime classification ---
+
+
+def test_classify_current_regime_trend_strongly_directional_series_is_trending() -> None:
+    candles = _candles(count=80, close_base=Decimal("100"), close_step=Decimal("1"))
+    assert _classify_current_regime_trend(candles=candles) == "TRENDING"
+
+
+def test_classify_current_regime_trend_flat_series_is_ranging() -> None:
+    candles = _candles(count=80, close_base=Decimal("100"), close_step=Decimal("0"))
+    assert _classify_current_regime_trend(candles=candles) == "RANGING"
+
+
+def test_classify_current_regime_trend_insufficient_history_is_none() -> None:
+    candles = _candles(count=5, close_base=Decimal("100"), close_step=Decimal("1"))
+    assert _classify_current_regime_trend(candles=candles) is None
+
+
+def test_classify_current_regime_trend_empty_candles_is_none() -> None:
+    assert _classify_current_regime_trend(candles=[]) is None
+
+
+def test_classify_current_regime_trend_is_deterministic() -> None:
+    candles = _candles(count=80, close_base=Decimal("100"), close_step=Decimal("1"))
+    assert _classify_current_regime_trend(candles=candles) == _classify_current_regime_trend(candles=candles)
+
+
+@pytest.mark.asyncio
+async def test_roster_run_persists_current_regime_trend() -> None:
+    candles = _candles(count=80, close_base=Decimal("100"), close_step=Decimal("1"))
+    strategy_rows = _strategy_rows()
+    db = _FakeDb(candles=candles, strategy_rows=strategy_rows)
+
+    await run_strategy_roster_for_candle(db=db, request=_request(candles))
+
+    persisted_run = next(iter(db.runs_by_key.values()))
+    assert persisted_run.current_regime_trend == "TRENDING"
+
+
+@pytest.mark.asyncio
+async def test_roster_run_insufficient_history_leaves_regime_trend_none() -> None:
+    candles = _candles(count=2)
+    strategy_rows = _strategy_rows()
+    db = _FakeDb(candles=candles, strategy_rows=strategy_rows)
+
+    await run_strategy_roster_for_candle(db=db, request=_request(candles))
+
+    persisted_run = next(iter(db.runs_by_key.values()))
+    assert persisted_run.current_regime_trend is None

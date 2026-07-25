@@ -130,6 +130,7 @@ async def _seed_roster_run_and_proposals(
     actions: dict[str, str],
     trigger: str = "kraken_btc_15m_candle_close",
     complete: bool = True,
+    current_regime_trend: str | None = None,
 ) -> uuid.UUID:
     roster_run_id = uuid.uuid4()
     failed_entries = [] if complete else [{"strategy_slug": "injected", "reason": "injected"}]
@@ -143,6 +144,7 @@ async def _seed_roster_run_and_proposals(
         candle_open_time=NOW,
         candle_close_time=NOW,
         trigger=trigger,
+        current_regime_trend=current_regime_trend,
         strategies_requested=list(actions.keys()),
         strategies_completed=list(actions.keys()) if complete else [],
         strategies_failed=failed_entries,
@@ -363,6 +365,184 @@ async def test_hold_evidence_profitability_is_none_when_no_hold_scoped_history_e
         # silently backed by the BUY-scoped or blended figures.
         assert evidence["source_identity"]["scorecard_strategy_slug"] == "breakout"
         assert evidence["profitable_after_fees_performance"] is None
+
+
+# --- _resolve_regime_match: pure-function unit coverage ---
+
+
+def test_resolve_regime_match_true_when_current_regime_is_best() -> None:
+    assert authoritative._resolve_regime_match(current_regime_trend="TRENDING", best_regime="TRENDING", worst_regime="RANGING") is True
+
+
+def test_resolve_regime_match_false_when_current_regime_is_worst() -> None:
+    assert authoritative._resolve_regime_match(current_regime_trend="RANGING", best_regime="TRENDING", worst_regime="RANGING") is False
+
+
+def test_resolve_regime_match_none_when_current_regime_unknown() -> None:
+    assert authoritative._resolve_regime_match(current_regime_trend=None, best_regime="TRENDING", worst_regime="RANGING") is None
+
+
+def test_resolve_regime_match_none_when_strategy_has_no_regime_evidence() -> None:
+    assert authoritative._resolve_regime_match(current_regime_trend="TRENDING", best_regime=None, worst_regime=None) is None
+
+
+def test_resolve_regime_match_none_when_current_regime_matches_neither() -> None:
+    # Defensive: only reachable if the vocabulary ever grows beyond
+    # TRENDING/RANGING, but must fail closed rather than guess.
+    assert authoritative._resolve_regime_match(current_regime_trend="UNKNOWN_FUTURE_REGIME", best_regime="TRENDING", worst_regime="RANGING") is None
+
+
+def _regime_scored_bucket(*, overall_correct_pct: Decimal) -> StrategyScorecardBucket:
+    return StrategyScorecardBucket(
+        horizon_label="aggregate",
+        total_evaluated=50,
+        buy_evaluations=50,
+        buy_correct=int(overall_correct_pct / 2),
+        sell_evaluations=0,
+        sell_correct=0,
+        hold_evaluations=0,
+        hold_correct=0,
+        overall_correct_pct=overall_correct_pct,
+        average_raw_return_pct=Decimal("1.0"),
+        average_fee_adjusted_return_pct=Decimal("1.0"),
+        average_mfe_pct=Decimal("0"),
+        average_mae_pct=Decimal("0"),
+        buy_average_fee_adjusted_return_pct=Decimal("1.0"),
+        sell_average_fee_adjusted_return_pct=None,
+        hold_average_fee_adjusted_return_pct=None,
+    )
+
+
+@pytest.mark.asyncio
+async def test_regime_match_flows_from_roster_run_and_scorecard_into_contribution(monkeypatch: pytest.MonkeyPatch) -> None:
+    """End-to-end wiring: a roster run's own current_regime_trend (computed
+    once, at roster time, from the real candle window -- see
+    strategy_roster.service._classify_current_regime_trend) compared against
+    a strategy's scorecard-derived best/worst regime must reach the
+    persisted contribution record and the decision's market_regime, not just
+    exist as disconnected data."""
+    _patch_flat_position(monkeypatch)
+
+    bucket = _regime_scored_bucket(overall_correct_pct=Decimal("60"))
+
+    async def _fake_scorecards(**_kwargs):
+        return [
+            StrategyScorecard(
+                strategy_slug="breakout",
+                per_horizon=[],
+                aggregate=bucket,
+                best_regime="TRENDING",
+                worst_regime="RANGING",
+                regime_evidence_count=50,
+                regime_min_evidence_required=50,
+            )
+        ]
+
+    monkeypatch.setattr(authoritative, "fetch_strategy_scorecards", _fake_scorecards)
+
+    async with _real_session() as session:
+        await _seed_roster_run_and_proposals(
+            session,
+            actions={"ma_crossover": "BUY", "momentum": "BUY", "breakout": "BUY"},
+            current_regime_trend="TRENDING",
+        )
+        evidence, reason = await _call_aggregator(session)
+
+        assert reason is None
+        assert evidence is not None
+        assert evidence["current_regime_trend"] == "TRENDING"
+
+        breakout_contribution = next(
+            item for item in evidence["aggregate_evidence"]["contributions"] if item["strategy_slug"] == "breakout"
+        )
+        assert breakout_contribution["regime_match"] is True
+        assert breakout_contribution["evidence_basis"] == "outcome_evidence_weighted_regime_matched"
+
+        decision_record = await session.get(DecisionRecord, uuid.UUID(evidence["decision_record"]["decision_id"]))
+        assert decision_record.market_regime == {"state": "TRENDING", "source": "classify_regime_labels"}
+
+
+@pytest.mark.asyncio
+async def test_regime_mismatch_flows_into_contribution(monkeypatch: pytest.MonkeyPatch) -> None:
+    _patch_flat_position(monkeypatch)
+
+    bucket = _regime_scored_bucket(overall_correct_pct=Decimal("60"))
+
+    async def _fake_scorecards(**_kwargs):
+        return [
+            StrategyScorecard(
+                strategy_slug="breakout",
+                per_horizon=[],
+                aggregate=bucket,
+                best_regime="TRENDING",
+                worst_regime="RANGING",
+                regime_evidence_count=50,
+                regime_min_evidence_required=50,
+            )
+        ]
+
+    monkeypatch.setattr(authoritative, "fetch_strategy_scorecards", _fake_scorecards)
+
+    async with _real_session() as session:
+        await _seed_roster_run_and_proposals(
+            session,
+            actions={"ma_crossover": "BUY", "momentum": "BUY", "breakout": "BUY"},
+            current_regime_trend="RANGING",
+        )
+        evidence, reason = await _call_aggregator(session)
+
+        assert reason is None
+        assert evidence is not None
+        assert evidence["current_regime_trend"] == "RANGING"
+
+        breakout_contribution = next(
+            item for item in evidence["aggregate_evidence"]["contributions"] if item["strategy_slug"] == "breakout"
+        )
+        assert breakout_contribution["regime_match"] is False
+        assert breakout_contribution["evidence_basis"] == "outcome_evidence_weighted_regime_mismatched"
+
+
+@pytest.mark.asyncio
+async def test_missing_current_regime_leaves_regime_match_none(monkeypatch: pytest.MonkeyPatch) -> None:
+    """No roster-run-level regime classification yet (e.g. insufficient
+    candle history at roster time) -- must fail closed to None, identical to
+    today's pre-regime behavior, never guessed."""
+    _patch_flat_position(monkeypatch)
+
+    bucket = _regime_scored_bucket(overall_correct_pct=Decimal("60"))
+
+    async def _fake_scorecards(**_kwargs):
+        return [
+            StrategyScorecard(
+                strategy_slug="breakout",
+                per_horizon=[],
+                aggregate=bucket,
+                best_regime="TRENDING",
+                worst_regime="RANGING",
+                regime_evidence_count=50,
+                regime_min_evidence_required=50,
+            )
+        ]
+
+    monkeypatch.setattr(authoritative, "fetch_strategy_scorecards", _fake_scorecards)
+
+    async with _real_session() as session:
+        await _seed_roster_run_and_proposals(
+            session,
+            actions={"ma_crossover": "BUY", "momentum": "BUY", "breakout": "BUY"},
+            current_regime_trend=None,
+        )
+        evidence, reason = await _call_aggregator(session)
+
+        assert reason is None
+        assert evidence is not None
+        assert evidence["current_regime_trend"] is None
+
+        breakout_contribution = next(
+            item for item in evidence["aggregate_evidence"]["contributions"] if item["strategy_slug"] == "breakout"
+        )
+        assert breakout_contribution["regime_match"] is None
+        assert breakout_contribution["evidence_basis"] == "outcome_evidence_weighted"
 
 
 # 14 (partial -- proves the aggregate never bypasses HOLD classification when

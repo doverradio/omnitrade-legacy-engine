@@ -317,8 +317,15 @@ def test_action_position_transition_table(action: str, position_state: str, comp
     ) == expected
 
 
-def _outcome(sample_size: int, overall_correct_pct: Decimal | None) -> StrategyOutcomeSummary:
-    return StrategyOutcomeSummary(sample_size=sample_size, overall_correct_pct=overall_correct_pct, average_fee_adjusted_return_pct=None)
+def _outcome(
+    sample_size: int, overall_correct_pct: Decimal | None, *, regime_match: bool | None = None
+) -> StrategyOutcomeSummary:
+    return StrategyOutcomeSummary(
+        sample_size=sample_size,
+        overall_correct_pct=overall_correct_pct,
+        average_fee_adjusted_return_pct=None,
+        regime_match=regime_match,
+    )
 
 
 # --- Evidence-based weighting: _strategy_weight ---
@@ -441,3 +448,99 @@ def test_evidence_based_weighting_resolves_previously_undecidable_split() -> Non
     assert buy_contribution.outcome_sample_size == 50
     assert buy_contribution.outcome_correctness_pct == "95"
     assert buy_contribution.equal_weight_fallback is False
+
+
+# --- Evidence-based weighting: regime-scoped nudge ---
+
+
+def test_strategy_weight_regime_match_nudges_weight_up() -> None:
+    matched = _proposal(slug="ma_crossover", action="BUY", outcome_evidence=_outcome(50, Decimal("60"), regime_match=True))
+    unmatched = _proposal(slug="ma_crossover", action="BUY", outcome_evidence=_outcome(50, Decimal("60")))
+    weight_matched, basis_matched = _strategy_weight(matched, config=_config(min_outcome_sample_size=20))
+    weight_baseline, basis_baseline = _strategy_weight(unmatched, config=_config(min_outcome_sample_size=20))
+    assert weight_matched == weight_baseline + Decimal("0.1")
+    assert basis_matched == "outcome_evidence_weighted_regime_matched"
+    assert basis_baseline == "outcome_evidence_weighted"
+
+
+def test_strategy_weight_regime_mismatch_nudges_weight_down() -> None:
+    mismatched = _proposal(slug="ma_crossover", action="BUY", outcome_evidence=_outcome(50, Decimal("60"), regime_match=False))
+    unmatched = _proposal(slug="ma_crossover", action="BUY", outcome_evidence=_outcome(50, Decimal("60")))
+    weight_mismatched, basis_mismatched = _strategy_weight(mismatched, config=_config(min_outcome_sample_size=20))
+    weight_baseline, _ = _strategy_weight(unmatched, config=_config(min_outcome_sample_size=20))
+    assert weight_mismatched == weight_baseline - Decimal("0.1")
+    assert basis_mismatched == "outcome_evidence_weighted_regime_mismatched"
+
+
+def test_strategy_weight_regime_adjustment_never_exceeds_maximum_clamp() -> None:
+    proposal = _proposal(slug="ma_crossover", action="BUY", outcome_evidence=_outcome(50, Decimal("100"), regime_match=True))
+    weight, _ = _strategy_weight(proposal, config=_config(min_outcome_sample_size=20))
+    assert weight == Decimal("1.5")
+
+
+def test_strategy_weight_regime_adjustment_never_drops_below_minimum_clamp() -> None:
+    proposal = _proposal(slug="ma_crossover", action="SELL", outcome_evidence=_outcome(50, Decimal("0"), regime_match=False))
+    weight, _ = _strategy_weight(proposal, config=_config(min_outcome_sample_size=20))
+    assert weight == Decimal("0.5")
+
+
+def test_strategy_weight_regime_match_never_applies_below_equal_weight_default() -> None:
+    # Sample size below the minimum: regime_match is set on the evidence, but
+    # correctness-based weighting itself never kicks in, so the regime nudge
+    # (which only ever applies on top of it) must not either.
+    proposal = _proposal(slug="ma_crossover", action="BUY", outcome_evidence=_outcome(5, Decimal("90"), regime_match=True))
+    weight, evidence_basis = _strategy_weight(proposal, config=_config(min_outcome_sample_size=20))
+    assert weight == Decimal("1")
+    assert evidence_basis == "equal_weight_default"
+
+
+def test_contribution_record_carries_regime_match() -> None:
+    proposals = [
+        _proposal(slug="ma_crossover", action="BUY", outcome_evidence=_outcome(50, Decimal("60"), regime_match=True)),
+        _proposal(slug="momentum", action="BUY", outcome_evidence=_outcome(50, Decimal("60"), regime_match=False)),
+        _proposal(slug="breakout", action="BUY"),
+    ]
+    result = aggregate_strategy_proposals(proposals=proposals, position_open=False, now=NOW, config=_config())
+    by_slug = {item.strategy_slug: item for item in result.contributions}
+    assert by_slug["ma_crossover"].regime_match is True
+    assert by_slug["momentum"].regime_match is False
+    assert by_slug["breakout"].regime_match is None
+
+
+def test_regime_evidence_can_resolve_a_near_miss_supermajority() -> None:
+    """A moderate, realistic 65%/35% correctness split alone lands just short
+    of the 60% supermajority threshold (0.575) -- HOLD. The regime-scoped
+    nudge is deliberately too small to manufacture a BUY out of nothing (see
+    test_strategy_weight_regime_match_nudges_weight_up: +/-0.1 against a 0.5
+    swing range), but is exactly enough to carry an already-near-miss
+    agreement the rest of the way (0.625) once the current regime confirms
+    the buy side's evidence and contradicts the sell side's."""
+    buy_evidence = _outcome(50, Decimal("65"))
+    sell_evidence = _outcome(50, Decimal("35"))
+
+    baseline_proposals = [
+        _proposal(slug="buy1", action="BUY", outcome_evidence=buy_evidence),
+        _proposal(slug="buy2", action="BUY", outcome_evidence=buy_evidence),
+        _proposal(slug="buy3", action="BUY", outcome_evidence=buy_evidence),
+        _proposal(slug="sell1", action="SELL", outcome_evidence=sell_evidence),
+        _proposal(slug="sell2", action="SELL", outcome_evidence=sell_evidence),
+        _proposal(slug="sell3", action="SELL", outcome_evidence=sell_evidence),
+    ]
+    baseline_result = aggregate_strategy_proposals(proposals=baseline_proposals, position_open=True, now=NOW, config=_config())
+    assert baseline_result.final_action == "HOLD"
+    assert baseline_result.weighted_buy_score / (baseline_result.weighted_buy_score + baseline_result.weighted_sell_score) < Decimal("0.60")
+
+    buy_evidence_matched = _outcome(50, Decimal("65"), regime_match=True)
+    sell_evidence_mismatched = _outcome(50, Decimal("35"), regime_match=False)
+    regime_weighted_proposals = [
+        _proposal(slug="buy1", action="BUY", outcome_evidence=buy_evidence_matched),
+        _proposal(slug="buy2", action="BUY", outcome_evidence=buy_evidence_matched),
+        _proposal(slug="buy3", action="BUY", outcome_evidence=buy_evidence_matched),
+        _proposal(slug="sell1", action="SELL", outcome_evidence=sell_evidence_mismatched),
+        _proposal(slug="sell2", action="SELL", outcome_evidence=sell_evidence_mismatched),
+        _proposal(slug="sell3", action="SELL", outcome_evidence=sell_evidence_mismatched),
+    ]
+    regime_weighted_result = aggregate_strategy_proposals(
+        proposals=regime_weighted_proposals, position_open=True, now=NOW, config=_config()
+    )
+    assert regime_weighted_result.final_action == "BUY"

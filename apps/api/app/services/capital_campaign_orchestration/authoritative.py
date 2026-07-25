@@ -597,6 +597,23 @@ async def _load_latest_roster_proposal_group(
     return run, proposals, None
 
 
+def _resolve_regime_match(*, current_regime_trend: str | None, best_regime: str | None, worst_regime: str | None) -> bool | None:
+    """True/False only when there is real, sufficiently-sampled regime-scoped
+    evidence on BOTH sides of the comparison: a current-regime classification
+    (from this cycle's own roster run, via classify_regime_labels) and a
+    strategy's own best/worst historical regime (from fetch_strategy_scorecards,
+    itself gated on regime_min_evidence_required). Any missing side leaves
+    this None -- fail-closed, matching every other evidence gate in this
+    module; never inferred or defaulted to a guess."""
+    if current_regime_trend is None:
+        return None
+    if best_regime is not None and current_regime_trend == best_regime:
+        return True
+    if worst_regime is not None and current_regime_trend == worst_regime:
+        return False
+    return None
+
+
 def _resolve_scorecard_summary(*, scorecard_by_slug: dict[str, Any], dominant_contributor_identity: str | None) -> Any | None:
     # The aggregate's reported strategy_identity is always the canonical
     # AGGREGATE_STRATEGY_IDENTITY (never a real roster slug -- see item 1 of
@@ -625,6 +642,7 @@ def _build_aggregate_evidence_dict(
     deterministic_explanation: list[str],
     strategy_contributions: list[dict[str, Any]],
     scorecard_by_slug: dict[str, Any],
+    current_regime_trend: str | None = None,
 ) -> dict[str, Any]:
     scorecard_summary = _resolve_scorecard_summary(scorecard_by_slug=scorecard_by_slug, dominant_contributor_identity=dominant_contributor_identity)
     score = None
@@ -682,6 +700,7 @@ def _build_aggregate_evidence_dict(
         "action": final_action,
         "score": score,
         "confidence": None,
+        "current_regime_trend": current_regime_trend,
         "sample_size": scorecard_summary.aggregate.total_evaluated if scorecard_summary is not None else 0,
         "profitable_after_fees_performance": None
         if action_scoped_profitability is None
@@ -753,6 +772,7 @@ def _build_aggregate_evidence_dict(
                     "outcome_sample_size": item.get("outcome_sample_size") if isinstance(item, dict) else item.outcome_sample_size,
                     "outcome_correctness_pct": item.get("outcome_correctness_pct") if isinstance(item, dict) else item.outcome_correctness_pct,
                     "equal_weight_fallback": item.get("equal_weight_fallback") if isinstance(item, dict) else item.equal_weight_fallback,
+                    "regime_match": item.get("regime_match") if isinstance(item, dict) else item.regime_match,
                 }
                 for item in strategy_contributions
             ],
@@ -956,6 +976,14 @@ async def load_strategy_aggregate_evidence(
     weighted_hold_score = Decimal(str(aggregate_row.weighted_hold_score))
     thresholds_applied = aggregate_row.thresholds_applied
     deterministic_explanation = aggregate_row.deterministic_explanation
+    # Reconstructed from the persisted DecisionRecord rather than recomputed
+    # from candles, so a replay of this exact scope reproduces the same
+    # regime_match evidence the original computation produced -- never a
+    # fresh, potentially different classification of "now".
+    persisted_market_regime_state = (
+        decision_record.market_regime.get("state") if isinstance(decision_record.market_regime, dict) else None
+    )
+    current_regime_trend = persisted_market_regime_state if persisted_market_regime_state in ("TRENDING", "RANGING") else None
     decision_record_snapshot = SimpleNamespace(
         decision_id=decision_record.decision_id,
         trade_accepted=decision_record.trade_accepted,
@@ -1026,6 +1054,7 @@ async def load_strategy_aggregate_evidence(
         deterministic_explanation=deterministic_explanation,
         strategy_contributions=contributions,
         scorecard_by_slug=scorecard_by_slug,
+        current_regime_trend=current_regime_trend,
     )
     return evidence, None
 
@@ -1078,6 +1107,12 @@ async def resolve_or_create_strategy_aggregate_evidence(
             selection_reason or "no_roster_proposals", asset_id, product_id, interval,
         )
         return None, selection_reason or "strategy_evidence_unavailable"
+
+    # Snapshotted immediately (same MissingGreenlet-avoidance reasoning as
+    # proposal_snapshots below): the only field this function reads off `run`
+    # itself, read once before the scorecard fetch's session-recovery risk
+    # window rather than touched again afterward.
+    current_regime_trend = run.current_regime_trend
 
     # Snapshot every field this function needs from `proposals` into plain
     # values now, before the scorecard fetch below. If that fetch times out
@@ -1183,9 +1218,11 @@ async def resolve_or_create_strategy_aggregate_evidence(
                 sample_size=scorecard.aggregate.total_evaluated,
                 overall_correct_pct=scorecard.aggregate.overall_correct_pct,
                 average_fee_adjusted_return_pct=scorecard.aggregate.average_fee_adjusted_return_pct,
-                # Reliable current-regime evidence is not yet available at this
-                # integration point -- do not fabricate a match/mismatch signal.
-                regime_match=None,
+                regime_match=_resolve_regime_match(
+                    current_regime_trend=current_regime_trend,
+                    best_regime=scorecard.best_regime,
+                    worst_regime=scorecard.worst_regime,
+                ),
             )
         failure_streak = await _recent_strategy_failure_streak(
             db=db,
@@ -1278,6 +1315,7 @@ async def resolve_or_create_strategy_aggregate_evidence(
                 position_state=position_state,
                 result=result,
                 actor=actor,
+                current_regime_trend=current_regime_trend,
             )
     except IntegrityError:
         # A competing worker may have won the exact idempotency-key race. The
@@ -1328,6 +1366,7 @@ async def resolve_or_create_strategy_aggregate_evidence(
         deterministic_explanation=list(result.deterministic_explanation),
         strategy_contributions=list(result.contributions),
         scorecard_by_slug=scorecard_by_slug,
+        current_regime_trend=current_regime_trend,
     )
     return evidence, None
 
@@ -1395,6 +1434,7 @@ async def _persist_strategy_aggregate_decision(
     position_state: str,
     result: AggregationResult,
     actor: str,
+    current_regime_trend: str | None = None,
 ) -> tuple[StrategyAggregateDecision, DecisionRecord]:
     now = datetime.now(timezone.utc)
     if result.primary_strategy_identity == AGGREGATE_STRATEGY_IDENTITY:
@@ -1413,6 +1453,7 @@ async def _persist_strategy_aggregate_decision(
             "outcome_sample_size": item.outcome_sample_size,
             "outcome_correctness_pct": item.outcome_correctness_pct,
             "equal_weight_fallback": item.equal_weight_fallback,
+            "regime_match": item.regime_match,
             "weighted_buy": item.weighted_buy,
             "weighted_sell": item.weighted_sell,
             "weighted_hold": item.weighted_hold,
@@ -1449,7 +1490,10 @@ async def _persist_strategy_aggregate_decision(
         timestamp=now,
         asset={"product_id": product_id, "provider": provider},
         timeframe=interval,
-        market_regime={"state": "unknown", "source": "strategy_decision_aggregator"},
+        market_regime={
+            "state": current_regime_trend or "unknown",
+            "source": "strategy_decision_aggregator" if current_regime_trend is None else "classify_regime_labels",
+        },
         indicators={},
         generated_signals=[
             {

@@ -21,6 +21,10 @@ class StrategyRosterRun(Base):
         CheckConstraint("strategies_requested_count >= 0", name="ck_strategy_roster_runs_req_count"),
         CheckConstraint("strategies_completed_count >= 0", name="ck_strategy_roster_runs_done_count"),
         CheckConstraint("strategies_failed_count >= 0", name="ck_strategy_roster_runs_fail_count"),
+        CheckConstraint(
+            "current_regime_trend IS NULL OR current_regime_trend IN ('TRENDING','RANGING')",
+            name="ck_strategy_roster_runs_current_regime_trend",
+        ),
         Index("ix_strategy_roster_runs_candle", "asset_id", "interval", "candle_close_time"),
         Index("ix_strategy_roster_runs_created", "created_at"),
     )
@@ -34,6 +38,18 @@ class StrategyRosterRun(Base):
     candle_open_time: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
     candle_close_time: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
     trigger: Mapped[str] = mapped_column(Text, nullable=False)
+    # Deterministic, backward-looking market-regime classification for this
+    # roster run's candle window, computed once (via
+    # app.services.strategy_outcomes.service.classify_regime_labels -- the
+    # same function that labels regime_trend on every persisted
+    # StrategyRosterProposalOutcome row, so this and historical regime
+    # evidence are always measured on an identical scale) from the identical
+    # candle snapshot the 7 voting strategies evaluated. NULL when there was
+    # insufficient history to classify (never fabricated). See
+    # app.services.strategy_roster.decision_aggregator.StrategyOutcomeSummary.regime_match
+    # for how this is later compared against each strategy's own historical
+    # best/worst regime to nudge its ensemble weight.
+    current_regime_trend: Mapped[str | None] = mapped_column(Text, nullable=True)
     execution_mode: Mapped[str] = mapped_column(Text, nullable=False, server_default=text("'SHADOW'"))
     live_submission_allowed: Mapped[bool] = mapped_column(Boolean, nullable=False, server_default=text("false"))
     scheduled_cycle_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), ForeignKey("autonomous_cycle_runs.cycle_id", ondelete="SET NULL"), nullable=True)

@@ -19,6 +19,18 @@ _OUTCOME_WEIGHT_MAX = Decimal("1.5")
 _OUTCOME_WEIGHT_BASELINE_CORRECT_PCT = Decimal("50")
 _OUTCOME_WEIGHT_SLOPE_PER_PCT = (_OUTCOME_WEIGHT_MAX - _OUTCOME_WEIGHT_NEUTRAL) / (Decimal("100") - _OUTCOME_WEIGHT_BASELINE_CORRECT_PCT)
 
+# Secondary, smaller nudge applied on top of the correctness-based weight
+# above, only once a strategy already qualifies for outcome-evidence
+# weighting (never applied to an equal-weight-default strategy). Deliberately
+# much smaller than the correctness-based swing (which can move a full 0.5
+# either way) so a strategy's overall track record always dominates its
+# regime-specific one; regime evidence only breaks ties/nudges among
+# strategies whose overall correctness is already known. Still re-clamped to
+# the same [_OUTCOME_WEIGHT_MIN, _OUTCOME_WEIGHT_MAX] band as the base
+# weight, so this can never let a single strategy dominate the ensemble
+# beyond what was already possible before regime evidence existed.
+_REGIME_WEIGHT_ADJUSTMENT = Decimal("0.1")
+
 
 def resolve_action_position_transition(*, action: str, position_state: str, compounding_allowed: bool = False) -> str:
     """Return the only governed campaign transition for a signal/position pair.
@@ -77,6 +89,12 @@ class StrategyOutcomeSummary:
     sample_size: int
     overall_correct_pct: Decimal | None
     average_fee_adjusted_return_pct: Decimal | None
+    # True when the CURRENT market regime (candle-window classification made
+    # at aggregation time) equals this strategy's own historically
+    # best-performing regime; False when it equals the worst-performing one;
+    # None when there isn't yet enough regime-scoped evidence to say either
+    # way (fewer than the configured minimum evaluations in that regime) --
+    # never fabricated, matching every other None-means-unknown field here.
     regime_match: bool | None = None
 
 
@@ -119,6 +137,10 @@ class StrategyContributionRecord:
     outcome_sample_size: int | None = None
     outcome_correctness_pct: str | None = None
     equal_weight_fallback: bool = False
+    # Mirrors StrategyOutcomeSummary.regime_match for this contribution --
+    # None whenever the base weight itself was equal_weight_default (regime
+    # evidence never applies before overall correctness evidence does).
+    regime_match: bool | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -198,8 +220,18 @@ def _strategy_weight(proposal: StrategyProposalInput, *, config: AggregationConf
         return Decimal("1"), "equal_weight_default"
 
     offset = (evidence.overall_correct_pct - _OUTCOME_WEIGHT_BASELINE_CORRECT_PCT) * _OUTCOME_WEIGHT_SLOPE_PER_PCT
-    weight = max(_OUTCOME_WEIGHT_MIN, min(_OUTCOME_WEIGHT_MAX, _OUTCOME_WEIGHT_NEUTRAL + offset))
-    return weight, "outcome_evidence_weighted"
+    weight = _OUTCOME_WEIGHT_NEUTRAL + offset
+    evidence_basis = "outcome_evidence_weighted"
+
+    if evidence.regime_match is True:
+        weight += _REGIME_WEIGHT_ADJUSTMENT
+        evidence_basis = "outcome_evidence_weighted_regime_matched"
+    elif evidence.regime_match is False:
+        weight -= _REGIME_WEIGHT_ADJUSTMENT
+        evidence_basis = "outcome_evidence_weighted_regime_mismatched"
+
+    weight = max(_OUTCOME_WEIGHT_MIN, min(_OUTCOME_WEIGHT_MAX, weight))
+    return weight, evidence_basis
 
 
 def _evaluate_eligibility(
@@ -342,6 +374,7 @@ def aggregate_strategy_proposals(
                     else str(proposal.outcome_evidence.overall_correct_pct)
                 ),
                 equal_weight_fallback=evidence_basis == "equal_weight_default",
+                regime_match=None if proposal.outcome_evidence is None else proposal.outcome_evidence.regime_match,
             )
         )
 

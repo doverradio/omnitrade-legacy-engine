@@ -18,12 +18,41 @@ from app.models.strategy_roster_run import StrategyRosterRun
 from app.services.strategies.base import StrategyContext
 from app.services.strategies.identity import build_strategy_identity
 from app.services.strategies.registry import StrategyLookupError, strategy_registry
+from app.services.strategy_outcomes.service import classify_regime_labels
 from app.services.strategy_roster.contracts import StrategyRosterRequest, StrategyRosterRunResult
 from app.services.strategy_roster.registry import ENABLED_PHASE1_ROSTER, minimum_history_required
 
 logger = logging.getLogger(__name__)
 
 _STALE_CANDLE_MAX_MINUTES = 90
+
+# Below this many trailing closed candles, a trend/range classification would
+# be dominated by noise (e.g. a 2-candle window always looks "trending").
+# Matches the largest default lookback among the roster's own strategies
+# (ma_crossover's slow_period), which is the closest existing precedent this
+# codebase has for "how much history is enough to call a regime."
+_MINIMUM_REGIME_CLASSIFICATION_CANDLES = 20
+
+
+def _classify_current_regime_trend(*, candles: list[Candle]) -> str | None:
+    """Deterministic, backward-looking regime label for the roster's own
+    candle snapshot -- the only window available before this decision's
+    outcome exists. Reuses classify_regime_labels, the exact same function
+    that labels regime_trend on every persisted StrategyRosterProposalOutcome
+    row, so "the current regime" and "the regime a strategy's historical
+    evidence was scored in" are always measured on an identical scale.
+    None (never fabricated) when there isn't enough history to classify."""
+    if len(candles) < _MINIMUM_REGIME_CLASSIFICATION_CANDLES:
+        return None
+    closes = [Decimal(str(row.close)) for row in candles]
+    highs = [Decimal(str(row.high)) for row in candles]
+    lows = [Decimal(str(row.low)) for row in candles]
+    try:
+        trend, _volatility, _range = classify_regime_labels(closes=closes, highs=highs, lows=lows)
+    except Exception:
+        logger.warning("current_regime_classification_failed candle_count=%s", len(candles), exc_info=True)
+        return None
+    return trend
 
 
 def _hash_payload(payload: dict[str, object]) -> str:
@@ -158,6 +187,11 @@ async def run_strategy_roster_for_candle(
     latest_close_utc = _utc(request.candle_close_time)
     is_stale = (datetime.now(timezone.utc) - latest_close_utc).total_seconds() > (_STALE_CANDLE_MAX_MINUTES * 60)
     is_incomplete = latest_close_utc > datetime.now(timezone.utc)
+
+    current_regime_trend = (
+        None if is_stale or is_incomplete else _classify_current_regime_trend(candles=candles)
+    )
+    run.current_regime_trend = current_regime_trend
 
     completed: list[str] = []
     failed: list[dict[str, str]] = []
