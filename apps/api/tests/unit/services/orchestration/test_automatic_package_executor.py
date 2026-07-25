@@ -133,6 +133,46 @@ async def test_executor_activated_replay_creates_no_new_evidence(monkeypatch: py
 
 
 @pytest.mark.asyncio
+async def test_executor_activated_replay_with_expired_mandate_authorization_does_not_report_activated(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Reproduces the production defect: an ACTIVATED package whose mandate
+    authorization has since expired (package.authorization_expires_at <=
+    now, raised by _validate_canonical_package_authority as
+    PermissionError("mandate package authorization expired")) must be
+    reported as NOT_ACTIVATED with failed_closed=True, so the caller
+    (continuous_pipeline_worker._attempt_automatic_ready_package_creation)
+    never proceeds to claim_activated_buy_package/execute against it.
+
+    Before the fix, activation_state was derived from the package's
+    persisted package_state alone ("ACTIVATED" in the DB, unchanged by this
+    failed re-validation), independent of failed_closed -- reproducing the
+    exact observed production sequence: activation_result=ACTIVATED,
+    reason_code=mandate ("mandate package authorization expired"), then
+    downstream reason_code=unexpected_executor_failure with
+    provider_submission_called=false, because the worker proceeded to
+    claim/execute against a package it had just determined was no longer
+    validly authorized.
+    """
+    _enable(monkeypatch)
+    package = _package("ACTIVATED")
+
+    async def _validate(**kwargs):
+        raise PermissionError("mandate package authorization expired")
+
+    monkeypatch.setattr(executor, "_validate_canonical_package_authority", _validate)
+    outcome = await executor.execute_automatic_ready_package_through_activation(db=_Db([package]), request=_request(package))
+
+    assert outcome.failed_closed is True
+    assert outcome.final_reason_code == "mandate package authorization expired"
+    assert outcome.activation_state == "NOT_ACTIVATED"
+    # The package's own persisted state is untouched by this failed
+    # re-validation -- the defect was in what the outcome REPORTED, not in
+    # an incorrect state mutation.
+    assert package.package_state == "ACTIVATED"
+
+
+@pytest.mark.asyncio
 async def test_executor_resolves_existing_package_without_package_id(monkeypatch: pytest.MonkeyPatch) -> None:
     _enable(monkeypatch)
     package = _package("DRY_RUN_PASSED")

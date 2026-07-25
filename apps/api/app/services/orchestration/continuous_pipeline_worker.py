@@ -1166,7 +1166,15 @@ async def _attempt_automatic_ready_package_creation(
                     progression.activation_state, progression.replayed, progression.final_reason_code,
                     progression.failed_closed,
                 )
-                if progression.activation_state == "ACTIVATED" and progression.package_id is not None:
+                # Defense in depth alongside automatic_package_executor._outcome's
+                # own activation_state/failed_closed consistency guarantee:
+                # never act on an outcome the executor itself flagged as
+                # failed_closed, regardless of what activation_state reports.
+                if (
+                    progression.activation_state == "ACTIVATED"
+                    and not progression.failed_closed
+                    and progression.package_id is not None
+                ):
                     claim_outcome = await claim_activated_buy_package(
                         db=db,
                         package_id=progression.package_id,

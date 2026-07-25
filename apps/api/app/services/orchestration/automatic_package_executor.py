@@ -72,7 +72,19 @@ def _outcome(
         mandate_id=None if package is None else package.mandate_id,
         authorization_state="AUTHORIZED" if state in {"AUTHORIZED", "DRY_RUN_PASSED", "ACTIVATED"} else state,
         dry_run_state="DRY_RUN_PASSED" if state in {"DRY_RUN_PASSED", "ACTIVATED"} else "NOT_RUN",
-        activation_state="ACTIVATED" if state == "ACTIVATED" else "NOT_ACTIVATED",
+        # Deliberately also gated on `not failed_closed`, not package_state
+        # alone: the ACTIVATED-replay branch re-validates mandate authority
+        # (_validate_canonical_package_authority) on every call, and that
+        # re-validation can fail (e.g. authorization_expires_at has since
+        # elapsed) for a package whose PERSISTED state is still "ACTIVATED"
+        # from an earlier, genuinely-successful activation. Reporting
+        # activation_state="ACTIVATED" from persisted state alone in that
+        # case told the caller (continuous_pipeline_worker) it was safe to
+        # proceed to claim/execute despite failed_closed=True -- the
+        # confirmed root cause of the production sequence
+        # activation_result=ACTIVATED -> reason_code=mandate ("mandate
+        # package authorization expired") -> reason_code=unexpected_executor_failure.
+        activation_state="ACTIVATED" if (state == "ACTIVATED" and not failed_closed) else "NOT_ACTIVATED",
         authority_source=None if package is None else package.authorization_source,
         replayed=replayed,
         final_reason_code=reason,
