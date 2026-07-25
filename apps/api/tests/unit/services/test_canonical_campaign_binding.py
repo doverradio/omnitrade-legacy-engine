@@ -1781,10 +1781,24 @@ async def test_legacy_transition_concurrent_style_retries_resolve_to_single_audi
     assert sum(1 for item in db.added if getattr(item, "action", "") == "capital_campaign.transition_to_successor") == 1
 
 
-def _status_definition(*, campaign_id: UUID, version: int, status: str = "DRAFT") -> SimpleNamespace:
+def _mock_feasible_instrument_binding(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Every instrument in allowed_instruments independently passes the new
+    per-instrument binding checks (worker roster / Asset Registry / min
+    order notional / candle history) -- used by tests whose focus is
+    idempotency/rollback/read-only behavior, not instrument feasibility
+    itself (that is covered by dedicated tests below)."""
+    monkeypatch.setattr(
+        binding, "_load_asset", _async_return(SimpleNamespace(id=uuid4(), min_order_notional=Decimal("1"))),
+    )
+    monkeypatch.setattr(binding, "_count_recent_candles", _async_return(100))
+
+
+def _status_definition(
+    *, campaign_id: UUID, version: int, status: str = "DRAFT", allowed_instruments: list[str] | None = None,
+) -> SimpleNamespace:
     item = _definition(campaign_id=campaign_id, version=version)
     item.status = status
-    item.allowed_instruments = ["BTC-USD"]
+    item.allowed_instruments = list(allowed_instruments) if allowed_instruments is not None else ["BTC-USD"]
     item.allowed_venues = ["kraken_spot"]
     item.maximum_open_positions = 1
     item.minimum_position_size = Decimal("5")
@@ -1864,6 +1878,7 @@ async def test_canonical_status_transition_execute_clean_draft_to_ready_succeeds
     monkeypatch.setattr(binding, "_count_active_proving_activations", _async_return(0))
     monkeypatch.setattr(binding, "_count_package_conflicts", _async_return(0))
     monkeypatch.setattr(binding, "_find_status_transition_audit_by_idempotency_key_for_update", _async_return(None))
+    _mock_feasible_instrument_binding(monkeypatch)
 
     async def _scalar(statement):
         entity = statement.column_descriptions[0].get("entity")
@@ -1910,6 +1925,7 @@ async def test_canonical_status_transition_readiness_is_read_only(monkeypatch: p
     monkeypatch.setattr(binding, "_count_open_btc_positions_for_campaign", _async_return(0))
     monkeypatch.setattr(binding, "_count_active_proving_activations", _async_return(0))
     monkeypatch.setattr(binding, "_count_package_conflicts", _async_return(0))
+    _mock_feasible_instrument_binding(monkeypatch)
 
     async def _scalar(statement):
         entity = statement.column_descriptions[0].get("entity")
@@ -2081,6 +2097,7 @@ async def test_canonical_status_transition_execute_audit_failure_rolls_back_stat
     monkeypatch.setattr(binding, "_count_active_proving_activations", _async_return(0))
     monkeypatch.setattr(binding, "_count_package_conflicts", _async_return(0))
     monkeypatch.setattr(binding, "_find_status_transition_audit_by_idempotency_key_for_update", _async_return(None))
+    _mock_feasible_instrument_binding(monkeypatch)
 
     async def _scalar(statement):
         entity = statement.column_descriptions[0].get("entity")
@@ -2267,3 +2284,165 @@ async def test_canonical_status_transition_post_audit_reports_eligible(monkeypat
     assert payload["audit"]["total"] == 1
     assert payload["unattended_eligibility"]["eligible"] is True
     assert payload["unattended_eligibility"]["appears_in_candidate_list"] is True
+
+
+# --- Multi-instrument canonical binding (ADR-generalized btc_usd_allowed check) ---
+
+
+async def _run_status_readiness(
+    *,
+    monkeypatch: pytest.MonkeyPatch,
+    allowed_instruments: list[str],
+    product_id: str = "BTC-USD",
+) -> binding.CanonicalCampaignStatusTransitionReadinessResult:
+    campaign_id = UUID("e9a9e8e9-9574-498d-b49e-f011218c7f2b")
+    paper_account_id = UUID("905a408c-7d8e-4fc7-ad3b-9ff637005d73")
+    profile_id = UUID("9da09ae9-475e-41e8-b2c2-717ba5acfa3d")
+
+    db = _FakeDb()
+    definition = _status_definition(campaign_id=campaign_id, version=1, allowed_instruments=allowed_instruments)
+    runtime = _status_runtime(campaign_id=campaign_id, runtime_campaign_id=2, paper_account_id=paper_account_id)
+
+    monkeypatch.setattr(binding, "_load_definition", _async_return(definition))
+    monkeypatch.setattr(binding, "_load_live_profile", _async_return(_profile(profile_id, paper_account_id)))
+    monkeypatch.setattr(binding, "_load_connection", _async_return(_status_connection()))
+    monkeypatch.setattr(binding, "_latest_definition_version", _async_return(1))
+    monkeypatch.setattr(binding, "_count_open_live_orders_for_campaign", _async_return(0))
+    monkeypatch.setattr(binding, "_count_unresolved_reconciliation_events_for_campaign", _async_return(0))
+    monkeypatch.setattr(binding, "_count_open_btc_positions_for_campaign", _async_return(0))
+    monkeypatch.setattr(binding, "_count_active_proving_activations", _async_return(0))
+    monkeypatch.setattr(binding, "_count_package_conflicts", _async_return(0))
+
+    async def _scalar(statement):
+        entity = statement.column_descriptions[0].get("entity")
+        if entity is not None and entity.__name__ == "CapitalCampaign":
+            return runtime
+        return None
+
+    monkeypatch.setattr(db, "scalar", _scalar)
+
+    return await binding.inspect_canonical_campaign_status_transition(
+        db=db,
+        request=binding.CanonicalCampaignStatusTransitionRequest(
+            campaign_id=campaign_id,
+            campaign_version=1,
+            runtime_campaign_id=2,
+            expected_current_status="DRAFT",
+            target_status="READY",
+            paper_account_id=paper_account_id,
+            live_trading_profile_id=profile_id,
+            provider="kraken_spot",
+            environment="production",
+            product_id=product_id,
+            actor="operator:human",
+            idempotency_key=None,
+            confirm=False,
+        ),
+    )
+
+
+@pytest.mark.asyncio
+async def test_btc_only_binding_remains_valid_unchanged(monkeypatch: pytest.MonkeyPatch) -> None:
+    _mock_feasible_instrument_binding(monkeypatch)
+    readiness = await _run_status_readiness(monkeypatch=monkeypatch, allowed_instruments=["BTC-USD"])
+    assert readiness.ready is True
+    assert "requested_product_in_allowed_instruments" not in readiness.blockers
+
+
+@pytest.mark.asyncio
+async def test_btc_plus_eth_binding_succeeds_only_when_eth_independently_authorized(monkeypatch: pytest.MonkeyPatch) -> None:
+    _mock_feasible_instrument_binding(monkeypatch)
+    monkeypatch.setattr(
+        binding.asset_roster, "resolve_autonomous_cycle_products", lambda *, settings: ["BTC-USD", "ETH-USD"],
+    )
+    readiness = await _run_status_readiness(monkeypatch=monkeypatch, allowed_instruments=["BTC-USD", "ETH-USD"])
+    assert readiness.ready is True
+
+
+@pytest.mark.asyncio
+async def test_empty_allowed_instruments_is_rejected_no_wildcard(monkeypatch: pytest.MonkeyPatch) -> None:
+    _mock_feasible_instrument_binding(monkeypatch)
+    readiness = await _run_status_readiness(monkeypatch=monkeypatch, allowed_instruments=[])
+    assert readiness.ready is False
+    assert "allowed_instruments_explicit_and_non_empty" in readiness.blockers
+
+
+@pytest.mark.asyncio
+async def test_requested_product_absent_from_allowed_instruments_fails_closed(monkeypatch: pytest.MonkeyPatch) -> None:
+    _mock_feasible_instrument_binding(monkeypatch)
+    readiness = await _run_status_readiness(
+        monkeypatch=monkeypatch, allowed_instruments=["BTC-USD"], product_id="ETH-USD",
+    )
+    assert readiness.ready is False
+    assert "requested_product_in_allowed_instruments" in readiness.blockers
+
+
+@pytest.mark.asyncio
+async def test_instrument_outside_worker_roster_fails_closed(monkeypatch: pytest.MonkeyPatch) -> None:
+    # Default settings: worker roster is BTC-USD only (AUTONOMOUS_CYCLE_ADDITIONAL_PRODUCTS unset).
+    _mock_feasible_instrument_binding(monkeypatch)
+    readiness = await _run_status_readiness(monkeypatch=monkeypatch, allowed_instruments=["BTC-USD", "ETH-USD"])
+    assert readiness.ready is False
+    assert "instrument_supported_by_worker_roster" in readiness.blockers
+
+
+@pytest.mark.asyncio
+async def test_instrument_missing_asset_registry_entry_fails_closed(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(binding.asset_roster, "resolve_autonomous_cycle_products", lambda *, settings: ["BTC-USD", "ETH-USD"])
+    monkeypatch.setattr(binding, "_load_asset", _async_return(None))
+    readiness = await _run_status_readiness(monkeypatch=monkeypatch, allowed_instruments=["BTC-USD", "ETH-USD"])
+    assert readiness.ready is False
+    assert "instrument_has_active_asset_registry_entry" in readiness.blockers
+
+
+@pytest.mark.asyncio
+async def test_instrument_below_venue_minimum_fails_closed(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(binding.asset_roster, "resolve_autonomous_cycle_products", lambda *, settings: ["BTC-USD", "ETH-USD"])
+    monkeypatch.setattr(
+        binding, "_load_asset", _async_return(SimpleNamespace(id=uuid4(), min_order_notional=Decimal("10"))),
+    )
+    monkeypatch.setattr(binding, "_count_recent_candles", _async_return(100))
+    readiness = await _run_status_readiness(monkeypatch=monkeypatch, allowed_instruments=["BTC-USD", "ETH-USD"])
+    assert readiness.ready is False
+    assert "instrument_minimum_order_feasible_at_proving_cap" in readiness.blockers
+
+
+@pytest.mark.asyncio
+async def test_instrument_unknown_venue_minimum_fails_closed(monkeypatch: pytest.MonkeyPatch) -> None:
+    """min_order_notional is None (never fetched/verified) -- must fail
+    closed, never assume a missing minimum means zero/feasible."""
+    monkeypatch.setattr(binding.asset_roster, "resolve_autonomous_cycle_products", lambda *, settings: ["BTC-USD", "ETH-USD"])
+    monkeypatch.setattr(
+        binding, "_load_asset", _async_return(SimpleNamespace(id=uuid4(), min_order_notional=None)),
+    )
+    monkeypatch.setattr(binding, "_count_recent_candles", _async_return(100))
+    readiness = await _run_status_readiness(monkeypatch=monkeypatch, allowed_instruments=["BTC-USD", "ETH-USD"])
+    assert readiness.ready is False
+    assert "instrument_minimum_order_feasible_at_proving_cap" in readiness.blockers
+
+
+@pytest.mark.asyncio
+async def test_instrument_insufficient_candle_history_fails_closed(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(binding.asset_roster, "resolve_autonomous_cycle_products", lambda *, settings: ["BTC-USD", "ETH-USD"])
+    monkeypatch.setattr(
+        binding, "_load_asset", _async_return(SimpleNamespace(id=uuid4(), min_order_notional=Decimal("1"))),
+    )
+    monkeypatch.setattr(binding, "_count_recent_candles", _async_return(3))
+    readiness = await _run_status_readiness(monkeypatch=monkeypatch, allowed_instruments=["BTC-USD", "ETH-USD"])
+    assert readiness.ready is False
+    assert "instrument_has_sufficient_candle_history" in readiness.blockers
+
+
+@pytest.mark.asyncio
+async def test_stale_eth_asset_missing_still_blocks_min_order_and_candle_checks_together(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A missing Asset row fails closed on every downstream check that
+    depends on it, not just the registry-existence check itself."""
+    monkeypatch.setattr(binding.asset_roster, "resolve_autonomous_cycle_products", lambda *, settings: ["BTC-USD", "ETH-USD"])
+    monkeypatch.setattr(binding, "_load_asset", _async_return(None))
+    readiness = await _run_status_readiness(monkeypatch=monkeypatch, allowed_instruments=["BTC-USD", "ETH-USD"])
+    assert readiness.ready is False
+    assert {
+        "instrument_has_active_asset_registry_entry",
+        "instrument_minimum_order_feasible_at_proving_cap",
+        "instrument_has_sufficient_candle_history",
+    }.issubset(set(readiness.blockers))

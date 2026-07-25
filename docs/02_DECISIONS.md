@@ -408,10 +408,71 @@ suite passing unchanged.
 Future Impact
 
 Future asset additions to the live roster should extend
-_ADDITIONAL_PRODUCT_ASSET_SYMBOLS (continuous_pipeline_worker.py) and the
-campaign/mandate scope together, deliberately, one asset at a time --
-never by broadening AUTONOMOUS_CYCLE_ADDITIONAL_PRODUCTS' parsing to
-accept unknown products by guessing their Kraken asset symbols.
+asset_roster.ADDITIONAL_PRODUCT_ASSET_SYMBOLS (moved from
+continuous_pipeline_worker.py into its own shared module in the ETH-USD
+enablement round, see below) and the campaign/mandate scope together,
+deliberately, one asset at a time -- never by broadening
+AUTONOMOUS_CYCLE_ADDITIONAL_PRODUCTS' parsing to accept unknown products
+by guessing their Kraken asset symbols.
+
+---
+
+## 2026-07
+
+### Bounded ETH-USD Enablement: Generalized Canonical Campaign Binding
+
+Decision
+
+canonical_campaign_binding.py's campaign-status-transition readiness check
+no longer hardcodes the literal string "BTC-USD" as the only instrument a
+canonical campaign may ever bind. It now validates every instrument in a
+campaign's `allowed_instruments` independently against: worker-roster
+membership (asset_roster.resolve_autonomous_cycle_products), an active
+Asset Registry entry, venue minimum-order feasibility at the proving cap,
+and sufficient recent candle history -- with an explicit, non-empty
+`allowed_instruments` set required (no wildcard authorization). The
+roster/symbol logic itself was extracted into a new shared module,
+app/services/orchestration/asset_roster.py, specifically to let
+canonical_campaign_binding.py reuse it without importing
+continuous_pipeline_worker.py (which would create an import cycle via
+app.services.autonomous_cycle).
+
+Reason
+
+The prior single-product literal check was correct for a BTC-only
+proving campaign but was never going to generalize on its own, and its
+safety intent (no instrument may bind without concrete, current evidence
+that it is authorized, supported, registered, and tradable) needed to be
+preserved exactly, not weakened, while removing the "BTC-USD" literal.
+
+Alternatives Considered
+
+Add a campaign-level `mandate_version_id` cross-check (verifying every
+campaign instrument is also present in the authorized mandate version's
+`allowed_products`) in this same round. Deferred: the current
+`CanonicalCampaignStatusTransitionRequest` dataclass carries no mandate
+reference at all; adding one would ripple into every existing caller
+(operator_cli, ~49 existing tests) under time pressure that this
+generalization did not need to accept. Recorded as a known, explicit gap
+-- not a silently dropped requirement.
+
+Consequences
+
+A BTC-only campaign continues to bind exactly as before (verified: the
+full pre-existing binding test suite, 39 tests, passes unchanged). A
+BTC+ETH campaign can now bind only when both instruments independently
+satisfy every check; ETH-USD specifically cannot bind today because no
+Asset Registry entry exists for it and it is outside the default worker
+roster -- both are separate, explicit operator actions, not automatic
+consequences of this code change.
+
+Future Impact
+
+The mandate cross-check gap noted above should be closed before any
+canonical campaign is actually granted multi-instrument authority, not
+merely before this generalization is committed -- it is a real,
+outstanding safety-completeness gap, tracked here rather than assumed
+closed.
 
 ---
 

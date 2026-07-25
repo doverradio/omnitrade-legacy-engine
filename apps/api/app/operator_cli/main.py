@@ -35,6 +35,7 @@ from app.operator_cli.service import (
     automatic_mandate_activation_proof,
     automatic_mandate_activation_readiness,
     autonomous_execution_status,
+    verify_kraken_product_readiness,
     mandate_evaluation_identity_diagnostic,
     buy_opportunity_diagnostic,
     hold_decision_diagnostic,
@@ -172,6 +173,17 @@ def _build_parser() -> argparse.ArgumentParser:
     preview.add_argument("--software-build-version", type=str, default=None)
     preview.add_argument("--forced-action", choices=["BUY", "SELL", "HOLD"], default=None)
     preview.add_argument("--json", action="store_true", dest="json_output")
+
+    verify_product = subparsers.add_parser(
+        "verify-product",
+        parents=[common],
+        help="Read-only Kraken product/venue-minimum/balance verification (never previews or submits an order)",
+        description="Verify a Kraken spot product's tradability, venue minimums, and account balance feasibility at a given proving notional. Read-only.",
+    )
+    verify_product.add_argument("--product-id", type=str, required=True)
+    verify_product.add_argument("--environment", type=str, default="production")
+    verify_product.add_argument("--proving-notional-usd", type=str, default="5")
+    verify_product.add_argument("--json", action="store_true", dest="json_output")
 
     preview_show = subparsers.add_parser(
         "preview-show",
@@ -1756,6 +1768,15 @@ async def _run_async(args: argparse.Namespace) -> tuple[int, dict[str, Any], str
         )
         text = render_json(payload) if args.json_output else render_candles_text(payload, options)
         return (0 if payload.get("ready") else 1), payload, text
+
+    if args.command == "verify-product":
+        payload = await verify_kraken_product_readiness(
+            product_id=args.product_id,
+            environment=args.environment,
+            proving_notional_usd=args.proving_notional_usd,
+        )
+        text = render_json(payload)
+        return (0 if payload.get("feasible_at_proving_notional") else 1), payload, text
 
     if args.command == "watch":
         payload = await fetch_watch_status(

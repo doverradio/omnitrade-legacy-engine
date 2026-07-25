@@ -267,6 +267,34 @@ The immediate engineering objective remains reproducing this exact
 package-progression failure and unblocking it, without modifying Risk
 Engine decision math, campaign risk limits, or strategy thresholds.
 
+✓ Bounded ETH-USD enablement preparation (2026-07-25, second round): the
+canonical campaign-binding check that previously hardcoded "BTC-USD" as
+the only allowed instrument (canonical_campaign_binding.py's
+btc_usd_allowed check) has been generalized into a genuine multi-instrument
+check -- every instrument in a campaign's allowed_instruments must
+independently pass worker-roster membership, an active Asset Registry
+entry, venue minimum-order feasibility at the proving cap, and sufficient
+candle history, with no wildcard/empty authorization permitted. A
+read-only `./operator verify-product --product-id ETH-USD` command and an
+idempotent `scripts/commission_kraken_asset.py` commissioning script were
+added, reusing the existing KrakenSpotClient and Asset Registry directly.
+
+**ETH-USD status, explicitly:**
+- Code support: ready (this round's work).
+- Live Kraken verification: **not run** -- this environment has no live
+  network access; the operator must run `verify-product` before
+  commissioning.
+- Asset Registry entry: **not created** -- `commission_kraken_asset.py`
+  has not been executed.
+- Campaign/mandate authorization: **not granted** -- `allowed_instruments`/
+  `allowed_products` remain BTC-USD only; no version was created or
+  activated.
+- Environment: `AUTONOMOUS_CYCLE_ADDITIONAL_PRODUCTS` remains unset.
+- Qualifying BUY: **none produced** -- ETH-USD has never been evaluated
+  in production.
+- Remaining blocker: every one of the above manual steps (see
+  02_DECISIONS.md, "Bounded ETH-USD Enablement", for exact commands).
+
 ✓ Bounded live multi-asset expansion foundation (2026-07-25): the
 autonomous worker (continuous_pipeline_worker.py) can now evaluate a
 configured roster of Kraken spot products (BTC-USD plus any of

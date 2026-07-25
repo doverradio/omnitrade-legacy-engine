@@ -113,6 +113,8 @@ CONSTRAINTS:
 
 **Does not affect dependency order:** Phase 1 → Phase 2 remains the critical path to First Autonomous Profit; Phase 3+ (Historical Simulation) remains fully independent of this lane.
 
+**Update (2026-07-25, second round — ETH-USD bounded enablement prep):** `canonical_campaign_binding.py`'s single-product (`"BTC-USD"`) hardcoded assertion is now generalized to a genuine multi-instrument check (worker-roster membership, Asset Registry, venue-minimum feasibility, candle history — see `02_DECISIONS.md`). Added a read-only `./operator verify-product` diagnostic and an idempotent `scripts/commission_kraken_asset.py` commissioning script. **ETH-USD is code-ready but not yet live-verified, not yet registered, and not yet authorized** — no campaign/mandate version was created or activated, and `AUTONOMOUS_CYCLE_ADDITIONAL_PRODUCTS` remains unset. See `00_PROJECT_STATE.md` for the explicit per-step status.
+
 ---
 
 ## Phase 2 — First Autonomous Profit Completion · **CRITICAL PATH**

@@ -9793,6 +9793,111 @@ async def automatic_mandate_activation_readiness(*, provider: str, environment: 
         }
 
 
+async def verify_kraken_product_readiness(*, product_id: str, environment: str = "production", proving_notional_usd: str = "5") -> dict[str, Any]:
+    """Read-only Kraken product verification. Never previews or submits an
+    order -- only KrakenSpotClient.fetch_product/fetch_price_evidence
+    (public venue metadata/price, no credentials required or used) and the
+    exchange connection's already-synced, cached balance snapshot
+    (ExchangeConnection.balances -- no live credential decryption)."""
+    from decimal import Decimal, InvalidOperation
+    from app.services.canonical_campaign_binding import _balance_value, _exchange_label
+    from app.services.exchange_connections.providers.kraken_spot import KrakenSpotClient
+    from app.services.orchestration import asset_roster
+
+    normalized_product = product_id.strip().upper()
+    base_symbol = normalized_product.split("-")[0]
+    result: dict[str, Any] = {
+        "read_only": True,
+        "provider_call_made": False,
+        "order_preview_or_submission_attempted": False,
+        "requested_product_id": normalized_product,
+    }
+    try:
+        proving_amount = Decimal(proving_notional_usd)
+    except InvalidOperation:
+        return {**result, "blocking_reason": f"invalid proving_notional_usd: {proving_notional_usd}"}
+
+    client = KrakenSpotClient()
+    try:
+        product = await client.fetch_product(credentials={}, environment=environment, product_id=normalized_product)
+        result["provider_call_made"] = True
+    except Exception as exc:
+        return {**result, "blocking_reason": f"kraken_product_lookup_failed:{type(exc).__name__}", "provider_call_made": True}
+
+    price_evidence = None
+    try:
+        price_evidence = await client.fetch_price_evidence(credentials={}, environment=environment, product_id=normalized_product)
+    except Exception:
+        price_evidence = None
+
+    result.update(
+        {
+            "kraken_pair_available": product.available,
+            "trading_enabled": product.trading_enabled,
+            "min_order_notional": None if product.min_order_notional is None else format(product.min_order_notional, "f"),
+            "min_order_quantity": None if product.min_order_quantity is None else format(product.min_order_quantity, "f"),
+            "quantity_increment": None if product.quantity_increment is None else format(product.quantity_increment, "f"),
+            "reference_price": None if price_evidence is None else str(getattr(price_evidence, "reference_price", None)),
+            "price_evidence_observed_at": None if price_evidence is None else str(getattr(price_evidence, "observed_at", None)),
+        }
+    )
+
+    blockers: list[str] = []
+    if not product.available:
+        blockers.append("product_not_available_on_kraken")
+    if not product.trading_enabled:
+        blockers.append("product_trading_not_enabled")
+    if product.min_order_notional is None:
+        blockers.append("min_order_notional_unknown")
+    elif product.min_order_notional > proving_amount:
+        blockers.append(f"proving_notional_below_kraken_minimum:{format(product.min_order_notional, 'f')}>{format(proving_amount, 'f')}")
+
+    required_quantity = None
+    if price_evidence is not None and getattr(price_evidence, "reference_price", None):
+        try:
+            price = Decimal(str(price_evidence.reference_price))
+            if price > 0:
+                required_quantity = proving_amount / price
+                if product.quantity_increment:
+                    steps = (required_quantity / product.quantity_increment).to_integral_value(rounding="ROUND_CEILING")
+                    required_quantity = steps * product.quantity_increment
+        except Exception:
+            required_quantity = None
+    result["required_rounded_quantity"] = None if required_quantity is None else format(required_quantity, "f")
+    if product.min_order_quantity is not None and required_quantity is not None and required_quantity < product.min_order_quantity:
+        blockers.append(f"required_quantity_below_kraken_minimum_quantity:{format(required_quantity, 'f')}<{format(product.min_order_quantity, 'f')}")
+
+    async with AsyncSessionLocal() as db:
+        exchange = _exchange_label(provider=asset_roster.AUTONOMOUS_CYCLE_PROVIDER, environment=environment)
+        connection = await db.scalar(
+            select(ExchangeConnection)
+            .where(ExchangeConnection.provider == asset_roster.AUTONOMOUS_CYCLE_PROVIDER)
+            .where(ExchangeConnection.environment == environment)
+            .order_by(desc(ExchangeConnection.updated_at), desc(ExchangeConnection.exchange_connection_id))
+            .limit(1)
+        )
+        balances = connection.balances if connection is not None and isinstance(connection.balances, list) else []
+        usd_available = _balance_value(balances=balances, currency="USD", key="available")
+        base_available = _balance_value(balances=balances, currency=base_symbol, key="available")
+
+    result["usd_available"] = None if usd_available is None else format(usd_available, "f")
+    result[f"{base_symbol.lower()}_available"] = None if base_available is None else format(base_available, "f")
+    result["sufficient_usd_for_buy"] = usd_available is not None and usd_available >= proving_amount
+    result["sufficient_base_asset_for_future_sell"] = (
+        base_available is not None and required_quantity is not None and base_available >= required_quantity
+    )
+    if usd_available is None:
+        blockers.append("usd_balance_evidence_missing")
+    elif usd_available < proving_amount:
+        blockers.append(f"insufficient_usd_balance:{format(usd_available, 'f')}<{format(proving_amount, 'f')}")
+
+    result["exchange_label"] = exchange
+    result["blockers"] = blockers
+    result["feasible_at_proving_notional"] = len(blockers) == 0
+    result["blocking_reason"] = None if not blockers else "; ".join(blockers)
+    return result
+
+
 async def _gather_autonomous_supervisor_evidence(
     *, provider: str, environment: str, product: str, since: datetime | None = None,
 ) -> tuple[dict[str, Any], dict[str, int]]:

@@ -14,6 +14,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.config import get_settings
 from app.models.audit_log import AuditLog
 from app.models.asset import Asset
+from app.models.candle import Candle
 from app.models.capital_campaign import CapitalCampaign
 from app.models.capital_campaign_definition import CapitalCampaignDefinition
 from app.models.canonical_preview_package import CanonicalPreviewPackage
@@ -26,6 +27,16 @@ from app.models.live_trading_profile import LiveTradingProfile
 from app.models.paper_account import PaperAccount
 from app.models.trade import Trade
 from app.services.capital_campaign_orchestration.service import _eligible_for_orchestration
+from app.services.orchestration import asset_roster
+
+# Mirrors the largest default lookback among the enabled strategy roster
+# (ma_crossover's slow_period=50, see strategy_roster/registry.py) plus one,
+# the same threshold convention used elsewhere in this codebase for "enough
+# history to evaluate every strategy" (see
+# strategy_roster.registry.minimum_history_required). An instrument with
+# fewer than this many recent candles cannot be bound into a canonical
+# campaign no matter how correctly authorized it otherwise is.
+_MINIMUM_CANDLE_HISTORY_FOR_BINDING = 51
 
 
 _TERMINAL_LIVE_ORDER_STATUSES = {"DRY_RUN_READY", "DRY_RUN_BLOCKED", "FILLED", "CANCELLED", "FAILED", "REJECTED", "EXPIRED", "COMPLETED"}
@@ -519,8 +530,28 @@ async def _inspect_canonical_campaign_status_transition_locked(
         checks.append(_check(Decimal(str(definition.maximum_total_exposure)) == _PROVING_CAP_USD, "maximum_total_exposure_equals_5", f"maximum_total_exposure={definition.maximum_total_exposure}"))
         allowed_instruments = {str(item or "").strip().upper() for item in (definition.allowed_instruments or [])}
         allowed_venues = {str(item or "").strip().lower() for item in (definition.allowed_venues or [])}
-        checks.append(_check("BTC-USD" in allowed_instruments and product == "BTC-USD", "btc_usd_allowed", f"requested_product={product} allowed_instruments={sorted(allowed_instruments)}"))
+        # Replaces the old hardcoded btc_usd_allowed single-product check.
+        # No wildcard: allowed_instruments must be a real, non-empty,
+        # explicit set, the requested product must be a member of it, and
+        # -- unlike the old check, which only ever validated the single
+        # literal "BTC-USD" -- every instrument the campaign claims
+        # authority over is independently validated here, never just the
+        # one currently being requested.
+        checks.append(_check(len(allowed_instruments) > 0, "allowed_instruments_explicit_and_non_empty", f"allowed_instruments={sorted(allowed_instruments)}"))
+        checks.append(_check(product in allowed_instruments, "requested_product_in_allowed_instruments", f"requested_product={product} allowed_instruments={sorted(allowed_instruments)}"))
         checks.append(_check("kraken_spot" in allowed_venues and provider == "kraken_spot", "kraken_spot_allowed", f"requested_provider={provider} allowed_venues={sorted(allowed_venues)}"))
+        worker_supported_products = asset_roster.resolve_autonomous_cycle_products(settings=get_settings())
+        for candidate_instrument in sorted(allowed_instruments):
+            checks.extend(
+                await _instrument_binding_checks(
+                    db=db,
+                    instrument=candidate_instrument,
+                    provider=provider,
+                    environment=environment,
+                    interval=asset_roster.AUTONOMOUS_CYCLE_INTERVAL,
+                    worker_supported_products=worker_supported_products,
+                )
+            )
         projected_campaign = type("ProjectedCampaign", (), {
             "status": "READY",
             "allowed_instruments": list(definition.allowed_instruments or []),
@@ -1660,6 +1691,72 @@ async def _load_asset(*, db: AsyncSession, provider: str, environment: str, prod
         .order_by(Asset.created_at.desc(), Asset.id.desc())
         .limit(1)
     )
+
+
+async def _count_recent_candles(*, db: AsyncSession, asset_id: UUID, interval: str, limit: int) -> int:
+    rows = list(
+        (
+            await db.execute(
+                select(Candle.id)
+                .where(Candle.asset_id == asset_id)
+                .where(Candle.interval == interval)
+                .order_by(Candle.open_time.desc())
+                .limit(limit)
+            )
+        ).all()
+    )
+    return len(rows)
+
+
+async def _instrument_binding_checks(
+    *,
+    db: AsyncSession,
+    instrument: str,
+    provider: str,
+    environment: str,
+    interval: str,
+    worker_supported_products: list[str],
+) -> list[BindingCheck]:
+    """Per-instrument replacement for the old hardcoded btc_usd_allowed
+    check: every instrument a campaign claims in allowed_instruments must
+    independently satisfy every one of these before the campaign can bind,
+    never just the single instrument currently being requested. No
+    instrument can pass by being unknown, unsupported, unregistered, or
+    stale -- every branch below fails closed on missing evidence."""
+    checks: list[BindingCheck] = []
+    checks.append(
+        _check(
+            instrument in worker_supported_products,
+            "instrument_supported_by_worker_roster",
+            f"instrument={instrument} worker_supported_products={sorted(worker_supported_products)}",
+        )
+    )
+    asset = await _load_asset(db=db, provider=provider, environment=environment, product_id=instrument)
+    checks.append(_check(asset is not None, "instrument_has_active_asset_registry_entry", f"instrument={instrument}"))
+    if asset is None:
+        checks.append(_check(False, "instrument_minimum_order_feasible_at_proving_cap", f"instrument={instrument} asset_missing=true"))
+        checks.append(_check(False, "instrument_has_sufficient_candle_history", f"instrument={instrument} asset_missing=true"))
+        return checks
+
+    min_notional = _coerce_decimal(asset.min_order_notional)
+    checks.append(
+        _check(
+            min_notional is not None and min_notional <= _PROVING_CAP_USD,
+            "instrument_minimum_order_feasible_at_proving_cap",
+            f"instrument={instrument} min_order_notional={asset.min_order_notional} proving_cap={format(_PROVING_CAP_USD, 'f')}",
+        )
+    )
+    candle_count = await _count_recent_candles(
+        db=db, asset_id=asset.id, interval=interval, limit=_MINIMUM_CANDLE_HISTORY_FOR_BINDING,
+    )
+    checks.append(
+        _check(
+            candle_count >= _MINIMUM_CANDLE_HISTORY_FOR_BINDING,
+            "instrument_has_sufficient_candle_history",
+            f"instrument={instrument} candle_count={candle_count} required={_MINIMUM_CANDLE_HISTORY_FOR_BINDING}",
+        )
+    )
+    return checks
 
 
 async def _load_conflicting_campaigns(*, db: AsyncSession, paper_account_id: UUID, exchange: str, campaign_id: UUID) -> list[CapitalCampaign]:

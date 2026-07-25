@@ -57,6 +57,7 @@ from app.services.capital_campaign_orchestration import run_campaign_orchestrati
 from app.services.capital_campaign_orchestration.authoritative import ScorecardSessionRecoveryError
 from app.services.mandates.contracts import AUTONOMY_LEVEL_2
 from app.services.mandates.evidence import MandateEvaluationWriteRequest, evaluate_and_record_mandate
+from app.services.orchestration import asset_roster
 from app.services.orchestration.venue_commissioning_bridge import service as venue_commissioning_service
 from app.services.orchestration.automatic_package_executor import (
     AutomaticPackageExecutionRequest,
@@ -82,21 +83,18 @@ from app.services.strategy_roster.decision_aggregator import AGGREGATE_STRATEGY_
 logger = logging.getLogger(__name__)
 
 _AUTONOMOUS_CYCLE_TRIGGER = "kraken_btc_15m_candle_close"
-_AUTONOMOUS_CYCLE_PRODUCT_ID = "BTC-USD"
 _AUTONOMOUS_CYCLE_INTERVAL = "15m"
-_AUTONOMOUS_CYCLE_PROVIDER = "kraken_spot"
-_AUTONOMOUS_CYCLE_ASSET_SYMBOLS = ("BTC", "XBT", "XXBT")
 
-# Bounded Phase-1 live multi-asset roster. Deliberately a small, explicit,
-# hand-maintained table -- not a general Kraken symbol-resolution system --
-# scoped to exactly the products this worker is prepared to evaluate.
-# settings.autonomous_cycle_additional_products entries not present here are
-# logged and skipped (fail closed), never guessed at. BTC-USD is never
-# listed here: it is always implicitly first via _resolve_autonomous_cycle_products.
-_ADDITIONAL_PRODUCT_ASSET_SYMBOLS: dict[str, tuple[str, ...]] = {
-    "ETH-USD": ("ETH", "XETH"),
-    "SOL-USD": ("SOL",),
-}
+# Roster/product-symbol logic lives in asset_roster.py, shared with
+# canonical_campaign_binding.py (which cannot import this module directly:
+# it would create a cycle via app.services.autonomous_cycle ->
+# canonical_campaign_binding). Rebound here under their original names so
+# every existing call site/monkeypatch in this module and its tests is
+# unaffected.
+_AUTONOMOUS_CYCLE_PRODUCT_ID = asset_roster.AUTONOMOUS_CYCLE_PRODUCT_ID
+_AUTONOMOUS_CYCLE_PROVIDER = asset_roster.AUTONOMOUS_CYCLE_PROVIDER
+_AUTONOMOUS_CYCLE_ASSET_SYMBOLS = asset_roster.AUTONOMOUS_CYCLE_ASSET_SYMBOLS
+_ADDITIONAL_PRODUCT_ASSET_SYMBOLS = asset_roster.ADDITIONAL_PRODUCT_ASSET_SYMBOLS
 
 # Used only when the resolved roster contains more than the single canonical
 # BTC-USD product. _trigger_to_instrument (capital_campaign_orchestration.
@@ -109,23 +107,7 @@ _AUTONOMOUS_MULTI_ASSET_TRIGGER = "kraken_roster_15m_candle_close"
 
 
 def _resolve_autonomous_cycle_products(*, settings) -> list[str]:
-    """BTC-USD first, always -- then any configured additional products that
-    are in the known roster table, deduplicated, order-preserving. Returns
-    exactly ["BTC-USD"] when no additional products are configured, which is
-    what makes the rest of the multi-asset wiring a no-op for the default
-    configuration."""
-    products = [_AUTONOMOUS_CYCLE_PRODUCT_ID]
-    for candidate in settings.parsed_autonomous_cycle_additional_products:
-        if candidate == _AUTONOMOUS_CYCLE_PRODUCT_ID or candidate in products:
-            continue
-        if candidate not in _ADDITIONAL_PRODUCT_ASSET_SYMBOLS:
-            logger.warning(
-                "autonomous_cycle_unknown_additional_product product_id=%s known_products=%s",
-                candidate, sorted(_ADDITIONAL_PRODUCT_ASSET_SYMBOLS),
-            )
-            continue
-        products.append(candidate)
-    return products
+    return asset_roster.resolve_autonomous_cycle_products(settings=settings)
 
 
 def _resolve_autonomous_cycle_trigger(*, products: list[str]) -> str:
