@@ -14,6 +14,7 @@ from sqlalchemy import and_, func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import get_settings
+from app.core.errors import InvalidRequestError
 from app.models.audit_log import AuditLog
 from app.models.autonomous_capital_mandate import AutonomousCapitalMandate
 from app.models.autonomous_cycle_run import AutonomousCycleRun
@@ -1329,9 +1330,28 @@ async def _attempt_automatic_ready_package_creation(
                         package_id=progression.package_id,
                     )
                     if claim_outcome.claim is not None:
-                        prepared = await prepare_autonomous_claimed_buy(
-                            db=db, claim_id=claim_outcome.claim.claim_id,
-                        )
+                        try:
+                            prepared = await prepare_autonomous_claimed_buy(
+                                db=db, claim_id=claim_outcome.claim.claim_id,
+                            )
+                        except InvalidRequestError as exc:
+                            # prepare_autonomous_claimed_buy re-validates the activation
+                            # window at prepare time; for a claim created on an earlier
+                            # tick, that window can have since elapsed. Previously this
+                            # exception escaped uncaught to the outer handler, which
+                            # mis-recorded it as reason_code=unexpected_executor_failure
+                            # and left the claim stuck at CLAIMED forever, retried
+                            # identically on every later tick. Mirror the terminal-failure
+                            # handling already used below for execute_prepared_autonomous_claim.
+                            prepared = None
+                            reason_code = str((exc.details or {}).get("blocker") or "autonomous_order_preparation_failed")
+                            await mark_pre_provider_blocked(
+                                db=db, claim=claim_outcome.claim, reason_code=reason_code,
+                            )
+                            logger.info(
+                                "autonomous_execution_failed_pre_provider claim_id=%s package_id=%s reason=%s provider_call_made=false",
+                                claim_outcome.claim.claim_id, progression.package_id, reason_code,
+                            )
                     else:
                         prepared = None
                     if prepared is not None and not get_settings().live_crypto_order_submission_enabled:

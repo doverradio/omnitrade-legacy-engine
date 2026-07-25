@@ -1043,6 +1043,69 @@ async def test_worker_contains_unexpected_automatic_package_executor_failure(
 
 
 @pytest.mark.asyncio
+async def test_expired_activation_at_prepare_time_terminates_claim_instead_of_unexpected_failure(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A claim already reaching CLAIMED on an earlier tick must be terminated
+    with its true reason when prepare's own activation-window re-check fails
+    on a later tick, not swallowed into reason_code=unexpected_executor_failure
+    while leaving the claim stuck at CLAIMED forever."""
+    import app.services.orchestration.continuous_pipeline_worker as worker_module
+    from app.core.errors import InvalidRequestError
+    from app.services.orchestration.automatic_package_executor import AutomaticPackageExecutionOutcome
+    from app.services.orchestration.autonomous_execution_claims import AutonomousClaimOutcome
+
+    cycle = _automatic_cycle()
+    package_id = uuid.uuid4()
+    claim = SimpleNamespace(claim_id=uuid.uuid4())
+    blocked_calls = []
+
+    async def _create(*, db, request):
+        return {"idempotent": False, "package": {"package_id": str(package_id), "package_state": "READY"}}
+
+    async def _execute(*, db, request):
+        return AutomaticPackageExecutionOutcome(
+            package_id=package_id, campaign_id=cycle.capital_campaign_id,
+            campaign_version=cycle.capital_campaign_version, decision_record_id=cycle.decision_record_id,
+            mandate_id=cycle.mandate_id, authorization_state="AUTHORIZED", dry_run_state="DRY_RUN_PASSED",
+            activation_state="ACTIVATED", authority_source="MANDATE", replayed=True,
+            final_reason_code="already_activated", failed_closed=False, starting_state="ACTIVATED",
+        )
+
+    async def _claim(*, db, package_id):
+        return AutonomousClaimOutcome(claim, False, "already_claimed")
+
+    async def _prepare(*, db, claim_id):
+        raise InvalidRequestError(
+            message="Autonomous order preparation failed closed",
+            details={"blocker": "activation_not_effective"},
+        )
+
+    async def _mark_pre_provider_blocked(*, db, claim, reason_code):
+        blocked_calls.append((claim, reason_code))
+
+    monkeypatch.setattr(worker_module, "_load_cycle_by_id", _async_return(cycle))
+    monkeypatch.setattr(worker_module, "_has_active_ready_package_for_opportunity", _async_return(False))
+    monkeypatch.setattr(worker_module, "_has_active_proving_activation", _async_return(False))
+    monkeypatch.setattr(worker_module, "_has_open_live_order", _async_return(False))
+    monkeypatch.setattr(worker_module, "_has_unresolved_reconciliation", _async_return(False))
+    monkeypatch.setattr(worker_module, "_load_runtime_campaign", _async_return(SimpleNamespace(paper_account_id=uuid.uuid4())))
+    monkeypatch.setattr(worker_module, "_load_live_trading_profile_for_paper_account", _async_return(SimpleNamespace(id=uuid.uuid4())))
+    monkeypatch.setattr(worker_module, "create_canonical_preview_package", _create)
+    monkeypatch.setattr(worker_module, "execute_automatic_ready_package_through_activation", _execute)
+    monkeypatch.setattr(worker_module, "claim_activated_buy_package", _claim)
+    monkeypatch.setattr(worker_module, "prepare_autonomous_claimed_buy", _prepare)
+    monkeypatch.setattr(worker_module, "mark_pre_provider_blocked", _mark_pre_provider_blocked)
+    caplog.set_level(logging.INFO)
+
+    await worker_module._attempt_automatic_ready_package_creation(db=object(), orchestration_payload=_automatic_payload(cycle))
+
+    assert blocked_calls == [(claim, "activation_not_effective")]
+    assert "reason=activation_not_effective" in caplog.text
+    assert "unexpected_executor_failure" not in caplog.text
+
+
+@pytest.mark.asyncio
 async def test_automatic_ready_package_path_never_calls_authorize_activate_dryrun_or_provider_submit(
     monkeypatch: pytest.MonkeyPatch,
     caplog: pytest.LogCaptureFixture,
