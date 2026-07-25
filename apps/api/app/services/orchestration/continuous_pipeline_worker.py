@@ -87,6 +87,57 @@ _AUTONOMOUS_CYCLE_INTERVAL = "15m"
 _AUTONOMOUS_CYCLE_PROVIDER = "kraken_spot"
 _AUTONOMOUS_CYCLE_ASSET_SYMBOLS = ("BTC", "XBT", "XXBT")
 
+# Bounded Phase-1 live multi-asset roster. Deliberately a small, explicit,
+# hand-maintained table -- not a general Kraken symbol-resolution system --
+# scoped to exactly the products this worker is prepared to evaluate.
+# settings.autonomous_cycle_additional_products entries not present here are
+# logged and skipped (fail closed), never guessed at. BTC-USD is never
+# listed here: it is always implicitly first via _resolve_autonomous_cycle_products.
+_ADDITIONAL_PRODUCT_ASSET_SYMBOLS: dict[str, tuple[str, ...]] = {
+    "ETH-USD": ("ETH", "XETH"),
+    "SOL-USD": ("SOL",),
+}
+
+# Used only when the resolved roster contains more than the single canonical
+# BTC-USD product. _trigger_to_instrument (capital_campaign_orchestration.
+# authoritative) parses trigger.split("_")[1] as a coin symbol to decide
+# whether to scope campaign composition to one instrument; "roster" does not
+# match any real instrument, so composition correctly falls through to
+# evaluating every instrument in the campaign's allowed_instruments instead
+# of collapsing to one -- exactly the multi-asset evaluation this exists for.
+_AUTONOMOUS_MULTI_ASSET_TRIGGER = "kraken_roster_15m_candle_close"
+
+
+def _resolve_autonomous_cycle_products(*, settings) -> list[str]:
+    """BTC-USD first, always -- then any configured additional products that
+    are in the known roster table, deduplicated, order-preserving. Returns
+    exactly ["BTC-USD"] when no additional products are configured, which is
+    what makes the rest of the multi-asset wiring a no-op for the default
+    configuration."""
+    products = [_AUTONOMOUS_CYCLE_PRODUCT_ID]
+    for candidate in settings.parsed_autonomous_cycle_additional_products:
+        if candidate == _AUTONOMOUS_CYCLE_PRODUCT_ID or candidate in products:
+            continue
+        if candidate not in _ADDITIONAL_PRODUCT_ASSET_SYMBOLS:
+            logger.warning(
+                "autonomous_cycle_unknown_additional_product product_id=%s known_products=%s",
+                candidate, sorted(_ADDITIONAL_PRODUCT_ASSET_SYMBOLS),
+            )
+            continue
+        products.append(candidate)
+    return products
+
+
+def _resolve_autonomous_cycle_trigger(*, products: list[str]) -> str:
+    return _AUTONOMOUS_CYCLE_TRIGGER if products == [_AUTONOMOUS_CYCLE_PRODUCT_ID] else _AUTONOMOUS_MULTI_ASSET_TRIGGER
+
+
+def _asset_symbols_for_product(*, product_id: str) -> tuple[str, ...]:
+    if product_id == _AUTONOMOUS_CYCLE_PRODUCT_ID:
+        return _AUTONOMOUS_CYCLE_ASSET_SYMBOLS
+    return _ADDITIONAL_PRODUCT_ASSET_SYMBOLS.get(product_id, ())
+
+
 _RESEARCH_STATUS_EVENT_TYPES = {
     "disabled": "RESEARCH_CYCLE_DISABLED",
     "skipped": "RESEARCH_CYCLE_SKIPPED",
@@ -281,8 +332,11 @@ async def _load_single_active_kraken_mandate(db: AsyncSession) -> AutonomousCapi
     return mandates[0]
 
 
-async def _load_latest_kraken_btc_15m_candle(db: AsyncSession) -> Candle | None:
+async def _load_latest_kraken_asset_15m_candle(db: AsyncSession, *, product_id: str, symbols: tuple[str, ...]) -> Candle | None:
     if not hasattr(db, "execute"):
+        return None
+    if not symbols:
+        logger.warning("autonomous_cycle_skip reason=unknown_asset_symbols product_id=%s", product_id)
         return None
 
     asset_result = await db.execute(
@@ -290,16 +344,16 @@ async def _load_latest_kraken_btc_15m_candle(db: AsyncSession) -> Candle | None:
         .where(Asset.is_active.is_(True))
         .where(Asset.asset_class == "crypto")
         .where(Asset.exchange == _AUTONOMOUS_CYCLE_PROVIDER)
-        .where(Asset.symbol.in_(_AUTONOMOUS_CYCLE_ASSET_SYMBOLS))
+        .where(Asset.symbol.in_(symbols))
         .order_by(Asset.created_at.desc())
         .limit(2)
     )
     assets = list(asset_result.scalars().all())
     if not assets:
-        logger.info("autonomous_cycle_skip reason=kraken_btc_asset_missing")
+        logger.info("autonomous_cycle_skip reason=kraken_asset_missing product_id=%s", product_id)
         return None
     if len(assets) > 1:
-        logger.warning("autonomous_cycle_skip reason=ambiguous_kraken_btc_assets asset_count=%s", len(assets))
+        logger.warning("autonomous_cycle_skip reason=ambiguous_kraken_assets product_id=%s asset_count=%s", product_id, len(assets))
         return None
 
     candle_result = await db.execute(
@@ -311,8 +365,16 @@ async def _load_latest_kraken_btc_15m_candle(db: AsyncSession) -> Candle | None:
     )
     candle = candle_result.scalars().first()
     if candle is None:
-        logger.info("autonomous_cycle_skip reason=kraken_btc_15m_candle_missing")
+        logger.info("autonomous_cycle_skip reason=kraken_15m_candle_missing product_id=%s", product_id)
     return candle
+
+
+async def _load_latest_kraken_btc_15m_candle(db: AsyncSession) -> Candle | None:
+    """Preserved as the exact BTC-only entry point for any remaining direct
+    caller; delegates to the generalized per-product loader."""
+    return await _load_latest_kraken_asset_15m_candle(
+        db, product_id=_AUTONOMOUS_CYCLE_PRODUCT_ID, symbols=_AUTONOMOUS_CYCLE_ASSET_SYMBOLS,
+    )
 
 
 @dataclass(frozen=True, slots=True)
@@ -378,6 +440,92 @@ async def _run_kraken_btc_autonomous_cycle_if_due(*, db: AsyncSession) -> tuple[
         result.idempotency_key,
     )
     return result.cycle_id, latest_candle
+
+
+def _build_kraken_asset_candle_idempotency_seed(*, product_id: str, candle: Candle) -> str:
+    close_time = candle.close_time
+    close_time_utc = close_time if close_time.tzinfo is not None else close_time.replace(tzinfo=timezone.utc)
+    return f"kraken-{product_id.lower()}-15m-close:{close_time_utc.astimezone(timezone.utc).isoformat()}"
+
+
+async def _trigger_autonomous_cycles_for_products(
+    *, db: AsyncSession, products: list[str], trigger: str,
+) -> dict[str, tuple[uuid.UUID | None, _KrakenBtcCandleIdentity | None]]:
+    """Per-product analogue of _run_kraken_btc_autonomous_cycle_if_due,
+    looped over the resolved roster. Every product is isolated in its own
+    try/except: one asset's failure is logged and skipped, never blocking
+    evaluation of the others. Returns {product_id: (cycle_id, candle_identity)},
+    with (None, None) for any product that was skipped or failed. For the
+    default single-product (BTC-only) roster this produces the exact same
+    single autonomous_cycle_triggered log line as before, since `products`
+    has exactly one entry and `trigger` equals _AUTONOMOUS_CYCLE_TRIGGER."""
+    results: dict[str, tuple[uuid.UUID | None, _KrakenBtcCandleIdentity | None]] = {
+        product_id: (None, None) for product_id in products
+    }
+
+    # In single-asset (default) mode -- trigger is still the original
+    # _AUTONOMOUS_CYCLE_TRIGGER -- the BTC-USD leg always delegates to the
+    # original, independently tested/mockable entry point rather than
+    # reimplementing its query shape here. This is what makes the default
+    # roster's runtime behavior, including every existing unit/integration
+    # test that monkeypatches _run_kraken_btc_autonomous_cycle_if_due
+    # directly, byte identical to before this change.
+    #
+    # In multi-asset mode (trigger is _AUTONOMOUS_MULTI_ASSET_TRIGGER), BTC
+    # must instead go through the same generalized per-product path as
+    # every other product: it needs its StrategyRosterRun persisted under
+    # the SHARED trigger too, or campaign composition (which resolves each
+    # instrument's roster run by an exact trigger match) would never find
+    # BTC's evidence -- _run_kraken_btc_autonomous_cycle_if_due always uses
+    # the hardcoded single-asset trigger internally and cannot do this.
+    remaining_products = list(products)
+    if _AUTONOMOUS_CYCLE_PRODUCT_ID in results and trigger == _AUTONOMOUS_CYCLE_TRIGGER:
+        try:
+            btc_cycle_id, btc_candle = await _run_kraken_btc_autonomous_cycle_if_due(db=db)
+            results[_AUTONOMOUS_CYCLE_PRODUCT_ID] = (btc_cycle_id, _capture_kraken_btc_candle_identity(btc_candle))
+        except Exception:
+            await _rollback_active_session(db=db)
+            logger.exception("autonomous_cycle_asset_failed trigger=%s product_id=%s", trigger, _AUTONOMOUS_CYCLE_PRODUCT_ID)
+        remaining_products = [product_id for product_id in products if product_id != _AUTONOMOUS_CYCLE_PRODUCT_ID]
+
+    if not remaining_products:
+        return results
+
+    mandate = await _load_single_active_kraken_mandate(db)
+    if mandate is None:
+        return results
+
+    for product_id in remaining_products:
+        try:
+            symbols = _asset_symbols_for_product(product_id=product_id)
+            latest_candle = await _load_latest_kraken_asset_15m_candle(db, product_id=product_id, symbols=symbols)
+            if latest_candle is None:
+                continue
+
+            result = await run_autonomous_preview_cycle(
+                db=db,
+                request=AutonomousCycleRequest(
+                    mandate_id=mandate.mandate_id,
+                    actor="orchestration_worker",
+                    product_id=product_id,
+                    strategy_interval=_AUTONOMOUS_CYCLE_INTERVAL,
+                    trigger=trigger,
+                    idempotency_seed=_build_kraken_asset_candle_idempotency_seed(product_id=product_id, candle=latest_candle),
+                    candle_id=latest_candle.id,
+                    candle_close_time=latest_candle.close_time,
+                ),
+            )
+            logger.info(
+                "autonomous_cycle_triggered trigger=%s product_id=%s mandate_id=%s cycle_id=%s state=%s replayed=%s idempotency_key=%s",
+                trigger, product_id, mandate.mandate_id, result.cycle_id, result.state, result.replayed, result.idempotency_key,
+            )
+            results[product_id] = (result.cycle_id, _capture_kraken_btc_candle_identity(latest_candle))
+        except Exception:
+            await _rollback_active_session(db=db)
+            logger.exception("autonomous_cycle_asset_failed trigger=%s product_id=%s", trigger, product_id)
+            continue
+
+    return results
 
 
 async def _load_active_validation_run_ids(*, db: AsyncSession) -> list[uuid.UUID]:
@@ -944,6 +1092,7 @@ async def _attempt_automatic_ready_package_creation(
     db: AsyncSession,
     orchestration_payload: dict[str, object] | None,
     originating_autonomous_cycle_id: uuid.UUID | None = None,
+    autonomous_cycle_ids_by_product: dict[str, uuid.UUID | None] | None = None,
 ) -> None:
     cycles = [] if not isinstance(orchestration_payload, dict) else list(orchestration_payload.get("cycles") or [])
     for cycle_summary in cycles:
@@ -969,7 +1118,13 @@ async def _attempt_automatic_ready_package_creation(
 
         provider = _AUTONOMOUS_CYCLE_PROVIDER
         environment = "production"
-        product = _AUTONOMOUS_CYCLE_PRODUCT_ID
+        # The winning instrument as selected by campaign composition's own
+        # deterministic ranking (authoritative.py's candidate_rows.sort +
+        # selected_decision["instrument"]) -- never a hardcoded product.
+        # Falls back to the canonical BTC-USD product only when no
+        # instrument was selected (HOLD/no-candidate cycles), where this
+        # value is never actually acted on downstream.
+        product = str(selected_decision.get("instrument") or "").strip().upper() or _AUTONOMOUS_CYCLE_PRODUCT_ID
         proposed_action = str(composition.get("proposed_action") or cycle.proposed_action or "").strip().upper()
         decision_kind = str(selected_decision.get("decision_kind") or "").strip().upper()
         risk_verdict = str(selected_decision.get("risk_verdict") or cycle.risk_verdict or "").strip().upper()
@@ -986,7 +1141,11 @@ async def _attempt_automatic_ready_package_creation(
         skip_reason = None
         if campaign_id is None or campaign_version is None:
             skip_reason = "campaign_identity_missing"
-        elif provider != _AUTONOMOUS_CYCLE_PROVIDER or environment != "production" or product != _AUTONOMOUS_CYCLE_PRODUCT_ID:
+        elif (
+            provider != _AUTONOMOUS_CYCLE_PROVIDER
+            or environment != "production"
+            or product not in _resolve_autonomous_cycle_products(settings=get_settings())
+        ):
             skip_reason = "scope_not_supported"
         elif cycle.termination_stage in {"hold_no_package_created", "failed_closed"}:
             skip_reason = f"termination_stage_{cycle.termination_stage}"
@@ -1025,8 +1184,16 @@ async def _attempt_automatic_ready_package_creation(
             if bundle_complete:
                 skip_reason = None
             else:
+                # Must be the autonomous cycle for the SAME product as the
+                # winning candidate, not just "the BTC cycle from this tick"
+                # -- otherwise a non-BTC winner's mandate-evaluation
+                # correlation check (product_id comparison below) would
+                # always mismatch against BTC's own autonomous_context.
+                resolved_originating_cycle_id = (
+                    (autonomous_cycle_ids_by_product or {}).get(product) or originating_autonomous_cycle_id
+                )
                 autonomous_cycle = await _load_originating_autonomous_cycle(
-                    db=db, cycle_id=originating_autonomous_cycle_id,
+                    db=db, cycle_id=resolved_originating_cycle_id,
                 )
                 strategy_identity = str(selected_decision.get("strategy_identity") or "").strip()
                 side = "SELL" if is_close_action else "BUY"
@@ -1271,14 +1438,20 @@ async def run_orchestration_cycle(
             await _rollback_active_session(db=db)
             logger.exception("venue_commission_resume_failed")
 
+    autonomous_cycle_products = _resolve_autonomous_cycle_products(settings=get_settings())
+    autonomous_cycle_trigger = _resolve_autonomous_cycle_trigger(products=autonomous_cycle_products)
+
     autonomous_cycle_id: uuid.UUID | None = None
     kraken_btc_identity: _KrakenBtcCandleIdentity | None = None
+    cycle_results: dict[str, tuple[uuid.UUID | None, _KrakenBtcCandleIdentity | None]] = {}
     try:
-        autonomous_cycle_id, kraken_btc_candle = await _run_kraken_btc_autonomous_cycle_if_due(db=db)
-        kraken_btc_identity = _capture_kraken_btc_candle_identity(kraken_btc_candle)
+        cycle_results = await _trigger_autonomous_cycles_for_products(
+            db=db, products=autonomous_cycle_products, trigger=autonomous_cycle_trigger,
+        )
+        autonomous_cycle_id, kraken_btc_identity = cycle_results.get(_AUTONOMOUS_CYCLE_PRODUCT_ID, (None, None))
     except Exception:
         await _rollback_active_session(db=db)
-        logger.exception("autonomous_cycle_failed trigger=%s", _AUTONOMOUS_CYCLE_TRIGGER)
+        logger.exception("autonomous_cycle_failed trigger=%s", autonomous_cycle_trigger)
 
     # The strategy roster must run, and its StrategyRosterRun row must be
     # committed, before campaign orchestration composes this candle -- the
@@ -1286,38 +1459,51 @@ async def run_orchestration_cycle(
     # product, interval, candle_close_time, trigger) match and never falls
     # back to "latest", so composing first always sees no matching run yet
     # and skips with strategy_aggregate_skipped reason=exact_roster_run_unavailable.
-    try:
-        if kraken_btc_identity is None:
-            kraken_btc_identity = _capture_kraken_btc_candle_identity(await _load_latest_kraken_btc_15m_candle(db))
-        if kraken_btc_identity is not None:
+    # Looped per product and isolated per product: one asset's roster
+    # failure is logged and skipped, never blocking the others.
+    for product_id in autonomous_cycle_products:
+        try:
+            scheduled_cycle_id, identity = cycle_results.get(product_id, (None, None))
+            if identity is None and product_id == _AUTONOMOUS_CYCLE_PRODUCT_ID:
+                # Delegates to the original, independently mockable loader
+                # for the BTC fallback path specifically -- same reasoning
+                # as _trigger_autonomous_cycles_for_products above.
+                identity = _capture_kraken_btc_candle_identity(await _load_latest_kraken_btc_15m_candle(db))
+            elif identity is None:
+                symbols = _asset_symbols_for_product(product_id=product_id)
+                identity = _capture_kraken_btc_candle_identity(
+                    await _load_latest_kraken_asset_15m_candle(db, product_id=product_id, symbols=symbols)
+                )
+            if identity is None:
+                continue
             await run_strategy_roster_for_candle(
                 db=db,
                 request=StrategyRosterRequest(
-                    asset_id=kraken_btc_identity.asset_id,
+                    asset_id=identity.asset_id,
                     provider=_AUTONOMOUS_CYCLE_PROVIDER,
-                    product_id=_AUTONOMOUS_CYCLE_PRODUCT_ID,
+                    product_id=product_id,
                     interval=_AUTONOMOUS_CYCLE_INTERVAL,
-                    candle_open_time=kraken_btc_identity.open_time,
-                    candle_close_time=kraken_btc_identity.close_time,
-                    trigger=_AUTONOMOUS_CYCLE_TRIGGER,
-                    scheduled_cycle_id=autonomous_cycle_id,
+                    candle_open_time=identity.open_time,
+                    candle_close_time=identity.close_time,
+                    trigger=autonomous_cycle_trigger,
+                    scheduled_cycle_id=scheduled_cycle_id,
                 ),
             )
-    except Exception:
-        await _rollback_active_session(db=db)
-        logger.exception(
-            "strategy_roster_failed trigger=%s provider=%s product_id=%s interval=%s",
-            _AUTONOMOUS_CYCLE_TRIGGER,
-            _AUTONOMOUS_CYCLE_PROVIDER,
-            _AUTONOMOUS_CYCLE_PRODUCT_ID,
-            _AUTONOMOUS_CYCLE_INTERVAL,
-        )
+        except Exception:
+            await _rollback_active_session(db=db)
+            logger.exception(
+                "strategy_roster_failed trigger=%s provider=%s product_id=%s interval=%s",
+                autonomous_cycle_trigger,
+                _AUTONOMOUS_CYCLE_PROVIDER,
+                product_id,
+                _AUTONOMOUS_CYCLE_INTERVAL,
+            )
 
     if all(hasattr(db, attr) for attr in ("execute", "scalar", "commit")):
         try:
             orchestration_payload = await run_campaign_orchestration_preview_for_candle(
                 db=db,
-                trigger=_AUTONOMOUS_CYCLE_TRIGGER,
+                trigger=autonomous_cycle_trigger,
             )
             payload = orchestration_payload if isinstance(orchestration_payload, dict) else {}
             cycle_count = int(payload.get("cycle_count") or 0)
@@ -1326,8 +1512,9 @@ async def run_orchestration_cycle(
             eligible_campaigns = payload.get("eligible_campaigns") if isinstance(payload.get("eligible_campaigns"), list) else []
             skipped_campaigns = payload.get("skipped_campaigns") if isinstance(payload.get("skipped_campaigns"), list) else []
             logger.info(
-                "campaign_orchestration_preview_result trigger=%s resolved_candle_id=%s resolved_candle_symbol=%s resolved_candle_product=%s resolved_candle_provider=%s resolved_candle_interval=%s resolved_candle_close_time=%s preview_reason=%s cycle_count=%s considered_campaigns=%s eligible_campaigns=%s skipped_campaigns=%s",
-                _AUTONOMOUS_CYCLE_TRIGGER,
+                "campaign_orchestration_preview_result trigger=%s roster_products=%s resolved_candle_id=%s resolved_candle_symbol=%s resolved_candle_product=%s resolved_candle_provider=%s resolved_candle_interval=%s resolved_candle_close_time=%s preview_reason=%s cycle_count=%s considered_campaigns=%s eligible_campaigns=%s skipped_campaigns=%s",
+                autonomous_cycle_trigger,
+                ",".join(autonomous_cycle_products),
                 None if kraken_btc_identity is None else kraken_btc_identity.id,
                 _AUTONOMOUS_CYCLE_PRODUCT_ID.split("-")[0],
                 _AUTONOMOUS_CYCLE_PRODUCT_ID,
@@ -1344,7 +1531,7 @@ async def run_orchestration_cycle(
                 skip_reason = preview_reason or "no_campaign_candidates"
                 logger.info(
                     "campaign_orchestration_preview_skipped trigger=%s resolved_candle_id=%s resolved_candle_symbol=%s resolved_candle_product=%s resolved_candle_provider=%s resolved_candle_interval=%s resolved_candle_close_time=%s reason=%s cycle_count=%s",
-                    _AUTONOMOUS_CYCLE_TRIGGER,
+                    autonomous_cycle_trigger,
                     None if kraken_btc_identity is None else kraken_btc_identity.id,
                     _AUTONOMOUS_CYCLE_PRODUCT_ID.split("-")[0],
                     _AUTONOMOUS_CYCLE_PRODUCT_ID,
@@ -1358,6 +1545,9 @@ async def run_orchestration_cycle(
                 db=db,
                 orchestration_payload=orchestration_payload,
                 originating_autonomous_cycle_id=autonomous_cycle_id,
+                autonomous_cycle_ids_by_product={
+                    product_id: cycle_id for product_id, (cycle_id, _identity) in cycle_results.items()
+                },
             )
             await db.commit()
         except ScorecardSessionRecoveryError:

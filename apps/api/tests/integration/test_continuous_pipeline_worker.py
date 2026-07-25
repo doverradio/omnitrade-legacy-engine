@@ -293,6 +293,7 @@ def _automatic_cycle(
     final_amount: str = "5",
     selected_decision_reason: str | None = None,
     rejected_candidates: list[dict[str, object]] | None = None,
+    instrument: str | None = None,
 ) -> SimpleNamespace:
     cycle_id = uuid.uuid4()
     campaign_id = uuid.UUID("aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa")
@@ -304,6 +305,8 @@ def _automatic_cycle(
         "evidence_freshness": freshness,
         "sizing_trace": {"final_amount": final_amount},
     }
+    if instrument is not None:
+        selected_decision["instrument"] = instrument
     if selected_decision_reason is not None:
         selected_decision["reason"] = selected_decision_reason
     authoritative_composition: dict[str, object] = {
@@ -646,6 +649,76 @@ async def test_automatic_ready_package_executable_buy_creates_one_ready_package(
     assert calls[0].mandate_id == cycle.mandate_id
     assert calls[0].mandate_version_id == cycle.mandate_version_id
     assert calls[0].mandate_evaluation_id == cycle.mandate_evaluation_id
+
+
+# Multi-asset expansion: the winning instrument selected by campaign
+# composition's own deterministic ranking (selected_decision["instrument"])
+# must be the product a ready package is created for -- not the hardcoded
+# BTC-USD constant -- and the correct per-product originating autonomous
+# cycle (not BTC's) must be resolved for the mandate-evaluation correlation
+# check, or a non-BTC winner would always fail closed with
+# autonomous_campaign_cycle_correlation_mismatch.
+@pytest.mark.asyncio
+async def test_automatic_ready_package_uses_the_selected_non_btc_instrument(monkeypatch: pytest.MonkeyPatch) -> None:
+    import app.services.orchestration.continuous_pipeline_worker as worker_module
+
+    cycle = _automatic_cycle(instrument="ETH-USD")
+    eth_autonomous_cycle_id = uuid.uuid4()
+    btc_autonomous_cycle_id = uuid.uuid4()
+    runtime_campaign = SimpleNamespace(paper_account_id=uuid.uuid4())
+    profile = SimpleNamespace(id=uuid.uuid4())
+    calls: list[object] = []
+
+    async def _fake_create(*, db, request):
+        calls.append(request)
+        return {
+            "idempotent": False,
+            "package": {"package_id": str(uuid.uuid4()), "package_state": "READY"},
+            "readiness": {"ready": True, "package_state": "READY"},
+        }
+
+    monkeypatch.setattr(worker_module, "_resolve_autonomous_cycle_products", lambda *, settings: ["BTC-USD", "ETH-USD"])
+    monkeypatch.setattr(worker_module, "_load_cycle_by_id", _async_return(cycle))
+    monkeypatch.setattr(worker_module, "_has_active_ready_package_for_opportunity", _async_return(False))
+    monkeypatch.setattr(worker_module, "_has_active_proving_activation", _async_return(False))
+    monkeypatch.setattr(worker_module, "_has_open_live_order", _async_return(False))
+    monkeypatch.setattr(worker_module, "_has_unresolved_reconciliation", _async_return(False))
+    monkeypatch.setattr(worker_module, "_load_runtime_campaign", _async_return(runtime_campaign))
+    monkeypatch.setattr(worker_module, "_load_live_trading_profile_for_paper_account", _async_return(profile))
+    monkeypatch.setattr(worker_module, "create_canonical_preview_package", _fake_create)
+
+    await worker_module._attempt_automatic_ready_package_creation(
+        db=object(),
+        orchestration_payload=_automatic_payload(cycle),
+        autonomous_cycle_ids_by_product={"BTC-USD": btc_autonomous_cycle_id, "ETH-USD": eth_autonomous_cycle_id},
+    )
+
+    assert len(calls) == 1
+    assert calls[0].product == "ETH-USD"
+
+
+@pytest.mark.asyncio
+async def test_automatic_ready_package_out_of_scope_product_is_rejected(monkeypatch: pytest.MonkeyPatch) -> None:
+    """An instrument outside the configured/authorized roster (e.g. campaign
+    composition somehow selected a product this worker was never told to
+    evaluate) must be rejected with scope_not_supported, never silently
+    progressed."""
+    import app.services.orchestration.continuous_pipeline_worker as worker_module
+
+    cycle = _automatic_cycle(instrument="DOGE-USD")
+    calls: list[object] = []
+
+    async def _fake_create(*, db, request):
+        calls.append(request)
+        raise AssertionError("must not reach package creation for an out-of-scope product")
+
+    monkeypatch.setattr(worker_module, "_resolve_autonomous_cycle_products", lambda *, settings: ["BTC-USD", "ETH-USD"])
+    monkeypatch.setattr(worker_module, "_load_cycle_by_id", _async_return(cycle))
+    monkeypatch.setattr(worker_module, "create_canonical_preview_package", _fake_create)
+
+    await worker_module._attempt_automatic_ready_package_creation(db=object(), orchestration_payload=_automatic_payload(cycle))
+
+    assert calls == []
 
 
 # Regression for production-readiness gap: a fully computed, risk-checked
@@ -2686,7 +2759,7 @@ async def test_worker_survives_a_prior_rollback_without_touching_expired_candle_
     async def _campaign_preview(*, db, trigger):
         return {"cycle_count": 0, "reason": "no_campaign_candidates", "considered_campaigns": [], "eligible_campaigns": [], "skipped_campaigns": []}
 
-    async def _ready_package_attempted(*, db, orchestration_payload, originating_autonomous_cycle_id=None):
+    async def _ready_package_attempted(*, db, orchestration_payload, originating_autonomous_cycle_id=None, autonomous_cycle_ids_by_product=None):
         # Only reached if campaign_orchestration's try body -- including its
         # logging, which reads the candle's id/close_time -- ran to
         # completion without raising. A stale direct attribute touch on the

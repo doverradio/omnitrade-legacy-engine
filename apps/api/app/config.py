@@ -146,6 +146,15 @@ class Settings(BaseSettings):
         default=6,
         validation_alias="INSTANT_TRADE_RECONCILIATION_POLL_TIMEOUT_SECONDS",
     )
+    # Bounded Phase-1 live multi-asset roster: comma-separated Kraken spot
+    # product ids ADDED on top of the canonical BTC-USD product (never
+    # replacing it). Empty by default -- preserves today's BTC-only
+    # autonomous cycle exactly. Only product ids recognized by
+    # continuous_pipeline_worker._ADDITIONAL_PRODUCT_ASSET_SYMBOLS are
+    # honored; anything else is logged and skipped, never guessed.
+    autonomous_cycle_additional_products: str = Field(
+        default="", validation_alias="AUTONOMOUS_CYCLE_ADDITIONAL_PRODUCTS"
+    )
     research_evolution_enabled: bool = Field(default=True, validation_alias="RESEARCH_EVOLUTION_ENABLED")
     research_cycle_interval_minutes: int = Field(default=30, validation_alias="RESEARCH_CYCLE_INTERVAL_MINUTES")
     research_max_candidates_per_cycle: int = Field(default=6, validation_alias="RESEARCH_MAX_CANDIDATES_PER_CYCLE")
@@ -226,6 +235,10 @@ class Settings(BaseSettings):
     @property
     def parsed_crypto_preview_allowed_products(self) -> list[str]:
         return [item.strip().upper() for item in self.crypto_preview_allowed_products.split(",") if item.strip()]
+
+    @property
+    def parsed_autonomous_cycle_additional_products(self) -> list[str]:
+        return [item.strip().upper() for item in self.autonomous_cycle_additional_products.split(",") if item.strip()]
 
 
 @lru_cache

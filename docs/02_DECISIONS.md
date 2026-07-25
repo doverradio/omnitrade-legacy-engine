@@ -347,6 +347,74 @@ superseded Phase 1 risk-input theory.
 
 ---
 
+## 2026-07
+
+### Bounded Live Multi-Asset Expansion
+
+Decision
+
+The autonomous worker may evaluate a small, explicitly configured roster
+of Kraken spot products per cycle (BTC-USD plus any of a bounded,
+hand-maintained set -- ETH-USD, SOL-USD -- via
+AUTONOMOUS_CYCLE_ADDITIONAL_PRODUCTS), instead of BTC-USD alone, reusing
+every existing gate (strategy roster, economics, Risk Engine, mandate
+authority, canonical package progression, execution provider,
+reconciliation/accounting) unchanged. Campaign composition's existing
+deterministic ranking (authoritative.py's candidate_rows.sort by
+expected_net_dollars, then risk_adjusted_score, then instrument name)
+selects at most one winning instrument per cycle; every other qualifying
+candidate is recorded as deferred (why_not_other_assets), not rejected.
+
+Reason
+
+Waiting on BTC alone to produce a qualifying BUY was judged to be
+needlessly narrowing the platform's own opportunity set given that
+almost the entire pipeline downstream of candle ingestion was already
+asset-parametrized (strategy roster, campaign composition's per-instrument
+loop and ranking, Risk Engine, canonical package/claim/execution) --
+the only genuinely single-asset code was the worker's own hardcoded
+trigger/product constants and the mandate-evaluation correlation lookup,
+both narrow and mechanical to generalize without touching Risk, economics,
+or execution logic at all.
+
+Alternatives Considered
+
+Build a separate multi-asset scanning/execution path in parallel with the
+existing one. Rejected: explicitly out of scope -- doubles the surface
+area needing the same safety guarantees and risks the two paths drifting
+apart, exactly the failure mode ADR-0012 (Operating Modes and Adapter
+Boundaries) was written to prevent for a different context.
+
+Hardcode a fixed multi-asset list without inspecting live Kraken
+tradability. Rejected: this session had no live network access to confirm
+current Kraken product status/minimums via KrakenSpotClient.fetch_product;
+the recommended roster (ETH-USD, SOL-USD) is repository-evidenced
+(matches the existing binance_us seed script's own historical choice of
+secondary assets) and well-established spot pairs, but must be confirmed
+live by the operator before enabling, not assumed.
+
+Consequences
+
+No asset beyond BTC-USD is authorized to trade: canonical_campaign_binding.py
+still hard-asserts the canonical proving campaign's allowed_instruments/
+allowed_venues equal exactly {"BTC-USD"}/{"kraken_spot"}, and no code in
+this change mutates campaign or mandate authority automatically. Enabling
+a second asset requires an explicit, manually-applied campaign version
+and/or mandate version change (operator commands provided separately),
+never an automatic one. The default (unset) configuration is byte-identical
+in behavior to before this change, verified by the full existing test
+suite passing unchanged.
+
+Future Impact
+
+Future asset additions to the live roster should extend
+_ADDITIONAL_PRODUCT_ASSET_SYMBOLS (continuous_pipeline_worker.py) and the
+campaign/mandate scope together, deliberately, one asset at a time --
+never by broadening AUTONOMOUS_CYCLE_ADDITIONAL_PRODUCTS' parsing to
+accept unknown products by guessing their Kraken asset symbols.
+
+---
+
 ## Future Decisions
 
 Append only.

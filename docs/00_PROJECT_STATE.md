@@ -267,6 +267,20 @@ The immediate engineering objective remains reproducing this exact
 package-progression failure and unblocking it, without modifying Risk
 Engine decision math, campaign risk limits, or strategy thresholds.
 
+✓ Bounded live multi-asset expansion foundation (2026-07-25): the
+autonomous worker (continuous_pipeline_worker.py) can now evaluate a
+configured roster of Kraken spot products (BTC-USD plus any of
+ETH-USD/SOL-USD via AUTONOMOUS_CYCLE_ADDITIONAL_PRODUCTS) in the same
+worker cycle, reusing the existing campaign-composition opportunity
+ranking (authoritative.py's candidate_rows.sort + selected_decision) to
+pick at most one winning instrument per cycle -- no parallel trading
+architecture, no new execution provider, no weakened Risk/economics/
+mandate gates. Default configuration (unset) is byte-identical to the
+prior BTC-only behavior. NO asset beyond BTC-USD is authorized to trade
+yet -- that requires an explicit campaign/mandate scope change the
+operator must apply manually (see 02_DECISIONS.md, "Bounded Live
+Multi-Asset Expansion").
+
 ✓ Parallel authorized lanes (2026-07-25): production proving-campaign
 work (First Autonomous Profit) and expansion-foundation work
 (Historical Intelligence Platform Phase 3: operating modes, evidence
