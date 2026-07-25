@@ -281,6 +281,72 @@ through evidence-based debugging instead of speculative feature growth.
 
 ---
 
+## 2026-07
+
+### Parallel Authorized Lanes
+
+Decision
+
+Production proving-campaign work toward First Autonomous Profit and
+expansion-foundation work (Historical Intelligence Platform Phase 3:
+operating modes, evidence contracts, isolated simulation persistence)
+are now both authorized to proceed in parallel, rather than expansion
+work waiting strictly behind First Autonomous Profit.
+
+Reason
+
+The live proving campaign continues operating independently while its
+current blocker (mandate package authorization expiry / executor
+failure at package progression, not a Risk Engine or strategy-threshold
+defect) is diagnosed and fixed. Phase 3 foundation work is
+production-isolated by construction: a separate `SimulationBase`
+metadata root, a separate `OT_SIMULATION_DATABASE_URL` with no fallback
+to the production database, and an `IsolationGuard` that fails closed
+on any historical/counterfactual run bound to production. Because this
+isolation is structural, not conventional, Phase 3 work carries no risk
+to the live proving campaign and does not need to wait behind it.
+
+Also recorded here: `IMPLEMENTATION_MASTER_PLAN.md` Phase 1's original
+diagnosis (unwired Risk Engine inputs — `campaign_authorized_notional`,
+stop-loss, loss-history) is superseded by runtime evidence. The actual
+blocker observed in production is package-progression/mandate
+authorization, downstream of a BUY candidate that already passed
+Strategy, Economics, and Risk. Phase 1's original risk-input changes
+were explicitly NOT implemented as part of this lane; they should be
+re-evaluated only if future evidence again implicates the Risk Engine
+inputs specifically.
+
+Alternatives Considered
+
+Hold all expansion-foundation work until First Autonomous Profit is
+fully proven. Rejected: Phase 3's isolation guarantees make this
+unnecessarily conservative — the isolation is enforced by
+`IsolationGuard`/separate persistence, not by sequencing discipline
+alone, so there is no real coupling to protect by waiting.
+
+Fix Phase 1's originally-diagnosed risk inputs anyway, since the master
+plan called for it. Rejected: doing so now would modify Risk Engine
+behavior based on a diagnosis the current runtime evidence contradicts,
+risking a change with no basis in the actual observed failure.
+
+Consequences
+
+Two lanes of engineering work can proceed without either blocking the
+other, as long as expansion-foundation work never touches the live
+autonomous crypto path, risk_engine.py decision math, campaign/mandate/
+execution/reconciliation/strategy behavior, or production
+decision_records/decision_snapshots schema.
+
+Future Impact
+
+Future engineering sessions should treat "production proving" and
+"expansion foundation" as two named, independently-tracked lanes, and
+should re-diagnose the production blocker from fresh runtime evidence
+(package progression / mandate authorization) rather than reusing the
+superseded Phase 1 risk-input theory.
+
+---
+
 ## Future Decisions
 
 Append only.

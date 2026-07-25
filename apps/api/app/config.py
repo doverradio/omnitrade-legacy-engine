@@ -15,6 +15,12 @@ class Settings(BaseSettings):
     model_config = SettingsConfigDict(env_file=DEFAULT_ENV_FILE, env_file_encoding="utf-8", extra="ignore")
 
     database_url: str = "postgresql+asyncpg://postgres:postgres@localhost:5432/omnitrade"
+    # Historical-simulation persistence is intentionally isolated from
+    # production: no default value here, and no fallback to database_url
+    # anywhere this is consumed (app.services.historical_simulation.persistence)
+    # -- a historical/counterfactual run without an explicit, distinct target
+    # must fail to start, never silently share the production database.
+    simulation_database_url: str | None = Field(default=None, validation_alias="OT_SIMULATION_DATABASE_URL")
     database_pool_size: int = Field(default=10, validation_alias="DATABASE_POOL_SIZE")
     database_max_overflow: int = Field(default=20, validation_alias="DATABASE_MAX_OVERFLOW")
     database_pool_timeout_seconds: int = Field(default=30, validation_alias="DATABASE_POOL_TIMEOUT_SECONDS")

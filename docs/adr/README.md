@@ -74,5 +74,12 @@ ADRs are numbered sequentially (`ADR-0001`, `ADR-0002`, ...) in the order they w
 | [ADR-0009](./ADR-0009-execution-price-evidence-boundary.md) | Execution Price Evidence Boundary | Accepted |
 | [ADR-0010](./ADR-0010-decision-linkage-integrity-guard.md) | Decision Linkage Integrity Guard | Accepted |
 | [ADR-0011](./ADR-0011-autonomous-capital-mandate-engine.md) | Autonomous Capital Mandate Engine | Accepted |
+| [ADR-0012](./ADR-0012-operating-modes-and-adapter-boundaries.md) | Operating Modes and Adapter Boundaries | Accepted |
+| [ADR-0013](./ADR-0013-canonical-simulation-and-evidence-terminology.md) | Canonical Simulation and Evidence Terminology | Accepted |
+| [ADR-0014](./ADR-0014-synthetic-evidence-provenance-and-persistence-isolation.md) | Synthetic Evidence Provenance and Persistence Isolation | Accepted |
+| [ADR-0015](./ADR-0015-point-in-time-knowledge-boundary.md) | Point-in-Time Knowledge Boundary | Accepted |
+| [ADR-0016](./ADR-0016-immutable-historical-dataset-requirement.md) | Immutable Historical Dataset Requirement | Accepted |
 
 This index must be updated whenever a new ADR is added or an existing one's status changes.
+
+Note: `IMPLEMENTATION_MASTER_PLAN.md` Phase 3 refers to these as ADR-0008–0012; those numbers were already taken (Capital Allocation Engine, Execution Price Evidence Boundary, Decision Linkage Integrity Guard, Autonomous Capital Mandate Engine) by the time this phase was implemented, so they were assigned the next available numbers, ADR-0012–0016, per this file's own numbering rule (never renumber or reuse).

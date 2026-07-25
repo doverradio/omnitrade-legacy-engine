@@ -5,7 +5,7 @@ Version:
 2.0
 
 Last Updated:
-2026-07-18
+2026-07-25
 
 Authority:
 Highest
@@ -245,13 +245,34 @@ Both improve together.
 
 ✓ Risk Engine evaluates candidate trades.
 
-✓ Current production blocker:
+✓ Regime-aware strategy weighting is production-validated.
 
-Risk Engine is rejecting BUY candidates before execution.
+✓ BUY candidates have been observed passing Strategy, Economics, and Risk
+and reaching OPEN_POSITION_PROPOSED.
 
-The immediate engineering objective is to determine whether these
-rejections are caused by intentional risk policy,
-position sizing,
-minimum order limits,
-campaign constraints,
-or a configuration defect.
+✓ Current production blocker (revised, replaces the earlier generic
+"Risk Engine is rejecting BUY candidates" diagnosis, which is stale):
+
+The most recent BUY candidate reached OPEN_POSITION_PROPOSED and then
+failed package progression with reason_code=mandate (mandate package
+authorization expired), followed by reason_code=unexpected_executor_failure,
+with live_submission_called=false and provider_submission_called=false.
+Subsequent cycles were genuine HOLD outcomes (weak/conflicting agreement
+or sell_signal_no_position_to_close), not further instances of this
+blocker. This is an execution-pipeline/mandate-authorization issue, not a
+Risk Engine, strategy-threshold, or campaign-limit defect, and it must
+not be diagnosed or fixed as one.
+
+The immediate engineering objective remains reproducing this exact
+package-progression failure and unblocking it, without modifying Risk
+Engine decision math, campaign risk limits, or strategy thresholds.
+
+✓ Parallel authorized lanes (2026-07-25): production proving-campaign
+work (First Autonomous Profit) and expansion-foundation work
+(Historical Intelligence Platform Phase 3: operating modes, evidence
+contracts, isolated simulation persistence) are now both authorized to
+proceed in parallel. Expansion-foundation work is production-isolated
+by construction (separate `SimulationBase`, separate
+`OT_SIMULATION_DATABASE_URL`, `IsolationGuard`) and must never delay or
+alter the live proving campaign. See `02_DECISIONS.md` (2026-07 —
+"Parallel Authorized Lanes").
