@@ -59,6 +59,15 @@ _ACTIVATION_STATES = {"ACTIVE", "PAUSED", "REVOKED", "EXPIRED", "INVALIDATED", "
 
 _EXECUTABLE_ACTIONS = {"OPEN_POSITION_PROPOSED", "CLOSE_POSITION_PROPOSED"}
 _FORCED_COMMISSIONING_MODE = "initial_proving_entry"
+# A second, deliberately distinct forced-entry mode: unlike
+# _FORCED_COMMISSIONING_MODE (which exists solely to bootstrap a campaign's
+# very first-ever package and is hard-blocked once any package already
+# exists -- see _forced_commissioning_guard_blocker), this one is meant to
+# be used repeatedly against an already-active, already-trading campaign.
+# Reuses the exact same "override a HOLD to an executable action, then run
+# every real downstream gate unchanged" mechanism, never conflated with the
+# initial-entry mode's own guards, supersession logic, or provenance labels.
+_CONTROLLED_PROOF_MODE = "controlled_proof"
 _TERMINAL_PACKAGE_STATES = {"EXPIRED", "INVALIDATED", "SUPERSEDED", "COMPLETED", "FAILED_CLOSED"}
 _FORCED_REISSUE_RATIONALE = "expired_unused_initial_proving_entry_reissued"
 _MANDATE_PACKAGE_AUTHORITY_ACTOR = "system:mandate-package-authority"
@@ -93,6 +102,11 @@ class CanonicalPreviewPackageCreateRequest:
     mandate_id: uuid.UUID | None = None
     mandate_version_id: uuid.UUID | None = None
     mandate_evaluation_id: uuid.UUID | None = None
+    # Only meaningful when commissioning_entry_mode == _CONTROLLED_PROOF_MODE:
+    # which executable action to force a HOLD cycle into. Never read for any
+    # other mode.
+    forced_action: str | None = None
+    controlled_proof_id: uuid.UUID | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -226,6 +240,11 @@ def _is_forced_commissioning_mode(request: CanonicalPreviewPackageCreateRequest)
     return value == _FORCED_COMMISSIONING_MODE
 
 
+def _is_controlled_proof_mode(request: CanonicalPreviewPackageCreateRequest) -> bool:
+    value = str(request.commissioning_entry_mode or "").strip().lower()
+    return value == _CONTROLLED_PROOF_MODE
+
+
 def _forced_commissioning_guard_blocker(
     *,
     request: CanonicalPreviewPackageCreateRequest,
@@ -233,6 +252,23 @@ def _forced_commissioning_guard_blocker(
     runtime_campaign: CapitalCampaign,
     prior_packages: int,
 ) -> str | None:
+    if _is_controlled_proof_mode(request):
+        # Deliberately minimal and deliberately NOT the initial-entry guard
+        # below: a controlled proof is expected to run against an
+        # already-active campaign with existing package history -- that is
+        # the whole point, unlike the one-shot initial-entry mode. Only the
+        # basic "campaign is genuinely governing right now" sanity applies;
+        # the controlled_proof service's own scope/authorization/readiness/
+        # position/idempotency checks (run before this is ever reached) are
+        # what actually bound it.
+        if str(definition.status or "").upper() != "READY" or str(runtime_campaign.status or "").upper() != "READY":
+            return "controlled_proof_requires_ready_definition_and_runtime"
+        if request.forced_action not in {"OPEN_POSITION_PROPOSED", "CLOSE_POSITION_PROPOSED"}:
+            return "controlled_proof_requires_valid_forced_action"
+        if request.controlled_proof_id is None:
+            return "controlled_proof_requires_proof_id"
+        return None
+
     if not _is_forced_commissioning_mode(request):
         return None
 
@@ -894,7 +930,7 @@ async def create_canonical_preview_package(
     if request.max_proposed_order_amount != Decimal("5"):
         raise ValueError("max proposed order amount must equal canonical bound of 5")
     mode_value = str(request.commissioning_entry_mode or "").strip().lower()
-    if mode_value and mode_value != _FORCED_COMMISSIONING_MODE:
+    if mode_value and mode_value not in {_FORCED_COMMISSIONING_MODE, _CONTROLLED_PROOF_MODE}:
         raise ValueError(f"unsupported commissioning_entry_mode: {request.commissioning_entry_mode}")
 
     existing = await _load_package_by_idempotency(db=db, idempotency_key=request.idempotency_key)
@@ -996,7 +1032,20 @@ async def create_canonical_preview_package(
     if is_hold_cycle:
         hold_reason = str(selected_decision.get("reason") or cycle.failure_reason or "no_executable_opportunity")
         can_force_commissioning_entry = _is_forced_commissioning_mode(request) and hold_reason == "strategy_hold_signal"
-        if not can_force_commissioning_entry:
+        # Controlled Proof: deliberately more permissive about which HOLD
+        # reason it overrides than the one-shot initial-entry mode above --
+        # "do not need to wait for the normal trading strategy signal"
+        # applies to both entry (strategy_hold_signal) and exit (whatever
+        # the campaign's exit policy's own HOLD reason is, e.g. not yet
+        # profitable). What is NOT relaxed: forced_action must still be a
+        # real executable action, and every check below this point (mandate
+        # evaluation, risk event, strategy/parameter_set resolution) still
+        # runs for real and can still reject it.
+        can_force_controlled_proof = (
+            _is_controlled_proof_mode(request)
+            and request.forced_action in {"OPEN_POSITION_PROPOSED", "CLOSE_POSITION_PROPOSED"}
+        )
+        if not (can_force_commissioning_entry or can_force_controlled_proof):
             return {
                 "idempotent": False,
                 "outcome_code": "HOLD_NO_PACKAGE_CREATED",
@@ -1016,7 +1065,7 @@ async def create_canonical_preview_package(
             }
 
         # Initial operator-commissioned proving entry can bypass strategy HOLD only.
-        proposed_action = "OPEN_POSITION_PROPOSED"
+        proposed_action = "OPEN_POSITION_PROPOSED" if can_force_commissioning_entry else request.forced_action
 
     if proposed_action and proposed_action not in _EXECUTABLE_ACTIONS:
         raise _preview_evidence_error(
@@ -1164,9 +1213,28 @@ async def create_canonical_preview_package(
             "environment": preview.environment,
             "product": preview.product_id,
             "exchange_connection_id": str(preview.exchange_connection_id),
-            "entry_authority": "OPERATOR_COMMISSIONED" if _is_forced_commissioning_mode(request) else "AUTONOMOUS_STRATEGY",
-            "entry_reason": "INITIAL_PROVING_ENTRY" if _is_forced_commissioning_mode(request) else "AUTONOMOUS_SELECTION",
-            "strategy_override_scope": "COMMISSIONING_ENTRY_ONLY" if _is_forced_commissioning_mode(request) else "NONE",
+            # Honest provenance: a controlled-proof-forced package must never
+            # claim AUTONOMOUS_STRATEGY/AUTONOMOUS_SELECTION origin, and must
+            # never be conflated with the one-shot INITIAL_PROVING_ENTRY
+            # mode either -- CONTROLLED_PROOF is its own, distinct, always
+            # truthful label, carrying the originating proof_id.
+            "entry_authority": (
+                "OPERATOR_COMMISSIONED" if _is_forced_commissioning_mode(request) or _is_controlled_proof_mode(request)
+                else "AUTONOMOUS_STRATEGY"
+            ),
+            "entry_reason": (
+                "INITIAL_PROVING_ENTRY" if _is_forced_commissioning_mode(request)
+                else "CONTROLLED_PROOF" if _is_controlled_proof_mode(request)
+                else "AUTONOMOUS_SELECTION"
+            ),
+            "strategy_override_scope": (
+                "COMMISSIONING_ENTRY_ONLY" if _is_forced_commissioning_mode(request)
+                else "CONTROLLED_PROOF_ENTRY" if _is_controlled_proof_mode(request)
+                else "NONE"
+            ),
+            "controlled_proof_id": (
+                str(request.controlled_proof_id) if _is_controlled_proof_mode(request) and request.controlled_proof_id is not None else None
+            ),
             "requested_quote_size": _serialize_decimal(request.max_proposed_order_amount),
             "reissued_from_package_id": (
                 str(supersession_context.reissued_from_package_id) if supersession_context is not None else None

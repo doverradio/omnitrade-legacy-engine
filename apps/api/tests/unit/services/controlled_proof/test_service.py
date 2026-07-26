@@ -1,0 +1,663 @@
+from __future__ import annotations
+
+import uuid
+from contextlib import asynccontextmanager
+from datetime import datetime, timedelta, timezone
+from decimal import Decimal
+from typing import AsyncIterator
+
+import pytest
+from sqlalchemy import select
+from sqlalchemy.ext.asyncio import AsyncSession
+
+from app.core.errors import InvalidRequestError, NotFoundError
+from app.models.asset import Asset
+from app.models.audit_log import AuditLog
+from app.models.autonomous_capital_mandate import AutonomousCapitalMandate
+from app.models.autonomous_capital_mandate_authorization import AutonomousCapitalMandateAuthorization
+from app.models.autonomous_capital_mandate_evaluation import AutonomousCapitalMandateEvaluation
+from app.models.autonomous_capital_mandate_version import AutonomousCapitalMandateVersion
+from app.models.candle import Candle
+from app.models.canonical_preview_package import CanonicalPreviewPackage
+from app.models.capital_campaign import CapitalCampaign
+from app.models.capital_campaign_definition import CapitalCampaignDefinition
+from app.models.controlled_proof_run import ControlledProofRun
+from app.models.decision_record import DecisionRecord
+from app.models.live_accounting_record import LiveAccountingRecord
+from app.models.live_crypto_order import LiveCryptoOrder
+from app.models.live_reconciliation_event import LiveReconciliationEvent
+from app.models.live_trading_profile import LiveTradingProfile
+from app.models.strategy_roster_run import StrategyRosterRun
+from app.services.controlled_proof import service as controlled_proof_service
+from app.services.strategies.identity import build_strategy_identity
+from tests.support.real_sqlite_session import real_sqlite_session
+
+_STRATEGY_IDENTITY = build_strategy_identity(slug="ma_crossover", module_version="1.0.0")
+_CAMPAIGN_ID = controlled_proof_service.ALLOWED_CAMPAIGN_ID
+_ALL_TABLES = [
+    Asset.__table__, AuditLog.__table__, AutonomousCapitalMandate.__table__,
+    AutonomousCapitalMandateVersion.__table__, AutonomousCapitalMandateAuthorization.__table__,
+    AutonomousCapitalMandateEvaluation.__table__, Candle.__table__,
+    CanonicalPreviewPackage.__table__,
+    CapitalCampaign.__table__, CapitalCampaignDefinition.__table__, ControlledProofRun.__table__,
+    DecisionRecord.__table__, LiveAccountingRecord.__table__, LiveCryptoOrder.__table__,
+    LiveReconciliationEvent.__table__, LiveTradingProfile.__table__, StrategyRosterRun.__table__,
+]
+
+
+@asynccontextmanager
+async def _real_session() -> AsyncIterator[AsyncSession]:
+    async with real_sqlite_session(_ALL_TABLES) as session:
+        yield session
+
+
+async def _seed_campaign(
+    session: AsyncSession, *, allowed_instruments: list[str] = ("BTC-USD",),
+) -> uuid.UUID:
+    paper_account_id = uuid.uuid4()
+    session.add(CapitalCampaignDefinition(
+        campaign_id=_CAMPAIGN_ID, version=1, name="test", owner_identity="operator:test", status="READY",
+        capital_budget=Decimal("25"), remaining_unallocated_capital=Decimal("25"), base_currency="USD",
+        allowed_asset_classes=["crypto"], allowed_venues=["kraken_spot"], allowed_instruments=list(allowed_instruments),
+        campaign_modes=[], maximum_open_positions=1, maximum_position_size=Decimal("5"),
+        minimum_position_size=Decimal("1"), maximum_total_exposure=Decimal("5"),
+        profitability_policy_id="p", profitability_policy_version="1", risk_policy_id="r", risk_policy_version="1",
+        compounding_policy={"policy_type": "FIXED_CAPITAL"},
+    ))
+    session.add(CapitalCampaign(
+        uuid=_CAMPAIGN_ID, owner="operator:test", name="test", status="READY", campaign_type="definition_pinned_runtime",
+        definition_campaign_id=_CAMPAIGN_ID, definition_version=1, paper_account_id=paper_account_id,
+        starting_capital=Decimal("25"), current_equity=Decimal("25"),
+    ))
+    session.add(LiveTradingProfile(
+        id=uuid.uuid4(), paper_account_id=paper_account_id, operating_mode="live", lifecycle_state="enabled",
+        approval_state="approved", live_opt_in=True, human_approval_recorded=True, paper_default_mode=True,
+        governance_approved=True, risk_authority_model="risk_engine_final", autonomous_capital_allocation=False,
+        autonomous_strategy_evolution=False, automatic_promotion_enabled=False, provenance_metadata={},
+    ))
+    await session.flush()
+    return paper_account_id
+
+
+async def _seed_asset_with_fresh_candles(session: AsyncSession, *, symbol: str = "BTC") -> Asset:
+    asset = Asset(symbol=symbol, asset_class="crypto", exchange="kraken_spot", base_currency="USD", is_active=True)
+    session.add(asset)
+    await session.flush()
+    now = datetime.now(timezone.utc) - timedelta(minutes=1)
+    for i in range(60, 0, -1):
+        open_time = now - timedelta(minutes=15 * i)
+        session.add(Candle(
+            asset_id=asset.id, interval="15m", open_time=open_time, close_time=open_time + timedelta(minutes=15),
+            open=Decimal("100"), high=Decimal("101"), low=Decimal("99"), close=Decimal("100"),
+            volume=Decimal("1"), source="kraken_spot",
+        ))
+    await session.flush()
+    return asset
+
+
+async def _seed_active_mandate(
+    session: AsyncSession, *, mandate_id: uuid.UUID, allowed_products: tuple[str, ...] = ("BTC-USD",),
+) -> None:
+    session.add(AutonomousCapitalMandate(
+        mandate_id=mandate_id, owner_actor_id="operator:owner", status="ACTIVE", autonomy_level="LEVEL_2",
+        provider="kraken_spot", exchange_environment="production", exchange_connection_id=uuid.uuid4(),
+        live_trading_profile_id=uuid.uuid4(), paper_account_id=uuid.uuid4(), capital_campaign_id=None,
+    ))
+    version = AutonomousCapitalMandateVersion(
+        mandate_version_id=uuid.uuid4(), mandate_id=mandate_id, version_number=1, version_hash="h1",
+        base_currency="USD", authorized_capital_usd=Decimal("25"), max_order_notional_usd=Decimal("5"),
+        max_open_exposure_usd=Decimal("5"), max_daily_deployed_usd=Decimal("5"),
+        max_daily_realized_loss_usd=Decimal("1"), max_campaign_drawdown_usd=Decimal("1"),
+        max_consecutive_losses=2, position_limit=1, price_evidence_max_age_seconds=30,
+        max_slippage_bps=Decimal("20"), max_fee_bps=Decimal("50"), allowed_products=list(allowed_products),
+        allowed_order_sides=["BUY", "SELL"], allowed_strategy_versions=[_STRATEGY_IDENTITY],
+        entry_policy={}, exit_policy={}, cooldown_policy={}, operating_schedule={}, approval_policy="MANDATE_ALLOWED",
+        reconciliation_policy={}, kill_switch_policy={}, owner_acknowledgements={"a": True},
+        authorization_evidence_summary={"b": True}, is_authorized=True, is_active=True,
+    )
+    session.add(version)
+    session.add(AutonomousCapitalMandateAuthorization(
+        mandate_id=mandate_id, mandate_version_id=version.mandate_version_id, authorization_state="AUTHORIZED",
+        approval_result="APPROVAL_SATISFIED_BY_ACTIVE_MANDATE", authorized_by_actor_id="operator:owner",
+        authorization_method="test", owner_acknowledgements={"a": True}, authorization_evidence={"b": True},
+        deterministic_explanation={"c": True}, idempotency_key=f"auth-{mandate_id}",
+    ))
+    await session.flush()
+
+
+def _fully_ready_settings(*, mandate_id: uuid.UUID, additional_products: str = ""):
+    from types import SimpleNamespace
+    return SimpleNamespace(
+        automatic_mandate_package_activation_mandate_id=mandate_id,
+        automatic_mandate_package_activation_campaign_id=_CAMPAIGN_ID,
+        asset_discovery_mode="env",
+        autonomous_cycle_additional_products=additional_products,
+        parsed_autonomous_cycle_additional_products=[p.strip() for p in additional_products.split(",") if p.strip()],
+    )
+
+
+async def _seed_fully_ready_scope(session: AsyncSession, monkeypatch: pytest.MonkeyPatch) -> uuid.UUID:
+    """BTC-USD is always runtime_selected (canonical product); everything
+    else must be established explicitly. Returns the mandate_id."""
+    mandate_id = uuid.uuid4()
+    await _seed_campaign(session, allowed_instruments=["BTC-USD"])
+    await _seed_asset_with_fresh_candles(session, symbol="BTC")
+    await _seed_active_mandate(session, mandate_id=mandate_id, allowed_products=("BTC-USD",))
+    monkeypatch.setattr(
+        "app.services.asset_commissioning.service.get_settings",
+        lambda: _fully_ready_settings(mandate_id=mandate_id),
+    )
+    return mandate_id
+
+
+# --- creation: scope, readiness, idempotency, exclusion -----------------------------
+
+@pytest.mark.asyncio
+async def test_create_requires_full_readiness_and_returns_server_scope(monkeypatch: pytest.MonkeyPatch) -> None:
+    async with _real_session() as session:
+        await _seed_fully_ready_scope(session, monkeypatch)
+        proof = await controlled_proof_service.create_controlled_proof(
+            db=session, product_id="BTC-USD", idempotency_key="proof-1", expires_in_minutes=30, actor="operator:alice",
+        )
+        assert proof.provider == "kraken_spot"
+        assert proof.environment == "production"
+        assert proof.campaign_id == _CAMPAIGN_ID
+        assert proof.campaign_version == 1
+        assert proof.max_notional_usd == Decimal("5")
+        assert proof.status == "REQUESTED"
+
+        audits = (await session.execute(
+            select(AuditLog).where(AuditLog.entity_id == proof.proof_id, AuditLog.action == "controlled_proof_run.requested")
+        )).scalars().all()
+        assert len(audits) == 1
+
+
+@pytest.mark.asyncio
+async def test_create_is_idempotent_on_replay(monkeypatch: pytest.MonkeyPatch) -> None:
+    async with _real_session() as session:
+        await _seed_fully_ready_scope(session, monkeypatch)
+        first = await controlled_proof_service.create_controlled_proof(
+            db=session, product_id="BTC-USD", idempotency_key="proof-dup", expires_in_minutes=30, actor="operator:alice",
+        )
+        second = await controlled_proof_service.create_controlled_proof(
+            db=session, product_id="BTC-USD", idempotency_key="proof-dup", expires_in_minutes=30, actor="operator:alice",
+        )
+        assert first.proof_id == second.proof_id
+        rows = (await session.execute(select(ControlledProofRun))).scalars().all()
+        assert len(rows) == 1
+
+
+@pytest.mark.asyncio
+async def test_second_concurrent_request_is_excluded_while_one_is_active(monkeypatch: pytest.MonkeyPatch) -> None:
+    async with _real_session() as session:
+        await _seed_fully_ready_scope(session, monkeypatch)
+        await controlled_proof_service.create_controlled_proof(
+            db=session, product_id="BTC-USD", idempotency_key="proof-a", expires_in_minutes=30, actor="operator:alice",
+        )
+        with pytest.raises(InvalidRequestError):
+            await controlled_proof_service.create_controlled_proof(
+                db=session, product_id="BTC-USD", idempotency_key="proof-b", expires_in_minutes=30, actor="operator:bob",
+            )
+        rows = (await session.execute(select(ControlledProofRun))).scalars().all()
+        assert len(rows) == 1
+
+
+@pytest.mark.asyncio
+async def test_create_rejects_unauthorized_product_scope(monkeypatch: pytest.MonkeyPatch) -> None:
+    async with _real_session() as session:
+        await _seed_fully_ready_scope(session, monkeypatch)
+        with pytest.raises(InvalidRequestError):
+            await controlled_proof_service.create_controlled_proof(
+                db=session, product_id="ETH-USD", idempotency_key="proof-eth", expires_in_minutes=30, actor="operator:alice",
+            )
+        rows = (await session.execute(select(ControlledProofRun))).scalars().all()
+        assert rows == []
+
+
+@pytest.mark.asyncio
+async def test_create_rejects_when_mandate_does_not_authorize_product(monkeypatch: pytest.MonkeyPatch) -> None:
+    async with _real_session() as session:
+        mandate_id = uuid.uuid4()
+        await _seed_campaign(session, allowed_instruments=["BTC-USD"])
+        await _seed_asset_with_fresh_candles(session, symbol="BTC")
+        # Mandate exists and is ACTIVE, but its authorized version does not
+        # include BTC-USD -- campaign_authorized True, mandate_authorized False.
+        await _seed_active_mandate(session, mandate_id=mandate_id, allowed_products=("SOL-USD",))
+        monkeypatch.setattr(
+            "app.services.asset_commissioning.service.get_settings",
+            lambda: _fully_ready_settings(mandate_id=mandate_id),
+        )
+        with pytest.raises(InvalidRequestError) as excinfo:
+            await controlled_proof_service.create_controlled_proof(
+                db=session, product_id="BTC-USD", idempotency_key="proof-mandate", expires_in_minutes=30, actor="operator:alice",
+            )
+        assert "mandate_authorized" in str(excinfo.value.details.get("unmet_readiness"))
+
+
+@pytest.mark.asyncio
+async def test_create_rejects_stale_market_data(monkeypatch: pytest.MonkeyPatch) -> None:
+    async with _real_session() as session:
+        mandate_id = uuid.uuid4()
+        await _seed_campaign(session, allowed_instruments=["BTC-USD"])
+        asset = Asset(symbol="BTC", asset_class="crypto", exchange="kraken_spot", base_currency="USD", is_active=True)
+        session.add(asset)
+        await session.flush()
+        stale_time = datetime.now(timezone.utc) - timedelta(hours=6)
+        for i in range(60, 0, -1):
+            open_time = stale_time - timedelta(minutes=15 * i)
+            session.add(Candle(
+                asset_id=asset.id, interval="15m", open_time=open_time, close_time=open_time + timedelta(minutes=15),
+                open=Decimal("100"), high=Decimal("101"), low=Decimal("99"), close=Decimal("100"),
+                volume=Decimal("1"), source="kraken_spot",
+            ))
+        await session.flush()
+        await _seed_active_mandate(session, mandate_id=mandate_id, allowed_products=("BTC-USD",))
+        monkeypatch.setattr(
+            "app.services.asset_commissioning.service.get_settings",
+            lambda: _fully_ready_settings(mandate_id=mandate_id),
+        )
+        with pytest.raises(InvalidRequestError) as excinfo:
+            await controlled_proof_service.create_controlled_proof(
+                db=session, product_id="BTC-USD", idempotency_key="proof-stale", expires_in_minutes=30, actor="operator:alice",
+            )
+        assert "market_data_current" in str(excinfo.value.details.get("unmet_readiness"))
+
+
+@pytest.mark.asyncio
+async def test_create_rejects_when_open_position_already_exists(monkeypatch: pytest.MonkeyPatch) -> None:
+    async with _real_session() as session:
+        await _seed_fully_ready_scope(session, monkeypatch)
+        runtime = await session.scalar(select(CapitalCampaign).where(CapitalCampaign.uuid == _CAMPAIGN_ID))
+        profile = await session.scalar(select(LiveTradingProfile).where(LiveTradingProfile.paper_account_id == runtime.paper_account_id))
+        session.add(LiveAccountingRecord(
+            idempotency_key="fill-1", live_trading_profile_id=profile.id, capital_campaign_id=runtime.id,
+            reconciliation_event_id=uuid.uuid4(), source_execution_event_id=uuid.uuid4(),
+            source_execution_event_type="execution_intent_created", record_type="fill_accounting", provider_order_id="o1",
+            symbol="BTC-USD", side="buy", filled_quantity=Decimal("0.001"), fill_price=Decimal("50000"),
+            gross_notional=Decimal("50"), fee_amount=Decimal("0.05"), fee_currency="USD",
+            net_cash_impact=Decimal("-50.05"), provenance={}, recorded_at=datetime.now(timezone.utc),
+        ))
+        await session.flush()
+        with pytest.raises(InvalidRequestError):
+            await controlled_proof_service.create_controlled_proof(
+                db=session, product_id="BTC-USD", idempotency_key="proof-openpos", expires_in_minutes=30, actor="operator:alice",
+            )
+
+
+# --- cancellation --------------------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_cancel_requested_proof_succeeds(monkeypatch: pytest.MonkeyPatch) -> None:
+    async with _real_session() as session:
+        await _seed_fully_ready_scope(session, monkeypatch)
+        proof = await controlled_proof_service.create_controlled_proof(
+            db=session, product_id="BTC-USD", idempotency_key="proof-cancel", expires_in_minutes=30, actor="operator:alice",
+        )
+        cancelled = await controlled_proof_service.cancel_controlled_proof(
+            db=session, proof_id=proof.proof_id, actor="operator:alice", reason="testing",
+        )
+        assert cancelled.status == "CANCELLED"
+        assert cancelled.cancelled_by == "operator:alice"
+        audits = (await session.execute(
+            select(AuditLog).where(AuditLog.entity_id == proof.proof_id, AuditLog.action == "controlled_proof_run.cancelled")
+        )).scalars().all()
+        assert len(audits) == 1
+
+
+@pytest.mark.asyncio
+async def test_cancel_after_entry_proposed_is_rejected(monkeypatch: pytest.MonkeyPatch) -> None:
+    async with _real_session() as session:
+        await _seed_fully_ready_scope(session, monkeypatch)
+        proof = await controlled_proof_service.create_controlled_proof(
+            db=session, product_id="BTC-USD", idempotency_key="proof-cancel2", expires_in_minutes=30, actor="operator:alice",
+        )
+        proof = await controlled_proof_service.claim_next_controlled_proof_for_scope(
+            db=session, campaign_id=_CAMPAIGN_ID, campaign_version=1, provider="kraken_spot",
+            environment="production", product_id="BTC-USD", cycle_id=uuid.uuid4(),
+        )
+        await controlled_proof_service.link_controlled_proof_entry(
+            db=session, proof=proof, decision_record_id=uuid.uuid4(),
+            mandate_id=None, mandate_version_id=None, mandate_evaluation_id=None,
+        )
+        with pytest.raises(InvalidRequestError):
+            await controlled_proof_service.cancel_controlled_proof(
+                db=session, proof_id=proof.proof_id, actor="operator:alice", reason="too late",
+            )
+
+
+@pytest.mark.asyncio
+async def test_cancel_unknown_proof_raises_not_found() -> None:
+    async with _real_session() as session:
+        with pytest.raises(NotFoundError):
+            await controlled_proof_service.cancel_controlled_proof(
+                db=session, proof_id=uuid.uuid4(), actor="operator:alice", reason=None,
+            )
+
+
+# --- worker claim: exactly-once, restart-safe, idempotent linkage -------------------
+
+@pytest.mark.asyncio
+async def test_claim_transitions_requested_to_claimed_exactly_once(monkeypatch: pytest.MonkeyPatch) -> None:
+    async with _real_session() as session:
+        await _seed_fully_ready_scope(session, monkeypatch)
+        proof = await controlled_proof_service.create_controlled_proof(
+            db=session, product_id="BTC-USD", idempotency_key="proof-claim", expires_in_minutes=30, actor="operator:alice",
+        )
+        cycle_id = uuid.uuid4()
+        claimed = await controlled_proof_service.claim_next_controlled_proof_for_scope(
+            db=session, campaign_id=_CAMPAIGN_ID, campaign_version=1, provider="kraken_spot",
+            environment="production", product_id="BTC-USD", cycle_id=cycle_id,
+        )
+        assert claimed is not None
+        assert claimed.proof_id == proof.proof_id
+        assert claimed.status == "CLAIMED"
+        assert claimed.claimed_by_cycle_id == cycle_id
+
+        claim_audits = (await session.execute(
+            select(AuditLog).where(AuditLog.entity_id == proof.proof_id, AuditLog.action == "controlled_proof_run.claimed")
+        )).scalars().all()
+        assert len(claim_audits) == 1
+
+
+@pytest.mark.asyncio
+async def test_repeated_claim_calls_simulating_worker_restart_do_not_reclaim_or_duplicate(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A worker restart re-runs the same per-cycle claim lookup. It must
+    keep finding the SAME already-CLAIMED proof, never create a second one,
+    and never emit a second 'claimed' audit entry."""
+    async with _real_session() as session:
+        await _seed_fully_ready_scope(session, monkeypatch)
+        proof = await controlled_proof_service.create_controlled_proof(
+            db=session, product_id="BTC-USD", idempotency_key="proof-restart", expires_in_minutes=30, actor="operator:alice",
+        )
+        first = await controlled_proof_service.claim_next_controlled_proof_for_scope(
+            db=session, campaign_id=_CAMPAIGN_ID, campaign_version=1, provider="kraken_spot",
+            environment="production", product_id="BTC-USD", cycle_id=uuid.uuid4(),
+        )
+        second = await controlled_proof_service.claim_next_controlled_proof_for_scope(
+            db=session, campaign_id=_CAMPAIGN_ID, campaign_version=1, provider="kraken_spot",
+            environment="production", product_id="BTC-USD", cycle_id=uuid.uuid4(),
+        )
+        assert first.proof_id == second.proof_id == proof.proof_id
+        assert second.claimed_by_cycle_id == first.claimed_by_cycle_id, "second call must not reassign the claim"
+
+        rows = (await session.execute(select(ControlledProofRun))).scalars().all()
+        assert len(rows) == 1
+        claim_audits = (await session.execute(
+            select(AuditLog).where(AuditLog.entity_id == proof.proof_id, AuditLog.action == "controlled_proof_run.claimed")
+        )).scalars().all()
+        assert len(claim_audits) == 1
+
+
+@pytest.mark.asyncio
+async def test_link_entry_and_package_are_idempotent_no_duplicate_buy(monkeypatch: pytest.MonkeyPatch) -> None:
+    async with _real_session() as session:
+        await _seed_fully_ready_scope(session, monkeypatch)
+        proof = await controlled_proof_service.create_controlled_proof(
+            db=session, product_id="BTC-USD", idempotency_key="proof-link", expires_in_minutes=30, actor="operator:alice",
+        )
+        proof = await controlled_proof_service.claim_next_controlled_proof_for_scope(
+            db=session, campaign_id=_CAMPAIGN_ID, campaign_version=1, provider="kraken_spot",
+            environment="production", product_id="BTC-USD", cycle_id=uuid.uuid4(),
+        )
+        decision_id = uuid.uuid4()
+        package_id = uuid.uuid4()
+        await controlled_proof_service.link_controlled_proof_entry(
+            db=session, proof=proof, decision_record_id=decision_id,
+            mandate_id=None, mandate_version_id=None, mandate_evaluation_id=None,
+        )
+        await controlled_proof_service.link_controlled_proof_package(db=session, proof=proof, package_id=package_id)
+        assert proof.status == "PACKAGE_CREATED"
+
+        # Simulate a replayed cycle attempting to link a DIFFERENT decision/package.
+        other_decision = uuid.uuid4()
+        other_package = uuid.uuid4()
+        await controlled_proof_service.link_controlled_proof_entry(
+            db=session, proof=proof, decision_record_id=other_decision,
+            mandate_id=None, mandate_version_id=None, mandate_evaluation_id=None,
+        )
+        await controlled_proof_service.link_controlled_proof_package(db=session, proof=proof, package_id=other_package)
+
+        assert proof.decision_record_id == decision_id, "must not overwrite the one controlled entry"
+        assert proof.package_id == package_id, "must not overwrite the linked package"
+
+        entry_audits = (await session.execute(
+            select(AuditLog).where(AuditLog.entity_id == proof.proof_id, AuditLog.action == "controlled_proof_run.entry_linked")
+        )).scalars().all()
+        assert len(entry_audits) == 1
+
+
+@pytest.mark.asyncio
+async def test_expired_proof_is_not_claimable_and_transitions_to_expired(monkeypatch: pytest.MonkeyPatch) -> None:
+    async with _real_session() as session:
+        await _seed_fully_ready_scope(session, monkeypatch)
+        proof = await controlled_proof_service.create_controlled_proof(
+            db=session, product_id="BTC-USD", idempotency_key="proof-expire", expires_in_minutes=30, actor="operator:alice",
+        )
+        proof.expires_at = datetime.now(timezone.utc) - timedelta(minutes=1)
+        await session.flush()
+
+        claimed = await controlled_proof_service.claim_next_controlled_proof_for_scope(
+            db=session, campaign_id=_CAMPAIGN_ID, campaign_version=1, provider="kraken_spot",
+            environment="production", product_id="BTC-USD", cycle_id=uuid.uuid4(),
+        )
+        assert claimed is None
+
+        refreshed = await session.get(ControlledProofRun, proof.proof_id)
+        assert refreshed.status == "EXPIRED"
+
+
+# --- status view: downstream linkage, reconciliation, net P&L derivation ------------
+
+@pytest.mark.asyncio
+async def test_status_view_derives_reconciled_without_fabricating_profit(monkeypatch: pytest.MonkeyPatch) -> None:
+    async with _real_session() as session:
+        await _seed_fully_ready_scope(session, monkeypatch)
+        proof = await controlled_proof_service.create_controlled_proof(
+            db=session, product_id="BTC-USD", idempotency_key="proof-pnl", expires_in_minutes=30, actor="operator:alice",
+        )
+        proof = await controlled_proof_service.claim_next_controlled_proof_for_scope(
+            db=session, campaign_id=_CAMPAIGN_ID, campaign_version=1, provider="kraken_spot",
+            environment="production", product_id="BTC-USD", cycle_id=uuid.uuid4(),
+        )
+        decision_id = uuid.uuid4()
+        session.add(DecisionRecord(
+            decision_id=decision_id, idempotency_key=f"dr-{decision_id}", source_lineage={}, field_provenance={},
+            version="1", timestamp=datetime.now(timezone.utc), asset={"symbol": "BTC-USD"}, timeframe="15m",
+            market_regime={}, indicators={}, generated_signals=[], supporting_strategies=[], opposing_strategies=[],
+            risk_adjustments=[], trade_accepted=True,
+        ))
+        await session.flush()
+        await controlled_proof_service.link_controlled_proof_entry(
+            db=session, proof=proof, decision_record_id=decision_id,
+            mandate_id=None, mandate_version_id=None, mandate_evaluation_id=None,
+        )
+        package_id = uuid.uuid4()
+        await controlled_proof_service.link_controlled_proof_package(db=session, proof=proof, package_id=package_id)
+
+        runtime = await session.scalar(select(CapitalCampaign).where(CapitalCampaign.uuid == _CAMPAIGN_ID))
+        profile = await session.scalar(select(LiveTradingProfile).where(LiveTradingProfile.paper_account_id == runtime.paper_account_id))
+        buy_order_id = uuid.uuid4()
+        sell_order_id = uuid.uuid4()
+        session.add(LiveCryptoOrder(
+            live_crypto_order_id=buy_order_id, crypto_order_preview_id=uuid.uuid4(), exchange_connection_id=uuid.uuid4(),
+            provider="kraken_spot", environment="production", product_id="BTC-USD", side="BUY", order_type="MARKET",
+            requested_quote_size=Decimal("5"), client_order_id="c-buy", status="FILLED",
+            decision_record_id=decision_id, filled_at=datetime.now(timezone.utc), audit_correlation_id=uuid.uuid4(),
+        ))
+        session.add(LiveCryptoOrder(
+            live_crypto_order_id=sell_order_id, crypto_order_preview_id=uuid.uuid4(), exchange_connection_id=uuid.uuid4(),
+            provider="kraken_spot", environment="production", product_id="BTC-USD", side="SELL", order_type="MARKET",
+            requested_quote_size=Decimal("5"), client_order_id="c-sell", status="FILLED",
+            filled_at=datetime.now(timezone.utc), audit_correlation_id=uuid.uuid4(),
+        ))
+        now = datetime.now(timezone.utc)
+        session.add(LiveAccountingRecord(
+            idempotency_key="fill-buy", live_trading_profile_id=profile.id, capital_campaign_id=runtime.id,
+            live_crypto_order_id=buy_order_id, reconciliation_event_id=uuid.uuid4(), source_execution_event_id=uuid.uuid4(),
+            source_execution_event_type="execution_intent_created", record_type="fill_accounting", provider_order_id="p-buy",
+            symbol="BTC-USD", side="buy", filled_quantity=Decimal("0.0001"), fill_price=Decimal("50000"),
+            gross_notional=Decimal("5"), fee_amount=Decimal("0.02"), fee_currency="USD",
+            net_cash_impact=Decimal("-5.02"), provenance={}, recorded_at=now,
+        ))
+        session.add(LiveAccountingRecord(
+            idempotency_key="fill-sell", live_trading_profile_id=profile.id, capital_campaign_id=runtime.id,
+            live_crypto_order_id=sell_order_id, reconciliation_event_id=uuid.uuid4(), source_execution_event_id=uuid.uuid4(),
+            source_execution_event_type="execution_intent_created", record_type="fill_accounting", provider_order_id="p-sell",
+            symbol="BTC-USD", side="sell", filled_quantity=Decimal("0.0001"), fill_price=Decimal("50010"),
+            gross_notional=Decimal("5.001"), fee_amount=Decimal("0.02"), fee_currency="USD",
+            net_cash_impact=Decimal("4.961"), provenance={}, recorded_at=now + timedelta(minutes=1),
+        ))
+        await session.flush()
+
+        view = await controlled_proof_service.get_controlled_proof_view(db=session, proof_id=proof.proof_id)
+
+        assert view["decision"]["decision_record_id"] == str(decision_id)
+        assert view["package"] is None or view["package"]["package_id"] == str(package_id)
+        assert view["buy_order"]["live_crypto_order_id"] == str(buy_order_id)
+        assert view["sell_order"]["live_crypto_order_id"] == str(sell_order_id)
+        # Net cash impact here is -5.02 + 4.961 = -0.059: a real, small net
+        # LOSS after fees on both legs. The view must never report
+        # PROFIT_CONFIRMED for a non-positive net P&L.
+        assert view["net_pnl_usd"] == Decimal("-0.059")
+        assert view["status"] in {"RECONCILED", "EXITED"}
+        assert view["status"] != "PROFIT_CONFIRMED"
+        # Requirement 9: actual fills and fees determine the terminal
+        # verdict -- a real net loss must be reported as
+        # LIFECYCLE_PROVEN_LOSS, never LIFECYCLE_PROVEN_PROFIT.
+        assert view["terminal_verdict"] == "LIFECYCLE_PROVEN_LOSS"
+
+
+async def _seed_reconciled_round_trip(
+    session: AsyncSession, monkeypatch: pytest.MonkeyPatch, *, sell_net_cash_impact: Decimal, idempotency_prefix: str,
+) -> uuid.UUID:
+    """Shared setup for terminal-verdict tests: a claimed proof with a real,
+    linked BUY entry/package and a real, filled BUY+SELL round trip whose net
+    P&L is controlled entirely by sell_net_cash_impact."""
+    await _seed_fully_ready_scope(session, monkeypatch)
+    proof = await controlled_proof_service.create_controlled_proof(
+        db=session, product_id="BTC-USD", idempotency_key=f"{idempotency_prefix}-req", expires_in_minutes=30, actor="operator:alice",
+    )
+    proof = await controlled_proof_service.claim_next_controlled_proof_for_scope(
+        db=session, campaign_id=_CAMPAIGN_ID, campaign_version=1, provider="kraken_spot",
+        environment="production", product_id="BTC-USD", cycle_id=uuid.uuid4(),
+    )
+    decision_id = uuid.uuid4()
+    session.add(DecisionRecord(
+        decision_id=decision_id, idempotency_key=f"dr-{decision_id}", source_lineage={}, field_provenance={},
+        version="1", timestamp=datetime.now(timezone.utc), asset={"symbol": "BTC-USD"}, timeframe="15m",
+        market_regime={}, indicators={}, generated_signals=[], supporting_strategies=[], opposing_strategies=[],
+        risk_adjustments=[], trade_accepted=True,
+    ))
+    await session.flush()
+    await controlled_proof_service.link_controlled_proof_entry(
+        db=session, proof=proof, decision_record_id=decision_id,
+        mandate_id=None, mandate_version_id=None, mandate_evaluation_id=None,
+    )
+    package_id = uuid.uuid4()
+    await controlled_proof_service.link_controlled_proof_package(db=session, proof=proof, package_id=package_id)
+
+    runtime = await session.scalar(select(CapitalCampaign).where(CapitalCampaign.uuid == _CAMPAIGN_ID))
+    profile = await session.scalar(select(LiveTradingProfile).where(LiveTradingProfile.paper_account_id == runtime.paper_account_id))
+    buy_order_id = uuid.uuid4()
+    sell_order_id = uuid.uuid4()
+    session.add(LiveCryptoOrder(
+        live_crypto_order_id=buy_order_id, crypto_order_preview_id=uuid.uuid4(), exchange_connection_id=uuid.uuid4(),
+        provider="kraken_spot", environment="production", product_id="BTC-USD", side="BUY", order_type="MARKET",
+        requested_quote_size=Decimal("5"), client_order_id=f"{idempotency_prefix}-buy", status="FILLED",
+        decision_record_id=decision_id, filled_at=datetime.now(timezone.utc), audit_correlation_id=uuid.uuid4(),
+    ))
+    session.add(LiveCryptoOrder(
+        live_crypto_order_id=sell_order_id, crypto_order_preview_id=uuid.uuid4(), exchange_connection_id=uuid.uuid4(),
+        provider="kraken_spot", environment="production", product_id="BTC-USD", side="SELL", order_type="MARKET",
+        requested_quote_size=Decimal("5"), client_order_id=f"{idempotency_prefix}-sell", status="FILLED",
+        filled_at=datetime.now(timezone.utc), audit_correlation_id=uuid.uuid4(),
+    ))
+    now = datetime.now(timezone.utc)
+    session.add(LiveAccountingRecord(
+        idempotency_key=f"{idempotency_prefix}-fill-buy", live_trading_profile_id=profile.id, capital_campaign_id=runtime.id,
+        live_crypto_order_id=buy_order_id, reconciliation_event_id=uuid.uuid4(), source_execution_event_id=uuid.uuid4(),
+        source_execution_event_type="execution_intent_created", record_type="fill_accounting", provider_order_id="p-buy",
+        symbol="BTC-USD", side="buy", filled_quantity=Decimal("0.0001"), fill_price=Decimal("50000"),
+        gross_notional=Decimal("5"), fee_amount=Decimal("0.02"), fee_currency="USD",
+        net_cash_impact=Decimal("-5.02"), provenance={}, recorded_at=now,
+    ))
+    session.add(LiveAccountingRecord(
+        idempotency_key=f"{idempotency_prefix}-fill-sell", live_trading_profile_id=profile.id, capital_campaign_id=runtime.id,
+        live_crypto_order_id=sell_order_id, reconciliation_event_id=uuid.uuid4(), source_execution_event_id=uuid.uuid4(),
+        source_execution_event_type="execution_intent_created", record_type="fill_accounting", provider_order_id="p-sell",
+        symbol="BTC-USD", side="sell", filled_quantity=Decimal("0.0001"), fill_price=Decimal("50010"),
+        gross_notional=Decimal("5.001"), fee_amount=Decimal("0.02"), fee_currency="USD",
+        net_cash_impact=sell_net_cash_impact, provenance={}, recorded_at=now + timedelta(minutes=1),
+    ))
+    await session.flush()
+    return proof.proof_id
+
+
+@pytest.mark.asyncio
+async def test_status_view_computes_profit_verdict_from_real_fills(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Requirement 9 (profit branch): a real net-positive P&L across the
+    actual BUY and SELL fills is reported as LIFECYCLE_PROVEN_PROFIT."""
+    async with _real_session() as session:
+        proof_id = await _seed_reconciled_round_trip(
+            session, monkeypatch, sell_net_cash_impact=Decimal("5.50"), idempotency_prefix="proof-profit",
+        )
+        view = await controlled_proof_service.get_controlled_proof_view(db=session, proof_id=proof_id)
+        # -5.02 + 5.50 = 0.48: a real net PROFIT after fees on both legs.
+        assert view["net_pnl_usd"] == Decimal("0.48")
+        assert view["terminal_verdict"] == "LIFECYCLE_PROVEN_PROFIT"
+
+
+@pytest.mark.asyncio
+async def test_status_view_computes_flat_verdict_from_real_fills(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Requirement 9 (flat branch): an exact real net-zero P&L is reported
+    as LIFECYCLE_PROVEN_FLAT -- never PROFIT, never LOSS."""
+    async with _real_session() as session:
+        proof_id = await _seed_reconciled_round_trip(
+            session, monkeypatch, sell_net_cash_impact=Decimal("5.02"), idempotency_prefix="proof-flat",
+        )
+        view = await controlled_proof_service.get_controlled_proof_view(db=session, proof_id=proof_id)
+        assert view["net_pnl_usd"] == Decimal("0")
+        assert view["terminal_verdict"] == "LIFECYCLE_PROVEN_FLAT"
+
+
+@pytest.mark.asyncio
+async def test_status_view_reports_blocked_verdict_when_proof_expires_before_any_entry(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A proof that expires while real gates (mandate/risk/evidence) never
+    let a controlled BUY get proposed is a genuine BLOCKED outcome, not a
+    silent no-op -- distinct from a lifecycle that ran and lost money."""
+    async with _real_session() as session:
+        await _seed_fully_ready_scope(session, monkeypatch)
+        proof = await controlled_proof_service.create_controlled_proof(
+            db=session, product_id="BTC-USD", idempotency_key="proof-blocked", expires_in_minutes=30, actor="operator:alice",
+        )
+        proof.expires_at = datetime.now(timezone.utc) - timedelta(minutes=1)
+        await session.flush()
+
+        view = await controlled_proof_service.get_controlled_proof_view(db=session, proof_id=proof.proof_id)
+
+        assert view["status"] == "EXPIRED"
+        assert view["terminal_verdict"] == "BLOCKED"
+
+
+# --- no direct provider submission ---------------------------------------------------
+
+def test_service_module_never_references_provider_submission() -> None:
+    """Static proof, not behavioral: the controlled-proof service must never
+    import or call anything that submits an order to a provider. Mirrors the
+    existing test_no_execution_side_effect_imports/test_no_provider_order_calls
+    pattern already used for capital_campaign_domain."""
+    import pathlib
+
+    root = pathlib.Path(__file__).resolve().parents[4] / "app" / "services" / "controlled_proof"
+    source = "\n".join((root / name).read_text() for name in ["service.py", "__init__.py"]).lower()
+    for forbidden in ("live_service.submit", "create_order", "submit_order", "kraken_spot.py", "exchange_connections.providers"):
+        assert forbidden not in source, f"forbidden reference found: {forbidden}"
+
+
+def test_routes_module_never_references_provider_submission() -> None:
+    import pathlib
+
+    path = pathlib.Path(__file__).resolve().parents[4] / "app" / "api" / "routes" / "controlled_proofs.py"
+    source = path.read_text().lower()
+    for forbidden in ("live_service.submit", "create_order", "submit_order", "kraken", "provider_client"):
+        assert forbidden not in source, f"forbidden reference found: {forbidden}"

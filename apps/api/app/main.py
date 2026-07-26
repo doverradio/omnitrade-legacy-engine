@@ -10,6 +10,7 @@ from app.api.routes.backtests import router as backtests_router
 from app.api.routes.crypto_order_previews import router as crypto_order_previews_router
 from app.api.routes.capital import router as capital_router
 from app.api.routes.capital_campaigns import router as capital_campaigns_router
+from app.api.routes.controlled_proofs import router as controlled_proofs_router
 from app.api.routes.dashboard import router as dashboard_router
 from app.api.routes.decisions import router as decisions_router
 from app.api.routes.exchange_connections import router as exchange_connections_router
@@ -20,6 +21,7 @@ from app.api.routes.live import router as live_router
 from app.api.routes.mission_control import router as mission_control_router
 from app.api.routes.markets import router as markets_router
 from app.api.routes.operations import router as operations_router
+from app.api.routes.operator_actions import router as operator_actions_router
 from app.api.routes.parameter_sets import router as parameter_sets_router
 from app.api.routes.paper import router as paper_router
 from app.api.routes.research import router as research_router
@@ -66,6 +68,8 @@ def create_app() -> FastAPI:
     app.include_router(arena_router)
     app.include_router(autonomous_capital_mandates_router)
     app.include_router(asset_commissioning_router)
+    app.include_router(controlled_proofs_router)
+    app.include_router(operator_actions_router)
     app.include_router(research_router)
     app.include_router(paper_router)
     app.include_router(risk_router)

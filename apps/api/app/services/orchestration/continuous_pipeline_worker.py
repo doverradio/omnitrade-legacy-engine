@@ -36,6 +36,14 @@ from app.models.strategy import Strategy as StrategyModel
 from app.models.validation_run import ValidationRun
 from app.models.validation_run_event import ValidationRunEvent
 from app.services.canonical_preview_package import CanonicalPreviewPackageCreateRequest, create_canonical_preview_package
+from app.services.controlled_proof import (
+    claim_next_controlled_proof_for_scope,
+    link_controlled_proof_entry,
+    link_controlled_proof_package,
+    link_controlled_proof_sell_package,
+    resolve_controlled_proof_strategy_identity,
+    should_propose_controlled_sell,
+)
 from app.services.ai_coach.deterministic import evaluate_decision_quality_v0
 from app.services.data.binance_client import BinanceUSClient
 from app.services.data.http_client import AsyncHTTPClient
@@ -1123,6 +1131,31 @@ async def _attempt_automatic_ready_package_creation(
         # bound below only applies to new entries.
         is_close_action = "CLOSE_POSITION_PROPOSED" in {proposed_action, decision_kind}
 
+        # Controlled Proof: purely additive. A cheap, side-effect-light
+        # lookup every cycle (single indexed SELECT, no matching row in the
+        # overwhelming common case of no pending proof) that only ever
+        # transitions an operator-requested proof from REQUESTED to CLAIMED.
+        # It does not create, skip, or alter any decision, gate, or package
+        # -- everything below this line runs exactly as it did before this
+        # existed. Deliberately isolated in its own try/except: a defect or
+        # outage in the controlled-proof subsystem must never block, skip,
+        # or otherwise affect the core autonomous package-creation path it
+        # is layered on top of.
+        controlled_proof = None
+        if campaign_id is not None and campaign_version is not None:
+            try:
+                controlled_proof = await claim_next_controlled_proof_for_scope(
+                    db=db, campaign_id=campaign_id, campaign_version=campaign_version,
+                    provider=provider, environment=environment, product_id=product,
+                    cycle_id=cycle_id,
+                )
+            except Exception:
+                logger.exception(
+                    "controlled_proof_claim_lookup_failed campaign_id=%s campaign_version=%s product=%s",
+                    campaign_id, campaign_version, product,
+                )
+                controlled_proof = None
+
         skip_reason = None
         if campaign_id is None or campaign_version is None:
             skip_reason = "campaign_identity_missing"
@@ -1149,6 +1182,47 @@ async def _attempt_automatic_ready_package_creation(
             skip_reason = "non_canonical_amount"
         elif candle_close_time is None:
             skip_reason = "missing_candle_close_time"
+
+        # Controlled Proof: deliberately overrides ONLY the single
+        # "non_executable_action" (ordinary strategy composition said HOLD)
+        # objection, and only when a proof is claimed for this exact scope.
+        # Every other gate above (campaign/product scope, termination
+        # state, decision-record presence, real evidence freshness, real
+        # risk verdict, candle recency) already ran against the cycle's own
+        # real, current data and is re-asserted unchanged below -- this can
+        # never defeat a risk denial or stale-evidence rejection, only the
+        # "nothing to do" HOLD outcome. Never written back to the persisted
+        # cycle row; local to this attempt only. Isolated in its own
+        # try/except: a defect here must never affect the core pipeline.
+        controlled_proof_forced_entry = False
+        if skip_reason == "non_executable_action" and controlled_proof is not None:
+            try:
+                wants_sell = await should_propose_controlled_sell(db=db, proof=controlled_proof)
+                already_has_entry = controlled_proof.decision_record_id is not None
+                target_action = (
+                    "CLOSE_POSITION_PROPOSED" if wants_sell
+                    else None if already_has_entry
+                    else "OPEN_POSITION_PROPOSED"
+                )
+            except Exception:
+                logger.exception("controlled_proof_sell_readiness_check_failed proof_id=%s", controlled_proof.proof_id)
+                target_action = None
+            if target_action is not None:
+                if decision_record_id is None:
+                    skip_reason = "missing_decision_record_id"
+                elif evidence_freshness and evidence_freshness != "fresh":
+                    skip_reason = "stale_market_data"
+                elif risk_verdict != "ALLOW":
+                    skip_reason = "risk_not_permitted"
+                elif candle_close_time is None:
+                    skip_reason = "missing_candle_close_time"
+                else:
+                    skip_reason = None
+                    proposed_action = target_action
+                    decision_kind = target_action
+                    is_close_action = target_action == "CLOSE_POSITION_PROPOSED"
+                    final_amount = _CANONICAL_READY_PACKAGE_AMOUNT
+                    controlled_proof_forced_entry = True
 
         underlying_reason: str | None = None
         rejection_reasons: list[str] = []
@@ -1181,6 +1255,23 @@ async def _attempt_automatic_ready_package_creation(
                     db=db, cycle_id=resolved_originating_cycle_id,
                 )
                 strategy_identity = str(selected_decision.get("strategy_identity") or "").strip()
+                if not strategy_identity and controlled_proof_forced_entry:
+                    # The HOLD cycle's own composition never selected a
+                    # winning strategy (nothing to select for a HOLD) --
+                    # resolve a real, mandate-authorized one independently,
+                    # the same way a genuine autonomous cycle would.
+                    governing_mandate_id = getattr(get_settings(), "automatic_mandate_package_activation_mandate_id", None)
+                    if governing_mandate_id is not None:
+                        try:
+                            strategy_identity = await resolve_controlled_proof_strategy_identity(
+                                db=db, mandate_id=governing_mandate_id,
+                            ) or ""
+                        except Exception:
+                            logger.exception(
+                                "controlled_proof_strategy_identity_resolution_failed proof_id=%s",
+                                getattr(controlled_proof, "proof_id", None),
+                            )
+                            strategy_identity = ""
                 side = "SELL" if is_close_action else "BUY"
                 if not strategy_identity:
                     skip_reason = "campaign_strategy_identity_missing"
@@ -1271,6 +1362,9 @@ async def _attempt_automatic_ready_package_creation(
                             mandate_id=getattr(cycle, "mandate_id", None),
                             mandate_version_id=getattr(cycle, "mandate_version_id", None),
                             mandate_evaluation_id=getattr(cycle, "mandate_evaluation_id", None),
+                            commissioning_entry_mode="controlled_proof" if controlled_proof_forced_entry else None,
+                            forced_action=proposed_action if controlled_proof_forced_entry else None,
+                            controlled_proof_id=getattr(controlled_proof, "proof_id", None) if controlled_proof_forced_entry else None,
                         ),
                     )
                     package = payload.get("package") if isinstance(payload, dict) else None
@@ -1297,6 +1391,35 @@ async def _attempt_automatic_ready_package_creation(
                             package_id,
                             idempotency_key,
                         )
+
+                    # Controlled Proof linkage: purely additive, after the
+                    # existing, unmodified package creation above already
+                    # succeeded. Only when a proof is actually claimed for
+                    # this exact scope. Idempotent: link_controlled_proof_
+                    # entry/_package/_sell_package each no-op once already
+                    # linked, so replays of the same cycle never relink or
+                    # double-propose either side.
+                    if controlled_proof is not None and decision_record_id is not None and package_id is not None:
+                        try:
+                            if not is_close_action:
+                                await link_controlled_proof_entry(
+                                    db=db, proof=controlled_proof, decision_record_id=decision_record_id,
+                                    mandate_id=getattr(cycle, "mandate_id", None),
+                                    mandate_version_id=getattr(cycle, "mandate_version_id", None),
+                                    mandate_evaluation_id=getattr(cycle, "mandate_evaluation_id", None),
+                                )
+                                await link_controlled_proof_package(
+                                    db=db, proof=controlled_proof, package_id=uuid.UUID(package_id),
+                                )
+                            elif controlled_proof.package_id is not None:
+                                await link_controlled_proof_sell_package(
+                                    db=db, proof=controlled_proof, sell_package_id=uuid.UUID(package_id),
+                                )
+                        except Exception:
+                            logger.exception(
+                                "controlled_proof_linkage_failed proof_id=%s decision_record_id=%s package_id=%s is_close_action=%s",
+                                getattr(controlled_proof, "proof_id", None), decision_record_id, package_id, is_close_action,
+                            )
 
         if skip_reason in {None, "active_ready_package_exists"} and campaign_id is not None and campaign_version is not None and decision_record_id is not None:
             try:
