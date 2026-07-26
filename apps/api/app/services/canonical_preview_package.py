@@ -637,14 +637,19 @@ def _selected_strategy_identity(*, selected_decision: dict[str, Any], compositio
     return None
 
 
-def _controlled_proof_decision_idempotency_key(request: CanonicalPreviewPackageCreateRequest) -> str:
-    return f"controlled_proof_forced_entry:{request.controlled_proof_id}:{request.forced_action}"
+def _controlled_proof_decision_idempotency_key(*, controlled_proof_id: uuid.UUID, forced_action: str) -> str:
+    return f"controlled_proof_forced_entry:{controlled_proof_id}:{forced_action}"
 
 
-async def _create_controlled_proof_decision_record(
+async def create_controlled_proof_decision_record(
     *,
     db: AsyncSession,
-    request: CanonicalPreviewPackageCreateRequest,
+    campaign_id: uuid.UUID,
+    controlled_proof_id: uuid.UUID,
+    forced_action: str,
+    product: str,
+    provider: str,
+    actor: str,
     strategy_identity: str,
 ) -> uuid.UUID:
     """A Controlled-Proof-forced action is never organically selected by the
@@ -662,21 +667,35 @@ async def _create_controlled_proof_decision_record(
     (controlled_proof_id, forced_action) the same way the organic
     aggregate decision is idempotent on its own roster-run-scoped key.
 
+    Public (not module-private) and takes primitive fields rather than a
+    CanonicalPreviewPackageCreateRequest: the worker must call this BEFORE
+    the mandate evaluation it writes for a forced entry, so that evaluation
+    references this record's real id instead of the organic cycle's --
+    otherwise create_canonical_preview_package's own
+    mandate_evaluation.decision_id == decision.decision_id check fails
+    every time (canonical_mandate_evaluation_mismatch), since the mandate
+    evaluation would have been computed against a decision identity that
+    predates this record's existence. create_crypto_order_preview_for_
+    package below also calls this (idempotently, same key) so the two call
+    sites always agree on exactly one row.
+
     Never reads or mutates the organic cycle's DecisionRecord in any way.
     """
-    idempotency_key = _controlled_proof_decision_idempotency_key(request)
+    idempotency_key = _controlled_proof_decision_idempotency_key(
+        controlled_proof_id=controlled_proof_id, forced_action=forced_action,
+    )
     existing = await db.scalar(select(DecisionRecord).where(DecisionRecord.idempotency_key == idempotency_key).limit(1))
     if existing is not None:
         return existing.decision_id
 
     now = datetime.now(timezone.utc)
-    action = "BUY" if request.forced_action == "OPEN_POSITION_PROPOSED" else "SELL"
+    action = "BUY" if forced_action == "OPEN_POSITION_PROPOSED" else "SELL"
     record = DecisionRecord(
         idempotency_key=idempotency_key,
         source_lineage={
             "strategy_roster_runs": [],
-            "campaigns": [str(request.campaign_id)],
-            "controlled_proof_runs": [str(request.controlled_proof_id)],
+            "campaigns": [str(campaign_id)],
+            "controlled_proof_runs": [str(controlled_proof_id)],
             # Deliberately not the risk_event_id from the Controlled Proof's
             # own fresh risk gate (evaluate_controlled_proof_risk): that is a
             # distinct risk evaluation from the one create_crypto_order_preview
@@ -690,11 +709,11 @@ async def _create_controlled_proof_decision_record(
             "trades": [],
         },
         field_provenance={
-            "generated_signals": [{"entity_type": "controlled_proof_runs", "entity_id": str(request.controlled_proof_id)}],
+            "generated_signals": [{"entity_type": "controlled_proof_runs", "entity_id": str(controlled_proof_id)}],
         },
         version=DECISION_ENGINE_VERSION,
         timestamp=now,
-        asset={"product_id": request.product, "provider": request.provider},
+        asset={"product_id": product, "provider": provider},
         timeframe="15m",
         market_regime={"state": "unknown", "source": "controlled_proof_forced_evaluation"},
         indicators={},
@@ -711,8 +730,8 @@ async def _create_controlled_proof_decision_record(
         trade_rejected_reason=None,
         execution_details={
             "stage": "controlled_proof_forced_entry",
-            "actor": request.actor,
-            "controlled_proof_id": str(request.controlled_proof_id),
+            "actor": actor,
+            "controlled_proof_id": str(controlled_proof_id),
         },
         exit_details=None,
         pnl=None,
@@ -822,11 +841,14 @@ async def _create_crypto_order_preview_for_package(
         # A Controlled-Proof-forced action must never be linked to the
         # organic cycle's own DecisionRecord -- that record describes a
         # different, genuinely organic evaluation (see
-        # _create_controlled_proof_decision_record's docstring). Create (or
-        # idempotently reuse) a decision record that truthfully describes
-        # this forced action instead.
-        decision_record_id = await _create_controlled_proof_decision_record(
-            db=db, request=request, strategy_identity=strategy_identity,
+        # create_controlled_proof_decision_record's docstring). Create (or,
+        # idempotently, reuse the one the worker already created before its
+        # own mandate evaluation) a decision record that truthfully
+        # describes this forced action instead.
+        decision_record_id = await create_controlled_proof_decision_record(
+            db=db, campaign_id=request.campaign_id, controlled_proof_id=request.controlled_proof_id,
+            forced_action=request.forced_action, product=request.product, provider=request.provider,
+            actor=request.actor, strategy_identity=strategy_identity,
         )
     else:
         decision_record_id = _selected_decision_record_id(selected_decision)

@@ -1642,20 +1642,13 @@ async def test_controlled_proof_decision_record_idempotent_reuse_does_not_duplic
     create a second one -- mirroring the organic
     strategy_aggregate_decision idempotency pattern."""
     proof_id = uuid4()
-    request = _create_request(
-        campaign_id=uuid4(),
-        profile=_profile(),
-        idempotency_key="pkg-controlled-proof-idempotent",
-        commissioning_entry_mode="controlled_proof",
-        forced_action="OPEN_POSITION_PROPOSED",
-        controlled_proof_id=proof_id,
-    )
     existing_decision_id = uuid4()
     existing = SimpleNamespace(decision_id=existing_decision_id)
 
     db = _FakeDb(scalar_values=[existing])
-    result = await cpp._create_controlled_proof_decision_record(
-        db=db, request=request, strategy_identity="ma_crossover@1.0.0",
+    result = await cpp.create_controlled_proof_decision_record(
+        db=db, campaign_id=uuid4(), controlled_proof_id=proof_id, forced_action="OPEN_POSITION_PROPOSED",
+        product="BTC-USD", provider="kraken_spot", actor="operator:human", strategy_identity="ma_crossover@1.0.0",
     )
 
     assert result == existing_decision_id
@@ -1709,6 +1702,110 @@ async def test_controlled_proof_forced_entry_never_touches_organic_decision_reco
     assert len(created_records) == 1
     assert created_records[0].decision_id != organic_decision_id
     assert all(getattr(obj, "decision_id", None) != organic_decision_id for obj in db.added)
+
+
+@pytest.mark.asyncio
+async def test_controlled_proof_forced_entry_proceeds_past_mandate_evaluation_check(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Regression test for a real production incident: create_canonical_
+    preview_package's mandate_evaluation.decision_id == decision.decision_id
+    check (canonical_mandate_evaluation_mismatch) failed on every genuine
+    controlled-proof-forced attempt in production, because the worker wrote
+    the mandate evaluation against the organic cycle's decision_record_id
+    while the package ended up bound to the newly-created Controlled Proof
+    DecisionRecord -- two different ids. The fix makes the worker create
+    the Controlled Proof DecisionRecord BEFORE mandate evaluation and pass
+    its id in, so the mandate evaluation and the package always agree. This
+    test proves that when the mandate evaluation's decision_id matches
+    whatever create_controlled_proof_decision_record produces (exactly
+    what the fixed worker now guarantees), the full
+    create_canonical_preview_package flow proceeds past the mandate check
+    without raising."""
+    campaign_id = uuid4()
+    proof_id = uuid4()
+    mandate_id = uuid4()
+    mandate_version_id = uuid4()
+    mandate_evaluation_id = uuid4()
+    profile = SimpleNamespace(
+        id=uuid4(), paper_account_id=uuid4(),
+        provenance_metadata={"provider": "kraken_spot", "exchange_environment": "production"},
+    )
+    runtime_campaign = SimpleNamespace(uuid=campaign_id, status="READY")
+    definition = _definition(campaign_id=campaign_id, campaign_version=1)
+    definition.status = "READY"
+    definition.metadata_evidence = {}
+    cycle = _cycle(proposed_action="HOLD", termination_stage="hold_no_package_created")
+    cycle.cycle_context["authoritative_composition"]["selected_decision"] = {
+        "decision_kind": "HOLD", "reason": "strategy_hold_signal", "strategy_identity": "ma_crossover@1.0.0",
+    }
+
+    # Exactly what the fixed worker now does: create the Controlled Proof
+    # DecisionRecord first, and use ITS id -- not any organic one -- for
+    # the mandate evaluation that create_canonical_preview_package will
+    # later validate against.
+    controlled_proof_decision_id = uuid4()
+
+    async def _fake_create_controlled_proof_decision_record(**_kwargs):
+        return controlled_proof_decision_id
+
+    strategy = SimpleNamespace(id=uuid4(), slug="ma_crossover")
+    parameter_set = SimpleNamespace(id=uuid4())
+    preview_id = uuid4()
+    preview = _preview(package_id=preview_id)
+    preview.status = "PREVIEW_READY"
+    preview.parameter_set_id = None
+    preview.side = "BUY"
+
+    mandate_evaluation = SimpleNamespace(
+        evaluation_id=mandate_evaluation_id,
+        mandate_id=mandate_id,
+        mandate_version_id=mandate_version_id,
+        decision_id=controlled_proof_decision_id,
+        proposed_action="BUY",
+        authorization_result="AUTHORIZED",
+        approval_result=cpp.MANDATE_APPROVAL_RESULT_ACTIVE_MANDATE,
+    )
+    risk_event = SimpleNamespace(id=uuid4())
+
+    request = _create_request(
+        campaign_id=campaign_id,
+        profile=profile,
+        idempotency_key="pkg-controlled-proof-mandate-check",
+        commissioning_entry_mode="controlled_proof",
+        forced_action="OPEN_POSITION_PROPOSED",
+        controlled_proof_id=proof_id,
+    )
+    request = replace(
+        request, mandate_id=mandate_id, mandate_version_id=mandate_version_id, mandate_evaluation_id=mandate_evaluation_id,
+    )
+
+    monkeypatch.setattr(cpp, "_load_package_by_idempotency", _async_return(None))
+    monkeypatch.setattr(cpp, "_load_profile", _async_return(profile))
+    monkeypatch.setattr(cpp, "_load_runtime_campaign", _async_return(runtime_campaign))
+    monkeypatch.setattr(cpp, "_load_campaign_definition", _async_return(definition))
+    monkeypatch.setattr(cpp, "run_campaign_orchestration_preview_for_candle", _async_return({"cycles": [{"cycle_id": str(cycle.cycle_id)}]}))
+    monkeypatch.setattr(cpp, "_load_campaign_cycle", _async_return(cycle))
+    monkeypatch.setattr(cpp, "_load_preview_for_package", _async_return(None))
+    monkeypatch.setattr(cpp, "_load_exchange_connection_for_scope", _async_return(SimpleNamespace(exchange_connection_id=uuid4())))
+    monkeypatch.setattr(cpp, "create_controlled_proof_decision_record", _fake_create_controlled_proof_decision_record)
+    monkeypatch.setattr(cpp, "_resolve_strategy_and_parameter_binding", _async_return((strategy, parameter_set)))
+    monkeypatch.setattr(cpp, "create_crypto_order_preview", _async_return(SimpleNamespace(crypto_order_preview_id=preview_id)))
+    monkeypatch.setattr(cpp, "_load_preview_by_id", _async_return(preview))
+    monkeypatch.setattr(cpp, "_load_decision_record", _async_return(SimpleNamespace(decision_id=controlled_proof_decision_id)))
+    monkeypatch.setattr(cpp, "_load_risk_event", _async_return(risk_event))
+
+    # count(canonical_preview_packages) auto-resolves to 0 without
+    # consuming the queue (no int at the front) -- these three are, in
+    # order: the mandate_evaluation lookup, then strategy-by-id, then
+    # parameter_set-by-id, the only remaining un-monkeypatched db.scalar
+    # calls in create_canonical_preview_package.
+    db = _FakeDb(scalar_values=[mandate_evaluation, strategy, parameter_set])
+
+    result = await cpp.create_canonical_preview_package(db=db, request=request)
+
+    assert result["package"]["package_state"] == "READY"
+    assert result["package"]["decision_record_id"] == str(controlled_proof_decision_id)
 
 
 @pytest.mark.asyncio

@@ -34,7 +34,11 @@ from app.models.signal import Signal as SignalModel
 from app.models.strategy import Strategy as StrategyModel
 from app.models.validation_run import ValidationRun
 from app.models.validation_run_event import ValidationRunEvent
-from app.services.canonical_preview_package import CanonicalPreviewPackageCreateRequest, create_canonical_preview_package
+from app.services.canonical_preview_package import (
+    CanonicalPreviewPackageCreateRequest,
+    create_canonical_preview_package,
+    create_controlled_proof_decision_record,
+)
 from app.services.controlled_proof import (
     claim_next_controlled_proof_for_scope,
     evaluate_controlled_proof_risk,
@@ -840,6 +844,7 @@ async def _ensure_campaign_cycle_mandate_evaluation(
     product: str,
     side: str,
     proposed_notional: Decimal,
+    decision_record_id: uuid.UUID | None = None,
 ) -> str | None:
     if all(
         getattr(campaign_cycle, field, None) is not None
@@ -859,6 +864,17 @@ async def _ensure_campaign_cycle_mandate_evaluation(
         return "originating_autonomous_mandate_identity_missing"
     if campaign_cycle.cycle_kind != "campaign" or campaign_cycle.decision_record_id is None:
         return "campaign_cycle_identity_invalid"
+    # For a controlled-proof-forced entry, the caller passes the freshly
+    # created Controlled Proof DecisionRecord's id here -- never the
+    # organic campaign_cycle.decision_record_id -- because that is the
+    # decision create_canonical_preview_package will actually bind the
+    # resulting package to. Using the organic id here (the default, correct
+    # for every non-forced cycle) would make this evaluation reference a
+    # decision the package never ends up using, and
+    # create_canonical_preview_package's own mandate_evaluation.decision_id
+    # == decision.decision_id check would then fail every time
+    # (canonical_mandate_evaluation_mismatch).
+    effective_decision_id = campaign_cycle.decision_record_id if decision_record_id is None else decision_record_id
     evaluation = await evaluate_and_record_mandate(
         db=db,
         request=MandateEvaluationWriteRequest(
@@ -878,7 +894,7 @@ async def _ensure_campaign_cycle_mandate_evaluation(
             evidence_age_seconds=0,
             kill_switch_engaged=False,
             observed_at=datetime.now(timezone.utc),
-            decision_id=campaign_cycle.decision_record_id,
+            decision_id=effective_decision_id,
             request_context={
                 "purpose": "automatic_ready_package_campaign_authority",
                 "autonomous_cycle_id": str(autonomous_cycle.cycle_id),
@@ -894,7 +910,7 @@ async def _ensure_campaign_cycle_mandate_evaluation(
     if (
         evaluation.mandate_id != autonomous_cycle.mandate_id
         or evaluation.mandate_version_id != autonomous_cycle.mandate_version_id
-        or evaluation.decision_id != campaign_cycle.decision_record_id
+        or evaluation.decision_id != effective_decision_id
         or evaluation.authorization_result != "AUTHORIZED"
         or evaluation.approval_result != "APPROVAL_SATISFIED_BY_ACTIVE_MANDATE"
     ):
@@ -1334,15 +1350,44 @@ async def _attempt_automatic_ready_package_creation(
                 elif final_amount is None or final_amount <= 0:
                     skip_reason = "campaign_notional_missing"
                 else:
-                    skip_reason = await _ensure_campaign_cycle_mandate_evaluation(
-                        db=db,
-                        campaign_cycle=cycle,
-                        autonomous_cycle=autonomous_cycle,
-                        strategy_identity=strategy_identity,
-                        product=product,
-                        side=side,
-                        proposed_notional=final_amount,
-                    )
+                    # A controlled-proof-forced entry's mandate evaluation
+                    # must reference the truthful Controlled Proof
+                    # DecisionRecord, not the organic cycle's -- created
+                    # here, before mandate evaluation, so the evaluation is
+                    # never computed against a decision identity that
+                    # predates (and diverges from) the one
+                    # create_canonical_preview_package will actually bind
+                    # the resulting package to. Isolated in its own
+                    # try/except like every other controlled-proof step: a
+                    # failure here must fail closed, never fall through to
+                    # the organic id.
+                    controlled_proof_decision_record_id = None
+                    if controlled_proof_forced_entry:
+                        try:
+                            controlled_proof_decision_record_id = await create_controlled_proof_decision_record(
+                                db=db, campaign_id=campaign_id, controlled_proof_id=controlled_proof.proof_id,
+                                forced_action=proposed_action, product=product, provider=provider,
+                                actor="system:controlled_proof_worker", strategy_identity=strategy_identity,
+                            )
+                        except Exception:
+                            logger.exception(
+                                "controlled_proof_decision_record_creation_failed proof_id=%s",
+                                getattr(controlled_proof, "proof_id", None),
+                            )
+                            controlled_proof_decision_record_id = None
+                    if controlled_proof_forced_entry and controlled_proof_decision_record_id is None:
+                        skip_reason = "controlled_proof_decision_record_unavailable"
+                    else:
+                        skip_reason = await _ensure_campaign_cycle_mandate_evaluation(
+                            db=db,
+                            campaign_cycle=cycle,
+                            autonomous_cycle=autonomous_cycle,
+                            strategy_identity=strategy_identity,
+                            product=product,
+                            side=side,
+                            proposed_notional=final_amount,
+                            decision_record_id=controlled_proof_decision_record_id,
+                        )
 
         missing_evidence_fields = [
             field for field in ("mandate_id", "mandate_version_id", "mandate_evaluation_id")
