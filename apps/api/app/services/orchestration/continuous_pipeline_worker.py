@@ -1190,7 +1190,21 @@ async def _attempt_automatic_ready_package_creation(
         # cycle row; local to this attempt only. Isolated in its own
         # try/except: a defect here must never affect the core pipeline.
         controlled_proof_forced_entry = False
-        if skip_reason == "non_executable_action" and controlled_proof is not None:
+        # A genuine strategy HOLD surfaces as either skip_reason=
+        # "non_executable_action" (composition never proposed an executable
+        # action) or skip_reason="termination_stage_hold_no_package_created"
+        # (composition explicitly terminated the cycle as HOLD) -- the same
+        # semantic condition via two different code paths. Mirrors the
+        # identical hold_reason == "strategy_hold_signal" narrowing already
+        # used by canonical_preview_package.py's _FORCED_COMMISSIONING_MODE
+        # for this exact purpose. "failed_closed" is deliberately never
+        # included here -- that is a real governance failure, never
+        # overridable.
+        _hold_reason = str(selected_decision.get("reason") or "").strip()
+        controlled_proof_overridable_hold = skip_reason == "non_executable_action" or (
+            skip_reason == "termination_stage_hold_no_package_created" and _hold_reason == "strategy_hold_signal"
+        )
+        if controlled_proof_overridable_hold and controlled_proof is not None:
             try:
                 wants_sell = await should_propose_controlled_sell(db=db, proof=controlled_proof)
                 already_has_entry = controlled_proof.decision_record_id is not None

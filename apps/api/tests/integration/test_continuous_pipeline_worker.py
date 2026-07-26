@@ -1375,6 +1375,142 @@ async def test_controlled_proof_forces_buy_candidate_when_strategy_would_hold(mo
 
 
 @pytest.mark.asyncio
+async def test_controlled_proof_forces_buy_when_hold_surfaces_as_termination_stage(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The production-observed gap: a genuine strategy HOLD that surfaces as
+    termination_stage="hold_no_package_created" (skip_reason=
+    "termination_stage_hold_no_package_created") with the ordinary
+    strategy_hold_signal reason must be just as overridable as the
+    proposed_action/decision_kind-driven HOLD path already covered by
+    test_controlled_proof_forces_buy_candidate_when_strategy_would_hold."""
+    import app.services.orchestration.continuous_pipeline_worker as worker_module
+    from app.services.orchestration.automatic_package_executor import AutomaticPackageExecutionOutcome
+
+    cycle = _automatic_cycle(
+        proposed_action="HOLD", decision_kind="HOLD",
+        termination_stage="hold_no_package_created", selected_decision_reason="strategy_hold_signal",
+    )
+    package_id = uuid.uuid4()
+    proof = _controlled_proof_stub()
+    create_requests: list = []
+    entry_link_calls = []
+    package_link_calls = []
+
+    async def _claim(*, db, campaign_id, campaign_version, provider, environment, product_id, cycle_id):
+        return proof
+
+    async def _sell_ready(*, db, proof):
+        return False
+
+    async def _link_entry(*, db, proof, decision_record_id, mandate_id, mandate_version_id, mandate_evaluation_id):
+        entry_link_calls.append(decision_record_id)
+        proof.decision_record_id = decision_record_id
+
+    async def _link_package(*, db, proof, package_id):
+        package_link_calls.append(package_id)
+        proof.package_id = package_id
+
+    async def _create(*, db, request):
+        create_requests.append(request)
+        return {"idempotent": False, "package": {"package_id": str(package_id), "package_state": "READY"}}
+
+    async def _execute(*, db, request):
+        return AutomaticPackageExecutionOutcome(
+            package_id=package_id, campaign_id=cycle.capital_campaign_id,
+            campaign_version=cycle.capital_campaign_version, decision_record_id=cycle.decision_record_id,
+            mandate_id=cycle.mandate_id, authorization_state="AUTHORIZED", dry_run_state="NOT_RUN",
+            activation_state="NOT_ACTIVATED", authority_source="MANDATE", replayed=False,
+            final_reason_code="test_stub_stops_before_activation", failed_closed=True, starting_state="READY",
+        )
+
+    monkeypatch.setattr(worker_module, "_load_cycle_by_id", _async_return(cycle))
+    monkeypatch.setattr(worker_module, "_has_active_ready_package_for_opportunity", _async_return(False))
+    monkeypatch.setattr(worker_module, "_has_active_proving_activation", _async_return(False))
+    monkeypatch.setattr(worker_module, "_has_open_live_order", _async_return(False))
+    monkeypatch.setattr(worker_module, "_has_unresolved_reconciliation", _async_return(False))
+    monkeypatch.setattr(worker_module, "_load_runtime_campaign", _async_return(SimpleNamespace(paper_account_id=uuid.uuid4())))
+    monkeypatch.setattr(worker_module, "_load_live_trading_profile_for_paper_account", _async_return(SimpleNamespace(id=uuid.uuid4())))
+    monkeypatch.setattr(worker_module, "create_canonical_preview_package", _create)
+    monkeypatch.setattr(worker_module, "execute_automatic_ready_package_through_activation", _execute)
+    monkeypatch.setattr(worker_module, "claim_next_controlled_proof_for_scope", _claim)
+    monkeypatch.setattr(worker_module, "should_propose_controlled_sell", _sell_ready)
+    monkeypatch.setattr(worker_module, "link_controlled_proof_entry", _link_entry)
+    monkeypatch.setattr(worker_module, "link_controlled_proof_package", _link_package)
+
+    await worker_module._attempt_automatic_ready_package_creation(db=object(), orchestration_payload=_automatic_payload(cycle))
+
+    assert len(create_requests) == 1
+    assert create_requests[0].commissioning_entry_mode == "controlled_proof"
+    assert create_requests[0].forced_action == "OPEN_POSITION_PROPOSED"
+    assert create_requests[0].controlled_proof_id == proof.proof_id
+    assert entry_link_calls == [cycle.decision_record_id]
+    assert package_link_calls == [package_id]
+
+
+@pytest.mark.asyncio
+async def test_controlled_proof_does_not_override_non_strategy_hold_termination(monkeypatch: pytest.MonkeyPatch) -> None:
+    """termination_stage="hold_no_package_created" with any reason other
+    than "strategy_hold_signal" must stay blocked -- this is not "any HOLD
+    termination is overridable", only the narrow ordinary-strategy-HOLD
+    sub-case, mirroring canonical_preview_package.py's own narrowing."""
+    import app.services.orchestration.continuous_pipeline_worker as worker_module
+
+    cycle = _automatic_cycle(
+        proposed_action="HOLD", decision_kind="HOLD",
+        termination_stage="hold_no_package_created", selected_decision_reason="insufficient_balance",
+    )
+    proof = _controlled_proof_stub()
+
+    async def _claim(*, db, campaign_id, campaign_version, provider, environment, product_id, cycle_id):
+        return proof
+
+    async def _sell_ready(*, db, proof):
+        return False
+
+    async def _create(*, db, request):
+        raise AssertionError("must not force a BUY for a non-strategy_hold_signal termination reason")
+
+    monkeypatch.setattr(worker_module, "_load_cycle_by_id", _async_return(cycle))
+    monkeypatch.setattr(worker_module, "claim_next_controlled_proof_for_scope", _claim)
+    monkeypatch.setattr(worker_module, "should_propose_controlled_sell", _sell_ready)
+    monkeypatch.setattr(worker_module, "create_canonical_preview_package", _create)
+
+    await worker_module._attempt_automatic_ready_package_creation(db=object(), orchestration_payload=_automatic_payload(cycle))
+
+
+@pytest.mark.asyncio
+async def test_controlled_proof_never_overrides_failed_closed_termination(monkeypatch: pytest.MonkeyPatch) -> None:
+    """failed_closed must never be overridable, even in the pathological
+    case where selected_decision.reason happens to equal
+    "strategy_hold_signal" -- the skip_reason string for this termination
+    stage is "termination_stage_failed_closed", never
+    "termination_stage_hold_no_package_created", so it can never match the
+    new override condition regardless of the reason field."""
+    import app.services.orchestration.continuous_pipeline_worker as worker_module
+
+    cycle = _automatic_cycle(
+        proposed_action="HOLD", decision_kind="HOLD",
+        termination_stage="failed_closed", selected_decision_reason="strategy_hold_signal",
+    )
+    proof = _controlled_proof_stub()
+
+    async def _claim(*, db, campaign_id, campaign_version, provider, environment, product_id, cycle_id):
+        return proof
+
+    async def _sell_ready(*, db, proof):
+        return False
+
+    async def _create(*, db, request):
+        raise AssertionError("must never force a BUY for a failed_closed termination")
+
+    monkeypatch.setattr(worker_module, "_load_cycle_by_id", _async_return(cycle))
+    monkeypatch.setattr(worker_module, "claim_next_controlled_proof_for_scope", _claim)
+    monkeypatch.setattr(worker_module, "should_propose_controlled_sell", _sell_ready)
+    monkeypatch.setattr(worker_module, "create_canonical_preview_package", _create)
+
+    await worker_module._attempt_automatic_ready_package_creation(db=object(), orchestration_payload=_automatic_payload(cycle))
+
+
+@pytest.mark.asyncio
 async def test_controlled_proof_forced_entry_blocked_by_risk_denial(monkeypatch: pytest.MonkeyPatch) -> None:
     """Requirement 4: the HOLD override never defeats a real risk denial --
     it only ever overrides the single "ordinary strategy said HOLD"
