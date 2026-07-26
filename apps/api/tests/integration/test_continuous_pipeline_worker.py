@@ -1343,14 +1343,28 @@ async def test_controlled_proof_forces_buy_candidate_when_strategy_would_hold(mo
         package_link_calls.append(package_id)
         proof.package_id = package_id
 
+    # Distinct from cycle.decision_record_id -- simulates the real, truthful
+    # decision record create_canonical_preview_package now creates for a
+    # controlled-proof-forced entry, never the organic cycle's own decision.
+    forced_decision_record_id = uuid.uuid4()
+
     async def _create(*, db, request):
         create_requests.append(request)
-        return {"idempotent": False, "package": {"package_id": str(package_id), "package_state": "READY"}}
+        return {
+            "idempotent": False,
+            "package": {
+                "package_id": str(package_id), "package_state": "READY",
+                "decision_record_id": str(forced_decision_record_id),
+            },
+        }
+
+    execute_requests: list = []
 
     async def _execute(*, db, request):
+        execute_requests.append(request)
         return AutomaticPackageExecutionOutcome(
             package_id=package_id, campaign_id=cycle.capital_campaign_id,
-            campaign_version=cycle.capital_campaign_version, decision_record_id=cycle.decision_record_id,
+            campaign_version=cycle.capital_campaign_version, decision_record_id=request.decision_record_id,
             mandate_id=cycle.mandate_id, authorization_state="AUTHORIZED", dry_run_state="NOT_RUN",
             activation_state="NOT_ACTIVATED", authority_source="MANDATE", replayed=False,
             final_reason_code="test_stub_stops_before_activation", failed_closed=True, starting_state="READY",
@@ -1377,8 +1391,64 @@ async def test_controlled_proof_forces_buy_candidate_when_strategy_would_hold(mo
     assert create_requests[0].commissioning_entry_mode == "controlled_proof"
     assert create_requests[0].forced_action == "OPEN_POSITION_PROPOSED"
     assert create_requests[0].controlled_proof_id == proof.proof_id
-    assert entry_link_calls == [cycle.decision_record_id]
+    # A controlled-proof-forced request must never constrain
+    # create_canonical_preview_package to the organic cycle's own decision --
+    # the whole point is that a new, different decision gets created.
+    assert create_requests[0].expected_decision_record_id is None
+    # The proof must be linked to the package's own truthful decision
+    # record, not the organic cycle's, and never fall back silently.
+    assert entry_link_calls == [forced_decision_record_id]
+    assert entry_link_calls != [cycle.decision_record_id]
     assert package_link_calls == [package_id]
+    # Requirement (production blocker fix): activation must be looked up
+    # using the package's own linked decision record, never the organic
+    # cycle's -- otherwise execute_automatic_ready_package_through_
+    # activation's own CanonicalPreviewPackage.decision_record_id ==
+    # request.decision_record_id lookup would never find the real package.
+    assert len(execute_requests) == 1
+    assert execute_requests[0].decision_record_id == forced_decision_record_id
+    assert execute_requests[0].decision_record_id != cycle.decision_record_id
+
+
+@pytest.mark.asyncio
+async def test_controlled_proof_activation_retry_uses_organic_decision_when_package_creation_skipped(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Regression test for a real bug found in review: on a retry cycle
+    where _has_active_ready_package_for_opportunity already finds an active
+    package (skip_reason="active_ready_package_exists"), package creation
+    is skipped entirely this cycle -- linked_decision_record_id must still
+    be defined (falling back to the organic decision_record_id) so
+    activation can still be attempted, never a NameError."""
+    import app.services.orchestration.continuous_pipeline_worker as worker_module
+    from app.services.orchestration.automatic_package_executor import AutomaticPackageExecutionOutcome
+
+    cycle = _automatic_cycle(proposed_action="OPEN_POSITION_PROPOSED", decision_kind="OPEN_POSITION_PROPOSED")
+    execute_requests: list = []
+
+    async def _create(*, db, request):
+        raise AssertionError("package creation must not be attempted when an active package already exists")
+
+    async def _execute(*, db, request):
+        execute_requests.append(request)
+        return AutomaticPackageExecutionOutcome(
+            package_id=None, campaign_id=cycle.capital_campaign_id,
+            campaign_version=cycle.capital_campaign_version, decision_record_id=request.decision_record_id,
+            mandate_id=cycle.mandate_id, authorization_state="AUTHORIZED", dry_run_state="NOT_RUN",
+            activation_state="NOT_ACTIVATED", authority_source="MANDATE", replayed=False,
+            final_reason_code="test_stub", failed_closed=True, starting_state="READY",
+        )
+
+    monkeypatch.setattr(worker_module, "_load_cycle_by_id", _async_return(cycle))
+    monkeypatch.setattr(worker_module, "_has_active_ready_package_for_opportunity", _async_return(True))
+    monkeypatch.setattr(worker_module, "create_canonical_preview_package", _create)
+    monkeypatch.setattr(worker_module, "execute_automatic_ready_package_through_activation", _execute)
+    monkeypatch.setattr(worker_module, "claim_next_controlled_proof_for_scope", _async_return(None))
+
+    await worker_module._attempt_automatic_ready_package_creation(db=object(), orchestration_payload=_automatic_payload(cycle))
+
+    assert len(execute_requests) == 1
+    assert execute_requests[0].decision_record_id == cycle.decision_record_id
 
 
 @pytest.mark.asyncio
@@ -1499,9 +1569,20 @@ async def test_controlled_proof_forces_buy_when_hold_surfaces_as_termination_sta
         package_link_calls.append(package_id)
         proof.package_id = package_id
 
+    # Distinct from cycle.decision_record_id -- simulates the real, truthful
+    # decision record create_canonical_preview_package now creates for a
+    # controlled-proof-forced entry, never the organic cycle's own decision.
+    forced_decision_record_id = uuid.uuid4()
+
     async def _create(*, db, request):
         create_requests.append(request)
-        return {"idempotent": False, "package": {"package_id": str(package_id), "package_state": "READY"}}
+        return {
+            "idempotent": False,
+            "package": {
+                "package_id": str(package_id), "package_state": "READY",
+                "decision_record_id": str(forced_decision_record_id),
+            },
+        }
 
     async def _execute(*, db, request):
         return AutomaticPackageExecutionOutcome(
@@ -1533,7 +1614,14 @@ async def test_controlled_proof_forces_buy_when_hold_surfaces_as_termination_sta
     assert create_requests[0].commissioning_entry_mode == "controlled_proof"
     assert create_requests[0].forced_action == "OPEN_POSITION_PROPOSED"
     assert create_requests[0].controlled_proof_id == proof.proof_id
-    assert entry_link_calls == [cycle.decision_record_id]
+    # A controlled-proof-forced request must never constrain
+    # create_canonical_preview_package to the organic cycle's own decision --
+    # the whole point is that a new, different decision gets created.
+    assert create_requests[0].expected_decision_record_id is None
+    # The proof must be linked to the package's own truthful decision
+    # record, not the organic cycle's, and never fall back silently.
+    assert entry_link_calls == [forced_decision_record_id]
+    assert entry_link_calls != [cycle.decision_record_id]
     assert package_link_calls == [package_id]
 
 
@@ -1903,6 +1991,7 @@ async def test_controlled_proof_forces_sell_after_buy_reconciled(monkeypatch: py
     assert create_requests[0].commissioning_entry_mode == "controlled_proof"
     assert create_requests[0].forced_action == "CLOSE_POSITION_PROPOSED"
     assert create_requests[0].controlled_proof_id == proof.proof_id
+    assert create_requests[0].expected_decision_record_id is None
     assert sell_link_calls == [sell_package_id]
     assert entry_link_calls == [], "a SELL must never be linked through the BUY entry-linkage path"
     assert proof.sell_package_id == sell_package_id

@@ -8,6 +8,7 @@ from uuid import UUID, uuid4
 
 import pytest
 
+from app.models.decision_record import DecisionRecord
 from app.services import canonical_preview_package as cpp
 
 
@@ -25,6 +26,20 @@ class _FakeResult:
         return self._rows[0] if self._rows else None
 
 
+class _FakeSavepoint:
+    """No-op stand-in for the real begin_nested() SAVEPOINT context manager
+    -- _FakeDb has no real transaction machinery, so there is nothing to
+    commit or roll back at this layer; it exists purely so production code
+    that opens a savepoint (mirroring authoritative.py's established
+    idempotency-race pattern) has something to call in tests."""
+
+    async def __aenter__(self) -> "_FakeSavepoint":
+        return self
+
+    async def __aexit__(self, *_exc: object) -> bool:
+        return False
+
+
 class _FakeDb:
     def __init__(self, *, scalar_values: list[object] | None = None, execute_rows: list[object] | None = None) -> None:
         self._scalar_values = list(scalar_values or [])
@@ -33,13 +48,16 @@ class _FakeDb:
         self.flush_calls = 0
 
     def add(self, obj: object) -> None:
-        for attr_name in ("package_id", "activation_id", "live_crypto_order_id"):
+        for attr_name in ("package_id", "activation_id", "live_crypto_order_id", "decision_id"):
             if hasattr(obj, attr_name) and getattr(obj, attr_name) is None:
                 setattr(obj, attr_name, uuid4())
         self.added.append(obj)
 
     async def flush(self) -> None:
         self.flush_calls += 1
+
+    def begin_nested(self) -> "_FakeSavepoint":
+        return _FakeSavepoint()
 
     async def scalar(self, _statement):
         sql = str(_statement)
@@ -1489,6 +1507,208 @@ async def test_create_forced_commissioning_preview_not_ready_fails_closed(monkey
         )
 
     assert "canonical_crypto_order_preview_not_ready" in str(exc_info.value)
+
+
+# --- Controlled Proof: forced-entry DecisionRecord lifecycle -------------------------
+
+@pytest.mark.asyncio
+async def test_controlled_proof_forced_entry_creates_new_truthful_decision_record(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A Controlled-Proof-forced BUY must never be linked to the organic
+    HOLD cycle's own DecisionRecord (which describes a different,
+    genuinely organic evaluation) -- it must get its own, new, honest
+    record describing the forced action itself."""
+    campaign_id = uuid4()
+    proof_id = uuid4()
+    profile = SimpleNamespace(
+        id=uuid4(), paper_account_id=uuid4(),
+        provenance_metadata={"provider": "kraken_spot", "exchange_environment": "production"},
+    )
+    organic_decision_id = uuid4()
+    strategy = SimpleNamespace(id=uuid4(), slug="ma_crossover")
+    parameter_set = SimpleNamespace(id=uuid4())
+    preview_id = uuid4()
+    preview = _preview(package_id=preview_id)
+    preview.status = "PREVIEW_READY"
+    preview.parameter_set_id = None
+    composition = {"strategy_identity": "ma_crossover@1.0.0"}
+    # The organic HOLD's own selected_decision -- carries a real
+    # decision_record_id and strategy_identity, exactly as authoritative.py
+    # produces for a genuine "strategy_hold_signal" rejection.
+    selected_decision = {
+        "decision_record_id": str(organic_decision_id),
+        "strategy_identity": "ma_crossover@1.0.0",
+    }
+    request = _create_request(
+        campaign_id=campaign_id,
+        profile=profile,
+        idempotency_key="pkg-controlled-proof-preview-1",
+        commissioning_entry_mode="controlled_proof",
+        forced_action="OPEN_POSITION_PROPOSED",
+        controlled_proof_id=proof_id,
+    )
+
+    captured: dict[str, object] = {}
+
+    async def _fake_create_crypto_order_preview(*, db, request, actor):
+        captured["decision_record_id"] = request.decision_record_id
+        captured["side"] = request.side
+        return SimpleNamespace(crypto_order_preview_id=preview_id)
+
+    monkeypatch.setattr(cpp, "_load_exchange_connection_for_scope", _async_return(SimpleNamespace(exchange_connection_id=uuid4())))
+    monkeypatch.setattr(cpp, "_resolve_strategy_and_parameter_binding", _async_return((strategy, parameter_set)))
+    monkeypatch.setattr(cpp, "create_crypto_order_preview", _fake_create_crypto_order_preview)
+    monkeypatch.setattr(cpp, "_load_preview_by_id", _async_return(preview))
+
+    db = _FakeDb()
+    resolved = await cpp._create_crypto_order_preview_for_package(
+        db=db, request=request, profile=profile, composition=composition, selected_decision=selected_decision,
+    )
+
+    assert resolved.crypto_order_preview_id == preview_id
+    assert captured["side"] == "BUY"
+    new_decision_id = captured["decision_record_id"]
+    assert new_decision_id is not None
+    # The whole point: never the organic cycle's own decision.
+    assert new_decision_id != organic_decision_id
+
+    created_records = [obj for obj in db.added if isinstance(obj, DecisionRecord)]
+    assert len(created_records) == 1
+    record = created_records[0]
+    assert record.decision_id == new_decision_id
+    assert record.idempotency_key == f"controlled_proof_forced_entry:{proof_id}:OPEN_POSITION_PROPOSED"
+    assert record.trade_accepted is True
+    assert record.trade_rejected_reason is None
+    assert record.generated_signals == [{"strategy_identity": "ma_crossover@1.0.0", "strategy_version": None, "action": "BUY"}]
+    assert record.supporting_strategies == []
+    assert record.opposing_strategies == []
+    assert record.execution_details["controlled_proof_id"] == str(proof_id)
+    assert record.execution_details["stage"] == "controlled_proof_forced_entry"
+    assert record.source_lineage["controlled_proof_runs"] == [str(proof_id)]
+    assert record.source_lineage["risk_events"] == []
+    assert record.outcome == "pending_preview"
+    assert record.future_tags == ["controlled_proof"]
+
+
+@pytest.mark.asyncio
+async def test_controlled_proof_forced_sell_decision_record_reports_sell_action(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The SELL-side counterpart: forced_action=CLOSE_POSITION_PROPOSED must
+    produce a new decision record honestly reporting action=SELL, distinct
+    from whatever decision record the BUY side used."""
+    campaign_id = uuid4()
+    proof_id = uuid4()
+    profile = SimpleNamespace(
+        id=uuid4(), paper_account_id=uuid4(),
+        provenance_metadata={"provider": "kraken_spot", "exchange_environment": "production"},
+    )
+    strategy = SimpleNamespace(id=uuid4(), slug="ma_crossover")
+    parameter_set = SimpleNamespace(id=uuid4())
+    preview_id = uuid4()
+    preview = _preview(package_id=preview_id)
+    preview.status = "PREVIEW_READY"
+    preview.parameter_set_id = None
+    composition = {"strategy_identity": "ma_crossover@1.0.0"}
+    selected_decision = {"decision_record_id": str(uuid4()), "strategy_identity": "ma_crossover@1.0.0"}
+    request = _create_request(
+        campaign_id=campaign_id,
+        profile=profile,
+        idempotency_key="pkg-controlled-proof-preview-sell-1",
+        commissioning_entry_mode="controlled_proof",
+        forced_action="CLOSE_POSITION_PROPOSED",
+        controlled_proof_id=proof_id,
+    )
+
+    monkeypatch.setattr(cpp, "_load_exchange_connection_for_scope", _async_return(SimpleNamespace(exchange_connection_id=uuid4())))
+    monkeypatch.setattr(cpp, "_resolve_strategy_and_parameter_binding", _async_return((strategy, parameter_set)))
+    monkeypatch.setattr(cpp, "create_crypto_order_preview", _async_return(SimpleNamespace(crypto_order_preview_id=preview_id)))
+    monkeypatch.setattr(cpp, "_load_preview_by_id", _async_return(preview))
+
+    db = _FakeDb()
+    await cpp._create_crypto_order_preview_for_package(
+        db=db, request=request, profile=profile, composition=composition, selected_decision=selected_decision,
+    )
+
+    created_records = [obj for obj in db.added if isinstance(obj, DecisionRecord)]
+    assert len(created_records) == 1
+    record = created_records[0]
+    assert record.idempotency_key == f"controlled_proof_forced_entry:{proof_id}:CLOSE_POSITION_PROPOSED"
+    assert record.generated_signals[0]["action"] == "SELL"
+    assert record.trade_accepted is True
+
+
+@pytest.mark.asyncio
+async def test_controlled_proof_decision_record_idempotent_reuse_does_not_duplicate() -> None:
+    """A repeated attempt for the same (controlled_proof_id, forced_action)
+    must reuse the existing decision record via its idempotency key, never
+    create a second one -- mirroring the organic
+    strategy_aggregate_decision idempotency pattern."""
+    proof_id = uuid4()
+    request = _create_request(
+        campaign_id=uuid4(),
+        profile=_profile(),
+        idempotency_key="pkg-controlled-proof-idempotent",
+        commissioning_entry_mode="controlled_proof",
+        forced_action="OPEN_POSITION_PROPOSED",
+        controlled_proof_id=proof_id,
+    )
+    existing_decision_id = uuid4()
+    existing = SimpleNamespace(decision_id=existing_decision_id)
+
+    db = _FakeDb(scalar_values=[existing])
+    result = await cpp._create_controlled_proof_decision_record(
+        db=db, request=request, strategy_identity="ma_crossover@1.0.0",
+    )
+
+    assert result == existing_decision_id
+    # Nothing new was inserted -- the existing row was found and reused.
+    assert db.added == []
+
+
+@pytest.mark.asyncio
+async def test_controlled_proof_forced_entry_never_touches_organic_decision_record(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The organic decision record is never read, written, or referenced by
+    the controlled-proof forced-entry path -- only its own, separate,
+    newly-created record is."""
+    campaign_id = uuid4()
+    proof_id = uuid4()
+    profile = SimpleNamespace(
+        id=uuid4(), paper_account_id=uuid4(),
+        provenance_metadata={"provider": "kraken_spot", "exchange_environment": "production"},
+    )
+    organic_decision_id = uuid4()
+    strategy = SimpleNamespace(id=uuid4(), slug="ma_crossover")
+    parameter_set = SimpleNamespace(id=uuid4())
+    preview_id = uuid4()
+    preview = _preview(package_id=preview_id)
+    preview.status = "PREVIEW_READY"
+    preview.parameter_set_id = None
+    composition = {"strategy_identity": "ma_crossover@1.0.0"}
+    selected_decision = {"decision_record_id": str(organic_decision_id), "strategy_identity": "ma_crossover@1.0.0"}
+    request = _create_request(
+        campaign_id=campaign_id,
+        profile=profile,
+        idempotency_key="pkg-controlled-proof-preview-untouched",
+        commissioning_entry_mode="controlled_proof",
+        forced_action="OPEN_POSITION_PROPOSED",
+        controlled_proof_id=proof_id,
+    )
+
+    monkeypatch.setattr(cpp, "_load_exchange_connection_for_scope", _async_return(SimpleNamespace(exchange_connection_id=uuid4())))
+    monkeypatch.setattr(cpp, "_resolve_strategy_and_parameter_binding", _async_return((strategy, parameter_set)))
+    monkeypatch.setattr(cpp, "create_crypto_order_preview", _async_return(SimpleNamespace(crypto_order_preview_id=preview_id)))
+    monkeypatch.setattr(cpp, "_load_preview_by_id", _async_return(preview))
+
+    db = _FakeDb()
+    await cpp._create_crypto_order_preview_for_package(
+        db=db, request=request, profile=profile, composition=composition, selected_decision=selected_decision,
+    )
+
+    # The organic decision id never appears anywhere in what was persisted --
+    # neither as an "add" (nothing to mutate: DecisionRecord has no update
+    # path at all) nor as the id of the newly created record.
+    created_records = [obj for obj in db.added if isinstance(obj, DecisionRecord)]
+    assert len(created_records) == 1
+    assert created_records[0].decision_id != organic_decision_id
+    assert all(getattr(obj, "decision_id", None) != organic_decision_id for obj in db.added)
 
 
 @pytest.mark.asyncio

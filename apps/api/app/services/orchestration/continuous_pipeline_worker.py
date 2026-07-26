@@ -1361,6 +1361,13 @@ async def _attempt_automatic_ready_package_creation(
 
         package_id: str | None = None
         idempotency_key: str | None = None
+        # Defaults to the organic value so a retry cycle that skips package
+        # creation entirely (skip_reason="active_ready_package_exists" --
+        # e.g. a package from a prior cycle still sitting in READY) still
+        # has a defined identity to pass into activation below. Only
+        # overwritten with the package's own truthful value when this cycle
+        # actually (re)creates or replays the package.
+        linked_decision_record_id = decision_record_id
         if skip_reason is None:
             if await _has_active_ready_package_for_opportunity(db=db, decision_record_id=decision_record_id):
                 skip_reason = "active_ready_package_exists"
@@ -1414,7 +1421,7 @@ async def _attempt_automatic_ready_package_creation(
                             max_proposed_order_amount=_CANONICAL_READY_PACKAGE_AMOUNT,
                             actor=_CANONICAL_READY_PACKAGE_ACTOR,
                             idempotency_key=idempotency_key,
-                            expected_decision_record_id=decision_record_id,
+                            expected_decision_record_id=None if controlled_proof_forced_entry else decision_record_id,
                             mandate_id=getattr(cycle, "mandate_id", None),
                             mandate_version_id=getattr(cycle, "mandate_version_id", None),
                             mandate_evaluation_id=getattr(cycle, "mandate_evaluation_id", None),
@@ -1425,6 +1432,19 @@ async def _attempt_automatic_ready_package_creation(
                     )
                     package = payload.get("package") if isinstance(payload, dict) else None
                     package_id = None if not isinstance(package, dict) else str(package.get("package_id") or "") or None
+                    # The package's own decision_record_id is the truthful
+                    # value actually bound to it -- for a controlled-proof-
+                    # forced entry this is a freshly created record
+                    # describing the forced action, never the organic
+                    # cycle's own decision_record_id computed above. Falls
+                    # back to the organic value only if the payload omits it
+                    # (e.g. an unrelated failure shape).
+                    linked_decision_record_id = decision_record_id
+                    if isinstance(package, dict) and package.get("decision_record_id"):
+                        try:
+                            linked_decision_record_id = uuid.UUID(str(package["decision_record_id"]))
+                        except ValueError:
+                            linked_decision_record_id = decision_record_id
                     if bool(payload.get("idempotent")):
                         logger.info(
                             "automatic_ready_package_replayed campaign_id=%s campaign_version=%s cycle_id=%s candle_close_time=%s decision_record_id=%s package_id=%s idempotency_key=%s",
@@ -1432,7 +1452,7 @@ async def _attempt_automatic_ready_package_creation(
                             campaign_version,
                             cycle_id,
                             candle_close_time,
-                            decision_record_id,
+                            linked_decision_record_id,
                             package_id,
                             idempotency_key,
                         )
@@ -1443,7 +1463,7 @@ async def _attempt_automatic_ready_package_creation(
                             campaign_version,
                             cycle_id,
                             candle_close_time,
-                            decision_record_id,
+                            linked_decision_record_id,
                             package_id,
                             idempotency_key,
                         )
@@ -1455,11 +1475,11 @@ async def _attempt_automatic_ready_package_creation(
                     # entry/_package/_sell_package each no-op once already
                     # linked, so replays of the same cycle never relink or
                     # double-propose either side.
-                    if controlled_proof is not None and decision_record_id is not None and package_id is not None:
+                    if controlled_proof is not None and linked_decision_record_id is not None and package_id is not None:
                         try:
                             if not is_close_action:
                                 await link_controlled_proof_entry(
-                                    db=db, proof=controlled_proof, decision_record_id=decision_record_id,
+                                    db=db, proof=controlled_proof, decision_record_id=linked_decision_record_id,
                                     mandate_id=getattr(cycle, "mandate_id", None),
                                     mandate_version_id=getattr(cycle, "mandate_version_id", None),
                                     mandate_evaluation_id=getattr(cycle, "mandate_evaluation_id", None),
@@ -1474,7 +1494,7 @@ async def _attempt_automatic_ready_package_creation(
                         except Exception:
                             logger.exception(
                                 "controlled_proof_linkage_failed proof_id=%s decision_record_id=%s package_id=%s is_close_action=%s",
-                                getattr(controlled_proof, "proof_id", None), decision_record_id, package_id, is_close_action,
+                                getattr(controlled_proof, "proof_id", None), linked_decision_record_id, package_id, is_close_action,
                             )
 
         if skip_reason in {None, "active_ready_package_exists"} and campaign_id is not None and campaign_version is not None and decision_record_id is not None:
@@ -1484,7 +1504,7 @@ async def _attempt_automatic_ready_package_creation(
                     request=AutomaticPackageExecutionRequest(
                         campaign_id=campaign_id,
                         campaign_version=campaign_version,
-                        decision_record_id=decision_record_id,
+                        decision_record_id=linked_decision_record_id,
                         package_id=None if package_id is None else uuid.UUID(package_id),
                     ),
                 )

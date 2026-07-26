@@ -10,6 +10,7 @@ from decimal import Decimal
 from typing import Any
 
 from sqlalchemy import func, select
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.models.autonomous_cycle_run import AutonomousCycleRun
@@ -35,6 +36,7 @@ from app.models.exchange_connection import ExchangeConnection
 from app.services.capital_campaign_orchestration.service import run_campaign_orchestration_preview_for_candle
 from app.services.crypto_order_previews.service import create_crypto_order_preview
 from app.schemas.crypto_order_previews import CryptoOrderPreviewCreateRequest
+from app.services.decisions.ingestion import DECISION_ENGINE_VERSION
 from app.services.live.approval import record_live_approval_checkpoint
 from app.services.live.contracts import LiveApprovalCheckpointRequest
 from app.services.mandates.contracts import MANDATE_APPROVAL_RESULT_ACTIVE_MANDATE
@@ -635,6 +637,112 @@ def _selected_strategy_identity(*, selected_decision: dict[str, Any], compositio
     return None
 
 
+def _controlled_proof_decision_idempotency_key(request: CanonicalPreviewPackageCreateRequest) -> str:
+    return f"controlled_proof_forced_entry:{request.controlled_proof_id}:{request.forced_action}"
+
+
+async def _create_controlled_proof_decision_record(
+    *,
+    db: AsyncSession,
+    request: CanonicalPreviewPackageCreateRequest,
+    strategy_identity: str,
+) -> uuid.UUID:
+    """A Controlled-Proof-forced action is never organically selected by the
+    strategy ensemble -- the HOLD cycle's own selected_decision describes a
+    genuinely different evaluation (e.g. an organic SELL-while-flat verdict
+    downgraded to HOLD), never the forced BUY/SELL that actually happened.
+    Reusing that decision record would be truthful in form (a real,
+    immutable row) but false in substance (its trade_accepted/
+    trade_rejected_reason/generated_signals describe a different action).
+    DecisionRecord is append-only and enforced immutable at the ORM layer
+    (see DecisionRecord's before_update/before_delete listeners) -- an
+    inaccurate link can never be corrected in place, only superseded by a
+    new, honest record. This creates exactly one such record per proof per
+    direction (BUY entry, SELL exit), idempotent on
+    (controlled_proof_id, forced_action) the same way the organic
+    aggregate decision is idempotent on its own roster-run-scoped key.
+
+    Never reads or mutates the organic cycle's DecisionRecord in any way.
+    """
+    idempotency_key = _controlled_proof_decision_idempotency_key(request)
+    existing = await db.scalar(select(DecisionRecord).where(DecisionRecord.idempotency_key == idempotency_key).limit(1))
+    if existing is not None:
+        return existing.decision_id
+
+    now = datetime.now(timezone.utc)
+    action = "BUY" if request.forced_action == "OPEN_POSITION_PROPOSED" else "SELL"
+    record = DecisionRecord(
+        idempotency_key=idempotency_key,
+        source_lineage={
+            "strategy_roster_runs": [],
+            "campaigns": [str(request.campaign_id)],
+            "controlled_proof_runs": [str(request.controlled_proof_id)],
+            # Deliberately not the risk_event_id from the Controlled Proof's
+            # own fresh risk gate (evaluate_controlled_proof_risk): that is a
+            # distinct risk evaluation from the one create_crypto_order_preview
+            # performs and binds to the package moments later. Citing it here
+            # would create a misleading cross-reference to a risk event this
+            # record's own package never actually uses.
+            "risk_events": [],
+            "crypto_order_previews": [],
+            "signals": [],
+            "model_outputs": [],
+            "trades": [],
+        },
+        field_provenance={
+            "generated_signals": [{"entity_type": "controlled_proof_runs", "entity_id": str(request.controlled_proof_id)}],
+        },
+        version=DECISION_ENGINE_VERSION,
+        timestamp=now,
+        asset={"product_id": request.product, "provider": request.provider},
+        timeframe="15m",
+        market_regime={"state": "unknown", "source": "controlled_proof_forced_evaluation"},
+        indicators={},
+        generated_signals=[{"strategy_identity": strategy_identity, "strategy_version": None, "action": action}],
+        signal_strength=None,
+        confidence=None,
+        supporting_strategies=[],
+        opposing_strategies=[],
+        risk_adjustments=[],
+        expected_risk=None,
+        expected_reward=None,
+        position_size=None,
+        trade_accepted=True,
+        trade_rejected_reason=None,
+        execution_details={
+            "stage": "controlled_proof_forced_entry",
+            "actor": request.actor,
+            "controlled_proof_id": str(request.controlled_proof_id),
+        },
+        exit_details=None,
+        pnl=None,
+        duration=None,
+        outcome="pending_preview",
+        post_trade_notes=None,
+        lessons_learned=None,
+        ai_reflection=None,
+        future_tags=["controlled_proof"],
+        confidence_calibration=None,
+        review_status=None,
+        human_notes=None,
+    )
+    db.add(record)
+    # Mirrors the established organic pattern (see
+    # _persist_strategy_aggregate_decision's caller in authoritative.py):
+    # a savepoint, not the outer transaction, absorbs a concurrent
+    # idempotency-key race, so a competing worker cycle can never poison
+    # everything else already flushed in this same call.
+    try:
+        async with db.begin_nested():
+            await db.flush()
+    except IntegrityError:
+        raced = await db.scalar(select(DecisionRecord).where(DecisionRecord.idempotency_key == idempotency_key).limit(1))
+        if raced is None:
+            raise
+        return raced.decision_id
+    return record.decision_id
+
+
 async def _resolve_strategy_and_parameter_binding(
     *,
     db: AsyncSession,
@@ -704,17 +812,28 @@ async def _create_crypto_order_preview_for_package(
             diagnostics=[_diagnostic(code="canonical_exchange_connection_missing", stage="preview_resolution")]
         )
 
-    decision_record_id = _selected_decision_record_id(selected_decision)
-    if decision_record_id is None:
-        raise _preview_evidence_error(
-            diagnostics=[_diagnostic(code="canonical_decision_record_id_missing", stage="preview_resolution")]
-        )
-
     strategy_identity = _selected_strategy_identity(selected_decision=selected_decision, composition=composition)
     if not strategy_identity:
         raise _preview_evidence_error(
             diagnostics=[_diagnostic(code="canonical_strategy_version_missing", stage="preview_resolution")]
         )
+
+    if _is_controlled_proof_mode(request):
+        # A Controlled-Proof-forced action must never be linked to the
+        # organic cycle's own DecisionRecord -- that record describes a
+        # different, genuinely organic evaluation (see
+        # _create_controlled_proof_decision_record's docstring). Create (or
+        # idempotently reuse) a decision record that truthfully describes
+        # this forced action instead.
+        decision_record_id = await _create_controlled_proof_decision_record(
+            db=db, request=request, strategy_identity=strategy_identity,
+        )
+    else:
+        decision_record_id = _selected_decision_record_id(selected_decision)
+        if decision_record_id is None:
+            raise _preview_evidence_error(
+                diagnostics=[_diagnostic(code="canonical_decision_record_id_missing", stage="preview_resolution")]
+            )
 
     strategy, parameter_set = await _resolve_strategy_and_parameter_binding(
         db=db,
