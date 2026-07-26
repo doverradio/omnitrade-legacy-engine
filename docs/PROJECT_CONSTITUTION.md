@@ -53,7 +53,39 @@ The project is built to outlast its original creators. Code should be understand
 OmniTrade exists to steward capital responsibly, not merely to trade it. Trading is one mechanism by which capital may be increased, preserved, allocated, or protected. The platform is designed to optimize long-term capital stewardship across any future asset class, market, or investment domain while preserving explainability, safety, and human accountability.
 
 ---
+## Git Branch Invariant
 
+The canonical default branch for the OmniTrade repository is:
+
+master
+
+AI assistants must never assume repository conventions.
+
+Before generating git commands, verify or use the documented repository invariants, including:
+
+• Default branch
+• Canonical remote
+• Repository root
+• Deployment workflow
+
+Unless this document is intentionally amended, all examples must target master.
+
+---
+When generating terminal commands:
+
+• Emit single-line commands.
+• Leave exactly one blank line after every command.
+• Use the repository's canonical branch (`master`) unless the repository itself changes.
+
+
+WARNING
+
+This repository intentionally uses `master` as its canonical branch.
+
+Historically, AI assistants have repeatedly assumed `main`, causing failed push and pull commands.
+
+Treat `master` as a permanent repository invariant unless this Constitution is explicitly amended.
+---
 ### Relationship to Other Documents
 
 This Constitution sits above the rest of the documentation set, but does not replace or duplicate any of it:
@@ -81,3 +113,11 @@ Whenever this Constitution is amended:
 - Constitutional additions should represent enduring governance principles rather than implementation details or temporary operational concerns.
 
 The constitutional architecture exists to provide long-term stability. It should grow only when a genuinely new constitutional concern is discovered, not merely because additional documentation could be written. Constitutional restraint is itself a form of stewardship.
+
+### Documentation Governance
+
+Operational documentation is considered part of OmniTrade's long-term architectural stewardship.
+
+Whenever a pull request introduces or materially changes any production environment file, systemd unit, infrastructure component, deployment dependency, operational entry point, or other critical operational artifact, the corresponding updates shall be made to `00_OPERATIONS_MAP.md` within the same pull request.
+
+`00_OPERATIONS_MAP.md` is the canonical operational index for the platform and should remain the fastest way for a new maintainer or AI assistant to locate and understand OmniTrade's production infrastructure.

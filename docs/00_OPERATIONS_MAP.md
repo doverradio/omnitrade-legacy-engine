@@ -10,6 +10,20 @@ Operational index for OmniTrade: services, entry points, configuration sources, 
 - Every factual claim carries a verification tag. Do not add a claim without one, and do not state a **[PROPOSED]** or **[UNRESOLVED]** item as current fact.
 
 ---
+## Git Repository
+
+Default branch: master
+
+All standard pull/push examples in this repository should use:
+
+git pull origin master
+
+git push origin master
+
+Do not substitute `main` unless the repository default branch is intentionally changed.
+
+
+---
 
 ## Verification Status Legend
 
