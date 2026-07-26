@@ -37,6 +37,7 @@ from app.models.validation_run_event import ValidationRunEvent
 from app.services.canonical_preview_package import CanonicalPreviewPackageCreateRequest, create_canonical_preview_package
 from app.services.controlled_proof import (
     claim_next_controlled_proof_for_scope,
+    evaluate_controlled_proof_risk,
     link_controlled_proof_entry,
     link_controlled_proof_package,
     link_controlled_proof_sell_package,
@@ -1221,17 +1222,63 @@ async def _attempt_automatic_ready_package_creation(
                     skip_reason = "missing_decision_record_id"
                 elif evidence_freshness and evidence_freshness != "fresh":
                     skip_reason = "stale_market_data"
-                elif risk_verdict != "ALLOW":
-                    skip_reason = "risk_not_permitted"
                 elif candle_close_time is None:
                     skip_reason = "missing_candle_close_time"
                 else:
-                    skip_reason = None
-                    proposed_action = target_action
-                    decision_kind = target_action
-                    is_close_action = target_action == "CLOSE_POSITION_PROPOSED"
-                    final_amount = _CANONICAL_READY_PACKAGE_AMOUNT
-                    controlled_proof_forced_entry = True
+                    # The organic risk_verdict reflects the ORIGINAL HOLD
+                    # decision -- or, for a pure strategy-consensus HOLD,
+                    # reflects nothing at all, since risk was never invoked
+                    # for it (see authoritative.py's HOLD-branch
+                    # selected_decision construction, which carries no
+                    # risk_verdict key). It must never gate a forced entry.
+                    # A genuine, fresh Risk Engine evaluation of this exact
+                    # forced candidate is required instead. Isolated in its
+                    # own try/except: a defect here must fail closed, never
+                    # fall through to treating a missing result as ALLOW.
+                    controlled_proof_risk_outcome = None
+                    try:
+                        risk_runtime_campaign = await _load_runtime_campaign(db=db, campaign_id=campaign_id)
+                        if risk_runtime_campaign is None or risk_runtime_campaign.paper_account_id is None:
+                            raise LookupError("runtime_campaign_or_paper_account_missing")
+                        controlled_proof_risk_outcome = await evaluate_controlled_proof_risk(
+                            db=db,
+                            proof_id=controlled_proof.proof_id,
+                            campaign_id=campaign_id,
+                            campaign_version=campaign_version,
+                            paper_account_id=risk_runtime_campaign.paper_account_id,
+                            product_id=product,
+                            side="SELL" if target_action == "CLOSE_POSITION_PROPOSED" else "BUY",
+                            notional_usd=_CANONICAL_READY_PACKAGE_AMOUNT,
+                            actor="system:controlled_proof_worker",
+                        )
+                    except Exception:
+                        logger.exception(
+                            "controlled_proof_risk_evaluation_call_failed proof_id=%s campaign_id=%s campaign_version=%s",
+                            controlled_proof.proof_id, campaign_id, campaign_version,
+                        )
+                        controlled_proof_risk_outcome = None
+
+                    if controlled_proof_risk_outcome is None or controlled_proof_risk_outcome.verdict == "UNAVAILABLE":
+                        skip_reason = "controlled_proof_risk_unavailable"
+                    elif controlled_proof_risk_outcome.verdict == "RESIZE":
+                        # The canonical package pipeline requires exactly
+                        # $5 (create_canonical_preview_package rejects any
+                        # other max_proposed_order_amount) -- there is no
+                        # code path to execute at a smaller, risk-approved
+                        # size, so a RESIZE can never be silently proceeded
+                        # with at the full requested amount. Blocks with a
+                        # distinct reason so it is diagnosable as "risk
+                        # wants a smaller size", not "risk said no".
+                        skip_reason = "controlled_proof_risk_resize"
+                    elif controlled_proof_risk_outcome.verdict == "DENY":
+                        skip_reason = "controlled_proof_risk_denied"
+                    else:
+                        skip_reason = None
+                        proposed_action = target_action
+                        decision_kind = target_action
+                        is_close_action = target_action == "CLOSE_POSITION_PROPOSED"
+                        final_amount = _CANONICAL_READY_PACKAGE_AMOUNT
+                        controlled_proof_forced_entry = True
 
         underlying_reason: str | None = None
         rejection_reasons: list[str] = []

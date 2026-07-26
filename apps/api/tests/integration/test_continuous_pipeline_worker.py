@@ -1329,6 +1329,12 @@ async def test_controlled_proof_forces_buy_candidate_when_strategy_would_hold(mo
     async def _sell_ready(*, db, proof):
         return False
 
+    async def _risk_allow(*, db, proof_id, campaign_id, campaign_version, paper_account_id, product_id, side, notional_usd, actor):
+        from app.services.controlled_proof import ControlledProofRiskOutcome
+        return ControlledProofRiskOutcome(
+            verdict="ALLOW", approved_notional_usd=notional_usd, reason_code="risk_approved", risk_event_id=uuid.uuid4(),
+        )
+
     async def _link_entry(*, db, proof, decision_record_id, mandate_id, mandate_version_id, mandate_evaluation_id):
         entry_link_calls.append(decision_record_id)
         proof.decision_record_id = decision_record_id
@@ -1361,6 +1367,7 @@ async def test_controlled_proof_forces_buy_candidate_when_strategy_would_hold(mo
     monkeypatch.setattr(worker_module, "execute_automatic_ready_package_through_activation", _execute)
     monkeypatch.setattr(worker_module, "claim_next_controlled_proof_for_scope", _claim)
     monkeypatch.setattr(worker_module, "should_propose_controlled_sell", _sell_ready)
+    monkeypatch.setattr(worker_module, "evaluate_controlled_proof_risk", _risk_allow)
     monkeypatch.setattr(worker_module, "link_controlled_proof_entry", _link_entry)
     monkeypatch.setattr(worker_module, "link_controlled_proof_package", _link_package)
 
@@ -1372,6 +1379,83 @@ async def test_controlled_proof_forces_buy_candidate_when_strategy_would_hold(mo
     assert create_requests[0].controlled_proof_id == proof.proof_id
     assert entry_link_calls == [cycle.decision_record_id]
     assert package_link_calls == [package_id]
+
+
+@pytest.mark.asyncio
+async def test_controlled_proof_forced_entry_never_mutates_original_hold_decision(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The fresh Controlled Proof risk evaluation is local evidence for the
+    forced-entry path only -- even on a successful forced BUY, the organic
+    HOLD decision (selected_decision, including its absent risk_verdict
+    key), the persisted cycle_context, and the cycle's own organic
+    risk_verdict field must come out byte-for-byte identical to how they
+    went in."""
+    import copy
+
+    import app.services.orchestration.continuous_pipeline_worker as worker_module
+    from app.services.controlled_proof import ControlledProofRiskOutcome
+    from app.services.orchestration.automatic_package_executor import AutomaticPackageExecutionOutcome
+
+    cycle = _automatic_cycle(proposed_action="HOLD_NO_TRADE", decision_kind="HOLD_NO_TRADE")
+    # Mirrors authoritative.py's real HOLD-branch selected_decision, which
+    # never sets a risk_verdict key at all (only the winning-candidate
+    # branch does) -- the _automatic_cycle test helper's default of
+    # "ALLOW" is purely synthetic fixture data, not what a genuine HOLD
+    # produces.
+    del cycle.cycle_context["authoritative_composition"]["selected_decision"]["risk_verdict"]
+    original_cycle_context = copy.deepcopy(cycle.cycle_context)
+    original_risk_verdict = cycle.risk_verdict
+    package_id = uuid.uuid4()
+    proof = _controlled_proof_stub()
+
+    async def _claim(*, db, campaign_id, campaign_version, provider, environment, product_id, cycle_id):
+        return proof
+
+    async def _sell_ready(*, db, proof):
+        return False
+
+    async def _risk_allow(*, db, proof_id, campaign_id, campaign_version, paper_account_id, product_id, side, notional_usd, actor):
+        return ControlledProofRiskOutcome(
+            verdict="ALLOW", approved_notional_usd=notional_usd, reason_code="risk_approved", risk_event_id=uuid.uuid4(),
+        )
+
+    async def _link_entry(*, db, proof, decision_record_id, mandate_id, mandate_version_id, mandate_evaluation_id):
+        proof.decision_record_id = decision_record_id
+
+    async def _link_package(*, db, proof, package_id):
+        proof.package_id = package_id
+
+    async def _create(*, db, request):
+        return {"idempotent": False, "package": {"package_id": str(package_id), "package_state": "READY"}}
+
+    async def _execute(*, db, request):
+        return AutomaticPackageExecutionOutcome(
+            package_id=package_id, campaign_id=cycle.capital_campaign_id,
+            campaign_version=cycle.capital_campaign_version, decision_record_id=cycle.decision_record_id,
+            mandate_id=cycle.mandate_id, authorization_state="AUTHORIZED", dry_run_state="NOT_RUN",
+            activation_state="NOT_ACTIVATED", authority_source="MANDATE", replayed=False,
+            final_reason_code="test_stub_stops_before_activation", failed_closed=True, starting_state="READY",
+        )
+
+    monkeypatch.setattr(worker_module, "_load_cycle_by_id", _async_return(cycle))
+    monkeypatch.setattr(worker_module, "_has_active_ready_package_for_opportunity", _async_return(False))
+    monkeypatch.setattr(worker_module, "_has_active_proving_activation", _async_return(False))
+    monkeypatch.setattr(worker_module, "_has_open_live_order", _async_return(False))
+    monkeypatch.setattr(worker_module, "_has_unresolved_reconciliation", _async_return(False))
+    monkeypatch.setattr(worker_module, "_load_runtime_campaign", _async_return(SimpleNamespace(paper_account_id=uuid.uuid4())))
+    monkeypatch.setattr(worker_module, "_load_live_trading_profile_for_paper_account", _async_return(SimpleNamespace(id=uuid.uuid4())))
+    monkeypatch.setattr(worker_module, "create_canonical_preview_package", _create)
+    monkeypatch.setattr(worker_module, "execute_automatic_ready_package_through_activation", _execute)
+    monkeypatch.setattr(worker_module, "claim_next_controlled_proof_for_scope", _claim)
+    monkeypatch.setattr(worker_module, "should_propose_controlled_sell", _sell_ready)
+    monkeypatch.setattr(worker_module, "evaluate_controlled_proof_risk", _risk_allow)
+    monkeypatch.setattr(worker_module, "link_controlled_proof_entry", _link_entry)
+    monkeypatch.setattr(worker_module, "link_controlled_proof_package", _link_package)
+
+    await worker_module._attempt_automatic_ready_package_creation(db=object(), orchestration_payload=_automatic_payload(cycle))
+
+    assert cycle.cycle_context == original_cycle_context
+    assert "risk_verdict" not in cycle.cycle_context["authoritative_composition"]["selected_decision"]
+    assert cycle.risk_verdict == original_risk_verdict
 
 
 @pytest.mark.asyncio
@@ -1401,6 +1485,12 @@ async def test_controlled_proof_forces_buy_when_hold_surfaces_as_termination_sta
     async def _sell_ready(*, db, proof):
         return False
 
+    async def _risk_allow(*, db, proof_id, campaign_id, campaign_version, paper_account_id, product_id, side, notional_usd, actor):
+        from app.services.controlled_proof import ControlledProofRiskOutcome
+        return ControlledProofRiskOutcome(
+            verdict="ALLOW", approved_notional_usd=notional_usd, reason_code="risk_approved", risk_event_id=uuid.uuid4(),
+        )
+
     async def _link_entry(*, db, proof, decision_record_id, mandate_id, mandate_version_id, mandate_evaluation_id):
         entry_link_calls.append(decision_record_id)
         proof.decision_record_id = decision_record_id
@@ -1433,6 +1523,7 @@ async def test_controlled_proof_forces_buy_when_hold_surfaces_as_termination_sta
     monkeypatch.setattr(worker_module, "execute_automatic_ready_package_through_activation", _execute)
     monkeypatch.setattr(worker_module, "claim_next_controlled_proof_for_scope", _claim)
     monkeypatch.setattr(worker_module, "should_propose_controlled_sell", _sell_ready)
+    monkeypatch.setattr(worker_module, "evaluate_controlled_proof_risk", _risk_allow)
     monkeypatch.setattr(worker_module, "link_controlled_proof_entry", _link_entry)
     monkeypatch.setattr(worker_module, "link_controlled_proof_package", _link_package)
 
@@ -1514,10 +1605,16 @@ async def test_controlled_proof_never_overrides_failed_closed_termination(monkey
 async def test_controlled_proof_forced_entry_blocked_by_risk_denial(monkeypatch: pytest.MonkeyPatch) -> None:
     """Requirement 4: the HOLD override never defeats a real risk denial --
     it only ever overrides the single "ordinary strategy said HOLD"
-    objection, and every other gate re-runs against the cycle's real data."""
+    objection, and every other gate re-runs against the cycle's real data.
+    The organic cycle.risk_verdict is left at its default (never consulted
+    by the forced path -- see authoritative.py's HOLD-branch, which never
+    sets a risk_verdict at all); the block must come from a genuine, fresh
+    Controlled Proof risk evaluation reporting DENY, not from stale/absent
+    organic risk data."""
     import app.services.orchestration.continuous_pipeline_worker as worker_module
+    from app.services.controlled_proof import ControlledProofRiskOutcome
 
-    cycle = _automatic_cycle(proposed_action="HOLD_NO_TRADE", decision_kind="HOLD_NO_TRADE", risk_verdict="DENY")
+    cycle = _automatic_cycle(proposed_action="HOLD_NO_TRADE", decision_kind="HOLD_NO_TRADE")
     proof = _controlled_proof_stub()
 
     async def _claim(*, db, campaign_id, campaign_version, provider, environment, product_id, cycle_id):
@@ -1526,12 +1623,65 @@ async def test_controlled_proof_forced_entry_blocked_by_risk_denial(monkeypatch:
     async def _sell_ready(*, db, proof):
         return False
 
+    async def _load_runtime_campaign(*, db, campaign_id):
+        return SimpleNamespace(paper_account_id=uuid.uuid4())
+
+    async def _risk_deny(*, db, proof_id, campaign_id, campaign_version, paper_account_id, product_id, side, notional_usd, actor):
+        assert side == "BUY"
+        return ControlledProofRiskOutcome(
+            verdict="DENY", approved_notional_usd=None, reason_code="max_drawdown_breached", risk_event_id=uuid.uuid4(),
+        )
+
     async def _create(*, db, request):
         raise AssertionError("a real risk denial must never be overridden by controlled-proof forcing")
 
     monkeypatch.setattr(worker_module, "_load_cycle_by_id", _async_return(cycle))
     monkeypatch.setattr(worker_module, "claim_next_controlled_proof_for_scope", _claim)
     monkeypatch.setattr(worker_module, "should_propose_controlled_sell", _sell_ready)
+    monkeypatch.setattr(worker_module, "_load_runtime_campaign", _load_runtime_campaign)
+    monkeypatch.setattr(worker_module, "evaluate_controlled_proof_risk", _risk_deny)
+    monkeypatch.setattr(worker_module, "create_canonical_preview_package", _create)
+
+    await worker_module._attempt_automatic_ready_package_creation(db=object(), orchestration_payload=_automatic_payload(cycle))
+
+
+@pytest.mark.asyncio
+async def test_controlled_proof_forced_entry_blocked_by_risk_resize(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A genuine RESIZE verdict must never be silently proceeded with at the
+    full $5 -- the canonical package pipeline hard-requires exactly $5
+    (create_canonical_preview_package rejects any other amount), so there is
+    no code path to execute at a smaller, risk-approved size. It must block,
+    with a distinct reason code diagnosable as "risk wants a smaller size",
+    not "risk said no"."""
+    import app.services.orchestration.continuous_pipeline_worker as worker_module
+    from app.services.controlled_proof import ControlledProofRiskOutcome
+
+    cycle = _automatic_cycle(proposed_action="HOLD_NO_TRADE", decision_kind="HOLD_NO_TRADE")
+    proof = _controlled_proof_stub()
+
+    async def _claim(*, db, campaign_id, campaign_version, provider, environment, product_id, cycle_id):
+        return proof
+
+    async def _sell_ready(*, db, proof):
+        return False
+
+    async def _load_runtime_campaign(*, db, campaign_id):
+        return SimpleNamespace(paper_account_id=uuid.uuid4())
+
+    async def _risk_resize(*, db, proof_id, campaign_id, campaign_version, paper_account_id, product_id, side, notional_usd, actor):
+        return ControlledProofRiskOutcome(
+            verdict="RESIZE", approved_notional_usd=Decimal("1"), reason_code="position_resized_by_risk_engine",
+            risk_event_id=uuid.uuid4(),
+        )
+
+    async def _create(*, db, request):
+        raise AssertionError("a RESIZE verdict must never be silently proceeded with at the full $5")
+
+    monkeypatch.setattr(worker_module, "_load_cycle_by_id", _async_return(cycle))
+    monkeypatch.setattr(worker_module, "claim_next_controlled_proof_for_scope", _claim)
+    monkeypatch.setattr(worker_module, "should_propose_controlled_sell", _sell_ready)
+    monkeypatch.setattr(worker_module, "_load_runtime_campaign", _load_runtime_campaign)
+    monkeypatch.setattr(worker_module, "evaluate_controlled_proof_risk", _risk_resize)
     monkeypatch.setattr(worker_module, "create_canonical_preview_package", _create)
 
     await worker_module._attempt_automatic_ready_package_creation(db=object(), orchestration_payload=_automatic_payload(cycle))
@@ -1568,8 +1718,12 @@ async def test_controlled_proof_forced_entry_blocked_by_mandate_denial(monkeypat
     controlled-proof-forced BUY. Forces the campaign cycle's mandate bundle
     to be incomplete (so the real _ensure_campaign_cycle_mandate_evaluation
     re-evaluation path runs) and has the real mandate evaluation call report
-    a rejected/mismatched result."""
+    a rejected/mismatched result. The fresh Controlled Proof risk check
+    (which runs before the mandate gate) is mocked to ALLOW so this test
+    genuinely exercises the mandate-denial gate rather than short-circuiting
+    on an unrelated risk-unavailable fail-closed."""
     import app.services.orchestration.continuous_pipeline_worker as worker_module
+    from app.services.controlled_proof import ControlledProofRiskOutcome
 
     cycle = _automatic_cycle(proposed_action="HOLD_NO_TRADE", decision_kind="HOLD_NO_TRADE")
     cycle.cycle_kind = "campaign"
@@ -1594,6 +1748,14 @@ async def test_controlled_proof_forced_entry_blocked_by_mandate_denial(monkeypat
     async def _resolve_strategy_identity(*, db, mandate_id):
         return "ma_crossover@1.0.0"
 
+    async def _load_runtime_campaign(*, db, campaign_id):
+        return SimpleNamespace(paper_account_id=uuid.uuid4())
+
+    async def _risk_allow(*, db, proof_id, campaign_id, campaign_version, paper_account_id, product_id, side, notional_usd, actor):
+        return ControlledProofRiskOutcome(
+            verdict="ALLOW", approved_notional_usd=notional_usd, reason_code="risk_approved", risk_event_id=uuid.uuid4(),
+        )
+
     async def _evaluate_denied(*, db, request):
         return SimpleNamespace(
             evaluation_id=uuid.uuid4(), mandate_id=request.mandate_id, mandate_version_id=uuid.uuid4(),
@@ -1613,6 +1775,8 @@ async def test_controlled_proof_forced_entry_blocked_by_mandate_denial(monkeypat
     monkeypatch.setattr(worker_module, "claim_next_controlled_proof_for_scope", _claim)
     monkeypatch.setattr(worker_module, "should_propose_controlled_sell", _sell_ready)
     monkeypatch.setattr(worker_module, "resolve_controlled_proof_strategy_identity", _resolve_strategy_identity)
+    monkeypatch.setattr(worker_module, "_load_runtime_campaign", _load_runtime_campaign)
+    monkeypatch.setattr(worker_module, "evaluate_controlled_proof_risk", _risk_allow)
     monkeypatch.setattr(worker_module, "evaluate_and_record_mandate", _evaluate_denied)
     monkeypatch.setattr(
         worker_module, "get_settings",
@@ -1633,11 +1797,16 @@ async def test_controlled_proof_forced_buy_not_reproposed_after_entry_already_li
     """Requirement 6: once a controlled proof already has a linked entry
     (decision_record_id set) from an earlier tick, a worker restart must not
     force a second BUY candidate, even while the ordinary strategy still
-    proposes HOLD."""
+    proposes HOLD. This also guarantees the bounded audit-persistence claim:
+    a successful forced entry is evaluated by the fresh Risk Engine exactly
+    once, ever, for a given proof -- once already_has_entry makes
+    target_action resolve to None, evaluate_controlled_proof_risk (and the
+    RiskEvent it would persist) is never reached again."""
     import app.services.orchestration.continuous_pipeline_worker as worker_module
 
     cycle = _automatic_cycle(proposed_action="HOLD_NO_TRADE", decision_kind="HOLD_NO_TRADE")
     proof = _controlled_proof_stub(decision_record_id=uuid.uuid4(), package_id=uuid.uuid4())
+    risk_calls: list = []
 
     async def _claim(*, db, campaign_id, campaign_version, provider, environment, product_id, cycle_id):
         return proof
@@ -1645,15 +1814,22 @@ async def test_controlled_proof_forced_buy_not_reproposed_after_entry_already_li
     async def _sell_ready(*, db, proof):
         return False
 
+    async def _risk_should_never_be_called(**kwargs):
+        risk_calls.append(kwargs)
+        raise AssertionError("evaluate_controlled_proof_risk must not run once the proof's entry is already linked")
+
     async def _create(*, db, request):
         raise AssertionError("must not force a second BUY once the proof's one controlled entry is already linked")
 
     monkeypatch.setattr(worker_module, "_load_cycle_by_id", _async_return(cycle))
     monkeypatch.setattr(worker_module, "claim_next_controlled_proof_for_scope", _claim)
     monkeypatch.setattr(worker_module, "should_propose_controlled_sell", _sell_ready)
+    monkeypatch.setattr(worker_module, "evaluate_controlled_proof_risk", _risk_should_never_be_called)
     monkeypatch.setattr(worker_module, "create_canonical_preview_package", _create)
 
     await worker_module._attempt_automatic_ready_package_creation(db=object(), orchestration_payload=_automatic_payload(cycle))
+
+    assert risk_calls == []
 
 
 @pytest.mark.asyncio
@@ -1678,6 +1854,13 @@ async def test_controlled_proof_forces_sell_after_buy_reconciled(monkeypatch: py
 
     async def _sell_ready(*, db, proof):
         return True
+
+    async def _risk_allow(*, db, proof_id, campaign_id, campaign_version, paper_account_id, product_id, side, notional_usd, actor):
+        from app.services.controlled_proof import ControlledProofRiskOutcome
+        assert side == "SELL"
+        return ControlledProofRiskOutcome(
+            verdict="ALLOW", approved_notional_usd=notional_usd, reason_code="risk_approved", risk_event_id=uuid.uuid4(),
+        )
 
     async def _link_sell(*, db, proof, sell_package_id):
         sell_link_calls.append(sell_package_id)
@@ -1710,6 +1893,7 @@ async def test_controlled_proof_forces_sell_after_buy_reconciled(monkeypatch: py
     monkeypatch.setattr(worker_module, "execute_automatic_ready_package_through_activation", _execute)
     monkeypatch.setattr(worker_module, "claim_next_controlled_proof_for_scope", _claim)
     monkeypatch.setattr(worker_module, "should_propose_controlled_sell", _sell_ready)
+    monkeypatch.setattr(worker_module, "evaluate_controlled_proof_risk", _risk_allow)
     monkeypatch.setattr(worker_module, "link_controlled_proof_sell_package", _link_sell)
     monkeypatch.setattr(worker_module, "link_controlled_proof_entry", _link_entry)
 

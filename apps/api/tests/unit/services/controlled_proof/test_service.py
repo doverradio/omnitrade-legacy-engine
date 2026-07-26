@@ -27,6 +27,8 @@ from app.models.live_accounting_record import LiveAccountingRecord
 from app.models.live_crypto_order import LiveCryptoOrder
 from app.models.live_reconciliation_event import LiveReconciliationEvent
 from app.models.live_trading_profile import LiveTradingProfile
+from app.models.paper_account import PaperAccount
+from app.models.risk_event import RiskEvent
 from app.models.strategy_roster_run import StrategyRosterRun
 from app.services.controlled_proof import service as controlled_proof_service
 from app.services.strategies.identity import build_strategy_identity
@@ -730,6 +732,236 @@ async def test_status_view_reports_blocked_verdict_when_proof_expires_before_any
 
         assert view["status"] == "EXPIRED"
         assert view["terminal_verdict"] == "BLOCKED"
+
+
+# --- fresh Controlled Proof risk evaluation -------------------------------------------
+
+async def _seed_paper_account(session: AsyncSession, *, paper_account_id: uuid.UUID) -> None:
+    session.add(PaperAccount(
+        id=paper_account_id, owner_user_id=uuid.uuid4(), name="test", asset_class="crypto",
+        starting_balance=Decimal("25"), current_cash_balance=Decimal("25"), is_active=True,
+    ))
+    await session.flush()
+
+
+def _stub_risk_context():
+    from app.services.risk.risk_context import ExecutionRiskContext
+
+    now = datetime.now(timezone.utc)
+    return ExecutionRiskContext(
+        account_equity=Decimal("25"), start_of_day_equity=Decimal("25"), current_equity=Decimal("25"),
+        max_position_size_pct=Decimal("1"), max_daily_loss_pct=Decimal("0.5"), high_water_mark_equity=Decimal("25"),
+        max_drawdown_pct=Decimal("0.5"), consecutive_losses_on_pair=0, cooldown_after_losses=3,
+        last_loss_at=None, cooldown_duration_minutes=Decimal("0"), evaluation_time=now,
+        data_is_stale=False, data_has_gaps=False, global_kill_switch_engaged_state=False,
+        global_kill_switch_rearm_required=False, account_kill_switch_engaged_state=False,
+        account_kill_switch_rearm_required=False, global_kill_switch_state_observed=True,
+        account_kill_switch_state_observed=True, risk_policy_source="test", runtime_cooldown_state="inactive",
+        runtime_no_trade_zone_state="inactive", start_of_day_equity_source="test", high_water_mark_equity_source="test",
+    )
+
+
+@pytest.mark.asyncio
+async def test_evaluate_controlled_proof_risk_allows_and_persists_real_risk_event() -> None:
+    """A genuine ALLOW verdict from the real Risk Engine triad proceeds and
+    persists a real RiskEvent through the existing canonical persistence
+    path -- not a fabricated approval."""
+
+    async with real_sqlite_session([*_ALL_TABLES, PaperAccount.__table__, RiskEvent.__table__]) as session:
+        paper_account_id = uuid.uuid4()
+        await _seed_paper_account(session, paper_account_id=paper_account_id)
+        await _seed_asset_with_fresh_candles(session, symbol="BTC")
+
+        real_context = _stub_risk_context()
+
+        async def _resolve(*, db, paper_account, asset):
+            return real_context
+
+        with pytest.MonkeyPatch.context() as mp:
+            mp.setattr(controlled_proof_service, "resolve_execution_risk_context", _resolve)
+
+            outcome = await controlled_proof_service.evaluate_controlled_proof_risk(
+                db=session, proof_id=uuid.uuid4(), campaign_id=_CAMPAIGN_ID, campaign_version=1,
+                paper_account_id=paper_account_id, product_id="BTC-USD", side="BUY",
+                notional_usd=Decimal("5"), actor="system:test",
+            )
+
+        assert outcome.verdict == "ALLOW"
+        assert outcome.risk_event_id is not None
+        persisted = await session.get(RiskEvent, outcome.risk_event_id)
+        assert persisted is not None
+        assert persisted.action_taken == "approved"
+
+
+@pytest.mark.asyncio
+async def test_evaluate_controlled_proof_risk_denies_never_fabricates_allow() -> None:
+    """A genuine REJECT verdict blocks with the real reason -- it must never
+    be silently treated as ALLOW."""
+    from app.services.risk.risk_engine import RiskDecisionAction, RiskEvaluationResult
+
+    async with real_sqlite_session([*_ALL_TABLES, PaperAccount.__table__, RiskEvent.__table__]) as session:
+        paper_account_id = uuid.uuid4()
+        await _seed_paper_account(session, paper_account_id=paper_account_id)
+        await _seed_asset_with_fresh_candles(session, symbol="BTC")
+
+        real_context = _stub_risk_context()
+
+        async def _resolve(*, db, paper_account, asset):
+            return real_context
+
+        def _denied(*, request, reference_price=None, context=None):
+            return RiskEvaluationResult(
+                action=RiskDecisionAction.REJECT, reason_code="max_drawdown_breached",
+                approved_quantity=Decimal("0"), steps=[],
+            )
+
+        with pytest.MonkeyPatch.context() as mp:
+            mp.setattr(controlled_proof_service, "resolve_execution_risk_context", _resolve)
+            mp.setattr(controlled_proof_service, "evaluate_signal_risk", _denied)
+
+            outcome = await controlled_proof_service.evaluate_controlled_proof_risk(
+                db=session, proof_id=uuid.uuid4(), campaign_id=_CAMPAIGN_ID, campaign_version=1,
+                paper_account_id=paper_account_id, product_id="BTC-USD", side="BUY",
+                notional_usd=Decimal("5"), actor="system:test",
+            )
+
+        assert outcome.verdict == "DENY"
+        assert outcome.approved_notional_usd is None
+        assert outcome.reason_code == "max_drawdown_breached"
+
+
+@pytest.mark.asyncio
+async def test_evaluate_controlled_proof_risk_resize_never_reports_full_notional() -> None:
+    """A genuine RESIZE verdict reports only the risk-approved amount --
+    never the full requested $5 -- so callers can never silently proceed
+    at the full size."""
+    from app.services.risk.risk_engine import RiskDecisionAction, RiskEvaluationResult
+
+    async with real_sqlite_session([*_ALL_TABLES, PaperAccount.__table__, RiskEvent.__table__]) as session:
+        paper_account_id = uuid.uuid4()
+        await _seed_paper_account(session, paper_account_id=paper_account_id)
+        await _seed_asset_with_fresh_candles(session, symbol="BTC")
+
+        real_context = _stub_risk_context()
+
+        async def _resolve(*, db, paper_account, asset):
+            return real_context
+
+        def _resized(*, request, reference_price=None, context=None):
+            return RiskEvaluationResult(
+                action=RiskDecisionAction.RESIZE, reason_code="position_resized_by_risk_engine",
+                approved_quantity=Decimal("0.01"), steps=[],
+            )
+
+        with pytest.MonkeyPatch.context() as mp:
+            mp.setattr(controlled_proof_service, "resolve_execution_risk_context", _resolve)
+            mp.setattr(controlled_proof_service, "evaluate_signal_risk", _resized)
+
+            outcome = await controlled_proof_service.evaluate_controlled_proof_risk(
+                db=session, proof_id=uuid.uuid4(), campaign_id=_CAMPAIGN_ID, campaign_version=1,
+                paper_account_id=paper_account_id, product_id="BTC-USD", side="BUY",
+                notional_usd=Decimal("5"), actor="system:test",
+            )
+
+        assert outcome.verdict == "RESIZE"
+        assert outcome.approved_notional_usd is not None
+        assert outcome.approved_notional_usd != Decimal("5")
+        assert outcome.approved_notional_usd == Decimal("0.01") * Decimal("100")
+
+
+@pytest.mark.asyncio
+async def test_evaluate_controlled_proof_risk_blank_verdict_fails_closed() -> None:
+    """An unrecognized action -- something outside the closed
+    APPROVE/RESIZE/REJECT enum this code maps -- must fail closed as
+    UNAVAILABLE, never be silently treated as ALLOW. Modeled as a distinct
+    str+Enum member (rather than a bare string) because the shared
+    persistence path always reads `.value` off the action before this
+    code's own verdict mapping ever runs -- so a genuinely value-less
+    action can never reach this function's defensive branch in practice;
+    what CAN reach it is a real enum-shaped action this elif chain simply
+    doesn't recognize, e.g. a future RiskDecisionAction member added
+    upstream before this mapping is updated for it."""
+    from enum import Enum
+
+    from app.services.risk.risk_engine import RiskEvaluationResult
+
+    class _UnrecognizedAction(str, Enum):
+        HOLD_FOR_REVIEW = "hold_for_review"
+
+    async with real_sqlite_session([*_ALL_TABLES, PaperAccount.__table__, RiskEvent.__table__]) as session:
+        paper_account_id = uuid.uuid4()
+        await _seed_paper_account(session, paper_account_id=paper_account_id)
+        await _seed_asset_with_fresh_candles(session, symbol="BTC")
+
+        real_context = _stub_risk_context()
+
+        async def _resolve(*, db, paper_account, asset):
+            return real_context
+
+        def _blank(*, request, reference_price=None, context=None):
+            return RiskEvaluationResult(
+                action=_UnrecognizedAction.HOLD_FOR_REVIEW, reason_code=None, approved_quantity=Decimal("0"), steps=[],
+            )
+
+        with pytest.MonkeyPatch.context() as mp:
+            mp.setattr(controlled_proof_service, "resolve_execution_risk_context", _resolve)
+            mp.setattr(controlled_proof_service, "evaluate_signal_risk", _blank)
+
+            outcome = await controlled_proof_service.evaluate_controlled_proof_risk(
+                db=session, proof_id=uuid.uuid4(), campaign_id=_CAMPAIGN_ID, campaign_version=1,
+                paper_account_id=paper_account_id, product_id="BTC-USD", side="BUY",
+                notional_usd=Decimal("5"), actor="system:test",
+            )
+
+        assert outcome.verdict == "UNAVAILABLE"
+        assert outcome.approved_notional_usd is None
+
+
+@pytest.mark.asyncio
+async def test_evaluate_controlled_proof_risk_fails_closed_when_asset_unregistered() -> None:
+    """A missing/unavailable dependency (here: no registered Asset for the
+    product) must fail closed as UNAVAILABLE, never silently proceed as if
+    risk had approved."""
+    async with real_sqlite_session([*_ALL_TABLES, PaperAccount.__table__, RiskEvent.__table__]) as session:
+        paper_account_id = uuid.uuid4()
+        await _seed_paper_account(session, paper_account_id=paper_account_id)
+        # Deliberately no Asset seeded for BTC-USD.
+
+        outcome = await controlled_proof_service.evaluate_controlled_proof_risk(
+            db=session, proof_id=uuid.uuid4(), campaign_id=_CAMPAIGN_ID, campaign_version=1,
+            paper_account_id=paper_account_id, product_id="BTC-USD", side="BUY",
+            notional_usd=Decimal("5"), actor="system:test",
+        )
+
+        assert outcome.verdict == "UNAVAILABLE"
+        assert outcome.risk_event_id is None
+        assert outcome.approved_notional_usd is None
+
+
+@pytest.mark.asyncio
+async def test_evaluate_controlled_proof_risk_fails_closed_when_risk_context_raises() -> None:
+    """An exception raised deep inside risk-context resolution (e.g. a
+    downstream dependency outage) must be caught and mapped to a fail-closed
+    UNAVAILABLE verdict, never propagate as a fabricated ALLOW."""
+    async with real_sqlite_session([*_ALL_TABLES, PaperAccount.__table__, RiskEvent.__table__]) as session:
+        paper_account_id = uuid.uuid4()
+        await _seed_paper_account(session, paper_account_id=paper_account_id)
+        await _seed_asset_with_fresh_candles(session, symbol="BTC")
+
+        async def _raise(*, db, paper_account, asset):
+            raise RuntimeError("simulated risk-context dependency outage")
+
+        with pytest.MonkeyPatch.context() as mp:
+            mp.setattr(controlled_proof_service, "resolve_execution_risk_context", _raise)
+
+            outcome = await controlled_proof_service.evaluate_controlled_proof_risk(
+                db=session, proof_id=uuid.uuid4(), campaign_id=_CAMPAIGN_ID, campaign_version=1,
+                paper_account_id=paper_account_id, product_id="BTC-USD", side="BUY",
+                notional_usd=Decimal("5"), actor="system:test",
+            )
+
+        assert outcome.verdict == "UNAVAILABLE"
+        assert outcome.risk_event_id is None
 
 
 # --- no direct provider submission ---------------------------------------------------

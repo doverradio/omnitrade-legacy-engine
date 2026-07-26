@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import logging
 import uuid
+from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 from typing import Any
@@ -10,20 +12,34 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.errors import InvalidRequestError, NotFoundError
+from app.models.asset import Asset
 from app.models.audit_log import AuditLog
 from app.models.autonomous_capital_mandate_evaluation import AutonomousCapitalMandateEvaluation
+from app.models.candle import Candle
 from app.models.canonical_preview_package import CanonicalPreviewPackage
 from app.models.capital_campaign import CapitalCampaign
 from app.models.controlled_proof_run import ControlledProofRun
 from app.models.decision_record import DecisionRecord
 from app.models.live_accounting_record import LiveAccountingRecord
 from app.models.live_crypto_order import LiveCryptoOrder
+from app.models.paper_account import PaperAccount
 from app.models.strategy import Strategy
 from app.services.asset_commissioning import get_asset_readiness
 from app.services.capital_campaign_domain import get_governing_campaign_definition
 from app.services.mandates.lifecycle import get_governing_authorized_mandate_version
 from app.services.position_lifecycle.source_adapter import load_position_snapshots
+from app.services.risk import (
+    RiskDecisionAction,
+    RiskDecisionPersistenceRequest,
+    RiskEvaluationContext,
+    RiskEvaluationRequest,
+    evaluate_signal_risk,
+    persist_risk_decision,
+)
+from app.services.risk.risk_context import resolve_execution_risk_context
 from app.services.strategies.identity import build_strategy_identity
+
+logger = logging.getLogger(__name__)
 
 # --- Server-enforced production scope for v1 ------------------------------
 #
@@ -363,6 +379,155 @@ async def should_propose_controlled_sell(*, db: AsyncSession, proof: ControlledP
     symbol_base = proof.product_id.split("-")[0]
     match = next((s for s in snapshots if s.symbol.split("-")[0].upper() == symbol_base), None)
     return match is not None and match.position_size != 0
+
+
+@dataclass(frozen=True, slots=True)
+class ControlledProofRiskOutcome:
+    """Result of one genuine, fresh Risk Engine evaluation for a
+    Controlled-Proof-forced candidate. "verdict" is always one of
+    ALLOW/RESIZE/DENY/UNAVAILABLE -- never blank -- and callers must never
+    treat anything other than ALLOW as permission to proceed."""
+
+    verdict: str
+    approved_notional_usd: Decimal | None
+    reason_code: str | None
+    risk_event_id: uuid.UUID | None
+
+
+async def evaluate_controlled_proof_risk(
+    *, db: AsyncSession, proof_id: uuid.UUID, campaign_id: uuid.UUID, campaign_version: int,
+    paper_account_id: uuid.UUID, product_id: str, side: str, notional_usd: Decimal, actor: str,
+) -> ControlledProofRiskOutcome:
+    """Genuine, fresh Risk Engine evaluation for one Controlled-Proof-forced
+    candidate -- reuses the exact same public Risk Engine services the
+    organic autonomous path uses (resolve_execution_risk_context,
+    evaluate_signal_risk, persist_risk_decision) rather than reusing the
+    organic cycle's own risk_verdict, which reflects the original HOLD
+    decision (or, for a pure strategy-consensus HOLD, reflects nothing at
+    all -- risk was never invoked for it). Deliberately local to the forced-
+    entry attempt: never reads or mutates the organic cycle/decision record.
+
+    Known bounded audit behavior: a CLAIMED proof that remains risk-denied
+    may persist one genuine risk evaluation per orchestration retry until
+    expiration. Durable idempotency requires a separately authorized
+    schema-level design.
+    """
+    logger.info(
+        "controlled_proof_risk_evaluation_started proof_id=%s campaign_id=%s campaign_version=%s product=%s side=%s requested_notional_usd=%s",
+        proof_id, campaign_id, campaign_version, product_id, side, notional_usd,
+    )
+    try:
+        symbol_base = product_id.split("-")[0]
+        asset = await db.scalar(select(Asset).where(Asset.symbol == symbol_base, Asset.exchange == ALLOWED_PROVIDER))
+        if asset is None:
+            raise LookupError(f"asset_not_registered:{product_id}")
+        paper_account = await db.scalar(select(PaperAccount).where(PaperAccount.id == paper_account_id))
+        if paper_account is None:
+            raise LookupError("paper_account_missing")
+        candle_row = (await db.execute(
+            select(Candle.close)
+            .where(Candle.asset_id == asset.id, Candle.interval == "15m")
+            .order_by(Candle.open_time.desc())
+            .limit(1)
+        )).first()
+        if candle_row is None or candle_row[0] is None:
+            raise LookupError("reference_price_unavailable")
+        reference_price = Decimal(str(candle_row[0]))
+
+        risk_context = await resolve_execution_risk_context(db=db, paper_account=paper_account, asset=asset)
+        quantity = notional_usd / reference_price
+        side_lower = "sell" if side.upper() == "SELL" else "buy"
+
+        risk_result = evaluate_signal_risk(
+            request=RiskEvaluationRequest(
+                signal_id=uuid.UUID(int=0),
+                paper_account_id=paper_account_id,
+                asset_id=asset.id,
+                side=side_lower,
+                quantity=quantity,
+                account_equity=risk_context.account_equity,
+                max_position_size_pct=risk_context.max_position_size_pct,
+                min_order_notional=asset.min_order_notional,
+                campaign_authorized_notional=notional_usd,
+                qty_step_size=asset.qty_step_size,
+                supports_fractional=asset.supports_fractional,
+                start_of_day_equity=risk_context.start_of_day_equity,
+                current_equity=risk_context.current_equity,
+                max_daily_loss_pct=risk_context.max_daily_loss_pct,
+                high_water_mark_equity=risk_context.high_water_mark_equity,
+                max_drawdown_pct=risk_context.max_drawdown_pct,
+                consecutive_losses_on_pair=risk_context.consecutive_losses_on_pair,
+                cooldown_after_losses=risk_context.cooldown_after_losses,
+                last_loss_at=risk_context.last_loss_at,
+                cooldown_duration_minutes=risk_context.cooldown_duration_minutes,
+                evaluation_time=risk_context.evaluation_time,
+                data_is_stale=risk_context.data_is_stale,
+                data_has_gaps=risk_context.data_has_gaps,
+                global_kill_switch_engaged_state=risk_context.global_kill_switch_engaged_state,
+                global_kill_switch_rearm_required=risk_context.global_kill_switch_rearm_required,
+                account_kill_switch_engaged_state=risk_context.account_kill_switch_engaged_state,
+                account_kill_switch_rearm_required=risk_context.account_kill_switch_rearm_required,
+                global_kill_switch_state_observed=risk_context.global_kill_switch_state_observed,
+                account_kill_switch_state_observed=risk_context.account_kill_switch_state_observed,
+                actor=actor,
+            ),
+            reference_price=reference_price,
+            context=RiskEvaluationContext(
+                global_kill_switch_engaged=bool(risk_context.global_kill_switch_engaged_state),
+            ),
+        )
+    except Exception as exc:
+        logger.exception(
+            "controlled_proof_risk_evaluation_unavailable proof_id=%s campaign_id=%s campaign_version=%s product=%s reason=%s",
+            proof_id, campaign_id, campaign_version, product_id, f"{exc.__class__.__name__}:{exc}",
+        )
+        return ControlledProofRiskOutcome(
+            verdict="UNAVAILABLE", approved_notional_usd=None,
+            reason_code=f"controlled_proof_risk_unavailable:{exc.__class__.__name__}", risk_event_id=None,
+        )
+
+    persist_result = await persist_risk_decision(
+        db=db,
+        request=RiskDecisionPersistenceRequest(
+            paper_account_id=paper_account_id, signal_id=None, actor=actor, evaluation_result=risk_result,
+        ),
+    )
+    approved_notional = risk_result.approved_quantity * reference_price if risk_result.approved_quantity else Decimal("0")
+
+    if risk_result.action == RiskDecisionAction.APPROVE:
+        verdict = "ALLOW"
+        logger.info(
+            "controlled_proof_risk_allow proof_id=%s campaign_id=%s campaign_version=%s product=%s requested_notional_usd=%s approved_notional_usd=%s reason_code=%s risk_event_id=%s",
+            proof_id, campaign_id, campaign_version, product_id, notional_usd, approved_notional, risk_result.reason_code, persist_result.risk_event_id,
+        )
+    elif risk_result.action == RiskDecisionAction.RESIZE:
+        verdict = "RESIZE"
+        logger.info(
+            "controlled_proof_risk_resize proof_id=%s campaign_id=%s campaign_version=%s product=%s requested_notional_usd=%s approved_notional_usd=%s reason_code=%s risk_event_id=%s",
+            proof_id, campaign_id, campaign_version, product_id, notional_usd, approved_notional, risk_result.reason_code, persist_result.risk_event_id,
+        )
+    elif risk_result.action == RiskDecisionAction.REJECT:
+        verdict = "DENY"
+        logger.info(
+            "controlled_proof_risk_deny proof_id=%s campaign_id=%s campaign_version=%s product=%s requested_notional_usd=%s reason_code=%s risk_event_id=%s",
+            proof_id, campaign_id, campaign_version, product_id, notional_usd, risk_result.reason_code, persist_result.risk_event_id,
+        )
+    else:
+        # Defensive: RiskDecisionAction is a closed three-member enum today,
+        # but an unrecognized or blank action must never be silently treated
+        # as ALLOW.
+        verdict = "UNAVAILABLE"
+        logger.error(
+            "controlled_proof_risk_blank_verdict proof_id=%s campaign_id=%s campaign_version=%s product=%s raw_action=%s risk_event_id=%s",
+            proof_id, campaign_id, campaign_version, product_id, risk_result.action, persist_result.risk_event_id,
+        )
+
+    return ControlledProofRiskOutcome(
+        verdict=verdict,
+        approved_notional_usd=approved_notional if verdict in {"ALLOW", "RESIZE"} else None,
+        reason_code=risk_result.reason_code,
+        risk_event_id=persist_result.risk_event_id,
+    )
 
 
 async def cancel_controlled_proof(*, db: AsyncSession, proof_id: uuid.UUID, actor: str, reason: str | None) -> ControlledProofRun:
