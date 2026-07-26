@@ -14,7 +14,6 @@ from sqlalchemy import and_, func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import get_settings
-from app.core.errors import InvalidRequestError
 from app.models.audit_log import AuditLog
 from app.models.autonomous_capital_mandate import AutonomousCapitalMandate
 from app.models.autonomous_cycle_run import AutonomousCycleRun
@@ -73,13 +72,9 @@ from app.services.orchestration.automatic_package_executor import (
     execute_automatic_ready_package_through_activation,
 )
 from app.services.orchestration.autonomous_execution_claims import (
+    advance_claimed_execution,
     claim_activated_buy_package,
-    mark_pre_provider_blocked,
-    mark_submission_safety_disabled,
-)
-from app.services.orchestration.autonomous_order_preparation import (
-    execute_prepared_autonomous_claim,
-    prepare_autonomous_claimed_buy,
+    sweep_stale_autonomous_execution_claims,
 )
 from app.services.orchestration.reconciliation_guard import (
     UNRESOLVED_RECONCILIATION_STATES,
@@ -1455,58 +1450,8 @@ async def _attempt_automatic_ready_package_creation(
                         package_id=progression.package_id,
                     )
                     if claim_outcome.claim is not None:
-                        try:
-                            prepared = await prepare_autonomous_claimed_buy(
-                                db=db, claim_id=claim_outcome.claim.claim_id,
-                            )
-                        except InvalidRequestError as exc:
-                            # prepare_autonomous_claimed_buy re-validates the activation
-                            # window at prepare time; for a claim created on an earlier
-                            # tick, that window can have since elapsed. Previously this
-                            # exception escaped uncaught to the outer handler, which
-                            # mis-recorded it as reason_code=unexpected_executor_failure
-                            # and left the claim stuck at CLAIMED forever, retried
-                            # identically on every later tick. Mirror the terminal-failure
-                            # handling already used below for execute_prepared_autonomous_claim.
-                            prepared = None
-                            reason_code = str((exc.details or {}).get("blocker") or "autonomous_order_preparation_failed")
-                            await mark_pre_provider_blocked(
-                                db=db, claim=claim_outcome.claim, reason_code=reason_code,
-                            )
-                            logger.info(
-                                "autonomous_execution_failed_pre_provider claim_id=%s package_id=%s reason=%s provider_call_made=false",
-                                claim_outcome.claim.claim_id, progression.package_id, reason_code,
-                            )
+                        await advance_claimed_execution(db=db, claim=claim_outcome.claim)
                     else:
-                        prepared = None
-                    if prepared is not None and not get_settings().live_crypto_order_submission_enabled:
-                        await mark_submission_safety_disabled(db=db, claim=prepared.claim)
-                        logger.info(
-                            "autonomous_execution_safety_disabled claim_id=%s package_id=%s live_order_id=%s campaign_id=%s campaign_version=%s reason=live_submission_disabled provider_call_made=false provider_call_reachable=false recoverable=true",
-                            prepared.claim.claim_id, progression.package_id, prepared.order.live_crypto_order_id,
-                            progression.campaign_id, progression.campaign_version,
-                        )
-                    elif prepared is not None:
-                        try:
-                            execution = await execute_prepared_autonomous_claim(db=db, prepared=prepared)
-                            prepared.claim.claim_status = (
-                                "RECONCILIATION_REQUIRED"
-                                if execution.current_state == "RECONCILIATION_REQUIRED"
-                                else "SUBMISSION_PENDING"
-                            )
-                            prepared.claim.reconciliation_state = execution.current_state
-                            prepared.claim.updated_at = datetime.now(timezone.utc)
-                            await db.flush()
-                        except Exception:
-                            await mark_pre_provider_blocked(
-                                db=db, claim=prepared.claim,
-                                reason_code="commissioned_execution_request_evidence_unavailable",
-                            )
-                            logger.exception(
-                                "autonomous_execution_failed_pre_provider claim_id=%s package_id=%s live_order_id=%s reason=commissioned_execution_request_evidence_unavailable provider_call_made=false",
-                                prepared.claim.claim_id, progression.package_id, prepared.order.live_crypto_order_id,
-                            )
-                    elif claim_outcome.claim is None:
                         logger.info(
                             "autonomous_execution_claim_skipped package_id=%s campaign_id=%s campaign_version=%s reason=%s provider_call_made=false",
                             progression.package_id, progression.campaign_id,
@@ -1564,6 +1509,21 @@ async def run_orchestration_cycle(
         except Exception:
             await _rollback_active_session(db=db)
             logger.exception("venue_commission_resume_failed")
+
+    # Recovery pass for durable autonomous execution claims, deliberately
+    # independent of this cycle's own decision composition -- see
+    # sweep_stale_autonomous_execution_claims. Without this, a claim whose
+    # originating decision_record_id never recurs (e.g. a Controlled-Proof-
+    # forced one-shot entry) is never revisited again by anything below.
+    if hasattr(db, "scalars") and hasattr(db, "scalar") and hasattr(db, "commit"):
+        try:
+            swept = await sweep_stale_autonomous_execution_claims(db=db)
+            if swept > 0:
+                logger.info("autonomous_execution_claim_sweep_completed swept=%s", swept)
+            await db.commit()
+        except Exception:
+            await _rollback_active_session(db=db)
+            logger.exception("autonomous_execution_claim_sweep_cycle_failed")
 
     autonomous_cycle_products = await _resolve_autonomous_cycle_products(settings=get_settings(), db=db)
     autonomous_cycle_trigger = _resolve_autonomous_cycle_trigger(products=autonomous_cycle_products)

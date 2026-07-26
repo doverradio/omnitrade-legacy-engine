@@ -74,7 +74,6 @@ class _ResumeCapableDB(_FakeDB):
     async def rollback(self) -> None:
         self.rollbacks += 1
         self.failed_transaction = False
-        self.pending.clear()
 
 
 @pytest.mark.asyncio
@@ -1050,6 +1049,7 @@ async def test_expired_activation_at_prepare_time_terminates_claim_instead_of_un
     with its true reason when prepare's own activation-window re-check fails
     on a later tick, not swallowed into reason_code=unexpected_executor_failure
     while leaving the claim stuck at CLAIMED forever."""
+    import app.services.orchestration.autonomous_execution_claims as claims_module
     import app.services.orchestration.continuous_pipeline_worker as worker_module
     from app.core.errors import InvalidRequestError
     from app.services.orchestration.automatic_package_executor import AutomaticPackageExecutionOutcome
@@ -1057,7 +1057,7 @@ async def test_expired_activation_at_prepare_time_terminates_claim_instead_of_un
 
     cycle = _automatic_cycle()
     package_id = uuid.uuid4()
-    claim = SimpleNamespace(claim_id=uuid.uuid4())
+    claim = SimpleNamespace(claim_id=uuid.uuid4(), package_id=package_id)
     blocked_calls = []
 
     async def _create(*, db, request):
@@ -1094,8 +1094,13 @@ async def test_expired_activation_at_prepare_time_terminates_claim_instead_of_un
     monkeypatch.setattr(worker_module, "create_canonical_preview_package", _create)
     monkeypatch.setattr(worker_module, "execute_automatic_ready_package_through_activation", _execute)
     monkeypatch.setattr(worker_module, "claim_activated_buy_package", _claim)
-    monkeypatch.setattr(worker_module, "prepare_autonomous_claimed_buy", _prepare)
-    monkeypatch.setattr(worker_module, "mark_pre_provider_blocked", _mark_pre_provider_blocked)
+    # prepare_autonomous_claimed_buy and mark_pre_provider_blocked are now
+    # called from inside advance_claimed_execution (autonomous_execution_claims.py),
+    # not directly by the worker -- patch them where they're actually used,
+    # exercising the real advance_claimed_execution/worker integration rather
+    # than a bypassed one.
+    monkeypatch.setattr(claims_module, "prepare_autonomous_claimed_buy", _prepare)
+    monkeypatch.setattr(claims_module, "mark_pre_provider_blocked", _mark_pre_provider_blocked)
     caplog.set_level(logging.INFO)
 
     await worker_module._attempt_automatic_ready_package_creation(db=object(), orchestration_payload=_automatic_payload(cycle))
@@ -2547,10 +2552,87 @@ async def test_worker_invokes_commissioning_resume_hook(monkeypatch: pytest.Monk
         ),
     )
     monkeypatch.setattr(worker_module, "capture_system_intelligence_snapshot_if_due", _async_return(None))
+    # _ResumeCapableDB only emulates enough of AsyncSession for the
+    # commissioning-resume hook this test isolates; the claim-recovery
+    # sweep is an unrelated, orthogonal per-cycle step, neutralized here
+    # the same way every other unrelated hook already is above.
+    monkeypatch.setattr(worker_module, "sweep_stale_autonomous_execution_claims", _async_return(0))
 
     await run_orchestration_cycle(db=db, client=object(), config=_config())
 
     assert resume_calls["count"] == 1
+
+
+@pytest.mark.asyncio
+async def test_worker_invokes_stale_claim_recovery_sweep_every_cycle(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Wiring proof: the claim-recovery sweep runs every cycle, independent
+    of decision composition -- the only thing that revisits a claim once
+    the cycle that originally created it stops recurring (see
+    sweep_stale_autonomous_execution_claims)."""
+    db = _ResumeCapableDB()
+    sweep_calls = []
+
+    async def _sweep(*, db):
+        sweep_calls.append(db)
+        return 1
+
+    import app.services.orchestration.continuous_pipeline_worker as worker_module
+
+    monkeypatch.setattr(worker_module, "run_ingestion_cycle", _fake_ingestion_cycle)
+    monkeypatch.setitem(worker_module.venue_commissioning_service, "resume_runs", _async_return(0))
+    monkeypatch.setattr(worker_module, "_load_active_assets", _async_return([]))
+    monkeypatch.setattr(worker_module, "_load_active_strategies", _async_return([]))
+    monkeypatch.setattr(
+        worker_module,
+        "run_deterministic_research_cycle_if_due",
+        _async_return(
+            SimpleNamespace(
+                started=False, reason="not_due", campaign_id=None, candidates_generated=0,
+                candidates_evaluated=0, descendants_generated=0, champion=None,
+            )
+        ),
+    )
+    monkeypatch.setattr(worker_module, "capture_system_intelligence_snapshot_if_due", _async_return(None))
+    monkeypatch.setattr(worker_module, "sweep_stale_autonomous_execution_claims", _sweep)
+
+    await run_orchestration_cycle(db=db, client=object(), config=_config())
+
+    assert sweep_calls == [db]
+    # The sweep's own result is committed durably, independent of whatever
+    # the rest of the cycle does later.
+    assert db.commits >= 1
+
+
+@pytest.mark.asyncio
+async def test_worker_isolates_stale_claim_recovery_sweep_failure(monkeypatch: pytest.MonkeyPatch) -> None:
+    db = _ResumeCapableDB()
+
+    async def _sweep_fail(*, db):
+        raise RuntimeError("sweep failed")
+
+    import app.services.orchestration.continuous_pipeline_worker as worker_module
+
+    monkeypatch.setattr(worker_module, "run_ingestion_cycle", _fake_ingestion_cycle)
+    monkeypatch.setitem(worker_module.venue_commissioning_service, "resume_runs", _async_return(0))
+    monkeypatch.setattr(worker_module, "_load_active_assets", _async_return([]))
+    monkeypatch.setattr(worker_module, "_load_active_strategies", _async_return([]))
+    monkeypatch.setattr(
+        worker_module,
+        "run_deterministic_research_cycle_if_due",
+        _async_return(
+            SimpleNamespace(
+                started=False, reason="not_due", campaign_id=None, candidates_generated=0,
+                candidates_evaluated=0, descendants_generated=0, champion=None,
+            )
+        ),
+    )
+    monkeypatch.setattr(worker_module, "capture_system_intelligence_snapshot_if_due", _async_return(None))
+    monkeypatch.setattr(worker_module, "sweep_stale_autonomous_execution_claims", _sweep_fail)
+
+    stats = await run_orchestration_cycle(db=db, client=object(), config=_config())
+
+    assert stats.ingestion_assets_ok == 1
+    assert db.rollbacks >= 1
 
 
 @pytest.mark.asyncio

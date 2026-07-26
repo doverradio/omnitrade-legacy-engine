@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 import os
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
@@ -11,6 +12,7 @@ from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import get_settings
+from app.core.errors import InvalidRequestError
 from app.models.audit_log import AuditLog
 from app.models.autonomous_capital_mandate import AutonomousCapitalMandate
 from app.models.autonomous_capital_mandate_version import AutonomousCapitalMandateVersion
@@ -21,7 +23,13 @@ from app.models.canonical_proving_activation import CanonicalProvingActivation
 from app.models.live_accounting_record import LiveAccountingRecord
 from app.models.live_crypto_order import LiveCryptoOrder
 from app.models.risk_kill_switch import RiskKillSwitch
+from app.services.orchestration.autonomous_order_preparation import (
+    execute_prepared_autonomous_claim,
+    prepare_autonomous_claimed_buy,
+)
 from app.services.orchestration.reconciliation_guard import claim_blocking_reconciliation_statement
+
+logger = logging.getLogger(__name__)
 
 _OPEN_ORDER_STATES = {"PENDING_CONFIRMATION", "VALIDATING", "SUBMISSION_PENDING", "ACKNOWLEDGED", "SUBMITTED", "PARTIALLY_FILLED", "RECONCILIATION_REQUIRED", "UNKNOWN"}
 _TERMINAL_CLAIMS = {"COMPLETED", "CANCELLED"}
@@ -194,3 +202,97 @@ async def mark_pre_provider_blocked(
         after_state={"claim_status": claim.claim_status, "reason_code": reason_code, "provider_call_made": False},
     ))
     await db.flush()
+
+
+async def advance_claimed_execution(*, db: AsyncSession, claim: AutonomousExecutionClaim) -> None:
+    """Given an already-CLAIMED claim, attempt to prepare and (if live
+    submission is enabled) execute it -- terminalizing on every failure
+    path, expected or not, so a claim this function touches can never be
+    left sitting in CLAIMED. Shared by the normal per-cycle activation path
+    (continuous_pipeline_worker._attempt_automatic_ready_package_creation)
+    and sweep_stale_autonomous_execution_claims below -- the only two
+    callers of prepare_autonomous_claimed_buy -- so this failure-handling
+    is defined exactly once."""
+    try:
+        prepared = await prepare_autonomous_claimed_buy(db=db, claim_id=claim.claim_id)
+    except InvalidRequestError as exc:
+        reason_code = str((exc.details or {}).get("blocker") or "autonomous_order_preparation_failed")
+        await mark_pre_provider_blocked(db=db, claim=claim, reason_code=reason_code)
+        logger.info(
+            "autonomous_execution_failed_pre_provider claim_id=%s package_id=%s reason=%s provider_call_made=false",
+            claim.claim_id, claim.package_id, reason_code,
+        )
+        return
+    except Exception:
+        # A defect in preparation (or anything it calls) must never leave
+        # the claim silently stuck in CLAIMED forever -- the exact failure
+        # mode that left claim 854e9b17-f608-400a-b6fe-58647b730cf0 with no
+        # lifecycle event beyond "created". Terminalize honestly instead of
+        # only logging.
+        await mark_pre_provider_blocked(db=db, claim=claim, reason_code="unexpected_preparation_failure")
+        logger.exception(
+            "autonomous_execution_failed_pre_provider claim_id=%s package_id=%s reason=unexpected_preparation_failure provider_call_made=false",
+            claim.claim_id, claim.package_id,
+        )
+        return
+
+    if not get_settings().live_crypto_order_submission_enabled:
+        await mark_submission_safety_disabled(db=db, claim=prepared.claim)
+        logger.info(
+            "autonomous_execution_safety_disabled claim_id=%s package_id=%s live_order_id=%s campaign_id=%s campaign_version=%s reason=live_submission_disabled provider_call_made=false provider_call_reachable=false recoverable=true",
+            prepared.claim.claim_id, prepared.claim.package_id, prepared.order.live_crypto_order_id,
+            prepared.claim.campaign_id, prepared.claim.campaign_version,
+        )
+        return
+
+    try:
+        execution = await execute_prepared_autonomous_claim(db=db, prepared=prepared)
+        prepared.claim.claim_status = (
+            "RECONCILIATION_REQUIRED"
+            if execution.current_state == "RECONCILIATION_REQUIRED"
+            else "SUBMISSION_PENDING"
+        )
+        prepared.claim.reconciliation_state = execution.current_state
+        prepared.claim.updated_at = _utcnow()
+        await db.flush()
+    except Exception:
+        await mark_pre_provider_blocked(
+            db=db, claim=prepared.claim, reason_code="commissioned_execution_request_evidence_unavailable",
+        )
+        logger.exception(
+            "autonomous_execution_failed_pre_provider claim_id=%s package_id=%s live_order_id=%s reason=commissioned_execution_request_evidence_unavailable provider_call_made=false",
+            prepared.claim.claim_id, prepared.claim.package_id, prepared.order.live_crypto_order_id,
+        )
+
+
+async def sweep_stale_autonomous_execution_claims(*, db: AsyncSession, now: datetime | None = None) -> int:
+    """Recovery pass, deliberately independent of any cycle's decision
+    composition. prepare_autonomous_claimed_buy re-derives everything it
+    needs from the claim_id alone (package/activation/risk/kill-switch/
+    position state), so a CLAIMED claim can safely be retried here at any
+    time -- this is the only mechanism that revisits a claim once the cycle
+    that originally created it stops recurring (e.g. a Controlled-Proof-
+    forced entry, whose HOLD-override never re-fires once the proof already
+    has a linked entry). Scoped by the same recover_after/claim_status
+    columns and index (ix_aec_status_recovery) that were already added for
+    exactly this purpose but never read anywhere until now. Returns the
+    number of claims swept."""
+    observed_at = now or _utcnow()
+    stale = (await db.scalars(
+        select(AutonomousExecutionClaim).where(
+            AutonomousExecutionClaim.claim_status == "CLAIMED",
+            AutonomousExecutionClaim.recover_after.is_not(None),
+            AutonomousExecutionClaim.recover_after <= observed_at,
+        )
+    )).all()
+    for claim in stale:
+        try:
+            await advance_claimed_execution(db=db, claim=claim)
+        except Exception:
+            # advance_claimed_execution already terminalizes every failure
+            # path it knows about; this is a last-resort backstop so one
+            # claim's unforeseen failure can never abort the sweep of the
+            # rest, or resurrect the "stuck forever" failure mode one layer
+            # up from where it was already closed.
+            logger.exception("autonomous_execution_claim_sweep_failed claim_id=%s", claim.claim_id)
+    return len(stale)
