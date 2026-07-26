@@ -1106,6 +1106,68 @@ async def test_expired_activation_at_prepare_time_terminates_claim_instead_of_un
 
 
 @pytest.mark.asyncio
+async def test_expired_mandate_authorization_on_replay_never_reaches_claim_or_unexpected_failure(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Worker-level regression for the production sequence
+    activation_result=ACTIVATED -> reason_code=mandate ("mandate package
+    authorization expired") -> reason_code=unexpected_executor_failure.
+
+    automatic_package_executor._outcome() already reports NOT_ACTIVATED with
+    failed_closed=True for exactly this case (see
+    test_executor_activated_replay_with_expired_mandate_authorization_does_not_report_activated
+    in test_automatic_package_executor.py), but that test only proves the
+    executor's own return value in isolation. This test closes the actual
+    integration seam where the original defect lived: it proves the WORKER
+    itself respects that outcome end-to-end -- it must never call
+    claim_activated_buy_package (or anything downstream of it), must report
+    a deterministic, non-crashing final_state, and must never log
+    unexpected_executor_failure, when the executor reports this outcome."""
+    import app.services.orchestration.continuous_pipeline_worker as worker_module
+    from app.services.orchestration.automatic_package_executor import AutomaticPackageExecutionOutcome
+
+    cycle = _automatic_cycle()
+    package_id = uuid.uuid4()
+    claim_calls: list[uuid.UUID] = []
+
+    async def _create(*, db, request):
+        return {"idempotent": False, "package": {"package_id": str(package_id), "package_state": "READY"}}
+
+    async def _execute(*, db, request):
+        return AutomaticPackageExecutionOutcome(
+            package_id=package_id, campaign_id=cycle.capital_campaign_id,
+            campaign_version=cycle.capital_campaign_version, decision_record_id=cycle.decision_record_id,
+            mandate_id=cycle.mandate_id, authorization_state="AUTHORIZED", dry_run_state="DRY_RUN_PASSED",
+            activation_state="NOT_ACTIVATED", authority_source="MANDATE", replayed=True,
+            final_reason_code="mandate package authorization expired", failed_closed=True, starting_state="ACTIVATED",
+        )
+
+    async def _claim(*, db, package_id):
+        claim_calls.append(package_id)
+        raise AssertionError("claim_activated_buy_package must not be called when activation_state is NOT_ACTIVATED")
+
+    monkeypatch.setattr(worker_module, "_load_cycle_by_id", _async_return(cycle))
+    monkeypatch.setattr(worker_module, "_has_active_ready_package_for_opportunity", _async_return(False))
+    monkeypatch.setattr(worker_module, "_has_active_proving_activation", _async_return(False))
+    monkeypatch.setattr(worker_module, "_has_open_live_order", _async_return(False))
+    monkeypatch.setattr(worker_module, "_has_unresolved_reconciliation", _async_return(False))
+    monkeypatch.setattr(worker_module, "_load_runtime_campaign", _async_return(SimpleNamespace(paper_account_id=uuid.uuid4())))
+    monkeypatch.setattr(worker_module, "_load_live_trading_profile_for_paper_account", _async_return(SimpleNamespace(id=uuid.uuid4())))
+    monkeypatch.setattr(worker_module, "create_canonical_preview_package", _create)
+    monkeypatch.setattr(worker_module, "execute_automatic_ready_package_through_activation", _execute)
+    monkeypatch.setattr(worker_module, "claim_activated_buy_package", _claim)
+    caplog.set_level(logging.INFO)
+
+    await worker_module._attempt_automatic_ready_package_creation(db=object(), orchestration_payload=_automatic_payload(cycle))
+
+    assert claim_calls == []
+    assert "unexpected_executor_failure" not in caplog.text
+    assert "final_state=AUTHORIZED" in caplog.text
+    assert "reason_code=mandate package authorization expired" in caplog.text
+    assert "failed_closed=True" in caplog.text
+
+
+@pytest.mark.asyncio
 async def test_automatic_ready_package_path_never_calls_authorize_activate_dryrun_or_provider_submit(
     monkeypatch: pytest.MonkeyPatch,
     caplog: pytest.LogCaptureFixture,
