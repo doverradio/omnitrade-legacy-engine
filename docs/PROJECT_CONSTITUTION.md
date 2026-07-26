@@ -64,3 +64,20 @@ This Constitution sits above the rest of the documentation set, but does not rep
 - **`DECISION_INTELLIGENCE_ENGINE.md`** describes the concrete design of the subsystem that exists to fulfill Articles II, III, and IV in practice — it is the technical home for principles this Constitution states but does not itself implement.
 
 In short: the Constitution defines what OmniTrade fundamentally believes; the vision defines what it is trying to achieve; the architecture defines how it is built; the ADRs defines why each significant building choice was made the way it was. These documents are expected to complement, not restate, one another. This Constitution should change extremely rarely — far more rarely than any of the documents it sits above.
+
+---
+
+## Constitutional Amendment
+
+This Constitution is intended to remain stable across decades, not development cycles. It should evolve only when the platform's most fundamental principles require clarification, correction, or expansion. New features, new engines, new markets, new asset classes, and new implementation techniques should ordinarily be accommodated beneath this Constitution rather than by changing it.
+
+Amendments should therefore be exceedingly rare and undertaken only after deliberate architectural review. Every amendment should preserve the internal consistency of the constitutional architecture and should avoid redefining principles that have already become foundational to the platform.
+
+Whenever this Constitution is amended:
+
+- The reason for the amendment should be documented in a corresponding Architecture Decision Record (ADR).
+- The amendment should be evaluated for consistency with every existing constitutional architecture document.
+- Existing constitutional principles should be preferred over introducing new ones whenever practical.
+- Constitutional additions should represent enduring governance principles rather than implementation details or temporary operational concerns.
+
+The constitutional architecture exists to provide long-term stability. It should grow only when a genuinely new constitutional concern is discovered, not merely because additional documentation could be written. Constitutional restraint is itself a form of stewardship.

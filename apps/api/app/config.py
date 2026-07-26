@@ -155,6 +155,13 @@ class Settings(BaseSettings):
     autonomous_cycle_additional_products: str = Field(
         default="", validation_alias="AUTONOMOUS_CYCLE_ADDITIONAL_PRODUCTS"
     )
+    # Milestone-1 asset commissioning: "env" preserves today's exact behavior
+    # (AUTONOMOUS_CYCLE_ADDITIONAL_PRODUCTS + restart, unchanged). "campaign_db"
+    # switches worker roster resolution to asset_roster.resolve_autonomous_cycle_products_from_campaign,
+    # which discovers newly commissioned assets automatically on the next cycle
+    # with no restart required, as long as they are already campaign-authorized
+    # and Asset-Registry-active. Defaults to "env" so this ships inert.
+    asset_discovery_mode: str = Field(default="env", validation_alias="ASSET_DISCOVERY_MODE")
     research_evolution_enabled: bool = Field(default=True, validation_alias="RESEARCH_EVOLUTION_ENABLED")
     research_cycle_interval_minutes: int = Field(default=30, validation_alias="RESEARCH_CYCLE_INTERVAL_MINUTES")
     research_max_candidates_per_cycle: int = Field(default=6, validation_alias="RESEARCH_MAX_CANDIDATES_PER_CYCLE")

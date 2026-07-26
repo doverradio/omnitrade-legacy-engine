@@ -17,24 +17,28 @@ def _settings(additional: str = "") -> SimpleNamespace:
     return ns
 
 
-def test_default_empty_config_resolves_to_btc_only() -> None:
-    products = worker._resolve_autonomous_cycle_products(settings=_settings(""))
+@pytest.mark.asyncio
+async def test_default_empty_config_resolves_to_btc_only() -> None:
+    products = await worker._resolve_autonomous_cycle_products(settings=_settings(""), db=None)
     assert products == ["BTC-USD"]
 
 
-def test_known_additional_products_are_appended_after_btc() -> None:
-    products = worker._resolve_autonomous_cycle_products(settings=_settings("ETH-USD,SOL-USD"))
+@pytest.mark.asyncio
+async def test_known_additional_products_are_appended_after_btc() -> None:
+    products = await worker._resolve_autonomous_cycle_products(settings=_settings("ETH-USD,SOL-USD"), db=None)
     assert products == ["BTC-USD", "ETH-USD", "SOL-USD"]
 
 
-def test_unknown_product_is_skipped_not_guessed(caplog) -> None:
-    products = worker._resolve_autonomous_cycle_products(settings=_settings("ETH-USD,DOGE-USD"))
+@pytest.mark.asyncio
+async def test_unknown_product_is_skipped_not_guessed(caplog) -> None:
+    products = await worker._resolve_autonomous_cycle_products(settings=_settings("ETH-USD,DOGE-USD"), db=None)
     assert products == ["BTC-USD", "ETH-USD"]
     assert "DOGE-USD" not in products
 
 
-def test_btc_and_duplicate_entries_in_config_are_deduplicated() -> None:
-    products = worker._resolve_autonomous_cycle_products(settings=_settings("BTC-USD,ETH-USD,ETH-USD"))
+@pytest.mark.asyncio
+async def test_btc_and_duplicate_entries_in_config_are_deduplicated() -> None:
+    products = await worker._resolve_autonomous_cycle_products(settings=_settings("BTC-USD,ETH-USD,ETH-USD"), db=None)
     assert products == ["BTC-USD", "ETH-USD"]
 
 

@@ -519,8 +519,37 @@ async def _inspect_canonical_campaign_status_transition_locked(
     checks.append(_check(runtime is not None, "runtime_campaign_exists", f"runtime_campaign_id={request.runtime_campaign_id}"))
     if runtime is not None:
         checks.append(_check(runtime.uuid == request.campaign_id, "runtime_uuid_linkage_matches", f"runtime_uuid={runtime.uuid}"))
-        checks.append(_check(runtime.definition_version == request.campaign_version, "runtime_definition_version_matches", f"runtime_definition_version={runtime.definition_version}"))
-        checks.append(_check(str(runtime.status).upper() == "DRAFT", "runtime_status_is_draft", f"runtime_status={runtime.status}"))
+        # The runtime pin is no longer required to already point at the
+        # successor being promoted -- create_campaign_draft deliberately
+        # leaves a currently-governing (READY) runtime's pin untouched when
+        # staging an unvalidated DRAFT successor, precisely so the prior
+        # governing version keeps resolving as governing until this very
+        # transition succeeds. What must still hold is that the runtime
+        # isn't pinned AHEAD of the version being promoted -- that would mean
+        # a different, already-newer operation is in flight and this request
+        # is stale. The repin to request.campaign_version itself happens as
+        # part of this transition's own atomic mutation below, only on
+        # success.
+        checks.append(
+            _check(
+                runtime.definition_version is not None and runtime.definition_version <= request.campaign_version,
+                "runtime_definition_version_not_ahead_of_target",
+                f"runtime_definition_version={runtime.definition_version} target_version={request.campaign_version}",
+            )
+        )
+        # The runtime may be DRAFT (the legacy eager-repin path, e.g. a
+        # brand-new campaign's first-ever activation) or READY (the deferred
+        # -repin path: an existing governing campaign whose successor is now
+        # ready to take over) -- anything else (RUNNING/PAUSED/etc.) was
+        # already rejected earlier, at draft-creation time, and can't reach
+        # here with an editable pin.
+        checks.append(
+            _check(
+                str(runtime.status).upper() in {"DRAFT", "READY"},
+                "runtime_status_is_draft_or_ready_predecessor",
+                f"runtime_status={runtime.status}",
+            )
+        )
         checks.append(_check(runtime.paper_account_id == request.paper_account_id, "dedicated_paper_account_matches", f"runtime_paper_account_id={runtime.paper_account_id}"))
     if definition is not None:
         checks.append(_check(str(definition.status).upper() == "DRAFT", "definition_status_is_draft", f"definition_status={definition.status}"))
@@ -715,8 +744,10 @@ async def _transition_canonical_campaign_status_without_begin(
 
     if str(definition.status).upper() != "DRAFT":
         raise PermissionError("definition status drifted from DRAFT")
-    if str(runtime.status).upper() != "DRAFT":
-        raise PermissionError("runtime status drifted from DRAFT")
+    if str(runtime.status).upper() not in {"DRAFT", "READY"}:
+        raise PermissionError("runtime status drifted from draft-or-ready-predecessor")
+    if runtime.definition_version is not None and runtime.definition_version > request.campaign_version:
+        raise PermissionError("runtime pin drifted ahead of the version being promoted")
 
     before = {
         "campaign_id": str(request.campaign_id),
@@ -724,10 +755,19 @@ async def _transition_canonical_campaign_status_without_begin(
         "runtime_campaign_id": request.runtime_campaign_id,
         "definition_status": str(definition.status),
         "runtime_status": str(runtime.status),
+        "runtime_definition_version": runtime.definition_version,
     }
 
     definition.status = "READY"
     runtime.status = "READY"
+    # The runtime pin moves to the successor HERE, atomically with the status
+    # flip -- the same flush, the same row-locked transaction -- never
+    # earlier. This is what makes requirement 4 (pin moves only when the
+    # successor is successfully READY) true: create_campaign_draft no longer
+    # performs this repin eagerly, so until this exact statement runs and
+    # commits, the runtime stays pinned to whatever it was governed by
+    # before (its prior READY version, in the deferred-repin case).
+    runtime.definition_version = request.campaign_version
     definition.updated_at = datetime.now(timezone.utc)
     runtime.updated_at = datetime.now(timezone.utc)
     await db.flush()
@@ -743,6 +783,8 @@ async def _transition_canonical_campaign_status_without_begin(
         "runtime_previous_status": before["runtime_status"],
         "definition_new_status": str(definition.status),
         "runtime_new_status": str(runtime.status),
+        "runtime_previous_definition_version": before["runtime_definition_version"],
+        "runtime_new_definition_version": runtime.definition_version,
         "actor": actor,
         "idempotency_key": idempotency_key,
         "request_fingerprint": request_fingerprint,

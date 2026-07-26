@@ -508,6 +508,42 @@ async def _load_governing_authorized_version(
     return await db.get(AutonomousCapitalMandateVersion, authorization.mandate_version_id)
 
 
+async def get_governing_authorized_mandate_version(
+    *, db: AsyncSession, mandate_id: uuid.UUID,
+) -> AutonomousCapitalMandateVersion | None:
+    """The single, fail-closed source of truth for "the exact governing mandate
+    identity used by production": wraps _load_governing_authorized_version --
+    the same resolution activation/authorization already use, not a second
+    definition -- with the additional mandate-level state checks a caller
+    outside the lifecycle-action pipeline (e.g. worker roster discovery,
+    asset commissioning) needs to have already been asserted for it, rather
+    than re-deriving them ad hoc. Returns None (never raises) on any missing,
+    inactive, expired, revoked, unauthorized, non-LEVEL_2, or conflicting
+    (version does not actually belong to mandate_id) condition, so callers on
+    a hot per-cycle path can treat a governing mandate as simply unavailable."""
+    mandate = await db.get(AutonomousCapitalMandate, mandate_id)
+    if mandate is None:
+        return None
+    if mandate.status != "ACTIVE" or mandate.autonomy_level != AUTONOMY_LEVEL_2:
+        return None
+    if mandate.revoked_at is not None:
+        return None
+    expires_at = mandate.expires_at
+    if expires_at is not None:
+        if expires_at.tzinfo is None:
+            expires_at = expires_at.replace(tzinfo=timezone.utc)
+        if expires_at <= datetime.now(timezone.utc):
+            return None
+    version = await _load_governing_authorized_version(db=db, mandate_id=mandate_id)
+    if version is None:
+        return None
+    if version.mandate_id != mandate_id:
+        return None
+    if not version.is_active or not version.is_authorized:
+        return None
+    return version
+
+
 async def _promote_governing_version(
     *,
     db: AsyncSession,

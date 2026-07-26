@@ -300,6 +300,43 @@
 
 ---
 
+### Asset Commissioning (Milestone 1)
+
+Replaces the manual, multi-step operational procedure for adding an already-supported
+provider asset (provider verification, canonical asset creation, candle backfill,
+campaign/mandate authorization, runtime discovery) with a governed, idempotent,
+fail-closed API. Reuses existing domain services throughout (`create_mandate_version`,
+`authorize_mandate_version`, `get_campaign_definition`, `KrakenSpotClient`, `upsert_candles`)
+rather than duplicating their logic. See `ASSET_COMMISSIONING_ARCHITECTURE.md` for the
+full design and safety invariants.
+
+#### `POST /operator/assets/commission/preview`
+**Purpose:** Read-only commissioning plan; never mutates production.
+**Auth:** none required (read-only).
+**Request:** `{ "provider": "kraken", "product_id": "SOL-USD", "campaign_id": "uuid", "environment": "production" }`
+**Response 200:** canonical product identity, provider support, current asset/candle state, whether a campaign or mandate mutation is required, the exact preserved risk/capital constraints, whether runtime discovery needs a manual step, expected changes, blockers, and a deterministic plan.
+
+#### `POST /operator/assets/commission`
+**Purpose:** Executes an approved commissioning plan.
+**Auth:** operator bearer token required.
+**Request:** adds `activate` (bool) and `idempotency_key` (string) to the preview request shape. `activate=false` runs provider verification, asset registration, market-data backfill, and campaign-authorization checking only — it never creates or promotes a mandate version, so it grants no new trading authority. `activate=true` additionally creates a successor mandate version (every existing numeric/risk field cloned unchanged, only the new product added), authorizes and promotes it, and confirms runtime discoverability.
+**Response 201:** the commissioning record (`commissioning_id`, per-stage status/evidence, `asset_id`, `mandate_version_id`, overall `status`).
+**Idempotency:** replaying the same `idempotency_key` resumes from the first incomplete stage rather than restarting or duplicating writes; a completed run returns unchanged.
+**Errors:** `400` on any stage failure (the run is marked `FAILED` with the specific blocking stage and reason; earlier successful stages are preserved for resumption).
+
+#### `GET /operator/assets/commission/{commissioning_id}`
+**Purpose:** Read-only stage-by-stage status and evidence for one commissioning run.
+**Auth:** none required (read-only).
+**Errors:** `404` unknown `commissioning_id`.
+
+#### `GET /operator/assets/{product_id}/readiness`
+**Purpose:** Read-only readiness determination. `campaign_id` is an optional query param; defaults to `AUTOMATIC_MANDATE_PACKAGE_ACTIVATION_CAMPAIGN_ID` when omitted.
+**Response 200:** `provider_supported`, `asset_registered`, `market_data_current`, `candle_count`, `campaign_authorized`, `mandate_authorized`, `runtime_selected`, `strategy_evaluation_observed`, `live_execution_eligible`, `blockers`, `warnings`, `overall_status`.
+**Critical rule:** `overall_status` is never `READY` from database/campaign/mandate state alone — `strategy_evaluation_observed` requires an actual `strategy_roster_runs` row tied to the asset's canonical ID, proving the continuous worker has genuinely processed it.
+**Errors:** `400` if `campaign_id` is omitted and no default campaign is configured.
+
+---
+
 ### Future API Surface: Decision Intelligence Engine (Architectural Placeholder)
 
 The Decision Intelligence Engine (`DECISION_INTELLIGENCE_ENGINE.md`) — one of the platform's four permanent core engines — will introduce its own endpoint family in a future implementation phase: `GET /decisions`, `GET /decisions/{id}`, `GET /decisions/search`, `GET /decisions/outcomes`, `GET /decisions/explanations`, `GET /decisions/reviews`, `POST /decisions/review`, `GET /decisions/{id}/counterfactuals`, and `GET /counterfactuals/lesson-tags` (see `DECISION_INTELLIGENCE_ENGINE.md` §10 for the full list and rationale, including the Counterfactual Outcome Ledger's contribution to it). These are named here only to reserve their place in the API surface; none are part of the current MVP contract, and none should be implemented until a dedicated phase and full request/response specification exist. `GET /ai/explanations/:signal_id` (in `RISK_AND_AUDIT_API_CONTRACTS.md`) is expected to eventually be superseded or subsumed by `GET /decisions/explanations`, but remains the authoritative MVP contract until that transition is explicitly planned.

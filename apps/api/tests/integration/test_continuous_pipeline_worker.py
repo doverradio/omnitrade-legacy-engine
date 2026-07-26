@@ -677,7 +677,7 @@ async def test_automatic_ready_package_uses_the_selected_non_btc_instrument(monk
             "readiness": {"ready": True, "package_state": "READY"},
         }
 
-    monkeypatch.setattr(worker_module, "_resolve_autonomous_cycle_products", lambda *, settings: ["BTC-USD", "ETH-USD"])
+    monkeypatch.setattr(worker_module, "_resolve_autonomous_cycle_products", _async_return(["BTC-USD", "ETH-USD"]))
     monkeypatch.setattr(worker_module, "_load_cycle_by_id", _async_return(cycle))
     monkeypatch.setattr(worker_module, "_has_active_ready_package_for_opportunity", _async_return(False))
     monkeypatch.setattr(worker_module, "_has_active_proving_activation", _async_return(False))
@@ -712,7 +712,7 @@ async def test_automatic_ready_package_out_of_scope_product_is_rejected(monkeypa
         calls.append(request)
         raise AssertionError("must not reach package creation for an out-of-scope product")
 
-    monkeypatch.setattr(worker_module, "_resolve_autonomous_cycle_products", lambda *, settings: ["BTC-USD", "ETH-USD"])
+    monkeypatch.setattr(worker_module, "_resolve_autonomous_cycle_products", _async_return(["BTC-USD", "ETH-USD"]))
     monkeypatch.setattr(worker_module, "_load_cycle_by_id", _async_return(cycle))
     monkeypatch.setattr(worker_module, "create_canonical_preview_package", _fake_create)
 

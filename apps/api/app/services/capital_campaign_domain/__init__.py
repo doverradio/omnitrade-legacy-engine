@@ -1,6 +1,7 @@
 from app.services.capital_campaign_domain.service import (
     create_campaign_draft,
     get_campaign_definition,
+    get_governing_campaign_definition,
     list_campaign_definitions,
     preview_campaign_definition,
 )
@@ -26,6 +27,7 @@ from app.services.capital_campaign_domain.commissioned_control_plane import (
 __all__ = [
     "create_campaign_draft",
     "get_campaign_definition",
+    "get_governing_campaign_definition",
     "list_campaign_definitions",
     "preview_campaign_definition",
     "transition_commissioned_campaign_state",

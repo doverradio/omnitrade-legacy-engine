@@ -1,4 +1,5 @@
 from app.models.asset import Asset
+from app.models.asset_commissioning_run import AssetCommissioningRun
 from app.models.arena_competition import ArenaCompetition
 from app.models.arena_comparison_record import ArenaComparisonRecord
 from app.models.arena_cycle import ArenaCycle
@@ -77,6 +78,7 @@ from app.models.system_intelligence_snapshot import SystemIntelligenceSnapshot
 
 __all__ = [
 	"Asset",
+	"AssetCommissioningRun",
 	"ArenaCompetition",
 	"ArenaComparisonRecord",
 	"ArenaCycle",

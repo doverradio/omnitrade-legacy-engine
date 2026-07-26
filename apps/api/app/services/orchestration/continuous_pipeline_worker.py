@@ -107,7 +107,9 @@ _ADDITIONAL_PRODUCT_ASSET_SYMBOLS = asset_roster.ADDITIONAL_PRODUCT_ASSET_SYMBOL
 _AUTONOMOUS_MULTI_ASSET_TRIGGER = "kraken_roster_15m_candle_close"
 
 
-def _resolve_autonomous_cycle_products(*, settings) -> list[str]:
+async def _resolve_autonomous_cycle_products(*, settings, db: AsyncSession) -> list[str]:
+    if getattr(settings, "asset_discovery_mode", "env") == "campaign_db":
+        return await asset_roster.resolve_autonomous_cycle_products_from_campaign(db=db, settings=settings)
     return asset_roster.resolve_autonomous_cycle_products(settings=settings)
 
 
@@ -1127,7 +1129,7 @@ async def _attempt_automatic_ready_package_creation(
         elif (
             provider != _AUTONOMOUS_CYCLE_PROVIDER
             or environment != "production"
-            or product not in _resolve_autonomous_cycle_products(settings=get_settings())
+            or product not in await _resolve_autonomous_cycle_products(settings=get_settings(), db=db)
         ):
             skip_reason = "scope_not_supported"
         elif cycle.termination_stage in {"hold_no_package_created", "failed_closed"}:
@@ -1440,7 +1442,7 @@ async def run_orchestration_cycle(
             await _rollback_active_session(db=db)
             logger.exception("venue_commission_resume_failed")
 
-    autonomous_cycle_products = _resolve_autonomous_cycle_products(settings=get_settings())
+    autonomous_cycle_products = await _resolve_autonomous_cycle_products(settings=get_settings(), db=db)
     autonomous_cycle_trigger = _resolve_autonomous_cycle_trigger(products=autonomous_cycle_products)
 
     autonomous_cycle_id: uuid.UUID | None = None

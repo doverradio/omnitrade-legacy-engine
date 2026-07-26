@@ -2027,8 +2027,12 @@ async def test_canonical_status_transition_execute_detects_definition_and_runtim
             ),
         )
 
+    # READY is now a legitimate predecessor runtime status (the
+    # deferred-repin case: a currently-governing runtime whose successor is
+    # about to take over) -- not a drift condition. Only a status outside
+    # {DRAFT, READY} -- e.g. RUNNING, meaning a live position exists -- is.
     definition.status = "DRAFT"
-    runtime.status = "READY"
+    runtime.status = "RUNNING"
     with pytest.raises(PermissionError, match="runtime status drifted"):
         await binding.transition_canonical_campaign_status(
             db=db,

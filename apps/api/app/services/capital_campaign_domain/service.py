@@ -194,6 +194,18 @@ async def _ensure_runtime_campaign_pin(
             },
         )
 
+    # A currently-governing (READY) runtime must never be repinned to an
+    # unvalidated DRAFT successor just because that successor was created --
+    # the governed transition (transition_canonical_campaign_status) is the
+    # only thing allowed to move the pin off a governing version, and only
+    # once the successor is itself validated and promoted to READY. Every
+    # other combination (bootstrapping a brand new runtime, editing an
+    # already-DRAFT/PAUSED runtime, or explicitly requesting READY status
+    # directly) keeps the existing eager-repin behavior unchanged.
+    if runtime.status == "READY" and desired_status == "DRAFT":
+        await db.flush()
+        return runtime
+
     runtime.name = request.name.strip()
     runtime.description = request.description.strip() if request.description else None
     runtime.definition_campaign_id = campaign_id
@@ -236,7 +248,18 @@ def _to_response(definition: CapitalCampaignDefinition, runtime: CapitalCampaign
         name=definition.name,
         description=definition.description,
         owner_identity=definition.owner_identity,
-        status=_definition_status_from_runtime(runtime.status),
+        # Only defer to the runtime's operational status when the runtime is
+        # actually pinned to THIS definition version -- the normal case. A
+        # definition that exists but isn't (yet, or no longer) what the
+        # runtime is pinned to -- e.g. a just-created, not-yet-promoted DRAFT
+        # successor -- must report its own real, stored status, never borrow
+        # the status of whatever version the runtime happens to be governed
+        # by right now.
+        status=(
+            _definition_status_from_runtime(runtime.status)
+            if runtime.definition_version == definition.version
+            else definition.status
+        ),
         capital_budget=definition.capital_budget,
         remaining_unallocated_capital=runtime.current_equity,
         base_currency=definition.base_currency,
@@ -352,6 +375,30 @@ async def get_campaign_definition(*, db: AsyncSession, campaign_id: UUID, versio
             },
         )
     return _to_response(definition, runtime)
+
+
+async def get_governing_campaign_definition(*, db: AsyncSession, campaign_id: UUID) -> CapitalCampaignDefinitionResponse | None:
+    """The single, authoritative "what does this campaign's runtime pin
+    currently, actually consider READY-and-governing" lookup -- resolved
+    directly from the runtime's own definition_version pin, never from "the
+    highest version number that happens to be READY". That distinction
+    matters: while an unvalidated DRAFT successor exists (created but not
+    yet promoted), the max-version-number row is that DRAFT, not the
+    still-governing predecessor -- a version-number-first lookup would
+    therefore see nothing at all during that window, even though the runtime
+    pin never moved. Reading through the pin instead means the previously
+    governing version keeps resolving as governing for exactly as long as it
+    genuinely still is: until (and only until) a governed transition
+    actually repins the runtime to a newly-promoted successor. Returns None
+    when there is no runtime, no pin, or the pinned version's operational
+    status isn't READY -- never a fallback to some other version."""
+    runtime = await _get_runtime_campaign(db=db, campaign_id=campaign_id)
+    if runtime is None or runtime.definition_version is None or str(runtime.status).upper() != "READY":
+        return None
+    try:
+        return await get_campaign_definition(db=db, campaign_id=campaign_id, version=runtime.definition_version)
+    except NotFoundError:
+        return None
 
 
 async def list_campaign_definitions(
