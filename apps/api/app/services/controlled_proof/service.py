@@ -32,10 +32,19 @@ from app.services.strategies.identity import build_strategy_identity
 # idempotency key, nothing else. Widening scope (a different campaign,
 # provider, environment, or notional ceiling) requires a code change and a
 # new review, never a request payload.
+#
+# Campaign VERSION is deliberately not pinned here the same way: it is
+# resolved dynamically, on every call, from get_governing_campaign_definition
+# -- the same single source of truth the normal autonomous path already trusts.
+# By the time any version is governing it has already passed the full,
+# separately-audited canonical-campaign-status-transition promotion gate
+# (exact $5 bounds, fresh provider evidence, zero conflicts, confirm=true).
+# A hardcoded version number would instead go stale the moment a new
+# campaign version is legitimately promoted, permanently dead-ending every
+# future controlled proof attempt for no safety benefit.
 ALLOWED_PROVIDER = "kraken_spot"
 ALLOWED_ENVIRONMENT = "production"
 ALLOWED_CAMPAIGN_ID = uuid.UUID("e9a9e8e9-9574-498d-b49e-f011218c7f2b")
-ALLOWED_CAMPAIGN_VERSION = 1
 MAX_NOTIONAL_USD = Decimal("5")
 
 _ACTIVE_STATES = (
@@ -94,16 +103,18 @@ async def create_controlled_proof(
     if existing is not None:
         return existing
 
-    # Fail closed: the campaign must genuinely still be governing at exactly
-    # the pinned version, and must already authorize this product, before a
-    # proof is even created -- not something the proof itself is allowed to
-    # establish or work around.
+    # Fail closed: the campaign must genuinely be governing right now, and
+    # must already authorize this product, before a proof is even created --
+    # not something the proof itself is allowed to establish or work around.
+    # The governing version itself is resolved here, not pinned, and used
+    # verbatim below -- see the module-level comment on ALLOWED_CAMPAIGN_ID.
     governing = await get_governing_campaign_definition(db=db, campaign_id=ALLOWED_CAMPAIGN_ID)
-    if governing is None or governing.version != ALLOWED_CAMPAIGN_VERSION:
+    if governing is None:
         raise InvalidRequestError(
-            message="Controlled proof scope requires the pinned campaign version to be governing",
-            details={"campaign_id": str(ALLOWED_CAMPAIGN_ID), "required_version": ALLOWED_CAMPAIGN_VERSION},
+            message="Controlled proof scope requires a currently governing campaign version",
+            details={"campaign_id": str(ALLOWED_CAMPAIGN_ID)},
         )
+    resolved_campaign_version = governing.version
     if product_id not in governing.allowed_instruments:
         raise InvalidRequestError(
             message="Campaign does not authorize this product", details={"product_id": product_id},
@@ -150,7 +161,7 @@ async def create_controlled_proof(
         provider=ALLOWED_PROVIDER,
         environment=ALLOWED_ENVIRONMENT,
         campaign_id=ALLOWED_CAMPAIGN_ID,
-        campaign_version=ALLOWED_CAMPAIGN_VERSION,
+        campaign_version=resolved_campaign_version,
         product_id=product_id,
         max_notional_usd=MAX_NOTIONAL_USD,
         idempotency_key=idempotency_key,
@@ -178,7 +189,7 @@ async def create_controlled_proof(
         before_state=None,
         after_state={
             "status": proof.status, "product_id": product_id, "campaign_id": str(ALLOWED_CAMPAIGN_ID),
-            "campaign_version": ALLOWED_CAMPAIGN_VERSION, "max_notional_usd": str(MAX_NOTIONAL_USD),
+            "campaign_version": resolved_campaign_version, "max_notional_usd": str(MAX_NOTIONAL_USD),
             "expires_at": proof.expires_at.isoformat(),
         },
     ))

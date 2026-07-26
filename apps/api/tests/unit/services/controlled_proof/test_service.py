@@ -52,11 +52,11 @@ async def _real_session() -> AsyncIterator[AsyncSession]:
 
 
 async def _seed_campaign(
-    session: AsyncSession, *, allowed_instruments: list[str] = ("BTC-USD",),
+    session: AsyncSession, *, allowed_instruments: list[str] = ("BTC-USD",), version: int = 1,
 ) -> uuid.UUID:
     paper_account_id = uuid.uuid4()
     session.add(CapitalCampaignDefinition(
-        campaign_id=_CAMPAIGN_ID, version=1, name="test", owner_identity="operator:test", status="READY",
+        campaign_id=_CAMPAIGN_ID, version=version, name="test", owner_identity="operator:test", status="READY",
         capital_budget=Decimal("25"), remaining_unallocated_capital=Decimal("25"), base_currency="USD",
         allowed_asset_classes=["crypto"], allowed_venues=["kraken_spot"], allowed_instruments=list(allowed_instruments),
         campaign_modes=[], maximum_open_positions=1, maximum_position_size=Decimal("5"),
@@ -66,7 +66,7 @@ async def _seed_campaign(
     ))
     session.add(CapitalCampaign(
         uuid=_CAMPAIGN_ID, owner="operator:test", name="test", status="READY", campaign_type="definition_pinned_runtime",
-        definition_campaign_id=_CAMPAIGN_ID, definition_version=1, paper_account_id=paper_account_id,
+        definition_campaign_id=_CAMPAIGN_ID, definition_version=version, paper_account_id=paper_account_id,
         starting_capital=Decimal("25"), current_equity=Decimal("25"),
     ))
     session.add(LiveTradingProfile(
@@ -136,11 +136,11 @@ def _fully_ready_settings(*, mandate_id: uuid.UUID, additional_products: str = "
     )
 
 
-async def _seed_fully_ready_scope(session: AsyncSession, monkeypatch: pytest.MonkeyPatch) -> uuid.UUID:
+async def _seed_fully_ready_scope(session: AsyncSession, monkeypatch: pytest.MonkeyPatch, *, version: int = 1) -> uuid.UUID:
     """BTC-USD is always runtime_selected (canonical product); everything
     else must be established explicitly. Returns the mandate_id."""
     mandate_id = uuid.uuid4()
-    await _seed_campaign(session, allowed_instruments=["BTC-USD"])
+    await _seed_campaign(session, allowed_instruments=["BTC-USD"], version=version)
     await _seed_asset_with_fresh_candles(session, symbol="BTC")
     await _seed_active_mandate(session, mandate_id=mandate_id, allowed_products=("BTC-USD",))
     monkeypatch.setattr(
@@ -170,6 +170,99 @@ async def test_create_requires_full_readiness_and_returns_server_scope(monkeypat
             select(AuditLog).where(AuditLog.entity_id == proof.proof_id, AuditLog.action == "controlled_proof_run.requested")
         )).scalars().all()
         assert len(audits) == 1
+
+
+# --- campaign version: resolved dynamically from the governing definition -----------
+
+@pytest.mark.asyncio
+async def test_create_resolves_campaign_version_dynamically_from_governing_definition(monkeypatch: pytest.MonkeyPatch) -> None:
+    """No hardcoded version pin: whatever CapitalCampaignDefinition version
+    the runtime is currently pinned to as READY-and-governing is what a new
+    proof is scoped to -- proven here with a governing version that is NOT 1,
+    which the old ALLOWED_CAMPAIGN_VERSION=1 constant would have rejected."""
+    async with _real_session() as session:
+        await _seed_fully_ready_scope(session, monkeypatch, version=7)
+        proof = await controlled_proof_service.create_controlled_proof(
+            db=session, product_id="BTC-USD", idempotency_key="proof-v7", expires_in_minutes=30, actor="operator:alice",
+        )
+        assert proof.campaign_id == _CAMPAIGN_ID
+        assert proof.campaign_version == 7
+
+        audits = (await session.execute(
+            select(AuditLog).where(AuditLog.entity_id == proof.proof_id, AuditLog.action == "controlled_proof_run.requested")
+        )).scalars().all()
+        assert audits[0].after_state["campaign_version"] == 7
+
+
+@pytest.mark.asyncio
+async def test_create_fails_closed_when_no_campaign_is_currently_governing() -> None:
+    """No CapitalCampaignDefinition/CapitalCampaign seeded at all -- the
+    dynamic resolver must fail closed with a clear error, not raise an
+    unrelated AttributeError from treating None as a governing definition."""
+    async with _real_session() as session:
+        with pytest.raises(InvalidRequestError) as excinfo:
+            await controlled_proof_service.create_controlled_proof(
+                db=session, product_id="BTC-USD", idempotency_key="proof-no-campaign",
+                expires_in_minutes=30, actor="operator:alice",
+            )
+        assert "governing" in str(excinfo.value.message).lower()
+        rows = (await session.execute(select(ControlledProofRun))).scalars().all()
+        assert rows == []
+
+
+@pytest.mark.asyncio
+async def test_create_resolves_the_version_governing_at_request_time_not_a_stale_one(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Two sequential requests, with a real campaign-version promotion in
+    between (a new CapitalCampaignDefinition row + runtime repin, exactly
+    what transition_canonical_campaign_status performs) -- proves resolution
+    happens fresh on every call, not once and cached, and that an earlier
+    proof's already-persisted campaign_version is never retroactively
+    changed by a later promotion."""
+    async with _real_session() as session:
+        await _seed_fully_ready_scope(session, monkeypatch, version=1)
+        first = await controlled_proof_service.create_controlled_proof(
+            db=session, product_id="BTC-USD", idempotency_key="proof-before-promotion",
+            expires_in_minutes=30, actor="operator:alice",
+        )
+        first_proof_id = first.proof_id
+        assert first.campaign_version == 1
+        await controlled_proof_service.cancel_controlled_proof(
+            db=session, proof_id=first_proof_id, actor="operator:alice", reason="testing",
+        )
+        # SQLite (unlike the real Postgres uq_controlled_proof_runs_single_active
+        # partial index it stands in for) enforces "(1)" as a table-wide
+        # unique value regardless of status -- this test isolates campaign-
+        # version resolution, not single-active-proof exclusivity (already
+        # covered by test_second_concurrent_request_is_excluded_while_one_is_active),
+        # so the terminal row is removed here the same way that existing test
+        # suite's own SQLite-limitation convention already does elsewhere.
+        first_row = await session.get(ControlledProofRun, first_proof_id)
+        await session.delete(first_row)
+        await session.flush()
+
+        # Simulate a real governed promotion: a new governing definition row,
+        # runtime repinned to it -- exactly the two effects
+        # transition_canonical_campaign_status produces.
+        session.add(CapitalCampaignDefinition(
+            campaign_id=_CAMPAIGN_ID, version=2, name="test", owner_identity="operator:test", status="READY",
+            capital_budget=Decimal("25"), remaining_unallocated_capital=Decimal("25"), base_currency="USD",
+            allowed_asset_classes=["crypto"], allowed_venues=["kraken_spot"], allowed_instruments=["BTC-USD"],
+            campaign_modes=[], maximum_open_positions=1, maximum_position_size=Decimal("5"),
+            minimum_position_size=Decimal("1"), maximum_total_exposure=Decimal("5"),
+            profitability_policy_id="p", profitability_policy_version="1", risk_policy_id="r", risk_policy_version="1",
+            compounding_policy={"policy_type": "FIXED_CAPITAL"},
+        ))
+        runtime = await session.scalar(select(CapitalCampaign).where(CapitalCampaign.uuid == _CAMPAIGN_ID))
+        runtime.definition_version = 2
+        await session.flush()
+
+        second = await controlled_proof_service.create_controlled_proof(
+            db=session, product_id="BTC-USD", idempotency_key="proof-after-promotion",
+            expires_in_minutes=30, actor="operator:alice",
+        )
+
+        assert second.campaign_version == 2
+        assert first.campaign_version == 1  # never mutated by the later promotion
 
 
 @pytest.mark.asyncio

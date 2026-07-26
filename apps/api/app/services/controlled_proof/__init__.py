@@ -1,6 +1,5 @@
 from app.services.controlled_proof.service import (
     ALLOWED_CAMPAIGN_ID,
-    ALLOWED_CAMPAIGN_VERSION,
     ALLOWED_ENVIRONMENT,
     ALLOWED_PROVIDER,
     MAX_NOTIONAL_USD,
@@ -17,7 +16,6 @@ from app.services.controlled_proof.service import (
 
 __all__ = [
     "ALLOWED_CAMPAIGN_ID",
-    "ALLOWED_CAMPAIGN_VERSION",
     "ALLOWED_ENVIRONMENT",
     "ALLOWED_PROVIDER",
     "MAX_NOTIONAL_USD",
