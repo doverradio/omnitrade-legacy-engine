@@ -581,6 +581,135 @@ async def test_replace_active_refused_when_open_position_exists(monkeypatch: pyt
         assert len(rows) == 1
 
 
+# --- replace-active: live-capital detection must not depend on a column that is only
+# --- ever backfilled as a side effect of get_controlled_proof_view being polled -------
+
+@pytest.mark.asyncio
+async def test_replace_active_refused_when_unresolved_buy_order_exists_without_backfilled_column(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Regression: buy_live_crypto_order_id is only ever written by
+    get_controlled_proof_view's own opportunistic backfill -- a fully
+    unattended run has no reason to call it, so a genuinely submitted,
+    unresolved BUY order must still be detected even when that column was
+    never populated. A false negative here would let create_controlled_proof
+    cancel a proof that may control real funds."""
+    async with _real_session() as session:
+        await _seed_fully_ready_scope(session, monkeypatch)
+        old, _ = await controlled_proof_service.create_controlled_proof(
+            db=session, product_id="BTC-USD", idempotency_key="proof-unresolved-buy", expires_in_minutes=30, actor="operator:alice",
+        )
+        session.add(LiveCryptoOrder(
+            live_crypto_order_id=uuid.uuid4(), crypto_order_preview_id=uuid.uuid4(), exchange_connection_id=uuid.uuid4(),
+            provider=old.provider, environment=old.environment, product_id=old.product_id, side="BUY",
+            order_type="market", requested_quote_size=Decimal("5"), client_order_id=str(uuid.uuid4()),
+            status="SUBMISSION_PENDING", submitted_at=datetime.now(timezone.utc), audit_correlation_id=uuid.uuid4(),
+        ))
+        await session.flush()
+        assert old.buy_live_crypto_order_id is None  # never backfilled -- the exact production gap
+
+        with pytest.raises(InvalidRequestError) as excinfo:
+            await controlled_proof_service.create_controlled_proof(
+                db=session, product_id="BTC-USD", idempotency_key="proof-unresolved-buy-new", expires_in_minutes=30,
+                actor="operator:bob", replace_active=True,
+            )
+        assert excinfo.value.details.get("blocker") == "live_buy_order_exists"
+        refreshed_old = await session.get(ControlledProofRun, old.proof_id)
+        assert refreshed_old.status not in ("CANCELLED",)
+        rows = (await session.execute(select(ControlledProofRun))).scalars().all()
+        assert len(rows) == 1
+
+
+@pytest.mark.asyncio
+async def test_replace_active_refused_when_unresolved_sell_order_exists_without_backfilled_column(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async with _real_session() as session:
+        await _seed_fully_ready_scope(session, monkeypatch)
+        old, _ = await controlled_proof_service.create_controlled_proof(
+            db=session, product_id="BTC-USD", idempotency_key="proof-unresolved-sell", expires_in_minutes=30, actor="operator:alice",
+        )
+        session.add(LiveCryptoOrder(
+            live_crypto_order_id=uuid.uuid4(), crypto_order_preview_id=uuid.uuid4(), exchange_connection_id=uuid.uuid4(),
+            provider=old.provider, environment=old.environment, product_id=old.product_id, side="SELL",
+            order_type="market", requested_quote_size=Decimal("5"), client_order_id=str(uuid.uuid4()),
+            status="RECONCILIATION_REQUIRED", submitted_at=datetime.now(timezone.utc), audit_correlation_id=uuid.uuid4(),
+        ))
+        await session.flush()
+
+        with pytest.raises(InvalidRequestError) as excinfo:
+            await controlled_proof_service.create_controlled_proof(
+                db=session, product_id="BTC-USD", idempotency_key="proof-unresolved-sell-new", expires_in_minutes=30,
+                actor="operator:bob", replace_active=True,
+            )
+        assert excinfo.value.details.get("blocker") == "live_sell_order_exists"
+
+
+@pytest.mark.asyncio
+async def test_replace_active_refused_when_open_position_exists_without_backfilled_column(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Regression: position_id is only ever written by get_controlled_proof_
+    view's own backfill. A real, filled BUY that left an open position (the
+    exact production scenario: automatic reconciliation records the fill,
+    but nothing ever polled this proof's status afterward) must still be
+    detected as live capital, not treated as safe to replace."""
+    async with _real_session() as session:
+        await _seed_fully_ready_scope(session, monkeypatch)
+        old, _ = await controlled_proof_service.create_controlled_proof(
+            db=session, product_id="BTC-USD", idempotency_key="proof-orphan-position", expires_in_minutes=30, actor="operator:alice",
+        )
+        runtime = await session.scalar(select(CapitalCampaign).where(CapitalCampaign.uuid == _CAMPAIGN_ID))
+        profile = await session.scalar(select(LiveTradingProfile).where(LiveTradingProfile.paper_account_id == runtime.paper_account_id))
+        session.add(LiveAccountingRecord(
+            idempotency_key="fill-orphan-1", live_trading_profile_id=profile.id, capital_campaign_id=runtime.id,
+            reconciliation_event_id=uuid.uuid4(), source_execution_event_id=uuid.uuid4(),
+            source_execution_event_type="execution_intent_created", record_type="fill_accounting", provider_order_id="kraken-orphan-1",
+            symbol="BTC-USD", side="buy", filled_quantity=Decimal("0.0001"), fill_price=Decimal("50000"),
+            gross_notional=Decimal("5"), fee_amount=Decimal("0.005"), fee_currency="USD",
+            net_cash_impact=Decimal("-5.005"), provenance={}, recorded_at=datetime.now(timezone.utc),
+        ))
+        await session.flush()
+        assert old.position_id is None  # never backfilled -- the exact production gap
+
+        # Exercised directly rather than through create_controlled_proof:
+        # a genuinely open position for this product ALSO trips that
+        # function's own, separate, pre-existing "open production position"
+        # guard first (same protective outcome via a different, already-
+        # tested path) -- this isolates _live_capital_blocker's own new
+        # live-derivation fallback specifically.
+        blocker = await controlled_proof_service._live_capital_blocker(db=session, proof=old)
+        assert blocker == "open_position_exists"
+
+
+@pytest.mark.asyncio
+async def test_replace_active_allowed_when_a_terminal_order_leaves_no_open_position(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A CANCELLED/REJECTED/EXPIRED order (submitted, but never resulted in
+    a fill or open position) must not falsely block replacement -- only a
+    genuinely unresolved order or a real nonzero position should."""
+    async with _real_session() as session:
+        await _seed_fully_ready_scope(session, monkeypatch)
+        old, _ = await controlled_proof_service.create_controlled_proof(
+            db=session, product_id="BTC-USD", idempotency_key="proof-terminal-order", expires_in_minutes=30, actor="operator:alice",
+        )
+        session.add(LiveCryptoOrder(
+            live_crypto_order_id=uuid.uuid4(), crypto_order_preview_id=uuid.uuid4(), exchange_connection_id=uuid.uuid4(),
+            provider=old.provider, environment=old.environment, product_id=old.product_id, side="BUY",
+            order_type="market", requested_quote_size=Decimal("5"), client_order_id=str(uuid.uuid4()),
+            status="CANCELLED", submitted_at=datetime.now(timezone.utc), audit_correlation_id=uuid.uuid4(),
+        ))
+        await session.flush()
+
+        new, replaced = await controlled_proof_service.create_controlled_proof(
+            db=session, product_id="BTC-USD", idempotency_key="proof-terminal-order-new", expires_in_minutes=30,
+            actor="operator:bob", replace_active=True,
+        )
+        assert replaced is not None and replaced.proof_id == old.proof_id
+        assert new.proof_id != old.proof_id
+
+
 @pytest.mark.asyncio
 async def test_replace_active_false_retains_unchanged_fail_closed_error(monkeypatch: pytest.MonkeyPatch) -> None:
     """The default (replace_active=False) path must be byte-for-byte

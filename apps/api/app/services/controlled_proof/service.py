@@ -69,6 +69,12 @@ _ACTIVE_STATES = (
 )
 _CANCELLABLE_STATES = ("REQUESTED", "CLAIMED")
 _TERMINAL_PERSISTED_STATES = ("BLOCKED", "EXPIRED", "CANCELLED", "FAILED")
+# Every LiveCryptoOrder status representing a genuinely final, already-
+# resolved provider outcome. Must stay in sync with _TERMINAL_ORDER_STATUSES
+# in app.services.orchestration.reconciliation_scheduler (duplicated locally
+# rather than imported to avoid coupling this module's import graph to the
+# orchestration package for one small constant).
+_TERMINAL_LIVE_ORDER_STATUSES = ("FILLED", "CANCELLED", "REJECTED", "EXPIRED")
 
 
 def _utcnow() -> datetime:
@@ -101,16 +107,50 @@ async def _reap_expired(*, db: AsyncSession) -> None:
         await db.flush()
 
 
-def _live_capital_blocker(proof: ControlledProofRun) -> str | None:
+async def _live_capital_blocker(*, db: AsyncSession, proof: ControlledProofRun) -> str | None:
     """Precise reason a proof may not be replaced, or None if replacement is
-    safe. Checked directly against the proof's own reference columns --
-    never zero once a live artifact exists, since those columns are only
-    ever set once the real downstream row is genuinely linked."""
+    safe.
+
+    proof.buy_live_crypto_order_id / sell_live_crypto_order_id / position_id
+    are checked first as a fast path, but are NOT trusted alone: all three
+    are written in exactly one place in this codebase --
+    get_controlled_proof_view's own opportunistic backfill -- which only
+    runs as a side effect of that proof's status being read. A proof whose
+    BUY was submitted and even fully filled, but whose view was never
+    queried since (a fully unattended run has no reason to call it), would
+    still show all three columns as NULL despite a real live order or open
+    position existing. A false negative here is the dangerous direction --
+    it would let create_controlled_proof cancel a proof that may control
+    real funds -- so this always re-derives from the same authoritative,
+    live sources claim_activated_buy_package's own unresolved_order_exists/
+    campaign_position_already_open checks and should_propose_controlled_sell
+    use, never trusting a cached column as sufficient proof of safety."""
     if proof.buy_live_crypto_order_id is not None:
         return "live_buy_order_exists"
     if proof.sell_live_crypto_order_id is not None:
         return "live_sell_order_exists"
     if proof.position_id is not None:
+        return "open_position_exists"
+
+    live_order = await db.scalar(
+        select(LiveCryptoOrder.side).where(
+            LiveCryptoOrder.provider == proof.provider,
+            LiveCryptoOrder.environment == proof.environment,
+            LiveCryptoOrder.product_id == proof.product_id,
+            LiveCryptoOrder.submitted_at.is_not(None),
+            LiveCryptoOrder.status.not_in(_TERMINAL_LIVE_ORDER_STATUSES),
+        ).limit(1)
+    )
+    if live_order is not None:
+        return "live_buy_order_exists" if live_order.upper() == "BUY" else "live_sell_order_exists"
+
+    runtime = await db.scalar(select(CapitalCampaign).where(CapitalCampaign.uuid == proof.campaign_id).limit(1))
+    if runtime is None or runtime.paper_account_id is None:
+        return None
+    snapshots = await load_position_snapshots(db=db, account_id=runtime.paper_account_id, campaign_id=runtime.id)
+    symbol_base = proof.product_id.split("-")[0]
+    match = next((s for s in snapshots if s.symbol.split("-")[0].upper() == symbol_base), None)
+    if match is not None and match.position_size != 0:
         return "open_position_exists"
     return None
 
@@ -213,7 +253,7 @@ async def create_controlled_proof(
                 message="Another controlled proof is already active",
                 details={"active_proof_id": str(existing_active.proof_id)},
             )
-        blocker = _live_capital_blocker(existing_active)
+        blocker = await _live_capital_blocker(db=db, proof=existing_active)
         if blocker is not None:
             # Fail closed: never cancel or supersede a proof that may
             # control real funds. The proof itself, and every real
