@@ -17,7 +17,7 @@ def _case():
     campaign_id, package_id, account_id, profile_id = uuid4(), uuid4(), uuid4(), uuid4()
     mandate_id, version_id, evaluation_id, preview_id = uuid4(), uuid4(), uuid4(), uuid4()
     package = SimpleNamespace(
-        package_id=package_id, package_state="ACTIVATED", campaign_id=campaign_id, campaign_version=1,
+        package_id=package_id, package_state="ACTIVATED", side="BUY", campaign_id=campaign_id, campaign_version=1,
         paper_account_id=account_id, live_trading_profile_id=profile_id, provider="kraken_spot",
         environment="production", product="BTC-USD", risk_event_id=uuid4(), crypto_order_preview_id=preview_id,
         mandate_id=mandate_id, mandate_version_id=version_id, mandate_evaluation_id=evaluation_id,

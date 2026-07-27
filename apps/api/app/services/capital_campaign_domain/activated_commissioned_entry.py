@@ -42,6 +42,8 @@ async def execute_activated_commissioned_entry(
         raise NotFoundError(message="Canonical preview package not found", details={"package_id": str(package_id)})
     if package.package_state != "ACTIVATED":
         _fail("package_not_activated", package_state=package.package_state)
+    if package.side != request.side:
+        _fail("package_side_mismatch", package_side=package.side, request_side=request.side)
 
     activation = await db.scalar(
         select(CanonicalProvingActivation)

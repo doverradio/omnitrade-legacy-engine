@@ -7,7 +7,7 @@ from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 from uuid import UUID
 
-from sqlalchemy import and_, case, func, select
+from sqlalchemy import and_, case, func, or_, select
 from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -150,8 +150,8 @@ async def _resolve_controlled_proof_execution_scope(
         return _blocked("proof_package_provider_mismatch")
     if package.environment != proof.environment:
         return _blocked("proof_package_environment_mismatch")
-    if package.side != "BUY":
-        return _blocked("non_buy_entry_package")
+    if package.side not in {"BUY", "SELL"}:
+        return _blocked("invalid_package_side")
     if package.package_state != "ACTIVATED":
         return _blocked("package_not_activated")
     if package.authorization_source != "MANDATE":
@@ -190,7 +190,10 @@ async def _resolve_autonomous_execution_scope(
     existing, byte-for-byte-unchanged configured-selector check."""
     logger.info("autonomous_execution_scope_resolution_started package_id=%s", package.package_id)
     proof = await db.scalar(
-        select(ControlledProofRun).where(ControlledProofRun.package_id == package.package_id).with_for_update().limit(1)
+        select(ControlledProofRun).where(or_(
+            ControlledProofRun.package_id == package.package_id,
+            ControlledProofRun.sell_package_id == package.package_id,
+        )).with_for_update().limit(1)
     )
     if proof is not None:
         return await _resolve_controlled_proof_execution_scope(db=db, package=package, proof=proof)
@@ -227,7 +230,7 @@ async def _resolve_autonomous_execution_scope(
     return scope, None
 
 
-async def claim_activated_buy_package(
+async def claim_activated_package(
     *, db: AsyncSession, package_id: UUID, claim_owner: str | None = None, now: datetime | None = None,
 ) -> AutonomousClaimOutcome:
     observed_at = now or _utcnow()
@@ -251,7 +254,7 @@ async def claim_activated_buy_package(
                 existing.claim_id, package_id, existing.claim_status,
             )
         return AutonomousClaimOutcome(existing, False, "already_claimed")
-    if package.package_state != "ACTIVATED" or package.side != "BUY" or package.preview_expires_at <= observed_at:
+    if package.package_state != "ACTIVATED" or package.side not in {"BUY", "SELL"} or package.preview_expires_at <= observed_at:
         return AutonomousClaimOutcome(None, False, "package_not_eligible")
     if package.superseded_at is not None or package.authorization_source != "MANDATE":
         return AutonomousClaimOutcome(None, False, "package_authority_invalid")
@@ -321,8 +324,11 @@ async def claim_activated_buy_package(
             LiveAccountingRecord.record_type.in_(QUANTITY_BEARING_RECORD_TYPES),
         )
     )
-    if Decimal(str(net_quantity or 0)) > 0:
+    owned_quantity = Decimal(str(net_quantity or 0))
+    if package.side == "BUY" and owned_quantity > 0:
         return AutonomousClaimOutcome(None, False, "campaign_position_already_open")
+    if package.side == "SELL" and owned_quantity <= 0:
+        return AutonomousClaimOutcome(None, False, "campaign_position_not_open")
 
     owner = claim_owner or _owner()
     statement = insert(AutonomousExecutionClaim).values(
@@ -331,7 +337,7 @@ async def claim_activated_buy_package(
         mandate_id=package.mandate_id, mandate_version_id=package.mandate_version_id,
         account_id=package.paper_account_id, profile_id=package.live_trading_profile_id,
         connection_id=connection_id, provider=package.provider, environment=package.environment,
-        product=package.product, side="BUY", claim_status="CLAIMED", claimed_at=observed_at,
+        product=package.product, side=package.side, claim_status="CLAIMED", claimed_at=observed_at,
         claim_owner=owner, recover_after=observed_at + timedelta(minutes=2), attempt_count=1,
     ).on_conflict_do_nothing().returning(AutonomousExecutionClaim.claim_id)
     inserted_id = await db.scalar(statement)
@@ -387,6 +393,11 @@ async def claim_activated_buy_package(
     return AutonomousClaimOutcome(claim, created, "claimed" if created else "already_claimed")
 
 
+# Backward-compatible public name for existing callers.  It now claims the
+# activated canonical package's persisted side rather than imposing BUY.
+claim_activated_buy_package = claim_activated_package
+
+
 async def mark_submission_safety_disabled(*, db: AsyncSession, claim: AutonomousExecutionClaim) -> None:
     # Guards against _CLAIM_SCOPE_RELEASED_STATES in full (not just COMPLETED/
     # CANCELLED): a claim that already reached BUY_RECONCILED, SAFETY_DISABLED,
@@ -436,7 +447,7 @@ async def mark_pre_provider_blocked(
 # all mean the outcome is still unresolved, so the claim (and its scope)
 # must stay exactly where it is.
 _ORDER_STATUS_TO_RELEASED_CLAIM_STATUS = {
-    "FILLED": "BUY_RECONCILED",
+    "FILLED": "FILLED",
     "CANCELLED": "CANCELLED",
     "REJECTED": "CANCELLED",
     "EXPIRED": "CANCELLED",
@@ -458,14 +469,19 @@ async def release_execution_claim_scope_if_order_resolved(
     itself an authoritative terminal outcome, when no claim references this
     order, or when that claim has already left the nonterminal set
     (idempotent -- safe to call on every reconciliation pass)."""
-    released_status = _ORDER_STATUS_TO_RELEASED_CLAIM_STATUS.get(order_status)
-    if released_status is None:
+    resolved_outcome = _ORDER_STATUS_TO_RELEASED_CLAIM_STATUS.get(order_status)
+    if resolved_outcome is None:
         return
     claim = await db.scalar(
         select(AutonomousExecutionClaim).where(AutonomousExecutionClaim.live_order_id == live_crypto_order_id).with_for_update().limit(1)
     )
     if claim is None or claim.claim_status not in _CLAIM_SCOPE_NONTERMINAL_STATES:
         return
+    released_status = (
+        "BUY_RECONCILED" if resolved_outcome == "FILLED" and claim.side == "BUY"
+        else "COMPLETED" if resolved_outcome == "FILLED"
+        else resolved_outcome
+    )
     observed_at = now or _utcnow()
     before = claim.claim_status
     claim.claim_status = released_status

@@ -24,6 +24,75 @@ Ordinary automatic packages (no Controlled Proof linkage) are unaffected:
 they remain governed solely by `AUTOMATIC_MANDATE_PACKAGE_ACTIVATION_ENABLED`,
 exactly as before this change.
 
+## Operator-triggered candidate architecture
+
+`RUN_CONTROLLED_PROOF` no longer waits for, claims from, or rewrites an
+ambient autonomous strategy decision.  After the accepted operator action
+commits, the API schedules `_attempt_operator_controlled_proof_entry`; the
+regular orchestration worker independently discovers the same pending proof
+as a restart-safe fallback.  Both callers converge through a row-locked,
+idempotent proof claim.
+
+The entry attempt resolves the proof's persisted provider, environment,
+campaign/version, product, expiry, and $5 cap; checks live-capital ownership
+and unresolved reconciliation; obtains current provider preview evidence;
+persists a Controlled-Proof-specific decision; performs a fresh Risk Engine
+evaluation for that exact BUY candidate; and records a mandate evaluation
+against that exact decision.  Only `ALLOW` reaches
+`create_canonical_preview_package`.  From that seam onward the existing
+authorization, dry-run, activation, execution-claim, submission,
+reconciliation, accounting, and supervision services are reused.
+
+The autonomous package loop never claims a Controlled Proof.  Its BUY, SELL,
+HOLD, weak agreement, skip reason, Risk verdict, and failure state therefore
+cannot authorize, veto, or delay the operator candidate, and autonomous
+behavior is unchanged when a proof exists or does not exist.
+
+### Entry state and retry semantics
+
+The persisted entry transitions are `REQUESTED -> CLAIMED -> ENTRY_PROPOSED
+-> PACKAGE_CREATED`.  A Risk `DENY` transitions directly to `BLOCKED` and
+stores `controlled_proof_risk_denied:<exact-risk-reason>` with immutable audit
+evidence.  Ownership/scope failures also fail closed as `BLOCKED`.  A
+transient evidence, dependency, Risk-unavailable/resize, or infrastructure
+stop remains `CLAIMED` only with a durable `failure_reason` prefixed by
+`retryable:` and a `controlled_proof_run.waiting` audit event whose retry
+semantics are `next_worker_attempt_until_expiry`.  Advancing to
+`ENTRY_PROPOSED` clears that retry reason.  Expiry reaping remains the bounded
+terminal fallback, so a reasonless `CLAIMED` row is never an accepted attempt
+outcome.
+
+Decision, mandate-evaluation, package, activation, execution-claim, preview,
+and provider-order idempotency keys are derived from the proof and direction.
+Together with proof row locking and the existing unique constraints, duplicate
+operator submissions, immediate dispatches, periodic retries, and concurrent
+workers converge without a duplicate BUY.
+
+## Side-neutral canonical execution
+
+The canonical execution claim and preparation pipeline accepts the persisted
+package side (`BUY` or `SELL`); compatibility names containing `buy` remain
+temporarily exported for existing callers, but no longer impose a BUY gate.
+Migration `20260727_0054` replaces the historical database constraint
+`side = 'BUY'` with `side IN ('BUY','SELL')`.
+
+For BUY, preparation still fails closed when authoritative accounting already
+shows owned quantity.  For SELL, the same preparation function requires a
+strictly positive signed owned quantity and rejects a preview quantity that is
+missing, non-positive, or greater than ownership.  The canonical SELL preview
+uses that full authoritative base quantity while package notional fields remain
+quote-currency notional, preserving the proof cap and truthful order sizing.
+
+Both sides then use the same activation-bound commissioned-order executor and
+`LiveCryptoOrderService.submit`; the side is included in economic idempotency,
+DecisionRecord action, preview binding, order scope, claim identity, and audit
+evidence.  The legacy commissioned seed-campaign lifecycle projection remains
+for its original API, while an already-authorized canonical package relies on
+its package/mandate/activation evidence rather than requiring a second seed-
+campaign state transition.  Reconciliation and accounting remain unchanged
+and side-aware.  A reconciled BUY releases its claim as `BUY_RECONCILED`; a
+reconciled SELL releases it as `COMPLETED`.
+
 ### Resolved activation scope (fixes `automatic_activation_scope_incomplete`)
 
 The first version of this override still let the *downstream* scope
@@ -250,6 +319,8 @@ fix: `alembic upgrade head` applies `20260727_0053`, replacing
 `uq_autonomous_execution_claim_campaign_version` with the partial index
 `uq_aec_active_campaign_scope`. Run the preflight query in that migration's
 docstring first (expected empty on a healthy system).
+The same upgrade also applies `20260727_0054`, replacing the historical
+BUY-only execution-claim check with the reviewed BUY/SELL side constraint.
 
 ## Operator commands
 

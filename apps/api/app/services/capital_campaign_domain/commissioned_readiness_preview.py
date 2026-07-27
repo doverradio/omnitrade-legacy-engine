@@ -289,7 +289,10 @@ async def assess_commissioned_campaign_readiness(
         )
     )
 
-    lifecycle_ok = commissioned_state in _ENTRY_ELIGIBLE_STATES
+    lifecycle_ok = commissioned_state in (
+        _ENTRY_ELIGIBLE_STATES if request.side == "BUY"
+        else {"ACTIVE_POSITION", "SELL_EVALUATION", "SELL_PENDING"}
+    )
     checks.append(
         _check(
             code="campaign_lifecycle_eligibility",
@@ -351,7 +354,12 @@ async def assess_commissioned_campaign_readiness(
 
     balance = request.balance_evidence
     available_balance = _to_decimal(balance.get("available_quote_balance"))
-    balance_ok = available_balance is not None and available_balance >= requested
+    owned_base_quantity = _to_decimal(request.reconciliation_evidence.get("owned_base_quantity"))
+    balance_ok = (
+        available_balance is not None and available_balance >= requested
+        if request.side == "BUY"
+        else owned_base_quantity is not None and owned_base_quantity > Decimal("0")
+    )
     checks.append(
         _check(
             code="balance",
@@ -418,8 +426,8 @@ async def assess_commissioned_campaign_readiness(
         )
     )
 
-    expected_quantity = None
-    if costs_available and price_fresh and reference_price is not None:
+    expected_quantity = owned_base_quantity if request.side == "SELL" else None
+    if request.side == "BUY" and costs_available and price_fresh and reference_price is not None:
         net_quote = requested - entry_fee - slippage
         if net_quote > Decimal("0"):
             expected_quantity = net_quote / reference_price

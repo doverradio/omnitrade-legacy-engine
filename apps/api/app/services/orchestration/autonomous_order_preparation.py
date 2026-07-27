@@ -29,7 +29,7 @@ from app.models.risk_kill_switch import RiskKillSwitch
 from app.schemas.capital_campaign_domain import CommissionedEntryExecutionRequest, CommissionedReadinessRequest
 from app.services.capital_campaign_domain.activated_commissioned_entry import execute_activated_commissioned_entry
 from app.services.capital_campaign_domain.commissioned_readiness_preview import generate_commissioned_campaign_preview
-from app.services.live.position_quantity import owned_position_exists
+from app.services.live.position_quantity import compute_signed_owned_quantity
 from app.services.risk.risk_context import resolve_effective_risk_policy
 
 
@@ -88,6 +88,7 @@ async def _canonical_preview_identity(
     request = CommissionedReadinessRequest(
         campaign_id=claim.campaign_id, version=claim.campaign_version,
         provider=claim.provider, environment=claim.environment, instrument=claim.product,
+        side=claim.side,
         requested_quote_amount=package.risk_approved_amount, quote_currency="USD",
         idempotency_key=f"autonomous-entry-readiness:{claim.claim_id}",
         live_trading_profile_id=claim.profile_id, account_id=claim.account_id,
@@ -112,7 +113,9 @@ async def _canonical_preview_identity(
             "estimated_slippage": str(slippage), "source": "canonical_preview",
         },
         runtime_readiness_evidence={"ready": True, "observed_at": observed_at.isoformat(), "source": "canonical_preview_commission_command"},
-        reconciliation_evidence={}, manual_review_evidence={"required": False},
+        reconciliation_evidence={
+            "owned_base_quantity": str(preview.estimated_base_size) if claim.side == "SELL" else None,
+        }, manual_review_evidence={"required": False},
     )
     commissioned_preview = await generate_commissioned_campaign_preview(db=db, request=request)
     return request, commissioned_preview
@@ -152,6 +155,8 @@ async def execute_prepared_autonomous_claim(
     policy = await resolve_effective_risk_policy(db=db, paper_account_id=claim.account_id)
     request = CommissionedEntryExecutionRequest.model_construct(
         campaign_id=claim.campaign_id, version=claim.campaign_version, actor=claim.claim_owner,
+        side=claim.side,
+        canonical_package_authorized=True,
         idempotency_key=f"autonomous-entry:{claim.claim_id}", readiness_request=readiness,
         expected_preview_identity_hash=persisted_hash,
         live_crypto_order_id=order.live_crypto_order_id, confirmation_challenge_id=None,
@@ -175,7 +180,7 @@ def _fail(code: str) -> None:
     raise InvalidRequestError(message="Autonomous order preparation failed closed", details={"blocker": code})
 
 
-async def prepare_autonomous_claimed_buy(
+async def prepare_autonomous_claimed_order(
     *, db: AsyncSession, claim_id: UUID, now: datetime | None = None,
 ) -> AutonomousOrderPreparationResult:
     observed_at = now or _utcnow()
@@ -192,16 +197,16 @@ async def prepare_autonomous_claimed_buy(
     )
     if package is None or activation is None or activation.package_id != package.package_id:
         _fail("package_activation_mismatch")
-    if package.package_state != "ACTIVATED" or package.side != "BUY" or package.preview_expires_at <= observed_at:
+    if package.package_state != "ACTIVATED" or package.side not in {"BUY", "SELL"} or package.preview_expires_at <= observed_at:
         _fail("package_not_actionable")
     if activation.activation_state != "ACTIVE" or activation.activated_at > observed_at or activation.expires_at <= observed_at:
         _fail("activation_not_effective")
     if (
         package.campaign_id, package.campaign_version, package.mandate_id, package.mandate_version_id,
-        package.paper_account_id, package.live_trading_profile_id, package.provider, package.environment, package.product,
+        package.paper_account_id, package.live_trading_profile_id, package.provider, package.environment, package.product, package.side,
     ) != (
         claim.campaign_id, claim.campaign_version, claim.mandate_id, claim.mandate_version_id,
-        claim.account_id, claim.profile_id, claim.provider, claim.environment, claim.product,
+        claim.account_id, claim.profile_id, claim.provider, claim.environment, claim.product, claim.side,
     ):
         _fail("claim_package_identity_mismatch")
     if (
@@ -249,8 +254,13 @@ async def prepare_autonomous_claimed_buy(
     )
     if unresolved is not None:
         _fail("reconciliation_obligation_exists")
-    if await owned_position_exists(db=db, live_trading_profile_id=claim.profile_id, symbol=claim.product):
+    owned_quantity = await compute_signed_owned_quantity(
+        db=db, live_trading_profile_id=claim.profile_id, symbol=claim.product,
+    )
+    if claim.side == "BUY" and owned_quantity > Decimal("0"):
         _fail("owned_position_exists")
+    if claim.side == "SELL" and owned_quantity <= Decimal("0"):
+        _fail("owned_position_missing")
 
     order = await db.scalar(
         select(LiveCryptoOrder).where(LiveCryptoOrder.live_crypto_order_id == package.dry_run_live_crypto_order_id).with_for_update().limit(1)
@@ -260,7 +270,7 @@ async def prepare_autonomous_claimed_buy(
     if order.exchange_connection_id != claim.connection_id:
         _fail("exchange_connection_mismatch")
     if (order.provider, order.environment, order.product_id, order.side) != (
-        claim.provider, claim.environment, claim.product, "BUY",
+        claim.provider, claim.environment, claim.product, claim.side,
     ):
         _fail("order_scope_mismatch")
     if claim.live_order_id is not None and claim.live_order_id != order.live_crypto_order_id:
@@ -274,6 +284,12 @@ async def prepare_autonomous_claimed_buy(
     )
     if preview is None:
         _fail("canonical_preview_identity_evidence_missing")
+    if claim.side == "SELL" and (
+        preview.estimated_base_size is None
+        or Decimal(str(preview.estimated_base_size)) <= Decimal("0")
+        or Decimal(str(preview.estimated_base_size)) > owned_quantity
+    ):
+        _fail("sell_quantity_exceeds_owned_position")
     _readiness, commissioned_preview = await _canonical_preview_identity(
         db=db, claim=claim, package=package, activation=activation, preview=preview,
     )
@@ -323,3 +339,7 @@ async def prepare_autonomous_claimed_buy(
     elif persisted_hash != canonical_hash:
         _fail("canonical_preview_identity_missing")
     return AutonomousOrderPreparationResult(claim=claim, order=order, replayed=replayed)
+
+
+# Compatibility alias; canonical preparation is now side-neutral.
+prepare_autonomous_claimed_buy = prepare_autonomous_claimed_order

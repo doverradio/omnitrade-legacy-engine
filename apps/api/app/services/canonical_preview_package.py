@@ -39,6 +39,7 @@ from app.schemas.crypto_order_previews import CryptoOrderPreviewCreateRequest
 from app.services.decisions.ingestion import DECISION_ENGINE_VERSION
 from app.services.live.approval import record_live_approval_checkpoint
 from app.services.live.contracts import LiveApprovalCheckpointRequest
+from app.services.live.position_quantity import compute_signed_owned_quantity
 from app.services.mandates.contracts import MANDATE_APPROVAL_RESULT_ACTIVE_MANDATE
 from app.services.strategies.identity import build_strategy_identity, parse_strategy_identity
 
@@ -870,23 +871,35 @@ async def _create_crypto_order_preview_for_package(
             diagnostics=[_diagnostic(code="canonical_parameter_set_id_missing", stage="preview_resolution")]
         )
 
+    preview_side = "SELL" if request.forced_action == "CLOSE_POSITION_PROPOSED" else "BUY"
+    sell_base_size = None
+    if preview_side == "SELL":
+        sell_base_size = await compute_signed_owned_quantity(
+            db=db, live_trading_profile_id=request.live_trading_profile_id, symbol=request.product,
+        )
+        if sell_base_size <= Decimal("0"):
+            raise _preview_evidence_error(
+                diagnostics=[_diagnostic(code="canonical_owned_sell_quantity_missing", stage="preview_resolution")]
+            )
+
     preview_response = await create_crypto_order_preview(
         db=db,
         request=CryptoOrderPreviewCreateRequest(
             exchange_connection_id=connection.exchange_connection_id,
             environment=request.environment,
             product_id=request.product,
-            side="BUY",
+            side=preview_side,
             order_type="MARKET",
-            quote_size=request.max_proposed_order_amount,
-            requested_amount_currency="USD",
+            quote_size=request.max_proposed_order_amount if preview_side == "BUY" else None,
+            base_size=sell_base_size,
+            requested_amount_currency="USD" if preview_side == "BUY" else "BTC",
             decision_record_id=decision_record_id,
             strategy_id=strategy.id,
             strategy_name=strategy.slug,
             generated_by="system_recommendation",
             client_request_id=f"canonical-forced-preview:{request.idempotency_key}",
             # Authoritative identity: must match package.paper_account_id /
-            # claim.account_id exactly, so prepare_autonomous_claimed_buy's
+            # claim.account_id exactly, so canonical order preparation's
             # risk.paper_account_id == claim.account_id check (a genuine,
             # unweakened fail-closed guarantee) is actually satisfiable.
             paper_account_id=request.paper_account_id,
@@ -1133,37 +1146,75 @@ async def create_canonical_preview_package(
             diagnostics=[_diagnostic(code=forced_blocker, stage="commissioning_mode")]
         )
 
-    orchestration = await run_campaign_orchestration_preview_for_candle(
-        db=db,
-        campaign_id=request.campaign_id,
-        version=request.campaign_version,
-        allow_draft_preview=True,
-    )
-    cycles = orchestration.get("cycles") or []
-    if not cycles:
-        raise _preview_evidence_error(
-            diagnostics=[_diagnostic(code="canonical_orchestration_cycle_missing", stage="canonical_orchestration")]
+    cycle = None
+    if _is_controlled_proof_mode(request):
+        # RUN_CONTROLLED_PROOF is its own operator-issued candidate source.
+        # It deliberately enters the canonical package seam here, after
+        # authorization/evidence/risk/mandate evaluation, without asking an
+        # ambient autonomous orchestration cycle to manufacture a HOLD (or
+        # any other action) first.  The persisted Controlled Proof decision
+        # remains the truthful source of strategy identity and provenance.
+        controlled_decision = await _load_decision_record(
+            db=db, decision_record_id=request.expected_decision_record_id,
+        ) if request.expected_decision_record_id is not None else None
+        generated_signals = (
+            controlled_decision.generated_signals
+            if controlled_decision is not None and isinstance(controlled_decision.generated_signals, list)
+            else []
         )
+        strategy_identity = next(
+            (
+                str(item.get("strategy_identity") or "").strip()
+                for item in generated_signals
+                if isinstance(item, dict) and str(item.get("strategy_identity") or "").strip()
+            ),
+            "",
+        )
+        proposed_action = str(request.forced_action or "").strip().upper()
+        selected_decision = {
+            "decision_record_id": None if controlled_decision is None else str(controlled_decision.decision_id),
+            "decision_kind": proposed_action,
+            "strategy_identity": strategy_identity,
+            "instrument": request.product,
+        }
+        composition = {
+            "proposed_action": proposed_action,
+            "selected_decision": selected_decision,
+            "authority": "CONTROLLED_PROOF",
+            "controlled_proof_id": str(request.controlled_proof_id),
+        }
+    else:
+        orchestration = await run_campaign_orchestration_preview_for_candle(
+            db=db,
+            campaign_id=request.campaign_id,
+            version=request.campaign_version,
+            allow_draft_preview=True,
+        )
+        cycles = orchestration.get("cycles") or []
+        if not cycles:
+            raise _preview_evidence_error(
+                diagnostics=[_diagnostic(code="canonical_orchestration_cycle_missing", stage="canonical_orchestration")]
+            )
 
-    latest_cycle_summary = cycles[-1]
-    cycle_id_raw = latest_cycle_summary.get("cycle_id")
-    if cycle_id_raw is None:
-        raise _preview_evidence_error(
-            diagnostics=[_diagnostic(code="canonical_orchestration_cycle_missing", stage="canonical_orchestration", detail="cycle_id_missing")]
-        )
-    cycle = await _load_campaign_cycle(db=db, cycle_id=uuid.UUID(str(cycle_id_raw)))
-    if cycle is None:
-        raise _preview_evidence_error(
-            diagnostics=[_diagnostic(code="canonical_orchestration_cycle_missing", stage="canonical_orchestration", detail="cycle_row_missing")]
-        )
+        latest_cycle_summary = cycles[-1]
+        cycle_id_raw = latest_cycle_summary.get("cycle_id")
+        if cycle_id_raw is None:
+            raise _preview_evidence_error(
+                diagnostics=[_diagnostic(code="canonical_orchestration_cycle_missing", stage="canonical_orchestration", detail="cycle_id_missing")]
+            )
+        cycle = await _load_campaign_cycle(db=db, cycle_id=uuid.UUID(str(cycle_id_raw)))
+        if cycle is None:
+            raise _preview_evidence_error(
+                diagnostics=[_diagnostic(code="canonical_orchestration_cycle_missing", stage="canonical_orchestration", detail="cycle_row_missing")]
+            )
 
-    cycle_context = cycle.cycle_context if isinstance(cycle.cycle_context, dict) else {}
-    composition = cycle_context.get("authoritative_composition") if isinstance(cycle_context.get("authoritative_composition"), dict) else {}
-    proposed_action = str(composition.get("proposed_action") or cycle.proposed_action or "").strip().upper()
-    selected_decision = composition.get("selected_decision") if isinstance(composition.get("selected_decision"), dict) else {}
+        cycle_context = cycle.cycle_context if isinstance(cycle.cycle_context, dict) else {}
+        composition = cycle_context.get("authoritative_composition") if isinstance(cycle_context.get("authoritative_composition"), dict) else {}
+        proposed_action = str(composition.get("proposed_action") or cycle.proposed_action or "").strip().upper()
+        selected_decision = composition.get("selected_decision") if isinstance(composition.get("selected_decision"), dict) else {}
     decision_kind = str(selected_decision.get("decision_kind") or "").strip().upper()
 
-    if cycle.failure_reason == "runtime_campaign_or_paper_account_unavailable":
+    if cycle is not None and cycle.failure_reason == "runtime_campaign_or_paper_account_unavailable":
         diagnostics = [
             _diagnostic(code="canonical_runtime_campaign_missing", stage="canonical_orchestration"),
             _diagnostic(code="canonical_paper_account_missing", stage="canonical_orchestration"),
@@ -1171,12 +1222,12 @@ async def create_canonical_preview_package(
         raise _preview_evidence_error(diagnostics=diagnostics)
 
     is_hold_cycle = (
-        cycle.termination_stage in {"hold_terminal", "hold_no_package_created"}
+        (cycle is not None and cycle.termination_stage in {"hold_terminal", "hold_no_package_created"})
         or proposed_action in {"NO_ACTION", "HOLD"}
         or decision_kind in {"NO_ACTION", "HOLD"}
     )
     if is_hold_cycle:
-        hold_reason = str(selected_decision.get("reason") or cycle.failure_reason or "no_executable_opportunity")
+        hold_reason = str(selected_decision.get("reason") or (cycle.failure_reason if cycle is not None else None) or "no_executable_opportunity")
         can_force_commissioning_entry = _is_forced_commissioning_mode(request) and hold_reason == "strategy_hold_signal"
         # Controlled Proof: deliberately more permissive about which HOLD
         # reason it overrides than the one-shot initial-entry mode above --
@@ -1200,10 +1251,10 @@ async def create_canonical_preview_package(
                 "stage": "canonical_orchestration",
                 "package": None,
                 "campaign_cycle": {
-                    "cycle_id": str(cycle.cycle_id),
-                    "state": cycle.state,
-                    "termination_stage": cycle.termination_stage,
-                    "failure_reason": cycle.failure_reason,
+                    "cycle_id": None if cycle is None else str(cycle.cycle_id),
+                    "state": None if cycle is None else cycle.state,
+                    "termination_stage": None if cycle is None else cycle.termination_stage,
+                    "failure_reason": None if cycle is None else cycle.failure_reason,
                 },
                 "diagnostics": [
                     _diagnostic(code="canonical_action_hold", stage="canonical_orchestration", detail=hold_reason),
@@ -1239,7 +1290,10 @@ async def create_canonical_preview_package(
     # persisted its CryptoOrderPreview, so this lookup always returned None
     # and the cycle crashed with canonical_crypto_order_preview_id_missing
     # instead of completing.
-    preview = await _load_preview_for_package(db=db, request=request, observed_after=cycle.started_at)
+    preview = await _load_preview_for_package(
+        db=db, request=request,
+        observed_after=cycle.started_at if cycle is not None else _utcnow(),
+    )
     if preview is None:
         preview = await _create_crypto_order_preview_for_package(
             db=db,
@@ -1345,8 +1399,14 @@ async def create_canonical_preview_package(
         environment=request.environment,
         product=request.product,
         side=preview.side,
-        proposed_order_amount=_decimal(preview.requested_amount),
-        risk_approved_amount=_decimal(preview.requested_amount),
+        # Package risk/notional fields remain quote-currency notional for
+        # both sides; SELL base quantity lives truthfully on its preview.
+        proposed_order_amount=(
+            request.max_proposed_order_amount if preview.side == "SELL" else _decimal(preview.requested_amount)
+        ),
+        risk_approved_amount=(
+            request.max_proposed_order_amount if preview.side == "SELL" else _decimal(preview.requested_amount)
+        ),
         strategy_id=strategy.id,
         strategy_version=getattr(strategy, "module_version", "unknown"),
         parameter_set_id=parameter_set.id,

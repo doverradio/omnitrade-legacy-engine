@@ -637,26 +637,19 @@ async def create_crypto_order_preview(
         raise InvalidRequestError(message="Unsupported side for crypto order preview", details={"side": request.side})
     if request.order_type not in SUPPORTED_ORDER_TYPE:
         raise InvalidRequestError(message="Unsupported order type for crypto order preview", details={"order_type": request.order_type})
-    if request.side == "SELL":
-        raise InvalidRequestError(
-            message="SELL previews are deferred in v1",
-            details={"side": request.side, "feature_state": "deferred"},
-        )
-
-    if request.requested_amount_currency != "USD":
-        raise InvalidRequestError(message="BUY previews must be quoted in USD in v1", details={"requested_amount_currency": request.requested_amount_currency})
-    if request.quote_size is None:
-        raise InvalidRequestError(message="quote_size is required for BUY previews", details={"field": "quote_size"})
-
-    quote_size = _require_decimal(request.quote_size, field_name="quote_size")
-    if quote_size > settings.crypto_preview_max_quote_size_usd:
-        raise InvalidRequestError(
-            message="quote_size exceeds the configured maximum preview amount",
-            details={"quote_size": format(quote_size, "f"), "max_quote_size_usd": format(settings.crypto_preview_max_quote_size_usd, "f")},
-        )
-
-    if request.base_size is not None:
-        raise InvalidRequestError(message="base_size is not supported for BUY previews in v1", details={"field": "base_size"})
+    is_sell = request.side == "SELL"
+    requested_base_size = None
+    if is_sell:
+        if request.base_size is None or request.quote_size is not None:
+            raise InvalidRequestError(message="base_size alone is required for SELL previews", details={"side": request.side})
+        requested_base_size = _require_decimal(request.base_size, field_name="base_size")
+    else:
+        if request.requested_amount_currency != "USD":
+            raise InvalidRequestError(message="BUY previews must be quoted in USD", details={"requested_amount_currency": request.requested_amount_currency})
+        if request.quote_size is None:
+            raise InvalidRequestError(message="quote_size is required for BUY previews", details={"field": "quote_size"})
+        if request.base_size is not None:
+            raise InvalidRequestError(message="base_size is not supported for BUY previews", details={"field": "base_size"})
 
     asset = await _load_asset_and_price(db=db, product_id=normalized_product)
     credentials = get_decrypted_credentials_for_connection(connection)
@@ -669,14 +662,29 @@ async def create_crypto_order_preview(
         product_id=normalized_product,
         max_age_minutes=settings.crypto_preview_market_data_max_age_minutes,
     )
+    quote_size = (
+        requested_base_size * reference_price if requested_base_size is not None
+        else _require_decimal(request.quote_size, field_name="quote_size")
+    )
+    if quote_size > settings.crypto_preview_max_quote_size_usd:
+        raise InvalidRequestError(
+            message="order notional exceeds the configured maximum preview amount",
+            details={"quote_size": format(quote_size, "f"), "max_quote_size_usd": format(settings.crypto_preview_max_quote_size_usd, "f")},
+        )
 
     balances_snapshot = await provider.fetch_balances(credentials=credentials, environment=connection.environment)
     available_quote_balance = next((item.available for item in balances_snapshot.balances if item.currency == "USD"), Decimal("0"))
-    available_base_balance = next((item.available for item in balances_snapshot.balances if item.currency == "BTC"), Decimal("0"))
-    if available_quote_balance < quote_size:
+    base_currency = normalized_product.split("-")[0]
+    available_base_balance = next((item.available for item in balances_snapshot.balances if item.currency == base_currency), Decimal("0"))
+    if not is_sell and available_quote_balance < quote_size:
         raise InvalidRequestError(
             message="Insufficient USD balance for preview amount",
             details={"available_balance": format(available_quote_balance, "f"), "requested_amount": format(quote_size, "f")},
+        )
+    if is_sell and (requested_base_size is None or available_base_balance < requested_base_size):
+        raise InvalidRequestError(
+            message="Insufficient base balance for SELL preview",
+            details={"available_balance": format(available_base_balance, "f"), "requested_amount": format(requested_base_size or 0, "f")},
         )
 
     global_kill_switch_engaged = await _get_global_kill_switch(db)
@@ -687,8 +695,8 @@ async def create_crypto_order_preview(
             signal_id=uuid.uuid5(uuid.NAMESPACE_URL, f"crypto-preview-signal:{request.exchange_connection_id}:{normalized_product}:{quote_size}"),
             paper_account_id=uuid.uuid5(uuid.NAMESPACE_URL, f"crypto-preview-paper-account:{request.exchange_connection_id}"),
             asset_id=asset.id,
-            side="buy",
-            quantity=(quote_size / reference_price),
+            side=request.side.lower(),
+            quantity=requested_base_size or (quote_size / reference_price),
             account_equity=available_quote_balance,
             max_position_size_pct=Decimal("1"),
             min_order_notional=Decimal(asset.min_order_notional) if asset.min_order_notional is not None else quote_size,
@@ -739,10 +747,10 @@ async def create_crypto_order_preview(
         product_id=normalized_product,
         side=request.side,
         order_type=request.order_type,
-        quote_size=quote_size,
-        base_size=None,
-        requested_amount=quote_size,
-        requested_amount_currency="USD",
+        quote_size=None if is_sell else quote_size,
+        base_size=requested_base_size,
+        requested_amount=requested_base_size if is_sell else quote_size,
+        requested_amount_currency=base_currency if is_sell else "USD",
         status="PREVIEW_REQUESTED",
         readiness_verdict=connection.last_readiness_verdict,
         decision_record_id=request.decision_record_id,
@@ -757,7 +765,7 @@ async def create_crypto_order_preview(
         audit_correlation_id=uuid.uuid4(),
         created_at=datetime.now(timezone.utc),
         updated_at=datetime.now(timezone.utc),
-        available_balance_before=available_quote_balance,
+        available_balance_before=available_base_balance if is_sell else available_quote_balance,
     )
     db.add(record)
     await db.flush()
@@ -867,8 +875,8 @@ async def create_crypto_order_preview(
         environment=connection.environment,
         product_id=normalized_product,
         side=request.side,
-        quote_size=quote_size,
-        base_size=None,
+        quote_size=None if is_sell else quote_size,
+        base_size=requested_base_size,
         client_order_id=request.client_request_id,
     )
 
@@ -887,7 +895,10 @@ async def create_crypto_order_preview(
     record.estimated_commission_total = preview.estimated_commission_total or record.estimated_fee
     record.estimated_total_value = preview.estimated_total_value or ((record.estimated_quote_size or quote_size) + (record.estimated_fee or Decimal("0")))
     record.estimated_slippage = preview.estimated_slippage or abs((record.estimated_average_price or reference_price) - reference_price) / reference_price
-    record.estimated_balance_after = available_quote_balance - (record.estimated_total_value or quote_size)
+    record.estimated_balance_after = (
+        available_base_balance - (record.estimated_base_size or requested_base_size or Decimal("0"))
+        if is_sell else available_quote_balance - (record.estimated_total_value or quote_size)
+    )
 
     if not preview.success:
         record.status = "PREVIEW_FAILED"

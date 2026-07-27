@@ -136,7 +136,7 @@ async def test_mark_pre_provider_blocked_never_overwrites_an_already_released_cl
 
 
 def test_claim_schema_prevents_duplicate_package_and_activation() -> None:
-    str(CreateTable(AutonomousExecutionClaim.__table__).compile(dialect=postgresql.dialect()))
+    ddl = str(CreateTable(AutonomousExecutionClaim.__table__).compile(dialect=postgresql.dialect()))
     unique_columns = {
         tuple(column.name for column in constraint.columns)
         for constraint in AutonomousExecutionClaim.__table__.constraints
@@ -144,6 +144,7 @@ def test_claim_schema_prevents_duplicate_package_and_activation() -> None:
     }
     assert ("package_id",) in unique_columns
     assert ("activation_id",) in unique_columns
+    assert "side IN ('BUY','SELL')" in ddl
 
 
 # --- advance_claimed_execution: shared prepare-then-execute path, always terminal on failure ---

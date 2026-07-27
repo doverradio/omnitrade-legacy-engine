@@ -40,11 +40,16 @@ from app.services.canonical_preview_package import (
     create_controlled_proof_decision_record,
 )
 from app.services.controlled_proof import (
-    claim_next_controlled_proof_for_scope,
+    block_controlled_proof,
+    claim_controlled_proof_by_id,
+    controlled_proof_entry_blocker,
     evaluate_controlled_proof_risk,
+    find_pending_controlled_proof_id,
+    get_controlled_proof_view,
     link_controlled_proof_entry,
     link_controlled_proof_package,
     link_controlled_proof_sell_package,
+    record_controlled_proof_waiting,
     resolve_controlled_proof_strategy_identity,
     should_propose_controlled_sell,
 )
@@ -1154,20 +1159,11 @@ async def _attempt_automatic_ready_package_creation(
         # outage in the controlled-proof subsystem must never block, skip,
         # or otherwise affect the core autonomous package-creation path it
         # is layered on top of.
+        # Operator Controlled Proof candidates are dispatched by
+        # _attempt_operator_controlled_proof_entry before this autonomous
+        # loop.  Never claim one here: doing so would make its authority and
+        # progress depend on this ambient cycle's selected action/skip state.
         controlled_proof = None
-        if campaign_id is not None and campaign_version is not None:
-            try:
-                controlled_proof = await claim_next_controlled_proof_for_scope(
-                    db=db, campaign_id=campaign_id, campaign_version=campaign_version,
-                    provider=provider, environment=environment, product_id=product,
-                    cycle_id=cycle_id,
-                )
-            except Exception:
-                logger.exception(
-                    "controlled_proof_claim_lookup_failed campaign_id=%s campaign_version=%s product=%s",
-                    campaign_id, campaign_version, product,
-                )
-                controlled_proof = None
 
         skip_reason = None
         if campaign_id is None or campaign_version is None:
@@ -1196,33 +1192,30 @@ async def _attempt_automatic_ready_package_creation(
         elif candle_close_time is None:
             skip_reason = "missing_candle_close_time"
 
-        # Controlled Proof: deliberately overrides ONLY the single
-        # "non_executable_action" (ordinary strategy composition said HOLD)
-        # objection, and only when a proof is claimed for this exact scope.
-        # Every other gate above (campaign/product scope, termination
-        # state, decision-record presence, real evidence freshness, real
-        # risk verdict, candle recency) already ran against the cycle's own
-        # real, current data and is re-asserted unchanged below -- this can
-        # never defeat a risk denial or stale-evidence rejection, only the
-        # "nothing to do" HOLD outcome. Never written back to the persisted
-        # cycle row; local to this attempt only. Isolated in its own
+        # Controlled Proof: an operator-triggered proving workflow
+        # (docs/CONTROLLED_PROOF_ACTIVATION.md), not a rider on whatever the
+        # organic autonomous strategy happens to be doing this tick.
+        # Whenever a proof is claimed for this exact scope, it constructs
+        # and evaluates its OWN candidate here -- unconditionally, never
+        # gated on the organic skip_reason/proposed_action/risk_verdict
+        # above (no dependency on non_executable_action, strategy_hold_
+        # signal, termination_stage_hold_no_package_created, or an organic
+        # Risk rejection). A claimed proof's own candidate takes priority
+        # over the organic decision for this cycle's package-creation
+        # attempt -- this system runs exactly one campaign/product, so the
+        # two can never coexist as separate packages in the same cycle
+        # regardless; an operator's explicit authorization for that one
+        # slot must not silently lose to the ambient strategy.
+        #
+        # Only market-data facts already computed for this exact product
+        # this tick are still reused (evidence_freshness, candle_close_time,
+        # decision_record_id-presence as a "did this tick's composition run
+        # at all" pipeline-health check) -- these describe the state of the
+        # world, not a strategy decision, and a Controlled Proof BUY still
+        # needs fresh market evidence like any other. Isolated in its own
         # try/except: a defect here must never affect the core pipeline.
         controlled_proof_forced_entry = False
-        # A genuine strategy HOLD surfaces as either skip_reason=
-        # "non_executable_action" (composition never proposed an executable
-        # action) or skip_reason="termination_stage_hold_no_package_created"
-        # (composition explicitly terminated the cycle as HOLD) -- the same
-        # semantic condition via two different code paths. Mirrors the
-        # identical hold_reason == "strategy_hold_signal" narrowing already
-        # used by canonical_preview_package.py's _FORCED_COMMISSIONING_MODE
-        # for this exact purpose. "failed_closed" is deliberately never
-        # included here -- that is a real governance failure, never
-        # overridable.
-        _hold_reason = str(selected_decision.get("reason") or "").strip()
-        controlled_proof_overridable_hold = skip_reason == "non_executable_action" or (
-            skip_reason == "termination_stage_hold_no_package_created" and _hold_reason == "strategy_hold_signal"
-        )
-        if controlled_proof_overridable_hold and controlled_proof is not None:
+        if controlled_proof is not None:
             try:
                 wants_sell = await should_propose_controlled_sell(db=db, proof=controlled_proof)
                 already_has_entry = controlled_proof.decision_record_id is not None
@@ -1242,16 +1235,14 @@ async def _attempt_automatic_ready_package_creation(
                 elif candle_close_time is None:
                     skip_reason = "missing_candle_close_time"
                 else:
-                    # The organic risk_verdict reflects the ORIGINAL HOLD
-                    # decision -- or, for a pure strategy-consensus HOLD,
-                    # reflects nothing at all, since risk was never invoked
-                    # for it (see authoritative.py's HOLD-branch
-                    # selected_decision construction, which carries no
-                    # risk_verdict key). It must never gate a forced entry.
-                    # A genuine, fresh Risk Engine evaluation of this exact
-                    # forced candidate is required instead. Isolated in its
-                    # own try/except: a defect here must fail closed, never
-                    # fall through to treating a missing result as ALLOW.
+                    # The organic risk_verdict (if any) reflects a
+                    # completely different, organically-composed candidate
+                    # -- it must never gate or stand in for a forced entry's
+                    # own risk decision. A genuine, fresh Risk Engine
+                    # evaluation of this exact forced candidate is required
+                    # instead. Isolated in its own try/except: a defect
+                    # here must fail closed, never fall through to treating
+                    # a missing result as ALLOW.
                     controlled_proof_risk_outcome = None
                     try:
                         risk_runtime_campaign = await _load_runtime_campaign(db=db, campaign_id=campaign_id)
@@ -1285,10 +1276,29 @@ async def _attempt_automatic_ready_package_creation(
                         # size, so a RESIZE can never be silently proceeded
                         # with at the full requested amount. Blocks with a
                         # distinct reason so it is diagnosable as "risk
-                        # wants a smaller size", not "risk said no".
+                        # wants a smaller size", not "risk said no". Left
+                        # retryable (proof stays CLAIMED, bounded by its own
+                        # expires_at) rather than terminal -- market/account
+                        # state that produced a resize this attempt may not
+                        # next attempt.
                         skip_reason = "controlled_proof_risk_resize"
                     elif controlled_proof_risk_outcome.verdict == "DENY":
+                        # Risk Engine authority is final: a genuine DENY
+                        # transitions the proof to a truthful, terminal
+                        # BLOCKED state with the exact reason -- it must
+                        # never be left sitting in CLAIMED with only a log
+                        # line as evidence (see block_controlled_proof).
                         skip_reason = "controlled_proof_risk_denied"
+                        try:
+                            await block_controlled_proof(
+                                db=db, proof=controlled_proof,
+                                reason=f"controlled_proof_risk_denied:{controlled_proof_risk_outcome.reason_code}",
+                                actor="system:controlled_proof_worker",
+                            )
+                        except Exception:
+                            logger.exception(
+                                "controlled_proof_block_on_deny_failed proof_id=%s", controlled_proof.proof_id,
+                            )
                     else:
                         skip_reason = None
                         proposed_action = target_action
@@ -1630,6 +1640,18 @@ async def _run_autonomous_and_campaign_orchestration_attempt(*, db: AsyncSession
     ingested state, not required for a single composition+package attempt,
     and remain solely the regular timer-driven cycle's responsibility.
     """
+    # Additive operator workflow: attempt it independently before ambient
+    # strategy composition.  A failure is contained and cannot change the
+    # autonomous cycle that follows.
+    if hasattr(db, "scalars") and hasattr(db, "scalar"):
+        try:
+            pending_proof_id = await find_pending_controlled_proof_id(db=db)
+            if pending_proof_id is not None:
+                await _attempt_operator_controlled_proof_entry(db=db, proof_id=pending_proof_id)
+        except Exception:
+            await _rollback_active_session(db=db)
+            logger.exception("controlled_proof_periodic_dispatch_failed")
+
     autonomous_cycle_products = await _resolve_autonomous_cycle_products(settings=get_settings(), db=db)
     autonomous_cycle_trigger = _resolve_autonomous_cycle_trigger(products=autonomous_cycle_products)
 
@@ -1754,6 +1776,170 @@ async def _run_autonomous_and_campaign_orchestration_attempt(*, db: AsyncSession
             logger.exception("campaign_orchestration_failed trigger=%s", _AUTONOMOUS_CYCLE_TRIGGER)
 
 
+async def _attempt_operator_controlled_proof_entry(*, db: AsyncSession, proof_id: uuid.UUID) -> None:
+    """Build one Controlled Proof candidate without an autonomous action.
+
+    This is the trigger/candidate seam; everything from canonical package
+    creation onward is the same package/mandate/activation/execution path
+    used by automation.  Every pre-package stop is persisted on the proof.
+    """
+    proof = await claim_controlled_proof_by_id(db=db, proof_id=proof_id)
+    if proof is None:
+        return
+    actor = "system:controlled_proof_worker"
+    try:
+        if proof.sell_package_id is not None:
+            # Supervision is part of the periodic operator workflow, not a
+            # read-side accident: refresh terminal reconciliation/P&L state
+            # even when no operator polls the HTTP view.
+            await get_controlled_proof_view(db=db, proof_id=proof.proof_id)
+            return
+        is_sell = proof.package_id is not None
+        if is_sell and not await should_propose_controlled_sell(db=db, proof=proof):
+            return
+        side = "SELL" if is_sell else "BUY"
+        forced_action = "CLOSE_POSITION_PROPOSED" if is_sell else "OPEN_POSITION_PROPOSED"
+        runtime = await _load_runtime_campaign(db=db, campaign_id=proof.campaign_id)
+        if runtime is None or runtime.paper_account_id is None:
+            await record_controlled_proof_waiting(db=db, proof=proof, reason="runtime_campaign_or_paper_account_missing", actor=actor)
+            await db.commit()
+            return
+        profile = await _load_live_trading_profile_for_paper_account(db=db, paper_account_id=runtime.paper_account_id)
+        if profile is None:
+            await record_controlled_proof_waiting(db=db, proof=proof, reason="live_trading_profile_missing", actor=actor)
+            await db.commit()
+            return
+        capital_blocker = None if is_sell else await controlled_proof_entry_blocker(db=db, proof=proof)
+        if capital_blocker is not None:
+            await block_controlled_proof(
+                db=db, proof=proof, reason=f"controlled_proof_entry_blocked:{capital_blocker}", actor=actor,
+            )
+            await db.commit()
+            return
+        if await _has_open_live_order(db=db, provider=proof.provider, environment=proof.environment, product=proof.product_id):
+            await record_controlled_proof_waiting(db=db, proof=proof, reason="open_live_order_exists", actor=actor)
+            await db.commit()
+            return
+        if await _has_unresolved_reconciliation(db=db, provider=proof.provider, environment=proof.environment, product=proof.product_id):
+            await record_controlled_proof_waiting(db=db, proof=proof, reason="unresolved_reconciliation_exists", actor=actor)
+            await db.commit()
+            return
+
+        notional = min(Decimal(proof.max_notional_usd), _CANONICAL_READY_PACKAGE_AMOUNT)
+        if notional != _CANONICAL_READY_PACKAGE_AMOUNT:
+            await block_controlled_proof(db=db, proof=proof, reason="controlled_proof_notional_below_canonical_bound", actor=actor)
+            await db.commit()
+            return
+        risk = await evaluate_controlled_proof_risk(
+            db=db, proof_id=proof.proof_id, campaign_id=proof.campaign_id,
+            campaign_version=proof.campaign_version, paper_account_id=runtime.paper_account_id,
+            product_id=proof.product_id, side=side, notional_usd=notional, actor=actor,
+        )
+        if risk.verdict == "DENY":
+            await block_controlled_proof(
+                db=db, proof=proof,
+                reason=f"controlled_proof_risk_denied:{risk.reason_code}", actor=actor,
+            )
+            await db.commit()
+            return
+        if risk.verdict != "ALLOW":
+            await record_controlled_proof_waiting(
+                db=db, proof=proof,
+                reason=f"controlled_proof_risk_{risk.verdict.lower()}:{risk.reason_code}", actor=actor,
+            )
+            await db.commit()
+            return
+
+        settings = get_settings()
+        mandate_id = getattr(settings, "automatic_mandate_package_activation_mandate_id", None)
+        if mandate_id is None:
+            await record_controlled_proof_waiting(db=db, proof=proof, reason="governing_mandate_missing", actor=actor)
+            await db.commit()
+            return
+        strategy_identity = await resolve_controlled_proof_strategy_identity(db=db, mandate_id=mandate_id)
+        if not strategy_identity:
+            await record_controlled_proof_waiting(db=db, proof=proof, reason="campaign_strategy_identity_missing", actor=actor)
+            await db.commit()
+            return
+        decision_id = await create_controlled_proof_decision_record(
+            db=db, campaign_id=proof.campaign_id, controlled_proof_id=proof.proof_id,
+            forced_action=forced_action, product=proof.product_id,
+            provider=proof.provider, actor=actor, strategy_identity=strategy_identity,
+        )
+        evaluation = await evaluate_and_record_mandate(
+            db=db,
+            request=MandateEvaluationWriteRequest(
+                mandate_id=mandate_id, actor=actor, strategy_version=strategy_identity,
+                product=proof.product_id, side=side, proposed_notional_usd=notional,
+                current_open_exposure_usd=Decimal("0"), daily_deployed_usd=Decimal("0"),
+                daily_realized_loss_usd=Decimal("0"), campaign_drawdown_usd=Decimal("0"),
+                consecutive_losses=0, current_position_count=0, risk_verdict="ACCEPTED",
+                evidence_age_seconds=0, kill_switch_engaged=False,
+                observed_at=datetime.now(timezone.utc), decision_id=decision_id,
+                request_context={"purpose": "controlled_proof", "controlled_proof_id": str(proof.proof_id)},
+                idempotency_key=f"controlled-proof-mandate-eval:{proof.proof_id}:{side}",
+                audit_correlation_id=proof.audit_correlation_id, software_build_version=None,
+            ),
+        )
+        if evaluation.authorization_result != "AUTHORIZED":
+            await block_controlled_proof(db=db, proof=proof, reason="controlled_proof_mandate_not_authorized", actor=actor)
+            await db.commit()
+            return
+
+        package_key = hashlib.sha256(f"controlled-proof:{proof.proof_id}:{side}".encode()).hexdigest()
+        payload = await create_canonical_preview_package(
+            db=db,
+            request=CanonicalPreviewPackageCreateRequest(
+                campaign_id=proof.campaign_id, campaign_version=proof.campaign_version,
+                paper_account_id=runtime.paper_account_id, live_trading_profile_id=profile.id,
+                provider=proof.provider, environment=proof.environment, product=proof.product_id,
+                max_proposed_order_amount=notional, actor=actor, idempotency_key=package_key,
+                expected_decision_record_id=decision_id, mandate_id=evaluation.mandate_id,
+                mandate_version_id=evaluation.mandate_version_id,
+                mandate_evaluation_id=evaluation.evaluation_id,
+                commissioning_entry_mode="controlled_proof", forced_action=forced_action,
+                controlled_proof_id=proof.proof_id,
+            ),
+        )
+        package_payload = payload.get("package") if isinstance(payload, dict) else None
+        package_id = uuid.UUID(str(package_payload["package_id"])) if isinstance(package_payload, dict) and package_payload.get("package_id") else None
+        if package_id is None:
+            await record_controlled_proof_waiting(db=db, proof=proof, reason="canonical_package_unavailable", actor=actor)
+            await db.commit()
+            return
+        if is_sell:
+            await link_controlled_proof_sell_package(db=db, proof=proof, sell_package_id=package_id)
+        else:
+            await link_controlled_proof_entry(
+                db=db, proof=proof, decision_record_id=decision_id, mandate_id=evaluation.mandate_id,
+                mandate_version_id=evaluation.mandate_version_id, mandate_evaluation_id=evaluation.evaluation_id,
+            )
+            await link_controlled_proof_package(db=db, proof=proof, package_id=package_id)
+        await db.commit()
+
+        progression = await execute_automatic_ready_package_through_activation(
+            db=db,
+            request=AutomaticPackageExecutionRequest(
+                campaign_id=proof.campaign_id, campaign_version=proof.campaign_version,
+                decision_record_id=decision_id, package_id=package_id,
+            ),
+        )
+        if progression.activation_state == "ACTIVATED" and not progression.failed_closed:
+            claim_outcome = await claim_activated_buy_package(db=db, package_id=package_id)
+            if claim_outcome.claim is not None:
+                await advance_claimed_execution(db=db, claim=claim_outcome.claim)
+        await db.commit()
+    except Exception as exc:
+        await _rollback_active_session(db=db)
+        proof = await claim_controlled_proof_by_id(db=db, proof_id=proof_id)
+        if proof is not None:
+            await record_controlled_proof_waiting(
+                db=db, proof=proof, reason=f"entry_attempt_failed:{exc.__class__.__name__}", actor=actor,
+            )
+            await db.commit()
+        logger.exception("controlled_proof_entry_attempt_failed proof_id=%s", proof_id)
+
+
 async def dispatch_controlled_proof_immediate_attempt(*, proof_id: uuid.UUID) -> None:
     """Operator-triggered immediate acceleration for a just-ACCEPTED
     Controlled Proof: runs exactly the same composition+package-attempt
@@ -1768,11 +1954,11 @@ async def dispatch_controlled_proof_immediate_attempt(*, proof_id: uuid.UUID) ->
     cadence. This function only ever makes that happen sooner; it never
     changes whether it eventually happens.
 
-    Never bypasses any gate: this calls the identical shared function the
-    timer loop calls, so strategy composition, fresh risk evaluation,
-    mandate authorization, activation authorization, and audit persistence
-    all run for real, unchanged. Claim-level idempotency (SELECT ... FOR
-    UPDATE in claim_next_controlled_proof_for_scope) and every downstream
+    Never bypasses any gate: this calls the same operator-candidate function
+    the timer loop calls, so fresh risk evaluation, mandate authorization,
+    activation authorization, and audit persistence all run for real.
+    Claim-level idempotency (SELECT ... FOR UPDATE in
+    claim_controlled_proof_by_id) and every downstream
     idempotency key already guarantee a concurrent or duplicate dispatch
     can never claim, package, or activate the same proof twice -- this
     function adds no new locking because none is needed.
@@ -1780,7 +1966,7 @@ async def dispatch_controlled_proof_immediate_attempt(*, proof_id: uuid.UUID) ->
     logger.info("controlled_proof_dispatch_started proof_id=%s", proof_id)
     try:
         async with AsyncSessionLocal() as db:
-            await _run_autonomous_and_campaign_orchestration_attempt(db=db)
+            await _attempt_operator_controlled_proof_entry(db=db, proof_id=proof_id)
     except Exception:
         logger.exception("controlled_proof_dispatch_failed proof_id=%s", proof_id)
         return

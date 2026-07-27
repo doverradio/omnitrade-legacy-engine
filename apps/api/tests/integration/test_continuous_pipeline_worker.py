@@ -1174,6 +1174,38 @@ async def test_expired_mandate_authorization_on_replay_never_reaches_claim_or_un
 
 # --- Controlled Proof worker integration: purely additive claim + linkage ----------
 
+# These tests encoded the retired implementation shortcut: claiming and
+# forcing a Controlled Proof from inside an ambient autonomous campaign
+# cycle.  Keeping them executable would require restoring the coupling the
+# governing contract explicitly forbids.  The immediate/periodic dispatch
+# tests below replace that assertion at the correct operator-candidate seam;
+# the canonical package, claim, preparation, and side-neutral execution
+# suites cover the shared downstream path.
+_RETIRED_ORGANIC_PROOF_TESTS = {
+    "test_controlled_proof_is_claimed_and_linked_through_normal_package_creation",
+    "test_controlled_proof_linkage_is_not_duplicated_on_worker_restart",
+    "test_controlled_proof_forces_buy_candidate_when_strategy_would_hold",
+    "test_controlled_proof_activation_retry_uses_organic_decision_when_package_creation_skipped",
+    "test_controlled_proof_forced_entry_never_mutates_original_hold_decision",
+    "test_controlled_proof_forces_buy_when_hold_surfaces_as_termination_stage",
+    "test_controlled_proof_does_not_override_non_strategy_hold_termination",
+    "test_controlled_proof_never_overrides_failed_closed_termination",
+    "test_controlled_proof_forced_entry_blocked_by_risk_denial",
+    "test_controlled_proof_forced_entry_blocked_by_risk_resize",
+    "test_controlled_proof_forced_entry_blocked_by_stale_evidence",
+    "test_controlled_proof_forced_entry_blocked_by_mandate_denial",
+    "test_controlled_proof_forced_buy_not_reproposed_after_entry_already_linked",
+    "test_controlled_proof_forces_sell_after_buy_reconciled",
+    "test_controlled_proof_sell_not_reproposed_after_sell_already_linked",
+    "test_run_orchestration_cycle_still_reaches_controlled_proof_claim_on_normal_candle_cadence",
+}
+
+
+@pytest.fixture(autouse=True)
+def _retire_organic_proof_coupling_contract(request: pytest.FixtureRequest) -> None:
+    if request.node.name in _RETIRED_ORGANIC_PROOF_TESTS:
+        pytest.skip("obsolete: Controlled Proof is no longer claimed from an organic autonomous cycle")
+
 @pytest.mark.asyncio
 async def test_controlled_proof_is_claimed_and_linked_through_normal_package_creation(
     monkeypatch: pytest.MonkeyPatch,
@@ -2047,7 +2079,43 @@ class _FakeSessionContext:
 
 
 @pytest.mark.asyncio
-async def test_controlled_proof_dispatch_runs_shared_orchestration_attempt_in_fresh_session(
+@pytest.mark.parametrize(
+    "ambient_state",
+    [
+        "BUY", "SELL", "HOLD", "weak_or_conflicting_agreement", "hold_action",
+        "sell_signal_no_position_to_close", "risk_not_permitted", "failed_candidate",
+    ],
+)
+async def test_operator_controlled_proof_dispatch_is_independent_of_ambient_autonomous_state(
+    monkeypatch: pytest.MonkeyPatch, ambient_state: str,
+) -> None:
+    """The operator attempt has no ambient action/skip input at all.
+
+    Parameterizing every historically-coupled state makes the contract
+    explicit: none can reach or gate the proof candidate builder.
+    """
+    import app.services.orchestration.continuous_pipeline_worker as worker_module
+
+    proof_id = uuid.uuid4()
+    calls: list[uuid.UUID] = []
+
+    async def _operator_attempt(*, db, proof_id):
+        calls.append(proof_id)
+
+    async def _ambient_attempt(**_kwargs):
+        raise AssertionError(f"ambient autonomous path must not run for {ambient_state}")
+
+    monkeypatch.setattr(worker_module, "AsyncSessionLocal", lambda: _FakeSessionContext(object()))
+    monkeypatch.setattr(worker_module, "_attempt_operator_controlled_proof_entry", _operator_attempt)
+    monkeypatch.setattr(worker_module, "_run_autonomous_and_campaign_orchestration_attempt", _ambient_attempt)
+
+    await worker_module.dispatch_controlled_proof_immediate_attempt(proof_id=proof_id)
+
+    assert calls == [proof_id]
+
+
+@pytest.mark.asyncio
+async def test_controlled_proof_dispatch_runs_operator_attempt_in_fresh_session(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Requirement: an accepted proof is promptly dispatched through the
@@ -2064,16 +2132,16 @@ async def test_controlled_proof_dispatch_runs_shared_orchestration_attempt_in_fr
         sessions_opened.append(fake_db)
         return _FakeSessionContext(fake_db)
 
-    async def _fake_attempt(*, db):
-        attempts.append(db)
+    async def _fake_attempt(*, db, proof_id):
+        attempts.append((db, proof_id))
 
     monkeypatch.setattr(worker_module, "AsyncSessionLocal", _fake_session_factory)
-    monkeypatch.setattr(worker_module, "_run_autonomous_and_campaign_orchestration_attempt", _fake_attempt)
+    monkeypatch.setattr(worker_module, "_attempt_operator_controlled_proof_entry", _fake_attempt)
 
     await worker_module.dispatch_controlled_proof_immediate_attempt(proof_id=proof_id)
 
     assert sessions_opened == [fake_db]
-    assert attempts == [fake_db]
+    assert attempts == [(fake_db, proof_id)]
 
 
 @pytest.mark.asyncio
@@ -2091,11 +2159,11 @@ async def test_controlled_proof_dispatch_failure_is_logged_and_fails_closed(
     def _fake_session_factory():
         return _FakeSessionContext(object())
 
-    async def _fake_attempt(*, db):
+    async def _fake_attempt(*, db, proof_id):
         raise RuntimeError("simulated orchestration failure")
 
     monkeypatch.setattr(worker_module, "AsyncSessionLocal", _fake_session_factory)
-    monkeypatch.setattr(worker_module, "_run_autonomous_and_campaign_orchestration_attempt", _fake_attempt)
+    monkeypatch.setattr(worker_module, "_attempt_operator_controlled_proof_entry", _fake_attempt)
 
     with caplog.at_level(logging.INFO, logger=worker_module.logger.name):
         await worker_module.dispatch_controlled_proof_immediate_attempt(proof_id=proof_id)
@@ -2121,7 +2189,7 @@ async def test_controlled_proof_duplicate_dispatch_is_idempotent(monkeypatch: py
     proof = _controlled_proof_stub()
     attempt_calls = 0
 
-    async def _fake_attempt(*, db):
+    async def _fake_attempt(*, db, proof_id):
         nonlocal attempt_calls
         attempt_calls += 1
         if attempt_calls == 1:
@@ -2137,7 +2205,7 @@ async def test_controlled_proof_duplicate_dispatch_is_idempotent(monkeypatch: py
         return _FakeSessionContext(object())
 
     monkeypatch.setattr(worker_module, "AsyncSessionLocal", _fake_session_factory)
-    monkeypatch.setattr(worker_module, "_run_autonomous_and_campaign_orchestration_attempt", _fake_attempt)
+    monkeypatch.setattr(worker_module, "_attempt_operator_controlled_proof_entry", _fake_attempt)
 
     await worker_module.dispatch_controlled_proof_immediate_attempt(proof_id=proof_id)
     await worker_module.dispatch_controlled_proof_immediate_attempt(proof_id=proof_id)

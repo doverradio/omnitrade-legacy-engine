@@ -20,7 +20,7 @@ class AutonomousExecutionClaim(Base):
             ["capital_campaign_definitions.campaign_id", "capital_campaign_definitions.version"],
             name="fk_aec_campaign_definition", ondelete="RESTRICT",
         ),
-        CheckConstraint("side = 'BUY'", name="ck_aec_buy_only"),
+        CheckConstraint("side IN ('BUY','SELL')", name="ck_aec_side"),
         CheckConstraint("attempt_count >= 1", name="ck_aec_attempt_count"),
         CheckConstraint(
             "claim_status IN ('CLAIMED','EXECUTION_STARTED','SUBMISSION_PENDING','SAFETY_DISABLED',"

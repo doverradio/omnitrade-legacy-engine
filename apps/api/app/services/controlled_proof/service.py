@@ -204,6 +204,11 @@ async def _live_capital_blocker(*, db: AsyncSession, proof: ControlledProofRun) 
     return None
 
 
+async def controlled_proof_entry_blocker(*, db: AsyncSession, proof: ControlledProofRun) -> str | None:
+    """Public pre-entry use of the canonical live-capital ownership guard."""
+    return await _live_capital_blocker(db=db, proof=proof)
+
+
 async def create_controlled_proof(
     *, db: AsyncSession, product_id: str, idempotency_key: str, expires_in_minutes: int, actor: str,
     replace_active: bool = False,
@@ -453,6 +458,65 @@ async def claim_next_controlled_proof_for_scope(
     )
 
 
+async def claim_controlled_proof_by_id(
+    *, db: AsyncSession, proof_id: uuid.UUID, cycle_id: uuid.UUID | None = None,
+) -> ControlledProofRun | None:
+    """Claim/reload one operator-selected proof independent of automation.
+
+    The row lock makes duplicate immediate dispatches and the periodic
+    worker converge on the same proof.  Only REQUESTED/CLAIMED rows are
+    returned; scope and expiry are revalidated from persisted authority.
+    """
+    await _reap_expired(db=db)
+    now = _utcnow()
+    row = await db.scalar(
+        select(ControlledProofRun)
+        .where(ControlledProofRun.proof_id == proof_id)
+        .limit(1)
+        .with_for_update()
+    )
+    if row is None or row.expires_at <= now or row.status not in _ACTIVE_STATES:
+        return None
+    if row.status == "REQUESTED":
+        await _claim_row(db=db, row=row, cycle_id=cycle_id, now=now)
+    return row
+
+
+async def find_pending_controlled_proof_id(*, db: AsyncSession) -> uuid.UUID | None:
+    """Return the bounded operator workflow awaiting an entry attempt."""
+    await _reap_expired(db=db)
+    return await db.scalar(
+        select(ControlledProofRun.proof_id)
+        .where(ControlledProofRun.status.in_(_ACTIVE_STATES))
+        .order_by(ControlledProofRun.requested_at.asc())
+        .limit(1)
+    )
+
+
+async def record_controlled_proof_waiting(
+    *, db: AsyncSession, proof: ControlledProofRun, reason: str, actor: str,
+) -> None:
+    """Persist an actionable retry reason for a nonterminal attempt.
+
+    The v1 schema intentionally has no separate waiting-reason column;
+    `failure_reason` is therefore the durable operational-reason field for
+    CLAIMED retries.  The `retryable:` prefix is machine-readable and is
+    cleared as soon as entry linkage advances the proof.
+    """
+    if proof.status != "CLAIMED":
+        return
+    value = f"retryable:{reason}"
+    proof.failure_reason = value
+    proof.updated_at = _utcnow()
+    db.add(AuditLog(
+        actor=actor, action="controlled_proof_run.waiting",
+        entity_type="controlled_proof_run", entity_id=proof.proof_id,
+        before_state={"status": "CLAIMED"},
+        after_state={"status": "CLAIMED", "failure_reason": value, "retry_semantics": "next_worker_attempt_until_expiry"},
+    ))
+    await db.flush()
+
+
 async def _claim_row(*, db: AsyncSession, row: ControlledProofRun, cycle_id: uuid.UUID | None, now: datetime) -> None:
     before = row.status
     row.status = "CLAIMED"
@@ -483,6 +547,7 @@ async def link_controlled_proof_entry(
     if proof.decision_record_id is not None:
         return
     proof.decision_record_id = decision_record_id
+    proof.failure_reason = None
     proof.mandate_id = mandate_id
     proof.mandate_version_id = mandate_version_id
     proof.mandate_evaluation_id = mandate_evaluation_id
@@ -721,6 +786,38 @@ async def evaluate_controlled_proof_risk(
         reason_code=risk_result.reason_code,
         risk_event_id=persist_result.risk_event_id,
     )
+
+
+async def block_controlled_proof(*, db: AsyncSession, proof: ControlledProofRun, reason: str, actor: str) -> None:
+    """Transitions a Controlled Proof to a truthful, terminal BLOCKED state
+    with the exact reason a fresh evaluate_controlled_proof_risk DENY (or
+    other fail-closed forced-entry condition) produced. Risk Engine
+    authority is final: a genuine DENY must never leave the proof sitting
+    silently in CLAIMED with only a log line as evidence.
+
+    The only place ControlledProofRun.status is ever set to 'BLOCKED' --
+    a value the model's CHECK constraint has always allowed, but nothing
+    wrote until now. Idempotent and fail-safe: a no-op once the proof has
+    already left the active-state set (already blocked, already progressed
+    to a real entry, expired, or cancelled by a concurrent path) -- never
+    overwrites a real outcome with a stale denial. Caller is responsible
+    for the surrounding transaction's commit, matching every other
+    controlled-proof linkage helper in this module (link_controlled_proof_
+    entry/_package/_sell_package)."""
+    if proof.status not in _ACTIVE_STATES:
+        return
+    before = proof.status
+    proof.status = "BLOCKED"
+    proof.blocked_reason = reason
+    proof.terminal_verdict = "BLOCKED"
+    proof.updated_at = _utcnow()
+    db.add(AuditLog(
+        actor=actor, action="controlled_proof_run.blocked", entity_type="controlled_proof_run",
+        entity_id=proof.proof_id,
+        before_state={"status": before},
+        after_state={"status": "BLOCKED", "blocked_reason": reason},
+    ))
+    await db.flush()
 
 
 async def cancel_controlled_proof(*, db: AsyncSession, proof_id: uuid.UUID, actor: str, reason: str | None) -> ControlledProofRun:

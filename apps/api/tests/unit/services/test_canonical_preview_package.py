@@ -1595,6 +1595,7 @@ async def test_create_forced_commissioning_preview_not_ready_fails_closed(monkey
     preview.status = "PREVIEW_FAILED"
 
     monkeypatch.setattr(cpp, "_load_exchange_connection_for_scope", _async_return(SimpleNamespace(exchange_connection_id=uuid4())))
+    monkeypatch.setattr(cpp, "compute_signed_owned_quantity", _async_return(Decimal("0.05")))
     monkeypatch.setattr(cpp, "_resolve_strategy_and_parameter_binding", _async_return((SimpleNamespace(id=uuid4(), slug="ma"), SimpleNamespace(id=uuid4()))))
     monkeypatch.setattr(cpp, "create_crypto_order_preview", _async_return(SimpleNamespace(crypto_order_preview_id=preview.crypto_order_preview_id)))
     monkeypatch.setattr(cpp, "_load_preview_by_id", _async_return(preview))
@@ -1720,6 +1721,7 @@ async def test_controlled_proof_forced_sell_decision_record_reports_sell_action(
     )
 
     monkeypatch.setattr(cpp, "_load_exchange_connection_for_scope", _async_return(SimpleNamespace(exchange_connection_id=uuid4())))
+    monkeypatch.setattr(cpp, "compute_signed_owned_quantity", _async_return(Decimal("0.05")))
     monkeypatch.setattr(cpp, "_resolve_strategy_and_parameter_binding", _async_return((strategy, parameter_set)))
     monkeypatch.setattr(cpp, "create_crypto_order_preview", _async_return(SimpleNamespace(crypto_order_preview_id=preview_id)))
     monkeypatch.setattr(cpp, "_load_preview_by_id", _async_return(preview))
@@ -1879,7 +1881,8 @@ async def test_controlled_proof_forced_entry_proceeds_past_mandate_evaluation_ch
         controlled_proof_id=proof_id,
     )
     request = replace(
-        request, mandate_id=mandate_id, mandate_version_id=mandate_version_id, mandate_evaluation_id=mandate_evaluation_id,
+        request, expected_decision_record_id=controlled_proof_decision_id,
+        mandate_id=mandate_id, mandate_version_id=mandate_version_id, mandate_evaluation_id=mandate_evaluation_id,
     )
 
     monkeypatch.setattr(cpp, "_load_package_by_idempotency", _async_return(None))
@@ -1894,7 +1897,10 @@ async def test_controlled_proof_forced_entry_proceeds_past_mandate_evaluation_ch
     monkeypatch.setattr(cpp, "_resolve_strategy_and_parameter_binding", _async_return((strategy, parameter_set)))
     monkeypatch.setattr(cpp, "create_crypto_order_preview", _async_return(SimpleNamespace(crypto_order_preview_id=preview_id)))
     monkeypatch.setattr(cpp, "_load_preview_by_id", _async_return(preview))
-    monkeypatch.setattr(cpp, "_load_decision_record", _async_return(SimpleNamespace(decision_id=controlled_proof_decision_id)))
+    monkeypatch.setattr(cpp, "_load_decision_record", _async_return(SimpleNamespace(
+        decision_id=controlled_proof_decision_id,
+        generated_signals=[{"strategy_identity": "ma_crossover@1.0.0", "action": "BUY"}],
+    )))
     monkeypatch.setattr(cpp, "_load_risk_event", _async_return(risk_event))
 
     # count(canonical_preview_packages) auto-resolves to 0 without

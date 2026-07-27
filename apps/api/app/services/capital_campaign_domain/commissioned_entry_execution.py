@@ -170,9 +170,9 @@ def _build_economic_idempotency_key(
         "provider": request.readiness_request.provider,
         "environment": request.readiness_request.environment,
         "instrument": _normalize_instrument(request.readiness_request.instrument),
-        "side": "BUY",
+        "side": request.side,
         "authorized_quote_amount": format(request.readiness_request.requested_quote_amount, "f"),
-        "entry_action": _ENTRY_ACTION,
+        "entry_action": _ENTRY_ACTION if request.side == "BUY" else "CLOSE_POSITION_PROPOSED",
     }
     return _hash_payload(payload)
 
@@ -292,7 +292,7 @@ async def _create_commissioned_decision_record(
     risk_action: str,
     risk_event_id: UUID,
 ) -> UUID:
-    decision_idempotency_key = f"commissioned-entry:{economic_idempotency_key}"
+    decision_idempotency_key = f"commissioned-order:{economic_idempotency_key}"
     existing = await db.scalar(
         select(DecisionRecord)
         .where(DecisionRecord.idempotency_key == decision_idempotency_key)
@@ -333,10 +333,10 @@ async def _create_commissioned_decision_record(
         },
         generated_signals=[
             {
-                "decision_kind": "OPEN_POSITION_PROPOSED",
+                "decision_kind": "OPEN_POSITION_PROPOSED" if request.side == "BUY" else "CLOSE_POSITION_PROPOSED",
                 "entry_authority": _AUTHORITY_CLASSIFICATION,
                 "strategy_signal": _STRATEGY_CLASSIFICATION,
-                "explanation": "Operator commissioned one bounded seed entry; no strategy-discovered BUY signal claimed.",
+                "explanation": f"Canonical {request.side} execution under persisted package authority.",
             }
         ],
         signal_strength=None,
@@ -355,7 +355,7 @@ async def _create_commissioned_decision_record(
         trade_accepted=risk_action in {"approve", "resize"},
         trade_rejected_reason=None if risk_action in {"approve", "resize"} else "risk_rejected",
         execution_details={
-            "decision_kind": "OPEN_POSITION_PROPOSED",
+            "decision_kind": "OPEN_POSITION_PROPOSED" if request.side == "BUY" else "CLOSE_POSITION_PROPOSED",
             "entry_authority": _AUTHORITY_CLASSIFICATION,
             "strategy_signal": _STRATEGY_CLASSIFICATION,
             "campaign_version": request.version,
@@ -384,7 +384,7 @@ async def _create_commissioned_decision_record(
         ohlcv_context=[],
         indicators=record.indicators,
         generated_features={
-            "decision_kind": "OPEN_POSITION_PROPOSED",
+            "decision_kind": "OPEN_POSITION_PROPOSED" if request.side == "BUY" else "CLOSE_POSITION_PROPOSED",
             "entry_authority": _AUTHORITY_CLASSIFICATION,
         },
         market_regime=record.market_regime,
@@ -565,7 +565,7 @@ def _build_risk_request(request: CommissionedEntryExecutionRequest) -> RiskEvalu
         signal_id=request.risk_signal_id,
         paper_account_id=request.paper_account_id,
         asset_id=request.asset_id,
-        side="buy",
+        side=request.side.lower(),
         quantity=request.requested_base_quantity,
         account_equity=request.account_equity,
         max_position_size_pct=request.max_position_size_pct,
@@ -714,6 +714,13 @@ async def execute_commissioned_entry(
 ) -> CommissionedEntryExecutionResponse:
     lock = _get_lock(campaign_id=request.campaign_id, version=request.version)
     async with lock:
+        side = request.side.upper()
+        pending_state: CommissionedCampaignState = "BUY_PENDING" if side == "BUY" else "SELL_PENDING"
+        submitted_state: CommissionedCampaignState = "BUY_SUBMITTED" if side == "BUY" else "SELL_SUBMITTED"
+        reconciliation_pending_state: CommissionedCampaignState = (
+            "BUY_RECONCILIATION_PENDING" if side == "BUY" else "SELL_RECONCILIATION_PENDING"
+        )
+        execution_blob_key = "entry_execution" if side == "BUY" else "exit_execution"
         definition, _runtime = await _load_definition_and_runtime_for_update(
             db=db,
             campaign_id=request.campaign_id,
@@ -722,6 +729,8 @@ async def execute_commissioned_entry(
         blob = _read_commissioned_blob(definition=definition)
         commissioning = blob.get("commissioning") if isinstance(blob.get("commissioning"), dict) else {}
         commissioning_identity = str(commissioning.get("commissioning_identity") or "").strip()
+        if request.canonical_package_authorized:
+            commissioning_identity = f"canonical-package:{request.live_crypto_order_id}"
         if not commissioning_identity:
             raise InvalidRequestError(
                 message="Missing commissioning authority",
@@ -729,14 +738,14 @@ async def execute_commissioned_entry(
             )
         commissioned_until_raw = commissioning.get("commissioned_until")
         commissioned_until = datetime.fromisoformat(str(commissioned_until_raw)) if commissioned_until_raw else None
-        if commissioned_until is None or commissioned_until <= _utcnow():
+        if not request.canonical_package_authorized and (commissioned_until is None or commissioned_until <= _utcnow()):
             raise InvalidRequestError(
                 message="Commissioned authority expired",
                 details={"blocker": "expired_commissioned_authority"},
             )
 
         bound_preview_hash = str(commissioning.get("preview_identity_hash") or "").strip()
-        if bound_preview_hash != request.expected_preview_identity_hash:
+        if not request.canonical_package_authorized and bound_preview_hash != request.expected_preview_identity_hash:
             raise InvalidRequestError(
                 message="Commissioned preview binding mismatch",
                 details={
@@ -750,7 +759,7 @@ async def execute_commissioned_entry(
             commissioning_identity=commissioning_identity,
         )
 
-        entry_execution = blob.get("entry_execution") if isinstance(blob.get("entry_execution"), dict) else {}
+        entry_execution = blob.get(execution_blob_key) if isinstance(blob.get(execution_blob_key), dict) else {}
         existing_key = str(entry_execution.get("economic_idempotency_key") or "").strip()
         if existing_key and existing_key != economic_idempotency_key:
             raise InvalidRequestError(
@@ -763,12 +772,12 @@ async def execute_commissioned_entry(
 
         commissioned_state = str(blob.get("state") or "DRAFT")
         resume_from_buy_pending = (
-            commissioned_state == "BUY_PENDING"
+            commissioned_state == pending_state
             and existing_key == economic_idempotency_key
             and _optional_uuid(entry_execution.get("live_crypto_order_id")) is not None
         )
 
-        if not resume_from_buy_pending:
+        if not resume_from_buy_pending and not request.canonical_package_authorized:
             readiness = await assess_commissioned_campaign_readiness(db=db, request=request.readiness_request)
             preview = await generate_commissioned_campaign_preview(db=db, request=request.readiness_request)
 
@@ -795,8 +804,8 @@ async def execute_commissioned_entry(
             return CommissionedEntryExecutionResponse(
                 campaign_id=request.campaign_id,
                 version=request.version,
-                previous_state="BUY_RECONCILIATION_PENDING",
-                current_state="BUY_RECONCILIATION_PENDING",
+                previous_state=reconciliation_pending_state,
+                current_state=reconciliation_pending_state,
                 replayed=True,
                 vetoed=False,
                     risk_event_id=_optional_uuid(entry_execution.get("risk_event_id")),
@@ -813,9 +822,10 @@ async def execute_commissioned_entry(
                 blockers=[],
             )
 
-        if commissioned_state != "COMMISSIONED" and not resume_from_buy_pending:
+        eligible_initial_states = {"COMMISSIONED"} if side == "BUY" else {"ACTIVE_POSITION", "SELL_EVALUATION"}
+        if not request.canonical_package_authorized and commissioned_state not in eligible_initial_states and not resume_from_buy_pending:
             raise InvalidRequestError(
-                message="Entry execution requires COMMISSIONED state",
+                message=f"Canonical {side} execution is not valid from the current state",
                 details={"current_state": commissioned_state},
             )
 
@@ -823,7 +833,7 @@ async def execute_commissioned_entry(
             expected_live_crypto_order_id = _optional_uuid(entry_execution.get("live_crypto_order_id"))
             if expected_live_crypto_order_id != request.live_crypto_order_id:
                 raise InvalidRequestError(
-                    message="BUY_PENDING execution requires matching live order identity",
+                    message=f"{pending_state} execution requires matching live order identity",
                     details={
                         "expected_live_crypto_order_id": None if expected_live_crypto_order_id is None else str(expected_live_crypto_order_id),
                         "received_live_crypto_order_id": str(request.live_crypto_order_id),
@@ -833,25 +843,37 @@ async def execute_commissioned_entry(
             decision_record_id = _optional_uuid(entry_execution.get("decision_record_id"))
             if persisted_risk_event_id is None or decision_record_id is None:
                 raise InvalidRequestError(
-                    message="BUY_PENDING execution missing persisted identities",
+                    message=f"{pending_state} execution missing persisted identities",
                     details={"entry_execution": entry_execution},
                 )
             persisted_risk = type("_PersistedRisk", (), {"risk_event_id": persisted_risk_event_id})()
             risk_action_value = str(entry_execution.get("risk_action") or "approve")
-            buy_pending_transition = type("_Transition", (), {"current_state": "BUY_PENDING"})()
+            buy_pending_transition = type("_Transition", (), {"current_state": pending_state})()
         else:
-            buy_pending_transition = await transition_commissioned_campaign_state(
-                db=db,
-                campaign_id=request.campaign_id,
-                version=request.version,
-                request=CommissionedCampaignTransitionRequest(
-                    target_state="BUY_PENDING",
-                    actor=request.actor,
-                    reason="commissioned_entry_pre_submission",
-                    idempotency_key=f"{request.idempotency_key}:buy_pending",
-                    expected_current_state="COMMISSIONED",
-                ),
-            )
+            if not request.canonical_package_authorized and side == "SELL" and commissioned_state == "ACTIVE_POSITION":
+                await transition_commissioned_campaign_state(
+                    db=db, campaign_id=request.campaign_id, version=request.version,
+                    request=CommissionedCampaignTransitionRequest(
+                        target_state="SELL_EVALUATION", actor=request.actor,
+                        reason="canonical_sell_evaluation", idempotency_key=f"{request.idempotency_key}:sell_evaluation",
+                        expected_current_state="ACTIVE_POSITION",
+                    ),
+                )
+            if request.canonical_package_authorized:
+                buy_pending_transition = type("_Transition", (), {"current_state": pending_state})()
+            else:
+                buy_pending_transition = await transition_commissioned_campaign_state(
+                    db=db,
+                    campaign_id=request.campaign_id,
+                    version=request.version,
+                    request=CommissionedCampaignTransitionRequest(
+                        target_state=pending_state,
+                        actor=request.actor,
+                        reason="commissioned_entry_pre_submission",
+                        idempotency_key=f"{request.idempotency_key}:{side.lower()}_pending",
+                        expected_current_state="COMMISSIONED" if side == "BUY" else "SELL_EVALUATION",
+                    ),
+                )
 
             risk_result = evaluate_signal_risk(
                 request=_build_risk_request(request),
@@ -877,7 +899,8 @@ async def execute_commissioned_entry(
                 ),
             )
             if risk_result.action == RiskDecisionAction.REJECT:
-                await transition_commissioned_campaign_state(
+                if not request.canonical_package_authorized:
+                    await transition_commissioned_campaign_state(
                     db=db,
                     campaign_id=request.campaign_id,
                     version=request.version,
@@ -886,7 +909,7 @@ async def execute_commissioned_entry(
                         actor=request.actor,
                         reason="risk_engine_veto",
                         idempotency_key=f"{request.idempotency_key}:vetoed",
-                        expected_current_state="BUY_PENDING",
+                        expected_current_state=pending_state,
                     ),
                 )
                 return CommissionedEntryExecutionResponse(
@@ -924,7 +947,7 @@ async def execute_commissioned_entry(
                 version=request.version,
             )
             blob_after_pending = _read_commissioned_blob(definition=definition_after_pending)
-            blob_after_pending["entry_execution"] = {
+            blob_after_pending[execution_blob_key] = {
                 "economic_idempotency_key": economic_idempotency_key,
                 "risk_event_id": str(persisted_risk.risk_event_id),
                 "risk_action": risk_result.action.value,
@@ -941,7 +964,7 @@ async def execute_commissioned_entry(
                 actor=request.actor,
                 campaign_id=request.campaign_id,
                 action="commissioned_seed_campaign.entry_pre_submission",
-                before_state={"state": "BUY_PENDING"},
+                before_state={"state": pending_state},
                 after_state={
                     "economic_idempotency_key": economic_idempotency_key,
                     "decision_record_id": str(decision_record_id),
@@ -973,7 +996,7 @@ async def execute_commissioned_entry(
             submit_error = exc
 
         final_classification = "submitted"
-        final_state: CommissionedCampaignState = "BUY_RECONCILIATION_PENDING"
+        final_state: CommissionedCampaignState = reconciliation_pending_state
         provider_order_id: str | None = None
 
         if submit_error is not None:
@@ -997,34 +1020,37 @@ async def execute_commissioned_entry(
                 final_classification = "ambiguous_submission"
                 final_state = "RECONCILIATION_REQUIRED"
             else:
-                await transition_commissioned_campaign_state(
+                if not request.canonical_package_authorized:
+                    await transition_commissioned_campaign_state(
                     db=db,
                     campaign_id=request.campaign_id,
                     version=request.version,
                     request=CommissionedCampaignTransitionRequest(
-                        target_state="BUY_SUBMITTED",
+                        target_state=submitted_state,
                         actor=request.actor,
                         reason="commissioned_entry_submitted",
-                        idempotency_key=f"{request.idempotency_key}:buy_submitted",
-                        expected_current_state="BUY_PENDING",
+                        idempotency_key=f"{request.idempotency_key}:{side.lower()}_submitted",
+                        expected_current_state=pending_state,
                     ),
                 )
-                final_state = "BUY_RECONCILIATION_PENDING"
-                await transition_commissioned_campaign_state(
+                final_state = reconciliation_pending_state
+                if not request.canonical_package_authorized:
+                    await transition_commissioned_campaign_state(
                     db=db,
                     campaign_id=request.campaign_id,
                     version=request.version,
                     request=CommissionedCampaignTransitionRequest(
-                        target_state="BUY_RECONCILIATION_PENDING",
+                        target_state=reconciliation_pending_state,
                         actor=request.actor,
                         reason="commissioned_entry_reconciliation_pending",
-                        idempotency_key=f"{request.idempotency_key}:buy_reconciliation_pending",
-                        expected_current_state="BUY_SUBMITTED",
+                        idempotency_key=f"{request.idempotency_key}:{side.lower()}_reconciliation_pending",
+                        expected_current_state=submitted_state,
                     ),
                 )
 
         if final_state == "RECONCILIATION_REQUIRED":
-            await transition_commissioned_campaign_state(
+            if not request.canonical_package_authorized:
+                await transition_commissioned_campaign_state(
                 db=db,
                 campaign_id=request.campaign_id,
                 version=request.version,
@@ -1033,7 +1059,7 @@ async def execute_commissioned_entry(
                     actor=request.actor,
                     reason="commissioned_entry_ambiguous_submission",
                     idempotency_key=f"{request.idempotency_key}:reconciliation_required",
-                    expected_current_state="BUY_PENDING",
+                    expected_current_state=pending_state,
                 ),
             )
 
@@ -1043,7 +1069,7 @@ async def execute_commissioned_entry(
             version=request.version,
         )
         blob_final = _read_commissioned_blob(definition=definition_final)
-        entry_final = blob_final.get("entry_execution") if isinstance(blob_final.get("entry_execution"), dict) else {}
+        entry_final = blob_final.get(execution_blob_key) if isinstance(blob_final.get(execution_blob_key), dict) else {}
         entry_final.update(
             {
                 "economic_idempotency_key": economic_idempotency_key,
@@ -1053,7 +1079,7 @@ async def execute_commissioned_entry(
                 "live_crypto_order_id": str(request.live_crypto_order_id),
                 "provider_order_id": provider_order_id,
                 "provider_submission_classification": final_classification,
-                "terminal": final_state == "BUY_RECONCILIATION_PENDING",
+                "terminal": final_state == reconciliation_pending_state,
                 "updated_at": _utcnow().isoformat(),
             }
         )
@@ -1062,14 +1088,14 @@ async def execute_commissioned_entry(
                 "type": submit_error.__class__.__name__,
                 "message": str(submit_error),
             }
-        blob_final["entry_execution"] = entry_final
+        blob_final[execution_blob_key] = entry_final
         _write_commissioned_blob(definition=definition_final, blob=blob_final)
         await _persist_entry_audit(
             db=db,
             actor=request.actor,
             campaign_id=request.campaign_id,
             action="commissioned_seed_campaign.entry_execution",
-            before_state={"state": "BUY_PENDING"},
+            before_state={"state": pending_state},
             after_state={
                 "state": final_state,
                 "provider_submission_classification": final_classification,

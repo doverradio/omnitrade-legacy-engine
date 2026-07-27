@@ -377,6 +377,7 @@ class CommissionedReadinessRequest(BaseModel):
     provider: str
     environment: str
     instrument: str
+    side: Literal["BUY", "SELL"] = "BUY"
     requested_quote_amount: Decimal
     quote_currency: str = "USD"
     idempotency_key: str | None = None
@@ -520,6 +521,8 @@ class CommissionedEntryExecutionRequest(BaseModel):
     version: int
     actor: str
     idempotency_key: str
+    side: Literal["BUY", "SELL"] = "BUY"
+    canonical_package_authorized: bool = False
     readiness_request: CommissionedReadinessRequest
     expected_preview_identity_hash: str
     live_crypto_order_id: UUID
