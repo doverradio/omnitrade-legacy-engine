@@ -683,6 +683,191 @@ async def test_replace_active_refused_when_open_position_exists_without_backfill
 
 
 @pytest.mark.asyncio
+async def test_create_rejects_open_position_uncategorized_by_campaign_id(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Regression for the production incident: a real BUY fill's accounting
+    record can be uncategorized (capital_campaign_id=None, see
+    _resolve_campaign_for_live_order's "uncategorized" outcome) or
+    attributed to a campaign row other than whichever one is currently
+    governing. A campaign_id-scoped position check would silently miss it.
+    The initial "no open position" pre-check must still catch it."""
+    async with _real_session() as session:
+        await _seed_fully_ready_scope(session, monkeypatch)
+        runtime = await session.scalar(select(CapitalCampaign).where(CapitalCampaign.uuid == _CAMPAIGN_ID))
+        profile = await session.scalar(select(LiveTradingProfile).where(LiveTradingProfile.paper_account_id == runtime.paper_account_id))
+        session.add(LiveAccountingRecord(
+            idempotency_key="fill-precheck-uncategorized", live_trading_profile_id=profile.id, capital_campaign_id=None,
+            reconciliation_event_id=uuid.uuid4(), source_execution_event_id=uuid.uuid4(),
+            source_execution_event_type="execution_intent_created", record_type="fill_accounting", provider_order_id="o-precheck-1",
+            symbol="BTC-USD", side="buy", filled_quantity=Decimal("0.001"), fill_price=Decimal("50000"),
+            gross_notional=Decimal("50"), fee_amount=Decimal("0.05"), fee_currency="USD",
+            net_cash_impact=Decimal("-50.05"), provenance={}, recorded_at=datetime.now(timezone.utc),
+        ))
+        await session.flush()
+        with pytest.raises(InvalidRequestError):
+            await controlled_proof_service.create_controlled_proof(
+                db=session, product_id="BTC-USD", idempotency_key="proof-precheck-uncategorized", expires_in_minutes=30,
+                actor="operator:alice",
+            )
+
+
+@pytest.mark.asyncio
+async def test_replace_active_refused_when_owned_position_exists_uncategorized_by_campaign(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Regression for the production incident: RUN_CONTROLLED_PROOF with
+    replace_active=true reported replacement_performed=true and a new proof
+    proceeded all the way to autonomous_execution_claimed, then failed
+    pre-provider with autonomous_execution_failed_pre_provider /
+    owned_position_exists. prepare_autonomous_claimed_buy's
+    owned_position_exists check (autonomous_order_preparation.py) is scoped
+    only to live_trading_profile_id + exact symbol -- it never filters by
+    capital_campaign_id, because a real fill's accounting record can be
+    uncategorized (capital_campaign_id=None, see
+    _resolve_campaign_for_live_order's "uncategorized" outcome) or
+    attributed to a different campaign row than whichever one is currently
+    governing. Before this fix, the replacement gate filtered by
+    capital_campaign_id == runtime.id and so silently missed exactly this
+    position, concluding "safe to replace" while execution independently,
+    correctly, concluded "owned position exists" for the same real funds.
+    Replacement must be rejected before any new proof is created."""
+    async with _real_session() as session:
+        await _seed_fully_ready_scope(session, monkeypatch)
+        old, _ = await controlled_proof_service.create_controlled_proof(
+            db=session, product_id="BTC-USD", idempotency_key="proof-uncategorized", expires_in_minutes=30, actor="operator:alice",
+        )
+        runtime = await session.scalar(select(CapitalCampaign).where(CapitalCampaign.uuid == _CAMPAIGN_ID))
+        profile = await session.scalar(select(LiveTradingProfile).where(LiveTradingProfile.paper_account_id == runtime.paper_account_id))
+        # The exact production gap: a real, filled BUY whose accounting
+        # record is not attributed to the currently governing campaign row
+        # (here: capital_campaign_id=None), and whose proof view was never
+        # polled afterward, so old.position_id was never backfilled either.
+        session.add(LiveAccountingRecord(
+            idempotency_key="fill-uncategorized-1", live_trading_profile_id=profile.id, capital_campaign_id=None,
+            reconciliation_event_id=uuid.uuid4(), source_execution_event_id=uuid.uuid4(),
+            source_execution_event_type="execution_intent_created", record_type="fill_accounting", provider_order_id="kraken-uncat-1",
+            symbol="BTC-USD", side="buy", filled_quantity=Decimal("0.0001"), fill_price=Decimal("50000"),
+            gross_notional=Decimal("5"), fee_amount=Decimal("0.005"), fee_currency="USD",
+            net_cash_impact=Decimal("-5.005"), provenance={}, recorded_at=datetime.now(timezone.utc),
+        ))
+        await session.flush()
+        assert old.position_id is None  # never backfilled -- matches the production gap
+
+        # Isolates _live_capital_blocker's own fix: even asked about this
+        # specific active proof directly, it must independently recognize
+        # the uncategorized fill as live capital.
+        blocker = await controlled_proof_service._live_capital_blocker(db=session, proof=old)
+        assert blocker == "open_position_exists"
+
+        # The full replace_active call must also refuse -- via
+        # create_controlled_proof's own pre-check firing first now that it
+        # shares the same profile+symbol scope, which is an even earlier
+        # and equally correct rejection point than _live_capital_blocker.
+        with pytest.raises(InvalidRequestError) as excinfo:
+            await controlled_proof_service.create_controlled_proof(
+                db=session, product_id="BTC-USD", idempotency_key="proof-uncategorized-new", expires_in_minutes=30,
+                actor="operator:bob", replace_active=True,
+            )
+        assert "open production position already exists" in str(excinfo.value)
+        refreshed_old = await session.get(ControlledProofRun, old.proof_id)
+        assert refreshed_old.status not in ("CANCELLED",)
+        rows = (await session.execute(select(ControlledProofRun))).scalars().all()
+        assert len(rows) == 1
+
+
+@pytest.mark.asyncio
+async def test_replace_active_refused_when_owned_position_belongs_to_different_campaign_row(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Same production gap as the "uncategorized" (capital_campaign_id=None)
+    case above, but with the accounting record attributed to a real,
+    different CapitalCampaign.id -- e.g. a prior or unrelated campaign row
+    -- rather than left NULL. The live_trading_profile_id + exact-symbol
+    scope must still catch it regardless of which campaign row (if any) the
+    record happens to be tagged with -- a real owned position belongs to the
+    live account, not to whichever internal campaign row created it."""
+    async with _real_session() as session:
+        await _seed_fully_ready_scope(session, monkeypatch)
+        old, _ = await controlled_proof_service.create_controlled_proof(
+            db=session, product_id="BTC-USD", idempotency_key="proof-foreign-campaign", expires_in_minutes=30, actor="operator:alice",
+        )
+        runtime = await session.scalar(select(CapitalCampaign).where(CapitalCampaign.uuid == _CAMPAIGN_ID))
+        profile = await session.scalar(select(LiveTradingProfile).where(LiveTradingProfile.paper_account_id == runtime.paper_account_id))
+
+        decoy_campaign = CapitalCampaign(
+            uuid=uuid.uuid4(), owner="operator:decoy", name="decoy", status="ARCHIVED",
+            campaign_type="definition_pinned_runtime", definition_campaign_id=None, definition_version=None,
+            paper_account_id=uuid.uuid4(), starting_capital=Decimal("25"), current_equity=Decimal("25"),
+        )
+        session.add(decoy_campaign)
+        await session.flush()
+        assert decoy_campaign.id != runtime.id
+
+        # Same live_trading_profile_id and exact BTC-USD symbol as the
+        # governing campaign's real profile, but capital_campaign_id points
+        # at an entirely different (decoy) campaign row.
+        session.add(LiveAccountingRecord(
+            idempotency_key="fill-foreign-campaign-1", live_trading_profile_id=profile.id, capital_campaign_id=decoy_campaign.id,
+            reconciliation_event_id=uuid.uuid4(), source_execution_event_id=uuid.uuid4(),
+            source_execution_event_type="execution_intent_created", record_type="fill_accounting", provider_order_id="kraken-foreign-1",
+            symbol="BTC-USD", side="buy", filled_quantity=Decimal("0.0001"), fill_price=Decimal("50000"),
+            gross_notional=Decimal("5"), fee_amount=Decimal("0.005"), fee_currency="USD",
+            net_cash_impact=Decimal("-5.005"), provenance={}, recorded_at=datetime.now(timezone.utc),
+        ))
+        await session.flush()
+        assert old.position_id is None  # never backfilled -- matches the production gap
+
+        blocker = await controlled_proof_service._live_capital_blocker(db=session, proof=old)
+        assert blocker == "open_position_exists"
+
+        with pytest.raises(InvalidRequestError):
+            await controlled_proof_service.create_controlled_proof(
+                db=session, product_id="BTC-USD", idempotency_key="proof-foreign-campaign-new", expires_in_minutes=30,
+                actor="operator:bob", replace_active=True,
+            )
+        refreshed_old = await session.get(ControlledProofRun, old.proof_id)
+        assert refreshed_old.status not in ("CANCELLED",)
+        rows = (await session.execute(select(ControlledProofRun))).scalars().all()
+        assert len(rows) == 1
+
+
+@pytest.mark.asyncio
+async def test_replace_active_refused_when_live_trading_profile_cannot_be_resolved(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Fail-closed regression: if the live trading profile for the
+    campaign's paper account cannot be resolved at all,
+    _live_capital_blocker must not treat that as "safe to replace" -- an
+    inability to prove no live capital exists is not proof that none
+    exists. Must return "ownership_scope_unresolved" and refuse
+    replacement, not silently fall through to None (the prior behavior)."""
+    async with _real_session() as session:
+        await _seed_fully_ready_scope(session, monkeypatch)
+        old, _ = await controlled_proof_service.create_controlled_proof(
+            db=session, product_id="BTC-USD", idempotency_key="proof-no-profile", expires_in_minutes=30, actor="operator:alice",
+        )
+        runtime = await session.scalar(select(CapitalCampaign).where(CapitalCampaign.uuid == _CAMPAIGN_ID))
+        profile = await session.scalar(select(LiveTradingProfile).where(LiveTradingProfile.paper_account_id == runtime.paper_account_id))
+        await session.delete(profile)
+        await session.flush()
+
+        blocker = await controlled_proof_service._live_capital_blocker(db=session, proof=old)
+        assert blocker == "ownership_scope_unresolved"
+
+        with pytest.raises(InvalidRequestError) as excinfo:
+            await controlled_proof_service.create_controlled_proof(
+                db=session, product_id="BTC-USD", idempotency_key="proof-no-profile-new", expires_in_minutes=30,
+                actor="operator:bob", replace_active=True,
+            )
+        assert excinfo.value.details.get("blocker") == "ownership_scope_unresolved"
+        refreshed_old = await session.get(ControlledProofRun, old.proof_id)
+        assert refreshed_old.status not in ("CANCELLED",)
+        rows = (await session.execute(select(ControlledProofRun))).scalars().all()
+        assert len(rows) == 1
+
+
+@pytest.mark.asyncio
 async def test_replace_active_allowed_when_a_terminal_order_leaves_no_open_position(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

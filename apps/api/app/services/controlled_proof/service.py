@@ -7,7 +7,7 @@ from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 from typing import Any
 
-from sqlalchemy import select
+from sqlalchemy import case, func, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -22,6 +22,7 @@ from app.models.controlled_proof_run import ControlledProofRun
 from app.models.decision_record import DecisionRecord
 from app.models.live_accounting_record import LiveAccountingRecord
 from app.models.live_crypto_order import LiveCryptoOrder
+from app.models.live_trading_profile import LiveTradingProfile
 from app.models.paper_account import PaperAccount
 from app.models.strategy import Strategy
 from app.services.asset_commissioning import get_asset_readiness
@@ -107,6 +108,48 @@ async def _reap_expired(*, db: AsyncSession) -> None:
         await db.flush()
 
 
+async def _resolve_live_trading_profile_id(
+    *, db: AsyncSession, paper_account_id: uuid.UUID,
+) -> uuid.UUID | None:
+    """Same resolution continuous_pipeline_worker._load_live_trading_profile_for_paper_account
+    uses to assign package.live_trading_profile_id when a package is created --
+    the value that ends up as claim.profile_id, which is exactly what
+    prepare_autonomous_claimed_buy's owned_position_exists check is scoped to.
+    Any other resolution here would let this module's notion of "the live
+    trading profile" silently diverge from the one execution actually uses."""
+    return await db.scalar(
+        select(LiveTradingProfile.id)
+        .where(LiveTradingProfile.paper_account_id == paper_account_id)
+        .order_by(LiveTradingProfile.created_at.desc(), LiveTradingProfile.id.desc())
+        .limit(1)
+    )
+
+
+async def _owned_position_exists(
+    *, db: AsyncSession, live_trading_profile_id: uuid.UUID, product_id: str,
+) -> bool:
+    """Bit-for-bit the same query prepare_autonomous_claimed_buy's
+    owned_position_exists check runs (autonomous_order_preparation.py): same
+    accounting records, same signed-sum position calculation, same
+    profile+exact-symbol scope, deliberately no capital_campaign_id filter
+    (a real owned position belongs to the live account, not to whichever
+    internal campaign row happened to be governing when it was opened).
+    This must never diverge from that query -- this module deciding "safe to
+    replace" while that one independently decides "owned position exists"
+    for the same real funds is exactly the production incident this
+    function exists to prevent."""
+    open_quantity = await db.scalar(
+        select(func.coalesce(func.sum(case(
+            (LiveAccountingRecord.side == "buy", LiveAccountingRecord.filled_quantity),
+            else_=-LiveAccountingRecord.filled_quantity,
+        )), Decimal("0"))).where(
+            LiveAccountingRecord.live_trading_profile_id == live_trading_profile_id,
+            LiveAccountingRecord.symbol == product_id,
+        )
+    )
+    return Decimal(str(open_quantity or 0)) > 0
+
+
 async def _live_capital_blocker(*, db: AsyncSession, proof: ControlledProofRun) -> str | None:
     """Precise reason a proof may not be replaced, or None if replacement is
     safe.
@@ -124,7 +167,13 @@ async def _live_capital_blocker(*, db: AsyncSession, proof: ControlledProofRun) 
     real funds -- so this always re-derives from the same authoritative,
     live sources claim_activated_buy_package's own unresolved_order_exists/
     campaign_position_already_open checks and should_propose_controlled_sell
-    use, never trusting a cached column as sufficient proof of safety."""
+    use, never trusting a cached column as sufficient proof of safety.
+
+    For the same reason, failing to resolve the ownership scope itself
+    (no runtime campaign row, no paper_account_id, no live trading profile)
+    is never treated as "safe" either -- an inability to prove no live
+    capital exists is not proof that none exists. See
+    "ownership_scope_unresolved" below."""
     if proof.buy_live_crypto_order_id is not None:
         return "live_buy_order_exists"
     if proof.sell_live_crypto_order_id is not None:
@@ -146,11 +195,19 @@ async def _live_capital_blocker(*, db: AsyncSession, proof: ControlledProofRun) 
 
     runtime = await db.scalar(select(CapitalCampaign).where(CapitalCampaign.uuid == proof.campaign_id).limit(1))
     if runtime is None or runtime.paper_account_id is None:
-        return None
-    snapshots = await load_position_snapshots(db=db, account_id=runtime.paper_account_id, campaign_id=runtime.id)
-    symbol_base = proof.product_id.split("-")[0]
-    match = next((s for s in snapshots if s.symbol.split("-")[0].upper() == symbol_base), None)
-    if match is not None and match.position_size != 0:
+        # Cannot resolve the runtime campaign or its paper account, so there
+        # is no way to derive which live trading profile (if any) may hold
+        # real capital for this proof's product. Not being able to prove
+        # "no live capital exists" is not the same as it being safe --
+        # fail closed rather than silently returning None (safe to replace).
+        return "ownership_scope_unresolved"
+    profile_id = await _resolve_live_trading_profile_id(db=db, paper_account_id=runtime.paper_account_id)
+    if profile_id is None:
+        # Same fail-closed reasoning: no live trading profile means the
+        # authoritative accounting-record scope cannot be established, not
+        # that it is provably empty.
+        return "ownership_scope_unresolved"
+    if await _owned_position_exists(db=db, live_trading_profile_id=profile_id, product_id=proof.product_id):
         return "open_position_exists"
     return None
 
@@ -228,12 +285,30 @@ async def create_controlled_proof(
     if runtime is None or runtime.paper_account_id is None:
         raise InvalidRequestError(message="Runtime campaign or paper account missing", details={})
 
-    open_positions = await load_position_snapshots(db=db, account_id=runtime.paper_account_id, campaign_id=runtime.id)
-    symbol_base = product_id.split("-")[0]
-    if any(p.symbol.split("-")[0] == symbol_base and p.position_size != 0 for p in open_positions):
+    # Product-specific check deliberately bit-for-bit matches
+    # prepare_autonomous_claimed_buy's owned_position_exists check (see
+    # _owned_position_exists) -- profile+exact-symbol scoped, no
+    # capital_campaign_id filter, since capital_campaign_id on a real fill's
+    # accounting records can legitimately be NULL ("uncategorized", see
+    # _resolve_campaign_for_live_order) or attributed to a different campaign
+    # row than whichever one happens to be governing now. A campaign-scoped
+    # query here would silently miss exactly the funds execution's own gate
+    # still sees -- the production incident this function exists to prevent.
+    profile_id = await _resolve_live_trading_profile_id(db=db, paper_account_id=runtime.paper_account_id)
+    if profile_id is not None and await _owned_position_exists(
+        db=db, live_trading_profile_id=profile_id, product_id=product_id,
+    ):
         raise InvalidRequestError(
             message="An open production position already exists for this product", details={"product_id": product_id},
         )
+
+    # Broader "no other product has an open position either" check. Also
+    # deliberately not campaign_id-scoped for the same reason as above --
+    # campaign_id=None here means "every accounting record for this paper
+    # account's live trading profile(s), regardless of campaign
+    # attribution", the safe (fail-closed) direction per
+    # _live_capital_blocker's own docstring.
+    open_positions = await load_position_snapshots(db=db, account_id=runtime.paper_account_id, campaign_id=None)
     if any(p.position_size != 0 for p in open_positions):
         raise InvalidRequestError(message="An open production position already exists", details={})
 
