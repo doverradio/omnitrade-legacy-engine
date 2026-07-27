@@ -1402,7 +1402,25 @@ async def create_canonical_preview_package(
     )
 
     db.add(package)
-    await db.flush()
+    # Savepoint, not the outer transaction: the immediate API dispatch and
+    # the timer-driven worker can now both reach this exact point for the
+    # same Controlled Proof concurrently (two independent processes/
+    # sessions), and idempotency_key is only unique at the DB level, not
+    # pre-locked. A plain except+rollback here would roll back everything
+    # already flushed earlier in this same call (the DecisionRecord,
+    # mandate evaluation, preview) -- mirrors the identical pattern already
+    # used by create_controlled_proof and
+    # create_controlled_proof_decision_record for the same reason.
+    try:
+        async with db.begin_nested():
+            await db.flush()
+    except IntegrityError:
+        winner = await _load_package_by_idempotency(db=db, idempotency_key=request.idempotency_key)
+        if winner is None:
+            raise
+        if winner.input_fingerprint != _input_fingerprint(request):
+            raise ValueError("idempotency key replay with different package input")
+        return {"idempotent": True, "package": _package_payload(winner), "readiness": _package_readiness(winner)}
 
     return {"idempotent": False, "package": _package_payload(package), "readiness": _package_readiness(package)}
 

@@ -7,6 +7,7 @@ from types import SimpleNamespace
 from uuid import UUID, uuid4
 
 import pytest
+from sqlalchemy.exc import IntegrityError
 
 from app.models.decision_record import DecisionRecord
 from app.services import canonical_preview_package as cpp
@@ -892,6 +893,99 @@ async def test_forced_commissioning_package_creation_has_zero_provider_submissio
     assert len(db.added) == 1
     assert getattr(db.added[0], "provider", None) == "kraken_spot"
     assert getattr(db.added[0], "side", None) == "BUY"
+
+
+class _ConflictOnFlushDb(_FakeDb):
+    """Simulates a concurrent process (e.g. immediate API dispatch racing
+    the timer-driven worker) winning the same idempotency_key INSERT first
+    -- the DB-level unique constraint rejects this session's own INSERT."""
+
+    async def flush(self) -> None:
+        self.flush_calls += 1
+        raise IntegrityError("insert", {}, Exception("uq_cpp_idempotency_key"))
+
+
+@pytest.mark.asyncio
+async def test_concurrent_package_creation_resolves_to_winning_package_not_a_crash(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Regression: two processes (immediate API dispatch + timer-driven
+    worker) racing to create the same package for the same Controlled
+    Proof must never crash the loser -- the loser must retrieve and return
+    the winner's already-created package, idempotently."""
+    campaign_id = uuid4()
+    package_id = uuid4()
+    profile = _profile()
+    runtime_campaign = SimpleNamespace(uuid=campaign_id, status="READY")
+    definition = _definition(campaign_id=campaign_id, campaign_version=1)
+    definition.status = "READY"
+    definition.metadata_evidence = {
+        "commissioned_seed_campaign": {
+            "state": "READY",
+            "commissioning": {"authority_classification": "OPERATOR_COMMISSIONED"},
+        }
+    }
+    preview = _preview(package_id=package_id)
+    strategy = SimpleNamespace(id=preview.strategy_id, module_version="strategy-v9")
+    parameter_set = SimpleNamespace(id=preview.parameter_set_id, label="ps-v3")
+    cycle = _cycle(proposed_action="HOLD", termination_stage="hold_no_package_created")
+    cycle.cycle_context["authoritative_composition"]["selected_decision"] = {
+        "decision_kind": "HOLD",
+        "reason": "strategy_hold_signal",
+    }
+    request = _create_request(
+        campaign_id=campaign_id,
+        profile=profile,
+        idempotency_key="pkg-concurrent-race",
+        commissioning_entry_mode="initial_proving_entry",
+    )
+    winner = SimpleNamespace(
+        package_id=uuid4(), campaign_id=campaign_id, campaign_version=1, runtime_campaign_id=campaign_id,
+        paper_account_id=profile.paper_account_id, live_trading_profile_id=profile.id, provider="kraken_spot",
+        environment="production", product="BTC-USD", side="BUY", proposed_order_amount=Decimal("5"),
+        risk_approved_amount=Decimal("5"), strategy_id=uuid4(), strategy_version="v1", parameter_set_id=uuid4(),
+        parameter_set_version="baseline", decision_record_id=uuid4(), risk_event_id=uuid4(),
+        crypto_order_preview_id=uuid4(),
+        market_evidence_identity={
+            "entry_authority": "OPERATOR_COMMISSIONED", "entry_reason": "INITIAL_PROVING_ENTRY",
+            "strategy_override_scope": "COMMISSIONING_ENTRY_ONLY", "requested_quote_size": "5",
+        },
+        market_evidence_observed_at=datetime.now(timezone.utc),
+        preview_expires_at=datetime.now(timezone.utc) + timedelta(minutes=10),
+        package_state="READY", generated_at=datetime.now(timezone.utc), idempotency_key=request.idempotency_key,
+        input_fingerprint=cpp._input_fingerprint(request), approval_event_id=None,
+        dry_run_live_crypto_order_id=None, superseded_at=None, invalidated_reason=None,
+    )
+
+    # First call (top-level idempotency check, before this session even
+    # attempts its own insert): no existing package yet, from this
+    # session's point of view. Second call (inside the new IntegrityError
+    # handler, after the concurrent winner's insert is now visible):
+    # returns the winner.
+    lookup_calls = {"count": 0}
+
+    async def _load_package_by_idempotency_racing(*, db, idempotency_key):
+        lookup_calls["count"] += 1
+        return None if lookup_calls["count"] == 1 else winner
+
+    monkeypatch.setattr(cpp, "_load_package_by_idempotency", _load_package_by_idempotency_racing)
+    monkeypatch.setattr(cpp, "_load_profile", _async_return(profile))
+    monkeypatch.setattr(cpp, "_load_runtime_campaign", _async_return(runtime_campaign))
+    monkeypatch.setattr(cpp, "_load_campaign_definition", _async_return(definition))
+    monkeypatch.setattr(cpp, "run_campaign_orchestration_preview_for_candle", _async_return({"cycles": [{"cycle_id": str(cycle.cycle_id)}]}))
+    monkeypatch.setattr(cpp, "_load_campaign_cycle", _async_return(cycle))
+    monkeypatch.setattr(cpp, "_load_preview_for_package", _async_return(preview))
+    monkeypatch.setattr(cpp, "_load_decision_record", _async_return(SimpleNamespace(decision_id=preview.decision_record_id)))
+    monkeypatch.setattr(cpp, "_load_risk_event", _async_return(SimpleNamespace(id=preview.risk_event_id)))
+
+    db = _ConflictOnFlushDb(scalar_values=[0, strategy, parameter_set])
+    result = await cpp.create_canonical_preview_package(db=db, request=request)
+
+    # No crash, no unhandled IntegrityError -- the loser resolves to the
+    # exact same package identity the winner already created.
+    assert result["idempotent"] is True
+    assert result["package"]["package_id"] == str(winner.package_id)
+    assert lookup_calls["count"] == 2
 
 
 @pytest.mark.asyncio
