@@ -12,6 +12,14 @@ def _action(*, status: str = "ACCEPTED", linked_resource_id: uuid.UUID | None = 
     return SimpleNamespace(status=status, result=None, linked_resource_id=linked_resource_id or uuid.uuid4())
 
 
+class _FakeReplacementLookupDb:
+    """Stands in for the real db in _project tests that don't care about
+    replacement: no "controlled_proof_run.replaced" audit entry exists."""
+
+    async def scalar(self, *_args, **_kwargs) -> None:
+        return None
+
+
 def _view(**overrides) -> dict:
     base = {
         "status": "REQUESTED", "terminal_verdict": None, "net_pnl_usd": None, "fees_usd": None,
@@ -24,7 +32,7 @@ def _view(**overrides) -> dict:
 @pytest.mark.asyncio
 async def test_proof_requested_projects_to_accepted(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(handler, "get_controlled_proof_view", lambda **_: _async(_view(status="REQUESTED")))
-    projection = await handler._project(object(), _action())
+    projection = await handler._project(_FakeReplacementLookupDb(), _action())
     assert projection.status == "ACCEPTED"
 
 
@@ -36,7 +44,7 @@ async def test_proof_requested_projects_to_accepted(monkeypatch: pytest.MonkeyPa
 async def test_active_proof_states_project_to_in_progress(monkeypatch: pytest.MonkeyPatch, proof_status: str) -> None:
     """Requirement 8."""
     monkeypatch.setattr(handler, "get_controlled_proof_view", lambda **_: _async(_view(status=proof_status)))
-    projection = await handler._project(object(), _action())
+    projection = await handler._project(_FakeReplacementLookupDb(), _action())
     assert projection.status == "IN_PROGRESS"
 
 
@@ -56,7 +64,7 @@ async def test_all_three_lifecycle_proven_verdicts_project_to_succeeded(
             handler, "get_controlled_proof_view",
             lambda **_: _async(_view(status=proof_status, terminal_verdict=verdict, net_pnl_usd=net_pnl, fees_usd="0.02")),
         )
-        projection = await handler._project(object(), _action())
+        projection = await handler._project(_FakeReplacementLookupDb(), _action())
         assert projection.status == "SUCCEEDED"
         assert projection.result["terminal_verdict"] == verdict
         assert projection.result["net_pnl_usd"] == net_pnl
@@ -66,7 +74,7 @@ async def test_all_three_lifecycle_proven_verdicts_project_to_succeeded(
 async def test_reconciled_without_a_computed_verdict_yet_stays_in_progress(monkeypatch: pytest.MonkeyPatch) -> None:
     """Never SUCCEEDED ahead of a real, computed verdict."""
     monkeypatch.setattr(handler, "get_controlled_proof_view", lambda **_: _async(_view(status="RECONCILED", terminal_verdict=None)))
-    projection = await handler._project(object(), _action())
+    projection = await handler._project(_FakeReplacementLookupDb(), _action())
     assert projection.status == "IN_PROGRESS"
 
 
@@ -83,7 +91,7 @@ async def test_terminal_non_success_states_project_correctly(
         handler, "get_controlled_proof_view",
         lambda **_: _async(_view(status=proof_status, blocked_reason="reason-b", failure_reason="reason-f")),
     )
-    projection = await handler._project(object(), _action())
+    projection = await handler._project(_FakeReplacementLookupDb(), _action())
     assert projection.status == expected_action_status
     if expected_action_status == "BLOCKED":
         assert projection.blocked_reason == "reason-b"

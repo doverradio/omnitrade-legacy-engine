@@ -224,7 +224,7 @@ async def test_idempotency_survives_without_relying_on_process_memory(monkeypatc
     must find it purely via the DB unique constraint lookup."""
     async with _real_session() as session:
         await _seed_fully_ready_scope(session, monkeypatch)
-        proof = await controlled_proof_service.create_controlled_proof(
+        proof, _ = await controlled_proof_service.create_controlled_proof(
             db=session, product_id="BTC-USD", idempotency_key="operator-action:oa-restart",
             expires_in_minutes=60, actor="operator:alice",
         )

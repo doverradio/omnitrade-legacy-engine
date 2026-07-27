@@ -4,8 +4,10 @@ import uuid
 from typing import Any
 
 from pydantic import BaseModel, ConfigDict, Field
+from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.models.audit_log import AuditLog
 from app.models.operator_action import OperatorAction
 from app.services.controlled_proof import create_controlled_proof, get_controlled_proof_view
 from app.services.operator_actions.registry import (
@@ -39,6 +41,11 @@ class RunControlledProofParameters(BaseModel):
 
     product_id: str
     expires_in_minutes: int = Field(default=60, ge=1, le=180)
+    # When true and another proof is currently active, atomically cancel it
+    # and create this one -- but only when the active proof has not crossed
+    # a live-capital boundary (no live BUY/SELL order, no open position).
+    # Otherwise fails closed with the exact live artifact blocking it.
+    replace_active: bool = False
 
 
 def _derive_proof_idempotency_key(action_idempotency_key: str) -> str:
@@ -51,12 +58,13 @@ def _derive_proof_idempotency_key(action_idempotency_key: str) -> str:
 
 async def _submit(db: AsyncSession, action: OperatorAction, parameters: BaseModel) -> OperatorActionSubmission:
     assert isinstance(parameters, RunControlledProofParameters)
-    proof = await create_controlled_proof(
+    proof, _replaced_proof = await create_controlled_proof(
         db=db,
         product_id=parameters.product_id,
         idempotency_key=_derive_proof_idempotency_key(action.idempotency_key),
         expires_in_minutes=parameters.expires_in_minutes,
         actor=action.actor,
+        replace_active=parameters.replace_active,
     )
     return OperatorActionSubmission(linked_resource_type="controlled_proof_run", linked_resource_id=proof.proof_id)
 
@@ -68,12 +76,27 @@ async def _project(db: AsyncSession, action: OperatorAction) -> OperatorActionPr
     view = await get_controlled_proof_view(db=db, proof_id=uuid.UUID(str(action.linked_resource_id)))
     proof_status = str(view["status"])
     terminal_verdict = view.get("terminal_verdict")
+    # Durable, not re-derived from anything transient: written once, at
+    # creation time, into the append-only audit trail itself (see
+    # create_controlled_proof's "controlled_proof_run.replaced" entry) --
+    # so this reads correctly on every call, not just the initial response.
+    replacement_audit = await db.scalar(
+        select(AuditLog)
+        .where(AuditLog.entity_id == action.linked_resource_id, AuditLog.action == "controlled_proof_run.replaced")
+        .limit(1)
+    )
+    replaced_proof_id = (
+        None if replacement_audit is None else (replacement_audit.before_state or {}).get("replaced_proof_id")
+    )
     result: dict[str, Any] = {
         "controlled_proof_id": str(action.linked_resource_id),
         "controlled_proof_status": proof_status,
         "terminal_verdict": terminal_verdict,
         "net_pnl_usd": None if view.get("net_pnl_usd") is None else str(view["net_pnl_usd"]),
         "fees_usd": None if view.get("fees_usd") is None else str(view["fees_usd"]),
+        "replaced_proof_id": replaced_proof_id,
+        "replacement_performed": replaced_proof_id is not None,
+        "replacement_reason": "replaced_by_operator_request" if replaced_proof_id is not None else None,
     }
 
     if proof_status == "REQUESTED":

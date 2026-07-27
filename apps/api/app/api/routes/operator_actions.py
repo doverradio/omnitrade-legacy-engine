@@ -20,11 +20,39 @@ Generic, auditable control-plane for repeatable operator actions.
 Supported `action_type`:
 - **RUN_CONTROLLED_PROOF** -- delegates to the existing Controlled Proof
   service (`app.services.controlled_proof`). Allowed `parameters`:
-  `product_id` (str, required) and `expires_in_minutes` (int, 1-180,
-  default 60). No other parameters are accepted; unknown fields are
-  rejected. All Controlled Proof server-enforced constraints (Kraken
-  production only, the pinned campaign, the $5 maximum notional, one proof
-  at a time) remain authoritative and unchanged by this API.
+  `product_id` (str, required), `expires_in_minutes` (int, 1-180, default
+  60), and `replace_active` (bool, default `false`). No other parameters
+  are accepted; unknown fields are rejected. All Controlled Proof
+  server-enforced constraints (Kraken production only, the pinned
+  campaign, the $5 maximum notional, one proof at a time) remain
+  authoritative and unchanged by this API.
+
+  By default, a request while another proof is already active fails
+  closed with "Another controlled proof is already active". Setting
+  `replace_active: true` instead atomically cancels the existing active
+  proof and creates this one in its place -- but *only* when the existing
+  proof has not crossed a live-capital boundary (no live BUY/SELL order,
+  no open position). If it has, replacement is refused with a precise
+  error naming the blocking artifact
+  (`live_buy_order_exists` / `live_sell_order_exists` / `open_position_exists`)
+  and the existing proof is left completely untouched -- a proof that may
+  control real funds is never cancelled or superseded. On a genuine
+  replacement, the cancelled proof is preserved (status `CANCELLED`,
+  `cancelled_at`/`cancelled_by` set, reason `replaced_by_operator_request`)
+  with a durable audit link to its replacement; nothing is ever deleted.
+  `result` includes `replaced_proof_id`, `replacement_performed`, and
+  `replacement_reason` reflecting whether this action's own request caused
+  a replacement. Automatic expiration reaping still runs independently of
+  `replace_active` and remains the fallback path for stalled proofs.
+
+  Example:
+  ```json
+  {
+    "action_type": "RUN_CONTROLLED_PROOF",
+    "idempotency_key": "operator-2026-07-26-btc-retry",
+    "parameters": {"product_id": "BTC-USD", "expires_in_minutes": 60, "replace_active": true}
+  }
+  ```
 
 Status lifecycle: `REQUESTED` -> `ACCEPTED` -> `IN_PROGRESS` -> `SUCCEEDED`,
 with `BLOCKED` / `FAILED` / `CANCELLED` / `EXPIRED` as additional terminal

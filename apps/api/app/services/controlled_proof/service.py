@@ -101,9 +101,27 @@ async def _reap_expired(*, db: AsyncSession) -> None:
         await db.flush()
 
 
+def _live_capital_blocker(proof: ControlledProofRun) -> str | None:
+    """Precise reason a proof may not be replaced, or None if replacement is
+    safe. Checked directly against the proof's own reference columns --
+    never zero once a live artifact exists, since those columns are only
+    ever set once the real downstream row is genuinely linked."""
+    if proof.buy_live_crypto_order_id is not None:
+        return "live_buy_order_exists"
+    if proof.sell_live_crypto_order_id is not None:
+        return "live_sell_order_exists"
+    if proof.position_id is not None:
+        return "open_position_exists"
+    return None
+
+
 async def create_controlled_proof(
     *, db: AsyncSession, product_id: str, idempotency_key: str, expires_in_minutes: int, actor: str,
-) -> ControlledProofRun:
+    replace_active: bool = False,
+) -> tuple[ControlledProofRun, ControlledProofRun | None]:
+    """Returns (new_or_replayed_proof, replaced_proof). replaced_proof is
+    non-None only when replace_active=True genuinely cancelled a prior
+    active proof to make room for this one."""
     product_id = product_id.strip().upper()
     idempotency_key = idempotency_key.strip()
     if not product_id:
@@ -130,7 +148,12 @@ async def create_controlled_proof(
         select(ControlledProofRun).where(ControlledProofRun.idempotency_key == idempotency_key)
     )
     if existing is not None:
-        return existing
+        # Idempotent replay: never re-cancels or re-creates anything, and in
+        # practice this call is only ever reached once per operator-action
+        # idempotency_key anyway -- submit_operator_action's own idempotency
+        # check already short-circuits before handler.submit is invoked
+        # again for a repeated key.
+        return existing, None
 
     # Fail closed: the campaign must genuinely be governing right now, and
     # must already authorize this product, before a proof is even created --
@@ -174,16 +197,47 @@ async def create_controlled_proof(
     if any(p.position_size != 0 for p in open_positions):
         raise InvalidRequestError(message="An open production position already exists", details={})
 
-    # Fast, friendly application-level check for the common (non-racing)
-    # case. The authoritative, race-safe guarantee is the database's own
-    # uq_controlled_proof_runs_single_active partial unique index (Postgres);
-    # this check exists so a plain sequential second request gets a clear
-    # error immediately rather than depending on that index alone.
+    # Locked (not just read) so a concurrent replace_active request racing
+    # this one cannot both observe the same active row as replaceable --
+    # the second request blocks here until the first's transaction commits
+    # or rolls back, then re-evaluates against the now-current row. The
+    # database's own uq_controlled_proof_runs_single_active partial unique
+    # index remains the final, authoritative backstop regardless.
     existing_active = await db.scalar(
-        select(ControlledProofRun).where(ControlledProofRun.status.in_(_ACTIVE_STATES)).limit(1)
+        select(ControlledProofRun).where(ControlledProofRun.status.in_(_ACTIVE_STATES)).with_for_update().limit(1)
     )
+    replaced_proof: ControlledProofRun | None = None
     if existing_active is not None:
-        raise InvalidRequestError(message="Another controlled proof is already active", details={})
+        if not replace_active:
+            raise InvalidRequestError(
+                message="Another controlled proof is already active",
+                details={"active_proof_id": str(existing_active.proof_id)},
+            )
+        blocker = _live_capital_blocker(existing_active)
+        if blocker is not None:
+            # Fail closed: never cancel or supersede a proof that may
+            # control real funds. The proof itself, and every real
+            # downstream row it references, is left completely untouched.
+            raise InvalidRequestError(
+                message=f"Cannot replace active controlled proof: live-capital evidence exists ({blocker})",
+                details={"active_proof_id": str(existing_active.proof_id), "blocker": blocker},
+            )
+        before = existing_active.status
+        existing_active.status = "CANCELLED"
+        existing_active.cancelled_at = _utcnow()
+        existing_active.cancelled_by = actor
+        existing_active.updated_at = _utcnow()
+        db.add(AuditLog(
+            actor=actor, action="controlled_proof_run.cancelled", entity_type="controlled_proof_run",
+            entity_id=existing_active.proof_id,
+            before_state={"status": before},
+            after_state={
+                "status": "CANCELLED", "reason": "replaced_by_operator_request",
+                "replacement_idempotency_key": idempotency_key,
+            },
+        ))
+        await db.flush()
+        replaced_proof = existing_active
 
     proof = ControlledProofRun(
         status="REQUESTED",
@@ -202,15 +256,29 @@ async def create_controlled_proof(
     try:
         await db.flush()
     except IntegrityError as exc:
+        # Rolls back the whole transaction, including any cancellation just
+        # performed above -- an extremely narrow compound race (this new
+        # proof's own idempotency_key colliding at the same instant as a
+        # replace_active call). Safe, fail-closed outcome: the old proof
+        # simply remains active and the operator retries; nothing is left
+        # inconsistent.
         await db.rollback()
         replay = await db.scalar(
             select(ControlledProofRun).where(ControlledProofRun.idempotency_key == idempotency_key)
         )
         if replay is not None:
-            return replay
+            return replay, None
         raise InvalidRequestError(
             message="Another controlled proof is already active", details={},
         ) from exc
+
+    if replaced_proof is not None:
+        db.add(AuditLog(
+            actor=actor, action="controlled_proof_run.replaced", entity_type="controlled_proof_run",
+            entity_id=proof.proof_id,
+            before_state={"replaced_proof_id": str(replaced_proof.proof_id)},
+            after_state={"new_proof_id": str(proof.proof_id), "reason": "replaced_by_operator_request"},
+        ))
 
     db.add(AuditLog(
         actor=actor, action="controlled_proof_run.requested", entity_type="controlled_proof_run",
@@ -220,10 +288,11 @@ async def create_controlled_proof(
             "status": proof.status, "product_id": product_id, "campaign_id": str(ALLOWED_CAMPAIGN_ID),
             "campaign_version": resolved_campaign_version, "max_notional_usd": str(MAX_NOTIONAL_USD),
             "expires_at": proof.expires_at.isoformat(),
+            "replaced_proof_id": None if replaced_proof is None else str(replaced_proof.proof_id),
         },
     ))
     await db.commit()
-    return proof
+    return proof, replaced_proof
 
 
 async def claim_next_controlled_proof_for_scope(

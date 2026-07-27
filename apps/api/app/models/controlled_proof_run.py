@@ -55,6 +55,16 @@ class ControlledProofRun(Base):
                 "status IN ('REQUESTED','CLAIMED','ENTRY_PROPOSED','PACKAGE_CREATED','POSITION_OPEN',"
                 "'WAITING_FOR_PROFITABLE_EXIT')"
             ),
+            # SQLite also supports partial indexes (3.8.0+) and SQLAlchemy
+            # honors this dialect-specific kwarg identically to
+            # postgresql_where above -- without it, the sqlite test double
+            # silently enforces "at most one row in the whole table, ever",
+            # which is far stricter than production and forces tests to
+            # delete terminal rows just to insert a new active one.
+            sqlite_where=text(
+                "status IN ('REQUESTED','CLAIMED','ENTRY_PROPOSED','PACKAGE_CREATED','POSITION_OPEN',"
+                "'WAITING_FOR_PROFITABLE_EXIT')"
+            ),
         ),
     )
 

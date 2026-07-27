@@ -17,6 +17,11 @@ class ControlledProofCreateRequest(BaseModel):
     product_id: str
     idempotency_key: str
     expires_in_minutes: int = Field(default=60, ge=1, le=180)
+    # When true and another proof is currently active, atomically cancel it
+    # and create this one -- but only when the active proof has not crossed
+    # a live-capital boundary (no live BUY/SELL order, no open position).
+    # Otherwise fails closed with the exact live artifact blocking it.
+    replace_active: bool = False
 
 
 class ControlledProofCancelRequest(BaseModel):

@@ -27,9 +27,10 @@ async def post_controlled_proof(
     current_user: dict[str, str] = Depends(get_authorized_operator),
     db: AsyncSession = Depends(get_db),
 ) -> ControlledProofResponse:
-    proof = await create_controlled_proof(
+    proof, _replaced_proof = await create_controlled_proof(
         db=db, product_id=payload.product_id, idempotency_key=payload.idempotency_key,
         expires_in_minutes=payload.expires_in_minutes, actor=current_user["id"],
+        replace_active=payload.replace_active,
     )
     view = await get_controlled_proof_view(db=db, proof_id=proof.proof_id)
     return ControlledProofResponse(**view)

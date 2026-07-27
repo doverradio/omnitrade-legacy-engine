@@ -83,9 +83,9 @@ def test_create_endpoint_succeeds_with_operator_auth_and_ignores_extra_fields(mo
     proof_id = uuid.uuid4()
     seen_kwargs: dict = {}
 
-    async def _fake_create(*, db, product_id, idempotency_key, expires_in_minutes, actor):
+    async def _fake_create(*, db, product_id, idempotency_key, expires_in_minutes, actor, replace_active=False):
         seen_kwargs.update(product_id=product_id, idempotency_key=idempotency_key, actor=actor)
-        return _FakeProof(proof_id)
+        return _FakeProof(proof_id), None
 
     async def _fake_view(*, db, proof_id):
         return _view_payload(proof_id)

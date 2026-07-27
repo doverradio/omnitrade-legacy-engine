@@ -158,7 +158,7 @@ async def _seed_fully_ready_scope(session: AsyncSession, monkeypatch: pytest.Mon
 async def test_create_requires_full_readiness_and_returns_server_scope(monkeypatch: pytest.MonkeyPatch) -> None:
     async with _real_session() as session:
         await _seed_fully_ready_scope(session, monkeypatch)
-        proof = await controlled_proof_service.create_controlled_proof(
+        proof, _ = await controlled_proof_service.create_controlled_proof(
             db=session, product_id="BTC-USD", idempotency_key="proof-1", expires_in_minutes=30, actor="operator:alice",
         )
         assert proof.provider == "kraken_spot"
@@ -184,7 +184,7 @@ async def test_create_resolves_campaign_version_dynamically_from_governing_defin
     which the old ALLOWED_CAMPAIGN_VERSION=1 constant would have rejected."""
     async with _real_session() as session:
         await _seed_fully_ready_scope(session, monkeypatch, version=7)
-        proof = await controlled_proof_service.create_controlled_proof(
+        proof, _ = await controlled_proof_service.create_controlled_proof(
             db=session, product_id="BTC-USD", idempotency_key="proof-v7", expires_in_minutes=30, actor="operator:alice",
         )
         assert proof.campaign_id == _CAMPAIGN_ID
@@ -222,7 +222,7 @@ async def test_create_resolves_the_version_governing_at_request_time_not_a_stale
     changed by a later promotion."""
     async with _real_session() as session:
         await _seed_fully_ready_scope(session, monkeypatch, version=1)
-        first = await controlled_proof_service.create_controlled_proof(
+        first, _ = await controlled_proof_service.create_controlled_proof(
             db=session, product_id="BTC-USD", idempotency_key="proof-before-promotion",
             expires_in_minutes=30, actor="operator:alice",
         )
@@ -258,7 +258,7 @@ async def test_create_resolves_the_version_governing_at_request_time_not_a_stale
         runtime.definition_version = 2
         await session.flush()
 
-        second = await controlled_proof_service.create_controlled_proof(
+        second, _ = await controlled_proof_service.create_controlled_proof(
             db=session, product_id="BTC-USD", idempotency_key="proof-after-promotion",
             expires_in_minutes=30, actor="operator:alice",
         )
@@ -271,10 +271,10 @@ async def test_create_resolves_the_version_governing_at_request_time_not_a_stale
 async def test_create_is_idempotent_on_replay(monkeypatch: pytest.MonkeyPatch) -> None:
     async with _real_session() as session:
         await _seed_fully_ready_scope(session, monkeypatch)
-        first = await controlled_proof_service.create_controlled_proof(
+        first, _ = await controlled_proof_service.create_controlled_proof(
             db=session, product_id="BTC-USD", idempotency_key="proof-dup", expires_in_minutes=30, actor="operator:alice",
         )
-        second = await controlled_proof_service.create_controlled_proof(
+        second, _ = await controlled_proof_service.create_controlled_proof(
             db=session, product_id="BTC-USD", idempotency_key="proof-dup", expires_in_minutes=30, actor="operator:alice",
         )
         assert first.proof_id == second.proof_id
@@ -309,7 +309,7 @@ async def test_expired_active_proof_no_longer_permanently_blocks_new_submission(
     already active" forever."""
     async with _real_session() as session:
         await _seed_fully_ready_scope(session, monkeypatch)
-        proof = await controlled_proof_service.create_controlled_proof(
+        proof, _ = await controlled_proof_service.create_controlled_proof(
             db=session, product_id="BTC-USD", idempotency_key="proof-stale", expires_in_minutes=30, actor="operator:alice",
         )
         proof.expires_at = datetime.now(timezone.utc) - timedelta(minutes=1)
@@ -418,13 +418,253 @@ async def test_create_rejects_when_open_position_already_exists(monkeypatch: pyt
             )
 
 
+# --- replace-active: operator-safe supersede of a stalled active proof ---------------
+
+@pytest.mark.asyncio
+async def test_replace_active_safely_cancels_and_replaces_when_no_live_capital_evidence(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async with _real_session() as session:
+        await _seed_fully_ready_scope(session, monkeypatch)
+        old, _ = await controlled_proof_service.create_controlled_proof(
+            db=session, product_id="BTC-USD", idempotency_key="proof-old", expires_in_minutes=30, actor="operator:alice",
+        )
+        new, replaced = await controlled_proof_service.create_controlled_proof(
+            db=session, product_id="BTC-USD", idempotency_key="proof-new", expires_in_minutes=30,
+            actor="operator:bob", replace_active=True,
+        )
+        assert replaced is not None
+        assert replaced.proof_id == old.proof_id
+        assert new.proof_id != old.proof_id
+        assert new.status == "REQUESTED"
+
+        rows = (await session.execute(select(ControlledProofRun))).scalars().all()
+        assert len(rows) == 2
+        active = [r for r in rows if r.status in controlled_proof_service._ACTIVE_STATES]
+        assert [r.proof_id for r in active] == [new.proof_id]
+
+
+@pytest.mark.asyncio
+async def test_replace_active_old_proof_remains_stored_as_cancelled_with_audit_link(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async with _real_session() as session:
+        await _seed_fully_ready_scope(session, monkeypatch)
+        old, _ = await controlled_proof_service.create_controlled_proof(
+            db=session, product_id="BTC-USD", idempotency_key="proof-old2", expires_in_minutes=30, actor="operator:alice",
+        )
+        new, replaced = await controlled_proof_service.create_controlled_proof(
+            db=session, product_id="BTC-USD", idempotency_key="proof-new2", expires_in_minutes=30,
+            actor="operator:bob", replace_active=True,
+        )
+
+        refreshed_old = await session.get(ControlledProofRun, old.proof_id)
+        assert refreshed_old.status == "CANCELLED"
+        assert refreshed_old.cancelled_by == "operator:bob"
+        assert refreshed_old.cancelled_at is not None
+
+        cancel_audit = (await session.execute(
+            select(AuditLog).where(AuditLog.entity_id == old.proof_id, AuditLog.action == "controlled_proof_run.cancelled")
+        )).scalar_one()
+        assert cancel_audit.after_state["reason"] == "replaced_by_operator_request"
+
+        link_audit = (await session.execute(
+            select(AuditLog).where(AuditLog.entity_id == new.proof_id, AuditLog.action == "controlled_proof_run.replaced")
+        )).scalar_one()
+        assert link_audit.before_state["replaced_proof_id"] == str(old.proof_id)
+        assert link_audit.after_state["new_proof_id"] == str(new.proof_id)
+
+
+@pytest.mark.asyncio
+async def test_replace_active_refused_when_live_buy_order_exists(monkeypatch: pytest.MonkeyPatch) -> None:
+    async with _real_session() as session:
+        await _seed_fully_ready_scope(session, monkeypatch)
+        old, _ = await controlled_proof_service.create_controlled_proof(
+            db=session, product_id="BTC-USD", idempotency_key="proof-buy", expires_in_minutes=30, actor="operator:alice",
+        )
+        old.buy_live_crypto_order_id = uuid.uuid4()
+        await session.flush()
+
+        with pytest.raises(InvalidRequestError) as excinfo:
+            await controlled_proof_service.create_controlled_proof(
+                db=session, product_id="BTC-USD", idempotency_key="proof-buy-new", expires_in_minutes=30,
+                actor="operator:bob", replace_active=True,
+            )
+        assert excinfo.value.details.get("blocker") == "live_buy_order_exists"
+
+        refreshed_old = await session.get(ControlledProofRun, old.proof_id)
+        assert refreshed_old.status not in ("CANCELLED",)
+        rows = (await session.execute(select(ControlledProofRun))).scalars().all()
+        assert len(rows) == 1
+
+
+@pytest.mark.asyncio
+async def test_replace_active_refused_when_live_sell_order_exists(monkeypatch: pytest.MonkeyPatch) -> None:
+    async with _real_session() as session:
+        await _seed_fully_ready_scope(session, monkeypatch)
+        old, _ = await controlled_proof_service.create_controlled_proof(
+            db=session, product_id="BTC-USD", idempotency_key="proof-sell", expires_in_minutes=30, actor="operator:alice",
+        )
+        old.sell_live_crypto_order_id = uuid.uuid4()
+        await session.flush()
+
+        with pytest.raises(InvalidRequestError) as excinfo:
+            await controlled_proof_service.create_controlled_proof(
+                db=session, product_id="BTC-USD", idempotency_key="proof-sell-new", expires_in_minutes=30,
+                actor="operator:bob", replace_active=True,
+            )
+        assert excinfo.value.details.get("blocker") == "live_sell_order_exists"
+        rows = (await session.execute(select(ControlledProofRun))).scalars().all()
+        assert len(rows) == 1
+
+
+@pytest.mark.asyncio
+async def test_replace_active_refused_when_open_position_exists(monkeypatch: pytest.MonkeyPatch) -> None:
+    async with _real_session() as session:
+        await _seed_fully_ready_scope(session, monkeypatch)
+        old, _ = await controlled_proof_service.create_controlled_proof(
+            db=session, product_id="BTC-USD", idempotency_key="proof-pos", expires_in_minutes=30, actor="operator:alice",
+        )
+        old.position_id = "pos-live-1"
+        await session.flush()
+
+        with pytest.raises(InvalidRequestError) as excinfo:
+            await controlled_proof_service.create_controlled_proof(
+                db=session, product_id="BTC-USD", idempotency_key="proof-pos-new", expires_in_minutes=30,
+                actor="operator:bob", replace_active=True,
+            )
+        assert excinfo.value.details.get("blocker") == "open_position_exists"
+        rows = (await session.execute(select(ControlledProofRun))).scalars().all()
+        assert len(rows) == 1
+
+
+@pytest.mark.asyncio
+async def test_replace_active_false_retains_unchanged_fail_closed_error(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The default (replace_active=False) path must be byte-for-byte
+    unchanged: same message, same details shape, old proof left untouched --
+    proving the new feature is strictly additive, opt-in behavior."""
+    async with _real_session() as session:
+        await _seed_fully_ready_scope(session, monkeypatch)
+        old, _ = await controlled_proof_service.create_controlled_proof(
+            db=session, product_id="BTC-USD", idempotency_key="proof-default", expires_in_minutes=30, actor="operator:alice",
+        )
+        with pytest.raises(InvalidRequestError) as excinfo:
+            await controlled_proof_service.create_controlled_proof(
+                db=session, product_id="BTC-USD", idempotency_key="proof-default-2", expires_in_minutes=30,
+                actor="operator:bob",
+            )
+        assert excinfo.value.message == "Another controlled proof is already active"
+        assert excinfo.value.details == {"active_proof_id": str(old.proof_id)}
+
+        refreshed_old = await session.get(ControlledProofRun, old.proof_id)
+        assert refreshed_old.status == old.status
+        assert refreshed_old.cancelled_at is None
+        rows = (await session.execute(select(ControlledProofRun))).scalars().all()
+        assert len(rows) == 1
+
+
+@pytest.mark.asyncio
+async def test_replace_active_idempotent_replay_returns_same_replacement_without_double_cancel(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async with _real_session() as session:
+        await _seed_fully_ready_scope(session, monkeypatch)
+        old, _ = await controlled_proof_service.create_controlled_proof(
+            db=session, product_id="BTC-USD", idempotency_key="proof-idem-old", expires_in_minutes=30, actor="operator:alice",
+        )
+        first, first_replaced = await controlled_proof_service.create_controlled_proof(
+            db=session, product_id="BTC-USD", idempotency_key="proof-idem-new", expires_in_minutes=30,
+            actor="operator:bob", replace_active=True,
+        )
+        second, second_replaced = await controlled_proof_service.create_controlled_proof(
+            db=session, product_id="BTC-USD", idempotency_key="proof-idem-new", expires_in_minutes=30,
+            actor="operator:bob", replace_active=True,
+        )
+
+        assert second.proof_id == first.proof_id
+        assert first_replaced is not None and first_replaced.proof_id == old.proof_id
+        # Replay never re-derives a replacement: create_controlled_proof's
+        # idempotent-replay branch always returns (existing, None).
+        assert second_replaced is None
+
+        rows = (await session.execute(select(ControlledProofRun))).scalars().all()
+        assert len(rows) == 2
+        cancelled = [r for r in rows if r.status == "CANCELLED"]
+        assert [r.proof_id for r in cancelled] == [old.proof_id]
+        cancel_audits = (await session.execute(
+            select(AuditLog).where(AuditLog.entity_id == old.proof_id, AuditLog.action == "controlled_proof_run.cancelled")
+        )).scalars().all()
+        assert len(cancel_audits) == 1
+
+
+@pytest.mark.asyncio
+async def test_sequential_replace_active_requests_never_leave_more_than_one_active_proof(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Proxy for the two-simultaneous-requests race requirement: the real
+    race-safety mechanism (SELECT ... FOR UPDATE row lock plus Postgres's
+    uq_controlled_proof_runs_single_active partial unique index) is not
+    exercisable under sqlite's single shared connection -- see this file's
+    other documented SQLite-limitation notes -- so this instead proves the
+    invariant those mechanisms exist to protect: no matter how many
+    replace_active requests land, at most one active proof ever exists at
+    any observable point."""
+    async with _real_session() as session:
+        await _seed_fully_ready_scope(session, monkeypatch)
+        proof_a, _ = await controlled_proof_service.create_controlled_proof(
+            db=session, product_id="BTC-USD", idempotency_key="race-a", expires_in_minutes=30, actor="operator:alice",
+        )
+        proof_b, replaced_1 = await controlled_proof_service.create_controlled_proof(
+            db=session, product_id="BTC-USD", idempotency_key="race-b", expires_in_minutes=30,
+            actor="operator:bob", replace_active=True,
+        )
+        proof_c, replaced_2 = await controlled_proof_service.create_controlled_proof(
+            db=session, product_id="BTC-USD", idempotency_key="race-c", expires_in_minutes=30,
+            actor="operator:carol", replace_active=True,
+        )
+        assert replaced_1.proof_id == proof_a.proof_id
+        assert replaced_2.proof_id == proof_b.proof_id
+
+        rows = (await session.execute(select(ControlledProofRun))).scalars().all()
+        assert len(rows) == 3
+        active = [r for r in rows if r.status in controlled_proof_service._ACTIVE_STATES]
+        assert [r.proof_id for r in active] == [proof_c.proof_id]
+
+
+@pytest.mark.asyncio
+async def test_expired_proofs_remain_automatically_reaped_alongside_replace_active(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Requirement 9: replace_active supplements expiration reaping, it does
+    not replace it -- an expired active proof is reaped (and thus never
+    needs replacing at all) whether or not replace_active is set."""
+    async with _real_session() as session:
+        await _seed_fully_ready_scope(session, monkeypatch)
+        stale, _ = await controlled_proof_service.create_controlled_proof(
+            db=session, product_id="BTC-USD", idempotency_key="proof-reap", expires_in_minutes=30, actor="operator:alice",
+        )
+        stale.expires_at = datetime.now(timezone.utc) - timedelta(minutes=1)
+        await session.commit()
+
+        new, replaced = await controlled_proof_service.create_controlled_proof(
+            db=session, product_id="BTC-USD", idempotency_key="proof-reap-new", expires_in_minutes=30,
+            actor="operator:bob", replace_active=True,
+        )
+        # Already reaped to EXPIRED before the active-proof check ever ran --
+        # so there was nothing left to replace.
+        assert replaced is None
+        refreshed_stale = await session.get(ControlledProofRun, stale.proof_id)
+        assert refreshed_stale.status == "EXPIRED"
+        assert new.status == "REQUESTED"
+
+
 # --- cancellation --------------------------------------------------------------------
 
 @pytest.mark.asyncio
 async def test_cancel_requested_proof_succeeds(monkeypatch: pytest.MonkeyPatch) -> None:
     async with _real_session() as session:
         await _seed_fully_ready_scope(session, monkeypatch)
-        proof = await controlled_proof_service.create_controlled_proof(
+        proof, _ = await controlled_proof_service.create_controlled_proof(
             db=session, product_id="BTC-USD", idempotency_key="proof-cancel", expires_in_minutes=30, actor="operator:alice",
         )
         cancelled = await controlled_proof_service.cancel_controlled_proof(
@@ -442,7 +682,7 @@ async def test_cancel_requested_proof_succeeds(monkeypatch: pytest.MonkeyPatch) 
 async def test_cancel_after_entry_proposed_is_rejected(monkeypatch: pytest.MonkeyPatch) -> None:
     async with _real_session() as session:
         await _seed_fully_ready_scope(session, monkeypatch)
-        proof = await controlled_proof_service.create_controlled_proof(
+        proof, _ = await controlled_proof_service.create_controlled_proof(
             db=session, product_id="BTC-USD", idempotency_key="proof-cancel2", expires_in_minutes=30, actor="operator:alice",
         )
         proof = await controlled_proof_service.claim_next_controlled_proof_for_scope(
@@ -474,7 +714,7 @@ async def test_cancel_unknown_proof_raises_not_found() -> None:
 async def test_claim_transitions_requested_to_claimed_exactly_once(monkeypatch: pytest.MonkeyPatch) -> None:
     async with _real_session() as session:
         await _seed_fully_ready_scope(session, monkeypatch)
-        proof = await controlled_proof_service.create_controlled_proof(
+        proof, _ = await controlled_proof_service.create_controlled_proof(
             db=session, product_id="BTC-USD", idempotency_key="proof-claim", expires_in_minutes=30, actor="operator:alice",
         )
         cycle_id = uuid.uuid4()
@@ -500,7 +740,7 @@ async def test_repeated_claim_calls_simulating_worker_restart_do_not_reclaim_or_
     and never emit a second 'claimed' audit entry."""
     async with _real_session() as session:
         await _seed_fully_ready_scope(session, monkeypatch)
-        proof = await controlled_proof_service.create_controlled_proof(
+        proof, _ = await controlled_proof_service.create_controlled_proof(
             db=session, product_id="BTC-USD", idempotency_key="proof-restart", expires_in_minutes=30, actor="operator:alice",
         )
         first = await controlled_proof_service.claim_next_controlled_proof_for_scope(
@@ -526,7 +766,7 @@ async def test_repeated_claim_calls_simulating_worker_restart_do_not_reclaim_or_
 async def test_link_entry_and_package_are_idempotent_no_duplicate_buy(monkeypatch: pytest.MonkeyPatch) -> None:
     async with _real_session() as session:
         await _seed_fully_ready_scope(session, monkeypatch)
-        proof = await controlled_proof_service.create_controlled_proof(
+        proof, _ = await controlled_proof_service.create_controlled_proof(
             db=session, product_id="BTC-USD", idempotency_key="proof-link", expires_in_minutes=30, actor="operator:alice",
         )
         proof = await controlled_proof_service.claim_next_controlled_proof_for_scope(
@@ -564,7 +804,7 @@ async def test_link_entry_and_package_are_idempotent_no_duplicate_buy(monkeypatc
 async def test_expired_proof_is_not_claimable_and_transitions_to_expired(monkeypatch: pytest.MonkeyPatch) -> None:
     async with _real_session() as session:
         await _seed_fully_ready_scope(session, monkeypatch)
-        proof = await controlled_proof_service.create_controlled_proof(
+        proof, _ = await controlled_proof_service.create_controlled_proof(
             db=session, product_id="BTC-USD", idempotency_key="proof-expire", expires_in_minutes=30, actor="operator:alice",
         )
         proof.expires_at = datetime.now(timezone.utc) - timedelta(minutes=1)
@@ -586,7 +826,7 @@ async def test_expired_proof_is_not_claimable_and_transitions_to_expired(monkeyp
 async def test_status_view_derives_reconciled_without_fabricating_profit(monkeypatch: pytest.MonkeyPatch) -> None:
     async with _real_session() as session:
         await _seed_fully_ready_scope(session, monkeypatch)
-        proof = await controlled_proof_service.create_controlled_proof(
+        proof, _ = await controlled_proof_service.create_controlled_proof(
             db=session, product_id="BTC-USD", idempotency_key="proof-pnl", expires_in_minutes=30, actor="operator:alice",
         )
         proof = await controlled_proof_service.claim_next_controlled_proof_for_scope(
@@ -668,7 +908,7 @@ async def _seed_reconciled_round_trip(
     linked BUY entry/package and a real, filled BUY+SELL round trip whose net
     P&L is controlled entirely by sell_net_cash_impact."""
     await _seed_fully_ready_scope(session, monkeypatch)
-    proof = await controlled_proof_service.create_controlled_proof(
+    proof, _ = await controlled_proof_service.create_controlled_proof(
         db=session, product_id="BTC-USD", idempotency_key=f"{idempotency_prefix}-req", expires_in_minutes=30, actor="operator:alice",
     )
     proof = await controlled_proof_service.claim_next_controlled_proof_for_scope(
@@ -761,7 +1001,7 @@ async def test_status_view_reports_blocked_verdict_when_proof_expires_before_any
     silent no-op -- distinct from a lifecycle that ran and lost money."""
     async with _real_session() as session:
         await _seed_fully_ready_scope(session, monkeypatch)
-        proof = await controlled_proof_service.create_controlled_proof(
+        proof, _ = await controlled_proof_service.create_controlled_proof(
             db=session, product_id="BTC-USD", idempotency_key="proof-blocked", expires_in_minutes=30, actor="operator:alice",
         )
         proof.expires_at = datetime.now(timezone.utc) - timedelta(minutes=1)
