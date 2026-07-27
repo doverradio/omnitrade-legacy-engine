@@ -1492,7 +1492,7 @@ async def _attempt_automatic_ready_package_creation(
                             linked_decision_record_id = decision_record_id
                     if bool(payload.get("idempotent")):
                         logger.info(
-                            "automatic_ready_package_replayed campaign_id=%s campaign_version=%s cycle_id=%s candle_close_time=%s decision_record_id=%s package_id=%s idempotency_key=%s",
+                            "automatic_ready_package_replayed campaign_id=%s campaign_version=%s cycle_id=%s candle_close_time=%s decision_record_id=%s package_id=%s idempotency_key=%s controlled_proof_id=%s",
                             campaign_id,
                             campaign_version,
                             cycle_id,
@@ -1500,10 +1500,11 @@ async def _attempt_automatic_ready_package_creation(
                             linked_decision_record_id,
                             package_id,
                             idempotency_key,
+                            getattr(controlled_proof, "proof_id", None),
                         )
                     else:
                         logger.info(
-                            "automatic_ready_package_created campaign_id=%s campaign_version=%s cycle_id=%s candle_close_time=%s decision_record_id=%s package_id=%s idempotency_key=%s",
+                            "automatic_ready_package_created campaign_id=%s campaign_version=%s cycle_id=%s candle_close_time=%s decision_record_id=%s package_id=%s idempotency_key=%s controlled_proof_id=%s",
                             campaign_id,
                             campaign_version,
                             cycle_id,
@@ -1511,6 +1512,7 @@ async def _attempt_automatic_ready_package_creation(
                             linked_decision_record_id,
                             package_id,
                             idempotency_key,
+                            getattr(controlled_proof, "proof_id", None),
                         )
 
                     # Controlled Proof linkage: purely additive, after the
@@ -1595,7 +1597,7 @@ async def _attempt_automatic_ready_package_creation(
 
         if skip_reason is not None:
             logger.info(
-                "automatic_ready_package_skipped campaign_id=%s campaign_version=%s cycle_id=%s candle_close_time=%s decision_record_id=%s package_id=%s idempotency_key=%s reason=%s underlying_reason=%s rejection_reasons=%s",
+                "automatic_ready_package_skipped campaign_id=%s campaign_version=%s cycle_id=%s candle_close_time=%s decision_record_id=%s package_id=%s idempotency_key=%s reason=%s underlying_reason=%s rejection_reasons=%s controlled_proof_id=%s",
                 campaign_id,
                 campaign_version,
                 cycle_id,
@@ -1606,51 +1608,27 @@ async def _attempt_automatic_ready_package_creation(
                 skip_reason,
                 underlying_reason,
                 json.dumps(rejection_reasons, sort_keys=True, separators=(",", ":")),
+                getattr(controlled_proof, "proof_id", None),
             )
 
 
-async def run_orchestration_cycle(
-    db: AsyncSession,
-    *,
-    client: BinanceUSClient,
-    kraken_client: KrakenSpotClient | None = None,
-    config: WorkerConfig,
-) -> CycleStats:
-    ingestion_result = await run_ingestion_cycle(
-        db,
-        client,
-        kraken_client,
-        interval=config.candle_interval,
-    )
+async def _run_autonomous_and_campaign_orchestration_attempt(*, db: AsyncSession) -> None:
+    """Composes the campaign orchestration cycle for the latest already-
+    ingested candle and attempts automatic-ready-package creation --
+    including the Controlled Proof claim and forced-entry path. Shared by
+    both the regular timer-driven poll (run_orchestration_cycle, below) and
+    an operator-triggered immediate dispatch (see
+    dispatch_controlled_proof_immediate_attempt) -- exactly one code path
+    for this, never two divergent ones. No new gate, check, or shortcut is
+    introduced here: strategy composition, fresh risk evaluation, mandate
+    authorization, activation authorization, and audit persistence all run
+    exactly as they do on a normal poll.
 
-    if hasattr(db, "scalars") and hasattr(db, "scalar"):
-        try:
-            resumed_runs = await venue_commissioning_service["resume_runs"](
-                db=db,
-                actor="orchestration_worker",
-                limit=10,
-            )
-            if resumed_runs > 0:
-                logger.info("venue_commission_resume_completed resumed_runs=%s", resumed_runs)
-        except Exception:
-            await _rollback_active_session(db=db)
-            logger.exception("venue_commission_resume_failed")
-
-    # Recovery pass for durable autonomous execution claims, deliberately
-    # independent of this cycle's own decision composition -- see
-    # sweep_stale_autonomous_execution_claims. Without this, a claim whose
-    # originating decision_record_id never recurs (e.g. a Controlled-Proof-
-    # forced one-shot entry) is never revisited again by anything below.
-    if hasattr(db, "scalars") and hasattr(db, "scalar") and hasattr(db, "commit"):
-        try:
-            swept = await sweep_stale_autonomous_execution_claims(db=db)
-            if swept > 0:
-                logger.info("autonomous_execution_claim_sweep_completed swept=%s", swept)
-            await db.commit()
-        except Exception:
-            await _rollback_active_session(db=db)
-            logger.exception("autonomous_execution_claim_sweep_cycle_failed")
-
+    Deliberately excludes ingestion, venue-commissioning resume, and stale-
+    claim sweep -- those are independent maintenance passes over already-
+    ingested state, not required for a single composition+package attempt,
+    and remain solely the regular timer-driven cycle's responsibility.
+    """
     autonomous_cycle_products = await _resolve_autonomous_cycle_products(settings=get_settings(), db=db)
     autonomous_cycle_trigger = _resolve_autonomous_cycle_trigger(products=autonomous_cycle_products)
 
@@ -1773,6 +1751,105 @@ async def run_orchestration_cycle(
         except Exception:
             await _rollback_active_session(db=db)
             logger.exception("campaign_orchestration_failed trigger=%s", _AUTONOMOUS_CYCLE_TRIGGER)
+
+
+async def dispatch_controlled_proof_immediate_attempt(*, proof_id: uuid.UUID) -> None:
+    """Operator-triggered immediate acceleration for a just-ACCEPTED
+    Controlled Proof: runs exactly the same composition+package-attempt
+    path a regular poll would (see
+    _run_autonomous_and_campaign_orchestration_attempt) in a fresh,
+    independent session, without waiting for the next candle-close poll.
+
+    Best-effort, not a correctness dependency: on any failure here
+    (including this task never running at all, e.g. a process restart),
+    the regular timer-driven poll -- entirely unaffected by this function
+    -- will still discover and process the proof on its own normal
+    cadence. This function only ever makes that happen sooner; it never
+    changes whether it eventually happens.
+
+    Never bypasses any gate: this calls the identical shared function the
+    timer loop calls, so strategy composition, fresh risk evaluation,
+    mandate authorization, activation authorization, and audit persistence
+    all run for real, unchanged. Claim-level idempotency (SELECT ... FOR
+    UPDATE in claim_next_controlled_proof_for_scope) and every downstream
+    idempotency key already guarantee a concurrent or duplicate dispatch
+    can never claim, package, or activate the same proof twice -- this
+    function adds no new locking because none is needed.
+    """
+    logger.info("controlled_proof_dispatch_started proof_id=%s", proof_id)
+    try:
+        async with AsyncSessionLocal() as db:
+            await _run_autonomous_and_campaign_orchestration_attempt(db=db)
+    except Exception:
+        logger.exception("controlled_proof_dispatch_failed proof_id=%s", proof_id)
+        return
+    logger.info("controlled_proof_dispatch_completed proof_id=%s", proof_id)
+
+
+# Holds strong references to in-flight dispatch tasks so they are never
+# garbage-collected mid-run (a well-known asyncio pitfall for fire-and-
+# forget tasks with no other referrer) -- each task removes itself on
+# completion via its own done-callback.
+_controlled_proof_dispatch_tasks: set[asyncio.Task] = set()
+
+
+def schedule_controlled_proof_immediate_dispatch(*, proof_id: uuid.UUID) -> None:
+    """Fire-and-forget scheduling for dispatch_controlled_proof_immediate_
+    attempt. Must only be called after the caller's own transaction that
+    created/accepted the proof has already committed -- calling this
+    before that commit risks the dispatch's own fresh session racing the
+    still-uncommitted proof row under READ COMMITTED isolation and simply
+    finding nothing (see the call site in app.api.routes.operator_actions
+    for why it is scheduled there, after submit_operator_action returns,
+    rather than inside the RUN_CONTROLLED_PROOF handler itself)."""
+    task = asyncio.create_task(dispatch_controlled_proof_immediate_attempt(proof_id=proof_id))
+    _controlled_proof_dispatch_tasks.add(task)
+    task.add_done_callback(_controlled_proof_dispatch_tasks.discard)
+
+
+async def run_orchestration_cycle(
+    db: AsyncSession,
+    *,
+    client: BinanceUSClient,
+    kraken_client: KrakenSpotClient | None = None,
+    config: WorkerConfig,
+) -> CycleStats:
+    ingestion_result = await run_ingestion_cycle(
+        db,
+        client,
+        kraken_client,
+        interval=config.candle_interval,
+    )
+
+    if hasattr(db, "scalars") and hasattr(db, "scalar"):
+        try:
+            resumed_runs = await venue_commissioning_service["resume_runs"](
+                db=db,
+                actor="orchestration_worker",
+                limit=10,
+            )
+            if resumed_runs > 0:
+                logger.info("venue_commission_resume_completed resumed_runs=%s", resumed_runs)
+        except Exception:
+            await _rollback_active_session(db=db)
+            logger.exception("venue_commission_resume_failed")
+
+    # Recovery pass for durable autonomous execution claims, deliberately
+    # independent of this cycle's own decision composition -- see
+    # sweep_stale_autonomous_execution_claims. Without this, a claim whose
+    # originating decision_record_id never recurs (e.g. a Controlled-Proof-
+    # forced one-shot entry) is never revisited again by anything below.
+    if hasattr(db, "scalars") and hasattr(db, "scalar") and hasattr(db, "commit"):
+        try:
+            swept = await sweep_stale_autonomous_execution_claims(db=db)
+            if swept > 0:
+                logger.info("autonomous_execution_claim_sweep_completed swept=%s", swept)
+            await db.commit()
+        except Exception:
+            await _rollback_active_session(db=db)
+            logger.exception("autonomous_execution_claim_sweep_cycle_failed")
+
+    await _run_autonomous_and_campaign_orchestration_attempt(db=db)
 
     if all(hasattr(db, attr) for attr in ("execute", "scalar", "commit")):
         try:

@@ -2029,6 +2029,164 @@ async def test_controlled_proof_sell_not_reproposed_after_sell_already_linked(mo
     await worker_module._attempt_automatic_ready_package_creation(db=object(), orchestration_payload=_automatic_payload(cycle))
 
 
+# --- Controlled Proof: immediate dispatch (RUN_CONTROLLED_PROOF accepted -> begins promptly) ---
+
+class _FakeSessionContext:
+    """Minimal async-context-manager stand-in for AsyncSessionLocal() in
+    dispatch tests -- proves a fresh, independent session is used, without
+    needing a real database."""
+
+    def __init__(self, db: object) -> None:
+        self._db = db
+
+    async def __aenter__(self) -> object:
+        return self._db
+
+    async def __aexit__(self, *_exc: object) -> bool:
+        return False
+
+
+@pytest.mark.asyncio
+async def test_controlled_proof_dispatch_runs_shared_orchestration_attempt_in_fresh_session(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Requirement: an accepted proof is promptly dispatched through the
+    same shared path the timer-driven poll uses -- never a second,
+    divergent pipeline -- using its own fresh session, not any caller's."""
+    import app.services.orchestration.continuous_pipeline_worker as worker_module
+
+    proof_id = uuid.uuid4()
+    sessions_opened: list = []
+    attempts: list = []
+    fake_db = object()
+
+    def _fake_session_factory():
+        sessions_opened.append(fake_db)
+        return _FakeSessionContext(fake_db)
+
+    async def _fake_attempt(*, db):
+        attempts.append(db)
+
+    monkeypatch.setattr(worker_module, "AsyncSessionLocal", _fake_session_factory)
+    monkeypatch.setattr(worker_module, "_run_autonomous_and_campaign_orchestration_attempt", _fake_attempt)
+
+    await worker_module.dispatch_controlled_proof_immediate_attempt(proof_id=proof_id)
+
+    assert sessions_opened == [fake_db]
+    assert attempts == [fake_db]
+
+
+@pytest.mark.asyncio
+async def test_controlled_proof_dispatch_failure_is_logged_and_fails_closed(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Requirement: failures remain recorded and fail closed -- a failure
+    inside the dispatched attempt must never raise out of dispatch (which
+    runs unsupervised as a background task with no caller to catch it) and
+    must be clearly logged with the proof id."""
+    import app.services.orchestration.continuous_pipeline_worker as worker_module
+
+    proof_id = uuid.uuid4()
+
+    def _fake_session_factory():
+        return _FakeSessionContext(object())
+
+    async def _fake_attempt(*, db):
+        raise RuntimeError("simulated orchestration failure")
+
+    monkeypatch.setattr(worker_module, "AsyncSessionLocal", _fake_session_factory)
+    monkeypatch.setattr(worker_module, "_run_autonomous_and_campaign_orchestration_attempt", _fake_attempt)
+
+    with caplog.at_level(logging.INFO, logger=worker_module.logger.name):
+        await worker_module.dispatch_controlled_proof_immediate_attempt(proof_id=proof_id)
+
+    messages = [record.getMessage() for record in caplog.records]
+    assert any("controlled_proof_dispatch_started" in m and str(proof_id) in m for m in messages)
+    assert any("controlled_proof_dispatch_failed" in m and str(proof_id) in m for m in messages)
+    assert not any("controlled_proof_dispatch_completed" in m for m in messages)
+
+
+@pytest.mark.asyncio
+async def test_controlled_proof_duplicate_dispatch_is_idempotent(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Requirement: duplicate dispatch (e.g. two concurrent operator
+    requests, or a dispatch racing the normal poll) must never claim,
+    package, or activate the same proof twice. The dispatch mechanism adds
+    no new locking of its own -- it relies entirely on
+    claim_next_controlled_proof_for_scope's SELECT ... FOR UPDATE plus
+    every downstream idempotency key, exercised here by having the second
+    call's shared-attempt observe the proof as already claimed/linked."""
+    import app.services.orchestration.continuous_pipeline_worker as worker_module
+
+    proof_id = uuid.uuid4()
+    proof = _controlled_proof_stub()
+    attempt_calls = 0
+
+    async def _fake_attempt(*, db):
+        nonlocal attempt_calls
+        attempt_calls += 1
+        if attempt_calls == 1:
+            # First dispatch claims and links the proof's one controlled entry.
+            proof.decision_record_id = uuid.uuid4()
+        else:
+            # Second (duplicate) dispatch must see it already linked and do
+            # nothing further -- mirroring already_has_entry's real
+            # short-circuit in _attempt_automatic_ready_package_creation.
+            assert proof.decision_record_id is not None
+
+    def _fake_session_factory():
+        return _FakeSessionContext(object())
+
+    monkeypatch.setattr(worker_module, "AsyncSessionLocal", _fake_session_factory)
+    monkeypatch.setattr(worker_module, "_run_autonomous_and_campaign_orchestration_attempt", _fake_attempt)
+
+    await worker_module.dispatch_controlled_proof_immediate_attempt(proof_id=proof_id)
+    await worker_module.dispatch_controlled_proof_immediate_attempt(proof_id=proof_id)
+
+    assert attempt_calls == 2
+    assert proof.decision_record_id is not None
+
+
+@pytest.mark.asyncio
+async def test_run_orchestration_cycle_still_reaches_controlled_proof_claim_on_normal_candle_cadence(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Requirement: normal autonomous candle-driven orchestration remains
+    unchanged by the dispatch feature -- run_orchestration_cycle must still
+    reach claim_next_controlled_proof_for_scope exactly as before the
+    _run_autonomous_and_campaign_orchestration_attempt extraction, without
+    mocking _attempt_automatic_ready_package_creation itself out of the
+    way (unlike the observability-focused helper elsewhere in this file)."""
+    import app.services.orchestration.continuous_pipeline_worker as worker_module
+
+    cycle = _automatic_cycle(proposed_action="HOLD_NO_TRADE", decision_kind="HOLD_NO_TRADE")
+    claim_calls: list = []
+
+    async def _claim(*, db, campaign_id, campaign_version, provider, environment, product_id, cycle_id):
+        claim_calls.append(product_id)
+        return None
+
+    async def _create(*, db, request):
+        raise AssertionError("no proof claimed -- must not create a package")
+
+    monkeypatch.setattr(worker_module, "run_ingestion_cycle", _fake_ingestion_cycle)
+    monkeypatch.setattr(worker_module, "_load_active_assets", _async_return([]))
+    monkeypatch.setattr(worker_module, "_load_active_strategies", _async_return([]))
+    monkeypatch.setattr(worker_module, "run_deterministic_research_cycle_if_due", _async_return(_not_due_research_result()))
+    monkeypatch.setattr(worker_module, "capture_system_intelligence_snapshot_if_due", _async_return(None))
+    monkeypatch.setattr(worker_module, "_load_cycle_by_id", _async_return(cycle))
+    monkeypatch.setattr(worker_module, "claim_next_controlled_proof_for_scope", _claim)
+    monkeypatch.setattr(worker_module, "should_propose_controlled_sell", _async_return(False))
+    monkeypatch.setattr(worker_module, "create_canonical_preview_package", _create)
+    monkeypatch.setattr(
+        worker_module, "run_campaign_orchestration_preview_for_candle",
+        _async_return({"cycles": [{"cycle_id": str(cycle.cycle_id)}], "cycle_count": 1}),
+    )
+
+    await worker_module.run_orchestration_cycle(db=_CampaignPreviewCapableDB(), client=object(), config=_config())
+
+    assert claim_calls == ["BTC-USD"]
+
+
 @pytest.mark.asyncio
 async def test_automatic_ready_package_path_never_calls_authorize_activate_dryrun_or_provider_submit(
     monkeypatch: pytest.MonkeyPatch,

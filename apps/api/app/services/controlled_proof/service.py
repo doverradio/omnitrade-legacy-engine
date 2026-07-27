@@ -276,6 +276,10 @@ async def _claim_row(*, db: AsyncSession, row: ControlledProofRun, cycle_id: uui
         before_state={"status": before}, after_state={"status": "CLAIMED", "claimed_by_cycle_id": None if cycle_id is None else str(cycle_id)},
     ))
     await db.flush()
+    logger.info(
+        "controlled_proof_claimed proof_id=%s campaign_id=%s campaign_version=%s product_id=%s cycle_id=%s",
+        row.proof_id, row.campaign_id, row.campaign_version, row.product_id, cycle_id,
+    )
 
 
 async def link_controlled_proof_entry(

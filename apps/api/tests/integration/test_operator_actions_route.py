@@ -73,12 +73,18 @@ def test_list_endpoint_requires_operator_auth(monkeypatch) -> None:
 def test_submit_endpoint_succeeds_with_operator_auth_and_ignores_actor_field(monkeypatch) -> None:
     action_id = uuid.uuid4()
     seen_kwargs: dict = {}
+    view = _action_view(action_id)
+    dispatched_proof_ids: list = []
 
     async def _fake_submit(*, db, action_type, idempotency_key, parameters, actor):
         seen_kwargs.update(action_type=action_type, idempotency_key=idempotency_key, parameters=parameters, actor=actor)
-        return _action_view(action_id)
+        return view
+
+    def _fake_schedule_dispatch(*, proof_id):
+        dispatched_proof_ids.append(proof_id)
 
     monkeypatch.setattr(route_module, "submit_operator_action", _fake_submit)
+    monkeypatch.setattr(route_module, "schedule_controlled_proof_immediate_dispatch", _fake_schedule_dispatch)
     client = _create_client()
 
     # A caller attempting to smuggle in an actor field must have it silently
@@ -97,6 +103,39 @@ def test_submit_endpoint_succeeds_with_operator_auth_and_ignores_actor_field(mon
     assert response.json()["action_id"] == str(action_id)
     assert seen_kwargs["actor"] == "operator:human"
     assert seen_kwargs["parameters"] == {"product_id": "BTC-USD"}
+    # Requirement: an accepted RUN_CONTROLLED_PROOF promptly schedules
+    # immediate dispatch for the linked proof, after submit_operator_action
+    # has already returned (i.e. already committed).
+    assert dispatched_proof_ids == [view["linked_resource_id"]]
+
+
+def test_submit_endpoint_does_not_dispatch_for_non_controlled_proof_actions(monkeypatch) -> None:
+    """A hypothetical/other action_type whose result never resolves to a
+    controlled_proof_run linked resource must never trigger dispatch."""
+    action_id = uuid.uuid4()
+    view = _action_view(action_id)
+    view["action_type"] = "SOME_OTHER_ACTION"
+    view["linked_resource_type"] = "some_other_resource"
+    dispatched_proof_ids: list = []
+
+    async def _fake_submit(*, db, action_type, idempotency_key, parameters, actor):
+        return view
+
+    def _fake_schedule_dispatch(*, proof_id):
+        dispatched_proof_ids.append(proof_id)
+
+    monkeypatch.setattr(route_module, "submit_operator_action", _fake_submit)
+    monkeypatch.setattr(route_module, "schedule_controlled_proof_immediate_dispatch", _fake_schedule_dispatch)
+    client = _create_client()
+
+    response = client.post(
+        "/api/v1/operator/actions",
+        json={"action_type": "SOME_OTHER_ACTION", "idempotency_key": "k-3", "parameters": {}},
+        headers={"Authorization": "Bearer operator:human"},
+    )
+
+    assert response.status_code == 201
+    assert dispatched_proof_ids == []
 
 
 def test_get_endpoint_succeeds_with_operator_auth(monkeypatch) -> None:

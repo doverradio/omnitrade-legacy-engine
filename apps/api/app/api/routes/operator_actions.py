@@ -10,6 +10,7 @@ from app.db.session import get_db
 from app.schemas.operator_action import OperatorActionCreateRequest, OperatorActionResponse
 from app.services.operator_actions import get_operator_action, list_operator_actions, submit_operator_action
 from app.services.operator_actions.service import DEFAULT_LIST_LIMIT, MAX_LIST_LIMIT
+from app.services.orchestration.continuous_pipeline_worker import schedule_controlled_proof_immediate_dispatch
 
 router = APIRouter(prefix="/api/v1/operator/actions", tags=["operator-actions"])
 
@@ -49,10 +50,24 @@ async def post_operator_action(
     current_user: dict[str, str] = Depends(get_authorized_operator),
     db: AsyncSession = Depends(get_db),
 ) -> dict:
-    return await submit_operator_action(
+    result = await submit_operator_action(
         db=db, action_type=payload.action_type, idempotency_key=payload.idempotency_key,
         parameters=payload.parameters, actor=current_user["id"],
     )
+    # Scheduled here, deliberately after submit_operator_action has already
+    # returned (and therefore already committed the transaction that
+    # created/accepted the proof) -- scheduling any earlier, e.g. inside
+    # the RUN_CONTROLLED_PROOF handler itself, would risk the dispatch's
+    # own fresh session racing the still-uncommitted proof row under READ
+    # COMMITTED isolation. Fire-and-forget: does not delay this response,
+    # and its own failure is independently logged and falls back to the
+    # regular candle-driven poll -- never surfaced as a failure of this
+    # request, which already succeeded.
+    if result.get("action_type") == "RUN_CONTROLLED_PROOF" and result.get("linked_resource_type") == "controlled_proof_run":
+        linked_resource_id = result.get("linked_resource_id")
+        if linked_resource_id is not None:
+            schedule_controlled_proof_immediate_dispatch(proof_id=linked_resource_id)
+    return result
 
 
 @router.get("/{action_id}", response_model=OperatorActionResponse)
