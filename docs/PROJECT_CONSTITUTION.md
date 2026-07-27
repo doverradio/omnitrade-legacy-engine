@@ -85,6 +85,14 @@ This repository intentionally uses `master` as its canonical branch.
 Historically, AI assistants have repeatedly assumed `main`, causing failed push and pull commands.
 
 Treat `master` as a permanent repository invariant unless this Constitution is explicitly amended.
+
+
+---
+## API-First Operations Principle
+
+Any operational capability expected to be performed more than once should be exposed as a secure, authenticated backend API. Manual terminal commands are considered temporary operational tooling and should eventually be replaced by governed APIs unless they are infrastructure administration tasks.
+
+
 ---
 ### Relationship to Other Documents
 

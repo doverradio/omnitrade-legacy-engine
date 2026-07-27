@@ -7,6 +7,8 @@ from uuid import UUID
 
 from pydantic import BaseModel, Field, field_serializer
 
+from app.schemas.live_crypto_orders import LiveCryptoOrderResponse
+
 
 ExchangeProvider = Literal["coinbase_advanced", "kraken_spot"]
 ExchangeEnvironment = Literal["sandbox", "production"]
@@ -130,3 +132,18 @@ class DisconnectExchangeConnectionResponse(BaseModel):
     exchange_connection_id: UUID
     disconnected: bool
     message: str
+
+
+class ReconcileExternalTradeRequest(BaseModel):
+    provider_order_id: str = Field(min_length=1, max_length=120)
+
+
+class ReconcileExternalTradeResponse(BaseModel):
+    live_crypto_order: LiveCryptoOrderResponse
+    provider_order_id: str
+    product_id: str
+    side: str
+    live_trading_profile_id: UUID
+    reconciliation_status: str
+    accounting_completion_status: str | None
+    provider_fill_observed: bool

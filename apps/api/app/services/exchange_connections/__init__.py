@@ -3,6 +3,7 @@ from app.services.exchange_connections.service import (
     disconnect_exchange_connection,
     get_exchange_readiness,
     list_exchange_connections,
+    reconcile_external_trade,
     refresh_exchange_account,
     refresh_exchange_balances,
     refresh_exchange_permissions,
@@ -22,4 +23,5 @@ __all__ = [
     "refresh_exchange_balances",
     "refresh_exchange_account",
     "refresh_exchange_permissions",
+    "reconcile_external_trade",
 ]

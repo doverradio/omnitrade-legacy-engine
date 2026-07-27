@@ -868,6 +868,55 @@ async def test_replace_active_refused_when_live_trading_profile_cannot_be_resolv
 
 
 @pytest.mark.asyncio
+async def test_replace_active_allowed_when_matching_buy_and_sell_fee_pairs_net_to_zero(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Regression for the fee_attribution double-counting defect:
+    record_live_fill_reconciliation always writes a fee_attribution row
+    alongside every fill_accounting row, with the SAME filled_quantity and
+    side. _owned_position_exists (now the shared
+    app.services.live.position_quantity.owned_position_exists) must scope to
+    quantity-bearing record types only -- a BUY fully offset by a SELL of
+    the exact same size, each with its real paired fee row, must net to
+    exactly zero and no longer block replacement."""
+    async with _real_session() as session:
+        await _seed_fully_ready_scope(session, monkeypatch)
+        old, _ = await controlled_proof_service.create_controlled_proof(
+            db=session, product_id="BTC-USD", idempotency_key="proof-fee-pairs", expires_in_minutes=30, actor="operator:alice",
+        )
+        runtime = await session.scalar(select(CapitalCampaign).where(CapitalCampaign.uuid == _CAMPAIGN_ID))
+        profile = await session.scalar(select(LiveTradingProfile).where(LiveTradingProfile.paper_account_id == runtime.paper_account_id))
+
+        def _fill_and_fee(*, side: str, provider_order_id: str, recorded_at):
+            common = dict(
+                live_trading_profile_id=profile.id, live_crypto_order_id=None, capital_campaign_id=None,
+                reconciliation_event_id=uuid.uuid4(), source_execution_event_id=uuid.uuid4(),
+                source_execution_event_type="execution_intent_created", provider_order_id=provider_order_id,
+                provider_fill_id=f"{provider_order_id}-fill", symbol="BTC-USD", side=side,
+                filled_quantity=Decimal("0.00007817"), fill_price=Decimal("64900.00"),
+                gross_notional=Decimal("5.08"), fee_amount=Decimal("0.05"), fee_currency="USD",
+                provenance={}, recorded_at=recorded_at,
+            )
+            session.add(LiveAccountingRecord(idempotency_key=f"{provider_order_id}:fill", record_type="fill_accounting", net_cash_impact=Decimal("-5.08"), **common))
+            session.add(LiveAccountingRecord(idempotency_key=f"{provider_order_id}:fee", record_type="fee_attribution", net_cash_impact=Decimal("0.05"), **common))
+
+        now = datetime.now(timezone.utc)
+        _fill_and_fee(side="buy", provider_order_id="BUY-1", recorded_at=now - timedelta(days=9))
+        _fill_and_fee(side="sell", provider_order_id="SELL-1", recorded_at=now)
+        await session.flush()
+
+        blocker = await controlled_proof_service._live_capital_blocker(db=session, proof=old)
+        assert blocker is None
+
+        new, replaced = await controlled_proof_service.create_controlled_proof(
+            db=session, product_id="BTC-USD", idempotency_key="proof-fee-pairs-new", expires_in_minutes=30,
+            actor="operator:bob", replace_active=True,
+        )
+        assert replaced is not None and replaced.proof_id == old.proof_id
+        assert new.proof_id != old.proof_id
+
+
+@pytest.mark.asyncio
 async def test_replace_active_allowed_when_a_terminal_order_leaves_no_open_position(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

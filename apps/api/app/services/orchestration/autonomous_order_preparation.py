@@ -6,7 +6,7 @@ from uuid import UUID
 
 from decimal import Decimal
 
-from sqlalchemy import and_, case, func, select
+from sqlalchemy import and_, func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import get_settings
@@ -21,7 +21,6 @@ from app.models.canonical_preview_package import CanonicalPreviewPackage
 from app.models.canonical_proving_activation import CanonicalProvingActivation
 from app.models.crypto_order_preview import CryptoOrderPreview
 from app.models.exchange_connection import ExchangeConnection
-from app.models.live_accounting_record import LiveAccountingRecord
 from app.models.live_crypto_order import LiveCryptoOrder
 from app.models.live_reconciliation_event import LiveReconciliationEvent
 from app.models.paper_account import PaperAccount
@@ -30,6 +29,7 @@ from app.models.risk_kill_switch import RiskKillSwitch
 from app.schemas.capital_campaign_domain import CommissionedEntryExecutionRequest, CommissionedReadinessRequest
 from app.services.capital_campaign_domain.activated_commissioned_entry import execute_activated_commissioned_entry
 from app.services.capital_campaign_domain.commissioned_readiness_preview import generate_commissioned_campaign_preview
+from app.services.live.position_quantity import owned_position_exists
 from app.services.risk.risk_context import resolve_effective_risk_policy
 
 
@@ -249,16 +249,7 @@ async def prepare_autonomous_claimed_buy(
     )
     if unresolved is not None:
         _fail("reconciliation_obligation_exists")
-    open_quantity = await db.scalar(
-        select(func.coalesce(func.sum(case(
-            (LiveAccountingRecord.side == "buy", LiveAccountingRecord.filled_quantity),
-            else_=-LiveAccountingRecord.filled_quantity,
-        )), Decimal("0"))).where(
-            LiveAccountingRecord.live_trading_profile_id == claim.profile_id,
-            LiveAccountingRecord.symbol == claim.product,
-        )
-    )
-    if Decimal(str(open_quantity or 0)) > 0:
+    if await owned_position_exists(db=db, live_trading_profile_id=claim.profile_id, symbol=claim.product):
         _fail("owned_position_exists")
 
     order = await db.scalar(

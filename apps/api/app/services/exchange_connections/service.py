@@ -6,11 +6,14 @@ import json
 import uuid
 
 from sqlalchemy import select
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.core.errors import InvalidRequestError, NotFoundError
+from app.core.errors import ConflictError, InvalidRequestError, NotFoundError
 from app.models.audit_log import AuditLog
 from app.models.exchange_connection import ExchangeConnection
+from app.models.live_crypto_order import LiveCryptoOrder
+from app.models.live_trading_profile import LiveTradingProfile
 from app.schemas.exchange_connections import (
     DisconnectExchangeConnectionResponse,
     DisconnectExchangeConnectionRequest,
@@ -20,6 +23,8 @@ from app.schemas.exchange_connections import (
     ExchangeCredentialMaskResponse,
     ExchangeReadinessCheckResponse,
     ExchangeReadinessReportResponse,
+    ReconcileExternalTradeRequest,
+    ReconcileExternalTradeResponse,
     RotateExchangeCredentialsRequest,
     SaveExchangeConnectionRequest,
     TestExchangeConnectionRequest,
@@ -27,7 +32,8 @@ from app.schemas.exchange_connections import (
 )
 from app.services.exchange_connections.crypto import decrypt_credential_payload, encrypt_credential_payload
 from app.services.exchange_connections.providers.base import ExchangeAuthResult
-from app.services.exchange_connections.providers.registry import get_exchange_provider
+from app.services.exchange_connections.providers.kraken_spot import product_id_from_kraken_pair
+from app.services.exchange_connections.providers.registry import get_exchange_provider, require_provider_capabilities
 from app.services.exchange_connections.readiness import build_report, readiness_check
 
 
@@ -1066,4 +1072,219 @@ async def disconnect_exchange_connection(
         exchange_connection_id=connection.exchange_connection_id,
         disconnected=True,
         message="Credentials removed locally. Revoke the API key in Coinbase separately if needed.",
+    )
+
+
+async def _resolve_unique_live_trading_profile(*, db: AsyncSession) -> LiveTradingProfile:
+    """External-trade reconciliation is deliberately narrow: this codebase has
+    no explicit ExchangeConnection -> LiveTradingProfile link (LiveTradingProfile
+    only stores paper_account_id, never provider/environment/exchange_connection_id),
+    so the only safe, fail-closed resolution available is "there must be exactly
+    one live-mode profile in the whole system" -- the same "exactly one, else
+    reject" idiom instant_trades.py's _resolve_connection already uses for
+    provider+environment. Building a general connection<->profile mapping is
+    out of scope; if this ever needs to support more than one live profile,
+    that mapping has to be designed and added deliberately, not inferred here."""
+    rows = list(await db.scalars(select(LiveTradingProfile).where(LiveTradingProfile.operating_mode == "live")))
+    if len(rows) != 1:
+        raise InvalidRequestError(
+            message="External trade cannot be associated with exactly one live trading profile",
+            details={"candidate_live_trading_profile_count": len(rows)},
+        )
+    return rows[0]
+
+
+async def reconcile_external_trade(
+    *, db: AsyncSession, exchange_connection_id: uuid.UUID, payload: ReconcileExternalTradeRequest, actor: str,
+) -> ReconcileExternalTradeResponse:
+    """Operator-attested recovery bridge for a trade executed directly against
+    the provider (e.g. manually in Kraken's own UI), never submitted through
+    this app, and therefore invisible to every existing reconciliation path --
+    all of which are scoped to LiveCryptoOrder rows OmniTrade itself created
+    (see discover_reconciliation_candidates, lookup_order/list_fills callers
+    throughout this codebase). This function creates exactly one such row,
+    with provenance that can never be mistaken for Risk Engine, mandate, or
+    Controlled Proof authority, then hands off to the same canonical
+    reconcile_live_order_and_fills path every other order uses -- it never
+    computes or inserts LiveAccountingRecord rows itself."""
+    provider_order_id = payload.provider_order_id.strip()
+    if not provider_order_id:
+        raise InvalidRequestError(message="provider_order_id is required", details={})
+
+    connection = await _load_connection(db=db, exchange_connection_id=exchange_connection_id)
+    if connection.environment != "production":
+        raise InvalidRequestError(
+            message="External trade reconciliation requires a production exchange connection",
+            details={"environment": connection.environment},
+        )
+    if connection.status != "connected":
+        raise InvalidRequestError(message="Exchange connection is not connected", details={"status": connection.status})
+    if not connection.credentials_valid:
+        raise InvalidRequestError(message="Exchange connection credentials are not valid", details={})
+
+    # get_exchange_provider raises InvalidRequestError itself for an
+    # unregistered provider -- "supported provider" is enforced for free.
+    require_provider_capabilities(
+        provider=connection.provider, operation="reconcile_external_trade",
+        required=("order_lookup_history", "fill_lookup"), environment=connection.environment,
+    )
+
+    profile = await _resolve_unique_live_trading_profile(db=db)
+
+    existing = await db.scalar(
+        select(LiveCryptoOrder).where(LiveCryptoOrder.provider_order_id == provider_order_id).limit(1)
+    )
+    if existing is not None:
+        raise ConflictError(
+            message="An order with this provider_order_id has already been imported",
+            details={
+                "provider_order_id": provider_order_id,
+                "existing_live_crypto_order_id": str(existing.live_crypto_order_id),
+                "existing_status": existing.status,
+            },
+        )
+
+    credentials = _decrypt_credentials(connection)
+    provider = get_exchange_provider(connection.provider, environment=connection.environment)
+    if not (hasattr(provider, "lookup_order") and hasattr(provider, "list_fills")):
+        raise InvalidRequestError(
+            message="Provider does not support direct order/fill lookup for external trade reconciliation",
+            details={"provider": connection.provider},
+        )
+
+    provider_order = await provider.lookup_order(
+        credentials=credentials, environment=connection.environment,
+        provider_order_id=provider_order_id, client_order_id=None, product_id=None,
+    )
+    if provider_order is None:
+        raise InvalidRequestError(message="Provider order not found", details={"provider_order_id": provider_order_id})
+    if (provider_order.status or "").strip().upper() != "FILLED":
+        raise InvalidRequestError(
+            message="Provider order is not terminal and filled",
+            details={"provider_order_id": provider_order_id, "observed_status": provider_order.status},
+        )
+
+    raw = provider_order.raw if isinstance(provider_order.raw, dict) else {}
+    descr = raw.get("descr") if isinstance(raw.get("descr"), dict) else {}
+    pair = descr.get("pair") if isinstance(descr.get("pair"), str) else None
+    product_id = product_id_from_kraken_pair(pair)
+    side = (provider_order.side or "").strip().upper()
+    if product_id is None or side not in {"BUY", "SELL"}:
+        raise InvalidRequestError(
+            message="Provider order product or side could not be normalized safely",
+            details={"provider_order_id": provider_order_id, "pair": pair, "side": provider_order.side},
+        )
+
+    fills = await provider.list_fills(
+        credentials=credentials, environment=connection.environment, provider_order_id=provider_order_id,
+    )
+    valid_fills = [f for f in fills if f.provider_fill_id is not None and f.size > Decimal("0") and f.price > Decimal("0")]
+    if not valid_fills:
+        raise InvalidRequestError(message="No fills found for provider order", details={"provider_order_id": provider_order_id})
+
+    total_filled_quantity = sum((f.size for f in valid_fills), Decimal("0"))
+    total_quote_notional = sum((f.size * f.price for f in valid_fills), Decimal("0"))
+    if total_filled_quantity <= Decimal("0") or total_quote_notional <= Decimal("0"):
+        raise InvalidRequestError(
+            message="Provider order quantities could not be normalized safely",
+            details={"provider_order_id": provider_order_id},
+        )
+
+    order_type_raw = descr.get("ordertype") if isinstance(descr.get("ordertype"), str) else None
+    order_type = order_type_raw.strip().upper() if order_type_raw else "MARKET"
+    submitted_at = provider_order.submitted_at or datetime.now(timezone.utc)
+
+    new_order = LiveCryptoOrder(
+        crypto_order_preview_id=uuid.uuid5(uuid.NAMESPACE_URL, f"external-trade-preview:{provider_order_id}"),
+        exchange_connection_id=connection.exchange_connection_id,
+        provider=connection.provider,
+        environment=connection.environment,
+        product_id=product_id,
+        side=side,
+        order_type=order_type,
+        requested_quote_size=total_quote_notional,
+        client_order_id=f"external-trade-{provider_order_id}",
+        status="SUBMITTED",
+        risk_event_id=None,
+        decision_record_id=None,
+        validation_run_id=None,
+        provider_order_id=provider_order_id,
+        provider_status=provider_order.status,
+        submitted_at=submitted_at,
+        acknowledged_at=None,
+        filled_at=None,
+        cancelled_at=None,
+        failure_code=None,
+        failure_reason=None,
+        safe_provider_response={
+            "authority_classification": "EXTERNALLY_EXECUTED_MANUAL_TRADE",
+            "capital_campaign_id": None,
+            "live_trading_profile_id": str(profile.id),
+            "paper_account_id": str(profile.paper_account_id),
+            "imported_by_actor": actor,
+            "imported_at": datetime.now(timezone.utc).isoformat(),
+            "provider_order_evidence": raw,
+        },
+        audit_correlation_id=uuid.uuid4(),
+        operator_confirmation_id=None,
+    )
+    db.add(new_order)
+    try:
+        await db.flush()
+    except IntegrityError as exc:
+        await db.rollback()
+        raise ConflictError(
+            message="An order with this provider_order_id has already been imported",
+            details={"provider_order_id": provider_order_id},
+        ) from exc
+
+    live_crypto_order_id = new_order.live_crypto_order_id
+
+    # Never computes fill quantities, fees, or LiveAccountingRecord rows here --
+    # hands off immediately to the exact same reconciliation entrypoint the
+    # scheduler and the operator /reconcile route both use, so accounting
+    # arithmetic has exactly one implementation in this codebase.
+    from app.schemas.live_crypto_orders import LiveCryptoOrderReconcileRequest
+    from app.services.live_crypto_orders import LiveCryptoOrderService
+
+    order_service = LiveCryptoOrderService()
+    reconcile_response = await order_service.reconcile(
+        db=db,
+        live_crypto_order_id=live_crypto_order_id,
+        request=LiveCryptoOrderReconcileRequest(operator_identity=actor),
+    )
+
+    await _record_audit(
+        db=db,
+        action="external_trade_reconciled",
+        entity_id=live_crypto_order_id,
+        before_state=None,
+        after_state={
+            "exchange_connection_id": str(connection.exchange_connection_id),
+            "provider_order_id": provider_order_id,
+            "product_id": product_id,
+            "side": side,
+            "authority_classification": "EXTERNALLY_EXECUTED_MANUAL_TRADE",
+            "live_trading_profile_id": str(profile.id),
+            "total_filled_quantity": format(total_filled_quantity, "f"),
+            "total_quote_notional": format(total_quote_notional, "f"),
+            "provider_fill_evidence": [dict(f.raw) if isinstance(f.raw, dict) else {} for f in valid_fills],
+            "resulting_live_crypto_order_id": str(live_crypto_order_id),
+            "resulting_status": reconcile_response.live_crypto_order.status,
+            "reconciliation_status": reconcile_response.reconciliation_status,
+            "accounting_completion_status": reconcile_response.accounting_completion_status,
+        },
+        actor=actor,
+    )
+    await db.commit()
+
+    return ReconcileExternalTradeResponse(
+        live_crypto_order=reconcile_response.live_crypto_order,
+        provider_order_id=provider_order_id,
+        product_id=product_id,
+        side=side,
+        live_trading_profile_id=profile.id,
+        reconciliation_status=reconcile_response.reconciliation_status,
+        accounting_completion_status=reconcile_response.accounting_completion_status,
+        provider_fill_observed=reconcile_response.provider_fill_observed,
     )

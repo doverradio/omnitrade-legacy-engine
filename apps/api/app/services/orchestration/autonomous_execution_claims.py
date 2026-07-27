@@ -25,6 +25,7 @@ from app.models.live_accounting_record import LiveAccountingRecord
 from app.models.live_crypto_order import LiveCryptoOrder
 from app.models.risk_kill_switch import RiskKillSwitch
 from app.services.controlled_proof.service import _ACTIVE_STATES as _CONTROLLED_PROOF_ACTIVE_STATES
+from app.services.live.position_quantity import QUANTITY_BEARING_RECORD_TYPES
 from app.services.orchestration.autonomous_order_preparation import (
     execute_prepared_autonomous_claim,
     prepare_autonomous_claimed_buy,
@@ -315,7 +316,10 @@ async def claim_activated_buy_package(
     net_quantity = await db.scalar(
         select(func.coalesce(func.sum(
             case((LiveAccountingRecord.side == "buy", LiveAccountingRecord.filled_quantity), else_=-LiveAccountingRecord.filled_quantity)
-        ), Decimal("0"))).where(LiveAccountingRecord.capital_campaign_id == runtime.id)
+        ), Decimal("0"))).where(
+            LiveAccountingRecord.capital_campaign_id == runtime.id,
+            LiveAccountingRecord.record_type.in_(QUANTITY_BEARING_RECORD_TYPES),
+        )
     )
     if Decimal(str(net_quantity or 0)) > 0:
         return AutonomousClaimOutcome(None, False, "campaign_position_already_open")

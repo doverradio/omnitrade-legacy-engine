@@ -155,6 +155,38 @@ If no migration exists, explicitly state:
 
 "No Alembic upgrade is required."
 
+
+## Production Alembic Procedure
+
+Production does not use apps/api/.venv.
+
+Canonical production runtime:
+
+- Python: /home/eric/miniconda3/envs/omnitrade311/bin/python3.11
+- API working directory: /home/eric/omnitrade-legacy-engine/apps/api
+- Environment file: /home/eric/omnitrade-legacy-engine/apps/api/.env
+
+Read-only migration check:
+
+cd /home/eric/omnitrade-legacy-engine/apps/api
+PYTHON=/home/eric/miniconda3/envs/omnitrade311/bin/python3.11
+set -a
+source .env
+set +a
+PYTHONPATH=. "$PYTHON" -m alembic -c alembic.ini current
+
+Apply migrations:
+
+cd /home/eric/omnitrade-legacy-engine/apps/api
+PYTHON=/home/eric/miniconda3/envs/omnitrade311/bin/python3.11
+set -a
+source .env
+set +a
+PYTHONPATH=. "$PYTHON" -m alembic -c alembic.ini upgrade head
+
+Always verify the resulting revision after migration.
+Do not assume a .venv path on production.
+
 ## Engineering Style
 
 Prefer:

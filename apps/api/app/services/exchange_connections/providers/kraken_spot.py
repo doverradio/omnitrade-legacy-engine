@@ -261,6 +261,23 @@ def _normalize_intent_product(product_id: str) -> tuple[str, str]:
     )
 
 
+# Inverse of _normalize_intent_product's pair half, restricted to the exact same
+# fixed set of pairs -- deliberately not a general Kraken-pair parser. Used to
+# recover our internal product_id from a pair Kraken itself reported on an order
+# we did not submit (external trade reconciliation), where the caller cannot
+# supply product_id up front.
+_KRAKEN_PAIR_KEY_TO_PRODUCT_ID = {
+    _kraken_pair_key("XBT/USD"): "BTC-USD",
+    _kraken_pair_key("ETH/USD"): "ETH-USD",
+}
+
+
+def product_id_from_kraken_pair(pair: str | None) -> str | None:
+    if not pair:
+        return None
+    return _KRAKEN_PAIR_KEY_TO_PRODUCT_ID.get(_kraken_pair_key(pair))
+
+
 # Kraken Spot REST auth contract:
 # docs.kraken.com/api/docs/guides/spot-rest-auth/
 # API-Sign = base64(HMAC-SHA512(url_path + SHA256(nonce + postdata), base64_decode(secret)))

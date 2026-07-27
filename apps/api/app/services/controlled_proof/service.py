@@ -7,7 +7,7 @@ from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 from typing import Any
 
-from sqlalchemy import case, func, select
+from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -27,6 +27,7 @@ from app.models.paper_account import PaperAccount
 from app.models.strategy import Strategy
 from app.services.asset_commissioning import get_asset_readiness
 from app.services.capital_campaign_domain import get_governing_campaign_definition
+from app.services.live.position_quantity import owned_position_exists as shared_owned_position_exists
 from app.services.mandates.lifecycle import get_governing_authorized_mandate_version
 from app.services.position_lifecycle.source_adapter import load_position_snapshots
 from app.services.risk import (
@@ -128,26 +129,17 @@ async def _resolve_live_trading_profile_id(
 async def _owned_position_exists(
     *, db: AsyncSession, live_trading_profile_id: uuid.UUID, product_id: str,
 ) -> bool:
-    """Bit-for-bit the same query prepare_autonomous_claimed_buy's
-    owned_position_exists check runs (autonomous_order_preparation.py): same
-    accounting records, same signed-sum position calculation, same
-    profile+exact-symbol scope, deliberately no capital_campaign_id filter
-    (a real owned position belongs to the live account, not to whichever
-    internal campaign row happened to be governing when it was opened).
-    This must never diverge from that query -- this module deciding "safe to
-    replace" while that one independently decides "owned position exists"
-    for the same real funds is exactly the production incident this
-    function exists to prevent."""
-    open_quantity = await db.scalar(
-        select(func.coalesce(func.sum(case(
-            (LiveAccountingRecord.side == "buy", LiveAccountingRecord.filled_quantity),
-            else_=-LiveAccountingRecord.filled_quantity,
-        )), Decimal("0"))).where(
-            LiveAccountingRecord.live_trading_profile_id == live_trading_profile_id,
-            LiveAccountingRecord.symbol == product_id,
-        )
+    """Thin wrapper over the single shared, canonical implementation
+    (app.services.live.position_quantity.owned_position_exists) --
+    prepare_autonomous_claimed_buy's owned_position_exists check
+    (autonomous_order_preparation.py) uses the exact same function. Both
+    must always agree: this module deciding "safe to replace" while that
+    one independently decides "owned position exists" for the same real
+    funds is exactly the production incident this function exists to
+    prevent."""
+    return await shared_owned_position_exists(
+        db=db, live_trading_profile_id=live_trading_profile_id, symbol=product_id,
     )
-    return Decimal(str(open_quantity or 0)) > 0
 
 
 async def _live_capital_blocker(*, db: AsyncSession, proof: ControlledProofRun) -> str | None:

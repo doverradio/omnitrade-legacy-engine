@@ -13,6 +13,8 @@ from app.schemas.exchange_connections import (
     ExchangeConnectionListResponse,
     ExchangeConnectionResponse,
     ExchangeReadinessReportResponse,
+    ReconcileExternalTradeRequest,
+    ReconcileExternalTradeResponse,
     RotateExchangeCredentialsRequest,
     SaveExchangeConnectionRequest,
     TestExchangeConnectionRequest,
@@ -23,6 +25,7 @@ from app.services.exchange_connections import (
     disconnect_exchange_connection,
     get_exchange_readiness,
     list_exchange_connections,
+    reconcile_external_trade,
     refresh_exchange_account,
     refresh_exchange_balances,
     refresh_exchange_permissions,
@@ -119,3 +122,15 @@ async def disconnect_connection(
     db: AsyncSession = Depends(get_db),
 ) -> DisconnectExchangeConnectionResponse:
     return await disconnect_exchange_connection(db=db, exchange_connection_id=exchange_connection_id, payload=payload, actor=current_user["id"])
+
+
+@router.post("/{exchange_connection_id}/reconcile-external-trade", response_model=ReconcileExternalTradeResponse)
+async def reconcile_connection_external_trade(
+    exchange_connection_id: uuid.UUID,
+    payload: ReconcileExternalTradeRequest,
+    current_user: dict[str, str] = Depends(get_authorized_operator),
+    db: AsyncSession = Depends(get_db),
+) -> ReconcileExternalTradeResponse:
+    return await reconcile_external_trade(
+        db=db, exchange_connection_id=exchange_connection_id, payload=payload, actor=current_user["id"],
+    )
