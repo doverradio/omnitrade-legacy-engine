@@ -85,6 +85,7 @@ from app.services.orchestration.reconciliation_guard import (
     UNRESOLVED_RECONCILIATION_STATES,
     latest_reconciliation_event_per_order,
 )
+from app.services.orchestration.reconciliation_scheduler import poll_unresolved_live_orders
 from app.services.strategy_outcomes import score_due_strategy_roster_proposal_outcomes
 from app.services.strategy_roster import StrategyRosterRequest, run_strategy_roster_for_candle
 from app.services.strategy_roster.decision_aggregator import AGGREGATE_STRATEGY_SLUG
@@ -1848,6 +1849,26 @@ async def run_orchestration_cycle(
         except Exception:
             await _rollback_active_session(db=db)
             logger.exception("autonomous_execution_claim_sweep_cycle_failed")
+
+    # Automatic reconciliation, run before this cycle's own orchestration
+    # attempt below so a fill discovered here (e.g. a Controlled Proof BUY
+    # that just filled) is already visible to _has_unresolved_reconciliation
+    # and should_propose_controlled_sell within the SAME cycle, not only
+    # starting from the next one. Independent of decision composition, same
+    # defensive hasattr guards as the claim sweep above (many existing
+    # tests call this cycle with a bare fake db).
+    if hasattr(db, "scalars") and hasattr(db, "scalar") and hasattr(db, "commit"):
+        try:
+            poll_outcome = await poll_unresolved_live_orders(db=db)
+            if poll_outcome.candidates_discovered > 0:
+                logger.info(
+                    "live_order_reconciliation_cycle_completed candidates=%s reconciled=%s still_pending=%s failed=%s",
+                    poll_outcome.candidates_discovered, poll_outcome.reconciled,
+                    poll_outcome.still_pending, poll_outcome.failed,
+                )
+        except Exception:
+            await _rollback_active_session(db=db)
+            logger.exception("live_order_reconciliation_cycle_failed")
 
     await _run_autonomous_and_campaign_orchestration_attempt(db=db)
 

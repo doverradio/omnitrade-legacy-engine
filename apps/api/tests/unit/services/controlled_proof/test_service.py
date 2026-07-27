@@ -418,6 +418,49 @@ async def test_create_rejects_when_open_position_already_exists(monkeypatch: pyt
             )
 
 
+# --- BUY-to-position progression: the handoff automatic reconciliation feeds --------
+
+@pytest.mark.asyncio
+async def test_should_propose_controlled_sell_becomes_true_once_buy_is_filled_and_reconciled(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """should_propose_controlled_sell is the exact mechanism automatic
+    reconciliation (reconciliation_scheduler.poll_unresolved_live_orders ->
+    LiveCryptoOrderService.reconcile -> reconcile_live_order_and_fills)
+    feeds: once that produces a real LiveAccountingRecord fill row and the
+    resulting position snapshot shows a nonzero position, the Controlled
+    Proof lifecycle must recognize the BUY as filled and become eligible to
+    propose a SELL -- with no manual reconciliation call required."""
+    async with _real_session() as session:
+        mandate_id = await _seed_fully_ready_scope(session, monkeypatch)
+        proof, _ = await controlled_proof_service.create_controlled_proof(
+            db=session, product_id="BTC-USD", idempotency_key="proof-sell-eligible", expires_in_minutes=30, actor="operator:alice",
+        )
+        proof.package_id = uuid.uuid4()
+        await session.flush()
+
+        # Before any fill exists, the BUY has not been reconciled yet.
+        assert await controlled_proof_service.should_propose_controlled_sell(db=session, proof=proof) is False
+
+        runtime = await session.scalar(select(CapitalCampaign).where(CapitalCampaign.uuid == _CAMPAIGN_ID))
+        profile = await session.scalar(select(LiveTradingProfile).where(LiveTradingProfile.paper_account_id == runtime.paper_account_id))
+        # Exactly the shape reconcile_live_order_and_fills persists for a
+        # genuinely filled BUY -- this test does not re-implement or bypass
+        # that logic, it proves the downstream consumer reacts correctly
+        # once that authoritative record exists.
+        session.add(LiveAccountingRecord(
+            idempotency_key="fill-buy-1", live_trading_profile_id=profile.id, capital_campaign_id=runtime.id,
+            reconciliation_event_id=uuid.uuid4(), source_execution_event_id=uuid.uuid4(),
+            source_execution_event_type="execution_intent_created", record_type="fill_accounting", provider_order_id="kraken-order-1",
+            symbol="BTC-USD", side="buy", filled_quantity=Decimal("0.0001"), fill_price=Decimal("50000"),
+            gross_notional=Decimal("5"), fee_amount=Decimal("0.005"), fee_currency="USD",
+            net_cash_impact=Decimal("-5.005"), provenance={}, recorded_at=datetime.now(timezone.utc),
+        ))
+        await session.flush()
+
+        assert await controlled_proof_service.should_propose_controlled_sell(db=session, proof=proof) is True
+
+
 # --- replace-active: operator-safe supersede of a stalled active proof ---------------
 
 @pytest.mark.asyncio

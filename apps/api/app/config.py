@@ -86,6 +86,25 @@ class Settings(BaseSettings):
         default=None,
         validation_alias="AUTOMATIC_MANDATE_PACKAGE_ACTIVATION_MANDATE_VERSION_ID",
     )
+    # Unlike automatic_mandate_package_activation_enabled/live_crypto_order_
+    # submission_enabled (both gate NEW live capital commitment and default
+    # False), automatic reconciliation only reads provider order state and
+    # records the resulting fills/fees -- it never submits a new order or
+    # risks a duplicate BUY (LiveAccountingRecord's own idempotency_key and
+    # (provider_order_id, provider_fill_id, record_type) unique constraints
+    # make a repeated or concurrent reconciliation attempt for the same
+    # order a safe no-op). Defaulting this off would leave every BUY
+    # permanently stuck at SUBMISSION_PENDING with no automatic path to a
+    # SELL, defeating the entire point of unattended execution -- so this
+    # one defaults on.
+    automatic_live_order_reconciliation_enabled: bool = Field(
+        default=True,
+        validation_alias="AUTOMATIC_LIVE_ORDER_RECONCILIATION_ENABLED",
+    )
+    automatic_live_order_reconciliation_batch_limit: int = Field(
+        default=10,
+        validation_alias="AUTOMATIC_LIVE_ORDER_RECONCILIATION_BATCH_LIMIT",
+    )
     default_production_crypto_paper_account_id: UUID | None = Field(
         default=None,
         validation_alias="DEFAULT_PRODUCTION_CRYPTO_PAPER_ACCOUNT_ID",

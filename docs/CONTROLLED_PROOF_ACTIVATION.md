@@ -179,15 +179,44 @@ deliberately excluded from the sweep, since re-preparing either would be an
 unsafe blind retry after a provider call may already have been made; the
 correct recovery there is `reconcile()` against the real order.
 
-**Known remaining gap (not fixed by this change, tracked separately):**
-nothing in the codebase currently triggers `reconcile()` automatically.
-`reconcile_commissioned_buy_ownership` / `LiveCryptoOrderService.reconcile()`
-are only invoked via an explicit operator CLI command or the `/reconcile`
-API route today -- there is no scheduled poller. Until one exists (or an
-operator manually reconciles), a claim that reaches `SUBMISSION_PENDING`
-stays there, `LiveAccountingRecord` rows for that fill are never created,
-and `should_propose_controlled_sell` never sees a "BUY filled" signal --
-the SELL side of the Controlled Proof lifecycle will not begin on its own.
+## Automatic reconciliation (no operator action required)
+
+**Reconciliation is now automatic.** `app/services/orchestration/reconciliation_scheduler.py`'s
+`poll_unresolved_live_orders` runs once per orchestration cycle (see
+`continuous_pipeline_worker.run_orchestration_cycle`, right before that
+cycle's own orchestration attempt -- so a fill discovered here is already
+visible to `should_propose_controlled_sell` within the same cycle), reusing
+the identical `LiveCryptoOrderService.reconcile()` service the operator CLI
+and `/reconcile` HTTP route already used -- no provider lookup, fill
+accounting, fee calculation, or ledger logic is duplicated.
+
+- **Candidate discovery**: every `LiveCryptoOrder` with `submitted_at IS NOT NULL`
+  whose `status` is not in `{FILLED, CANCELLED, REJECTED, EXPIRED}`
+  (exclude-based, not an allow-list -- an unrecognized status defaults to
+  "needs reconciliation," never silently skipped), oldest first, bounded by
+  `AUTOMATIC_LIVE_ORDER_RECONCILIATION_BATCH_LIMIT` (default 10) to cap
+  provider requests per cycle. Row-locked with `SKIP LOCKED` so a
+  concurrent poller never re-attempts an order another attempt already has
+  in flight -- correctness itself is independently guaranteed regardless,
+  by `LiveAccountingRecord`'s own `idempotency_key` and
+  `(provider_order_id, provider_fill_id, record_type)` unique constraints.
+- **Fail-closed per candidate**: each order is reconciled independently;
+  one candidate's failure (provider outage, missing credentials, ambiguous
+  response, accounting mismatch -- `reconcile_live_order_and_fills` already
+  fails closed on all of these) never aborts the rest of the batch and
+  never fabricates or forces an outcome.
+- **Ordinary autonomous execution and Controlled Proof execution share this
+  one path** -- candidate discovery has no notion of Controlled Proof at
+  all, only `LiveCryptoOrder`'s own status.
+- **Toggle**: `AUTOMATIC_LIVE_ORDER_RECONCILIATION_ENABLED` (default `true`
+  -- unlike the live-capital-committing flags above, reconciliation only
+  reads provider order state and records the resulting fills/fees; it never
+  submits a new order or risks a duplicate BUY, so defaulting it off would
+  leave every BUY permanently stuck at `SUBMISSION_PENDING` with no
+  automatic path to a SELL).
+- **Manual reconciliation remains available** as an operator recovery tool
+  (CLI command, `/reconcile` route) -- unchanged, for out-of-band recovery
+  or immediate manual intervention.
 
 ## Exactly-once provider submission
 
@@ -266,7 +295,12 @@ autonomous_execution_claimed
 autonomous_execution_failed_pre_provider  -- absent on the golden path
 provider_submission_started
 provider_submission_succeeded
-controlled_proof_buy_filled / fill detection via reconciliation
+live_order_reconciliation_poll_started
+live_order_reconciliation_candidates_discovered
+live_order_reconciliation_attempt_started
+live_order_reconciliation_attempt_resolved status=FILLED
+reconciliation_completed reconciliation_status=reconciled provider_fill_observed=True
+autonomous_execution_claim_scope_released new_claim_status=BUY_RECONCILED
 controlled_proof_position_opened
 controlled_proof_exit_evaluation
 controlled_proof_sell_submitted

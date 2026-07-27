@@ -3203,6 +3203,82 @@ async def test_worker_isolates_stale_claim_recovery_sweep_failure(monkeypatch: p
 
 
 @pytest.mark.asyncio
+async def test_worker_invokes_automatic_reconciliation_poll_every_cycle(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Wiring proof: automatic reconciliation runs every cycle, before this
+    cycle's own orchestration attempt -- so a fill discovered here is
+    already visible to _has_unresolved_reconciliation and
+    should_propose_controlled_sell within the same cycle. Both Controlled
+    Proof and ordinary autonomous execution share this one call site --
+    poll_unresolved_live_orders itself has no Controlled-Proof-specific
+    branch."""
+    db = _ResumeCapableDB()
+    poll_calls = []
+
+    async def _poll(*, db):
+        poll_calls.append(db)
+        from app.services.orchestration.reconciliation_scheduler import ReconciliationPollOutcome
+        return ReconciliationPollOutcome(candidates_discovered=1, reconciled=1, still_pending=0, failed=0)
+
+    import app.services.orchestration.continuous_pipeline_worker as worker_module
+
+    monkeypatch.setattr(worker_module, "run_ingestion_cycle", _fake_ingestion_cycle)
+    monkeypatch.setitem(worker_module.venue_commissioning_service, "resume_runs", _async_return(0))
+    monkeypatch.setattr(worker_module, "_load_active_assets", _async_return([]))
+    monkeypatch.setattr(worker_module, "_load_active_strategies", _async_return([]))
+    monkeypatch.setattr(
+        worker_module,
+        "run_deterministic_research_cycle_if_due",
+        _async_return(
+            SimpleNamespace(
+                started=False, reason="not_due", campaign_id=None, candidates_generated=0,
+                candidates_evaluated=0, descendants_generated=0, champion=None,
+            )
+        ),
+    )
+    monkeypatch.setattr(worker_module, "capture_system_intelligence_snapshot_if_due", _async_return(None))
+    monkeypatch.setattr(worker_module, "sweep_stale_autonomous_execution_claims", _async_return(0))
+    monkeypatch.setattr(worker_module, "poll_unresolved_live_orders", _poll)
+
+    await run_orchestration_cycle(db=db, client=object(), config=_config())
+
+    assert poll_calls == [db]
+
+
+@pytest.mark.asyncio
+async def test_worker_isolates_automatic_reconciliation_poll_failure(monkeypatch: pytest.MonkeyPatch) -> None:
+    db = _ResumeCapableDB()
+
+    async def _poll_fail(*, db):
+        raise RuntimeError("reconciliation poll failed")
+
+    import app.services.orchestration.continuous_pipeline_worker as worker_module
+
+    monkeypatch.setattr(worker_module, "run_ingestion_cycle", _fake_ingestion_cycle)
+    monkeypatch.setitem(worker_module.venue_commissioning_service, "resume_runs", _async_return(0))
+    monkeypatch.setattr(worker_module, "_load_active_assets", _async_return([]))
+    monkeypatch.setattr(worker_module, "_load_active_strategies", _async_return([]))
+    monkeypatch.setattr(
+        worker_module,
+        "run_deterministic_research_cycle_if_due",
+        _async_return(
+            SimpleNamespace(
+                started=False, reason="not_due", campaign_id=None, candidates_generated=0,
+                candidates_evaluated=0, descendants_generated=0, champion=None,
+            )
+        ),
+    )
+    monkeypatch.setattr(worker_module, "capture_system_intelligence_snapshot_if_due", _async_return(None))
+    monkeypatch.setattr(worker_module, "sweep_stale_autonomous_execution_claims", _async_return(0))
+    monkeypatch.setattr(worker_module, "poll_unresolved_live_orders", _poll_fail)
+
+    stats = await run_orchestration_cycle(db=db, client=object(), config=_config())
+
+    # A reconciliation poll failure must never abort the rest of the cycle.
+    assert stats.ingestion_assets_ok == 1
+    assert db.rollbacks >= 1
+
+
+@pytest.mark.asyncio
 async def test_worker_isolates_commissioning_resume_failure(monkeypatch: pytest.MonkeyPatch) -> None:
     db = _FakeDB()
 
