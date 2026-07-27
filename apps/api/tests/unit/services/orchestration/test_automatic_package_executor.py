@@ -21,6 +21,14 @@ class _Rows:
 
 
 class _Db:
+    """This lightweight fake never configures a real Controlled-Proof
+    linkage, so db.get() always resolves to None -- _authorize_controlled_
+    proof_activation_override's own "package_missing" fail-closed path
+    fires immediately, preserving every existing (pre-override) test's
+    behavior unchanged. Controlled-Proof-override-specific behavior itself
+    is covered separately, against a real session, in
+    test_automatic_package_executor_controlled_proof_override.py."""
+
     def __init__(self, rows):
         self.rows = rows
         self.statements = []
@@ -28,6 +36,9 @@ class _Db:
     async def execute(self, statement):
         self.statements.append(statement)
         return _Rows(self.rows)
+
+    async def get(self, model, pk):
+        return None
 
 
 def _package(state: str = "READY") -> SimpleNamespace:

@@ -54,6 +54,14 @@ Supported `action_type`:
   }
   ```
 
+  A package created under this proof progresses through mandate
+  authorization, dry-run, and activation via a narrow Controlled-Proof
+  activation override even when the campaign-wide
+  `AUTOMATIC_MANDATE_PACKAGE_ACTIVATION_ENABLED` switch stays off in
+  production -- see `docs/CONTROLLED_PROOF_ACTIVATION.md` for the full
+  fail-closed invariant list, exactly-once submission guarantees, and the
+  BUY-to-SELL-to-verified-profit lifecycle.
+
 Status lifecycle: `REQUESTED` -> `ACCEPTED` -> `IN_PROGRESS` -> `SUCCEEDED`,
 with `BLOCKED` / `FAILED` / `CANCELLED` / `EXPIRED` as additional terminal
 outcomes. For RUN_CONTROLLED_PROOF, status is a live projection of the

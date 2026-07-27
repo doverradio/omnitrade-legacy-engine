@@ -3,12 +3,14 @@ from __future__ import annotations
 import logging
 import uuid
 from dataclasses import dataclass
+from datetime import datetime, timezone
 
-from sqlalchemy import select
+from sqlalchemy import or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import get_settings
 from app.models.canonical_preview_package import CanonicalPreviewPackage
+from app.models.controlled_proof_run import ControlledProofRun
 from app.services.canonical_preview_package import (
     CanonicalPreviewPackageActivationRequest,
     CanonicalPreviewPackageDryRunRequest,
@@ -18,6 +20,7 @@ from app.services.canonical_preview_package import (
     authorize_canonical_preview_package_under_mandate,
     run_dry_run_for_canonical_preview_package,
 )
+from app.services.controlled_proof.service import _ACTIVE_STATES as _CONTROLLED_PROOF_ACTIVE_STATES
 
 logger = logging.getLogger(__name__)
 
@@ -93,18 +96,151 @@ def _outcome(
     )
 
 
+async def _authorize_controlled_proof_activation_override(
+    *, db: AsyncSession, request: AutomaticPackageExecutionRequest,
+) -> ControlledProofRun | None:
+    """When the global automatic_mandate_package_activation_enabled feature
+    is off, a package created under an explicit, currently-active
+    Controlled Proof may still receive a narrow, package-scoped activation
+    override -- the Controlled Proof itself (an operator-issued,
+    fully-audited RUN_CONTROLLED_PROOF request) is its own explicit
+    authority to attempt exactly one BUY-to-SELL lifecycle, distinct from
+    (and much narrower than) permanently enabling unattended automatic
+    activation for every package the campaign ever produces. Every
+    invariant below is re-verified fresh against the DB on every call --
+    never cached, never assumed from an earlier check in this same
+    request -- and returns the authorizing (row-locked) ControlledProofRun
+    only when all of them hold. Returns None, with one precise logged
+    reason, otherwise; callers must treat that exactly like "the global
+    feature is disabled", never as a softer outcome. Ordinary automatic
+    packages (no Controlled Proof linkage at all) always resolve to None
+    here and remain governed solely by the existing global feature flag,
+    unchanged."""
+    logger.info(
+        "controlled_proof_activation_override_evaluated campaign_id=%s campaign_version=%s decision_record_id=%s package_id=%s",
+        request.campaign_id, request.campaign_version, request.decision_record_id, request.package_id,
+    )
+    if request.package_id is None:
+        logger.info(
+            "controlled_proof_activation_override_blocked campaign_id=%s campaign_version=%s decision_record_id=%s package_id=None controlled_proof_id=None reason=no_package_identity",
+            request.campaign_id, request.campaign_version, request.decision_record_id,
+        )
+        return None
+    package = await db.get(CanonicalPreviewPackage, request.package_id)
+    if package is None:
+        logger.info(
+            "controlled_proof_activation_override_blocked campaign_id=%s campaign_version=%s decision_record_id=%s package_id=%s controlled_proof_id=None reason=package_missing",
+            request.campaign_id, request.campaign_version, request.decision_record_id, request.package_id,
+        )
+        return None
+
+    # Locked, not just read: a concurrent activation attempt for the same
+    # proof (e.g. the API's immediate-dispatch task racing this cycle's
+    # orchestration poll) must serialize here rather than both observing
+    # the same not-yet-terminal proof as eligible.
+    proof = await db.scalar(
+        select(ControlledProofRun)
+        .where(or_(
+            ControlledProofRun.package_id == package.package_id,
+            ControlledProofRun.sell_package_id == package.package_id,
+        ))
+        .with_for_update()
+        .limit(1)
+    )
+    if proof is None:
+        logger.info(
+            "controlled_proof_activation_override_blocked campaign_id=%s campaign_version=%s decision_record_id=%s package_id=%s controlled_proof_id=None reason=no_controlled_proof_linkage",
+            request.campaign_id, request.campaign_version, request.decision_record_id, package.package_id,
+        )
+        return None
+
+    def _blocked(reason: str) -> None:
+        logger.info(
+            "controlled_proof_activation_override_blocked campaign_id=%s campaign_version=%s decision_record_id=%s package_id=%s controlled_proof_id=%s reason=%s",
+            request.campaign_id, request.campaign_version, request.decision_record_id, package.package_id, proof.proof_id, reason,
+        )
+        return None
+
+    now = datetime.now(timezone.utc)
+    # Fail closed if the proof is expired, cancelled, blocked, failed, or
+    # otherwise terminal -- _ACTIVE_STATES is the exact same set
+    # create_controlled_proof's own "already active" guard and the
+    # database's uq_controlled_proof_runs_single_active partial index are
+    # built on, never a second, possibly-divergent definition of "active".
+    if proof.status not in _CONTROLLED_PROOF_ACTIVE_STATES:
+        return _blocked("controlled_proof_not_active")
+    # Postgres's TIMESTAMPTZ always round-trips timezone-aware; sqlite (used
+    # only by this module's own test double) has no native tz-aware type and
+    # can hand back a naive value after a flush-triggered reload -- normalize
+    # rather than let that test-environment quirk raise TypeError here.
+    expires_at = proof.expires_at if proof.expires_at.tzinfo is not None else proof.expires_at.replace(tzinfo=timezone.utc)
+    if expires_at <= now:
+        return _blocked("controlled_proof_expired")
+    if package.product != proof.product_id:
+        return _blocked("controlled_proof_product_mismatch")
+    if package.campaign_id != proof.campaign_id or package.campaign_version != proof.campaign_version:
+        return _blocked("controlled_proof_campaign_scope_mismatch")
+    if (
+        package.decision_record_id is None
+        or package.risk_event_id is None
+        or package.mandate_id is None
+        or package.mandate_version_id is None
+        or package.mandate_evaluation_id is None
+    ):
+        return _blocked("controlled_proof_evidence_incomplete")
+    if package.risk_approved_amount > proof.max_notional_usd:
+        return _blocked("controlled_proof_notional_exceeds_maximum")
+    if package.provider != proof.provider or package.environment != proof.environment:
+        return _blocked("controlled_proof_provider_environment_mismatch")
+
+    # Duplicate-submission guard for a package this proof has not yet
+    # activated: if the proof already shows live-capital evidence on the
+    # matching side, this is not a legitimate first activation attempt --
+    # an already-ACTIVATED package instead takes the existing idempotent-
+    # replay branch below (package.package_state == "ACTIVATED"), which
+    # re-validates authority rather than re-running this check.
+    if package.package_state != "ACTIVATED":
+        is_buy_package = proof.package_id == package.package_id
+        is_sell_package = proof.sell_package_id == package.package_id
+        if is_buy_package and (proof.buy_live_crypto_order_id is not None or proof.position_id is not None):
+            return _blocked("controlled_proof_live_capital_already_exists")
+        if is_sell_package and proof.sell_live_crypto_order_id is not None:
+            return _blocked("controlled_proof_live_capital_already_exists")
+
+    logger.info(
+        "controlled_proof_activation_override_allowed campaign_id=%s campaign_version=%s decision_record_id=%s package_id=%s controlled_proof_id=%s product=%s provider=%s environment=%s",
+        request.campaign_id, request.campaign_version, request.decision_record_id, package.package_id,
+        proof.proof_id, proof.product_id, proof.provider, proof.environment,
+    )
+    return proof
+
+
 async def execute_automatic_ready_package_through_activation(
     *,
     db: AsyncSession,
     request: AutomaticPackageExecutionRequest,
 ) -> AutomaticPackageExecutionOutcome:
     settings = get_settings()
+    controlled_proof_authority: ControlledProofRun | None = None
     if not settings.automatic_mandate_package_activation_enabled:
-        logger.info(
-            "automatic_package_progression_skipped campaign_id=%s campaign_version=%s decision_record_id=%s package_id=%s reason=feature_disabled failed_closed=False",
-            request.campaign_id, request.campaign_version, request.decision_record_id, request.package_id,
-        )
-        return _outcome(request=request, package=None, reason="automatic_mandate_package_activation_disabled")
+        try:
+            controlled_proof_authority = await _authorize_controlled_proof_activation_override(db=db, request=request)
+        except Exception:
+            # An unexpected failure while resolving Controlled Proof
+            # authority must fail closed exactly like "the global feature
+            # is disabled" -- never surface as a different, more permissive
+            # outcome, and never as an unhandled crash either.
+            logger.exception(
+                "controlled_proof_activation_override_evaluation_failed campaign_id=%s campaign_version=%s decision_record_id=%s package_id=%s",
+                request.campaign_id, request.campaign_version, request.decision_record_id, request.package_id,
+            )
+            controlled_proof_authority = None
+        if controlled_proof_authority is None:
+            logger.info(
+                "automatic_package_progression_skipped campaign_id=%s campaign_version=%s decision_record_id=%s package_id=%s reason=feature_disabled failed_closed=False",
+                request.campaign_id, request.campaign_version, request.decision_record_id, request.package_id,
+            )
+            return _outcome(request=request, package=None, reason="automatic_mandate_package_activation_disabled")
 
     scope_values = {
         "campaign_id": getattr(settings, "automatic_mandate_package_activation_campaign_id", None),
