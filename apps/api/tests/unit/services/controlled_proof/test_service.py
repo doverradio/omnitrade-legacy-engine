@@ -298,6 +298,45 @@ async def test_second_concurrent_request_is_excluded_while_one_is_active(monkeyp
 
 
 @pytest.mark.asyncio
+async def test_expired_active_proof_no_longer_permanently_blocks_new_submission(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Regression: create_controlled_proof's own _reap_expired call must
+    durably commit an expired active proof's EXPIRED transition immediately
+    -- not merely flush it and leave it dependent on this request's own
+    eventual success -- otherwise a later, unrelated failure in the same
+    request rolls back the whole transaction via get_db()'s exception path,
+    silently undoing the reap every time, so the same stale proof keeps
+    blocking every future submission with "Another controlled proof is
+    already active" forever."""
+    async with _real_session() as session:
+        await _seed_fully_ready_scope(session, monkeypatch)
+        proof = await controlled_proof_service.create_controlled_proof(
+            db=session, product_id="BTC-USD", idempotency_key="proof-stale", expires_in_minutes=30, actor="operator:alice",
+        )
+        proof.expires_at = datetime.now(timezone.utc) - timedelta(minutes=1)
+        await session.commit()
+
+        # Exactly what create_controlled_proof itself now does at its own
+        # top: reap, then commit immediately, before the "already active"
+        # check (the exact check that raises "Another controlled proof is
+        # already active") ever runs.
+        await controlled_proof_service._reap_expired(db=session)
+        await session.commit()
+
+        refreshed_stale = (
+            await session.execute(select(ControlledProofRun).where(ControlledProofRun.proof_id == proof.proof_id))
+        ).scalar_one()
+        assert refreshed_stale.status == "EXPIRED"
+
+        # The exact query create_controlled_proof's "already active" guard
+        # runs -- must now find nothing, proving a fresh submission would no
+        # longer be blocked.
+        existing_active = await session.scalar(
+            select(ControlledProofRun).where(ControlledProofRun.status.in_(controlled_proof_service._ACTIVE_STATES))
+        )
+        assert existing_active is None
+
+
+@pytest.mark.asyncio
 async def test_create_rejects_unauthorized_product_scope(monkeypatch: pytest.MonkeyPatch) -> None:
     async with _real_session() as session:
         await _seed_fully_ready_scope(session, monkeypatch)

@@ -111,7 +111,20 @@ async def create_controlled_proof(
     if not idempotency_key:
         raise InvalidRequestError(message="idempotency_key is required", details={})
 
+    # Committed immediately, independent of whatever this call does next --
+    # otherwise a later failure in this same request (any InvalidRequestError
+    # below, including "already active" itself) propagates up through
+    # get_db()'s exception path and rolls back the whole transaction,
+    # silently undoing this reap's in-memory EXPIRED transition every time,
+    # permanently: the row is correctly identified and flipped on every
+    # attempt, but never durably persisted, so it blocks every subsequent
+    # attempt in exactly the same way, forever. This commit is scoped only
+    # to this call site -- claim_next_controlled_proof_for_scope and
+    # cancel_controlled_proof are untouched, since cancel already holds a
+    # row-level lock before reaping and an early commit there would release
+    # it prematurely.
     await _reap_expired(db=db)
+    await db.commit()
 
     existing = await db.scalar(
         select(ControlledProofRun).where(ControlledProofRun.idempotency_key == idempotency_key)
