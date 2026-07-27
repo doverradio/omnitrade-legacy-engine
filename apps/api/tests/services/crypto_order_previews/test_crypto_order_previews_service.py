@@ -193,6 +193,7 @@ async def test_create_buy_preview_success(monkeypatch: pytest.MonkeyPatch) -> No
     monkeypatch.setattr(service, "get_decrypted_credentials_for_connection", lambda _connection: {"api_key": "key", "api_secret": "secret", "passphrase": "pass"})
     monkeypatch.setattr(service, "get_exchange_provider", lambda _provider: _Provider())
 
+    authoritative_paper_account_id = uuid.uuid4()
     response = await service.create_crypto_order_preview(
         db=db,
         request=service.CryptoOrderPreviewCreateRequest(
@@ -204,6 +205,7 @@ async def test_create_buy_preview_success(monkeypatch: pytest.MonkeyPatch) -> No
             quote_size=Decimal("5.00"),
             requested_amount_currency="USD",
             generated_by="operator",
+            paper_account_id=authoritative_paper_account_id,
         ),
     )
 
@@ -218,6 +220,12 @@ async def test_create_buy_preview_success(monkeypatch: pytest.MonkeyPatch) -> No
     decision = next(item for item in db.added if isinstance(item, DecisionRecord))
     snapshot = next(item for item in db.added if isinstance(item, DecisionSnapshot))
     risk_event = next(item for item in db.added if isinstance(item, RiskEvent))
+    # Regression: RiskEvent.paper_account_id must match the authoritative
+    # identity supplied by the caller (the package/execution pipeline's own
+    # paper_account_id) -- previously hardcoded to None, which made
+    # prepare_autonomous_claimed_buy's risk.paper_account_id ==
+    # claim.account_id check unsatisfiable for every autonomous BUY.
+    assert risk_event.paper_account_id == authoritative_paper_account_id
     risk_request = captured["request"]
     assert risk_request.global_kill_switch_state_observed is True
     assert risk_request.global_kill_switch_engaged_state is False

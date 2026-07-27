@@ -782,7 +782,7 @@ async def create_crypto_order_preview(
         risk_result = await persist_risk_decision(
             db=db,
             request=RiskDecisionPersistenceRequest(
-                paper_account_id=None,
+                paper_account_id=request.paper_account_id,
                 signal_id=None,
                 actor=actor,
                 evaluation_result=risk_eval,
@@ -839,7 +839,7 @@ async def create_crypto_order_preview(
     risk_result = await persist_risk_decision(
         db=db,
         request=RiskDecisionPersistenceRequest(
-            paper_account_id=None,
+            paper_account_id=request.paper_account_id,
             signal_id=None,
             actor=actor,
             evaluation_result=risk_eval,

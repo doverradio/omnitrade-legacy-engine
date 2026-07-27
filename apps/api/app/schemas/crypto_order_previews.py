@@ -43,6 +43,13 @@ class CryptoOrderPreviewCreateRequest(BaseModel):
     strategy_name: str | None = None
     generated_by: CryptoOrderPreviewGeneratedBy = "operator"
     client_request_id: str | None = None
+    # Authoritative paper-account identity for the resulting RiskEvent, when
+    # the caller already knows it (e.g. the canonical package pipeline,
+    # which must persist a RiskEvent.paper_account_id matching the same
+    # account claim_activated_buy_package/prepare_autonomous_claimed_buy
+    # later validate against). None preserves the prior standalone/manual
+    # preview behavior unchanged.
+    paper_account_id: UUID | None = None
 
 
 class CryptoOrderPreviewRefreshRequest(BaseModel):

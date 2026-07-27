@@ -1440,6 +1440,7 @@ async def test_create_forced_commissioning_preview_reuses_create_crypto_order_pr
         captured["strategy_id"] = request.strategy_id
         captured["client_request_id"] = request.client_request_id
         captured["actor"] = actor
+        captured["paper_account_id"] = request.paper_account_id
         return SimpleNamespace(crypto_order_preview_id=preview_id)
 
     monkeypatch.setattr(
@@ -1474,6 +1475,13 @@ async def test_create_forced_commissioning_preview_reuses_create_crypto_order_pr
     assert str(captured["client_request_id"]).startswith("canonical-forced-preview:")
     assert resolved.crypto_order_preview_id == preview_id
     assert preview.parameter_set_id == parameter_set.id
+    # Regression: the preview pipeline's RiskEvent must be persisted against
+    # the SAME paper_account_id the package/claim pipeline uses -- not an
+    # independently-resolved (or previously, hardcoded-None) identity --
+    # otherwise prepare_autonomous_claimed_buy's genuine, unweakened
+    # risk.paper_account_id == claim.account_id check can never pass.
+    assert captured["paper_account_id"] == request.paper_account_id
+    assert captured["paper_account_id"] == profile.paper_account_id
 
 
 @pytest.mark.asyncio

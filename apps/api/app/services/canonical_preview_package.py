@@ -885,6 +885,11 @@ async def _create_crypto_order_preview_for_package(
             strategy_name=strategy.slug,
             generated_by="system_recommendation",
             client_request_id=f"canonical-forced-preview:{request.idempotency_key}",
+            # Authoritative identity: must match package.paper_account_id /
+            # claim.account_id exactly, so prepare_autonomous_claimed_buy's
+            # risk.paper_account_id == claim.account_id check (a genuine,
+            # unweakened fail-closed guarantee) is actually satisfiable.
+            paper_account_id=request.paper_account_id,
         ),
         actor=request.actor,
     )
