@@ -34,6 +34,7 @@ from app.schemas.capital_campaign_domain import (
 )
 from app.schemas.live_crypto_orders import LiveCryptoOrderSubmitRequest
 from app.schemas.live_crypto_orders import LiveCryptoOrderReconcileRequest
+from app.models.live_crypto_order import LiveCryptoOrder
 from app.services.capital_campaign_domain.commissioned_readiness_preview import (
     assess_commissioned_campaign_readiness,
     generate_commissioned_campaign_preview,
@@ -404,7 +405,10 @@ async def _create_commissioned_decision_record(
         portfolio_exposure=None,
         parameter_set_version="commissioned_seed_campaign",
         strategy_version="operator_commissioned@1",
-        ai_model_version=None,
+        # No AI model participates in canonical commissioned execution, but
+        # DecisionSnapshot's immutable contract requires an explicit version
+        # string. Persist truthful non-participation rather than SQL NULL.
+        ai_model_version="not_applicable",
         decision_engine_version=_DECISION_ENGINE_VERSION,
         configuration_version="commissioned_seed_campaign_task5",
     )
@@ -893,7 +897,13 @@ async def execute_commissioned_entry(
                 db=db,
                 request=RiskDecisionPersistenceRequest(
                     paper_account_id=request.paper_account_id,
-                    signal_id=request.risk_signal_id,
+                    # Canonical package execution is sourced by its persisted
+                    # preview/decision/package evidence, not a Signal row.
+                    # risk_signal_id remains a deterministic evaluation
+                    # correlation UUID, but must not be written into the
+                    # risk_events.related_signal_id foreign key unless this
+                    # is the legacy signal-backed path.
+                    signal_id=None if request.canonical_package_authorized else request.risk_signal_id,
                     actor=request.actor,
                     evaluation_result=risk_result,
                 ),
@@ -940,6 +950,23 @@ async def execute_commissioned_entry(
                 risk_action=risk_result.action.value,
                 risk_event_id=persisted_risk.risk_event_id,
             )
+
+            # The dry-run order predates this final execution-time risk
+            # evaluation. Bind its persisted submission evidence before the
+            # shared LiveCryptoOrderService revalidates LEVEL_2 authority;
+            # otherwise that service truthfully sees NOT_EVALUATED and falls
+            # back to manual confirmation despite this approved canonical
+            # execution. This is evidence propagation, not an authorization
+            # bypass: submit() independently re-evaluates the mandate.
+            live_order = await db.get(LiveCryptoOrder, request.live_crypto_order_id)
+            if live_order is None:
+                raise InvalidRequestError(
+                    message="Canonical live order evidence is unavailable",
+                    details={"blocker": "canonical_live_order_missing"},
+                )
+            live_order_evidence = dict(live_order.safe_provider_response or {})
+            live_order_evidence["execution_risk_verdict"] = risk_result.action.value
+            live_order.safe_provider_response = live_order_evidence
 
             definition_after_pending, _runtime_after_pending = await _load_definition_and_runtime_for_update(
                 db=db,

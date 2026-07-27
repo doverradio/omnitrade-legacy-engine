@@ -13,10 +13,11 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.models.audit_log import AuditLog
 from app.models.autonomous_execution_claim import AutonomousExecutionClaim
+from app.models.canonical_proving_activation import CanonicalProvingActivation
 from app.services.orchestration import autonomous_execution_claims as subject
 from tests.support.real_sqlite_session import real_sqlite_session
 
-_ALL_TABLES = [AutonomousExecutionClaim.__table__, AuditLog.__table__]
+_ALL_TABLES = [CanonicalProvingActivation.__table__, AutonomousExecutionClaim.__table__, AuditLog.__table__]
 
 
 @asynccontextmanager

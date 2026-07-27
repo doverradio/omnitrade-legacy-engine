@@ -118,7 +118,11 @@ async def _validate_autonomous_one_shot_submission(
         or activation.activation_state != "ACTIVE" or activation.activated_at > now or activation.expires_at <= now
     ):
         raise PermissionError("autonomous one-shot activation inactive")
-    if package.package_state != "ACTIVATED" or package.side != "BUY" or package.authorization_source != "MANDATE":
+    if (
+        package.package_state != "ACTIVATED"
+        or package.side not in {"BUY", "SELL"}
+        or package.authorization_source != "MANDATE"
+    ):
         raise PermissionError("autonomous one-shot package ineligible")
     if (
         claim.campaign_id, claim.campaign_version, claim.mandate_id, claim.mandate_version_id,
@@ -129,7 +133,11 @@ async def _validate_autonomous_one_shot_submission(
         live_order.provider, live_order.environment, live_order.product_id,
     ):
         raise PermissionError("autonomous one-shot scope mismatch")
-    if live_order.side != "BUY" or _decimal(live_order.requested_quote_size) > _decimal(package.risk_approved_amount):
+    if (
+        live_order.side != package.side
+        or claim.side != package.side
+        or _decimal(live_order.requested_quote_size) > _decimal(package.risk_approved_amount)
+    ):
         raise PermissionError("autonomous one-shot notional exceeded")
     if _decimal(live_order.requested_quote_size) > _decimal(activation.max_order_amount):
         raise PermissionError("autonomous one-shot activation cap exceeded")
@@ -490,9 +498,12 @@ def _require_fresh_timestamp(*, label: str, observed_at: datetime | None, now: d
     if observed_at is None:
         raise PermissionError(f"{label} timestamp missing")
     observed_utc = observed_at.astimezone(timezone.utc)
-    if observed_utc > now:
+    # Database and API clocks are independently disciplined. Reject material
+    # future evidence, but do not fail a canonical submission for sub-second
+    # host skew (observed with a real PostgreSQL boundary).
+    if (observed_utc - now).total_seconds() > 1:
         raise PermissionError(f"{label} timestamp is in the future")
-    age_seconds = int((now - observed_utc).total_seconds())
+    age_seconds = max(0, int((now - observed_utc).total_seconds()))
     if age_seconds >= max_age_seconds:
         raise PermissionError(f"{label} evidence is stale")
     return age_seconds
@@ -2139,6 +2150,14 @@ class LiveCryptoOrderService:
             raise LookupError("linked preview not found")
 
         connection = await _load_exchange_connection(db=db, exchange_connection_id=live_order.exchange_connection_id)
+        pre_submit_usd_balance = next(
+            (
+                _decimal(item.get("available", item.get("balance", "0")))
+                for item in (connection.balances or [])
+                if str(item.get("currency") or item.get("asset") or "").upper() in {"USD", "ZUSD"}
+            ),
+            None,
+        )
         if autonomous_prepared:
             binding = live_order.safe_provider_response.get("commissioned_preview_identity_binding")
             profile_id = None if not isinstance(binding, dict) else binding.get("profile_id")
@@ -2490,6 +2509,13 @@ class LiveCryptoOrderService:
             "create_order_success": success,
             "create_order_responded": True,
             "execution_risk_verdict": risk_action.value,
+            # Reconciliation compares the provider-refreshed post-trade
+            # balance to this immutable pre-submit observation. Without it,
+            # every otherwise-successful canonical order remains unresolved
+            # forever with balance_mismatch_state=missing.
+            "usd_available_before_submit": (
+                None if pre_submit_usd_balance is None else format(pre_submit_usd_balance, "f")
+            ),
         }
         if success and provider_order_id is not None:
             live_order.status = "ACKNOWLEDGED"

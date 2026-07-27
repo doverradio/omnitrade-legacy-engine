@@ -390,7 +390,7 @@ async def test_dry_run_blocks_on_missing_revoked_suspended_or_expired_approval(
         ("stale_readiness", timedelta(seconds=1), timedelta(seconds=60), timedelta(seconds=1), timedelta(seconds=1), timedelta(seconds=1), "readiness evidence is stale"),
         ("stale_balance", timedelta(seconds=1), timedelta(seconds=1), timedelta(seconds=60), timedelta(seconds=1), timedelta(seconds=1), "balance evidence is stale"),
         ("missing_evidence_timestamp", timedelta(seconds=1), timedelta(seconds=1), timedelta(seconds=1), timedelta(seconds=1), timedelta(seconds=1), "preview timestamp missing"),
-        ("future_evidence_timestamp", timedelta(seconds=-1), timedelta(seconds=1), timedelta(seconds=1), timedelta(seconds=1), timedelta(seconds=1), "preview timestamp is in the future"),
+        ("future_evidence_timestamp", timedelta(seconds=-2), timedelta(seconds=1), timedelta(seconds=1), timedelta(seconds=1), timedelta(seconds=1), "preview timestamp is in the future"),
     ],
     ids=["stale_preview", "stale_readiness", "stale_balance", "missing_timestamp", "future_timestamp"],
 )

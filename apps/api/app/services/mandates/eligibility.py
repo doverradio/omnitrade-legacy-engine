@@ -19,6 +19,11 @@ def evaluate_mandate_eligibility(
     version: MandateVersionModel,
     request: MandateEligibilityInput,
 ) -> MandateAuthorizationDecision:
+    # Exposure and deployed-capital limits constrain capital-increasing
+    # entries. A spot SELL closes owned inventory; treating its notional as
+    # another deployment is a historical BUY-only shortcut that prevents the
+    # same mandate machinery from authorizing an exit.
+    capital_increase_usd = request.proposed_notional_usd if request.side == "BUY" else 0
     checks: list[tuple[str, bool, str]] = [
         ("owner_match", mandate.owner_actor_id == request.owner_actor_id, "owner_mismatch"),
         ("mandate_status", mandate.status in {"ACTIVE", "EXIT_ONLY"}, "mandate_not_active"),
@@ -82,12 +87,12 @@ def evaluate_mandate_eligibility(
         ),
         (
             "exposure_limit",
-            request.current_open_exposure_usd + request.proposed_notional_usd <= version.max_open_exposure_usd,
+            request.current_open_exposure_usd + capital_increase_usd <= version.max_open_exposure_usd,
             "open_exposure_exceeds_mandate_limit",
         ),
         (
             "daily_deployment_limit",
-            request.daily_deployed_usd + request.proposed_notional_usd <= version.max_daily_deployed_usd,
+            request.daily_deployed_usd + capital_increase_usd <= version.max_daily_deployed_usd,
             "daily_deployed_exceeds_mandate_limit",
         ),
         (

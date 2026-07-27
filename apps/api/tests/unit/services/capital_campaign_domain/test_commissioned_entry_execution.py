@@ -40,6 +40,9 @@ class _FakeDb:
     async def scalar(self, _statement):
         return None
 
+    async def get(self, _model, _identity):
+        return SimpleNamespace(safe_provider_response={})
+
 
 class _TransitionRecorder:
     def __init__(self, definition) -> None:

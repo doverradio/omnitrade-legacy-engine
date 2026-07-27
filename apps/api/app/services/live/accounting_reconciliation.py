@@ -565,7 +565,13 @@ async def reconcile_live_order_and_fills(
     quote_currency = "USD"
     settings = get_settings()
     balance_tolerance = _decimal(settings.live_crypto_accounting_balance_tolerance_usd)
-    expected_quote_reduction = total_quote_notional + total_fees_by_currency.get(quote_currency, Decimal("0"))
+    quote_fee = total_fees_by_currency.get(quote_currency, Decimal("0"))
+    expected_quote_cash_delta = (
+        -(total_quote_notional + quote_fee)
+        if live_order.side.upper() == "BUY"
+        else total_quote_notional - quote_fee
+    )
+    expected_quote_reduction = -expected_quote_cash_delta
 
     pre_balance = None
     for key in ("usd_available_before_submit", "usd_balance_before_submit", "usd_balance_before"):
@@ -593,7 +599,7 @@ async def reconcile_live_order_and_fills(
     )
 
     balance_mismatch_state = "ok"
-    if expected_quote_reduction <= Decimal("0"):
+    if total_quote_notional <= Decimal("0"):
         balance_mismatch_state = "not_required"
     elif post_balance is None:
         balance_mismatch_state = "missing"
@@ -602,8 +608,8 @@ async def reconcile_live_order_and_fills(
     elif pre_balance is None:
         balance_mismatch_state = "missing"
     else:
-        observed_reduction = pre_balance - post_balance
-        delta = abs(observed_reduction - expected_quote_reduction)
+        observed_quote_cash_delta = post_balance - pre_balance
+        delta = abs(observed_quote_cash_delta - expected_quote_cash_delta)
         if delta > balance_tolerance:
             balance_mismatch_state = "material_mismatch"
         elif delta > Decimal("0"):
@@ -690,7 +696,7 @@ async def reconcile_live_order_and_fills(
                     "filled_quantity": format(total_filled_quantity, "f"),
                     "gross_filled_notional": format(total_quote_notional, "f"),
                     "provider_fee_usd": format(provider_fee_total, "f"),
-                    "net_quote_capital_effect": format(expected_quote_reduction, "f"),
+                    "net_quote_capital_effect": format(expected_quote_cash_delta, "f"),
                     "campaign_correlation_status": campaign_correlation_status,
                     "accounting_projection_status": accounting_projection_status,
                 },
@@ -723,6 +729,41 @@ async def reconcile_live_order_and_fills(
             ),
         )
 
+    if accounting_completion_status == "complete":
+        # A prior pass may have appended an unresolved balance event after
+        # the provider-status event. Replaying once fresh balance evidence is
+        # persisted must append a newer terminal resolution; otherwise every
+        # latest-event reconciliation guard remains blocked forever even
+        # though this pass proved the accounting complete. The balance
+        # observation timestamp makes the immutable event idempotent for one
+        # exact external snapshot.
+        balance_resolution_identity = (
+            "none" if balance_observed_at is None else balance_observed_at.isoformat()
+        )
+        await record_live_order_reconciliation(
+            db=db,
+            request=LiveOrderReconciliationRequest(
+                live_trading_profile_id=profile.id,
+                source_execution_event_id=source_event.id,
+                provider_name=live_order.provider,
+                provider_order_id=live_order.provider_order_id,
+                client_order_id=live_order.client_order_id,
+                reconciliation_status=normalized_status,
+                live_crypto_order_id=live_order.live_crypto_order_id,
+                capital_campaign_id=None if campaign is None else campaign.id,
+                provider_recorded_at=balance_observed_at,
+                requested_by=operator_identity,
+                provenance_metadata={
+                    "reason": "balance_evidence_resolved",
+                    "balance_mismatch_state": balance_mismatch_state,
+                },
+                idempotency_key=(
+                    f"lco-reconcile:{live_order.live_crypto_order_id}:balance-resolved:"
+                    f"{balance_resolution_identity}"
+                ),
+            ),
+        )
+
     live_order.safe_provider_response = {
         **(live_order.safe_provider_response or {}),
         "capital_campaign_id": None if campaign is None else campaign.id,
@@ -736,6 +777,7 @@ async def reconcile_live_order_and_fills(
             "weighted_average_fill_price": None if weighted_average_fill_price is None else format(weighted_average_fill_price, "f"),
             "fees": {currency: format(amount, "f") for currency, amount in total_fees_by_currency.items()},
             "expected_quote_reduction": format(expected_quote_reduction, "f"),
+            "expected_quote_cash_delta": format(expected_quote_cash_delta, "f"),
             "balance_status": balance_status,
             "balance_mismatch_state": balance_mismatch_state,
             "balance_tolerance_usd": format(balance_tolerance, "f"),
@@ -743,7 +785,7 @@ async def reconcile_live_order_and_fills(
             "campaign_correlation_status": campaign_correlation_status,
             "accounting_projection_status": accounting_projection_status,
             "accounting_completion_status": accounting_completion_status,
-            "net_quote_capital_effect": format(expected_quote_reduction, "f"),
+            "net_quote_capital_effect": format(expected_quote_cash_delta, "f"),
             "profit_cycle_consistency": {
                 "buy_fill_realized_profit": "0",
                 "distributable_profit_created": False,
@@ -770,7 +812,7 @@ async def reconcile_live_order_and_fills(
         "filled_quantity": format(total_filled_quantity, "f"),
         "gross_filled_notional": format(total_quote_notional, "f"),
         "provider_fees": format(provider_fee_total, "f"),
-        "net_quote_capital_effect": format(expected_quote_reduction, "f"),
+        "net_quote_capital_effect": format(expected_quote_cash_delta, "f"),
         "safe_provider_response": _safe_json(live_order.safe_provider_response.get("reconciliation", {})),
     }
 
@@ -999,9 +1041,11 @@ async def record_live_fill_reconciliation(
     reconciliation_status = "partially_filled" if is_partial else "filled"
     accounting_record_type = "partial_fill_accounting" if is_partial else "fill_accounting"
 
-    net_cash_impact = gross_notional + fee_amount
-    if request.side == "buy":
-        net_cash_impact = net_cash_impact * Decimal("-1")
+    # Keep trade proceeds/cost and fee attribution as distinct ledger effects.
+    # The former implementation added the fee to SELL proceeds and then added
+    # it again in the fee row, overstating exits. Direction belongs only to the
+    # fill notional; fees are always a cash reduction.
+    net_cash_impact = -gross_notional if request.side == "buy" else gross_notional
 
     recorded_at = datetime.now(timezone.utc)
     async with _join_or_begin_transaction(db):
@@ -1106,7 +1150,7 @@ async def record_live_fill_reconciliation(
             gross_notional=gross_notional,
             fee_amount=fee_amount,
             fee_currency=request.fee_currency,
-            net_cash_impact=fee_amount,
+            net_cash_impact=-fee_amount,
             provenance={
                 "requested_by": request.requested_by,
                 "recorded_at": recorded_at.isoformat(),

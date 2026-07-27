@@ -487,6 +487,19 @@ async def release_execution_claim_scope_if_order_resolved(
     claim.claim_status = released_status
     claim.completed_at = observed_at
     claim.updated_at = observed_at
+    activation = await db.get(CanonicalProvingActivation, claim.activation_id)
+    if activation is not None and activation.activation_state == "ACTIVE":
+        activation.activation_state = "COMPLETED"
+        activation.updated_at = observed_at
+        db.add(AuditLog(
+            actor="system:reconciliation", action="canonical_proving_activation.completed",
+            entity_type="canonical_proving_activation", entity_id=activation.activation_id,
+            before_state={"activation_state": "ACTIVE"},
+            after_state={
+                "activation_state": "COMPLETED", "claim_status": released_status,
+                "order_status": order_status, "live_crypto_order_id": str(live_crypto_order_id),
+            },
+        ))
     db.add(AuditLog(
         actor="system:reconciliation", action="autonomous_execution_claim.scope_released",
         entity_type="autonomous_execution_claim", entity_id=claim.claim_id,

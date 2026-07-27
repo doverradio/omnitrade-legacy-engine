@@ -108,6 +108,22 @@ def test_valid_mandate_authorizes_action() -> None:
     assert decision.failed_checks == ()
 
 
+def test_sell_exit_does_not_redeploy_capital_or_increase_open_exposure() -> None:
+    mandate = _mandate()
+    request = _request(mandate)
+    request = MandateEligibilityInput(**{
+        **request.__dict__, "side": "SELL",
+        "current_open_exposure_usd": Decimal("10"),
+        "daily_deployed_usd": Decimal("10"),
+    })
+
+    decision = evaluate_mandate_eligibility(mandate=mandate, version=_version(), request=request)
+
+    assert decision.result == "AUTHORIZED"
+    assert "exposure_limit" in decision.passed_checks
+    assert "daily_deployment_limit" in decision.passed_checks
+
+
 def test_invalid_mandate_version_rejected_by_validation_service() -> None:
     invalid = _version()
     invalid = MandateVersionModel(**{**invalid.__dict__, "max_order_notional_usd": Decimal("0")})

@@ -1956,12 +1956,19 @@ async def _validate_canonical_package_authority(
     evaluation_context = evaluation.request_context if isinstance(evaluation.request_context, dict) else {}
     evaluation_package_id = evaluation_context.get("package_id")
     if evaluation_package_id is None:
-        # The authoritative campaign-cycle evaluation is persisted before the
-        # canonical package exists, so it cannot contain a package_id.  The
-        # package later pins that exact evaluation by primary key and all
-        # mandate/decision identities above are still revalidated.  Only this
-        # canonical pre-package provenance may omit the package identity.
-        if evaluation_context.get("purpose") != "automatic_ready_package_campaign_authority":
+        # Both canonical candidate sources persist mandate authority before
+        # the package exists, so neither can truthfully include package_id.
+        # Autonomous authority is identified by its established purpose;
+        # Controlled Proof authority additionally has to bind the exact proof
+        # identity carried by the package's immutable market evidence.
+        purpose = evaluation_context.get("purpose")
+        package_proof_id = (package.market_evidence_identity or {}).get("controlled_proof_id")
+        controlled_proof_matches = (
+            purpose == "controlled_proof"
+            and package_proof_id is not None
+            and evaluation_context.get("controlled_proof_id") == package_proof_id
+        )
+        if purpose != "automatic_ready_package_campaign_authority" and not controlled_proof_matches:
             raise PermissionError("mandate evaluation package mismatch")
     elif evaluation_package_id != str(package.package_id):
         raise PermissionError("mandate evaluation package mismatch")

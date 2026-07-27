@@ -24,6 +24,7 @@ from app.models.paper_account import PaperAccount
 from app.models.risk_event import RiskEvent
 from app.models.risk_kill_switch import RiskKillSwitch
 from app.services.live_crypto_orders import _evaluate_level2_mandate_authorization
+from app.services.live.risk_accounting_snapshot import RiskAccountingSnapshot
 from app.services.mandates import lifecycle
 from app.services.mandates.contracts import (
     MandateAuthorizationRequest,
@@ -37,6 +38,21 @@ _STRATEGY_IDENTITY = build_strategy_identity(slug="ma_crossover", module_version
 _PROVIDER = "kraken_spot"
 _ENVIRONMENT = "production"
 _PRODUCT = "BTC-USD"
+
+
+@pytest.fixture(autouse=True)
+def _authoritative_zero_accounting_snapshot(monkeypatch: pytest.MonkeyPatch) -> None:
+    async def _snapshot(**kwargs) -> RiskAccountingSnapshot:
+        return RiskAccountingSnapshot(
+            current_open_exposure_usd=Decimal("0"), daily_deployed_usd=Decimal("0"),
+            daily_realized_loss_usd=Decimal("0"), campaign_drawdown_usd=Decimal("0"),
+            current_position_count=0, as_of=datetime.now(timezone.utc), evidence_ids={},
+            campaign_id=kwargs["campaign_id"], campaign_version=kwargs["campaign_version"],
+            account_id=kwargs["account_id"], provider=kwargs["provider"],
+            environment=kwargs["environment"], product=kwargs["product"],
+        )
+
+    monkeypatch.setattr("app.services.live_crypto_orders.build_risk_accounting_snapshot", _snapshot)
 
 
 @asynccontextmanager
@@ -219,6 +235,13 @@ async def _seed_scope(
     )
     session.add(RiskKillSwitch(scope="global", paper_account_id=None, engaged=False, rearm_required=False))
     session.add(RiskKillSwitch(scope="account", paper_account_id=paper_account_id, engaged=False, rearm_required=False))
+    campaign_uuid = uuid.uuid4()
+    session.add(CapitalCampaign(
+        uuid=campaign_uuid, owner="test", name="mandate-accounting-scope", status="READY",
+        campaign_type="TEST", exchange=_PROVIDER, paper_account_id=paper_account_id,
+        definition_campaign_id=campaign_uuid, definition_version=1,
+        starting_capital=Decimal("25"), current_equity=Decimal("25"),
+    ))
     profile = LiveTradingProfile(
         id=uuid.uuid4(),
         paper_account_id=paper_account_id,
