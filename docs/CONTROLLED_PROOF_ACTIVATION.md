@@ -89,6 +89,33 @@ authorization, dry-run, and activation calls (`authorize_canonical_preview_packa
 -- Risk Engine authority, mandate authority, and kill switches are not
 bypassed by this override, only the global automatic-activation flag is.
 
+## Activation scope vs. execution scope: two separate gates
+
+Reaching `package_state="ACTIVATED"` is **not** sufficient for a package to
+be claimed for execution -- `claim_activated_buy_package`
+(`app/services/orchestration/autonomous_execution_claims.py`) independently
+re-resolves its own scope before creating an `AutonomousExecutionClaim`, via
+`_resolve_autonomous_execution_scope`. This mirrors the activation
+resolver's two-mode design exactly, and for the identical reason: a
+Controlled Proof's own persisted linkage is authoritative for its own
+package, and a legacy global selector setting (`AUTOMATIC_MANDATE_PACKAGE_ACTIVATION_*`)
+must never gate or redirect it.
+
+- If the package is linked to a `ControlledProofRun` (via that proof's own
+  `package_id`), scope resolves through `_resolve_controlled_proof_execution_scope`
+  -- exclusively from the package and proof's own persisted fields (campaign
+  identity, product, provider, environment, mandate identity, dry-run/
+  activation/decision/risk evidence, `side == "BUY"`, proof still active and
+  unexpired). The legacy `AUTOMATIC_MANDATE_PACKAGE_ACTIVATION_*` settings
+  are never consulted for this package.
+- Otherwise (ordinary automation), scope resolves through the original,
+  byte-for-byte-unchanged configured-selector check (`configured_scope_mismatch`
+  when any of the four settings is unset).
+
+Both modes construct the same `ResolvedAutonomousExecutionScope` and feed
+the identical, unmodified claim-insert / preparation / provider-submission
+pipeline below -- not duplicated.
+
 ## Exactly-once provider submission
 
 Activation only gets a package to `ACTIVATED`. Provider submission happens
@@ -150,7 +177,9 @@ automatic_package_authorization_started
 automatic_package_authorized_under_mandate
 automatic_package_dry_run_passed
 automatic_package_activated
-autonomous_execution_claim.created (audit log)
+autonomous_execution_scope_resolution_started
+autonomous_execution_scope_resolved authority_mode=CONTROLLED_PROOF_DERIVED_SCOPE
+autonomous_execution_claimed
 autonomous_execution_failed_pre_provider  -- absent on the golden path
 controlled_proof_buy_filled / fill detection via reconciliation
 controlled_proof_position_opened

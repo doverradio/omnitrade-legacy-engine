@@ -72,7 +72,11 @@ async def test_fresh_matching_package_creates_one_durable_claim(monkeypatch: pyt
     version = SimpleNamespace(is_active=True, is_authorized=True, mandate_id=package.mandate_id)
     claim = SimpleNamespace(claim_id=uuid4(), package_id=package.package_id, claim_status="CLAIMED")
     db = SimpleNamespace(
-        scalar=AsyncMock(side_effect=[package, None, activation, runtime, mandate, version, None, None, None, 0, uuid4(), claim]),
+        # The extra `None` right after the existing-claim check is the new
+        # ControlledProofRun linkage lookup (_resolve_autonomous_execution_scope)
+        # -- no proof is linked to this package, so it falls through to the
+        # unchanged, settings-derived configured-scope path exercised here.
+        scalar=AsyncMock(side_effect=[package, None, None, activation, runtime, mandate, version, None, None, None, 0, uuid4(), claim]),
         add=Mock(), flush=AsyncMock(),
     )
     monkeypatch.setattr(subject, "get_settings", lambda: _settings(package))

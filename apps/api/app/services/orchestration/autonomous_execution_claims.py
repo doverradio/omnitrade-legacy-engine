@@ -20,9 +20,11 @@ from app.models.autonomous_execution_claim import AutonomousExecutionClaim
 from app.models.capital_campaign import CapitalCampaign
 from app.models.canonical_preview_package import CanonicalPreviewPackage
 from app.models.canonical_proving_activation import CanonicalProvingActivation
+from app.models.controlled_proof_run import ControlledProofRun
 from app.models.live_accounting_record import LiveAccountingRecord
 from app.models.live_crypto_order import LiveCryptoOrder
 from app.models.risk_kill_switch import RiskKillSwitch
+from app.services.controlled_proof.service import _ACTIVE_STATES as _CONTROLLED_PROOF_ACTIVE_STATES
 from app.services.orchestration.autonomous_order_preparation import (
     execute_prepared_autonomous_claim,
     prepare_autonomous_claimed_buy,
@@ -34,6 +36,9 @@ logger = logging.getLogger(__name__)
 _OPEN_ORDER_STATES = {"PENDING_CONFIRMATION", "VALIDATING", "SUBMISSION_PENDING", "ACKNOWLEDGED", "SUBMITTED", "PARTIALLY_FILLED", "RECONCILIATION_REQUIRED", "UNKNOWN"}
 _TERMINAL_CLAIMS = {"COMPLETED", "CANCELLED"}
 
+_AUTHORITY_MODE_CONFIGURED_AUTOMATIC = "CONFIGURED_AUTOMATIC_SCOPE"
+_AUTHORITY_MODE_CONTROLLED_PROOF_DERIVED = "CONTROLLED_PROOF_DERIVED_SCOPE"
+
 
 @dataclass(frozen=True)
 class AutonomousClaimOutcome:
@@ -42,12 +47,149 @@ class AutonomousClaimOutcome:
     reason_code: str
 
 
+@dataclass(frozen=True, slots=True)
+class ResolvedAutonomousExecutionScope:
+    """The one authoritative scope claim_activated_buy_package claims an
+    execution under -- resolved exactly once, from exactly one source:
+    either the operator's globally-configured selector settings (ordinary
+    automation, unchanged from before this existed), or a specific
+    Controlled Proof's own persisted, already-activated package (authority_
+    mode records which). A configured global selector -- including a
+    statically pinned package/campaign/mandate value -- can never redirect
+    or reject a genuinely Controlled-Proof-linked package: that package's
+    scope is derived exclusively from its own linked ControlledProofRun."""
+
+    authority_mode: str
+    package_id: UUID
+    campaign_id: UUID
+    campaign_version: int
+    mandate_id: UUID
+    mandate_version_id: UUID
+    mandate_evaluation_id: UUID | None
+    controlled_proof_id: UUID | None
+    product: str
+    provider: str
+    environment: str
+
+
 def _utcnow() -> datetime:
     return datetime.now(timezone.utc)
 
 
 def _owner() -> str:
     return f"orchestration:{os.getpid()}"
+
+
+async def _resolve_controlled_proof_execution_scope(
+    *, db: AsyncSession, package: CanonicalPreviewPackage, proof: ControlledProofRun,
+) -> tuple[ResolvedAutonomousExecutionScope | None, str | None]:
+    """Given a package already known to be linked to `proof` (via the
+    proof's own `package_id`), verify every Controlled Proof execution-claim
+    invariant fresh against the DB and either return a scope derived
+    exclusively from the package's own persisted fields, or a precise
+    fail-closed reason. Never falls back to the legacy configured-selector
+    check -- once a package is genuinely linked to a Controlled Proof, its
+    own invariants are authoritative; a coincidentally-matching (or
+    mismatching) global selector is irrelevant."""
+
+    def _blocked(reason: str) -> tuple[None, str]:
+        logger.info(
+            "autonomous_execution_scope_blocked authority_mode=%s package_id=%s controlled_proof_id=%s reason=%s",
+            _AUTHORITY_MODE_CONTROLLED_PROOF_DERIVED, package.package_id, proof.proof_id, reason,
+        )
+        return None, reason
+
+    if proof.status not in _CONTROLLED_PROOF_ACTIVE_STATES:
+        return _blocked("controlled_proof_not_active")
+    # Postgres's TIMESTAMPTZ always round-trips timezone-aware; sqlite (used
+    # only by this module's own tests) has no native tz-aware type and can
+    # hand back a naive value after a flush-triggered reload -- normalize.
+    expires_at = proof.expires_at if proof.expires_at.tzinfo is not None else proof.expires_at.replace(tzinfo=timezone.utc)
+    if expires_at <= _utcnow():
+        return _blocked("controlled_proof_expired")
+    if package.campaign_id != proof.campaign_id or package.campaign_version != proof.campaign_version:
+        return _blocked("campaign_version_mismatch")
+    if package.product != proof.product_id:
+        return _blocked("proof_package_product_mismatch")
+    if package.provider != proof.provider:
+        return _blocked("proof_package_provider_mismatch")
+    if package.environment != proof.environment:
+        return _blocked("proof_package_environment_mismatch")
+    if package.side != "BUY":
+        return _blocked("non_buy_entry_package")
+    if package.package_state != "ACTIVATED":
+        return _blocked("package_not_activated")
+    if package.authorization_source != "MANDATE":
+        return _blocked("package_authority_invalid")
+    if package.mandate_id is None or package.mandate_version_id is None or package.mandate_evaluation_id is None:
+        return _blocked("missing_mandate_identity")
+    if package.dry_run_live_crypto_order_id is None:
+        return _blocked("dry_run_evidence_missing")
+    if package.decision_record_id is None or package.risk_event_id is None:
+        return _blocked("evidence_incomplete")
+
+    scope = ResolvedAutonomousExecutionScope(
+        authority_mode=_AUTHORITY_MODE_CONTROLLED_PROOF_DERIVED,
+        package_id=package.package_id, campaign_id=package.campaign_id, campaign_version=package.campaign_version,
+        mandate_id=package.mandate_id, mandate_version_id=package.mandate_version_id,
+        mandate_evaluation_id=package.mandate_evaluation_id, controlled_proof_id=proof.proof_id,
+        product=package.product, provider=package.provider, environment=package.environment,
+    )
+    logger.info(
+        "autonomous_execution_scope_resolved authority_mode=%s controlled_proof_id=%s package_id=%s campaign_id=%s "
+        "campaign_version=%s mandate_id=%s mandate_version_id=%s mandate_evaluation_id=%s product=%s provider=%s environment=%s",
+        scope.authority_mode, scope.controlled_proof_id, scope.package_id, scope.campaign_id, scope.campaign_version,
+        scope.mandate_id, scope.mandate_version_id, scope.mandate_evaluation_id, scope.product, scope.provider, scope.environment,
+    )
+    return scope, None
+
+
+async def _resolve_autonomous_execution_scope(
+    *, db: AsyncSession, package: CanonicalPreviewPackage,
+) -> tuple[ResolvedAutonomousExecutionScope | None, str | None]:
+    """Resolves execution-claim scope for `package` from exactly one
+    source. A package genuinely linked to a Controlled Proof (via that
+    proof's own `package_id`) always resolves -- or fails closed -- through
+    the Controlled-Proof-derived path, never the legacy configured-selector
+    path. Every other package (ordinary automation) resolves through the
+    existing, byte-for-byte-unchanged configured-selector check."""
+    logger.info("autonomous_execution_scope_resolution_started package_id=%s", package.package_id)
+    proof = await db.scalar(
+        select(ControlledProofRun).where(ControlledProofRun.package_id == package.package_id).with_for_update().limit(1)
+    )
+    if proof is not None:
+        return await _resolve_controlled_proof_execution_scope(db=db, package=package, proof=proof)
+
+    settings = get_settings()
+    configured = (
+        settings.automatic_mandate_package_activation_campaign_id,
+        settings.automatic_mandate_package_activation_campaign_version,
+        settings.automatic_mandate_package_activation_mandate_id,
+        settings.automatic_mandate_package_activation_mandate_version_id,
+    )
+    if any(value is None for value in configured) or configured != (
+        package.campaign_id, package.campaign_version, package.mandate_id, package.mandate_version_id,
+    ):
+        logger.info(
+            "autonomous_execution_scope_blocked authority_mode=%s package_id=%s controlled_proof_id=None reason=configured_scope_mismatch",
+            _AUTHORITY_MODE_CONFIGURED_AUTOMATIC, package.package_id,
+        )
+        return None, "configured_scope_mismatch"
+
+    scope = ResolvedAutonomousExecutionScope(
+        authority_mode=_AUTHORITY_MODE_CONFIGURED_AUTOMATIC,
+        package_id=package.package_id, campaign_id=package.campaign_id, campaign_version=package.campaign_version,
+        mandate_id=package.mandate_id, mandate_version_id=package.mandate_version_id,
+        mandate_evaluation_id=package.mandate_evaluation_id, controlled_proof_id=None,
+        product=package.product, provider=package.provider, environment=package.environment,
+    )
+    logger.info(
+        "autonomous_execution_scope_resolved authority_mode=%s controlled_proof_id=None package_id=%s campaign_id=%s "
+        "campaign_version=%s mandate_id=%s mandate_version_id=%s mandate_evaluation_id=%s product=%s provider=%s environment=%s",
+        scope.authority_mode, scope.package_id, scope.campaign_id, scope.campaign_version, scope.mandate_id,
+        scope.mandate_version_id, scope.mandate_evaluation_id, scope.product, scope.provider, scope.environment,
+    )
+    return scope, None
 
 
 async def claim_activated_buy_package(
@@ -71,17 +213,9 @@ async def claim_activated_buy_package(
     if package.mandate_id is None or package.mandate_version_id is None or package.mandate_evaluation_id is None:
         return AutonomousClaimOutcome(None, False, "mandate_identity_incomplete")
 
-    settings = get_settings()
-    configured = (
-        settings.automatic_mandate_package_activation_campaign_id,
-        settings.automatic_mandate_package_activation_campaign_version,
-        settings.automatic_mandate_package_activation_mandate_id,
-        settings.automatic_mandate_package_activation_mandate_version_id,
-    )
-    if any(value is None for value in configured) or configured != (
-        package.campaign_id, package.campaign_version, package.mandate_id, package.mandate_version_id,
-    ):
-        return AutonomousClaimOutcome(None, False, "configured_scope_mismatch")
+    resolved_scope, blocker = await _resolve_autonomous_execution_scope(db=db, package=package)
+    if resolved_scope is None:
+        return AutonomousClaimOutcome(None, False, blocker or "configured_scope_mismatch")
 
     activation = await db.scalar(
         select(CanonicalProvingActivation).where(CanonicalProvingActivation.package_id == package_id).with_for_update().limit(1)
@@ -163,9 +297,19 @@ async def claim_activated_buy_package(
         db.add(AuditLog(
             actor=owner, action="autonomous_execution_claim.created", entity_type="autonomous_execution_claim",
             entity_id=claim.claim_id, before_state=None,
-            after_state={"package_id": str(package.package_id), "activation_id": str(activation.activation_id), "claim_status": "CLAIMED"},
+            after_state={
+                "package_id": str(package.package_id), "activation_id": str(activation.activation_id), "claim_status": "CLAIMED",
+                "authority_mode": resolved_scope.authority_mode,
+                "controlled_proof_id": None if resolved_scope.controlled_proof_id is None else str(resolved_scope.controlled_proof_id),
+            },
         ))
         await db.flush()
+        logger.info(
+            "autonomous_execution_claimed claim_id=%s package_id=%s campaign_id=%s campaign_version=%s "
+            "authority_mode=%s controlled_proof_id=%s provider=%s environment=%s product=%s",
+            claim.claim_id, package.package_id, package.campaign_id, package.campaign_version,
+            resolved_scope.authority_mode, resolved_scope.controlled_proof_id, package.provider, package.environment, package.product,
+        )
     return AutonomousClaimOutcome(claim, created, "claimed" if created else "already_claimed")
 
 
