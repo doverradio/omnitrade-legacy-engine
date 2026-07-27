@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
+import logging
 from datetime import datetime, timezone
 from decimal import Decimal
 from typing import Any
@@ -56,6 +57,7 @@ from app.services.risk.risk_engine import (
 )
 from app.services.risk.risk_persistence import RiskDecisionPersistenceRequest, persist_risk_decision
 
+logger = logging.getLogger(__name__)
 
 _COMMISSIONED_STATE_KEY = "commissioned_seed_campaign"
 _AUTHORITY_CLASSIFICATION = "OPERATOR_COMMISSIONED"
@@ -952,6 +954,10 @@ async def execute_commissioned_entry(
         live_service = LiveCryptoOrderService()
         submit_response = None
         submit_error: Exception | None = None
+        logger.info(
+            "provider_submission_started live_crypto_order_id=%s campaign_id=%s idempotency_token=%s",
+            request.live_crypto_order_id, request.campaign_id, request.submit_idempotency_token,
+        )
         try:
             submit_response = await live_service.submit(
                 db=db,
@@ -973,7 +979,16 @@ async def execute_commissioned_entry(
         if submit_error is not None:
             final_classification = "ambiguous_submission"
             final_state = "RECONCILIATION_REQUIRED"
+            logger.warning(
+                "provider_submission_ambiguous live_crypto_order_id=%s campaign_id=%s reason=%s",
+                request.live_crypto_order_id, request.campaign_id, type(submit_error).__name__,
+            )
         elif submit_response is not None:
+            logger.info(
+                "provider_submission_succeeded live_crypto_order_id=%s campaign_id=%s provider_order_id=%s status=%s",
+                request.live_crypto_order_id, request.campaign_id,
+                submit_response.live_crypto_order.provider_order_id, submit_response.live_crypto_order.status,
+            )
             provider_order_id = submit_response.live_crypto_order.provider_order_id
             if (
                 submit_response.live_crypto_order.status in {"RECONCILIATION_REQUIRED", "UNKNOWN"}

@@ -2567,6 +2567,19 @@ class LiveCryptoOrderService:
             "reconciliation_completed live_crypto_order_id=%s reconciliation_status=%s provider_fill_observed=%s",
             live_crypto_order_id, outcome.get("reconciliation_status"), outcome.get("provider_fill_observed"),
         )
+        # Local import: autonomous_execution_claims -> autonomous_order_preparation
+        # -> capital_campaign_domain.activated_commissioned_entry ->
+        # commissioned_entry_execution -> this module, so a module-level
+        # import here would be circular (same reason reconcile_live_order_
+        # and_fills above imports _load_exchange_connection locally). A
+        # claim's campaign/version execution scope must not remain reserved
+        # forever once its order's outcome is authoritatively resolved --
+        # otherwise no later, legitimate sequential Controlled Proof could
+        # ever claim the same campaign version again.
+        from app.services.orchestration.autonomous_execution_claims import release_execution_claim_scope_if_order_resolved
+        await release_execution_claim_scope_if_order_resolved(
+            db=db, live_crypto_order_id=live_crypto_order_id, order_status=live_order.status,
+        )
 
         return LiveCryptoOrderReconcileResponse(
             live_crypto_order=self._to_response(live_order),
@@ -2619,6 +2632,10 @@ class LiveCryptoOrderService:
         live_order.cancelled_at = _utcnow()
         live_order.updated_at = _utcnow()
         await db.flush()
+        from app.services.orchestration.autonomous_execution_claims import release_execution_claim_scope_if_order_resolved
+        await release_execution_claim_scope_if_order_resolved(
+            db=db, live_crypto_order_id=live_order.live_crypto_order_id, order_status=live_order.status,
+        )
         return self._to_response(live_order)
 
     async def _get_or_create_live_order(

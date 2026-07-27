@@ -116,17 +116,93 @@ Both modes construct the same `ResolvedAutonomousExecutionScope` and feed
 the identical, unmodified claim-insert / preparation / provider-submission
 pipeline below -- not duplicated.
 
+## Claim uniqueness: per-package, per-activation, and per-active-scope
+
+`AutonomousExecutionClaim` enforces three independent invariants:
+
+- `uq_autonomous_execution_claim_package` -- exactly one claim per package,
+  ever (unchanged).
+- `uq_autonomous_execution_claim_activation` -- exactly one claim per
+  activation, ever (unchanged).
+- `uq_aec_active_campaign_scope` -- a **partial** unique index on
+  `(campaign_id, campaign_version)`, scoped to claim_status values whose
+  provider-submission outcome is not yet resolved (`CLAIMED`,
+  `EXECUTION_STARTED`, `SUBMISSION_PENDING`, `RECONCILIATION_REQUIRED`,
+  `RECOVERY_REQUIRED` -- see `_CLAIM_SCOPE_NONTERMINAL_STATES` in
+  `autonomous_execution_claims.py`). `BLOCKED` is deliberately a
+  scope-*releasing* status (its name describes a permanent, non-recoverable
+  pre-provider stop, the same shape as `FAILED_PRE_PROVIDER`, not an
+  in-progress one). This **replaces** the original migration-20260724_0048
+  plain `UNIQUE(campaign_id, campaign_version)`, which permitted at most one
+  claim row *ever* per campaign version regardless of status -- since every
+  Controlled Proof shares one pinned campaign/version, that made every
+  second Controlled Proof's claim permanently fail with
+  `claim_concurrency_conflict`, even after the first claim's package fully
+  resolved (e.g. `SAFETY_DISABLED` because live submission was off, or
+  `FAILED_PRE_PROVIDER`) with no provider call ever made. Migration
+  `20260727_0053` fixes this; see that file's docstring for the preflight
+  query and downgrade path.
+
+`claim_activated_buy_package`'s INSERT distinguishes the two possible
+rejection causes precisely: if the by-`package_id` lookup after the insert
+attempt still finds nothing, it queries for a currently-nonterminal claim in
+the same `(campaign_id, campaign_version)` scope. Finding one returns
+`active_campaign_execution_claim_exists` (a real, distinct, active claim
+already owns this scope); finding none returns the generic
+`claim_concurrency_conflict` (a genuinely unexplained race). A same-package
+replay is always resolved first, before any insert is attempted, and always
+returns the existing claim (`autonomous_execution_claim_reused`,
+`already_claimed`) -- never a second insert, never a second provider call.
+
+A successful (or terminally failed) execution must also eventually
+*release* its campaign scope, or a later, legitimate sequential Controlled
+Proof could never claim again -- the same defect in a different shape.
+`release_execution_claim_scope_if_order_resolved` (called from
+`LiveCryptoOrderService.reconcile()`/`.cancel()` right after a live order's
+status is authoritatively updated) maps `FILLED -> BUY_RECONCILED` and
+`CANCELLED/REJECTED/EXPIRED -> CANCELLED`; it is a no-op for any
+still-ambiguous status and never overwrites a claim that has already left
+the nonterminal set. `advance_claimed_execution` itself is now a guaranteed
+no-op for any claim already outside `_CLAIM_SCOPE_NONTERMINAL_STATES` --
+without this, `continuous_pipeline_worker` calls it on *every* cycle for as
+long as the package's own `package_state` stays `ACTIVATED` (nothing ever
+advances that), which would otherwise re-drive `prepare_autonomous_claimed_buy`
+against a claim that already finished, typically fail on the by-then-expired
+activation window, and let `mark_pre_provider_blocked` silently overwrite a
+genuinely successful `BUY_RECONCILED` claim's status back to
+`FAILED_PRE_PROVIDER` -- corrupting the record of a real, profitable BUY.
+`sweep_stale_autonomous_execution_claims` now also recovers claims stuck in
+`EXECUTION_STARTED` (previously only `CLAIMED`), covering a crash between
+`prepare_autonomous_claimed_buy`'s own state transition and the submission
+call that follows it -- `SUBMISSION_PENDING`/`RECONCILIATION_REQUIRED` are
+deliberately excluded from the sweep, since re-preparing either would be an
+unsafe blind retry after a provider call may already have been made; the
+correct recovery there is `reconcile()` against the real order.
+
+**Known remaining gap (not fixed by this change, tracked separately):**
+nothing in the codebase currently triggers `reconcile()` automatically.
+`reconcile_commissioned_buy_ownership` / `LiveCryptoOrderService.reconcile()`
+are only invoked via an explicit operator CLI command or the `/reconcile`
+API route today -- there is no scheduled poller. Until one exists (or an
+operator manually reconciles), a claim that reaches `SUBMISSION_PENDING`
+stays there, `LiveAccountingRecord` rows for that fill are never created,
+and `should_propose_controlled_sell` never sees a "BUY filled" signal --
+the SELL side of the Controlled Proof lifecycle will not begin on its own.
+
 ## Exactly-once provider submission
 
 Activation only gets a package to `ACTIVATED`. Provider submission happens
 downstream, in `claim_activated_buy_package` /
 `app.services.orchestration.autonomous_execution_claims` and
 `prepare_autonomous_claimed_buy` / `execute_activated_commissioned_entry`,
-which are unmodified by this change: one row-locked, unique
-`AutonomousExecutionClaim` per package (`on_conflict_do_nothing` +
-reload-the-winner), one `LiveCryptoOrder` per claim, and an identity-bound
-preview hash checked before every submission so a retried or replayed call
-can never produce a second Kraken order.
+which are unmodified by this change beyond the claim-scope fix above: one
+row-locked, unique `AutonomousExecutionClaim` per package
+(`on_conflict_do_nothing` + reload-the-winner), one `LiveCryptoOrder` per
+claim, and an identity-bound preview hash checked before every submission
+so a retried or replayed call can never produce a second Kraken order.
+`provider_submission_started` / `_succeeded` / `_ambiguous` are now logged
+directly around the actual Kraken call in
+`commissioned_entry_execution.py`.
 
 ## Required runtime configuration
 
@@ -139,6 +215,12 @@ must still be configured identically on both `omnitrade-api` and
 `omnitrade-orchestration` -- they already are, since asset-commissioning
 readiness (`automatic_package_identity_bundle`) depends on the same values
 to declare a product `package_creation_eligible`.
+
+A database migration **is** required for the `claim_concurrency_conflict`
+fix: `alembic upgrade head` applies `20260727_0053`, replacing
+`uq_autonomous_execution_claim_campaign_version` with the partial index
+`uq_aec_active_campaign_scope`. Run the preflight query in that migration's
+docstring first (expected empty on a healthy system).
 
 ## Operator commands
 
@@ -179,8 +261,11 @@ automatic_package_dry_run_passed
 automatic_package_activated
 autonomous_execution_scope_resolution_started
 autonomous_execution_scope_resolved authority_mode=CONTROLLED_PROOF_DERIVED_SCOPE
+autonomous_execution_claim_resolution_started
 autonomous_execution_claimed
 autonomous_execution_failed_pre_provider  -- absent on the golden path
+provider_submission_started
+provider_submission_succeeded
 controlled_proof_buy_filled / fill detection via reconciliation
 controlled_proof_position_opened
 controlled_proof_exit_evaluation

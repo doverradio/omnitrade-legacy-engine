@@ -71,10 +71,23 @@ async def test_stale_activation_fails_closed() -> None:
         await _validate_autonomous_one_shot_submission(db=db, live_order=order, preview=preview)
 
 
-def test_database_enforces_one_claim_per_campaign_version() -> None:
+def test_database_enforces_at_most_one_active_claim_per_campaign_version() -> None:
+    """Superseded by the partial unique index uq_aec_active_campaign_scope
+    (migration 20260727_0053): the original UNIQUE(campaign_id,
+    campaign_version) allowed at most one AutonomousExecutionClaim row EVER
+    for a given campaign version regardless of status, which permanently
+    blocked every legitimate sequential Controlled Proof after the first.
+    The correct, narrower invariant -- at most one claim whose
+    provider-submission outcome is not yet resolved per campaign version --
+    is now enforced by a unique partial index instead."""
+    indexes = {index.name: index for index in AutonomousExecutionClaim.__table__.indexes}
+    scope_index = indexes["uq_aec_active_campaign_scope"]
+    assert scope_index.unique is True
+    assert tuple(column.name for column in scope_index.columns) == ("campaign_id", "campaign_version")
+    assert "RECONCILIATION_REQUIRED" in str(scope_index.dialect_options["postgresql"]["where"])
     unique_columns = {
         tuple(column.name for column in constraint.columns)
         for constraint in AutonomousExecutionClaim.__table__.constraints
         if constraint.__class__.__name__ == "UniqueConstraint"
     }
-    assert ("campaign_id", "campaign_version") in unique_columns
+    assert ("campaign_id", "campaign_version") not in unique_columns

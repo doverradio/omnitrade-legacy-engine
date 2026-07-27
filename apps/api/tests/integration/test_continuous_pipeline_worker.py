@@ -1057,7 +1057,7 @@ async def test_expired_activation_at_prepare_time_terminates_claim_instead_of_un
 
     cycle = _automatic_cycle()
     package_id = uuid.uuid4()
-    claim = SimpleNamespace(claim_id=uuid.uuid4(), package_id=package_id)
+    claim = SimpleNamespace(claim_id=uuid.uuid4(), package_id=package_id, claim_status="CLAIMED")
     blocked_calls = []
 
     async def _create(*, db, request):

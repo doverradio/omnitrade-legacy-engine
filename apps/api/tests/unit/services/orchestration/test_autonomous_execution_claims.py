@@ -48,7 +48,7 @@ async def test_stale_activated_package_creates_no_claim() -> None:
 async def test_existing_claim_is_idempotently_replayed() -> None:
     now = datetime.now(timezone.utc)
     package = _package(now)
-    claim = SimpleNamespace(claim_id=uuid4(), package_id=package.package_id, claim_status="SAFETY_DISABLED")
+    claim = SimpleNamespace(claim_id=uuid4(), package_id=package.package_id, claim_status="SAFETY_DISABLED", claim_owner="worker:other")
     db = SimpleNamespace(scalar=AsyncMock(side_effect=[package, claim]))
     outcome = await subject.claim_activated_buy_package(db=db, package_id=package.package_id, now=now)
     assert outcome.claim is claim
@@ -101,6 +101,40 @@ async def test_submission_disabled_is_recoverable_and_not_ambiguous() -> None:
     assert claim.recover_after is None
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "released_status",
+    ["SAFETY_DISABLED", "FAILED_PRE_PROVIDER", "BUY_RECONCILED", "POSITION_OPENED", "COMPLETED", "CANCELLED", "BLOCKED"],
+)
+async def test_mark_submission_safety_disabled_never_overwrites_an_already_released_claim(released_status: str) -> None:
+    claim = SimpleNamespace(
+        claim_id=uuid4(), package_id=uuid4(), claim_status=released_status, claim_owner="worker:test",
+        last_error_code="original", recover_after=None, updated_at=None, reconciliation_state=None,
+    )
+    db = SimpleNamespace(add=Mock(), flush=AsyncMock())
+    await subject.mark_submission_safety_disabled(db=db, claim=claim)
+    assert claim.claim_status == released_status
+    assert claim.last_error_code == "original"
+    db.add.assert_not_called()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "released_status",
+    ["SAFETY_DISABLED", "FAILED_PRE_PROVIDER", "BUY_RECONCILED", "POSITION_OPENED", "COMPLETED", "CANCELLED", "BLOCKED"],
+)
+async def test_mark_pre_provider_blocked_never_overwrites_an_already_released_claim(released_status: str) -> None:
+    claim = SimpleNamespace(
+        claim_id=uuid4(), package_id=uuid4(), claim_status=released_status, claim_owner="worker:test",
+        last_error_code="original", recover_after=None, updated_at=None,
+    )
+    db = SimpleNamespace(add=Mock(), flush=AsyncMock())
+    await subject.mark_pre_provider_blocked(db=db, claim=claim, reason_code="some_new_reason")
+    assert claim.claim_status == released_status
+    assert claim.last_error_code == "original"
+    db.add.assert_not_called()
+
+
 def test_claim_schema_prevents_duplicate_package_and_activation() -> None:
     str(CreateTable(AutonomousExecutionClaim.__table__).compile(dialect=postgresql.dialect()))
     unique_columns = {
@@ -124,6 +158,38 @@ def _claim(*, claim_status: str = "CLAIMED") -> SimpleNamespace:
 def _prepared(claim) -> SimpleNamespace:
     order = SimpleNamespace(live_crypto_order_id=uuid4())
     return SimpleNamespace(claim=claim, order=order, replayed=False)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "released_status",
+    ["SAFETY_DISABLED", "FAILED_PRE_PROVIDER", "BUY_RECONCILED", "POSITION_OPENED", "COMPLETED", "CANCELLED", "BLOCKED"],
+)
+async def test_advance_claimed_execution_is_a_true_no_op_for_any_already_released_claim(
+    monkeypatch: pytest.MonkeyPatch, released_status: str,
+) -> None:
+    """Regression: continuous_pipeline_worker calls advance_claimed_execution
+    on every cycle for as long as the package's own package_state stays
+    ACTIVATED (nothing ever advances it past that) -- including for a claim
+    that has already reached a released status. Before this guard existed,
+    that re-drove prepare_autonomous_claimed_buy every cycle, which would
+    typically fail on the by-then-expired activation window, and
+    mark_pre_provider_blocked would overwrite even a genuinely successful
+    BUY_RECONCILED claim's status back to FAILED_PRE_PROVIDER -- silently
+    corrupting the record of a real, profitable BUY."""
+    claim = _claim(claim_status=released_status)
+
+    async def _unexpected_prepare(*, db, claim_id):
+        raise AssertionError("prepare_autonomous_claimed_buy must not be called for an already-released claim")
+
+    monkeypatch.setattr(subject, "prepare_autonomous_claimed_buy", _unexpected_prepare)
+    db = SimpleNamespace(add=Mock(), flush=AsyncMock())
+
+    await subject.advance_claimed_execution(db=db, claim=claim)
+
+    assert claim.claim_status == released_status
+    db.add.assert_not_called()
+    db.flush.assert_not_called()
 
 
 @pytest.mark.asyncio
@@ -324,10 +390,21 @@ async def test_sweep_isolates_one_claims_failure_from_the_rest(monkeypatch: pyte
 
 
 @pytest.mark.asyncio
-async def test_sweep_query_filters_by_claimed_status_and_due_recovery() -> None:
-    """Proves the sweep's WHERE clause targets exactly claim_status='CLAIMED'
-    AND recover_after IS NOT NULL AND recover_after <= now -- against a real
-    SQLite-backed session, not a mock, so the actual SQL is exercised."""
+async def test_sweep_query_filters_by_claimed_or_execution_started_status_and_due_recovery(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Proves the sweep's real WHERE clause targets claim_status IN
+    ('CLAIMED', 'EXECUTION_STARTED') AND recover_after IS NOT NULL AND
+    recover_after <= now -- against a real SQLite-backed session, not a
+    mock, and against the actual sweep_stale_autonomous_execution_claims
+    function (not a hand-duplicated query), so a future change to the
+    production WHERE clause cannot silently drift from this assertion.
+    EXECUTION_STARTED must be swept too -- a crash between prepare_
+    autonomous_claimed_buy's own EXECUTION_STARTED transition and the
+    submission call that follows it would otherwise orphan the claim (and
+    its campaign scope) forever. SUBMISSION_PENDING and RECONCILIATION_
+    REQUIRED must never be swept -- a provider call has already been made
+    (or may have been); blind re-preparation there would be unsafe."""
     from datetime import timedelta
 
     from app.models.audit_log import AuditLog
@@ -347,19 +424,27 @@ async def test_sweep_query_filters_by_claimed_status_and_due_recovery() -> None:
             defaults.update(overrides)
             return AutonomousExecutionClaim(**defaults)
 
-        due = _row()
+        due_claimed = _row()
+        due_execution_started = _row(claim_status="EXECUTION_STARTED")
         not_yet_due = _row(recover_after=now + timedelta(minutes=5))
         never_swept = _row(recover_after=None)
         already_terminal = _row(claim_status="COMPLETED", recover_after=now - timedelta(minutes=8))
-        session.add_all([due, not_yet_due, never_swept, already_terminal])
+        due_submission_pending = _row(claim_status="SUBMISSION_PENDING")
+        due_reconciliation_required = _row(claim_status="RECONCILIATION_REQUIRED")
+        session.add_all([
+            due_claimed, due_execution_started, not_yet_due, never_swept,
+            already_terminal, due_submission_pending, due_reconciliation_required,
+        ])
         await session.flush()
 
-        stale = (await session.scalars(
-            select(AutonomousExecutionClaim).where(
-                AutonomousExecutionClaim.claim_status == "CLAIMED",
-                AutonomousExecutionClaim.recover_after.is_not(None),
-                AutonomousExecutionClaim.recover_after <= now,
-            )
-        )).all()
+        advanced: list = []
 
-        assert [item.claim_id for item in stale] == [due.claim_id]
+        async def _fake_advance(*, db, claim):
+            advanced.append(claim.claim_id)
+
+        monkeypatch.setattr(subject, "advance_claimed_execution", _fake_advance)
+
+        swept = await subject.sweep_stale_autonomous_execution_claims(db=session, now=now)
+
+        assert swept == 2
+        assert set(advanced) == {due_claimed.claim_id, due_execution_started.claim_id}

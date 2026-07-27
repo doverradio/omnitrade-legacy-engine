@@ -34,7 +34,41 @@ from app.services.orchestration.reconciliation_guard import claim_blocking_recon
 logger = logging.getLogger(__name__)
 
 _OPEN_ORDER_STATES = {"PENDING_CONFIRMATION", "VALIDATING", "SUBMISSION_PENDING", "ACKNOWLEDGED", "SUBMITTED", "PARTIALLY_FILLED", "RECONCILIATION_REQUIRED", "UNKNOWN"}
-_TERMINAL_CLAIMS = {"COMPLETED", "CANCELLED"}
+
+# The set of claim_status values under which a claim still holds its
+# (campaign_id, campaign_version) execution scope -- i.e. its eventual
+# provider-submission outcome is not yet fully resolved, so a second,
+# concurrent claim for the same scope must not be allowed to exist. Must
+# stay in sync with the partial unique index uq_aec_active_campaign_scope
+# (see AutonomousExecutionClaim / migration 20260727_0053). Derived from
+# the actual, currently-reachable state machine (see module docstring-level
+# transitions in claim_activated_buy_package/mark_submission_safety_disabled/
+# mark_pre_provider_blocked/advance_claimed_execution/
+# release_execution_claim_scope_if_order_resolved): CLAIMED and
+# EXECUTION_STARTED precede any provider call; SUBMISSION_PENDING and
+# RECONCILIATION_REQUIRED follow a provider call whose outcome (including
+# whether an order now exists) is not yet certain; RECOVERY_REQUIRED (name
+# implies active, in-progress recovery, not yet resolved either way) is
+# treated the same way, conservatively, since its semantics are not yet
+# defined in code. BLOCKED is deliberately NOT here -- see
+# _CLAIM_SCOPE_RELEASED_STATES below.
+_CLAIM_SCOPE_NONTERMINAL_STATES = {
+    "CLAIMED", "EXECUTION_STARTED", "SUBMISSION_PENDING", "RECONCILIATION_REQUIRED", "RECOVERY_REQUIRED",
+}
+# The complement: a claim in one of these states has either never made (and
+# will never make, per mark_submission_safety_disabled/mark_pre_provider_
+# blocked's own provider_call_made=false logging) a provider call, or has a
+# fully, authoritatively resolved outcome -- it no longer needs to occupy
+# the scope, so a later, legitimate sequential Controlled Proof (or
+# ordinary automatic package) may claim the same campaign/version again.
+# BLOCKED is included here (not in the nonterminal set above): unlike
+# RECOVERY_REQUIRED, its name describes a permanent, non-recoverable
+# pre-provider stop -- the same shape as FAILED_PRE_PROVIDER/
+# SAFETY_DISABLED, not an in-progress state -- so it must not reserve the
+# campaign scope forever either, once it is ever actually emitted.
+_CLAIM_SCOPE_RELEASED_STATES = {
+    "SAFETY_DISABLED", "FAILED_PRE_PROVIDER", "COMPLETED", "CANCELLED", "BUY_RECONCILED", "POSITION_OPENED", "BLOCKED",
+}
 
 _AUTHORITY_MODE_CONFIGURED_AUTOMATIC = "CONFIGURED_AUTOMATIC_SCOPE"
 _AUTHORITY_MODE_CONTROLLED_PROOF_DERIVED = "CONTROLLED_PROOF_DERIVED_SCOPE"
@@ -196,6 +230,7 @@ async def claim_activated_buy_package(
     *, db: AsyncSession, package_id: UUID, claim_owner: str | None = None, now: datetime | None = None,
 ) -> AutonomousClaimOutcome:
     observed_at = now or _utcnow()
+    logger.info("autonomous_execution_claim_resolution_started package_id=%s", package_id)
     package = await db.scalar(
         select(CanonicalPreviewPackage).where(CanonicalPreviewPackage.package_id == package_id).with_for_update().limit(1)
     )
@@ -205,6 +240,15 @@ async def claim_activated_buy_package(
         select(AutonomousExecutionClaim).where(AutonomousExecutionClaim.package_id == package_id).limit(1)
     )
     if existing is not None:
+        logger.info(
+            "autonomous_execution_claim_reused claim_id=%s package_id=%s claim_status=%s claim_owner=%s",
+            existing.claim_id, package_id, existing.claim_status, existing.claim_owner,
+        )
+        if existing.claim_status in _CLAIM_SCOPE_NONTERMINAL_STATES:
+            logger.info(
+                "autonomous_execution_claim_recovery_required claim_id=%s package_id=%s claim_status=%s",
+                existing.claim_id, package_id, existing.claim_status,
+            )
         return AutonomousClaimOutcome(existing, False, "already_claimed")
     if package.package_state != "ACTIVATED" or package.side != "BUY" or package.preview_expires_at <= observed_at:
         return AutonomousClaimOutcome(None, False, "package_not_eligible")
@@ -291,6 +335,32 @@ async def claim_activated_buy_package(
         select(AutonomousExecutionClaim).where(AutonomousExecutionClaim.package_id == package.package_id).with_for_update().limit(1)
     )
     if claim is None:
+        # Not a same-package race -- if another worker had just inserted
+        # THIS package's own claim between our existence check above and
+        # this INSERT, the by-package_id SELECT just above would have found
+        # it. Reaching here instead means the INSERT was rejected by the
+        # active-campaign-scope partial unique index
+        # (uq_aec_active_campaign_scope): a different, still-nonterminal
+        # claim already owns this (campaign_id, campaign_version).
+        conflicting = await db.scalar(
+            select(AutonomousExecutionClaim).where(
+                AutonomousExecutionClaim.campaign_id == package.campaign_id,
+                AutonomousExecutionClaim.campaign_version == package.campaign_version,
+                AutonomousExecutionClaim.claim_status.in_(_CLAIM_SCOPE_NONTERMINAL_STATES),
+            ).limit(1)
+        )
+        if conflicting is not None:
+            logger.warning(
+                "autonomous_execution_claim_blocked package_id=%s campaign_id=%s campaign_version=%s reason=active_campaign_execution_claim_exists "
+                "conflicting_claim_id=%s conflicting_package_id=%s conflicting_claim_owner=%s conflicting_claim_status=%s",
+                package.package_id, package.campaign_id, package.campaign_version,
+                conflicting.claim_id, conflicting.package_id, conflicting.claim_owner, conflicting.claim_status,
+            )
+            return AutonomousClaimOutcome(None, False, "active_campaign_execution_claim_exists")
+        logger.warning(
+            "autonomous_execution_claim_blocked package_id=%s campaign_id=%s campaign_version=%s reason=claim_concurrency_conflict",
+            package.package_id, package.campaign_id, package.campaign_version,
+        )
         return AutonomousClaimOutcome(None, False, "claim_concurrency_conflict")
     created = inserted_id is not None
     if created:
@@ -314,7 +384,12 @@ async def claim_activated_buy_package(
 
 
 async def mark_submission_safety_disabled(*, db: AsyncSession, claim: AutonomousExecutionClaim) -> None:
-    if claim.claim_status in _TERMINAL_CLAIMS:
+    # Guards against _CLAIM_SCOPE_RELEASED_STATES in full (not just COMPLETED/
+    # CANCELLED): a claim that already reached BUY_RECONCILED, SAFETY_DISABLED,
+    # FAILED_PRE_PROVIDER, POSITION_OPENED, or BLOCKED must never be
+    # overwritten by a later, stale call -- see advance_claimed_execution's
+    # own top-level guard for why such a call can still occur.
+    if claim.claim_status in _CLAIM_SCOPE_RELEASED_STATES:
         return
     before = claim.claim_status
     claim.claim_status = "SAFETY_DISABLED"
@@ -332,7 +407,8 @@ async def mark_submission_safety_disabled(*, db: AsyncSession, claim: Autonomous
 async def mark_pre_provider_blocked(
     *, db: AsyncSession, claim: AutonomousExecutionClaim, reason_code: str,
 ) -> None:
-    if claim.claim_status in _TERMINAL_CLAIMS:
+    # See mark_submission_safety_disabled's identical guard comment above.
+    if claim.claim_status in _CLAIM_SCOPE_RELEASED_STATES:
         return
     before = claim.claim_status
     claim.claim_status = "FAILED_PRE_PROVIDER"
@@ -348,15 +424,90 @@ async def mark_pre_provider_blocked(
     await db.flush()
 
 
+# A live order's status, once reconciliation has authoritatively resolved
+# it, maps onto the one claim-lifecycle status that correctly reflects that
+# outcome and releases the claim's campaign/version execution scope. Only
+# genuinely final, authoritative provider outcomes are listed here --
+# ACKNOWLEDGED/SUBMITTED/PARTIALLY_FILLED/UNKNOWN/RECONCILIATION_REQUIRED
+# all mean the outcome is still unresolved, so the claim (and its scope)
+# must stay exactly where it is.
+_ORDER_STATUS_TO_RELEASED_CLAIM_STATUS = {
+    "FILLED": "BUY_RECONCILED",
+    "CANCELLED": "CANCELLED",
+    "REJECTED": "CANCELLED",
+    "EXPIRED": "CANCELLED",
+}
+
+
+async def release_execution_claim_scope_if_order_resolved(
+    *, db: AsyncSession, live_crypto_order_id: UUID, order_status: str, now: datetime | None = None,
+) -> None:
+    """Called after a live order's status has just been set to an
+    authoritative, reconciliation-confirmed terminal outcome (never a
+    merely-observed, still-ambiguous one). Before this existed, nothing in
+    the codebase ever advanced a claim past SUBMISSION_PENDING /
+    RECONCILIATION_REQUIRED -- so even a genuinely, successfully completed
+    BUY would keep its (campaign_id, campaign_version) execution scope
+    reserved forever, permanently blocking every later, legitimate
+    sequential Controlled Proof exactly like the original
+    claim_concurrency_conflict defect. No-op when the order status is not
+    itself an authoritative terminal outcome, when no claim references this
+    order, or when that claim has already left the nonterminal set
+    (idempotent -- safe to call on every reconciliation pass)."""
+    released_status = _ORDER_STATUS_TO_RELEASED_CLAIM_STATUS.get(order_status)
+    if released_status is None:
+        return
+    claim = await db.scalar(
+        select(AutonomousExecutionClaim).where(AutonomousExecutionClaim.live_order_id == live_crypto_order_id).with_for_update().limit(1)
+    )
+    if claim is None or claim.claim_status not in _CLAIM_SCOPE_NONTERMINAL_STATES:
+        return
+    observed_at = now or _utcnow()
+    before = claim.claim_status
+    claim.claim_status = released_status
+    claim.completed_at = observed_at
+    claim.updated_at = observed_at
+    db.add(AuditLog(
+        actor="system:reconciliation", action="autonomous_execution_claim.scope_released",
+        entity_type="autonomous_execution_claim", entity_id=claim.claim_id,
+        before_state={"claim_status": before},
+        after_state={"claim_status": released_status, "order_status": order_status, "live_crypto_order_id": str(live_crypto_order_id)},
+    ))
+    await db.flush()
+    logger.info(
+        "autonomous_execution_claim_scope_released claim_id=%s live_crypto_order_id=%s campaign_id=%s campaign_version=%s "
+        "previous_claim_status=%s new_claim_status=%s order_status=%s",
+        claim.claim_id, live_crypto_order_id, claim.campaign_id, claim.campaign_version, before, released_status, order_status,
+    )
+
+
 async def advance_claimed_execution(*, db: AsyncSession, claim: AutonomousExecutionClaim) -> None:
-    """Given an already-CLAIMED claim, attempt to prepare and (if live
-    submission is enabled) execute it -- terminalizing on every failure
-    path, expected or not, so a claim this function touches can never be
-    left sitting in CLAIMED. Shared by the normal per-cycle activation path
+    """Given an already-CLAIMED (or EXECUTION_STARTED) claim, attempt to
+    prepare and (if live submission is enabled) execute it -- terminalizing
+    on every failure path, expected or not, so a claim this function
+    touches can never be left sitting in CLAIMED. Shared by the normal
+    per-cycle activation path
     (continuous_pipeline_worker._attempt_automatic_ready_package_creation)
     and sweep_stale_autonomous_execution_claims below -- the only two
     callers of prepare_autonomous_claimed_buy -- so this failure-handling
-    is defined exactly once."""
+    is defined exactly once.
+
+    Guarded as a true no-op for any claim that has already left
+    _CLAIM_SCOPE_NONTERMINAL_STATES. Without this, continuous_pipeline_
+    worker's per-cycle path calls this on every cycle for as long as the
+    package's own package_state stays "ACTIVATED" -- which nothing ever
+    changes, even after the claim itself reaches BUY_RECONCILED -- so a
+    claim already resolved (successfully filled, or dead-ended pre-
+    provider) would otherwise be re-prepared every cycle. That re-
+    preparation would typically fail on activation_not_effective (the
+    short-lived activation window has long since expired by then), which
+    mark_pre_provider_blocked would (before its own guard above) have
+    silently overwritten a genuinely successful BUY_RECONCILED claim's
+    status back to FAILED_PRE_PROVIDER -- corrupting the record of a real,
+    profitable BUY. This guard stops that before prepare_autonomous_
+    claimed_buy is even called."""
+    if claim.claim_status not in _CLAIM_SCOPE_NONTERMINAL_STATES:
+        return
     try:
         prepared = await prepare_autonomous_claimed_buy(db=db, claim_id=claim.claim_id)
     except InvalidRequestError as exc:
@@ -413,18 +564,35 @@ async def sweep_stale_autonomous_execution_claims(*, db: AsyncSession, now: date
     """Recovery pass, deliberately independent of any cycle's decision
     composition. prepare_autonomous_claimed_buy re-derives everything it
     needs from the claim_id alone (package/activation/risk/kill-switch/
-    position state), so a CLAIMED claim can safely be retried here at any
-    time -- this is the only mechanism that revisits a claim once the cycle
-    that originally created it stops recurring (e.g. a Controlled-Proof-
-    forced entry, whose HOLD-override never re-fires once the proof already
-    has a linked entry). Scoped by the same recover_after/claim_status
+    position state), so a CLAIMED or EXECUTION_STARTED claim can safely be
+    retried here at any time -- this is the only mechanism that revisits a
+    claim once the cycle that originally created it stops recurring (e.g. a
+    Controlled-Proof-forced entry, whose HOLD-override never re-fires once
+    the proof already has a linked entry) -- or after a worker crash mid-
+    preparation. EXECUTION_STARTED is included alongside CLAIMED: without
+    it, a crash between prepare_autonomous_claimed_buy's own EXECUTION_
+    STARTED transition and advance_claimed_execution's subsequent submission
+    call would orphan the claim forever (recover_after is set once, at
+    CLAIMED-insert time, and never advanced by the EXECUTION_STARTED
+    transition, so it is still meaningful here) -- permanently reserving
+    its campaign scope, exactly the class of defect this whole fix removes.
+    Re-preparing an EXECUTION_STARTED claim is safe: prepare_autonomous_
+    claimed_buy recognizes its own already-set live_order_id and returns a
+    replayed result rather than re-transitioning anything. SUBMISSION_
+    PENDING and RECONCILIATION_REQUIRED are deliberately excluded -- a
+    provider call has already been made (or may have been); the correct
+    recovery there is reconciliation against the real order, never a blind
+    re-preparation attempt (prepare_autonomous_claimed_buy itself refuses to
+    re-prepare a RECONCILIATION_REQUIRED claim; sweeping it here would
+    misclassify it as failed_pre_provider with provider_call_made=false,
+    which would be false). Scoped by the same recover_after/claim_status
     columns and index (ix_aec_status_recovery) that were already added for
     exactly this purpose but never read anywhere until now. Returns the
     number of claims swept."""
     observed_at = now or _utcnow()
     stale = (await db.scalars(
         select(AutonomousExecutionClaim).where(
-            AutonomousExecutionClaim.claim_status == "CLAIMED",
+            AutonomousExecutionClaim.claim_status.in_(("CLAIMED", "EXECUTION_STARTED")),
             AutonomousExecutionClaim.recover_after.is_not(None),
             AutonomousExecutionClaim.recover_after <= observed_at,
         )
