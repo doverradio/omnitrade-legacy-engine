@@ -15,7 +15,7 @@ operator-issued authorization to attempt exactly one BUY-to-SELL lifecycle
 for one product, up to one notional cap, inside one time window. Rather than
 widening the global switch to let that one proof through, the executor
 (`app/services/orchestration/automatic_package_executor.py`,
-`_authorize_controlled_proof_activation_override`) recognizes the Controlled
+`_resolve_controlled_proof_activation_scope`) recognizes the Controlled
 Proof's own authority and grants a narrow, package-scoped override -- only
 for the one package genuinely linked to that one proof, only while every
 invariant below holds, re-verified fresh against the database on every call.
@@ -23,6 +23,41 @@ invariant below holds, re-verified fresh against the database on every call.
 Ordinary automatic packages (no Controlled Proof linkage) are unaffected:
 they remain governed solely by `AUTOMATIC_MANDATE_PACKAGE_ACTIVATION_ENABLED`,
 exactly as before this change.
+
+### Resolved activation scope (fixes `automatic_activation_scope_incomplete`)
+
+The first version of this override still let the *downstream* scope
+resolution read from the legacy global selector settings
+(`AUTOMATIC_MANDATE_PACKAGE_ACTIVATION_CAMPAIGN_ID/_CAMPAIGN_VERSION/_MANDATE_ID/_MANDATE_VERSION_ID`)
+unconditionally, even after granting a Controlled Proof override -- so a
+partially-configured global selector (as production actually had:
+`campaign_id`/`mandate_id` set, `campaign_version`/`mandate_version_id`
+unset) still failed the whole request closed with
+`automatic_activation_scope_incomplete`, before the already-resolved
+package was ever used. `execute_automatic_ready_package_through_activation`
+now resolves one `ResolvedAutomaticActivationScope` exactly once, from
+exactly one source, before ever touching the global selector settings:
+
+- **`CONTROLLED_PROOF_DERIVED_SCOPE`** -- whenever `_resolve_controlled_proof_activation_scope`
+  grants an override, `package_id`, `campaign_id`, `campaign_version`,
+  `mandate_id`, `mandate_version_id`, and `mandate_evaluation_id` are taken
+  directly off that exact, already-validated `CanonicalPreviewPackage` row
+  -- never off settings, never off a statically pinned package ID (every
+  Controlled Proof creates a fresh package). The legacy global selector
+  settings are not consulted at all in this mode, so a partially- or
+  differently-configured global selector (including a pinned
+  `automatic_mandate_package_activation_package_id` pointing at an unrelated
+  package) can never redirect or block it.
+- **`GLOBAL_CONFIGURED_SCOPE`** -- unchanged: ordinary automatic packages
+  resolve scope from settings exactly as before (unrestricted when all four
+  are unset, `automatic_activation_scope_incomplete` when only some are
+  set, `automatic_activation_campaign_scope_mismatch`/
+  `automatic_activation_mandate_scope_mismatch` when fully set but
+  mismatched).
+
+Both modes then feed the identical, unmodified package-fetch and
+authorize/dry-run/activate state machine -- the state machine itself is not
+duplicated.
 
 ## Fail-closed conditions
 
@@ -110,6 +145,7 @@ automatic_package_identity_bundle ... package_creation_eligible=True
 automatic_ready_package_created
 controlled_proof_activation_override_evaluated
 controlled_proof_activation_override_allowed
+automatic_activation_scope_resolved authority_mode=CONTROLLED_PROOF_DERIVED_SCOPE
 automatic_package_authorization_started
 automatic_package_authorized_under_mandate
 automatic_package_dry_run_passed

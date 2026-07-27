@@ -78,7 +78,7 @@ def _mandate_ids() -> dict:
     return {"mandate_id": uuid.uuid4(), "mandate_version_id": uuid.uuid4(), "mandate_evaluation_id": uuid.uuid4()}
 
 
-# --- _authorize_controlled_proof_activation_override -----------------------------------
+# --- _resolve_controlled_proof_activation_scope -----------------------------------
 
 @pytest.mark.asyncio
 async def test_override_allowed_when_all_invariants_pass() -> None:
@@ -91,9 +91,13 @@ async def test_override_allowed_when_all_invariants_pass() -> None:
             campaign_id=campaign_id, campaign_version=campaign_version,
             decision_record_id=package.decision_record_id, package_id=package.package_id,
         )
-        authority = await executor._authorize_controlled_proof_activation_override(db=session, request=request)
-        assert authority is not None
-        assert authority.proof_id == proof.proof_id
+        scope = await executor._resolve_controlled_proof_activation_scope(db=session, request=request)
+        assert scope is not None
+        assert scope.controlled_proof_id == proof.proof_id
+        assert scope.package_id == package.package_id
+        assert scope.campaign_id == campaign_id
+        assert scope.campaign_version == campaign_version
+        assert scope.authority_mode == "CONTROLLED_PROOF_DERIVED_SCOPE"
 
 
 @pytest.mark.asyncio
@@ -105,7 +109,7 @@ async def test_override_blocked_when_no_controlled_proof_linkage() -> None:
             campaign_id=campaign_id, campaign_version=campaign_version,
             decision_record_id=package.decision_record_id, package_id=package.package_id,
         )
-        authority = await executor._authorize_controlled_proof_activation_override(db=session, request=request)
+        authority = await executor._resolve_controlled_proof_activation_scope(db=session, request=request)
         assert authority is None
 
 
@@ -119,7 +123,7 @@ async def test_override_blocked_when_product_mismatched() -> None:
             campaign_id=campaign_id, campaign_version=campaign_version,
             decision_record_id=package.decision_record_id, package_id=package.package_id,
         )
-        authority = await executor._authorize_controlled_proof_activation_override(db=session, request=request)
+        authority = await executor._resolve_controlled_proof_activation_scope(db=session, request=request)
         assert authority is None
 
 
@@ -133,7 +137,7 @@ async def test_override_blocked_when_campaign_scope_mismatched() -> None:
             campaign_id=campaign_id, campaign_version=campaign_version,
             decision_record_id=package.decision_record_id, package_id=package.package_id,
         )
-        authority = await executor._authorize_controlled_proof_activation_override(db=session, request=request)
+        authority = await executor._resolve_controlled_proof_activation_scope(db=session, request=request)
         assert authority is None
 
 
@@ -150,7 +154,7 @@ async def test_override_blocked_when_proof_is_expired() -> None:
             campaign_id=campaign_id, campaign_version=campaign_version,
             decision_record_id=package.decision_record_id, package_id=package.package_id,
         )
-        authority = await executor._authorize_controlled_proof_activation_override(db=session, request=request)
+        authority = await executor._resolve_controlled_proof_activation_scope(db=session, request=request)
         assert authority is None
 
 
@@ -167,7 +171,7 @@ async def test_override_blocked_when_proof_is_cancelled() -> None:
             campaign_id=campaign_id, campaign_version=campaign_version,
             decision_record_id=package.decision_record_id, package_id=package.package_id,
         )
-        authority = await executor._authorize_controlled_proof_activation_override(db=session, request=request)
+        authority = await executor._resolve_controlled_proof_activation_scope(db=session, request=request)
         assert authority is None
 
 
@@ -185,7 +189,7 @@ async def test_override_blocked_for_every_non_active_proof_status(terminal_statu
             campaign_id=campaign_id, campaign_version=campaign_version,
             decision_record_id=package.decision_record_id, package_id=package.package_id,
         )
-        authority = await executor._authorize_controlled_proof_activation_override(db=session, request=request)
+        authority = await executor._resolve_controlled_proof_activation_scope(db=session, request=request)
         assert authority is None
 
 
@@ -200,7 +204,54 @@ async def test_override_blocked_when_evidence_incomplete() -> None:
             campaign_id=campaign_id, campaign_version=campaign_version,
             decision_record_id=package.decision_record_id, package_id=package.package_id,
         )
-        authority = await executor._authorize_controlled_proof_activation_override(db=session, request=request)
+        authority = await executor._resolve_controlled_proof_activation_scope(db=session, request=request)
+        assert authority is None
+
+
+@pytest.mark.asyncio
+async def test_override_blocked_when_only_mandate_version_id_missing() -> None:
+    async with _real_session() as session:
+        campaign_id, campaign_version = uuid.uuid4(), 1
+        ids = _mandate_ids()
+        ids["mandate_version_id"] = None
+        package = await _make_package(db=session, campaign_id=campaign_id, campaign_version=campaign_version, **ids)
+        await _make_proof(db=session, campaign_id=campaign_id, campaign_version=campaign_version, package_id=package.package_id)
+        request = executor.AutomaticPackageExecutionRequest(
+            campaign_id=campaign_id, campaign_version=campaign_version,
+            decision_record_id=package.decision_record_id, package_id=package.package_id,
+        )
+        authority = await executor._resolve_controlled_proof_activation_scope(db=session, request=request)
+        assert authority is None
+
+
+@pytest.mark.asyncio
+async def test_override_blocked_when_only_mandate_evaluation_id_missing() -> None:
+    async with _real_session() as session:
+        campaign_id, campaign_version = uuid.uuid4(), 1
+        ids = _mandate_ids()
+        ids["mandate_evaluation_id"] = None
+        package = await _make_package(db=session, campaign_id=campaign_id, campaign_version=campaign_version, **ids)
+        await _make_proof(db=session, campaign_id=campaign_id, campaign_version=campaign_version, package_id=package.package_id)
+        request = executor.AutomaticPackageExecutionRequest(
+            campaign_id=campaign_id, campaign_version=campaign_version,
+            decision_record_id=package.decision_record_id, package_id=package.package_id,
+        )
+        authority = await executor._resolve_controlled_proof_activation_scope(db=session, request=request)
+        assert authority is None
+
+
+@pytest.mark.asyncio
+async def test_override_blocked_when_decision_record_id_mismatched() -> None:
+    async with _real_session() as session:
+        campaign_id, campaign_version = uuid.uuid4(), 1
+        package = await _make_package(db=session, campaign_id=campaign_id, campaign_version=campaign_version, **_mandate_ids())
+        await _make_proof(db=session, campaign_id=campaign_id, campaign_version=campaign_version, package_id=package.package_id)
+        request = executor.AutomaticPackageExecutionRequest(
+            campaign_id=campaign_id, campaign_version=campaign_version,
+            decision_record_id=uuid.uuid4(),  # Deliberately not package.decision_record_id.
+            package_id=package.package_id,
+        )
+        authority = await executor._resolve_controlled_proof_activation_scope(db=session, request=request)
         assert authority is None
 
 
@@ -220,7 +271,7 @@ async def test_override_blocked_when_approved_notional_exceeds_proof_maximum() -
             campaign_id=campaign_id, campaign_version=campaign_version,
             decision_record_id=package.decision_record_id, package_id=package.package_id,
         )
-        authority = await executor._authorize_controlled_proof_activation_override(db=session, request=request)
+        authority = await executor._resolve_controlled_proof_activation_scope(db=session, request=request)
         assert authority is None
 
 
@@ -244,7 +295,7 @@ async def test_override_blocked_when_provider_or_environment_mismatched() -> Non
             campaign_id=campaign_id, campaign_version=campaign_version,
             decision_record_id=package.decision_record_id, package_id=package.package_id,
         )
-        authority = await executor._authorize_controlled_proof_activation_override(db=session, request=request)
+        authority = await executor._resolve_controlled_proof_activation_scope(db=session, request=request)
         assert authority is None
 
 
@@ -264,7 +315,7 @@ async def test_override_blocked_when_buy_package_already_has_live_capital_eviden
             campaign_id=campaign_id, campaign_version=campaign_version,
             decision_record_id=package.decision_record_id, package_id=package.package_id,
         )
-        authority = await executor._authorize_controlled_proof_activation_override(db=session, request=request)
+        authority = await executor._resolve_controlled_proof_activation_scope(db=session, request=request)
         assert authority is None
 
 
@@ -286,7 +337,7 @@ async def test_override_blocked_when_sell_package_already_has_live_capital_evide
             campaign_id=campaign_id, campaign_version=campaign_version,
             decision_record_id=sell_package.decision_record_id, package_id=sell_package.package_id,
         )
-        authority = await executor._authorize_controlled_proof_activation_override(db=session, request=request)
+        authority = await executor._resolve_controlled_proof_activation_scope(db=session, request=request)
         assert authority is None
 
 
@@ -310,7 +361,7 @@ async def test_override_allowed_for_already_activated_replay_despite_live_capita
             campaign_id=campaign_id, campaign_version=campaign_version,
             decision_record_id=package.decision_record_id, package_id=package.package_id,
         )
-        authority = await executor._authorize_controlled_proof_activation_override(db=session, request=request)
+        authority = await executor._resolve_controlled_proof_activation_scope(db=session, request=request)
         assert authority is not None
 
 
@@ -320,7 +371,7 @@ async def test_override_blocked_when_request_has_no_package_id() -> None:
         request = executor.AutomaticPackageExecutionRequest(
             campaign_id=uuid.uuid4(), campaign_version=1, decision_record_id=uuid.uuid4(), package_id=None,
         )
-        authority = await executor._authorize_controlled_proof_activation_override(db=session, request=request)
+        authority = await executor._resolve_controlled_proof_activation_scope(db=session, request=request)
         assert authority is None
 
 
@@ -387,6 +438,235 @@ async def test_full_executor_progresses_controlled_proof_package_through_activat
         assert outcome.activation_state == "ACTIVATED"
         assert outcome.final_reason_code == "activated_under_mandate"
         assert outcome.failed_closed is False
+        # Regression: package_id/mandate_id must reflect the real,
+        # already-resolved package -- never None from an early return that
+        # discarded the package the override itself had already loaded.
+        assert outcome.package_id == package.package_id
+        assert outcome.mandate_id == package.mandate_id
+
+
+def _partially_configured_settings() -> SimpleNamespace:
+    """The exact production shape that produced automatic_activation_scope_
+    incomplete: the global boolean is off (so Controlled Proof packages
+    still need the override), and the legacy global selector settings are
+    only partially populated -- campaign_id/mandate_id set, campaign_version/
+    mandate_version_id left None. Before the fix, execute_automatic_ready_
+    package_through_activation read this settings-derived scope
+    unconditionally, even for an already-authorized Controlled Proof
+    package, and failed closed before ever resolving a package."""
+    return SimpleNamespace(
+        automatic_mandate_package_activation_enabled=False,
+        automatic_mandate_package_activation_package_id=None,
+        automatic_mandate_package_activation_campaign_id=uuid.uuid4(),
+        automatic_mandate_package_activation_campaign_version=None,
+        automatic_mandate_package_activation_mandate_id=uuid.uuid4(),
+        automatic_mandate_package_activation_mandate_version_id=None,
+    )
+
+
+@pytest.mark.asyncio
+async def test_full_executor_controlled_proof_package_activates_despite_incomplete_global_selectors(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Reproduces the production regression directly: a valid Controlled
+    Proof package must derive its own scope from the package/proof, never
+    fall through to (or be blocked by) the legacy global selector settings
+    -- even when those settings are only partially configured."""
+    monkeypatch.setattr(executor, "get_settings", _partially_configured_settings)
+
+    async def _fake_authorize(*, db, request):
+        package = await db.get(CanonicalPreviewPackage, request.package_id)
+        package.package_state = "AUTHORIZED"
+        package.authorization_source = "MANDATE"
+
+    async def _fake_dry_run(*, db, request):
+        package = await db.get(CanonicalPreviewPackage, request.package_id)
+        package.package_state = "DRY_RUN_PASSED"
+        package.dry_run_live_crypto_order_id = uuid.uuid4()
+
+    async def _fake_activate(*, db, request):
+        package = await db.get(CanonicalPreviewPackage, request.package_id)
+        package.package_state = "ACTIVATED"
+
+    monkeypatch.setattr(executor, "authorize_canonical_preview_package_under_mandate", _fake_authorize)
+    monkeypatch.setattr(executor, "run_dry_run_for_canonical_preview_package", _fake_dry_run)
+    monkeypatch.setattr(executor, "activate_canonical_proving_campaign", _fake_activate)
+
+    async with _real_session() as session:
+        campaign_id, campaign_version = uuid.uuid4(), 3
+        package = await _make_package(
+            db=session, campaign_id=campaign_id, campaign_version=campaign_version, package_state="READY",
+            **_mandate_ids(),
+        )
+        await _make_proof(db=session, campaign_id=campaign_id, campaign_version=campaign_version, package_id=package.package_id)
+
+        outcome = await executor.execute_automatic_ready_package_through_activation(
+            db=session,
+            request=executor.AutomaticPackageExecutionRequest(
+                campaign_id=campaign_id, campaign_version=campaign_version,
+                decision_record_id=package.decision_record_id, package_id=package.package_id,
+            ),
+        )
+
+        assert outcome.final_reason_code == "activated_under_mandate"
+        assert outcome.activation_state == "ACTIVATED"
+        assert outcome.failed_closed is False
+        assert outcome.package_id == package.package_id
+        assert outcome.mandate_id == package.mandate_id
+
+
+@pytest.mark.asyncio
+async def test_full_executor_conflicting_global_package_selector_cannot_redirect_controlled_proof_package(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A statically pinned automatic_mandate_package_activation_package_id
+    (pointing at some unrelated package) must never redirect or block a
+    genuinely Controlled-Proof-authorized package -- Controlled Proof scope
+    resolution bypasses the global pin entirely."""
+    other_pinned_package_id = uuid.uuid4()
+    monkeypatch.setattr(
+        executor, "get_settings",
+        lambda: SimpleNamespace(
+            automatic_mandate_package_activation_enabled=False,
+            automatic_mandate_package_activation_package_id=other_pinned_package_id,
+            automatic_mandate_package_activation_campaign_id=None,
+            automatic_mandate_package_activation_campaign_version=None,
+            automatic_mandate_package_activation_mandate_id=None,
+            automatic_mandate_package_activation_mandate_version_id=None,
+        ),
+    )
+
+    async def _fake_authorize(*, db, request):
+        package = await db.get(CanonicalPreviewPackage, request.package_id)
+        package.package_state = "AUTHORIZED"
+        package.authorization_source = "MANDATE"
+
+    async def _fake_dry_run(*, db, request):
+        package = await db.get(CanonicalPreviewPackage, request.package_id)
+        package.package_state = "DRY_RUN_PASSED"
+        package.dry_run_live_crypto_order_id = uuid.uuid4()
+
+    async def _fake_activate(*, db, request):
+        package = await db.get(CanonicalPreviewPackage, request.package_id)
+        package.package_state = "ACTIVATED"
+
+    monkeypatch.setattr(executor, "authorize_canonical_preview_package_under_mandate", _fake_authorize)
+    monkeypatch.setattr(executor, "run_dry_run_for_canonical_preview_package", _fake_dry_run)
+    monkeypatch.setattr(executor, "activate_canonical_proving_campaign", _fake_activate)
+
+    async with _real_session() as session:
+        campaign_id, campaign_version = uuid.uuid4(), 1
+        package = await _make_package(
+            db=session, campaign_id=campaign_id, campaign_version=campaign_version, package_state="READY",
+            **_mandate_ids(),
+        )
+        await _make_proof(db=session, campaign_id=campaign_id, campaign_version=campaign_version, package_id=package.package_id)
+
+        outcome = await executor.execute_automatic_ready_package_through_activation(
+            db=session,
+            request=executor.AutomaticPackageExecutionRequest(
+                campaign_id=campaign_id, campaign_version=campaign_version,
+                decision_record_id=package.decision_record_id, package_id=package.package_id,
+            ),
+        )
+
+        assert outcome.activation_state == "ACTIVATED"
+        assert outcome.package_id == package.package_id
+
+
+@pytest.mark.asyncio
+async def test_full_executor_idempotent_replay_when_package_already_activated_and_global_scope_incomplete(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(executor, "get_settings", _partially_configured_settings)
+
+    async def _validate(**kwargs):
+        return None
+
+    monkeypatch.setattr(executor, "_validate_canonical_package_authority", _validate)
+
+    async with _real_session() as session:
+        campaign_id, campaign_version = uuid.uuid4(), 1
+        package = await _make_package(
+            db=session, campaign_id=campaign_id, campaign_version=campaign_version, package_state="ACTIVATED",
+            **_mandate_ids(),
+        )
+        await _make_proof(
+            db=session, campaign_id=campaign_id, campaign_version=campaign_version, package_id=package.package_id,
+            buy_live_crypto_order_id=uuid.uuid4(),
+        )
+
+        outcome = await executor.execute_automatic_ready_package_through_activation(
+            db=session,
+            request=executor.AutomaticPackageExecutionRequest(
+                campaign_id=campaign_id, campaign_version=campaign_version,
+                decision_record_id=package.decision_record_id, package_id=package.package_id,
+            ),
+        )
+
+        assert outcome.final_reason_code == "already_activated"
+        assert outcome.replayed is True
+        assert outcome.activation_state == "ACTIVATED"
+        assert outcome.package_id == package.package_id
+
+
+@pytest.mark.asyncio
+async def test_full_executor_sequential_progression_activates_exactly_once(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Proxy for the concurrent-progression-exactly-once requirement: the
+    real race-safety mechanism is the row lock taken on both the
+    ControlledProofRun and the CanonicalPreviewPackage rows, which a single
+    shared sqlite connection cannot exercise as true concurrency (see this
+    file's other documented sqlite-limitation notes) -- so this instead
+    proves the invariant those locks exist to protect: repeated calls
+    against an already-ACTIVATED package never re-run authorize/dry-run/
+    activate a second time."""
+    monkeypatch.setattr(executor, "get_settings", _disabled_settings)
+    calls: list[str] = []
+
+    async def _fake_authorize(*, db, request):
+        calls.append("authorize")
+        package = await db.get(CanonicalPreviewPackage, request.package_id)
+        package.package_state = "AUTHORIZED"
+        package.authorization_source = "MANDATE"
+
+    async def _fake_dry_run(*, db, request):
+        calls.append("dry_run")
+        package = await db.get(CanonicalPreviewPackage, request.package_id)
+        package.package_state = "DRY_RUN_PASSED"
+        package.dry_run_live_crypto_order_id = uuid.uuid4()
+
+    async def _fake_activate(*, db, request):
+        calls.append("activate")
+        package = await db.get(CanonicalPreviewPackage, request.package_id)
+        package.package_state = "ACTIVATED"
+
+    async def _validate(**kwargs):
+        return None
+
+    monkeypatch.setattr(executor, "authorize_canonical_preview_package_under_mandate", _fake_authorize)
+    monkeypatch.setattr(executor, "run_dry_run_for_canonical_preview_package", _fake_dry_run)
+    monkeypatch.setattr(executor, "activate_canonical_proving_campaign", _fake_activate)
+    monkeypatch.setattr(executor, "_validate_canonical_package_authority", _validate)
+
+    async with _real_session() as session:
+        campaign_id, campaign_version = uuid.uuid4(), 1
+        package = await _make_package(
+            db=session, campaign_id=campaign_id, campaign_version=campaign_version, package_state="READY",
+            **_mandate_ids(),
+        )
+        await _make_proof(db=session, campaign_id=campaign_id, campaign_version=campaign_version, package_id=package.package_id)
+        request = executor.AutomaticPackageExecutionRequest(
+            campaign_id=campaign_id, campaign_version=campaign_version,
+            decision_record_id=package.decision_record_id, package_id=package.package_id,
+        )
+
+        first = await executor.execute_automatic_ready_package_through_activation(db=session, request=request)
+        second = await executor.execute_automatic_ready_package_through_activation(db=session, request=request)
+
+        assert calls == ["authorize", "dry_run", "activate"]
+        assert first.activation_state == "ACTIVATED" and first.final_reason_code == "activated_under_mandate"
+        assert second.activation_state == "ACTIVATED" and second.final_reason_code == "already_activated"
+        assert second.replayed is True
 
 
 @pytest.mark.asyncio

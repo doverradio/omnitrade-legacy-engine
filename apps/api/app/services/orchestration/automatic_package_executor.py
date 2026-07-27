@@ -26,6 +26,31 @@ logger = logging.getLogger(__name__)
 
 _PROGRESSABLE_STATES = {"READY", "AUTHORIZED", "DRY_RUN_PASSED", "ACTIVATED"}
 
+_AUTHORITY_MODE_GLOBAL_CONFIGURED = "GLOBAL_CONFIGURED_SCOPE"
+_AUTHORITY_MODE_CONTROLLED_PROOF_DERIVED = "CONTROLLED_PROOF_DERIVED_SCOPE"
+
+
+@dataclass(frozen=True, slots=True)
+class ResolvedAutomaticActivationScope:
+    """The one authoritative scope execute_automatic_ready_package_through_activation
+    progresses a package under -- resolved exactly once, from exactly one
+    source per call (never a mix): either the operator's globally-pinned
+    settings (ordinary automation), or a specific Controlled Proof's own
+    persisted, already-validated package (authority_mode records which).
+    Every field here is a real, persisted value -- never a caller-supplied
+    or reconstructed one -- so a conflicting global selector setting can
+    never redirect a Controlled-Proof-derived scope to a different package
+    or mandate."""
+
+    package_id: uuid.UUID
+    campaign_id: uuid.UUID
+    campaign_version: int
+    mandate_id: uuid.UUID
+    mandate_version_id: uuid.UUID
+    mandate_evaluation_id: uuid.UUID
+    authority_mode: str
+    controlled_proof_id: uuid.UUID | None
+
 
 @dataclass(frozen=True, slots=True)
 class AutomaticPackageExecutionRequest:
@@ -96,9 +121,9 @@ def _outcome(
     )
 
 
-async def _authorize_controlled_proof_activation_override(
+async def _resolve_controlled_proof_activation_scope(
     *, db: AsyncSession, request: AutomaticPackageExecutionRequest,
-) -> ControlledProofRun | None:
+) -> ResolvedAutomaticActivationScope | None:
     """When the global automatic_mandate_package_activation_enabled feature
     is off, a package created under an explicit, currently-active
     Controlled Proof may still receive a narrow, package-scoped activation
@@ -109,13 +134,14 @@ async def _authorize_controlled_proof_activation_override(
     activation for every package the campaign ever produces. Every
     invariant below is re-verified fresh against the DB on every call --
     never cached, never assumed from an earlier check in this same
-    request -- and returns the authorizing (row-locked) ControlledProofRun
-    only when all of them hold. Returns None, with one precise logged
-    reason, otherwise; callers must treat that exactly like "the global
-    feature is disabled", never as a softer outcome. Ordinary automatic
-    packages (no Controlled Proof linkage at all) always resolve to None
-    here and remain governed solely by the existing global feature flag,
-    unchanged."""
+    request -- and returns a ResolvedAutomaticActivationScope built
+    exclusively from this exact package's own persisted fields (never from
+    global settings) only when all of them hold. Returns None, with one
+    precise logged reason, otherwise; callers must treat that exactly like
+    "the global feature is disabled", never as a softer outcome. Ordinary
+    automatic packages (no Controlled Proof linkage at all) always resolve
+    to None here and remain governed solely by the existing global feature
+    flag, unchanged."""
     logger.info(
         "controlled_proof_activation_override_evaluated campaign_id=%s campaign_version=%s decision_record_id=%s package_id=%s",
         request.campaign_id, request.campaign_version, request.decision_record_id, request.package_id,
@@ -125,12 +151,20 @@ async def _authorize_controlled_proof_activation_override(
             "controlled_proof_activation_override_blocked campaign_id=%s campaign_version=%s decision_record_id=%s package_id=None controlled_proof_id=None reason=no_package_identity",
             request.campaign_id, request.campaign_version, request.decision_record_id,
         )
+        logger.info(
+            "automatic_activation_scope_blocked authority_mode=%s controlled_proof_id=None package_id=None reason=no_package_identity",
+            _AUTHORITY_MODE_CONTROLLED_PROOF_DERIVED,
+        )
         return None
     package = await db.get(CanonicalPreviewPackage, request.package_id)
     if package is None:
         logger.info(
             "controlled_proof_activation_override_blocked campaign_id=%s campaign_version=%s decision_record_id=%s package_id=%s controlled_proof_id=None reason=package_missing",
             request.campaign_id, request.campaign_version, request.decision_record_id, request.package_id,
+        )
+        logger.info(
+            "automatic_activation_scope_blocked authority_mode=%s controlled_proof_id=None package_id=%s reason=package_missing",
+            _AUTHORITY_MODE_CONTROLLED_PROOF_DERIVED, request.package_id,
         )
         return None
 
@@ -152,12 +186,20 @@ async def _authorize_controlled_proof_activation_override(
             "controlled_proof_activation_override_blocked campaign_id=%s campaign_version=%s decision_record_id=%s package_id=%s controlled_proof_id=None reason=no_controlled_proof_linkage",
             request.campaign_id, request.campaign_version, request.decision_record_id, package.package_id,
         )
+        logger.info(
+            "automatic_activation_scope_blocked authority_mode=%s controlled_proof_id=None package_id=%s reason=no_controlled_proof_linkage",
+            _AUTHORITY_MODE_CONTROLLED_PROOF_DERIVED, package.package_id,
+        )
         return None
 
     def _blocked(reason: str) -> None:
         logger.info(
             "controlled_proof_activation_override_blocked campaign_id=%s campaign_version=%s decision_record_id=%s package_id=%s controlled_proof_id=%s reason=%s",
             request.campaign_id, request.campaign_version, request.decision_record_id, package.package_id, proof.proof_id, reason,
+        )
+        logger.info(
+            "automatic_activation_scope_blocked authority_mode=%s controlled_proof_id=%s package_id=%s reason=%s",
+            _AUTHORITY_MODE_CONTROLLED_PROOF_DERIVED, proof.proof_id, package.package_id, reason,
         )
         return None
 
@@ -180,6 +222,8 @@ async def _authorize_controlled_proof_activation_override(
         return _blocked("controlled_proof_product_mismatch")
     if package.campaign_id != proof.campaign_id or package.campaign_version != proof.campaign_version:
         return _blocked("controlled_proof_campaign_scope_mismatch")
+    if package.decision_record_id != request.decision_record_id:
+        return _blocked("controlled_proof_decision_record_mismatch")
     if (
         package.decision_record_id is None
         or package.risk_event_id is None
@@ -212,7 +256,22 @@ async def _authorize_controlled_proof_activation_override(
         request.campaign_id, request.campaign_version, request.decision_record_id, package.package_id,
         proof.proof_id, proof.product_id, proof.provider, proof.environment,
     )
-    return proof
+    scope = ResolvedAutomaticActivationScope(
+        package_id=package.package_id,
+        campaign_id=package.campaign_id,
+        campaign_version=package.campaign_version,
+        mandate_id=package.mandate_id,
+        mandate_version_id=package.mandate_version_id,
+        mandate_evaluation_id=package.mandate_evaluation_id,
+        authority_mode=_AUTHORITY_MODE_CONTROLLED_PROOF_DERIVED,
+        controlled_proof_id=proof.proof_id,
+    )
+    logger.info(
+        "automatic_activation_scope_resolved authority_mode=%s controlled_proof_id=%s package_id=%s campaign_id=%s campaign_version=%s mandate_id=%s mandate_version_id=%s mandate_evaluation_id=%s",
+        scope.authority_mode, scope.controlled_proof_id, scope.package_id, scope.campaign_id,
+        scope.campaign_version, scope.mandate_id, scope.mandate_version_id, scope.mandate_evaluation_id,
+    )
+    return scope
 
 
 async def execute_automatic_ready_package_through_activation(
@@ -221,10 +280,10 @@ async def execute_automatic_ready_package_through_activation(
     request: AutomaticPackageExecutionRequest,
 ) -> AutomaticPackageExecutionOutcome:
     settings = get_settings()
-    controlled_proof_authority: ControlledProofRun | None = None
+    controlled_proof_scope: ResolvedAutomaticActivationScope | None = None
     if not settings.automatic_mandate_package_activation_enabled:
         try:
-            controlled_proof_authority = await _authorize_controlled_proof_activation_override(db=db, request=request)
+            controlled_proof_scope = await _resolve_controlled_proof_activation_scope(db=db, request=request)
         except Exception:
             # An unexpected failure while resolving Controlled Proof
             # authority must fail closed exactly like "the global feature
@@ -234,42 +293,63 @@ async def execute_automatic_ready_package_through_activation(
                 "controlled_proof_activation_override_evaluation_failed campaign_id=%s campaign_version=%s decision_record_id=%s package_id=%s",
                 request.campaign_id, request.campaign_version, request.decision_record_id, request.package_id,
             )
-            controlled_proof_authority = None
-        if controlled_proof_authority is None:
+            controlled_proof_scope = None
+        if controlled_proof_scope is None:
             logger.info(
                 "automatic_package_progression_skipped campaign_id=%s campaign_version=%s decision_record_id=%s package_id=%s reason=feature_disabled failed_closed=False",
                 request.campaign_id, request.campaign_version, request.decision_record_id, request.package_id,
             )
             return _outcome(request=request, package=None, reason="automatic_mandate_package_activation_disabled")
 
-    scope_values = {
-        "campaign_id": getattr(settings, "automatic_mandate_package_activation_campaign_id", None),
-        "campaign_version": getattr(settings, "automatic_mandate_package_activation_campaign_version", None),
-        "mandate_id": getattr(settings, "automatic_mandate_package_activation_mandate_id", None),
-        "mandate_version_id": getattr(settings, "automatic_mandate_package_activation_mandate_version_id", None),
-    }
-    configured_scope = [value is not None for value in scope_values.values()]
-    if any(configured_scope) and not all(configured_scope):
-        return _outcome(request=request, package=None, reason="automatic_activation_scope_incomplete", failed_closed=True)
-    if all(configured_scope) and (
-        request.campaign_id != scope_values["campaign_id"]
-        or request.campaign_version != scope_values["campaign_version"]
-    ):
-        return _outcome(request=request, package=None, reason="automatic_activation_campaign_scope_mismatch", failed_closed=True)
+    mandate_scope: tuple[uuid.UUID, uuid.UUID] | None
+    if controlled_proof_scope is not None:
+        # CONTROLLED_PROOF_DERIVED_SCOPE: package identity and mandate scope
+        # come exclusively from the already-resolved, persisted scope --
+        # never from global settings. No global selector (including any
+        # pinned automatic_mandate_package_activation_package_id) can
+        # redirect a Controlled-Proof-authorized package to a different
+        # package or mandate, and no statically configured package ID is
+        # required -- a fresh package_id is derived per Controlled Proof.
+        resolved_package_id: uuid.UUID | None = controlled_proof_scope.package_id
+        mandate_scope = (controlled_proof_scope.mandate_id, controlled_proof_scope.mandate_version_id)
+    else:
+        scope_values = {
+            "campaign_id": getattr(settings, "automatic_mandate_package_activation_campaign_id", None),
+            "campaign_version": getattr(settings, "automatic_mandate_package_activation_campaign_version", None),
+            "mandate_id": getattr(settings, "automatic_mandate_package_activation_mandate_id", None),
+            "mandate_version_id": getattr(settings, "automatic_mandate_package_activation_mandate_version_id", None),
+        }
+        configured_scope = [value is not None for value in scope_values.values()]
+        if any(configured_scope) and not all(configured_scope):
+            return _outcome(request=request, package=None, reason="automatic_activation_scope_incomplete", failed_closed=True)
+        if all(configured_scope) and (
+            request.campaign_id != scope_values["campaign_id"]
+            or request.campaign_version != scope_values["campaign_version"]
+        ):
+            return _outcome(request=request, package=None, reason="automatic_activation_campaign_scope_mismatch", failed_closed=True)
 
-    pinned_package_id = getattr(settings, "automatic_mandate_package_activation_package_id", None)
-    if pinned_package_id is not None and request.package_id not in {None, pinned_package_id}:
-        logger.warning(
-            "automatic_package_progression_failed_closed campaign_id=%s campaign_version=%s decision_record_id=%s package_id=%s pinned_package_id=%s reason=proof_package_pin_mismatch failed_closed=True",
-            request.campaign_id, request.campaign_version, request.decision_record_id,
-            request.package_id, pinned_package_id,
-        )
-        return _outcome(
-            request=request,
-            package=None,
-            reason="proof_package_pin_mismatch",
-            failed_closed=True,
-        )
+        pinned_package_id = getattr(settings, "automatic_mandate_package_activation_package_id", None)
+        if pinned_package_id is not None and request.package_id not in {None, pinned_package_id}:
+            logger.warning(
+                "automatic_package_progression_failed_closed campaign_id=%s campaign_version=%s decision_record_id=%s package_id=%s pinned_package_id=%s reason=proof_package_pin_mismatch failed_closed=True",
+                request.campaign_id, request.campaign_version, request.decision_record_id,
+                request.package_id, pinned_package_id,
+            )
+            return _outcome(
+                request=request,
+                package=None,
+                reason="proof_package_pin_mismatch",
+                failed_closed=True,
+            )
+
+        resolved_package_id = request.package_id or pinned_package_id
+        mandate_scope = (scope_values["mandate_id"], scope_values["mandate_version_id"]) if all(configured_scope) else None
+        if all(configured_scope):
+            logger.info(
+                "automatic_activation_scope_resolved authority_mode=%s controlled_proof_id=None package_id=%s campaign_id=%s campaign_version=%s mandate_id=%s mandate_version_id=%s mandate_evaluation_id=None",
+                _AUTHORITY_MODE_GLOBAL_CONFIGURED, resolved_package_id, scope_values["campaign_id"],
+                scope_values["campaign_version"], scope_values["mandate_id"], scope_values["mandate_version_id"],
+            )
 
     statement = select(CanonicalPreviewPackage).where(
         CanonicalPreviewPackage.campaign_id == request.campaign_id,
@@ -277,7 +357,6 @@ async def execute_automatic_ready_package_through_activation(
         CanonicalPreviewPackage.decision_record_id == request.decision_record_id,
         CanonicalPreviewPackage.package_state.in_(_PROGRESSABLE_STATES),
     )
-    resolved_package_id = request.package_id or pinned_package_id
     if resolved_package_id is not None:
         statement = statement.where(CanonicalPreviewPackage.package_id == resolved_package_id)
     rows = list((await db.execute(statement.order_by(CanonicalPreviewPackage.generated_at.desc()).limit(2).with_for_update())).scalars().all())
@@ -291,10 +370,7 @@ async def execute_automatic_ready_package_through_activation(
     package = rows[0]
     starting_state = package.package_state
 
-    if all(configured_scope) and (
-        package.mandate_id != scope_values["mandate_id"]
-        or package.mandate_version_id != scope_values["mandate_version_id"]
-    ):
+    if mandate_scope is not None and (package.mandate_id, package.mandate_version_id) != mandate_scope:
         return _outcome(
             request=request, package=package, reason="automatic_activation_mandate_scope_mismatch",
             failed_closed=True, starting_state=starting_state,
