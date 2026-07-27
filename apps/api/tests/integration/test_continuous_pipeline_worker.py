@@ -1093,13 +1093,13 @@ async def test_expired_activation_at_prepare_time_terminates_claim_instead_of_un
     monkeypatch.setattr(worker_module, "_load_live_trading_profile_for_paper_account", _async_return(SimpleNamespace(id=uuid.uuid4())))
     monkeypatch.setattr(worker_module, "create_canonical_preview_package", _create)
     monkeypatch.setattr(worker_module, "execute_automatic_ready_package_through_activation", _execute)
-    monkeypatch.setattr(worker_module, "claim_activated_buy_package", _claim)
-    # prepare_autonomous_claimed_buy and mark_pre_provider_blocked are now
+    monkeypatch.setattr(worker_module, "claim_activated_package", _claim)
+    # prepare_autonomous_claimed_order and mark_pre_provider_blocked are now
     # called from inside advance_claimed_execution (autonomous_execution_claims.py),
     # not directly by the worker -- patch them where they're actually used,
     # exercising the real advance_claimed_execution/worker integration rather
     # than a bypassed one.
-    monkeypatch.setattr(claims_module, "prepare_autonomous_claimed_buy", _prepare)
+    monkeypatch.setattr(claims_module, "prepare_autonomous_claimed_order", _prepare)
     monkeypatch.setattr(claims_module, "mark_pre_provider_blocked", _mark_pre_provider_blocked)
     caplog.set_level(logging.INFO)
 
@@ -1125,7 +1125,7 @@ async def test_expired_mandate_authorization_on_replay_never_reaches_claim_or_un
     executor's own return value in isolation. This test closes the actual
     integration seam where the original defect lived: it proves the WORKER
     itself respects that outcome end-to-end -- it must never call
-    claim_activated_buy_package (or anything downstream of it), must report
+    claim_activated_package (or anything downstream of it), must report
     a deterministic, non-crashing final_state, and must never log
     unexpected_executor_failure, when the executor reports this outcome."""
     import app.services.orchestration.continuous_pipeline_worker as worker_module
@@ -1149,7 +1149,7 @@ async def test_expired_mandate_authorization_on_replay_never_reaches_claim_or_un
 
     async def _claim(*, db, package_id):
         claim_calls.append(package_id)
-        raise AssertionError("claim_activated_buy_package must not be called when activation_state is NOT_ACTIVATED")
+        raise AssertionError("claim_activated_package must not be called when activation_state is NOT_ACTIVATED")
 
     monkeypatch.setattr(worker_module, "_load_cycle_by_id", _async_return(cycle))
     monkeypatch.setattr(worker_module, "_has_active_ready_package_for_opportunity", _async_return(False))
@@ -1160,7 +1160,7 @@ async def test_expired_mandate_authorization_on_replay_never_reaches_claim_or_un
     monkeypatch.setattr(worker_module, "_load_live_trading_profile_for_paper_account", _async_return(SimpleNamespace(id=uuid.uuid4())))
     monkeypatch.setattr(worker_module, "create_canonical_preview_package", _create)
     monkeypatch.setattr(worker_module, "execute_automatic_ready_package_through_activation", _execute)
-    monkeypatch.setattr(worker_module, "claim_activated_buy_package", _claim)
+    monkeypatch.setattr(worker_module, "claim_activated_package", _claim)
     caplog.set_level(logging.INFO)
 
     await worker_module._attempt_automatic_ready_package_creation(db=object(), orchestration_payload=_automatic_payload(cycle))

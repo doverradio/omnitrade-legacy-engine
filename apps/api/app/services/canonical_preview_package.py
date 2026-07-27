@@ -892,7 +892,7 @@ async def _create_crypto_order_preview_for_package(
             order_type="MARKET",
             quote_size=request.max_proposed_order_amount if preview_side == "BUY" else None,
             base_size=sell_base_size,
-            requested_amount_currency="USD" if preview_side == "BUY" else "BTC",
+            requested_amount_currency="USD" if preview_side == "BUY" else request.product.split("-")[0].upper(),
             decision_record_id=decision_record_id,
             strategy_id=strategy.id,
             strategy_name=strategy.slug,

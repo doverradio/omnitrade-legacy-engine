@@ -23,7 +23,10 @@ CryptoOrderPreviewStatus = Literal[
 ]
 CryptoOrderPreviewSide = Literal["BUY", "SELL"]
 CryptoOrderPreviewOrderType = Literal["MARKET"]
-CryptoOrderPreviewAmountCurrency = Literal["USD", "BTC"]
+# Quote currency for BUY or the product's base currency for SELL.  This was
+# historically limited to BTC while previews were BUY-only; canonical SELL
+# must preserve the actual product identity (for example ETH), not relabel it.
+CryptoOrderPreviewAmountCurrency = str
 CryptoOrderPreviewGeneratedBy = Literal["operator", "system_recommendation"]
 CryptoOrderPreviewRiskVerdict = Literal["approved_for_preview", "rejected", "blocked", "needs_refresh"]
 
@@ -46,7 +49,7 @@ class CryptoOrderPreviewCreateRequest(BaseModel):
     # Authoritative paper-account identity for the resulting RiskEvent, when
     # the caller already knows it (e.g. the canonical package pipeline,
     # which must persist a RiskEvent.paper_account_id matching the same
-    # account claim_activated_buy_package/prepare_autonomous_claimed_buy
+    # account claim_activated_package/prepare_autonomous_claimed_order
     # later validate against). None preserves the prior standalone/manual
     # preview behavior unchanged.
     paper_account_id: UUID | None = None

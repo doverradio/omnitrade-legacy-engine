@@ -83,7 +83,7 @@ from app.services.orchestration.automatic_package_executor import (
 )
 from app.services.orchestration.autonomous_execution_claims import (
     advance_claimed_execution,
-    claim_activated_buy_package,
+    claim_activated_package,
     sweep_stale_autonomous_execution_claims,
 )
 from app.services.orchestration.reconciliation_guard import (
@@ -1584,7 +1584,7 @@ async def _attempt_automatic_ready_package_creation(
                     and not progression.failed_closed
                     and progression.package_id is not None
                 ):
-                    claim_outcome = await claim_activated_buy_package(
+                    claim_outcome = await claim_activated_package(
                         db=db,
                         package_id=progression.package_id,
                     )
@@ -1925,7 +1925,7 @@ async def _attempt_operator_controlled_proof_entry(*, db: AsyncSession, proof_id
             ),
         )
         if progression.activation_state == "ACTIVATED" and not progression.failed_closed:
-            claim_outcome = await claim_activated_buy_package(db=db, package_id=package_id)
+            claim_outcome = await claim_activated_package(db=db, package_id=package_id)
             if claim_outcome.claim is not None:
                 await advance_claimed_execution(db=db, claim=claim_outcome.claim)
         await db.commit()

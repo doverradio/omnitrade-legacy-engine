@@ -28,7 +28,7 @@ from app.services.controlled_proof.service import _ACTIVE_STATES as _CONTROLLED_
 from app.services.live.position_quantity import QUANTITY_BEARING_RECORD_TYPES
 from app.services.orchestration.autonomous_order_preparation import (
     execute_prepared_autonomous_claim,
-    prepare_autonomous_claimed_buy,
+    prepare_autonomous_claimed_order,
 )
 from app.services.orchestration.reconciliation_guard import claim_blocking_reconciliation_statement
 
@@ -43,7 +43,7 @@ _OPEN_ORDER_STATES = {"PENDING_CONFIRMATION", "VALIDATING", "SUBMISSION_PENDING"
 # stay in sync with the partial unique index uq_aec_active_campaign_scope
 # (see AutonomousExecutionClaim / migration 20260727_0053). Derived from
 # the actual, currently-reachable state machine (see module docstring-level
-# transitions in claim_activated_buy_package/mark_submission_safety_disabled/
+# transitions in claim_activated_package/mark_submission_safety_disabled/
 # mark_pre_provider_blocked/advance_claimed_execution/
 # release_execution_claim_scope_if_order_resolved): CLAIMED and
 # EXECUTION_STARTED precede any provider call; SUBMISSION_PENDING and
@@ -84,7 +84,7 @@ class AutonomousClaimOutcome:
 
 @dataclass(frozen=True, slots=True)
 class ResolvedAutonomousExecutionScope:
-    """The one authoritative scope claim_activated_buy_package claims an
+    """The one authoritative scope claim_activated_package claims an
     execution under -- resolved exactly once, from exactly one source:
     either the operator's globally-configured selector settings (ordinary
     automation, unchanged from before this existed), or a specific
@@ -509,7 +509,7 @@ async def advance_claimed_execution(*, db: AsyncSession, claim: AutonomousExecut
     per-cycle activation path
     (continuous_pipeline_worker._attempt_automatic_ready_package_creation)
     and sweep_stale_autonomous_execution_claims below -- the only two
-    callers of prepare_autonomous_claimed_buy -- so this failure-handling
+    callers of prepare_autonomous_claimed_order -- so this failure-handling
     is defined exactly once.
 
     Guarded as a true no-op for any claim that has already left
@@ -529,7 +529,7 @@ async def advance_claimed_execution(*, db: AsyncSession, claim: AutonomousExecut
     if claim.claim_status not in _CLAIM_SCOPE_NONTERMINAL_STATES:
         return
     try:
-        prepared = await prepare_autonomous_claimed_buy(db=db, claim_id=claim.claim_id)
+        prepared = await prepare_autonomous_claimed_order(db=db, claim_id=claim.claim_id)
     except InvalidRequestError as exc:
         reason_code = str((exc.details or {}).get("blocker") or "autonomous_order_preparation_failed")
         await mark_pre_provider_blocked(db=db, claim=claim, reason_code=reason_code)
@@ -582,7 +582,7 @@ async def advance_claimed_execution(*, db: AsyncSession, claim: AutonomousExecut
 
 async def sweep_stale_autonomous_execution_claims(*, db: AsyncSession, now: datetime | None = None) -> int:
     """Recovery pass, deliberately independent of any cycle's decision
-    composition. prepare_autonomous_claimed_buy re-derives everything it
+    composition. prepare_autonomous_claimed_order re-derives everything it
     needs from the claim_id alone (package/activation/risk/kill-switch/
     position state), so a CLAIMED or EXECUTION_STARTED claim can safely be
     retried here at any time -- this is the only mechanism that revisits a
@@ -590,7 +590,7 @@ async def sweep_stale_autonomous_execution_claims(*, db: AsyncSession, now: date
     Controlled-Proof-forced entry, whose HOLD-override never re-fires once
     the proof already has a linked entry) -- or after a worker crash mid-
     preparation. EXECUTION_STARTED is included alongside CLAIMED: without
-    it, a crash between prepare_autonomous_claimed_buy's own EXECUTION_
+    it, a crash between prepare_autonomous_claimed_order's own EXECUTION_
     STARTED transition and advance_claimed_execution's subsequent submission
     call would orphan the claim forever (recover_after is set once, at
     CLAIMED-insert time, and never advanced by the EXECUTION_STARTED
@@ -602,7 +602,7 @@ async def sweep_stale_autonomous_execution_claims(*, db: AsyncSession, now: date
     PENDING and RECONCILIATION_REQUIRED are deliberately excluded -- a
     provider call has already been made (or may have been); the correct
     recovery there is reconciliation against the real order, never a blind
-    re-preparation attempt (prepare_autonomous_claimed_buy itself refuses to
+    re-preparation attempt (prepare_autonomous_claimed_order itself refuses to
     re-prepare a RECONCILIATION_REQUIRED claim; sweeping it here would
     misclassify it as failed_pre_provider with provider_call_made=false,
     which would be false). Scoped by the same recover_after/claim_status

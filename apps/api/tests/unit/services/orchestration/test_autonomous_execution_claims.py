@@ -39,7 +39,7 @@ async def test_stale_activated_package_creates_no_claim() -> None:
     package = _package(now)
     package.preview_expires_at = now
     db = SimpleNamespace(scalar=AsyncMock(side_effect=[package, None]))
-    outcome = await subject.claim_activated_buy_package(db=db, package_id=package.package_id, now=now)
+    outcome = await subject.claim_activated_package(db=db, package_id=package.package_id, now=now)
     assert outcome.claim is None
     assert outcome.reason_code == "package_not_eligible"
 
@@ -50,7 +50,7 @@ async def test_existing_claim_is_idempotently_replayed() -> None:
     package = _package(now)
     claim = SimpleNamespace(claim_id=uuid4(), package_id=package.package_id, claim_status="SAFETY_DISABLED", claim_owner="worker:other")
     db = SimpleNamespace(scalar=AsyncMock(side_effect=[package, claim]))
-    outcome = await subject.claim_activated_buy_package(db=db, package_id=package.package_id, now=now)
+    outcome = await subject.claim_activated_package(db=db, package_id=package.package_id, now=now)
     assert outcome.claim is claim
     assert not outcome.created
     assert outcome.reason_code == "already_claimed"
@@ -80,7 +80,7 @@ async def test_fresh_matching_package_creates_one_durable_claim(monkeypatch: pyt
         add=Mock(), flush=AsyncMock(),
     )
     monkeypatch.setattr(subject, "get_settings", lambda: _settings(package))
-    outcome = await subject.claim_activated_buy_package(db=db, package_id=package.package_id, claim_owner="worker:test", now=now)
+    outcome = await subject.claim_activated_package(db=db, package_id=package.package_id, claim_owner="worker:test", now=now)
     assert outcome.created
     assert outcome.claim is claim
     assert outcome.reason_code == "claimed"
@@ -173,7 +173,7 @@ async def test_advance_claimed_execution_is_a_true_no_op_for_any_already_release
     on every cycle for as long as the package's own package_state stays
     ACTIVATED (nothing ever advances it past that) -- including for a claim
     that has already reached a released status. Before this guard existed,
-    that re-drove prepare_autonomous_claimed_buy every cycle, which would
+    that re-drove prepare_autonomous_claimed_order every cycle, which would
     typically fail on the by-then-expired activation window, and
     mark_pre_provider_blocked would overwrite even a genuinely successful
     BUY_RECONCILED claim's status back to FAILED_PRE_PROVIDER -- silently
@@ -181,9 +181,9 @@ async def test_advance_claimed_execution_is_a_true_no_op_for_any_already_release
     claim = _claim(claim_status=released_status)
 
     async def _unexpected_prepare(*, db, claim_id):
-        raise AssertionError("prepare_autonomous_claimed_buy must not be called for an already-released claim")
+        raise AssertionError("prepare_autonomous_claimed_order must not be called for an already-released claim")
 
-    monkeypatch.setattr(subject, "prepare_autonomous_claimed_buy", _unexpected_prepare)
+    monkeypatch.setattr(subject, "prepare_autonomous_claimed_order", _unexpected_prepare)
     db = SimpleNamespace(add=Mock(), flush=AsyncMock())
 
     await subject.advance_claimed_execution(db=db, claim=claim)
@@ -205,7 +205,7 @@ async def test_advance_claimed_execution_reaches_submission_pending_on_success(m
     async def _execute(*, db, prepared):
         return SimpleNamespace(current_state="SUBMITTED")
 
-    monkeypatch.setattr(subject, "prepare_autonomous_claimed_buy", _prepare)
+    monkeypatch.setattr(subject, "prepare_autonomous_claimed_order", _prepare)
     monkeypatch.setattr(subject, "execute_prepared_autonomous_claim", _execute)
     monkeypatch.setattr(subject, "get_settings", lambda: SimpleNamespace(live_crypto_order_submission_enabled=True))
     db = SimpleNamespace(add=Mock(), flush=AsyncMock())
@@ -227,7 +227,7 @@ async def test_advance_claimed_execution_reaches_reconciliation_required_on_succ
     async def _execute(*, db, prepared):
         return SimpleNamespace(current_state="RECONCILIATION_REQUIRED")
 
-    monkeypatch.setattr(subject, "prepare_autonomous_claimed_buy", _prepare)
+    monkeypatch.setattr(subject, "prepare_autonomous_claimed_order", _prepare)
     monkeypatch.setattr(subject, "execute_prepared_autonomous_claim", _execute)
     monkeypatch.setattr(subject, "get_settings", lambda: SimpleNamespace(live_crypto_order_submission_enabled=True))
     db = SimpleNamespace(add=Mock(), flush=AsyncMock())
@@ -253,7 +253,7 @@ async def test_advance_claimed_execution_invalid_request_error_terminalizes(monk
     async def _execute(*, db, prepared):
         raise AssertionError("must not execute when preparation failed")
 
-    monkeypatch.setattr(subject, "prepare_autonomous_claimed_buy", _prepare)
+    monkeypatch.setattr(subject, "prepare_autonomous_claimed_order", _prepare)
     monkeypatch.setattr(subject, "mark_pre_provider_blocked", _mark_blocked)
     monkeypatch.setattr(subject, "execute_prepared_autonomous_claim", _execute)
     db = SimpleNamespace(add=Mock(), flush=AsyncMock())
@@ -280,7 +280,7 @@ async def test_advance_claimed_execution_unexpected_exception_terminalizes_inste
     async def _mark_blocked(*, db, claim, reason_code):
         blocked.append((claim, reason_code))
 
-    monkeypatch.setattr(subject, "prepare_autonomous_claimed_buy", _prepare)
+    monkeypatch.setattr(subject, "prepare_autonomous_claimed_order", _prepare)
     monkeypatch.setattr(subject, "mark_pre_provider_blocked", _mark_blocked)
     db = SimpleNamespace(add=Mock(), flush=AsyncMock())
 
@@ -305,7 +305,7 @@ async def test_advance_claimed_execution_marks_safety_disabled_when_submission_o
     async def _execute(*, db, prepared):
         raise AssertionError("must not execute when live submission is disabled")
 
-    monkeypatch.setattr(subject, "prepare_autonomous_claimed_buy", _prepare)
+    monkeypatch.setattr(subject, "prepare_autonomous_claimed_order", _prepare)
     monkeypatch.setattr(subject, "mark_submission_safety_disabled", _mark_safety_disabled)
     monkeypatch.setattr(subject, "execute_prepared_autonomous_claim", _execute)
     monkeypatch.setattr(subject, "get_settings", lambda: SimpleNamespace(live_crypto_order_submission_enabled=False))
@@ -331,7 +331,7 @@ async def test_advance_claimed_execution_execute_failure_terminalizes(monkeypatc
     async def _mark_blocked(*, db, claim, reason_code):
         blocked.append((claim, reason_code))
 
-    monkeypatch.setattr(subject, "prepare_autonomous_claimed_buy", _prepare)
+    monkeypatch.setattr(subject, "prepare_autonomous_claimed_order", _prepare)
     monkeypatch.setattr(subject, "execute_prepared_autonomous_claim", _execute)
     monkeypatch.setattr(subject, "mark_pre_provider_blocked", _mark_blocked)
     monkeypatch.setattr(subject, "get_settings", lambda: SimpleNamespace(live_crypto_order_submission_enabled=True))

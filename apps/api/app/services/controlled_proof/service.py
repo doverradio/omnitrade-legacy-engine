@@ -157,7 +157,7 @@ async def _live_capital_blocker(*, db: AsyncSession, proof: ControlledProofRun) 
     position existing. A false negative here is the dangerous direction --
     it would let create_controlled_proof cancel a proof that may control
     real funds -- so this always re-derives from the same authoritative,
-    live sources claim_activated_buy_package's own unresolved_order_exists/
+    live sources claim_activated_package's own unresolved_order_exists/
     campaign_position_already_open checks and should_propose_controlled_sell
     use, never trusting a cached column as sufficient proof of safety.
 
@@ -418,7 +418,7 @@ async def claim_next_controlled_proof_for_scope(
     1. At most one REQUESTED proof for this exact scope is atomically
        claimed (REQUESTED -> CLAIMED), using the same SELECT ... FOR UPDATE
        + Python-side status re-check pattern already used by
-       claim_activated_buy_package for exactly-once claims elsewhere in
+       claim_activated_package for exactly-once claims elsewhere in
        this codebase -- not a new pattern.
     2. Whether or not a new claim happened this cycle, the already-CLAIMED
        proof for this scope (if any -- from THIS cycle or an earlier one) is

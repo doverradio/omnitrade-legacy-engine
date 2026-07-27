@@ -57,6 +57,7 @@ async def _make_package(
 
 async def _make_proof(
     *, db: AsyncSession, campaign_id: uuid.UUID, campaign_version: int, package_id: uuid.UUID,
+    sell_package_id: uuid.UUID | None = None,
     product_id: str = "BTC-USD", provider: str = "kraken_spot", environment: str = "production",
     status: str = "PACKAGE_CREATED", expires_at: datetime | None = None,
 ) -> ControlledProofRun:
@@ -65,7 +66,7 @@ async def _make_proof(
         campaign_id=campaign_id, campaign_version=campaign_version, product_id=product_id,
         max_notional_usd=Decimal("5"), idempotency_key=f"idem-{uuid.uuid4()}", requested_by="operator:alice",
         expires_at=expires_at or (datetime.now(timezone.utc) + timedelta(minutes=30)),
-        package_id=package_id,
+        package_id=package_id, sell_package_id=sell_package_id,
     )
     db.add(proof)
     await db.flush()
@@ -216,14 +217,21 @@ async def test_controlled_proof_package_blocked_when_environment_not_production(
 
 
 @pytest.mark.asyncio
-async def test_controlled_proof_sell_package_is_not_eligible_for_entry_claim() -> None:
+async def test_controlled_proof_sell_package_resolves_the_same_execution_scope() -> None:
     campaign_id, campaign_version = uuid.uuid4(), 1
     async with _real_session() as session:
+        buy_package_id = uuid.uuid4()
         package = await _make_package(db=session, campaign_id=campaign_id, campaign_version=campaign_version, side="SELL", **_mandate_ids())
-        await _make_proof(db=session, campaign_id=campaign_id, campaign_version=campaign_version, package_id=package.package_id)
+        await _make_proof(
+            db=session, campaign_id=campaign_id, campaign_version=campaign_version,
+            package_id=buy_package_id, sell_package_id=package.package_id,
+            status="WAITING_FOR_PROFITABLE_EXIT",
+        )
         scope, blocker = await subject._resolve_autonomous_execution_scope(db=session, package=package)
-        assert scope is None
-        assert blocker == "non_buy_entry_package"
+        assert blocker is None
+        assert scope is not None
+        assert scope.package_id == package.package_id
+        assert scope.authority_mode == "CONTROLLED_PROOF_DERIVED_SCOPE"
 
 
 @pytest.mark.asyncio
@@ -331,7 +339,7 @@ async def test_controlled_proof_package_blocked_when_proof_expired() -> None:
         assert blocker == "controlled_proof_expired"
 
 
-# --- claim_activated_buy_package: end-to-end via the existing mock convention ---------
+# --- claim_activated_package: end-to-end via the existing mock convention -------------
 
 def _full_package(now: datetime, **overrides) -> SimpleNamespace:
     base = dict(
@@ -381,7 +389,7 @@ async def test_full_claim_creates_exactly_one_claim_for_controlled_proof_package
         automatic_mandate_package_activation_mandate_version_id=uuid.uuid4(),
     ))
 
-    outcome = await subject.claim_activated_buy_package(db=db, package_id=package.package_id, claim_owner="worker:test", now=now)
+    outcome = await subject.claim_activated_package(db=db, package_id=package.package_id, claim_owner="worker:test", now=now)
 
     assert outcome.created
     assert outcome.claim is claim
@@ -400,7 +408,7 @@ async def test_full_claim_still_blocks_ordinary_package_on_configured_scope_mism
         automatic_mandate_package_activation_mandate_version_id=None,
     ))
 
-    outcome = await subject.claim_activated_buy_package(db=db, package_id=package.package_id, now=now)
+    outcome = await subject.claim_activated_package(db=db, package_id=package.package_id, now=now)
 
     assert outcome.claim is None
     assert outcome.reason_code == "configured_scope_mismatch"
