@@ -11,10 +11,11 @@ import pytest
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.models.live_crypto_order import LiveCryptoOrder
+from app.models.live_reconciliation_event import LiveReconciliationEvent
 from app.services.orchestration import reconciliation_scheduler as subject
 from tests.support.real_sqlite_session import real_sqlite_session
 
-_ALL_TABLES = [LiveCryptoOrder.__table__]
+_ALL_TABLES = [LiveCryptoOrder.__table__, LiveReconciliationEvent.__table__]
 
 
 @asynccontextmanager
@@ -32,6 +33,20 @@ def _order(
         product_id=product_id, side=side, order_type="market", requested_quote_size=Decimal("5"),
         client_order_id=str(uuid.uuid4()), status=status, submitted_at=submitted_at,
         audit_correlation_id=uuid.uuid4(),
+    )
+
+
+def _reconciliation(order: LiveCryptoOrder, *, sequence: int, status: str) -> LiveReconciliationEvent:
+    now = datetime.now(timezone.utc)
+    return LiveReconciliationEvent(
+        id=uuid.uuid4(), idempotency_key=str(uuid.uuid4()), event_hash=str(uuid.uuid4()),
+        live_trading_profile_id=uuid.uuid4(), live_crypto_order_id=order.live_crypto_order_id,
+        capital_campaign_id=None, source_execution_event_id=uuid.uuid4(),
+        source_execution_event_type="execution_intent_created", sequence_number=sequence,
+        event_type="order_reconciled", reconciliation_status=status,
+        provider_name=order.provider, provider_order_id=order.provider_order_id,
+        provider_fill_id=None, event_payload={}, provenance={}, immutable_contract_version="1",
+        provider_recorded_at=now, recorded_at=now,
     )
 
 
@@ -91,6 +106,40 @@ async def test_terminal_order_statuses_are_never_candidates(terminal_status: str
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("side", ["BUY", "SELL"])
+async def test_filled_order_with_latest_unresolved_reconciliation_is_discovered(side: str) -> None:
+    now = datetime.now(timezone.utc)
+    async with _real_session() as session:
+        order = _order(status="FILLED", submitted_at=now, side=side)
+        session.add(order)
+        await session.flush()
+        session.add(_reconciliation(order, sequence=1, status="reconciliation_required"))
+        await session.flush()
+
+        candidates = await subject.discover_reconciliation_candidates(db=session, limit=10)
+
+        assert candidates == [order.live_crypto_order_id]
+
+
+@pytest.mark.asyncio
+async def test_terminal_latest_reconciliation_is_not_rediscovered() -> None:
+    now = datetime.now(timezone.utc)
+    async with _real_session() as session:
+        order = _order(status="FILLED", submitted_at=now)
+        session.add(order)
+        await session.flush()
+        session.add_all([
+            _reconciliation(order, sequence=1, status="reconciliation_required"),
+            _reconciliation(order, sequence=2, status="filled"),
+        ])
+        await session.flush()
+
+        candidates = await subject.discover_reconciliation_candidates(db=session, limit=10)
+
+        assert candidates == []
+
+
+@pytest.mark.asyncio
 async def test_ordinary_and_controlled_proof_orders_are_discovered_identically() -> None:
     """discover_reconciliation_candidates has no notion of Controlled Proof
     at all -- it only ever looks at LiveCryptoOrder's own submitted_at/
@@ -139,6 +188,7 @@ def _response(*, status: str, reconciliation_status: str = "open") -> SimpleName
         reconciliation_status=reconciliation_status,
         provider_order_id="kraken-order-1",
         provider_fill_observed=status == "FILLED",
+        balance_mismatch_state="ok" if reconciliation_status not in subject.UNRESOLVED_RECONCILIATION_STATES else "stale",
     )
 
 
@@ -243,6 +293,82 @@ async def test_completed_sell_counts_as_reconciled(monkeypatch: pytest.MonkeyPat
     outcome = await subject.poll_unresolved_live_orders(db=_FakeDb())
 
     assert outcome.reconciled == 1
+
+
+@pytest.mark.asyncio
+async def test_terminal_unresolved_candidate_refreshes_balance_before_authoritative_reconcile(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    order_id = uuid.uuid4()
+    order = SimpleNamespace(
+        live_crypto_order_id=order_id, exchange_connection_id=uuid.uuid4(),
+        provider_order_id="provider-filled-1", status="FILLED",
+    )
+    prior_event = SimpleNamespace(
+        id=uuid.uuid4(), reconciliation_status="reconciliation_required",
+    )
+    resolved_event = SimpleNamespace(id=uuid.uuid4(), reconciliation_status="filled")
+    calls: list[str] = []
+
+    monkeypatch.setattr(subject, "get_settings", _enabled_settings)
+    monkeypatch.setattr(subject, "discover_reconciliation_candidates", lambda *, db, limit: _async([order_id]))
+
+    async def _context(**_kwargs):
+        return order, prior_event
+
+    async def _refresh(**_kwargs):
+        calls.append("refresh_balance")
+        return SimpleNamespace(
+            last_successful_sync_at=datetime.now(timezone.utc),
+            readiness=SimpleNamespace(verdict="ready"),
+        )
+
+    class _Service(_FakeReconcileService):
+        async def reconcile(self, **kwargs):
+            calls.append("reconcile")
+            return await super().reconcile(**kwargs)
+
+    class _Db(_FakeDb):
+        async def scalar(self, _statement):
+            return resolved_event
+
+    fake_service = _Service({order_id: _response(status="FILLED", reconciliation_status="filled")})
+    monkeypatch.setattr(subject, "_terminal_unresolved_context", _context)
+    monkeypatch.setattr(subject, "refresh_exchange_balances", _refresh)
+    monkeypatch.setattr(subject, "LiveCryptoOrderService", lambda: fake_service)
+
+    outcome = await subject.poll_unresolved_live_orders(db=_Db())
+
+    assert outcome == subject.ReconciliationPollOutcome(1, 1, 0, 0)
+    assert calls == ["refresh_balance", "reconcile"]
+
+
+@pytest.mark.asyncio
+async def test_terminal_unresolved_provider_ambiguity_remains_pending(monkeypatch: pytest.MonkeyPatch) -> None:
+    order_id = uuid.uuid4()
+    order = SimpleNamespace(
+        live_crypto_order_id=order_id, exchange_connection_id=uuid.uuid4(),
+        provider_order_id="provider-ambiguous-1", status="FILLED",
+    )
+    unresolved = SimpleNamespace(id=uuid.uuid4(), reconciliation_status="reconciliation_required")
+    monkeypatch.setattr(subject, "get_settings", _enabled_settings)
+    monkeypatch.setattr(subject, "discover_reconciliation_candidates", lambda *, db, limit: _async([order_id]))
+    monkeypatch.setattr(subject, "_terminal_unresolved_context", lambda **_kwargs: _async((order, unresolved)))
+    monkeypatch.setattr(subject, "refresh_exchange_balances", lambda **_kwargs: _async(SimpleNamespace(
+        last_successful_sync_at=datetime.now(timezone.utc), readiness=SimpleNamespace(verdict="ready"),
+    )))
+    fake_service = _FakeReconcileService({
+        order_id: _response(status="FILLED", reconciliation_status="reconciliation_required"),
+    })
+    monkeypatch.setattr(subject, "LiveCryptoOrderService", lambda: fake_service)
+
+    class _Db(_FakeDb):
+        async def scalar(self, _statement):
+            return unresolved
+
+    outcome = await subject.poll_unresolved_live_orders(db=_Db())
+
+    assert outcome == subject.ReconciliationPollOutcome(1, 0, 1, 0)
 
 
 @pytest.mark.asyncio

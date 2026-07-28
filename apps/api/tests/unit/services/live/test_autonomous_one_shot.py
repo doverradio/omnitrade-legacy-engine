@@ -26,7 +26,7 @@ def _case():
         claim_id=claim_id, package_id=package_id, activation_id=activation_id, live_order_id=order.live_crypto_order_id,
         claim_status="SAFETY_DISABLED", campaign_id=campaign_uuid, campaign_version=1,
         mandate_id=mandate_id, mandate_version_id=version_id, account_id=account_id, profile_id=profile_id,
-        connection_id=connection_id, provider="kraken_spot", environment="production", product="BTC-USD",
+        connection_id=connection_id, provider="kraken_spot", environment="production", product="BTC-USD", side="BUY",
     )
     package = SimpleNamespace(
         package_id=package_id, crypto_order_preview_id=preview.crypto_order_preview_id, campaign_id=campaign_uuid,

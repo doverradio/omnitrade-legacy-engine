@@ -4,13 +4,16 @@ import logging
 from dataclasses import dataclass
 from uuid import UUID
 
-from sqlalchemy import select
+from sqlalchemy import and_, func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import get_settings
 from app.models.live_crypto_order import LiveCryptoOrder
+from app.models.live_reconciliation_event import LiveReconciliationEvent
 from app.schemas.live_crypto_orders import LiveCryptoOrderReconcileRequest
+from app.services.exchange_connections import refresh_exchange_balances
 from app.services.live_crypto_orders import LiveCryptoOrderService
+from app.services.orchestration.reconciliation_guard import UNRESOLVED_RECONCILIATION_STATES
 
 logger = logging.getLogger(__name__)
 
@@ -55,11 +58,33 @@ async def discover_reconciliation_candidates(
     LiveAccountingRecord's own idempotency_key and
     (provider_order_id, provider_fill_id, record_type) unique constraints
     regardless, but this avoids wasted duplicate provider calls."""
+    latest_sequence = (
+        select(func.max(LiveReconciliationEvent.sequence_number))
+        .where(LiveReconciliationEvent.live_crypto_order_id == LiveCryptoOrder.live_crypto_order_id)
+        .correlate(LiveCryptoOrder)
+        .scalar_subquery()
+    )
+    terminal_with_unresolved_evidence = (
+        select(LiveReconciliationEvent.id)
+        .where(
+            LiveReconciliationEvent.live_crypto_order_id == LiveCryptoOrder.live_crypto_order_id,
+            LiveReconciliationEvent.sequence_number == latest_sequence,
+            LiveReconciliationEvent.reconciliation_status.in_(UNRESOLVED_RECONCILIATION_STATES),
+        )
+        .correlate(LiveCryptoOrder)
+        .exists()
+    )
     statement = (
         select(LiveCryptoOrder.live_crypto_order_id)
         .where(
             LiveCryptoOrder.submitted_at.is_not(None),
-            LiveCryptoOrder.status.not_in(_TERMINAL_ORDER_STATUSES),
+            or_(
+                LiveCryptoOrder.status.not_in(_TERMINAL_ORDER_STATUSES),
+                and_(
+                    LiveCryptoOrder.status.in_(_TERMINAL_ORDER_STATUSES),
+                    terminal_with_unresolved_evidence,
+                ),
+            ),
         )
         .order_by(LiveCryptoOrder.submitted_at.asc())
         .limit(limit)
@@ -67,6 +92,27 @@ async def discover_reconciliation_candidates(
     )
     rows = (await db.scalars(statement)).all()
     return list(rows)
+
+
+async def _terminal_unresolved_context(*, db: AsyncSession, live_crypto_order_id: UUID):
+    if not hasattr(db, "scalar"):
+        return None
+    order = await db.scalar(
+        select(LiveCryptoOrder)
+        .where(LiveCryptoOrder.live_crypto_order_id == live_crypto_order_id)
+        .limit(1)
+    )
+    if order is None or order.status not in _TERMINAL_ORDER_STATUSES:
+        return None
+    event = await db.scalar(
+        select(LiveReconciliationEvent)
+        .where(LiveReconciliationEvent.live_crypto_order_id == live_crypto_order_id)
+        .order_by(LiveReconciliationEvent.sequence_number.desc())
+        .limit(1)
+    )
+    if event is None or event.reconciliation_status not in UNRESOLVED_RECONCILIATION_STATES:
+        return None
+    return order, event
 
 
 async def poll_unresolved_live_orders(
@@ -105,12 +151,58 @@ async def poll_unresolved_live_orders(
     service = LiveCryptoOrderService()
     for live_crypto_order_id in candidate_ids:
         logger.info("live_order_reconciliation_attempt_started live_crypto_order_id=%s", live_crypto_order_id)
+        recovery_latest_status: str | None = None
         try:
+            recovery_context = await _terminal_unresolved_context(
+                db=db, live_crypto_order_id=live_crypto_order_id,
+            )
+            if recovery_context is not None:
+                prior_order, prior_event = recovery_context
+                logger.info(
+                    "terminal_unresolved_reconciliation_candidate_discovered "
+                    "live_crypto_order_id=%s provider_order_id=%s prior_order_status=%s "
+                    "prior_reconciliation_status=%s prior_reconciliation_event_id=%s",
+                    live_crypto_order_id, prior_order.provider_order_id, prior_order.status,
+                    prior_event.reconciliation_status, prior_event.id,
+                )
+                refreshed = await refresh_exchange_balances(
+                    db=db,
+                    exchange_connection_id=prior_order.exchange_connection_id,
+                    actor=actor,
+                )
+                logger.info(
+                    "terminal_unresolved_reconciliation_balance_evidence_refreshed "
+                    "live_crypto_order_id=%s provider_order_id=%s connection_id=%s "
+                    "last_successful_sync_at=%s readiness_verdict=%s",
+                    live_crypto_order_id, prior_order.provider_order_id,
+                    prior_order.exchange_connection_id, refreshed.last_successful_sync_at,
+                    refreshed.readiness.verdict,
+                )
             response = await service.reconcile(
                 db=db,
                 live_crypto_order_id=live_crypto_order_id,
                 request=LiveCryptoOrderReconcileRequest(operator_identity=actor),
             )
+            if recovery_context is not None:
+                latest_event = await db.scalar(
+                    select(LiveReconciliationEvent)
+                    .where(LiveReconciliationEvent.live_crypto_order_id == live_crypto_order_id)
+                    .order_by(LiveReconciliationEvent.sequence_number.desc())
+                    .limit(1)
+                )
+                recovery_latest_status = None if latest_event is None else latest_event.reconciliation_status
+                logger.info(
+                    "terminal_unresolved_reconciliation_recovery_completed "
+                    "live_crypto_order_id=%s provider_order_id=%s provider_query_outcome=%s "
+                    "balance_evidence_outcome=%s reconciliation_event_id=%s "
+                    "new_reconciliation_status=%s controlled_proof_gate_released=%s",
+                    live_crypto_order_id, response.provider_order_id,
+                    response.live_crypto_order.status, response.balance_mismatch_state,
+                    None if latest_event is None else latest_event.id,
+                    recovery_latest_status,
+                    recovery_latest_status is not None
+                    and recovery_latest_status not in UNRESOLVED_RECONCILIATION_STATES,
+                )
         except Exception:
             failed += 1
             logger.exception(
@@ -121,7 +213,13 @@ async def poll_unresolved_live_orders(
             continue
 
         status = response.live_crypto_order.status
-        if status in _TERMINAL_ORDER_STATUSES:
+        if recovery_latest_status in UNRESOLVED_RECONCILIATION_STATES:
+            still_pending += 1
+            logger.info(
+                "live_order_reconciliation_attempt_still_pending live_crypto_order_id=%s status=%s reconciliation_status=%s",
+                live_crypto_order_id, status, recovery_latest_status,
+            )
+        elif status in _TERMINAL_ORDER_STATUSES:
             reconciled += 1
             logger.info(
                 "live_order_reconciliation_attempt_resolved live_crypto_order_id=%s status=%s "
