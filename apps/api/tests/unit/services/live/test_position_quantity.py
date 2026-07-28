@@ -10,7 +10,11 @@ import pytest
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.models.live_accounting_record import LiveAccountingRecord
-from app.services.live.position_quantity import compute_signed_owned_quantity, owned_position_exists
+from app.services.live.position_quantity import (
+    compute_controlled_proof_owned_quantity,
+    compute_signed_owned_quantity,
+    owned_position_exists,
+)
 from tests.support.real_sqlite_session import real_sqlite_session
 
 _ALL_TABLES = [LiveAccountingRecord.__table__]
@@ -126,3 +130,33 @@ async def test_fee_attribution_rows_remain_present_after_quantity_computation() 
         assert len(fee_rows) == 1
         assert fee_rows[0].fee_amount == Decimal("0.05")
         assert fee_rows[0].filled_quantity == Decimal("0.00007817")  # untouched, not deleted or zeroed
+
+
+@pytest.mark.asyncio
+async def test_controlled_proof_quantity_uses_only_linked_buy_and_sell_orders() -> None:
+    proof_id, buy_order_id, sell_order_id = uuid.uuid4(), uuid.uuid4(), uuid.uuid4()
+
+    class _Db:
+        def __init__(self) -> None:
+            self.statements = []
+            self.results = [
+                type("Proof", (), {
+                    "buy_live_crypto_order_id": buy_order_id,
+                    "sell_live_crypto_order_id": sell_order_id,
+                })(),
+                Decimal("0.00007817"),
+            ]
+
+        async def scalar(self, statement):
+            self.statements.append(statement)
+            return self.results.pop(0)
+
+    db = _Db()
+    quantity = await compute_controlled_proof_owned_quantity(db=db, proof_id=proof_id)
+
+    assert quantity == Decimal("0.00007817")
+    compiled = db.statements[1].compile()
+    parameter_values = list(compiled.params.values())
+    assert any(buy_order_id == value or isinstance(value, list) and buy_order_id in value for value in parameter_values)
+    assert any(sell_order_id == value or isinstance(value, list) and sell_order_id in value for value in parameter_values)
+    assert "live_crypto_orders" not in str(db.statements[1])

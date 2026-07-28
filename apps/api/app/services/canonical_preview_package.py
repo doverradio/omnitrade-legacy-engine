@@ -39,7 +39,10 @@ from app.schemas.crypto_order_previews import CryptoOrderPreviewCreateRequest
 from app.services.decisions.ingestion import DECISION_ENGINE_VERSION
 from app.services.live.approval import record_live_approval_checkpoint
 from app.services.live.contracts import LiveApprovalCheckpointRequest
-from app.services.live.position_quantity import compute_signed_owned_quantity
+from app.services.live.position_quantity import (
+    compute_controlled_proof_owned_quantity,
+    compute_signed_owned_quantity,
+)
 from app.services.mandates.contracts import MANDATE_APPROVAL_RESULT_ACTIVE_MANDATE
 from app.services.strategies.identity import build_strategy_identity, parse_strategy_identity
 
@@ -890,8 +893,12 @@ async def _create_crypto_order_preview_for_package(
     preview_side = "SELL" if request.forced_action == "CLOSE_POSITION_PROPOSED" else "BUY"
     sell_base_size = None
     if preview_side == "SELL":
-        sell_base_size = await compute_signed_owned_quantity(
-            db=db, live_trading_profile_id=request.live_trading_profile_id, symbol=request.product,
+        sell_base_size = (
+            await compute_controlled_proof_owned_quantity(db=db, proof_id=request.controlled_proof_id)
+            if _is_controlled_proof_mode(request) and request.controlled_proof_id is not None
+            else await compute_signed_owned_quantity(
+                db=db, live_trading_profile_id=request.live_trading_profile_id, symbol=request.product,
+            )
         )
         if sell_base_size <= Decimal("0"):
             raise _preview_evidence_error(
@@ -1463,6 +1470,12 @@ async def create_canonical_preview_package(
                 else None
             ),
             "requested_quote_size": _serialize_decimal(request.max_proposed_order_amount),
+            "requested_base_size": (
+                _serialize_decimal(_decimal(preview.base_size)) if preview.side == "SELL" else None
+            ),
+            "provider_base_size": (
+                _serialize_decimal(_decimal(preview.estimated_base_size)) if preview.side == "SELL" else None
+            ),
             "reissued_from_package_id": (
                 str(supersession_context.reissued_from_package_id) if supersession_context is not None else None
             ),
@@ -2116,6 +2129,16 @@ async def run_dry_run_for_canonical_preview_package(
             "mandate_evaluation_id": None if authority.mandate_evaluation_id is None else str(authority.mandate_evaluation_id),
             "authority_audit_correlation_id": str(authority.audit_correlation_id),
             "idempotency_token": request.idempotency_token,
+            "requested_base_size": (
+                _serialize_decimal(_decimal(package.market_evidence_identity.get("requested_base_size")))
+                if package.side == "SELL" and package.market_evidence_identity.get("requested_base_size") is not None
+                else None
+            ),
+            "approved_base_size": (
+                _serialize_decimal(_decimal(package.market_evidence_identity.get("provider_base_size")))
+                if package.side == "SELL" and package.market_evidence_identity.get("provider_base_size") is not None
+                else None
+            ),
         },
         audit_correlation_id=uuid.uuid4(),
         operator_confirmation_id=None,

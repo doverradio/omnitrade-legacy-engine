@@ -1525,6 +1525,116 @@ async def test_explicit_provider_rejection_sets_rejected_without_blind_retry(mon
 
 
 @pytest.mark.asyncio
+async def test_autonomous_sell_submits_owned_base_size_without_quote_size(monkeypatch: pytest.MonkeyPatch) -> None:
+    profile, live_order, preview, connection, campaign, _approval_event, db = _submit_authority_fixture()
+    claim_id, package_id, recovery_id = uuid.uuid4(), uuid.uuid4(), uuid.uuid4()
+    owned = service.Decimal("0.00007887")
+    provider_size = service.Decimal("0.00007880")
+    live_order.side = preview.side = "SELL"
+    live_order.provider = preview.provider = connection.provider = "kraken_spot"
+    profile.provenance_metadata["provider"] = "kraken_spot"
+    preview.quote_size = None
+    preview.base_size = owned
+    preview.estimated_base_size = provider_size
+    live_order.safe_provider_response.update({
+        "autonomous_prepared": True,
+        "autonomous_execution_claim_id": str(claim_id),
+        "canonical_preview_package_id": str(package_id),
+        "commissioned_preview_identity_binding": {"profile_id": str(profile.id)},
+        "requested_base_size": str(owned),
+        "approved_base_size": str(provider_size),
+        "execution_readiness_evidence": {
+            "claim_id": str(claim_id), "package_id": str(package_id),
+            "live_order_id": str(live_order.live_crypto_order_id),
+            "connection_id": str(live_order.exchange_connection_id),
+            "provider": live_order.provider, "environment": live_order.environment,
+            "product": live_order.product_id, "side": "SELL",
+            "verdict": "READY_FOR_DRY_RUN", "checked_at": connection.last_verified_at.isoformat(),
+        },
+    })
+    captured = {}
+
+    async def _reject(*, request, **_kwargs):
+        captured["request"] = request
+        return ExchangeOrderSubmissionResult(
+            classification="rejected", order=None,
+            rejection=ExchangeProviderRejection(code="test_rejection", message="test", retryable=False),
+            ambiguous=None, raw_response={}, safe_headers={},
+        )
+
+    monkeypatch.setattr(service, "get_settings", _submit_settings)
+    monkeypatch.setattr(service, "_utcnow", lambda: datetime(2026, 7, 9, 12, 0, tzinfo=timezone.utc))
+    monkeypatch.setattr(service, "_evaluate_level2_mandate_authorization", AsyncMock(return_value=(False, None)))
+    monkeypatch.setattr(service, "_evaluate_exit_recovery_confirmation_authorization", AsyncMock(return_value=(True, recovery_id)))
+    monkeypatch.setattr(service, "_validate_autonomous_one_shot_submission", AsyncMock(return_value=(campaign.id, SimpleNamespace())))
+    monkeypatch.setattr(service, "compute_signed_owned_quantity", AsyncMock(return_value=owned))
+    monkeypatch.setattr(service, "_load_decrypted_credentials", lambda _connection: {"api_key": "key", "api_secret": "secret"})
+    monkeypatch.setattr(service, "get_exchange_provider", lambda *_args, **_kwargs: _provider_stub(submit_order=_reject))
+
+    await service.service.submit(
+        db=db,
+        request=service.LiveCryptoOrderSubmitRequest(
+            live_crypto_order_id=live_order.live_crypto_order_id,
+            operator_identity="orchestration:test", idempotency_token="controlled-proof-sell",
+        ),
+    )
+
+    submitted = captured["request"]
+    assert submitted.side == "SELL"
+    assert submitted.quote_size is None
+    assert submitted.base_size == provider_size
+    assert submitted.base_size <= owned
+    payload = submitted.raw_payload["order_configuration"]["market_market_ioc"]
+    assert payload["base_size"] == str(provider_size)
+    assert "quote_size" not in payload
+
+
+@pytest.mark.asyncio
+async def test_autonomous_sell_owned_quantity_change_fails_before_provider(monkeypatch: pytest.MonkeyPatch) -> None:
+    profile, live_order, preview, connection, campaign, _approval_event, db = _submit_authority_fixture()
+    claim_id, package_id = uuid.uuid4(), uuid.uuid4()
+    approved_owned = service.Decimal("0.00007887")
+    live_order.side = preview.side = "SELL"
+    preview.quote_size = None
+    preview.base_size = approved_owned
+    preview.estimated_base_size = service.Decimal("0.00007880")
+    live_order.safe_provider_response.update({
+        "autonomous_prepared": True,
+        "autonomous_execution_claim_id": str(claim_id),
+        "canonical_preview_package_id": str(package_id),
+        "commissioned_preview_identity_binding": {"profile_id": str(profile.id)},
+        "requested_base_size": str(approved_owned),
+        "approved_base_size": str(preview.estimated_base_size),
+        "execution_readiness_evidence": {
+            "claim_id": str(claim_id), "package_id": str(package_id),
+            "live_order_id": str(live_order.live_crypto_order_id),
+            "connection_id": str(live_order.exchange_connection_id),
+            "provider": live_order.provider, "environment": live_order.environment,
+            "product": live_order.product_id, "side": "SELL",
+            "verdict": "READY_FOR_DRY_RUN", "checked_at": connection.last_verified_at.isoformat(),
+        },
+    })
+    provider_call = AsyncMock()
+    monkeypatch.setattr(service, "get_settings", _submit_settings)
+    monkeypatch.setattr(service, "_utcnow", lambda: datetime(2026, 7, 9, 12, 0, tzinfo=timezone.utc))
+    monkeypatch.setattr(service, "_evaluate_level2_mandate_authorization", AsyncMock(return_value=(True, uuid.uuid4())))
+    monkeypatch.setattr(service, "_validate_autonomous_one_shot_submission", AsyncMock(return_value=(campaign.id, SimpleNamespace())))
+    monkeypatch.setattr(service, "compute_signed_owned_quantity", AsyncMock(return_value=service.Decimal("0.00007000")))
+    monkeypatch.setattr(service, "get_exchange_provider", lambda *_args, **_kwargs: _provider_stub(submit_order=provider_call))
+
+    with pytest.raises(PermissionError, match="current SELL owned quantity mismatch"):
+        await service.service.submit(
+            db=db,
+            request=service.LiveCryptoOrderSubmitRequest(
+                live_crypto_order_id=live_order.live_crypto_order_id,
+                operator_identity="orchestration:test", idempotency_token="changed-owned-quantity",
+            ),
+        )
+
+    provider_call.assert_not_awaited()
+
+
+@pytest.mark.asyncio
 async def test_transport_failure_after_submission_started_enters_reconciliation_required(monkeypatch: pytest.MonkeyPatch) -> None:
     profile = SimpleNamespace(id=uuid.uuid4())
     live_order = _submit_live_order(status="PENDING_CONFIRMATION")
@@ -1861,7 +1971,7 @@ async def test_submit_allows_exact_campaign_scoped_authority_and_calls_provider_
 
 @pytest.mark.asyncio
 async def test_autonomous_one_shot_reaches_mocked_provider_exactly_once(monkeypatch: pytest.MonkeyPatch) -> None:
-    profile, live_order, _preview, connection, campaign, _approval_event, db = _submit_authority_fixture()
+    profile, live_order, preview, connection, campaign, _approval_event, db = _submit_authority_fixture()
     claim_id = uuid.uuid4()
     package_id = uuid.uuid4()
     live_order.safe_provider_response.update({
@@ -1921,14 +2031,20 @@ async def test_autonomous_one_shot_reaches_mocked_provider_exactly_once(monkeypa
 async def test_exit_recovery_authority_satisfies_only_autonomous_sell_confirmation(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    profile, live_order, _preview, connection, campaign, _approval_event, db = _submit_authority_fixture()
+    profile, live_order, preview, connection, campaign, _approval_event, db = _submit_authority_fixture()
     claim_id, package_id, recovery_id = uuid.uuid4(), uuid.uuid4(), uuid.uuid4()
-    live_order.side = "SELL"
+    owned = service.Decimal("0.00007887")
+    live_order.side = preview.side = "SELL"
+    preview.quote_size = None
+    preview.base_size = owned
+    preview.estimated_base_size = owned
     live_order.safe_provider_response.update({
         "autonomous_prepared": True,
         "autonomous_execution_claim_id": str(claim_id),
         "canonical_preview_package_id": str(package_id),
         "commissioned_preview_identity_binding": {"profile_id": str(profile.id)},
+        "requested_base_size": str(owned),
+        "approved_base_size": str(owned),
         "execution_readiness_evidence": {
             "claim_id": str(claim_id), "package_id": str(package_id),
             "live_order_id": str(live_order.live_crypto_order_id),
@@ -1952,6 +2068,7 @@ async def test_exit_recovery_authority_satisfies_only_autonomous_sell_confirmati
     monkeypatch.setattr(service, "_evaluate_level2_mandate_authorization", AsyncMock(return_value=(False, uuid.uuid4())))
     monkeypatch.setattr(service, "_evaluate_exit_recovery_confirmation_authorization", AsyncMock(return_value=(True, recovery_id)))
     monkeypatch.setattr(service, "_validate_autonomous_one_shot_submission", AsyncMock(return_value=(campaign.id, claim)))
+    monkeypatch.setattr(service, "compute_signed_owned_quantity", AsyncMock(return_value=owned))
     monkeypatch.setattr(service, "_load_decrypted_credentials", lambda _connection: {"api_key": "key", "api_secret": "secret"})
     monkeypatch.setattr(service, "get_exchange_provider", lambda *_args, **_kwargs: _provider_stub(create_order=_create_order))
 

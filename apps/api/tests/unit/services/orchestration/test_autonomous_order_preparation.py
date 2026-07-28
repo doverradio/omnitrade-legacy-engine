@@ -80,12 +80,22 @@ async def test_submission_off_foundation_prepares_exactly_one_canonical_order() 
 
 
 @pytest.mark.asyncio
-async def test_sell_preparation_uses_same_path_and_requires_owned_quantity() -> None:
+async def test_sell_preparation_uses_exact_controlled_proof_quantity_without_unrelated_btc(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     now, claim, package, activation, risk, order, preview = _evidence()
     claim.side = package.side = order.side = "SELL"
+    preview.base_size = 0.05
     preview.estimated_base_size = 0.05
+    preview.quote_size = None
+    proof_id = uuid4()
+    package.market_evidence_identity = {"controlled_proof_id": str(proof_id)}
+    monkeypatch.setattr(
+        subject, "compute_controlled_proof_owned_quantity", AsyncMock(return_value=subject.Decimal("0.05")),
+    )
     db = SimpleNamespace(
-        scalar=AsyncMock(side_effect=[claim, package, activation, risk, None, None, 0.05, order, preview]),
+        # Profile owns 0.06, but this proof owns only the requested 0.05.
+        scalar=AsyncMock(side_effect=[claim, package, activation, risk, None, None, 0.06, order, preview]),
         add=Mock(), flush=AsyncMock(),
     )
     result = await subject.prepare_autonomous_claimed_order(db=db, claim_id=claim.claim_id, now=now)
@@ -93,6 +103,38 @@ async def test_sell_preparation_uses_same_path_and_requires_owned_quantity() -> 
     assert order.status == "PENDING_CONFIRMATION"
     assert order.side == "SELL"
     assert claim.claim_status == "EXECUTION_STARTED"
+    assert order.safe_provider_response["requested_base_size"] == "0.05"
+    assert order.safe_provider_response["approved_base_size"] == "0.05"
+    assert order.safe_provider_response["controlled_proof_id"] == str(proof_id)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("owned", "requested", "provider_size", "quote_size", "blocker"),
+    [
+        (0.04, 0.05, 0.05, None, "sell_quantity_ownership_mismatch"),
+        (0.05, 0.05, 0, None, "sell_quantity_evidence_missing"),
+        (0.05, 0.05, 0.051, None, "sell_quantity_rounds_up"),
+        (0.05, 0.05, 0.05, 5, "sell_quote_size_forbidden"),
+    ],
+)
+async def test_sell_preparation_fails_closed_for_invalid_quantity_lineage(
+    owned, requested, provider_size, quote_size, blocker,
+) -> None:
+    now, claim, package, activation, risk, order, preview = _evidence()
+    claim.side = package.side = order.side = "SELL"
+    preview.base_size = requested
+    preview.estimated_base_size = provider_size
+    preview.quote_size = quote_size
+    db = SimpleNamespace(
+        scalar=AsyncMock(side_effect=[claim, package, activation, risk, None, None, owned, order, preview]),
+        add=Mock(), flush=AsyncMock(),
+    )
+
+    with pytest.raises(InvalidRequestError) as raised:
+        await subject.prepare_autonomous_claimed_order(db=db, claim_id=claim.claim_id, now=now)
+
+    assert raised.value.details["blocker"] == blocker
 
 
 @pytest.mark.asyncio

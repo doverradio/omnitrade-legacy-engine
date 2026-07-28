@@ -114,6 +114,9 @@ def _preview(*, package_id: UUID, requested_amount: Decimal = Decimal("3")) -> S
         environment="production",
         product_id="BTC-USD",
         side="BUY",
+        quote_size=requested_amount,
+        base_size=None,
+        estimated_base_size=Decimal("0.00005"),
         requested_amount=requested_amount,
         decision_record_id=uuid4(),
         risk_event_id=uuid4(),
@@ -502,6 +505,9 @@ async def test_controlled_proof_mode_forces_sell_when_requested(monkeypatch: pyt
     definition.metadata_evidence = {}
     preview = _preview(package_id=package_id)
     preview.side = "SELL"
+    preview.quote_size = None
+    preview.base_size = Decimal("0.00005")
+    preview.estimated_base_size = Decimal("0.00005")
     strategy = SimpleNamespace(id=preview.strategy_id, module_version="strategy-v9")
     parameter_set = SimpleNamespace(id=preview.parameter_set_id, label="ps-v3")
     cycle = _cycle(proposed_action="HOLD", termination_stage="hold_no_package_created")
@@ -1730,7 +1736,7 @@ async def test_controlled_proof_forced_sell_decision_record_reports_sell_action(
         return SimpleNamespace(crypto_order_preview_id=preview_id)
 
     monkeypatch.setattr(cpp, "_load_exchange_connection_for_scope", _async_return(SimpleNamespace(exchange_connection_id=uuid4())))
-    monkeypatch.setattr(cpp, "compute_signed_owned_quantity", _async_return(Decimal("0.05")))
+    monkeypatch.setattr(cpp, "compute_controlled_proof_owned_quantity", _async_return(Decimal("0.05")))
     monkeypatch.setattr(cpp, "_resolve_strategy_and_parameter_binding", _async_return((strategy, parameter_set)))
     monkeypatch.setattr(cpp, "create_crypto_order_preview", _create_sell_preview)
     monkeypatch.setattr(cpp, "_load_preview_by_id", _async_return(preview))

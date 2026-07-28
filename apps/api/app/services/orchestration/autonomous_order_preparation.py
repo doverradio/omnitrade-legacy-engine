@@ -31,7 +31,7 @@ from app.services.capital_campaign_domain.activated_commissioned_entry import ex
 from app.services.capital_campaign_domain.commissioned_readiness_preview import generate_commissioned_campaign_preview
 from app.services.exchange_connections.readiness import supports_autonomous_preview
 from app.services.exchange_connections.service import refresh_exchange_balances
-from app.services.live.position_quantity import compute_signed_owned_quantity
+from app.services.live.position_quantity import compute_controlled_proof_owned_quantity, compute_signed_owned_quantity
 from app.services.risk.risk_context import resolve_effective_risk_policy
 
 
@@ -331,12 +331,30 @@ async def prepare_autonomous_claimed_order(
     )
     if preview is None:
         _fail("canonical_preview_identity_evidence_missing")
-    if claim.side == "SELL" and (
-        preview.estimated_base_size is None
-        or Decimal(str(preview.estimated_base_size)) <= Decimal("0")
-        or Decimal(str(preview.estimated_base_size)) > owned_quantity
-    ):
-        _fail("sell_quantity_exceeds_owned_position")
+    if claim.side == "SELL":
+        requested_base_size = Decimal(str(preview.base_size or "0"))
+        provider_base_size = Decimal(str(preview.estimated_base_size or "0"))
+        if preview.quote_size is not None:
+            _fail("sell_quote_size_forbidden")
+        if requested_base_size <= Decimal("0") or provider_base_size <= Decimal("0"):
+            _fail("sell_quantity_evidence_missing")
+        package_market_identity = getattr(package, "market_evidence_identity", None) or {}
+        proof_id_raw = package_market_identity.get("controlled_proof_id")
+        if proof_id_raw:
+            try:
+                proof_quantity = await compute_controlled_proof_owned_quantity(
+                    db=db, proof_id=UUID(str(proof_id_raw)),
+                )
+            except (TypeError, ValueError):
+                _fail("controlled_proof_sell_identity_invalid")
+            if requested_base_size != proof_quantity:
+                _fail("controlled_proof_sell_quantity_mismatch")
+            if requested_base_size > owned_quantity:
+                _fail("sell_quantity_exceeds_owned_position")
+        elif requested_base_size != owned_quantity:
+            _fail("sell_quantity_ownership_mismatch")
+        if provider_base_size > requested_base_size:
+            _fail("sell_quantity_rounds_up")
     _readiness, commissioned_preview = await _canonical_preview_identity(
         db=db, claim=claim, package=package, activation=activation, preview=preview,
     )
@@ -366,6 +384,12 @@ async def prepare_autonomous_claimed_order(
             "decision_record_id": str(package.decision_record_id),
             "risk_event_id": str(package.risk_event_id),
             "approved_quote_size": str(package.risk_approved_amount),
+            "requested_base_size": str(preview.base_size) if claim.side == "SELL" else None,
+            "approved_base_size": str(preview.estimated_base_size) if claim.side == "SELL" else None,
+            "controlled_proof_id": (
+                package_market_identity.get("controlled_proof_id")
+                if claim.side == "SELL" else None
+            ),
             "commissioned_preview_identity_hash": canonical_hash,
             "commissioned_preview_identity_binding": binding,
         })

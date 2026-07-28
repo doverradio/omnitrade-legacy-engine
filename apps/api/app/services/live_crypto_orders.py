@@ -55,6 +55,7 @@ from app.services.exchange_connections.providers.registry import (
 )
 from app.services.exchange_connections.readiness import supports_autonomous_preview
 from app.services.live.accounting_reconciliation import reconcile_live_order_and_fills
+from app.services.live.position_quantity import compute_controlled_proof_owned_quantity, compute_signed_owned_quantity
 from app.services.live.risk_accounting_snapshot import (
     RiskAccountingUnavailableError,
     build_risk_accounting_snapshot,
@@ -2384,6 +2385,49 @@ class LiveCryptoOrderService:
         if _decimal(prepared_approved_quote_size) != live_order.requested_quote_size:
             raise PermissionError("prepared approved amount mismatch")
         approved_quote_size = live_order.requested_quote_size
+        provider_quote_size: Decimal | None = approved_quote_size
+        provider_base_size: Decimal | None = None
+        if live_order.side == "SELL":
+            if preview.quote_size is not None:
+                raise PermissionError("SELL preview must not contain quote_size")
+            if preview.base_size is None or preview.estimated_base_size is None:
+                raise PermissionError("SELL base quantity evidence missing")
+            requested_base_size = _decimal(preview.base_size)
+            provider_base_size = _decimal(preview.estimated_base_size)
+            if requested_base_size <= Decimal("0") or provider_base_size <= Decimal("0"):
+                raise PermissionError("SELL base quantity evidence missing")
+            if provider_base_size > requested_base_size:
+                raise PermissionError("SELL base quantity rounds upward")
+            prepared_requested_raw = live_order.safe_provider_response.get("requested_base_size")
+            prepared_approved_raw = live_order.safe_provider_response.get("approved_base_size")
+            if prepared_requested_raw is None or prepared_approved_raw is None:
+                raise PermissionError("prepared SELL base quantity evidence missing")
+            prepared_requested_base_size = _decimal(prepared_requested_raw)
+            prepared_approved_base_size = _decimal(prepared_approved_raw)
+            if prepared_requested_base_size != requested_base_size:
+                raise PermissionError("prepared SELL owned quantity mismatch")
+            if prepared_approved_base_size != provider_base_size:
+                raise PermissionError("prepared SELL provider quantity mismatch")
+            current_owned_quantity = await compute_signed_owned_quantity(
+                db=db,
+                live_trading_profile_id=resolved_profile_id,
+                symbol=live_order.product_id,
+            )
+            controlled_proof_id_raw = live_order.safe_provider_response.get("controlled_proof_id")
+            if controlled_proof_id_raw:
+                try:
+                    controlled_proof_quantity = await compute_controlled_proof_owned_quantity(
+                        db=db, proof_id=uuid.UUID(str(controlled_proof_id_raw)),
+                    )
+                except (TypeError, ValueError):
+                    raise PermissionError("controlled proof SELL identity invalid") from None
+                if controlled_proof_quantity != requested_base_size:
+                    raise PermissionError("current controlled proof SELL quantity mismatch")
+                if requested_base_size > current_owned_quantity:
+                    raise PermissionError("current SELL owned quantity insufficient")
+            elif current_owned_quantity != requested_base_size:
+                raise PermissionError("current SELL owned quantity mismatch")
+            provider_quote_size = None
         risk_action = RiskDecisionAction.APPROVE
 
         live_order.status = "SUBMISSION_PENDING"
@@ -2441,21 +2485,29 @@ class LiveCryptoOrderService:
             environment=live_order.environment,
         )
         provider = get_exchange_provider(live_order.provider, environment=live_order.environment)
+        provider_amount_payload = (
+            {"quote_size": format(provider_quote_size, "f")}
+            if live_order.side == "BUY" and provider_quote_size is not None
+            else {"base_size": format(provider_base_size, "f")}
+            if live_order.side == "SELL" and provider_base_size is not None
+            else {}
+        )
+        if not provider_amount_payload:
+            raise PermissionError("provider submission amount unavailable")
         request_payload = {
             "client_order_id": live_order.client_order_id,
             "product_id": live_order.product_id,
             "side": live_order.side,
             "order_configuration": {
                 "market_market_ioc": {
-                    "quote_size": format(approved_quote_size, "f"),
+                    **provider_amount_payload,
                     "rfq_disabled": True,
                 }
             },
         }
-        payload_quote_size = _decimal(
-            request_payload["order_configuration"]["market_market_ioc"]["quote_size"]
-        )
-        if payload_quote_size != approved_quote_size:
+        payload_amount = _decimal(next(iter(provider_amount_payload.values())))
+        expected_provider_amount = provider_quote_size if live_order.side == "BUY" else provider_base_size
+        if expected_provider_amount is None or payload_amount != expected_provider_amount:
             raise PermissionError("provider payload amount mismatch with approved amount")
         if hasattr(provider, "submit_order"):
             submission = await provider.submit_order(
@@ -2465,8 +2517,8 @@ class LiveCryptoOrderService:
                     product_id=live_order.product_id,
                     side=live_order.side,
                     order_type=live_order.order_type,
-                    quote_size=approved_quote_size,
-                    base_size=None,
+                    quote_size=provider_quote_size,
+                    base_size=provider_base_size,
                     client_order_id=live_order.client_order_id,
                     idempotency_key=live_order.client_order_id,
                     raw_payload=request_payload,
