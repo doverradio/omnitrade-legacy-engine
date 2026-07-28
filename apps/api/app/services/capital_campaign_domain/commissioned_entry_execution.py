@@ -1021,6 +1021,14 @@ async def execute_commissioned_entry(
             )
         except (TimeoutError, ServiceUnavailableError) as exc:
             submit_error = exc
+        except Exception as exc:
+            # Diagnostic stage marker only. The orchestration boundary owns
+            # terminalization and secret-safe logging; preserving the same
+            # exception and traceback here keeps execution behavior exactly
+            # unchanged while identifying that the failure arose inside the
+            # canonical LiveCryptoOrderService submission boundary.
+            setattr(exc, "omnitrade_failing_stage", "live_crypto_order_submit")
+            raise
 
         final_classification = "submitted"
         final_state: CommissionedCampaignState = reconciliation_pending_state

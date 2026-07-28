@@ -152,7 +152,8 @@ def test_claim_schema_prevents_duplicate_package_and_activation() -> None:
 def _claim(*, claim_status: str = "CLAIMED") -> SimpleNamespace:
     return SimpleNamespace(
         claim_id=uuid4(), package_id=uuid4(), campaign_id=uuid4(), campaign_version=1,
-        claim_status=claim_status, claim_owner="worker:test",
+        claim_status=claim_status, claim_owner="worker:test", product="BTC-USD", side="BUY",
+        provider="kraken_spot", environment="production",
     )
 
 
@@ -328,8 +329,8 @@ async def test_advance_claimed_execution_execute_failure_terminalizes(monkeypatc
     async def _execute(*, db, prepared):
         raise RuntimeError("provider evidence unavailable")
 
-    async def _mark_blocked(*, db, claim, reason_code):
-        blocked.append((claim, reason_code))
+    async def _mark_blocked(*, db, claim, reason_code, safe_failure_evidence=None):
+        blocked.append((claim, reason_code, safe_failure_evidence))
 
     monkeypatch.setattr(subject, "prepare_autonomous_claimed_order", _prepare)
     monkeypatch.setattr(subject, "execute_prepared_autonomous_claim", _execute)
@@ -339,7 +340,109 @@ async def test_advance_claimed_execution_execute_failure_terminalizes(monkeypatc
 
     await subject.advance_claimed_execution(db=db, claim=claim)
 
-    assert blocked == [(claim, "commissioned_execution_request_evidence_unavailable")]
+    assert blocked == [(
+        claim,
+        "commissioned_execution_request_evidence_unavailable",
+        {
+            "exception_type": "RuntimeError",
+            "exception_message": "provider evidence unavailable",
+            "safe_reason_code": "RuntimeError",
+            "failing_stage": "commissioned_execution",
+            "provider_call_made": False,
+        },
+    )]
+
+
+@pytest.mark.asyncio
+async def test_execute_failure_logs_redacted_structured_traceback_and_exact_identities(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture,
+) -> None:
+    claim = _claim()
+    prepared = _prepared(claim)
+    proof_id = uuid4()
+    secret = "kraken-test-secret-value"
+    blocked = []
+
+    async def _prepare(*, db, claim_id):
+        return prepared
+
+    async def _execute(*, db, prepared):
+        exc = PermissionError(f"credential validation failed for {secret}")
+        setattr(exc, "omnitrade_failing_stage", "live_crypto_order_submit")
+        raise exc
+
+    async def _proof_id(*, db, package_id):
+        assert package_id == claim.package_id
+        return proof_id
+
+    async def _mark_blocked(*, db, claim, reason_code, safe_failure_evidence=None):
+        blocked.append((reason_code, safe_failure_evidence))
+
+    monkeypatch.setenv("OT_KRAKEN_API_SECRET", secret)
+    monkeypatch.setattr(subject, "prepare_autonomous_claimed_order", _prepare)
+    monkeypatch.setattr(subject, "execute_prepared_autonomous_claim", _execute)
+    monkeypatch.setattr(subject, "_controlled_proof_id_for_failure_diagnostics", _proof_id)
+    monkeypatch.setattr(subject, "mark_pre_provider_blocked", _mark_blocked)
+    monkeypatch.setattr(subject, "get_settings", lambda: SimpleNamespace(live_crypto_order_submission_enabled=True, database_url=""))
+    db = SimpleNamespace(add=Mock(), flush=AsyncMock())
+
+    with caplog.at_level("ERROR", logger=subject.__name__):
+        await subject.advance_claimed_execution(db=db, claim=claim)
+
+    message = caplog.text
+    assert "event=commissioned_execution_pre_provider_exception" in message
+    assert f"claim_id={claim.claim_id}" in message
+    assert f"package_id={claim.package_id}" in message
+    assert f"controlled_proof_id={proof_id}" in message
+    assert f"live_order_id={prepared.order.live_crypto_order_id}" in message
+    assert f"campaign_id={claim.campaign_id}" in message
+    assert "campaign_version=1" in message
+    assert "product=BTC-USD side=BUY provider=kraken_spot environment=production" in message
+    assert "exception_type=PermissionError" in message
+    assert "failing_stage=live_crypto_order_submit provider_call_made=false" in message
+    assert "Traceback (most recent call last)" in message
+    assert "[REDACTED]" in message
+    assert secret not in message
+    assert blocked == [(
+        "commissioned_execution_request_evidence_unavailable",
+        {
+            "exception_type": "PermissionError",
+            "exception_message": "credential validation failed for [REDACTED]",
+            "safe_reason_code": "PermissionError",
+            "failing_stage": "live_crypto_order_submit",
+            "provider_call_made": False,
+        },
+    )]
+
+
+@pytest.mark.asyncio
+async def test_mark_pre_provider_blocked_persists_safe_specific_failure_evidence() -> None:
+    claim = _claim()
+    db = SimpleNamespace(add=Mock(), flush=AsyncMock())
+    evidence = {
+        "exception_type": "PermissionError",
+        "exception_message": "confirmation phrase mismatch",
+        "safe_reason_code": "PermissionError",
+        "failing_stage": "live_crypto_order_submit",
+        "provider_call_made": False,
+    }
+
+    await subject.mark_pre_provider_blocked(
+        db=db,
+        claim=claim,
+        reason_code="commissioned_execution_request_evidence_unavailable",
+        safe_failure_evidence=evidence,
+    )
+
+    assert claim.claim_status == "FAILED_PRE_PROVIDER"
+    assert claim.last_error_code == "commissioned_execution_request_evidence_unavailable"
+    audit = db.add.call_args.args[0]
+    assert audit.after_state == {
+        "claim_status": "FAILED_PRE_PROVIDER",
+        "reason_code": "commissioned_execution_request_evidence_unavailable",
+        "provider_call_made": False,
+        "safe_failure_evidence": evidence,
+    }
 
 
 # --- sweep_stale_autonomous_execution_claims: the never-implemented recovery pass ----

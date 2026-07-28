@@ -13,6 +13,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import get_settings
 from app.core.errors import InvalidRequestError
+from app.core.redaction import redact_message_for_diagnostics
 from app.models.audit_log import AuditLog
 from app.models.autonomous_capital_mandate import AutonomousCapitalMandate
 from app.models.autonomous_capital_mandate_version import AutonomousCapitalMandateVersion
@@ -421,6 +422,7 @@ async def mark_submission_safety_disabled(*, db: AsyncSession, claim: Autonomous
 
 async def mark_pre_provider_blocked(
     *, db: AsyncSession, claim: AutonomousExecutionClaim, reason_code: str,
+    safe_failure_evidence: dict[str, object] | None = None,
 ) -> None:
     # See mark_submission_safety_disabled's identical guard comment above.
     if claim.claim_status in _CLAIM_SCOPE_RELEASED_STATES:
@@ -430,13 +432,41 @@ async def mark_pre_provider_blocked(
     claim.last_error_code = reason_code
     claim.recover_after = None
     claim.updated_at = _utcnow()
+    after_state: dict[str, object] = {
+        "claim_status": claim.claim_status,
+        "reason_code": reason_code,
+        "provider_call_made": False,
+    }
+    if safe_failure_evidence:
+        after_state["safe_failure_evidence"] = safe_failure_evidence
     db.add(AuditLog(
         actor=claim.claim_owner, action="autonomous_execution_claim.failed_pre_provider",
         entity_type="autonomous_execution_claim", entity_id=claim.claim_id,
         before_state={"claim_status": before},
-        after_state={"claim_status": claim.claim_status, "reason_code": reason_code, "provider_call_made": False},
+        after_state=after_state,
     ))
     await db.flush()
+
+
+async def _controlled_proof_id_for_failure_diagnostics(
+    *, db: AsyncSession, package_id: UUID,
+) -> UUID | None:
+    """Best-effort diagnostic linkage only; never affects authorization."""
+    try:
+        return await db.scalar(
+            select(ControlledProofRun.proof_id)
+            .where(
+                or_(
+                    ControlledProofRun.package_id == package_id,
+                    ControlledProofRun.sell_package_id == package_id,
+                )
+            )
+            .limit(1)
+        )
+    except Exception:
+        # The original exception remains the authoritative failure. A broken
+        # transaction must not let optional diagnostic enrichment replace it.
+        return None
 
 
 # A live order's status, once reconciliation has authoritatively resolved
@@ -583,13 +613,59 @@ async def advance_claimed_execution(*, db: AsyncSession, claim: AutonomousExecut
         prepared.claim.reconciliation_state = execution.current_state
         prepared.claim.updated_at = _utcnow()
         await db.flush()
-    except Exception:
-        await mark_pre_provider_blocked(
-            db=db, claim=prepared.claim, reason_code="commissioned_execution_request_evidence_unavailable",
+    except Exception as exc:
+        exception_type = type(exc).__name__
+        exception_message = redact_message_for_diagnostics(str(exc), settings=get_settings())
+        failing_stage = str(getattr(exc, "omnitrade_failing_stage", "commissioned_execution"))
+        safe_reason_code = exception_type
+        if isinstance(exc, InvalidRequestError):
+            blocker = str((exc.details or {}).get("blocker") or "").strip()
+            if blocker:
+                safe_reason_code = redact_message_for_diagnostics(blocker, settings=get_settings())
+        controlled_proof_id = await _controlled_proof_id_for_failure_diagnostics(
+            db=db, package_id=prepared.claim.package_id,
         )
-        logger.exception(
-            "autonomous_execution_failed_pre_provider claim_id=%s package_id=%s live_order_id=%s reason=commissioned_execution_request_evidence_unavailable provider_call_made=false",
-            prepared.claim.claim_id, prepared.claim.package_id, prepared.order.live_crypto_order_id,
+        safe_failure_evidence: dict[str, object] = {
+            "exception_type": exception_type,
+            "exception_message": exception_message,
+            "safe_reason_code": safe_reason_code,
+            "failing_stage": failing_stage,
+            "provider_call_made": False,
+        }
+        await mark_pre_provider_blocked(
+            db=db,
+            claim=prepared.claim,
+            reason_code="commissioned_execution_request_evidence_unavailable",
+            safe_failure_evidence=safe_failure_evidence,
+        )
+        # Use the original traceback with a redacted exception object. Plain
+        # logger.exception would append str(exc) again, bypassing redaction.
+        safe_traceback_exception = RuntimeError(exception_message)
+        logger.error(
+            "event=commissioned_execution_pre_provider_exception claim_id=%s package_id=%s controlled_proof_id=%s "
+            "live_order_id=%s campaign_id=%s campaign_version=%s product=%s side=%s provider=%s environment=%s "
+            "exception_type=%s exception_message=%r failing_stage=%s provider_call_made=false",
+            prepared.claim.claim_id,
+            prepared.claim.package_id,
+            controlled_proof_id,
+            prepared.order.live_crypto_order_id,
+            prepared.claim.campaign_id,
+            prepared.claim.campaign_version,
+            prepared.claim.product,
+            prepared.claim.side,
+            prepared.claim.provider,
+            prepared.claim.environment,
+            exception_type,
+            exception_message,
+            failing_stage,
+            exc_info=(type(safe_traceback_exception), safe_traceback_exception, exc.__traceback__),
+        )
+        logger.info(
+            "autonomous_execution_failed_pre_provider claim_id=%s package_id=%s live_order_id=%s "
+            "reason=commissioned_execution_request_evidence_unavailable provider_call_made=false",
+            prepared.claim.claim_id,
+            prepared.claim.package_id,
+            prepared.order.live_crypto_order_id,
         )
 
 
