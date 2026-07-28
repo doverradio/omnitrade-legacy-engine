@@ -5008,3 +5008,87 @@ async def test_claim_guard_blocks_unscopable_orphaned_current_state() -> None:
         result = await db.scalar(claim_blocking_reconciliation_statement(**scope))
 
     assert result == event_id
+
+
+@pytest.mark.asyncio
+async def test_exit_recovery_enters_existing_pipeline_as_sell_only(monkeypatch: pytest.MonkeyPatch) -> None:
+    import app.services.orchestration.continuous_pipeline_worker as worker_module
+    from app.services.controlled_proof import ControlledProofRiskOutcome
+    from app.services.orchestration.automatic_package_executor import AutomaticPackageExecutionOutcome
+
+    proof = SimpleNamespace(
+        proof_id=uuid.uuid4(), status="EXPIRED", terminal_verdict="FAILED",
+        package_id=uuid.uuid4(), sell_package_id=None, campaign_id=uuid.uuid4(), campaign_version=1,
+        provider="kraken_spot", environment="production", product_id="BTC-USD",
+        max_notional_usd=Decimal("5"), audit_correlation_id=uuid.uuid4(),
+    )
+    recovery = SimpleNamespace(recovery_id=uuid.uuid4(), status="IN_PROGRESS")
+    package_id = uuid.uuid4()
+    captured = {}
+
+    monkeypatch.setattr(worker_module, "claim_exit_recovery_by_id", _async_return((recovery, proof)))
+    monkeypatch.setattr(worker_module, "should_propose_controlled_sell", _async_return(True))
+    monkeypatch.setattr(worker_module, "_load_runtime_campaign", _async_return(SimpleNamespace(paper_account_id=uuid.uuid4())))
+    monkeypatch.setattr(worker_module, "_load_live_trading_profile_for_paper_account", _async_return(SimpleNamespace(id=uuid.uuid4())))
+    monkeypatch.setattr(worker_module, "_has_open_live_order", _async_return(False))
+    monkeypatch.setattr(worker_module, "_has_unresolved_reconciliation", _async_return(False))
+    monkeypatch.setattr(worker_module, "evaluate_controlled_proof_risk", _async_return(ControlledProofRiskOutcome(verdict="ALLOW", approved_notional_usd=Decimal("5"), reason_code=None, risk_event_id=uuid.uuid4())))
+    monkeypatch.setattr(worker_module, "get_settings", lambda: SimpleNamespace(automatic_mandate_package_activation_mandate_id=uuid.uuid4()))
+    monkeypatch.setattr(worker_module, "resolve_controlled_proof_strategy_identity", _async_return("ma_crossover@1.0.0"))
+    monkeypatch.setattr(worker_module, "create_controlled_proof_decision_record", _async_return(uuid.uuid4()))
+    evaluation = SimpleNamespace(authorization_result="AUTHORIZED", mandate_id=uuid.uuid4(), mandate_version_id=uuid.uuid4(), evaluation_id=uuid.uuid4())
+    monkeypatch.setattr(worker_module, "evaluate_and_record_mandate", _async_return(evaluation))
+
+    async def _create(*, db, request):
+        captured["request"] = request
+        return {"package": {"package_id": str(package_id)}}
+    async def _link(*, db, proof, sell_package_id, preserve_terminal_status=False):
+        captured["preserve"] = preserve_terminal_status
+        proof.sell_package_id = sell_package_id
+    monkeypatch.setattr(worker_module, "create_canonical_preview_package", _create)
+    monkeypatch.setattr(worker_module, "link_controlled_proof_sell_package", _link)
+    monkeypatch.setattr(worker_module, "execute_automatic_ready_package_through_activation", _async_return(AutomaticPackageExecutionOutcome(package_id=package_id, campaign_id=proof.campaign_id, campaign_version=1, decision_record_id=uuid.uuid4(), mandate_id=evaluation.mandate_id, authorization_state="AUTHORIZED", dry_run_state="NOT_RUN", activation_state="NOT_ACTIVATED", authority_source="MANDATE", replayed=False, final_reason_code="test", failed_closed=True, starting_state="READY")))
+
+    await worker_module._attempt_operator_controlled_proof_entry(db=_FakeDB(), recovery_id=recovery.recovery_id)
+
+    request = captured["request"]
+    assert request.forced_action == "CLOSE_POSITION_PROPOSED"
+    assert request.commissioning_entry_mode == "controlled_proof"
+    assert captured["preserve"] is True
+    assert proof.status == "EXPIRED"
+    assert proof.terminal_verdict == "FAILED"
+
+
+@pytest.mark.asyncio
+async def test_exit_recovery_resumes_exact_linked_package_after_worker_restart(monkeypatch: pytest.MonkeyPatch) -> None:
+    import app.services.orchestration.continuous_pipeline_worker as worker_module
+    from app.services.orchestration.automatic_package_executor import AutomaticPackageExecutionOutcome
+
+    package_id, decision_id = uuid.uuid4(), uuid.uuid4()
+    proof = SimpleNamespace(
+        proof_id=uuid.uuid4(), status="EXPIRED", terminal_verdict="FAILED",
+        package_id=uuid.uuid4(), sell_package_id=package_id, campaign_id=uuid.uuid4(), campaign_version=1,
+        provider="kraken_spot", environment="production", product_id="BTC-USD",
+    )
+    recovery = SimpleNamespace(recovery_id=uuid.uuid4(), status="IN_PROGRESS")
+    package = SimpleNamespace(package_id=package_id, decision_record_id=decision_id)
+
+    class _Db(_FakeDB):
+        async def get(self, model, identity):
+            assert model is worker_module.CanonicalPreviewPackage and identity == package_id
+            return package
+
+    progressed = []
+    monkeypatch.setattr(worker_module, "claim_exit_recovery_by_id", _async_return((recovery, proof)))
+    monkeypatch.setattr(worker_module, "get_controlled_proof_view", _async_return({}))
+    monkeypatch.setattr(worker_module, "refresh_exit_recovery_completion", _async_return(None))
+    async def _execute(*, db, request):
+        progressed.append(request)
+        return AutomaticPackageExecutionOutcome(package_id=package_id, campaign_id=proof.campaign_id, campaign_version=1, decision_record_id=decision_id, mandate_id=uuid.uuid4(), authorization_state="AUTHORIZED", dry_run_state="NOT_RUN", activation_state="NOT_ACTIVATED", authority_source="MANDATE", replayed=True, final_reason_code="retryable", failed_closed=True, starting_state="READY")
+    monkeypatch.setattr(worker_module, "execute_automatic_ready_package_through_activation", _execute)
+
+    await worker_module._attempt_operator_controlled_proof_entry(db=_Db(), recovery_id=recovery.recovery_id)
+
+    assert len(progressed) == 1
+    assert progressed[0].package_id == package_id
+    assert progressed[0].decision_record_id == decision_id

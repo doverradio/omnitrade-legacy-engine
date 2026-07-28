@@ -13,10 +13,11 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.models.canonical_preview_package import CanonicalPreviewPackage
 from app.models.controlled_proof_run import ControlledProofRun
+from app.models.controlled_proof_exit_recovery import ControlledProofExitRecovery
 from app.services.orchestration import autonomous_execution_claims as subject
 from tests.support.real_sqlite_session import real_sqlite_session
 
-_ALL_TABLES = [CanonicalPreviewPackage.__table__, ControlledProofRun.__table__]
+_ALL_TABLES = [CanonicalPreviewPackage.__table__, ControlledProofRun.__table__, ControlledProofExitRecovery.__table__]
 
 _AUTO = object()  # sentinel: "generate a real value" -- distinct from an explicitly-passed None
 
@@ -75,6 +76,52 @@ async def _make_proof(
 
 def _mandate_ids() -> dict:
     return {"mandate_id": uuid.uuid4(), "mandate_version_id": uuid.uuid4(), "mandate_evaluation_id": uuid.uuid4()}
+
+
+@pytest.mark.asyncio
+async def test_terminal_proof_sell_resolves_only_with_active_exit_recovery() -> None:
+    campaign_id = uuid.uuid4()
+    ids = _mandate_ids()
+    async with _real_session() as session:
+        package = await _make_package(db=session, campaign_id=campaign_id, campaign_version=1, side="SELL", **ids)
+        proof = await _make_proof(db=session, campaign_id=campaign_id, campaign_version=1, package_id=uuid.uuid4(), sell_package_id=package.package_id, status="EXPIRED")
+        session.add(ControlledProofExitRecovery(
+            proof_id=proof.proof_id, status="IN_PROGRESS", idempotency_key="execution-recovery",
+            authorized_by="operator:human", authorized_at=datetime.now(timezone.utc),
+            expires_at=datetime.now(timezone.utc) + timedelta(minutes=30),
+        ))
+        await session.flush()
+        scope, blocker = await subject._resolve_autonomous_execution_scope(db=session, package=package)
+        assert blocker is None
+        assert scope is not None and scope.controlled_proof_id == proof.proof_id
+
+
+@pytest.mark.asyncio
+async def test_exit_recovery_cannot_authorize_buy_or_unrelated_sell_or_expired_authority() -> None:
+    ids = _mandate_ids()
+    for side, exact_sell_link, recovery_expires, expected in (
+        ("BUY", False, timedelta(minutes=30), "controlled_proof_not_active"),
+        ("SELL", False, timedelta(minutes=30), "controlled_proof_not_active"),
+        ("SELL", True, timedelta(minutes=-1), "controlled_proof_not_active"),
+    ):
+        async with _real_session() as session:
+            campaign_id = uuid.uuid4()
+            package = await _make_package(db=session, campaign_id=campaign_id, campaign_version=1, side=side, **ids)
+            proof = await _make_proof(
+                db=session, campaign_id=campaign_id, campaign_version=1,
+                package_id=package.package_id,
+                sell_package_id=package.package_id if exact_sell_link else uuid.uuid4(),
+                status="EXPIRED",
+            )
+            session.add(ControlledProofExitRecovery(
+                proof_id=proof.proof_id, status="IN_PROGRESS", idempotency_key=f"containment-{side}-{uuid.uuid4()}",
+                authorized_by="operator:human", authorized_at=datetime.now(timezone.utc),
+                expires_at=datetime.now(timezone.utc) + recovery_expires,
+            ))
+            await session.flush()
+            scope, blocker = await subject._resolve_autonomous_execution_scope(db=session, package=package)
+            assert scope is None
+            assert blocker == expected
 
 
 # --- _resolve_autonomous_execution_scope: linkage routing -----------------------------

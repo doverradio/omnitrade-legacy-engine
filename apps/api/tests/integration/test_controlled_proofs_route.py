@@ -156,3 +156,50 @@ def test_cancel_endpoint_succeeds_with_operator_auth(monkeypatch) -> None:
     assert response.status_code == 200
     assert response.json()["status"] == "CANCELLED"
     assert seen_actor["actor"] == "operator:human"
+
+
+def _recovery_payload(proof_id: uuid.UUID) -> dict:
+    now = datetime.now(timezone.utc)
+    return {
+        "recovery_id": uuid.uuid4(), "proof_id": proof_id, "status": "AUTHORIZED",
+        "idempotency_key": "recover-1", "authorized_by": "operator:human",
+        "authorized_at": now, "expires_at": now, "claimed_at": None,
+        "completed_at": None, "blocked_reason": None, "failure_reason": None,
+        "audit_correlation_id": uuid.uuid4(),
+    }
+
+
+def test_exit_recovery_requires_operator_auth(monkeypatch) -> None:
+    async def _unexpected(**kwargs):
+        raise AssertionError("must not authorize without operator authentication")
+    monkeypatch.setattr(route_module, "authorize_controlled_proof_exit_recovery", _unexpected)
+    response = _create_client().post(
+        f"/api/v1/operator/controlled-proofs/{uuid.uuid4()}/exit-recovery",
+        json={"idempotency_key": "recover-unauthorized"},
+    )
+    assert response.status_code == 401
+
+
+def test_exit_recovery_authorizes_and_dispatches(monkeypatch) -> None:
+    proof_id = uuid.uuid4()
+    seen: dict = {}
+
+    async def _authorize(**kwargs):
+        seen.update(kwargs)
+
+    async def _view(*, db, proof_id):
+        return _recovery_payload(proof_id)
+
+    monkeypatch.setattr(route_module, "authorize_controlled_proof_exit_recovery", _authorize)
+    monkeypatch.setattr(route_module, "get_exit_recovery_view", _view)
+    monkeypatch.setattr(route_module, "schedule_controlled_proof_exit_recovery_dispatch", lambda *, proof_id: seen.update(dispatched=proof_id))
+    response = _create_client().post(
+        f"/api/v1/operator/controlled-proofs/{proof_id}/exit-recovery",
+        json={"idempotency_key": "recover-1", "expires_in_minutes": 45},
+        headers={"Authorization": "Bearer operator:human"},
+    )
+    assert response.status_code == 201
+    assert response.json()["status"] == "AUTHORIZED"
+    assert seen["proof_id"] == proof_id
+    assert seen["actor"] == "operator:human"
+    assert seen["dispatched"] == proof_id

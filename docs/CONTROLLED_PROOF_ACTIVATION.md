@@ -20,6 +20,43 @@ Proof's own authority and grants a narrow, package-scoped override -- only
 for the one package genuinely linked to that one proof, only while every
 invariant below holds, re-verified fresh against the database on every call.
 
+## Governed exit recovery
+
+`POST /api/v1/operator/controlled-proofs/{proof_id}/exit-recovery` creates a
+bounded, idempotent `ControlledProofExitRecovery` authority for the one case
+where a proof reached a reconciled BUY and an owned open position but became
+`EXPIRED` or `FAILED` before creating any SELL lineage. The request accepts
+only an idempotency key and a 1–180 minute authority window. Provider,
+environment, campaign, product, position, side, and quantity are resolved from
+authoritative existing lineage and cannot be supplied by the caller.
+
+Authorization fails closed unless the BUY is `FILLED`, its latest
+reconciliation is `filled`, accounting attributes the position to that exact
+BUY and campaign/profile scope, authoritative owned quantity is positive, the
+linked position remains open, no SELL package/order exists, and neither an
+open provider order nor unresolved reconciliation exists.
+
+The original proof remains terminal and its original verdict is never erased
+or rewritten. Recovery has its own `AUTHORIZED -> IN_PROGRESS -> COMPLETED`
+state machine (with `BLOCKED` and `EXPIRED` terminal outcomes), append-only
+audit events, at most one active authority per proof, and bounded expiry.
+A terminal `BLOCKED` or `EXPIRED` attempt remains preserved and a new explicit
+operator authorization may create a later attempt for the same proof when
+fresh validation succeeds. If an earlier attempt created the exact SELL
+package but expired before submission, the later authority may resume only
+that package; it cannot create another SELL lineage. Worker dispatch enters immediately before
+`should_propose_controlled_sell()` and can therefore execute only the existing
+SELL path:
+
+```text
+fresh SELL Risk -> mandate evaluation -> canonical SELL preview/package
+-> authorization/activation -> canonical execution -> accounting
+-> reconciliation -> exit recovery COMPLETED
+```
+
+It does not make `EXPIRED` an active proof state, construct a replacement
+proof, or introduce any BUY, provider, accounting, or reconciliation bypass.
+
 Ordinary automatic packages (no Controlled Proof linkage) are unaffected:
 they remain governed solely by `AUTOMATIC_MANDATE_PACKAGE_ACTIVATION_ENABLED`,
 exactly as before this change.

@@ -11,6 +11,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.config import get_settings
 from app.models.canonical_preview_package import CanonicalPreviewPackage
 from app.models.controlled_proof_run import ControlledProofRun
+from app.models.controlled_proof_exit_recovery import ControlledProofExitRecovery
 from app.services.canonical_preview_package import (
     CanonicalPreviewPackageActivationRequest,
     CanonicalPreviewPackageDryRunRequest,
@@ -204,18 +205,35 @@ async def _resolve_controlled_proof_activation_scope(
         return None
 
     now = datetime.now(timezone.utc)
+    recovery = None
+    if (
+        proof.status not in _CONTROLLED_PROOF_ACTIVE_STATES
+        and package.side == "SELL"
+        and proof.sell_package_id == package.package_id
+    ):
+        recovery = await db.scalar(select(ControlledProofExitRecovery).where(
+            ControlledProofExitRecovery.proof_id == proof.proof_id,
+            ControlledProofExitRecovery.status.in_(("AUTHORIZED", "IN_PROGRESS")),
+            ControlledProofExitRecovery.expires_at > now,
+        ).limit(1))
+    exit_recovery_authorized = bool(
+        recovery is not None
+        and package.side == "SELL"
+        and proof.sell_package_id == package.package_id
+    )
     # Fail closed if the proof is expired, cancelled, blocked, failed, or
     # otherwise terminal -- _ACTIVE_STATES is the exact same set
     # create_controlled_proof's own "already active" guard and the
     # database's uq_controlled_proof_runs_single_active partial index are
     # built on, never a second, possibly-divergent definition of "active".
-    if proof.status not in _CONTROLLED_PROOF_ACTIVE_STATES:
+    if proof.status not in _CONTROLLED_PROOF_ACTIVE_STATES and not exit_recovery_authorized:
         return _blocked("controlled_proof_not_active")
     # Postgres's TIMESTAMPTZ always round-trips timezone-aware; sqlite (used
     # only by this module's own test double) has no native tz-aware type and
     # can hand back a naive value after a flush-triggered reload -- normalize
     # rather than let that test-environment quirk raise TypeError here.
-    expires_at = proof.expires_at if proof.expires_at.tzinfo is not None else proof.expires_at.replace(tzinfo=timezone.utc)
+    authority_expires_at = recovery.expires_at if exit_recovery_authorized else proof.expires_at
+    expires_at = authority_expires_at if authority_expires_at.tzinfo is not None else authority_expires_at.replace(tzinfo=timezone.utc)
     if expires_at <= now:
         return _blocked("controlled_proof_expired")
     if package.product != proof.product_id:

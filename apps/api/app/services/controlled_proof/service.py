@@ -580,6 +580,7 @@ async def link_controlled_proof_package(
 
 async def link_controlled_proof_sell_package(
     *, db: AsyncSession, proof: ControlledProofRun, sell_package_id: uuid.UUID,
+    preserve_terminal_status: bool = False,
 ) -> None:
     """Idempotent, mirrors link_controlled_proof_package: a proof is linked
     to its one controlled SELL exactly once. Only meaningful once the
@@ -587,13 +588,18 @@ async def link_controlled_proof_sell_package(
     if proof.sell_package_id is not None:
         return
     proof.sell_package_id = sell_package_id
-    proof.status = "WAITING_FOR_PROFITABLE_EXIT"
+    if not preserve_terminal_status:
+        proof.status = "WAITING_FOR_PROFITABLE_EXIT"
     proof.updated_at = _utcnow()
     db.add(AuditLog(
         actor="system:controlled_proof_worker", action="controlled_proof_run.sell_package_linked",
         entity_type="controlled_proof_run", entity_id=proof.proof_id,
         before_state={"sell_package_id": None},
-        after_state={"sell_package_id": str(sell_package_id), "status": "WAITING_FOR_PROFITABLE_EXIT"},
+        after_state={
+            "sell_package_id": str(sell_package_id),
+            "status": proof.status,
+            "exit_recovery": preserve_terminal_status,
+        },
     ))
     await db.flush()
 

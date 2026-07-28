@@ -20,6 +20,16 @@ from app.services.controlled_proof.service import (
     resolve_controlled_proof_strategy_identity,
     should_propose_controlled_sell,
 )
+from app.services.controlled_proof.exit_recovery import (
+    authorize_controlled_proof_exit_recovery,
+    block_exit_recovery,
+    claim_exit_recovery_by_id,
+    find_pending_exit_recovery_id,
+    get_exit_recovery_view,
+    record_exit_recovery_waiting,
+    refresh_exit_recovery_completion,
+    refresh_exit_recovery_outcomes,
+)
 
 __all__ = [
     "ALLOWED_CAMPAIGN_ID",
@@ -42,4 +52,12 @@ __all__ = [
     "record_controlled_proof_waiting",
     "resolve_controlled_proof_strategy_identity",
     "should_propose_controlled_sell",
+    "authorize_controlled_proof_exit_recovery",
+    "block_exit_recovery",
+    "claim_exit_recovery_by_id",
+    "find_pending_exit_recovery_id",
+    "get_exit_recovery_view",
+    "record_exit_recovery_waiting",
+    "refresh_exit_recovery_completion",
+    "refresh_exit_recovery_outcomes",
 ]

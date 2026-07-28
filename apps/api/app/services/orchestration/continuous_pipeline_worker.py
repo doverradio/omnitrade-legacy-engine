@@ -40,16 +40,23 @@ from app.services.canonical_preview_package import (
     create_controlled_proof_decision_record,
 )
 from app.services.controlled_proof import (
+    block_exit_recovery,
+    claim_exit_recovery_by_id,
     block_controlled_proof,
     claim_controlled_proof_by_id,
     controlled_proof_entry_blocker,
     evaluate_controlled_proof_risk,
     find_pending_controlled_proof_id,
+    find_pending_exit_recovery_id,
     get_controlled_proof_view,
+    get_exit_recovery_view,
     link_controlled_proof_entry,
     link_controlled_proof_package,
     link_controlled_proof_sell_package,
     record_controlled_proof_waiting,
+    record_exit_recovery_waiting,
+    refresh_exit_recovery_completion,
+    refresh_exit_recovery_outcomes,
     resolve_controlled_proof_strategy_identity,
     should_propose_controlled_sell,
 )
@@ -1645,6 +1652,10 @@ async def _run_autonomous_and_campaign_orchestration_attempt(*, db: AsyncSession
     # autonomous cycle that follows.
     if hasattr(db, "scalars") and hasattr(db, "scalar"):
         try:
+            await refresh_exit_recovery_outcomes(db=db)
+            pending_recovery_id = await find_pending_exit_recovery_id(db=db)
+            if pending_recovery_id is not None:
+                await _attempt_operator_controlled_proof_entry(db=db, recovery_id=pending_recovery_id)
             pending_proof_id = await find_pending_controlled_proof_id(db=db)
             if pending_proof_id is not None:
                 await _attempt_operator_controlled_proof_entry(db=db, proof_id=pending_proof_id)
@@ -1776,17 +1787,62 @@ async def _run_autonomous_and_campaign_orchestration_attempt(*, db: AsyncSession
             logger.exception("campaign_orchestration_failed trigger=%s", _AUTONOMOUS_CYCLE_TRIGGER)
 
 
-async def _attempt_operator_controlled_proof_entry(*, db: AsyncSession, proof_id: uuid.UUID) -> None:
+async def _attempt_operator_controlled_proof_entry(
+    *, db: AsyncSession, proof_id: uuid.UUID | None = None,
+    recovery_id: uuid.UUID | None = None,
+) -> None:
     """Build one Controlled Proof candidate without an autonomous action.
 
     This is the trigger/candidate seam; everything from canonical package
     creation onward is the same package/mandate/activation/execution path
     used by automation.  Every pre-package stop is persisted on the proof.
     """
-    proof = await claim_controlled_proof_by_id(db=db, proof_id=proof_id)
-    if proof is None:
-        return
+    recovery = None
+    if recovery_id is not None:
+        claimed_recovery = await claim_exit_recovery_by_id(db=db, recovery_id=recovery_id)
+        if claimed_recovery is None:
+            return
+        recovery, proof = claimed_recovery
+        proof_id = proof.proof_id
+    else:
+        if proof_id is None:
+            return
+        proof = await claim_controlled_proof_by_id(db=db, proof_id=proof_id)
+        if proof is None:
+            return
     actor = "system:controlled_proof_worker"
+    async def _record_wait(reason: str) -> None:
+        if recovery is not None:
+            await record_exit_recovery_waiting(db=db, recovery=recovery, reason=reason)
+        else:
+            await record_controlled_proof_waiting(db=db, proof=proof, reason=reason, actor=actor)
+
+    async def _record_block(reason: str) -> None:
+        if recovery is not None:
+            await block_exit_recovery(db=db, recovery=recovery, reason=reason)
+        else:
+            await block_controlled_proof(db=db, proof=proof, reason=reason, actor=actor)
+
+    async def _progress_package(*, package_id: uuid.UUID, decision_record_id: uuid.UUID) -> None:
+        progression = await execute_automatic_ready_package_through_activation(
+            db=db,
+            request=AutomaticPackageExecutionRequest(
+                campaign_id=proof.campaign_id, campaign_version=proof.campaign_version,
+                decision_record_id=decision_record_id, package_id=package_id,
+            ),
+        )
+        if progression.activation_state == "ACTIVATED" and not progression.failed_closed:
+            claim_outcome = await claim_activated_package(db=db, package_id=package_id)
+            logger.info(
+                "controlled_proof_execution_claim_outcome proof_id=%s package_id=%s claim_id=%s "
+                "claim_created=%s reason=%s provider_call_made=false",
+                proof.proof_id, package_id,
+                None if claim_outcome.claim is None else claim_outcome.claim.claim_id,
+                claim_outcome.created, claim_outcome.reason_code,
+            )
+            if claim_outcome.claim is not None:
+                await advance_claimed_execution(db=db, claim=claim_outcome.claim)
+        await db.commit()
     logger.info(
         "controlled_proof_selected_for_evaluation proof_id=%s proof_status=%s "
         "buy_package_id=%s sell_package_id=%s",
@@ -1798,8 +1854,21 @@ async def _attempt_operator_controlled_proof_entry(*, db: AsyncSession, proof_id
             # read-side accident: refresh terminal reconciliation/P&L state
             # even when no operator polls the HTTP view.
             await get_controlled_proof_view(db=db, proof_id=proof.proof_id)
+            if recovery is not None:
+                await refresh_exit_recovery_completion(db=db, recovery=recovery, proof=proof)
+                await db.commit()
+                if recovery.status == "IN_PROGRESS":
+                    sell_package = await db.get(CanonicalPreviewPackage, proof.sell_package_id)
+                    if sell_package is None or sell_package.decision_record_id is None:
+                        await _record_block("linked_sell_package_unavailable")
+                        await db.commit()
+                    else:
+                        await _progress_package(
+                            package_id=sell_package.package_id,
+                            decision_record_id=sell_package.decision_record_id,
+                        )
             return
-        is_sell = proof.package_id is not None
+        is_sell = recovery is not None or proof.package_id is not None
         if is_sell:
             logger.info(
                 "controlled_proof_exit_evaluation_started proof_id=%s proof_status=%s "
@@ -1808,6 +1877,8 @@ async def _attempt_operator_controlled_proof_entry(*, db: AsyncSession, proof_id
             )
             sell_eligible = await should_propose_controlled_sell(db=db, proof=proof)
             if not sell_eligible:
+                await _record_wait("sell_prerequisites_unmet")
+                await db.commit()
                 return
             logger.info(
                 "controlled_proof_sell_eligible proof_id=%s proof_status=%s next_stage=sell_risk_evaluation",
@@ -1817,33 +1888,31 @@ async def _attempt_operator_controlled_proof_entry(*, db: AsyncSession, proof_id
         forced_action = "CLOSE_POSITION_PROPOSED" if is_sell else "OPEN_POSITION_PROPOSED"
         runtime = await _load_runtime_campaign(db=db, campaign_id=proof.campaign_id)
         if runtime is None or runtime.paper_account_id is None:
-            await record_controlled_proof_waiting(db=db, proof=proof, reason="runtime_campaign_or_paper_account_missing", actor=actor)
+            await _record_wait("runtime_campaign_or_paper_account_missing")
             await db.commit()
             return
         profile = await _load_live_trading_profile_for_paper_account(db=db, paper_account_id=runtime.paper_account_id)
         if profile is None:
-            await record_controlled_proof_waiting(db=db, proof=proof, reason="live_trading_profile_missing", actor=actor)
+            await _record_wait("live_trading_profile_missing")
             await db.commit()
             return
         capital_blocker = None if is_sell else await controlled_proof_entry_blocker(db=db, proof=proof)
         if capital_blocker is not None:
-            await block_controlled_proof(
-                db=db, proof=proof, reason=f"controlled_proof_entry_blocked:{capital_blocker}", actor=actor,
-            )
+            await _record_block(f"controlled_proof_entry_blocked:{capital_blocker}")
             await db.commit()
             return
         if await _has_open_live_order(db=db, provider=proof.provider, environment=proof.environment, product=proof.product_id):
-            await record_controlled_proof_waiting(db=db, proof=proof, reason="open_live_order_exists", actor=actor)
+            await _record_wait("open_live_order_exists")
             await db.commit()
             return
         if await _has_unresolved_reconciliation(db=db, provider=proof.provider, environment=proof.environment, product=proof.product_id):
-            await record_controlled_proof_waiting(db=db, proof=proof, reason="unresolved_reconciliation_exists", actor=actor)
+            await _record_wait("unresolved_reconciliation_exists")
             await db.commit()
             return
 
         notional = min(Decimal(proof.max_notional_usd), _CANONICAL_READY_PACKAGE_AMOUNT)
         if notional != _CANONICAL_READY_PACKAGE_AMOUNT:
-            await block_controlled_proof(db=db, proof=proof, reason="controlled_proof_notional_below_canonical_bound", actor=actor)
+            await _record_block("controlled_proof_notional_below_canonical_bound")
             await db.commit()
             return
         risk = await evaluate_controlled_proof_risk(
@@ -1852,29 +1921,23 @@ async def _attempt_operator_controlled_proof_entry(*, db: AsyncSession, proof_id
             product_id=proof.product_id, side=side, notional_usd=notional, actor=actor,
         )
         if risk.verdict == "DENY":
-            await block_controlled_proof(
-                db=db, proof=proof,
-                reason=f"controlled_proof_risk_denied:{risk.reason_code}", actor=actor,
-            )
+            await _record_block(f"controlled_proof_risk_denied:{risk.reason_code}")
             await db.commit()
             return
         if risk.verdict != "ALLOW":
-            await record_controlled_proof_waiting(
-                db=db, proof=proof,
-                reason=f"controlled_proof_risk_{risk.verdict.lower()}:{risk.reason_code}", actor=actor,
-            )
+            await _record_wait(f"controlled_proof_risk_{risk.verdict.lower()}:{risk.reason_code}")
             await db.commit()
             return
 
         settings = get_settings()
         mandate_id = getattr(settings, "automatic_mandate_package_activation_mandate_id", None)
         if mandate_id is None:
-            await record_controlled_proof_waiting(db=db, proof=proof, reason="governing_mandate_missing", actor=actor)
+            await _record_wait("governing_mandate_missing")
             await db.commit()
             return
         strategy_identity = await resolve_controlled_proof_strategy_identity(db=db, mandate_id=mandate_id)
         if not strategy_identity:
-            await record_controlled_proof_waiting(db=db, proof=proof, reason="campaign_strategy_identity_missing", actor=actor)
+            await _record_wait("campaign_strategy_identity_missing")
             await db.commit()
             return
         decision_id = await create_controlled_proof_decision_record(
@@ -1898,7 +1961,7 @@ async def _attempt_operator_controlled_proof_entry(*, db: AsyncSession, proof_id
             ),
         )
         if evaluation.authorization_result != "AUTHORIZED":
-            await block_controlled_proof(db=db, proof=proof, reason="controlled_proof_mandate_not_authorized", actor=actor)
+            await _record_block("controlled_proof_mandate_not_authorized")
             await db.commit()
             return
 
@@ -1920,11 +1983,14 @@ async def _attempt_operator_controlled_proof_entry(*, db: AsyncSession, proof_id
         package_payload = payload.get("package") if isinstance(payload, dict) else None
         package_id = uuid.UUID(str(package_payload["package_id"])) if isinstance(package_payload, dict) and package_payload.get("package_id") else None
         if package_id is None:
-            await record_controlled_proof_waiting(db=db, proof=proof, reason="canonical_package_unavailable", actor=actor)
+            await _record_wait("canonical_package_unavailable")
             await db.commit()
             return
         if is_sell:
-            await link_controlled_proof_sell_package(db=db, proof=proof, sell_package_id=package_id)
+            await link_controlled_proof_sell_package(
+                db=db, proof=proof, sell_package_id=package_id,
+                preserve_terminal_status=recovery is not None,
+            )
         else:
             await link_controlled_proof_entry(
                 db=db, proof=proof, decision_record_id=decision_id, mandate_id=evaluation.mandate_id,
@@ -1933,29 +1999,18 @@ async def _attempt_operator_controlled_proof_entry(*, db: AsyncSession, proof_id
             await link_controlled_proof_package(db=db, proof=proof, package_id=package_id)
         await db.commit()
 
-        progression = await execute_automatic_ready_package_through_activation(
-            db=db,
-            request=AutomaticPackageExecutionRequest(
-                campaign_id=proof.campaign_id, campaign_version=proof.campaign_version,
-                decision_record_id=decision_id, package_id=package_id,
-            ),
-        )
-        if progression.activation_state == "ACTIVATED" and not progression.failed_closed:
-            claim_outcome = await claim_activated_package(db=db, package_id=package_id)
-            logger.info(
-                "controlled_proof_execution_claim_outcome proof_id=%s package_id=%s claim_id=%s "
-                "claim_created=%s reason=%s provider_call_made=false",
-                proof.proof_id, package_id,
-                None if claim_outcome.claim is None else claim_outcome.claim.claim_id,
-                claim_outcome.created, claim_outcome.reason_code,
-            )
-            if claim_outcome.claim is not None:
-                await advance_claimed_execution(db=db, claim=claim_outcome.claim)
-        await db.commit()
+        await _progress_package(package_id=package_id, decision_record_id=decision_id)
     except Exception as exc:
         await _rollback_active_session(db=db)
-        proof = await claim_controlled_proof_by_id(db=db, proof_id=proof_id)
-        if proof is not None:
+        if recovery_id is not None:
+            claimed_recovery = await claim_exit_recovery_by_id(db=db, recovery_id=recovery_id)
+            if claimed_recovery is not None:
+                recovery, _proof = claimed_recovery
+                await record_exit_recovery_waiting(db=db, recovery=recovery, reason=f"entry_attempt_failed:{exc.__class__.__name__}")
+                await db.commit()
+        elif proof_id is not None:
+            proof = await claim_controlled_proof_by_id(db=db, proof_id=proof_id)
+        if recovery_id is None and proof is not None:
             await record_controlled_proof_waiting(
                 db=db, proof=proof, reason=f"entry_attempt_failed:{exc.__class__.__name__}", actor=actor,
             )
@@ -2013,6 +2068,24 @@ def schedule_controlled_proof_immediate_dispatch(*, proof_id: uuid.UUID) -> None
     for why it is scheduled there, after submit_operator_action returns,
     rather than inside the RUN_CONTROLLED_PROOF handler itself)."""
     task = asyncio.create_task(dispatch_controlled_proof_immediate_attempt(proof_id=proof_id))
+    _controlled_proof_dispatch_tasks.add(task)
+    task.add_done_callback(_controlled_proof_dispatch_tasks.discard)
+
+
+async def dispatch_controlled_proof_exit_recovery_attempt(*, proof_id: uuid.UUID) -> None:
+    logger.info("controlled_proof_exit_recovery_dispatch_started proof_id=%s", proof_id)
+    try:
+        async with AsyncSessionLocal() as db:
+            view = await get_exit_recovery_view(db=db, proof_id=proof_id)
+            await _attempt_operator_controlled_proof_entry(db=db, recovery_id=view["recovery_id"])
+    except Exception:
+        logger.exception("controlled_proof_exit_recovery_dispatch_failed proof_id=%s", proof_id)
+        return
+    logger.info("controlled_proof_exit_recovery_dispatch_completed proof_id=%s", proof_id)
+
+
+def schedule_controlled_proof_exit_recovery_dispatch(*, proof_id: uuid.UUID) -> None:
+    task = asyncio.create_task(dispatch_controlled_proof_exit_recovery_attempt(proof_id=proof_id))
     _controlled_proof_dispatch_tasks.add(task)
     task.add_done_callback(_controlled_proof_dispatch_tasks.discard)
 

@@ -28,6 +28,26 @@ class ControlledProofCancelRequest(BaseModel):
     reason: str | None = None
 
 
+class ControlledProofExitRecoveryCreateRequest(BaseModel):
+    idempotency_key: str
+    expires_in_minutes: int = Field(default=60, ge=1, le=180)
+
+
+class ControlledProofExitRecoveryResponse(BaseModel):
+    recovery_id: uuid.UUID
+    proof_id: uuid.UUID
+    status: str
+    idempotency_key: str
+    authorized_by: str
+    authorized_at: datetime
+    expires_at: datetime
+    claimed_at: datetime | None
+    completed_at: datetime | None
+    blocked_reason: str | None
+    failure_reason: str | None
+    audit_correlation_id: uuid.UUID
+
+
 class ControlledProofResponse(BaseModel):
     proof_id: uuid.UUID
     status: str

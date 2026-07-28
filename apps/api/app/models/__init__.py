@@ -1,6 +1,7 @@
 from app.models.asset import Asset
 from app.models.asset_commissioning_run import AssetCommissioningRun
 from app.models.controlled_proof_run import ControlledProofRun
+from app.models.controlled_proof_exit_recovery import ControlledProofExitRecovery
 from app.models.operator_action import OperatorAction
 from app.models.arena_competition import ArenaCompetition
 from app.models.arena_comparison_record import ArenaComparisonRecord
@@ -82,6 +83,7 @@ __all__ = [
 	"Asset",
 	"AssetCommissioningRun",
 	"ControlledProofRun",
+	"ControlledProofExitRecovery",
 	"OperatorAction",
 	"ArenaCompetition",
 	"ArenaComparisonRecord",
