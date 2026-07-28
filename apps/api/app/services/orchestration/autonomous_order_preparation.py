@@ -29,6 +29,8 @@ from app.models.risk_kill_switch import RiskKillSwitch
 from app.schemas.capital_campaign_domain import CommissionedEntryExecutionRequest, CommissionedReadinessRequest
 from app.services.capital_campaign_domain.activated_commissioned_entry import execute_activated_commissioned_entry
 from app.services.capital_campaign_domain.commissioned_readiness_preview import generate_commissioned_campaign_preview
+from app.services.exchange_connections.readiness import supports_autonomous_preview
+from app.services.exchange_connections.service import refresh_exchange_balances
 from app.services.live.position_quantity import compute_signed_owned_quantity
 from app.services.risk.risk_context import resolve_effective_risk_policy
 
@@ -126,6 +128,51 @@ async def execute_prepared_autonomous_claim(
 ):
     """Build the execution request exclusively from the claimed persisted rows."""
     claim, order = prepared.claim, prepared.order
+    try:
+        refreshed_connection = await refresh_exchange_balances(
+            db=db,
+            exchange_connection_id=claim.connection_id,
+            actor=claim.claim_owner,
+        )
+    except Exception as exc:
+        setattr(exc, "omnitrade_failing_stage", "canonical_execution_readiness_refresh")
+        raise
+    if (
+        refreshed_connection.exchange_connection_id != claim.connection_id
+        or refreshed_connection.provider != claim.provider
+        or refreshed_connection.environment != claim.environment
+        or not (
+            supports_autonomous_preview(refreshed_connection.readiness.verdict)
+            or refreshed_connection.readiness.verdict == "READY_FOR_DRY_RUN"
+        )
+    ):
+        _fail("canonical_execution_readiness_unavailable")
+    readiness_evidence = {
+        "claim_id": str(claim.claim_id),
+        "package_id": str(claim.package_id),
+        "live_order_id": str(order.live_crypto_order_id),
+        "connection_id": str(claim.connection_id),
+        "provider": claim.provider,
+        "environment": claim.environment,
+        "product": claim.product,
+        "side": claim.side,
+        "verdict": refreshed_connection.readiness.verdict,
+        "checked_at": refreshed_connection.readiness.checked_at.isoformat(),
+        "source": "exchange_connection_execution_refresh",
+    }
+    order.safe_provider_response = {
+        **(order.safe_provider_response if isinstance(order.safe_provider_response, dict) else {}),
+        "execution_readiness_evidence": readiness_evidence,
+    }
+    db.add(AuditLog(
+        actor=claim.claim_owner,
+        action="autonomous_execution_claim.readiness_refreshed",
+        entity_type="autonomous_execution_claim",
+        entity_id=claim.claim_id,
+        before_state=None,
+        after_state={**readiness_evidence, "provider_call_made": False},
+    ))
+    await db.flush()
     package = await db.scalar(select(CanonicalPreviewPackage).where(CanonicalPreviewPackage.package_id == claim.package_id).limit(1))
     activation = await db.scalar(select(CanonicalProvingActivation).where(CanonicalProvingActivation.activation_id == claim.activation_id).limit(1))
     preview = None if package is None else await db.scalar(

@@ -1814,12 +1814,27 @@ async def test_submit_allows_exact_campaign_scoped_authority_and_calls_provider_
 
 @pytest.mark.asyncio
 async def test_autonomous_one_shot_reaches_mocked_provider_exactly_once(monkeypatch: pytest.MonkeyPatch) -> None:
-    profile, live_order, _preview, _connection, campaign, _approval_event, db = _submit_authority_fixture()
+    profile, live_order, _preview, connection, campaign, _approval_event, db = _submit_authority_fixture()
+    claim_id = uuid.uuid4()
+    package_id = uuid.uuid4()
     live_order.safe_provider_response.update({
         "autonomous_prepared": True,
-        "autonomous_execution_claim_id": str(uuid.uuid4()),
-        "canonical_preview_package_id": str(uuid.uuid4()),
+        "autonomous_execution_claim_id": str(claim_id),
+        "canonical_preview_package_id": str(package_id),
         "commissioned_preview_identity_binding": {"profile_id": str(profile.id)},
+        "execution_readiness_evidence": {
+            "claim_id": str(claim_id),
+            "package_id": str(package_id),
+            "live_order_id": str(live_order.live_crypto_order_id),
+            "connection_id": str(live_order.exchange_connection_id),
+            "provider": live_order.provider,
+            "environment": live_order.environment,
+            "product": live_order.product_id,
+            "side": live_order.side,
+            "verdict": "READY_FOR_DRY_RUN",
+            "checked_at": connection.last_verified_at.isoformat(),
+            "source": "exchange_connection_execution_refresh",
+        },
     })
     claim = SimpleNamespace(claim_status="SAFETY_DISABLED", last_error_code="live_submission_disabled", updated_at=None)
     calls = {"create_order": 0}
@@ -1849,6 +1864,52 @@ async def test_autonomous_one_shot_reaches_mocked_provider_exactly_once(monkeypa
     assert calls["create_order"] == 1
     assert claim.claim_status == "SUBMISSION_PENDING"
     assert response.live_crypto_order.status == "ACKNOWLEDGED"
+
+
+@pytest.mark.asyncio
+async def test_autonomous_execution_readiness_evidence_still_fails_when_stale(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    profile, live_order, _preview, connection, campaign, _approval_event, db = _submit_authority_fixture()
+    claim_id = uuid.uuid4()
+    package_id = uuid.uuid4()
+    stale_at = datetime(2026, 7, 9, 11, 0, tzinfo=timezone.utc)
+    connection.last_verified_at = stale_at
+    live_order.safe_provider_response.update({
+        "autonomous_prepared": True,
+        "autonomous_execution_claim_id": str(claim_id),
+        "canonical_preview_package_id": str(package_id),
+        "commissioned_preview_identity_binding": {"profile_id": str(profile.id)},
+        "execution_readiness_evidence": {
+            "claim_id": str(claim_id), "package_id": str(package_id),
+            "live_order_id": str(live_order.live_crypto_order_id),
+            "connection_id": str(live_order.exchange_connection_id),
+            "provider": live_order.provider, "environment": live_order.environment,
+            "product": live_order.product_id, "side": live_order.side,
+            "verdict": "READY_FOR_DRY_RUN", "checked_at": stale_at.isoformat(),
+            "source": "exchange_connection_execution_refresh",
+        },
+    })
+    provider_call = AsyncMock()
+    monkeypatch.setattr(service, "get_settings", _submit_settings)
+    monkeypatch.setattr(service, "_utcnow", lambda: datetime(2026, 7, 9, 12, 0, tzinfo=timezone.utc))
+    monkeypatch.setattr(service, "_evaluate_level2_mandate_authorization", AsyncMock(return_value=(True, uuid.uuid4())))
+    monkeypatch.setattr(service, "_validate_autonomous_one_shot_submission", AsyncMock(return_value=(campaign.id, SimpleNamespace())))
+    monkeypatch.setattr(service, "get_exchange_provider", lambda *_args, **_kwargs: _provider_stub(create_order=provider_call))
+
+    with pytest.raises(PermissionError, match="readiness evidence is stale"):
+        await service.service.submit(
+            db=db,
+            request=service.LiveCryptoOrderSubmitRequest(
+                live_crypto_order_id=live_order.live_crypto_order_id,
+                confirmation_challenge_id=None,
+                confirmation_phrase=None,
+                operator_identity="orchestration:test",
+                idempotency_token="autonomous-stale-readiness",
+            ),
+        )
+
+    provider_call.assert_not_awaited()
 
 
 @pytest.mark.asyncio

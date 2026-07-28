@@ -146,7 +146,13 @@ async def test_enabled_execution_uses_persisted_exact_package_and_order(monkeypa
     }
     account = SimpleNamespace(current_cash_balance=25)
     asset = SimpleNamespace(id=uuid4(), min_order_notional=1, qty_step_size=0.00001, supports_fractional=True)
-    db = SimpleNamespace(scalar=AsyncMock(side_effect=[package, activation, preview, account, asset]))
+    checked_at = datetime.now(timezone.utc)
+    refresh = AsyncMock(return_value=SimpleNamespace(
+        exchange_connection_id=claim.connection_id, provider=claim.provider, environment=claim.environment,
+        readiness=SimpleNamespace(verdict="READY_FOR_DRY_RUN", checked_at=checked_at),
+    ))
+    monkeypatch.setattr(subject, "refresh_exchange_balances", refresh)
+    db = SimpleNamespace(scalar=AsyncMock(side_effect=[package, activation, preview, account, asset]), add=Mock(), flush=AsyncMock())
     monkeypatch.setattr(subject, "resolve_effective_risk_policy", AsyncMock(return_value=SimpleNamespace(max_position_size_pct=1)))
     execute = AsyncMock(return_value=SimpleNamespace(current_state="BUY_RECONCILIATION_PENDING"))
     monkeypatch.setattr(subject, "execute_activated_commissioned_entry", execute)
@@ -157,6 +163,10 @@ async def test_enabled_execution_uses_persisted_exact_package_and_order(monkeypa
     assert kwargs["request"].live_crypto_order_id == order.live_crypto_order_id
     assert kwargs["request"].confirmation_challenge_id is None
     assert kwargs["request"].expected_preview_identity_hash == "canonical-preview-hash"
+    refresh.assert_awaited_once_with(db=db, exchange_connection_id=claim.connection_id, actor=claim.claim_owner)
+    assert order.safe_provider_response["execution_readiness_evidence"]["checked_at"] == checked_at.isoformat()
+    assert order.safe_provider_response["execution_readiness_evidence"]["claim_id"] == str(claim.claim_id)
+    assert order.safe_provider_response["execution_readiness_evidence"]["package_id"] == str(claim.package_id)
 
 
 @pytest.mark.asyncio
@@ -173,7 +183,11 @@ async def test_enabled_sell_execution_uses_identical_activated_executor(monkeypa
     }
     account = SimpleNamespace(current_cash_balance=25)
     asset = SimpleNamespace(id=uuid4(), min_order_notional=1, qty_step_size=0.00001, supports_fractional=True)
-    db = SimpleNamespace(scalar=AsyncMock(side_effect=[package, activation, preview, account, asset]))
+    monkeypatch.setattr(subject, "refresh_exchange_balances", AsyncMock(return_value=SimpleNamespace(
+        exchange_connection_id=claim.connection_id, provider=claim.provider, environment=claim.environment,
+        readiness=SimpleNamespace(verdict="READY_FOR_DRY_RUN", checked_at=datetime.now(timezone.utc)),
+    )))
+    db = SimpleNamespace(scalar=AsyncMock(side_effect=[package, activation, preview, account, asset]), add=Mock(), flush=AsyncMock())
     monkeypatch.setattr(subject, "resolve_effective_risk_policy", AsyncMock(return_value=SimpleNamespace(max_position_size_pct=1)))
     execute = AsyncMock(return_value=SimpleNamespace(current_state="SELL_RECONCILIATION_PENDING"))
     monkeypatch.setattr(subject, "execute_activated_commissioned_entry", execute)
@@ -194,7 +208,11 @@ async def test_input_fingerprint_is_rejected_as_preview_identity(monkeypatch: py
     preview = SimpleNamespace(estimated_average_price=100, estimated_base_size=0.05)
     account = SimpleNamespace(current_cash_balance=25)
     asset = SimpleNamespace(id=uuid4(), min_order_notional=1, qty_step_size=0.00001, supports_fractional=True)
-    db = SimpleNamespace(scalar=AsyncMock(side_effect=[package, activation, preview, account, asset]))
+    monkeypatch.setattr(subject, "refresh_exchange_balances", AsyncMock(return_value=SimpleNamespace(
+        exchange_connection_id=claim.connection_id, provider=claim.provider, environment=claim.environment,
+        readiness=SimpleNamespace(verdict="READY_FOR_DRY_RUN", checked_at=datetime.now(timezone.utc)),
+    )))
+    db = SimpleNamespace(scalar=AsyncMock(side_effect=[package, activation, preview, account, asset]), add=Mock(), flush=AsyncMock())
     monkeypatch.setattr(
         subject, "_canonical_preview_identity",
         AsyncMock(return_value=(SimpleNamespace(), SimpleNamespace(preview_identity_hash=package.input_fingerprint))),

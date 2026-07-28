@@ -51,6 +51,7 @@ from app.services.exchange_connections.providers.registry import (
     provider_mock_mode_enabled,
     require_provider_capabilities,
 )
+from app.services.exchange_connections.readiness import supports_autonomous_preview
 from app.services.live.accounting_reconciliation import reconcile_live_order_and_fills
 from app.services.live.risk_accounting_snapshot import (
     RiskAccountingUnavailableError,
@@ -2190,6 +2191,32 @@ class LiveCryptoOrderService:
             raise PermissionError("confirmation approval expired")
 
         now = _utcnow()
+        readiness_observed_at = connection.last_verified_at
+        if autonomous_prepared:
+            execution_readiness = live_order.safe_provider_response.get("execution_readiness_evidence")
+            if not isinstance(execution_readiness, dict):
+                raise PermissionError("execution readiness evidence missing")
+            expected_readiness_identity = {
+                "claim_id": str(live_order.safe_provider_response.get("autonomous_execution_claim_id") or ""),
+                "package_id": str(live_order.safe_provider_response.get("canonical_preview_package_id") or ""),
+                "live_order_id": str(live_order.live_crypto_order_id),
+                "connection_id": str(live_order.exchange_connection_id),
+                "provider": live_order.provider,
+                "environment": live_order.environment,
+                "product": live_order.product_id,
+                "side": live_order.side,
+            }
+            if any(str(execution_readiness.get(key) or "") != value for key, value in expected_readiness_identity.items()):
+                raise PermissionError("execution readiness identity mismatch")
+            readiness_verdict = str(execution_readiness.get("verdict") or "")
+            if not (supports_autonomous_preview(readiness_verdict) or readiness_verdict == "READY_FOR_DRY_RUN"):
+                raise PermissionError("execution readiness verdict unavailable")
+            try:
+                readiness_observed_at = datetime.fromisoformat(str(execution_readiness.get("checked_at")))
+            except (TypeError, ValueError):
+                raise PermissionError("execution readiness timestamp missing") from None
+            if connection.last_verified_at != readiness_observed_at:
+                raise PermissionError("execution readiness connection binding mismatch")
         _require_fresh_timestamp(
             label="preview",
             observed_at=preview.created_at,
@@ -2198,7 +2225,7 @@ class LiveCryptoOrderService:
         )
         _require_fresh_timestamp(
             label="readiness",
-            observed_at=connection.last_verified_at,
+            observed_at=readiness_observed_at,
             now=now,
             max_age_seconds=settings.live_crypto_readiness_max_age_seconds,
         )
