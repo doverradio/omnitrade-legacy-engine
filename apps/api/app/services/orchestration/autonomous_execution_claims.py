@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import logging
 import os
 from dataclasses import dataclass
@@ -654,6 +655,58 @@ async def release_execution_claim_scope_if_order_resolved(
     )
 
 
+async def _persist_provider_rejection_diagnostics(
+    *, db: AsyncSession, claim: AutonomousExecutionClaim, order: LiveCryptoOrder,
+) -> None:
+    """Attach an explicit provider rejection to its orchestration lineage.
+
+    This records diagnostics only. It deliberately does not change claim or
+    Controlled Proof lifecycle status, retry policy, or reconciliation.
+    """
+    if getattr(order, "status", None) != "REJECTED":
+        return
+    evidence = order.safe_provider_response if isinstance(order.safe_provider_response, dict) else {}
+    rejection = evidence.get("create_order_error") if isinstance(evidence.get("create_order_error"), dict) else {}
+    code = str(rejection.get("code") or order.failure_code or "provider_rejected")
+    safe_evidence = {
+        "live_crypto_order_id": str(order.live_crypto_order_id),
+        "provider": order.provider,
+        "environment": order.environment,
+        "product": order.product_id,
+        "side": order.side,
+        "failure_code": order.failure_code,
+        "failure_reason": order.failure_reason,
+        "provider_rejection": rejection,
+    }
+    claim.last_error_code = code
+    claim.updated_at = _utcnow()
+    db.add(AuditLog(
+        actor=claim.claim_owner, action="autonomous_execution_claim.provider_rejected",
+        entity_type="autonomous_execution_claim", entity_id=claim.claim_id,
+        before_state=None, after_state=safe_evidence,
+    ))
+    proof = await db.scalar(
+        select(ControlledProofRun).where(or_(
+            ControlledProofRun.package_id == claim.package_id,
+            ControlledProofRun.sell_package_id == claim.package_id,
+        )).with_for_update().limit(1)
+    )
+    if proof is not None:
+        proof.failure_reason = json.dumps(safe_evidence, sort_keys=True, default=str)
+        proof.updated_at = _utcnow()
+        db.add(AuditLog(
+            actor=claim.claim_owner, action="controlled_proof.provider_rejected",
+            entity_type="controlled_proof_run", entity_id=proof.proof_id,
+            before_state=None, after_state=safe_evidence,
+        ))
+    logger.warning(
+        "autonomous_execution_provider_rejected claim_id=%s package_id=%s controlled_proof_id=%s "
+        "live_order_id=%s provider_error_code=%s rejection_message=%r http_status=%s",
+        claim.claim_id, claim.package_id, None if proof is None else proof.proof_id,
+        order.live_crypto_order_id, code, rejection.get("message"), rejection.get("http_status"),
+    )
+
+
 async def advance_claimed_execution(*, db: AsyncSession, claim: AutonomousExecutionClaim) -> None:
     """Given an already-CLAIMED (or EXECUTION_STARTED) claim, attempt to
     prepare and (if live submission is enabled) execute it -- terminalizing
@@ -715,6 +768,9 @@ async def advance_claimed_execution(*, db: AsyncSession, claim: AutonomousExecut
 
     try:
         execution = await execute_prepared_autonomous_claim(db=db, prepared=prepared)
+        await _persist_provider_rejection_diagnostics(
+            db=db, claim=prepared.claim, order=prepared.order,
+        )
         prepared.claim.claim_status = (
             "RECONCILIATION_REQUIRED"
             if execution.current_state == "RECONCILIATION_REQUIRED"

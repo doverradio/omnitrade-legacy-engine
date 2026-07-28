@@ -11,6 +11,7 @@ from app.core.errors import InvalidRequestError
 from app.services.exchange_connections.providers.base import ExchangeOrderSubmissionRequest
 from app.services.exchange_connections.providers.kraken_spot import (
     KrakenSpotClient,
+    _kraken_client_order_id,
     build_kraken_signature,
 )
 from app.services.exchange_connections.providers.registry import get_exchange_provider
@@ -21,6 +22,26 @@ async def test_conformance_01_stable_kraken_identity() -> None:
     client = KrakenSpotClient()
     assert client.metadata.provider_key == "kraken_spot"
     assert client.metadata.display_name == "Kraken Spot"
+
+
+def test_controlled_proof_internal_id_maps_to_deterministic_kraken_uuid() -> None:
+    package_id = "76ac13a3-0d2e-4aa5-a730-1155a636ff55"
+    internal = f"cpp-{package_id}"
+    first = _kraken_client_order_id(internal)
+    repeated = _kraken_client_order_id(internal)
+    different = _kraken_client_order_id(f"cpp-{'0' * 36}")
+
+    assert len(internal) == 40
+    assert len(first) == 36
+    assert first == repeated
+    assert first != different
+    assert all(character in "0123456789abcdef-" for character in first)
+
+
+def test_kraken_accepted_client_id_formats_are_preserved() -> None:
+    long_uuid = "6d1b345e-2821-40e2-ad83-4ecb18a06876"
+    assert _kraken_client_order_id(long_uuid) == long_uuid
+    assert _kraken_client_order_id("arb-20240509-00010") == "arb-20240509-00010"
 
 
 @pytest.mark.asyncio
@@ -482,7 +503,15 @@ async def test_conformance_20_submission_explicit_rejection_classification(monke
         return {"error": [], "result": {"XXBTZUSD": {"a": ["50000.0", "1", "1"], "b": ["49999.0", "1", "1"]}}}
 
     async def _private(**_kwargs):
-        raise InvalidRequestError(message="Kraken API returned errors", details={"errors": ["EOrder:Insufficient funds"]})
+        raise InvalidRequestError(
+            message="Kraken API returned errors",
+            details={
+                "status_code": 200,
+                "path": "/private/AddOrder",
+                "errors": ["EOrder:Insufficient funds"],
+                "response_body": {"error": ["EOrder:Insufficient funds"], "result": {}},
+            },
+        )
 
     monkeypatch.setattr(client, "_public_request", _public)
     monkeypatch.setattr(client, "_private_request", _private)
@@ -506,6 +535,10 @@ async def test_conformance_20_submission_explicit_rejection_classification(monke
     assert result.rejection.code == "insufficient_funds"
     assert "EOrder:Insufficient funds" in (result.rejection.safe_details or {}).get("provider_errors", [])
     assert result.raw_response.get("provider_errors") == ["EOrder:Insufficient funds"]
+    assert result.raw_response.get("http_status") == 200
+    assert result.raw_response.get("provider_response_body") == {
+        "error": ["EOrder:Insufficient funds"], "result": {},
+    }
 
 
 @pytest.mark.asyncio

@@ -8,6 +8,11 @@ from unittest.mock import AsyncMock
 
 import pytest
 
+from app.services.exchange_connections.providers.base import (
+    ExchangeOrderSubmissionResult,
+    ExchangeProviderRejection,
+)
+
 from app.schemas.live_crypto_orders import LiveCryptoOrderPrepareRequest
 from app.services import live_crypto_orders as service
 from app.core.errors import InvalidRequestError, ServiceUnavailableError
@@ -1456,12 +1461,33 @@ async def test_explicit_provider_rejection_sets_rejected_without_blind_retry(mon
     monkeypatch.setattr(service, "_build_real_risk_context", _risk_context)
 
     async def _reject(*_args, **_kwargs):
-        raise InvalidRequestError("Coinbase API request failed", details={"status_code": 400, "response": {"message": "rejected"}})
+        return ExchangeOrderSubmissionResult(
+            classification="rejected",
+            order=None,
+            rejection=ExchangeProviderRejection(
+                code="insufficient_funds",
+                message="EOrder:Insufficient funds",
+                retryable=False,
+                provider_status=None,
+                safe_details={
+                    "provider_errors": ["EOrder:Insufficient funds"],
+                    "http_status": 200,
+                },
+            ),
+            ambiguous=None,
+            raw_response={
+                "provider_path": "/private/AddOrder",
+                "http_status": 200,
+                "provider_errors": ["EOrder:Insufficient funds"],
+                "provider_response_body": {"error": ["EOrder:Insufficient funds"], "result": {}},
+            },
+            safe_headers={},
+        )
 
     monkeypatch.setattr(
         service,
         "get_exchange_provider",
-        lambda *_args, **_kwargs: _provider_stub(create_order=_reject),
+        lambda *_args, **_kwargs: _provider_stub(submit_order=_reject),
     )
 
     response = await service.service.submit(
@@ -1478,6 +1504,13 @@ async def test_explicit_provider_rejection_sets_rejected_without_blind_retry(mon
     assert response.live_crypto_order.status == "REJECTED"
     assert response.order_submitted is False
     assert response.live_crypto_order.failure_code == "provider_rejected"
+    error = response.live_crypto_order.safe_provider_response["create_order_error"]
+    assert error["code"] == "insufficient_funds"
+    assert error["message"] == "EOrder:Insufficient funds"
+    assert error["http_status"] == 200
+    assert error["provider_response_body"]["provider_errors"] == ["EOrder:Insufficient funds"]
+    assert error["request_payload_summary"]["product_id"] == "BTC-USD"
+    assert response.live_crypto_order.safe_provider_response["create_order_payload"]["side"] == "BUY"
 
 
 @pytest.mark.asyncio

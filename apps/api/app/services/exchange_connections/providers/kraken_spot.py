@@ -37,6 +37,20 @@ from app.services.exchange_connections.providers.base import (
     ProviderCapability,
 )
 
+_KRAKEN_CLIENT_ORDER_ID_NAMESPACE = uuid.UUID("742aacbf-3f32-4ba7-a323-39aa8f31f87e")
+
+
+def _kraken_client_order_id(internal_client_order_id: str) -> str:
+    """Map a stable internal ID onto one of Kraken's accepted formats."""
+    value = str(internal_client_order_id or "").strip()
+    try:
+        return str(uuid.UUID(value))
+    except (ValueError, AttributeError):
+        pass
+    if value and len(value) <= 18 and value.isascii():
+        return value
+    return str(uuid.uuid5(_KRAKEN_CLIENT_ORDER_ID_NAMESPACE, value))
+
 
 def _kraken_mock_mode_enabled() -> bool:
     return str(os.getenv("OT_KRAKEN_SANDBOX_MOCK_MODE", "false")).strip().lower() in {"1", "true", "yes", "on"}
@@ -1181,12 +1195,13 @@ class KrakenSpotClient:
                 safe_headers={},
             )
 
+        provider_client_order_id = _kraken_client_order_id(request.client_order_id)
         payload = {
             "ordertype": "market",
             "type": side.lower(),
             "pair": altname,
             "volume": format(quote_size, "f") if side == "BUY" else format(base_size, "f"),
-            "cl_ord_id": request.client_order_id,
+            "cl_ord_id": provider_client_order_id,
         }
         if side == "BUY":
             payload["oflags"] = "fciq,viqc"
@@ -1203,6 +1218,9 @@ class KrakenSpotClient:
             errors = details.get("errors") if isinstance(details.get("errors"), list) else []
             status_code = details.get("status_code")
             provider_path = details.get("path")
+            response_body = details.get("response_body")
+            if not errors and isinstance(response_body, dict) and isinstance(response_body.get("error"), list):
+                errors = response_body["error"]
             forensics = details.get("forensics") if isinstance(details.get("forensics"), dict) else None
             if isinstance(status_code, int) and status_code >= 500:
                 return ExchangeOrderSubmissionResult(
@@ -1217,6 +1235,7 @@ class KrakenSpotClient:
                         "provider_path": provider_path,
                         "http_status": status_code,
                         "provider_errors": [str(item) for item in errors[:10]],
+                        "provider_response_body": response_body,
                         "forensics": forensics,
                     },
                     safe_headers={},
@@ -1233,6 +1252,7 @@ class KrakenSpotClient:
                 "provider_path": provider_path,
                 "http_status": status_code,
                 "provider_errors": [str(item) for item in errors[:10]],
+                "provider_response_body": response_body,
                 "forensics": forensics,
             }
             return ExchangeOrderSubmissionResult(
@@ -1334,6 +1354,7 @@ class KrakenSpotClient:
     ) -> ExchangeProviderOrder | None:
         normalized_product = None
         normalized_pair = None
+        provider_client_order_id = _kraken_client_order_id(client_order_id) if client_order_id else None
         if product_id is not None:
             normalized_product, normalized_pair = _normalize_intent_product(product_id)
 
@@ -1371,7 +1392,7 @@ class KrakenSpotClient:
                 )
                 return ExchangeProviderOrder(
                     provider_order_id=provider_order_id,
-                    client_order_id=exact_client_order_id or client_order_id,
+                    client_order_id=client_order_id or exact_client_order_id,
                     product_id=normalized_product,
                     side=str(descr.get("type") or "").upper() or None,
                     status=status,
@@ -1384,7 +1405,7 @@ class KrakenSpotClient:
             path="/private/OpenOrders",
             environment=environment,
             credentials=credentials,
-            payload={"cl_ord_id": client_order_id} if client_order_id else {},
+            payload={"cl_ord_id": provider_client_order_id} if provider_client_order_id else {},
         )
         open_rows = (open_payload.get("result") or {}).get("open") if isinstance(open_payload.get("result"), dict) else {}
         if isinstance(open_rows, dict):
@@ -1393,7 +1414,7 @@ class KrakenSpotClient:
                     continue
                 if provider_order_id is not None and str(txid) != provider_order_id:
                     continue
-                if client_order_id is not None and str(row.get("cl_ord_id") or "") != client_order_id:
+                if provider_client_order_id is not None and str(row.get("cl_ord_id") or "") != provider_client_order_id:
                     continue
                 pair = str((row.get("descr") or {}).get("pair") or "") if isinstance(row.get("descr"), dict) else ""
                 if not _kraken_pair_matches(actual=pair, expected=normalized_pair):
@@ -1401,7 +1422,7 @@ class KrakenSpotClient:
                 status = str(row.get("status") or "open").upper()
                 return ExchangeProviderOrder(
                     provider_order_id=str(txid),
-                    client_order_id=str(row.get("cl_ord_id") or client_order_id) if (row.get("cl_ord_id") or client_order_id) else None,
+                    client_order_id=client_order_id or str(row.get("cl_ord_id") or "") or None,
                     product_id=normalized_product,
                     side=str((row.get("descr") or {}).get("type") or "").upper() if isinstance(row.get("descr"), dict) else None,
                     status=status,
@@ -1411,8 +1432,8 @@ class KrakenSpotClient:
                 )
 
         closed_query: dict[str, str] = {"trades": "true"}
-        if client_order_id:
-            closed_query["cl_ord_id"] = client_order_id
+        if provider_client_order_id:
+            closed_query["cl_ord_id"] = provider_client_order_id
         closed_payload = await self._private_request(
             path="/private/ClosedOrders",
             environment=environment,
@@ -1427,7 +1448,7 @@ class KrakenSpotClient:
                 continue
             if provider_order_id is not None and str(txid) != provider_order_id:
                 continue
-            if client_order_id is not None and str(row.get("cl_ord_id") or "") != client_order_id:
+            if provider_client_order_id is not None and str(row.get("cl_ord_id") or "") != provider_client_order_id:
                 continue
             pair = str((row.get("descr") or {}).get("pair") or "") if isinstance(row.get("descr"), dict) else ""
             if not _kraken_pair_matches(actual=pair, expected=normalized_pair):
@@ -1450,7 +1471,7 @@ class KrakenSpotClient:
                 status = raw_status.upper() if raw_status else "UNKNOWN"
             return ExchangeProviderOrder(
                 provider_order_id=str(txid),
-                client_order_id=str(row.get("cl_ord_id") or client_order_id) if (row.get("cl_ord_id") or client_order_id) else None,
+                client_order_id=client_order_id or str(row.get("cl_ord_id") or "") or None,
                 product_id=normalized_product,
                 side=str((row.get("descr") or {}).get("type") or "").upper() if isinstance(row.get("descr"), dict) else None,
                 status=status,
@@ -1568,6 +1589,10 @@ class KrakenSpotClient:
             raise ServiceUnavailableError(message="Kraken API is unreachable", details={"provider": self.provider, "path": path}) from exc
 
         if response.status_code >= 400:
+            try:
+                response_body: object = _redact_sensitive(response.json())
+            except ValueError:
+                response_body = {"text": response.text[:2000]}
             self._last_error_classification = "http_error"
             self._last_error_message = f"status={response.status_code} path={path}"
             raise InvalidRequestError(
@@ -1730,7 +1755,12 @@ class KrakenSpotClient:
             self._last_error_message = f"status={response.status_code} path={path}"
             raise InvalidRequestError(
                 message="Kraken API request failed",
-                details={"status_code": response.status_code, "path": path, "response_text": response.text[:500], "forensics": forensics},
+                details={
+                    "status_code": response.status_code,
+                    "path": path,
+                    "response_body": response_body,
+                    "forensics": forensics,
+                },
             )
 
         parsed = self._parse_json_response(response=response, path=path)
@@ -1741,7 +1771,13 @@ class KrakenSpotClient:
             self._last_error_message = str(errors[:1])
             raise InvalidRequestError(
                 message="Kraken API returned errors",
-                details={"path": path, "errors": [str(item) for item in errors[:5]], "forensics": forensics},
+                details={
+                    "status_code": response.status_code,
+                    "path": path,
+                    "errors": [str(item) for item in errors[:10]],
+                    "response_body": _redact_sensitive(parsed),
+                    "forensics": forensics,
+                },
             )
 
         self._last_successful_call_at = datetime.now(timezone.utc)

@@ -2449,14 +2449,30 @@ class LiveCryptoOrderService:
         safe_response = submission.safe_headers
 
         if submission.classification == "rejected":
+            safe_provider_body = _redact_sensitive(submission.raw_response)
+            safe_payload_summary = _safe_request_summary(
+                request_payload=request_payload,
+                provider_response=submission.raw_response,
+            )
             safe_error = {
                 "code": None if submission.rejection is None else submission.rejection.code,
                 "message": None if submission.rejection is None else submission.rejection.message,
                 "details": None if submission.rejection is None else submission.rejection.safe_details,
+                "http_status": (
+                    submission.raw_response.get("http_status")
+                    if isinstance(submission.raw_response, dict)
+                    else None
+                ),
+                "provider_response_body": safe_provider_body,
+                "request_payload_summary": safe_payload_summary,
+                "rejection_reason": "provider_explicit_rejection",
             }
             live_order.safe_provider_response = {
                 **live_order.safe_provider_response,
                 "create_order_error": safe_error,
+                "create_order": safe_provider_body,
+                "create_order_payload": request_payload,
+                "safe_request_summary": safe_payload_summary,
                 "create_order_responded": False,
             }
             live_order.status = "REJECTED"
@@ -2473,9 +2489,18 @@ class LiveCryptoOrderService:
             live_order.updated_at = _utcnow()
             await db.flush()
             await _commit_if_supported(db=db)
-            logger.info(
-                "kraken_order_rejected live_crypto_order_id=%s risk_event_id=%s failure_code=%s failed_closed=True",
-                live_order.live_crypto_order_id, risk_event_id, live_order.failure_code,
+            logger.warning(
+                "kraken_order_rejected live_crypto_order_id=%s risk_event_id=%s failure_code=%s "
+                "provider_error_codes=%s rejection_message=%r http_status=%s request_payload_summary=%s "
+                "provider_response_body=%s rejection_reason=provider_explicit_rejection failed_closed=True",
+                live_order.live_crypto_order_id,
+                risk_event_id,
+                live_order.failure_code,
+                [] if submission.rejection is None else (submission.rejection.safe_details or {}).get("provider_errors", [submission.rejection.code]),
+                None if submission.rejection is None else submission.rejection.message,
+                safe_error["http_status"],
+                json.dumps(safe_payload_summary, sort_keys=True, default=str),
+                json.dumps(safe_provider_body, sort_keys=True, default=str),
             )
             return self._existing_submit_response(live_order=live_order)
 

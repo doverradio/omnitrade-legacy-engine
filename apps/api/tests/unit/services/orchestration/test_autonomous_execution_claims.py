@@ -34,6 +34,39 @@ def _settings(package):
 
 
 @pytest.mark.asyncio
+async def test_provider_rejection_diagnostics_are_attached_to_claim_and_proof() -> None:
+    claim = _claim()
+    claim.last_error_code = None
+    order = SimpleNamespace(
+        live_crypto_order_id=uuid4(),
+        status="REJECTED",
+        provider="kraken_spot",
+        environment="production",
+        product_id="BTC-USD",
+        side="BUY",
+        failure_code="provider_rejected",
+        failure_reason="rejected",
+        safe_provider_response={
+            "create_order_error": {
+                "code": "insufficient_funds",
+                "message": "EOrder:Insufficient funds",
+                "http_status": 200,
+                "provider_response_body": {"error": ["EOrder:Insufficient funds"]},
+            }
+        },
+    )
+    proof = SimpleNamespace(proof_id=uuid4(), failure_reason=None, updated_at=None)
+    db = SimpleNamespace(scalar=AsyncMock(return_value=proof), add=Mock())
+
+    await subject._persist_provider_rejection_diagnostics(db=db, claim=claim, order=order)
+
+    assert claim.last_error_code == "insufficient_funds"
+    assert "EOrder:Insufficient funds" in proof.failure_reason
+    assert str(order.live_crypto_order_id) in proof.failure_reason
+    assert db.add.call_count == 2
+
+
+@pytest.mark.asyncio
 async def test_stale_activated_package_creates_no_claim() -> None:
     now = datetime.now(timezone.utc)
     package = _package(now)
