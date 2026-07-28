@@ -267,33 +267,60 @@ async def claim_activated_package(
     if resolved_scope is None:
         return AutonomousClaimOutcome(None, False, blocker or "configured_scope_mismatch")
 
+    def _post_scope_blocked(reason: str, **details: object) -> AutonomousClaimOutcome:
+        logger.info(
+            "autonomous_execution_claim_post_scope_blocked package_id=%s controlled_proof_id=%s "
+            "campaign_id=%s campaign_version=%s product=%s side=%s provider=%s environment=%s "
+            "reason=%s details=%s provider_call_made=false",
+            package.package_id, resolved_scope.controlled_proof_id, package.campaign_id,
+            package.campaign_version, package.product, package.side, package.provider,
+            package.environment, reason, json.dumps(details, sort_keys=True, default=str),
+        )
+        return AutonomousClaimOutcome(None, False, reason)
+
     activation = await db.scalar(
         select(CanonicalProvingActivation).where(CanonicalProvingActivation.package_id == package_id).with_for_update().limit(1)
     )
     if activation is None or activation.package_id != package.package_id:
-        return AutonomousClaimOutcome(None, False, "activation_missing_or_mismatched")
+        return _post_scope_blocked("activation_missing_or_mismatched")
     if activation.activation_state != "ACTIVE" or activation.activated_at > observed_at or activation.expires_at <= observed_at:
-        return AutonomousClaimOutcome(None, False, "activation_not_effective")
+        return _post_scope_blocked(
+            "activation_not_effective", activation_state=activation.activation_state,
+            activated_at=activation.activated_at, expires_at=activation.expires_at,
+            observed_at=observed_at,
+        )
     if (activation.campaign_id, activation.campaign_version, activation.paper_account_id, activation.live_trading_profile_id, activation.provider, activation.environment, activation.product) != (
         package.campaign_id, package.campaign_version, package.paper_account_id, package.live_trading_profile_id, package.provider, package.environment, package.product,
     ):
-        return AutonomousClaimOutcome(None, False, "activation_scope_mismatch")
+        return _post_scope_blocked("activation_scope_mismatch")
 
     connection_raw = package.market_evidence_identity.get("exchange_connection_id") if isinstance(package.market_evidence_identity, dict) else None
     try:
         connection_id = UUID(str(connection_raw))
     except (TypeError, ValueError):
-        return AutonomousClaimOutcome(None, False, "connection_identity_missing")
+        return _post_scope_blocked("connection_identity_missing", connection_identity=connection_raw)
 
     runtime = await db.scalar(select(CapitalCampaign).where(CapitalCampaign.uuid == package.runtime_campaign_id).limit(1))
     mandate = await db.scalar(select(AutonomousCapitalMandate).where(AutonomousCapitalMandate.mandate_id == package.mandate_id).limit(1))
     version = await db.scalar(select(AutonomousCapitalMandateVersion).where(AutonomousCapitalMandateVersion.mandate_version_id == package.mandate_version_id).limit(1))
     if runtime is None or runtime.status not in {"READY", "RUNNING"} or runtime.definition_version != package.campaign_version:
-        return AutonomousClaimOutcome(None, False, "campaign_not_active")
+        return _post_scope_blocked(
+            "campaign_not_active", runtime_present=runtime is not None,
+            runtime_status=None if runtime is None else runtime.status,
+            runtime_definition_version=None if runtime is None else runtime.definition_version,
+        )
     if mandate is None or mandate.status != "ACTIVE" or mandate.expires_at is not None and mandate.expires_at <= observed_at:
-        return AutonomousClaimOutcome(None, False, "mandate_not_active")
+        return _post_scope_blocked(
+            "mandate_not_active", mandate_present=mandate is not None,
+            mandate_status=None if mandate is None else mandate.status,
+            mandate_expires_at=None if mandate is None else mandate.expires_at,
+        )
     if version is None or not version.is_active or not version.is_authorized or version.mandate_id != package.mandate_id:
-        return AutonomousClaimOutcome(None, False, "mandate_version_not_active")
+        return _post_scope_blocked(
+            "mandate_version_not_active", version_present=version is not None,
+            is_active=None if version is None else version.is_active,
+            is_authorized=None if version is None else version.is_authorized,
+        )
 
     kill_switch = await db.scalar(
         select(RiskKillSwitch.id).where(RiskKillSwitch.engaged.is_(True)).where(
@@ -301,7 +328,7 @@ async def claim_activated_package(
         ).limit(1)
     )
     if kill_switch is not None:
-        return AutonomousClaimOutcome(None, False, "kill_switch_engaged")
+        return _post_scope_blocked("kill_switch_engaged", kill_switch_id=kill_switch)
 
     await _recover_failed_pre_provider_order_for_scope(db=db, package=package)
     open_order = await db.scalar(
@@ -311,18 +338,18 @@ async def claim_activated_package(
         ).limit(1)
     )
     if open_order is not None:
-        logger.info(
-            "autonomous_execution_claim_blocked package_id=%s reason=unresolved_order_exists blocking_live_order_id=%s",
-            package.package_id, open_order,
+        return _post_scope_blocked(
+            "unresolved_order_exists", blocking_live_order_id=open_order,
         )
-        return AutonomousClaimOutcome(None, False, "unresolved_order_exists")
     unresolved = await db.scalar(claim_blocking_reconciliation_statement(
         provider=package.provider,
         environment=package.environment,
         product=package.product,
     ))
     if unresolved is not None:
-        return AutonomousClaimOutcome(None, False, "unresolved_reconciliation_exists")
+        return _post_scope_blocked(
+            "unresolved_reconciliation_exists", reconciliation_event_id=unresolved,
+        )
     net_quantity = await db.scalar(
         select(func.coalesce(func.sum(
             case((LiveAccountingRecord.side == "buy", LiveAccountingRecord.filled_quantity), else_=-LiveAccountingRecord.filled_quantity)
@@ -333,9 +360,13 @@ async def claim_activated_package(
     )
     owned_quantity = Decimal(str(net_quantity or 0))
     if package.side == "BUY" and owned_quantity > 0:
-        return AutonomousClaimOutcome(None, False, "campaign_position_already_open")
+        return _post_scope_blocked(
+            "campaign_position_already_open", owned_quantity=owned_quantity,
+        )
     if package.side == "SELL" and owned_quantity <= 0:
-        return AutonomousClaimOutcome(None, False, "campaign_position_not_open")
+        return _post_scope_blocked(
+            "campaign_position_not_open", owned_quantity=owned_quantity,
+        )
 
     owner = claim_owner or _owner()
     statement = insert(AutonomousExecutionClaim).values(

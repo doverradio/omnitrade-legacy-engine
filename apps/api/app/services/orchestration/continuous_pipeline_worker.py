@@ -1926,6 +1926,13 @@ async def _attempt_operator_controlled_proof_entry(*, db: AsyncSession, proof_id
         )
         if progression.activation_state == "ACTIVATED" and not progression.failed_closed:
             claim_outcome = await claim_activated_package(db=db, package_id=package_id)
+            logger.info(
+                "controlled_proof_execution_claim_outcome proof_id=%s package_id=%s claim_id=%s "
+                "claim_created=%s reason=%s provider_call_made=false",
+                proof.proof_id, package_id,
+                None if claim_outcome.claim is None else claim_outcome.claim.claim_id,
+                claim_outcome.created, claim_outcome.reason_code,
+            )
             if claim_outcome.claim is not None:
                 await advance_claimed_execution(db=db, claim=claim_outcome.claim)
         await db.commit()

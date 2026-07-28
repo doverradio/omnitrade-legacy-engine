@@ -138,6 +138,43 @@ def _settings(package):
 
 
 @pytest.mark.asyncio
+async def test_post_scope_reconciliation_blocker_emits_structured_diagnostics(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture,
+) -> None:
+    now = datetime.now(timezone.utc)
+    package = _package(now)
+    activation = SimpleNamespace(
+        activation_id=uuid.uuid4(), package_id=package.package_id, activation_state="ACTIVE",
+        activated_at=now - timedelta(seconds=1), expires_at=now + timedelta(minutes=4),
+        campaign_id=package.campaign_id, campaign_version=1, paper_account_id=package.paper_account_id,
+        live_trading_profile_id=package.live_trading_profile_id, provider=package.provider,
+        environment=package.environment, product=package.product,
+    )
+    runtime = SimpleNamespace(id=7, status="RUNNING", definition_version=1)
+    mandate = SimpleNamespace(status="ACTIVE", expires_at=now + timedelta(days=1))
+    version = SimpleNamespace(is_active=True, is_authorized=True, mandate_id=package.mandate_id)
+    reconciliation_event_id = uuid.uuid4()
+    db = SimpleNamespace(
+        scalar=AsyncMock(side_effect=[
+            package, None, None, activation, runtime, mandate, version,
+            None, None, None, reconciliation_event_id,
+        ]),
+        add=Mock(), flush=AsyncMock(),
+    )
+    monkeypatch.setattr(subject, "get_settings", lambda: _settings(package))
+
+    with caplog.at_level("INFO"):
+        outcome = await subject.claim_activated_package(
+            db=db, package_id=package.package_id, claim_owner="worker:test", now=now,
+        )
+
+    assert outcome.reason_code == "unresolved_reconciliation_exists"
+    assert "autonomous_execution_claim_post_scope_blocked" in caplog.text
+    assert f'"reconciliation_event_id": "{reconciliation_event_id}"' in caplog.text
+    assert "provider_call_made=false" in caplog.text
+
+
+@pytest.mark.asyncio
 async def test_insert_rejected_by_active_campaign_scope_reports_the_conflicting_claim(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
