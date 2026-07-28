@@ -302,6 +302,7 @@ async def claim_activated_package(
     if kill_switch is not None:
         return AutonomousClaimOutcome(None, False, "kill_switch_engaged")
 
+    await _recover_failed_pre_provider_order_for_scope(db=db, package=package)
     open_order = await db.scalar(
         select(LiveCryptoOrder.live_crypto_order_id).where(
             LiveCryptoOrder.provider == package.provider, LiveCryptoOrder.environment == package.environment,
@@ -309,6 +310,10 @@ async def claim_activated_package(
         ).limit(1)
     )
     if open_order is not None:
+        logger.info(
+            "autonomous_execution_claim_blocked package_id=%s reason=unresolved_order_exists blocking_live_order_id=%s",
+            package.package_id, open_order,
+        )
         return AutonomousClaimOutcome(None, False, "unresolved_order_exists")
     unresolved = await db.scalar(claim_blocking_reconciliation_statement(
         provider=package.provider,
@@ -432,6 +437,38 @@ async def mark_pre_provider_blocked(
     claim.last_error_code = reason_code
     claim.recover_after = None
     claim.updated_at = _utcnow()
+    live_order_transition: dict[str, object] | None = None
+    live_order_id = getattr(claim, "live_order_id", None)
+    if live_order_id is not None:
+        live_order = await db.scalar(
+            select(LiveCryptoOrder)
+            .where(LiveCryptoOrder.live_crypto_order_id == live_order_id)
+            .with_for_update()
+            .limit(1)
+        )
+        if (
+            live_order is not None
+            and live_order.status in {"PENDING_CONFIRMATION", "VALIDATING"}
+            and live_order.provider_order_id is None
+            and live_order.submitted_at is None
+            and isinstance(live_order.safe_provider_response, dict)
+            and live_order.safe_provider_response.get("provider_call_made") is False
+        ):
+            previous_order_status = live_order.status
+            live_order.status = "CANCELLED"
+            live_order.cancelled_at = claim.updated_at
+            live_order.failure_code = "failed_pre_provider"
+            live_order.failure_reason = reason_code
+            live_order.safe_provider_response = {
+                **(live_order.safe_provider_response if isinstance(live_order.safe_provider_response, dict) else {}),
+                "provider_call_made": False,
+                "pre_provider_terminal_reason": reason_code,
+            }
+            live_order_transition = {
+                "live_order_id": str(live_order.live_crypto_order_id),
+                "before_status": previous_order_status,
+                "after_status": live_order.status,
+            }
     after_state: dict[str, object] = {
         "claim_status": claim.claim_status,
         "reason_code": reason_code,
@@ -439,6 +476,8 @@ async def mark_pre_provider_blocked(
     }
     if safe_failure_evidence:
         after_state["safe_failure_evidence"] = safe_failure_evidence
+    if live_order_transition:
+        after_state["live_order_transition"] = live_order_transition
     db.add(AuditLog(
         actor=claim.claim_owner, action="autonomous_execution_claim.failed_pre_provider",
         entity_type="autonomous_execution_claim", entity_id=claim.claim_id,
@@ -446,6 +485,77 @@ async def mark_pre_provider_blocked(
         after_state=after_state,
     ))
     await db.flush()
+
+
+async def _recover_failed_pre_provider_order_for_scope(
+    *, db: AsyncSession, package: CanonicalPreviewPackage,
+) -> UUID | None:
+    """Terminalize one historical provider-never-called prepared order.
+
+    FAILED_PRE_PROVIDER releases its execution claim scope, so its linked
+    local order must also leave an open pre-submission state. This recovery
+    handles rows written before that transition was enforced atomically.
+    Provider-visible or submission-started orders are deliberately excluded.
+    """
+    order = await db.scalar(
+        select(LiveCryptoOrder)
+        .join(
+            AutonomousExecutionClaim,
+            AutonomousExecutionClaim.live_order_id == LiveCryptoOrder.live_crypto_order_id,
+        )
+        .where(
+            AutonomousExecutionClaim.claim_status == "FAILED_PRE_PROVIDER",
+            LiveCryptoOrder.provider == package.provider,
+            LiveCryptoOrder.environment == package.environment,
+            LiveCryptoOrder.product_id == package.product,
+            LiveCryptoOrder.status.in_({"PENDING_CONFIRMATION", "VALIDATING"}),
+            LiveCryptoOrder.provider_order_id.is_(None),
+            LiveCryptoOrder.submitted_at.is_(None),
+            LiveCryptoOrder.safe_provider_response["provider_call_made"].as_boolean().is_(False),
+        )
+        .with_for_update()
+        .limit(1)
+    )
+    if order is None:
+        return None
+    if (
+        order.status not in {"PENDING_CONFIRMATION", "VALIDATING"}
+        or order.provider_order_id is not None
+        or order.submitted_at is not None
+        or not isinstance(order.safe_provider_response, dict)
+        or order.safe_provider_response.get("provider_call_made") is not False
+    ):
+        return None
+    before = order.status
+    observed_at = _utcnow()
+    order.status = "CANCELLED"
+    order.cancelled_at = observed_at
+    order.failure_code = "failed_pre_provider"
+    order.failure_reason = "historical_failed_pre_provider_recovered"
+    order.safe_provider_response = {
+        **(order.safe_provider_response if isinstance(order.safe_provider_response, dict) else {}),
+        "provider_call_made": False,
+        "pre_provider_terminal_reason": "historical_failed_pre_provider_recovered",
+    }
+    db.add(AuditLog(
+        actor="system:orchestration",
+        action="live_crypto_order.failed_pre_provider_recovered",
+        entity_type="live_crypto_order",
+        entity_id=order.live_crypto_order_id,
+        before_state={"status": before},
+        after_state={
+            "status": order.status,
+            "failure_code": order.failure_code,
+            "provider_call_made": False,
+        },
+    ))
+    await db.flush()
+    logger.info(
+        "autonomous_execution_failed_pre_provider_order_recovered live_order_id=%s provider=%s environment=%s "
+        "product=%s previous_status=%s new_status=CANCELLED provider_call_made=false",
+        order.live_crypto_order_id, order.provider, order.environment, order.product_id, before,
+    )
+    return order.live_crypto_order_id
 
 
 async def _controlled_proof_id_for_failure_diagnostics(

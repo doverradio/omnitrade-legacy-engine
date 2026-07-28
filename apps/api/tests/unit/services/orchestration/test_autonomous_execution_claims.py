@@ -76,7 +76,7 @@ async def test_fresh_matching_package_creates_one_durable_claim(monkeypatch: pyt
         # ControlledProofRun linkage lookup (_resolve_autonomous_execution_scope)
         # -- no proof is linked to this package, so it falls through to the
         # unchanged, settings-derived configured-scope path exercised here.
-        scalar=AsyncMock(side_effect=[package, None, None, activation, runtime, mandate, version, None, None, None, 0, uuid4(), claim]),
+        scalar=AsyncMock(side_effect=[package, None, None, activation, runtime, mandate, version, None, None, None, None, 0, uuid4(), claim]),
         add=Mock(), flush=AsyncMock(),
     )
     monkeypatch.setattr(subject, "get_settings", lambda: _settings(package))
@@ -443,6 +443,113 @@ async def test_mark_pre_provider_blocked_persists_safe_specific_failure_evidence
         "provider_call_made": False,
         "safe_failure_evidence": evidence,
     }
+
+
+@pytest.mark.asyncio
+async def test_mark_pre_provider_blocked_terminalizes_provider_never_called_order() -> None:
+    claim = _claim()
+    claim.live_order_id = uuid4()
+    order = SimpleNamespace(
+        live_crypto_order_id=claim.live_order_id,
+        status="PENDING_CONFIRMATION",
+        provider_order_id=None,
+        submitted_at=None,
+        cancelled_at=None,
+        failure_code=None,
+        failure_reason=None,
+        safe_provider_response={"provider_call_made": False},
+    )
+    db = SimpleNamespace(scalar=AsyncMock(return_value=order), add=Mock(), flush=AsyncMock())
+
+    await subject.mark_pre_provider_blocked(
+        db=db, claim=claim, reason_code="readiness_evidence_stale",
+    )
+
+    assert claim.claim_status == "FAILED_PRE_PROVIDER"
+    assert order.status == "CANCELLED"
+    assert order.provider_order_id is None
+    assert order.submitted_at is None
+    assert order.failure_code == "failed_pre_provider"
+    assert order.safe_provider_response["provider_call_made"] is False
+    audit = db.add.call_args.args[0]
+    assert audit.after_state["live_order_transition"] == {
+        "live_order_id": str(order.live_crypto_order_id),
+        "before_status": "PENDING_CONFIRMATION",
+        "after_status": "CANCELLED",
+    }
+
+
+@pytest.mark.asyncio
+async def test_historical_failed_pre_provider_order_is_safely_recovered() -> None:
+    package = SimpleNamespace(provider="kraken_spot", environment="production", product="BTC-USD")
+    order = SimpleNamespace(
+        live_crypto_order_id=uuid4(), provider="kraken_spot", environment="production",
+        product_id="BTC-USD", status="PENDING_CONFIRMATION", provider_order_id=None,
+        submitted_at=None, cancelled_at=None, failure_code=None, failure_reason=None,
+        safe_provider_response={"provider_call_made": False},
+    )
+    db = SimpleNamespace(scalar=AsyncMock(return_value=order), add=Mock(), flush=AsyncMock())
+
+    recovered_id = await subject._recover_failed_pre_provider_order_for_scope(db=db, package=package)
+
+    assert recovered_id == order.live_crypto_order_id
+    assert order.status == "CANCELLED"
+    assert order.failure_code == "failed_pre_provider"
+    assert order.provider_order_id is None
+    assert order.submitted_at is None
+    assert order.safe_provider_response["provider_call_made"] is False
+    audit = db.add.call_args.args[0]
+    assert audit.action == "live_crypto_order.failed_pre_provider_recovered"
+    assert audit.after_state["provider_call_made"] is False
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("provider_order_id", "submitted_at", "provider_call_made"),
+    [
+        ("provider-123", None, False),
+        (None, datetime.now(timezone.utc), False),
+        (None, None, True),
+        (None, None, None),
+    ],
+)
+async def test_historical_recovery_refuses_any_uncertain_provider_boundary(
+    provider_order_id, submitted_at, provider_call_made,
+) -> None:
+    package = SimpleNamespace(provider="kraken_spot", environment="production", product="BTC-USD")
+    evidence = {} if provider_call_made is None else {"provider_call_made": provider_call_made}
+    order = SimpleNamespace(
+        live_crypto_order_id=uuid4(), provider="kraken_spot", environment="production",
+        product_id="BTC-USD", status="PENDING_CONFIRMATION", provider_order_id=provider_order_id,
+        submitted_at=submitted_at, cancelled_at=None, failure_code=None, failure_reason=None,
+        safe_provider_response=evidence,
+    )
+    db = SimpleNamespace(scalar=AsyncMock(return_value=order), add=Mock(), flush=AsyncMock())
+
+    recovered_id = await subject._recover_failed_pre_provider_order_for_scope(db=db, package=package)
+
+    assert recovered_id is None
+    assert order.status == "PENDING_CONFIRMATION"
+    db.add.assert_not_called()
+    db.flush.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_provider_visible_order_is_never_terminalized_as_pre_provider() -> None:
+    claim = _claim()
+    claim.live_order_id = uuid4()
+    order = SimpleNamespace(
+        live_crypto_order_id=claim.live_order_id,
+        status="SUBMISSION_PENDING",
+        provider_order_id="provider-123",
+        submitted_at=datetime.now(timezone.utc),
+    )
+    db = SimpleNamespace(scalar=AsyncMock(return_value=order), add=Mock(), flush=AsyncMock())
+
+    await subject.mark_pre_provider_blocked(db=db, claim=claim, reason_code="unexpected")
+
+    assert order.status == "SUBMISSION_PENDING"
+    assert order.provider_order_id == "provider-123"
 
 
 # --- sweep_stale_autonomous_execution_claims: the never-implemented recovery pass ----

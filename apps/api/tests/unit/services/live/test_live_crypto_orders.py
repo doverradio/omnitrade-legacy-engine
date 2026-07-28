@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import uuid
 from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
@@ -1535,6 +1536,8 @@ async def test_transport_failure_after_submission_started_enters_reconciliation_
 
     assert response.live_crypto_order.status == "RECONCILIATION_REQUIRED"
     assert response.live_crypto_order.failure_code == "provider_response_ambiguous"
+    assert response.live_crypto_order.submitted_at is not None
+    assert db.commits >= 2  # durable pre-call marker, then ambiguous outcome
 
 
 @pytest.mark.asyncio
@@ -1840,6 +1843,10 @@ async def test_autonomous_one_shot_reaches_mocked_provider_exactly_once(monkeypa
     calls = {"create_order": 0}
 
     async def _create_order(*_args, **_kwargs):
+        assert db.commits >= 1
+        assert live_order.status == "SUBMISSION_PENDING"
+        assert live_order.submitted_at is not None
+        assert live_order.provider_order_id is None
         calls["create_order"] += 1
         return {"success": True, "success_response": {"order_id": "provider-order-auto-1", "status": "OPEN"}}, {}
 
@@ -1864,6 +1871,106 @@ async def test_autonomous_one_shot_reaches_mocked_provider_exactly_once(monkeypa
     assert calls["create_order"] == 1
     assert claim.claim_status == "SUBMISSION_PENDING"
     assert response.live_crypto_order.status == "ACKNOWLEDGED"
+
+
+@pytest.mark.asyncio
+async def test_submission_commit_failure_prevents_provider_boundary(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    profile, live_order, _preview, connection, campaign, _approval_event, db = _submit_authority_fixture()
+    claim_id, package_id = uuid.uuid4(), uuid.uuid4()
+    live_order.safe_provider_response.update({
+        "autonomous_prepared": True,
+        "autonomous_execution_claim_id": str(claim_id),
+        "canonical_preview_package_id": str(package_id),
+        "commissioned_preview_identity_binding": {"profile_id": str(profile.id)},
+        "execution_readiness_evidence": {
+            "claim_id": str(claim_id), "package_id": str(package_id),
+            "live_order_id": str(live_order.live_crypto_order_id),
+            "connection_id": str(live_order.exchange_connection_id),
+            "provider": live_order.provider, "environment": live_order.environment,
+            "product": live_order.product_id, "side": live_order.side,
+            "verdict": "READY_FOR_DRY_RUN", "checked_at": connection.last_verified_at.isoformat(),
+        },
+    })
+    provider_call = AsyncMock()
+
+    async def _commit_failure():
+        db.commits += 1
+        raise RuntimeError("durable submission marker unavailable")
+
+    db.commit = _commit_failure
+    monkeypatch.setattr(service, "get_settings", _submit_settings)
+    monkeypatch.setattr(service, "_utcnow", lambda: datetime(2026, 7, 9, 12, 0, tzinfo=timezone.utc))
+    monkeypatch.setattr(service, "_evaluate_level2_mandate_authorization", AsyncMock(return_value=(True, uuid.uuid4())))
+    monkeypatch.setattr(service, "_validate_autonomous_one_shot_submission", AsyncMock(return_value=(campaign.id, SimpleNamespace())))
+    monkeypatch.setattr(service, "get_exchange_provider", lambda *_args, **_kwargs: _provider_stub(submit_order=provider_call))
+
+    with pytest.raises(RuntimeError, match="durable submission marker unavailable"):
+        await service.service.submit(
+            db=db,
+            request=service.LiveCryptoOrderSubmitRequest(
+                live_crypto_order_id=live_order.live_crypto_order_id,
+                confirmation_challenge_id=None,
+                confirmation_phrase=None,
+                operator_identity="orchestration:test",
+                idempotency_token="commit-must-precede-provider",
+            ),
+        )
+
+    provider_call.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_process_cancellation_after_provider_boundary_keeps_durable_submission_marker(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    profile, live_order, _preview, connection, campaign, _approval_event, db = _submit_authority_fixture()
+    claim_id, package_id = uuid.uuid4(), uuid.uuid4()
+    live_order.safe_provider_response.update({
+        "autonomous_prepared": True,
+        "autonomous_execution_claim_id": str(claim_id),
+        "canonical_preview_package_id": str(package_id),
+        "commissioned_preview_identity_binding": {"profile_id": str(profile.id)},
+        "execution_readiness_evidence": {
+            "claim_id": str(claim_id), "package_id": str(package_id),
+            "live_order_id": str(live_order.live_crypto_order_id),
+            "connection_id": str(live_order.exchange_connection_id),
+            "provider": live_order.provider, "environment": live_order.environment,
+            "product": live_order.product_id, "side": live_order.side,
+            "verdict": "READY_FOR_DRY_RUN", "checked_at": connection.last_verified_at.isoformat(),
+        },
+    })
+
+    async def _cancel_after_boundary(*_args, **_kwargs):
+        assert db.commits >= 1
+        assert live_order.status == "SUBMISSION_PENDING"
+        assert live_order.submitted_at is not None
+        raise asyncio.CancelledError()
+
+    monkeypatch.setattr(service, "get_settings", _submit_settings)
+    monkeypatch.setattr(service, "_utcnow", lambda: datetime(2026, 7, 9, 12, 0, tzinfo=timezone.utc))
+    monkeypatch.setattr(service, "_evaluate_level2_mandate_authorization", AsyncMock(return_value=(True, uuid.uuid4())))
+    monkeypatch.setattr(service, "_validate_autonomous_one_shot_submission", AsyncMock(return_value=(campaign.id, SimpleNamespace())))
+    monkeypatch.setattr(service, "_load_decrypted_credentials", lambda _connection: {"api_key": "key", "api_secret": "secret"})
+    monkeypatch.setattr(service, "get_exchange_provider", lambda *_args, **_kwargs: _provider_stub(submit_order=_cancel_after_boundary))
+
+    with pytest.raises(asyncio.CancelledError):
+        await service.service.submit(
+            db=db,
+            request=service.LiveCryptoOrderSubmitRequest(
+                live_crypto_order_id=live_order.live_crypto_order_id,
+                confirmation_challenge_id=None,
+                confirmation_phrase=None,
+                operator_identity="orchestration:test",
+                idempotency_token="crash-after-provider-boundary",
+            ),
+        )
+
+    assert live_order.status == "SUBMISSION_PENDING"
+    assert live_order.submitted_at is not None
+    assert live_order.provider_order_id is None
+    assert db.commits >= 1
 
 
 @pytest.mark.asyncio
