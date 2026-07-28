@@ -1918,6 +1918,136 @@ async def test_autonomous_one_shot_reaches_mocked_provider_exactly_once(monkeypa
 
 
 @pytest.mark.asyncio
+async def test_exit_recovery_authority_satisfies_only_autonomous_sell_confirmation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    profile, live_order, _preview, connection, campaign, _approval_event, db = _submit_authority_fixture()
+    claim_id, package_id, recovery_id = uuid.uuid4(), uuid.uuid4(), uuid.uuid4()
+    live_order.side = "SELL"
+    live_order.safe_provider_response.update({
+        "autonomous_prepared": True,
+        "autonomous_execution_claim_id": str(claim_id),
+        "canonical_preview_package_id": str(package_id),
+        "commissioned_preview_identity_binding": {"profile_id": str(profile.id)},
+        "execution_readiness_evidence": {
+            "claim_id": str(claim_id), "package_id": str(package_id),
+            "live_order_id": str(live_order.live_crypto_order_id),
+            "connection_id": str(live_order.exchange_connection_id),
+            "provider": live_order.provider, "environment": live_order.environment,
+            "product": live_order.product_id, "side": "SELL",
+            "verdict": "READY_FOR_DRY_RUN", "checked_at": connection.last_verified_at.isoformat(),
+            "source": "exchange_connection_execution_refresh",
+        },
+    })
+    claim = SimpleNamespace(claim_status="EXECUTION_STARTED", last_error_code=None, updated_at=None)
+    provider_calls = 0
+
+    async def _create_order(*_args, **_kwargs):
+        nonlocal provider_calls
+        provider_calls += 1
+        return {"success": True, "success_response": {"order_id": "provider-recovery-sell", "status": "OPEN"}}, {}
+
+    monkeypatch.setattr(service, "get_settings", _submit_settings)
+    monkeypatch.setattr(service, "_utcnow", lambda: datetime(2026, 7, 9, 12, 0, tzinfo=timezone.utc))
+    monkeypatch.setattr(service, "_evaluate_level2_mandate_authorization", AsyncMock(return_value=(False, uuid.uuid4())))
+    monkeypatch.setattr(service, "_evaluate_exit_recovery_confirmation_authorization", AsyncMock(return_value=(True, recovery_id)))
+    monkeypatch.setattr(service, "_validate_autonomous_one_shot_submission", AsyncMock(return_value=(campaign.id, claim)))
+    monkeypatch.setattr(service, "_load_decrypted_credentials", lambda _connection: {"api_key": "key", "api_secret": "secret"})
+    monkeypatch.setattr(service, "get_exchange_provider", lambda *_args, **_kwargs: _provider_stub(create_order=_create_order))
+
+    response = await service.service.submit(
+        db=db,
+        request=service.LiveCryptoOrderSubmitRequest(
+            live_crypto_order_id=live_order.live_crypto_order_id,
+            confirmation_challenge_id=None, confirmation_phrase=None,
+            operator_identity="orchestration:exit-recovery",
+            idempotency_token="exit-recovery-sell-submit",
+        ),
+    )
+
+    assert provider_calls == 1
+    assert response.live_crypto_order.safe_provider_response["authorization_source"] == "CONTROLLED_PROOF_EXIT_RECOVERY"
+    assert response.live_crypto_order.safe_provider_response["controlled_proof_exit_recovery_id"] == str(recovery_id)
+
+
+@pytest.mark.asyncio
+async def test_missing_exit_recovery_authority_still_requires_confirmation_phrase(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _profile, live_order, _preview, _connection, _campaign, _approval_event, db = _submit_authority_fixture()
+    live_order.side = "SELL"
+    live_order.safe_provider_response["autonomous_prepared"] = True
+    provider_call = AsyncMock()
+    monkeypatch.setattr(service, "get_settings", _submit_settings)
+    monkeypatch.setattr(service, "_evaluate_level2_mandate_authorization", AsyncMock(return_value=(False, None)))
+    monkeypatch.setattr(service, "_evaluate_exit_recovery_confirmation_authorization", AsyncMock(return_value=(False, None)))
+    monkeypatch.setattr(service, "get_exchange_provider", lambda *_args, **_kwargs: _provider_stub(create_order=provider_call))
+
+    with pytest.raises(PermissionError, match="confirmation phrase mismatch"):
+        await service.service.submit(
+            db=db,
+            request=service.LiveCryptoOrderSubmitRequest(
+                live_crypto_order_id=live_order.live_crypto_order_id,
+                confirmation_challenge_id=None, confirmation_phrase=None,
+                operator_identity="orchestration:not-authorized",
+                idempotency_token="ordinary-sell-without-confirmation",
+            ),
+        )
+
+    provider_call.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_exit_recovery_confirmation_resolver_requires_exact_sell_lineage(monkeypatch: pytest.MonkeyPatch) -> None:
+    now = datetime(2026, 7, 9, 12, 0, tzinfo=timezone.utc)
+    order_id, claim_id, package_id, proof_id, recovery_id = (uuid.uuid4() for _ in range(5))
+    order = SimpleNamespace(
+        live_crypto_order_id=order_id, side="SELL", provider="kraken_spot",
+        environment="production", product_id="BTC-USD",
+        safe_provider_response={
+            "autonomous_prepared": True,
+            "autonomous_execution_claim_id": str(claim_id),
+            "canonical_preview_package_id": str(package_id),
+        },
+    )
+    claim = SimpleNamespace(claim_id=claim_id, campaign_id=uuid.uuid4(), campaign_version=1)
+    package = SimpleNamespace(package_id=package_id)
+    proof = SimpleNamespace(proof_id=proof_id, sell_live_crypto_order_id=None)
+    recovery = SimpleNamespace(recovery_id=recovery_id)
+
+    class _SequenceDb:
+        def __init__(self, values):
+            self.values = list(values)
+            self.statements = []
+
+        async def scalar(self, statement):
+            self.statements.append(str(statement))
+            return self.values.pop(0)
+
+    monkeypatch.setattr(service, "_utcnow", lambda: now)
+    db = _SequenceDb([claim, package, proof, recovery])
+
+    assert await service._evaluate_exit_recovery_confirmation_authorization(db=db, live_order=order) == (True, recovery_id)
+    compiled = "\n".join(db.statements)
+    assert "autonomous_execution_claims.side" in compiled
+    assert "canonical_preview_packages.side" in compiled
+    assert "controlled_proof_runs.sell_package_id" in compiled
+    assert "controlled_proof_exit_recoveries.expires_at" in compiled
+
+    unrelated_db = _SequenceDb([claim, package, None])
+    assert await service._evaluate_exit_recovery_confirmation_authorization(
+        db=unrelated_db, live_order=order,
+    ) == (False, None)
+
+    order.side = "BUY"
+    no_query_db = _SequenceDb([])
+    assert await service._evaluate_exit_recovery_confirmation_authorization(
+        db=no_query_db, live_order=order,
+    ) == (False, None)
+    assert no_query_db.statements == []
+
+
+@pytest.mark.asyncio
 async def test_submission_commit_failure_prevents_provider_boundary(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

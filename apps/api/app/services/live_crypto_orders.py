@@ -31,6 +31,8 @@ from app.models.risk_event import RiskEvent
 from app.models.autonomous_capital_mandate import AutonomousCapitalMandate
 from app.models.autonomous_capital_mandate_version import AutonomousCapitalMandateVersion
 from app.models.autonomous_execution_claim import AutonomousExecutionClaim
+from app.models.controlled_proof_exit_recovery import ControlledProofExitRecovery
+from app.models.controlled_proof_run import ControlledProofRun
 from app.schemas.live_crypto_orders import (
     LiveCryptoOrderCancelRequest,
     LiveCryptoOrderDryRunRequest,
@@ -168,6 +170,76 @@ async def _validate_autonomous_one_shot_submission(
     if campaign is None or campaign.id is None or campaign.status not in {"READY", "RUNNING"}:
         raise PermissionError("autonomous one-shot campaign inactive")
     return campaign.id, claim
+
+
+async def _evaluate_exit_recovery_confirmation_authorization(
+    *, db: AsyncSession, live_order: LiveCryptoOrder,
+) -> tuple[bool, uuid.UUID | None]:
+    """Resolve the one narrow non-human confirmation authority for recovery.
+
+    This does not authorize submission.  It only lets the exact, unexpired
+    exit-recovery authority satisfy the manual phrase/challenge step; the
+    canonical one-shot validator below still rechecks activation, mandate,
+    campaign, kill switch, scope, notional, and claim consumption before the
+    provider boundary.
+    """
+    evidence = live_order.safe_provider_response if isinstance(live_order.safe_provider_response, dict) else {}
+    if not evidence.get("autonomous_prepared") or live_order.side != "SELL":
+        return False, None
+    try:
+        claim_id = uuid.UUID(str(evidence.get("autonomous_execution_claim_id")))
+        package_id = uuid.UUID(str(evidence.get("canonical_preview_package_id")))
+    except (TypeError, ValueError):
+        return False, None
+
+    claim = await db.scalar(select(AutonomousExecutionClaim).where(
+        AutonomousExecutionClaim.claim_id == claim_id,
+        AutonomousExecutionClaim.package_id == package_id,
+        AutonomousExecutionClaim.live_order_id == live_order.live_crypto_order_id,
+        AutonomousExecutionClaim.claim_status == "EXECUTION_STARTED",
+        AutonomousExecutionClaim.side == "SELL",
+        AutonomousExecutionClaim.provider == live_order.provider,
+        AutonomousExecutionClaim.environment == live_order.environment,
+        AutonomousExecutionClaim.product == live_order.product_id,
+    ).limit(1))
+    if claim is None:
+        return False, None
+    package = await db.scalar(select(CanonicalPreviewPackage).where(
+        CanonicalPreviewPackage.package_id == package_id,
+        CanonicalPreviewPackage.package_state == "ACTIVATED",
+        CanonicalPreviewPackage.side == "SELL",
+        CanonicalPreviewPackage.authorization_source == "MANDATE",
+        CanonicalPreviewPackage.campaign_id == claim.campaign_id,
+        CanonicalPreviewPackage.campaign_version == claim.campaign_version,
+        CanonicalPreviewPackage.provider == live_order.provider,
+        CanonicalPreviewPackage.environment == live_order.environment,
+        CanonicalPreviewPackage.product == live_order.product_id,
+    ).limit(1))
+    if package is None:
+        return False, None
+    proof = await db.scalar(select(ControlledProofRun).where(
+        ControlledProofRun.sell_package_id == package_id,
+        ControlledProofRun.campaign_id == claim.campaign_id,
+        ControlledProofRun.campaign_version == claim.campaign_version,
+        ControlledProofRun.provider == live_order.provider,
+        ControlledProofRun.environment == live_order.environment,
+        ControlledProofRun.product_id == live_order.product_id,
+    ).limit(1))
+    if proof is None or proof.sell_live_crypto_order_id not in {None, live_order.live_crypto_order_id}:
+        return False, None
+    recovery = await db.scalar(select(ControlledProofExitRecovery).where(
+        ControlledProofExitRecovery.proof_id == proof.proof_id,
+        ControlledProofExitRecovery.status.in_(("AUTHORIZED", "IN_PROGRESS")),
+        ControlledProofExitRecovery.expires_at > _utcnow(),
+    ).limit(1))
+    if recovery is None:
+        return False, None
+    logger.info(
+        "controlled_proof_exit_recovery_confirmation_authorized "
+        "recovery_id=%s proof_id=%s package_id=%s claim_id=%s live_crypto_order_id=%s side=SELL",
+        recovery.recovery_id, proof.proof_id, package_id, claim_id, live_order.live_crypto_order_id,
+    )
+    return True, recovery.recovery_id
 
 
 def _serialize_payload(payload: dict[str, Any]) -> str:
@@ -2121,22 +2193,29 @@ class LiveCryptoOrderService:
 
         # ADR-0011 / AUTONOMOUS_CAPITAL_MANAGEMENT_MODE_SPEC.md Phase E: a
         # LEVEL_2 mandate may satisfy the human confirmation-phrase
-        # requirement below (APPROVAL_SATISFIED_BY_ACTIVE_MANDATE), never
-        # any other check in this function. Everything else -- operator
+        # requirement below (APPROVAL_SATISFIED_BY_ACTIVE_MANDATE). The exact
+        # unexpired Controlled Proof exit-recovery lineage may satisfy that
+        # same single requirement for its SELL, never for BUY or another
+        # package. Neither authority bypasses any other check in this
+        # function. Everything else -- operator
         # identity/challenge binding, fingerprint matching, campaign-scoped
         # authority, Risk Engine, idempotency, audit -- is unconditional and
-        # unchanged regardless of which path satisfies this one check. If no
-        # active LEVEL_2 mandate authorizes this exact decision, behavior is
-        # byte-for-byte identical to before this change: the confirmation
-        # phrase is required.
+        # unchanged regardless of which path satisfies this one check. If
+        # neither authority resolves, the confirmation phrase is required.
         mandate_authorized, mandate_id_for_audit = await _evaluate_level2_mandate_authorization(
             db=db, live_order=live_order, actor=request.operator_identity,
         )
         autonomous_prepared = bool(live_order.safe_provider_response.get("autonomous_prepared"))
-        if not mandate_authorized:
+        recovery_authorized, recovery_id_for_audit = await _evaluate_exit_recovery_confirmation_authorization(
+            db=db, live_order=live_order,
+        )
+        autonomous_confirmation_authorized = bool(
+            autonomous_prepared and (mandate_authorized or recovery_authorized)
+        )
+        if not mandate_authorized and not recovery_authorized:
             if request.confirmation_phrase != CONFIRMATION_PHRASE:
                 raise PermissionError("confirmation phrase mismatch")
-        if not (mandate_authorized and autonomous_prepared):
+        if not autonomous_confirmation_authorized:
             if request.operator_identity != live_order.safe_provider_response.get("prepared_by"):
                 raise PermissionError("operator identity mismatch")
             if live_order.operator_confirmation_id != request.confirmation_challenge_id:
@@ -2248,7 +2327,7 @@ class LiveCryptoOrderService:
 
         autonomous_claim: AutonomousExecutionClaim | None = None
         approval_event_id = live_order.safe_provider_response.get("approval_event_id")
-        if mandate_authorized and autonomous_prepared:
+        if autonomous_confirmation_authorized:
             verified_capital_campaign_id, autonomous_claim = await _validate_autonomous_one_shot_submission(
                 db=db, live_order=live_order, preview=preview,
             )
@@ -2311,8 +2390,15 @@ class LiveCryptoOrderService:
         live_order.safe_provider_response = {
             **live_order.safe_provider_response,
             "capital_campaign_id": verified_capital_campaign_id,
-            "authorization_source": "LEVEL_2" if mandate_authorized else "MANUAL",
+            "authorization_source": (
+                "LEVEL_2" if mandate_authorized
+                else "CONTROLLED_PROOF_EXIT_RECOVERY" if recovery_authorized
+                else "MANUAL"
+            ),
             "level2_mandate_id": None if mandate_id_for_audit is None else str(mandate_id_for_audit),
+            "controlled_proof_exit_recovery_id": (
+                None if recovery_id_for_audit is None else str(recovery_id_for_audit)
+            ),
             "submission_identity": {
                 "live_crypto_order_id": str(live_order.live_crypto_order_id),
                 "client_order_id": live_order.client_order_id,
