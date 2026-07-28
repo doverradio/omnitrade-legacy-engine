@@ -125,6 +125,8 @@ Success is waking up to more money than when the campaign began.
 
 ✅ Live production reconciliation
 
+✅ Terminal reconciliation recovery scheduler
+
 ## Decision Layer
 
 ✅ Decision Records
@@ -289,22 +291,47 @@ Do not assume a .venv path on production.
 ✓ BUY candidates have been observed passing Strategy, Economics, and Risk
 and reaching OPEN_POSITION_PROPOSED.
 
-✓ Current production blocker (revised, replaces the earlier generic
-"Risk Engine is rejecting BUY candidates" diagnosis, which is stale):
+✓ Current production blocker (2026-07-28)
 
-The most recent BUY candidate reached OPEN_POSITION_PROPOSED and then
-failed package progression with reason_code=mandate (mandate package
-authorization expired), followed by reason_code=unexpected_executor_failure,
-with live_submission_called=false and provider_submission_called=false.
-Subsequent cycles were genuine HOLD outcomes (weak/conflicting agreement
-or sell_signal_no_position_to_close), not further instances of this
-blocker. This is an execution-pipeline/mandate-authorization issue, not a
-Risk Engine, strategy-threshold, or campaign-limit defect, and it must
-not be diagnosed or fixed as one.
+Production proving has advanced beyond package-progression diagnosis.
 
-The immediate engineering objective remains reproducing this exact
-package-progression failure and unblocking it, without modifying Risk
-Engine decision math, campaign risk limits, or strategy thresholds.
+The terminal unresolved reconciliation scheduler defect has been
+identified, repaired, deployed, and verified in production.
+
+The scheduler now correctly rediscovers terminal FILLED orders whose
+latest reconciliation event remains unresolved.
+
+Production evidence confirms:
+
+• historical terminal orders are rediscovered
+• reconciliation executes
+• Kraken returns authoritative FILLED status
+• reconciliation completes
+
+However, reconciliation still remains:
+
+reconciliation_required
+
+because:
+
+balance_evidence_outcome=missing
+
+The imported external trade does not contain the historical
+pre-submit USD balance evidence required by the canonical accounting
+reconciliation contract.
+
+Current engineering work is therefore focused on determining whether
+this is:
+
+• an intentional reconciliation-policy requirement for externally
+imported trades, or
+
+• an unintended consequence of applying the canonical reconciliation
+contract to externally executed manual trades.
+
+No changes should weaken reconciliation, fabricate historical
+evidence, or bypass existing production safety guarantees until the
+intended repository behavior is conclusively established.
 
 ✓ Bounded live multi-asset expansion foundation (2026-07-25): the
 autonomous worker (continuous_pipeline_worker.py) can now evaluate a

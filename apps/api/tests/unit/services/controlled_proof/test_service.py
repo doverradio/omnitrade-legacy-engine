@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 import uuid
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
@@ -422,7 +423,7 @@ async def test_create_rejects_when_open_position_already_exists(monkeypatch: pyt
 
 @pytest.mark.asyncio
 async def test_should_propose_controlled_sell_becomes_true_once_buy_is_filled_and_reconciled(
-    monkeypatch: pytest.MonkeyPatch,
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture,
 ) -> None:
     """should_propose_controlled_sell is the exact mechanism automatic
     reconciliation (reconciliation_scheduler.poll_unresolved_live_orders ->
@@ -440,7 +441,22 @@ async def test_should_propose_controlled_sell_becomes_true_once_buy_is_filled_an
         await session.flush()
 
         # Before any fill exists, the BUY has not been reconciled yet.
-        assert await controlled_proof_service.should_propose_controlled_sell(db=session, proof=proof) is False
+        with caplog.at_level(logging.INFO, logger=controlled_proof_service.logger.name):
+            assert await controlled_proof_service.should_propose_controlled_sell(db=session, proof=proof) is False
+        false_messages = [record.getMessage() for record in caplog.records]
+        assert any(
+            "controlled_proof_sell_evaluation" in message
+            and "buy_fill_accounting_exists=false" in message
+            and "matching_position_exists=false" in message
+            and "position_nonzero=false" in message
+            and "eligible=false" in message
+            for message in false_messages
+        )
+        assert any(
+            "controlled_proof_sell_ineligible" in message
+            and "reason=buy_fill_accounting_exists" in message
+            for message in false_messages
+        )
 
         runtime = await session.scalar(select(CapitalCampaign).where(CapitalCampaign.uuid == _CAMPAIGN_ID))
         profile = await session.scalar(select(LiveTradingProfile).where(LiveTradingProfile.paper_account_id == runtime.paper_account_id))
@@ -458,7 +474,23 @@ async def test_should_propose_controlled_sell_becomes_true_once_buy_is_filled_an
         ))
         await session.flush()
 
-        assert await controlled_proof_service.should_propose_controlled_sell(db=session, proof=proof) is True
+        caplog.clear()
+        with caplog.at_level(logging.INFO, logger=controlled_proof_service.logger.name):
+            assert await controlled_proof_service.should_propose_controlled_sell(db=session, proof=proof) is True
+        true_messages = [record.getMessage() for record in caplog.records]
+        assert any(
+            "controlled_proof_sell_evaluation" in message
+            and "buy_package_linked=true" in message
+            and "sell_package_unlinked=true" in message
+            and "runtime_campaign_exists=true" in message
+            and "paper_account_linked=true" in message
+            and "buy_fill_accounting_exists=true" in message
+            and "matching_position_exists=true" in message
+            and "position_nonzero=true" in message
+            and "eligible=true" in message
+            for message in true_messages
+        )
+        assert not any("controlled_proof_sell_ineligible" in message for message in true_messages)
 
 
 # --- replace-active: operator-safe supersede of a stalled active proof ---------------

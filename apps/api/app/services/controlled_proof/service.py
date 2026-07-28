@@ -624,19 +624,57 @@ async def should_propose_controlled_sell(*, db: AsyncSession, proof: ControlledP
     """True only once the controlled BUY has a real, filled order and the
     resulting position is genuinely open, and no controlled SELL has been
     proposed yet. Read-only; never itself creates or submits anything."""
-    if proof.package_id is None or proof.sell_package_id is not None:
-        return False
+    buy_package_linked = proof.package_id is not None
+    sell_package_unlinked = proof.sell_package_id is None
     runtime = await db.scalar(select(CapitalCampaign).where(CapitalCampaign.uuid == proof.campaign_id).limit(1))
-    if runtime is None or runtime.paper_account_id is None:
-        return False
-    accounting_records = await _accounting_records_for_product(db=db, runtime_campaign_id=runtime.id, product_id=proof.product_id)
-    buy_filled = any(r.side.upper() == "BUY" for r in accounting_records)
-    if not buy_filled:
-        return False
-    snapshots = await load_position_snapshots(db=db, account_id=runtime.paper_account_id, campaign_id=runtime.id)
+    runtime_campaign_exists = runtime is not None
+    paper_account_linked = runtime is not None and runtime.paper_account_id is not None
+
+    accounting_records: list[LiveAccountingRecord] = []
+    if runtime_campaign_exists:
+        accounting_records = await _accounting_records_for_product(
+            db=db, runtime_campaign_id=runtime.id, product_id=proof.product_id,
+        )
+    buy_fill_accounting_exists = any(r.side.upper() == "BUY" for r in accounting_records)
+
+    snapshots = []
+    if paper_account_linked:
+        snapshots = await load_position_snapshots(
+            db=db, account_id=runtime.paper_account_id, campaign_id=runtime.id,
+        )
     symbol_base = proof.product_id.split("-")[0]
     match = next((s for s in snapshots if s.symbol.split("-")[0].upper() == symbol_base), None)
-    return match is not None and match.position_size != 0
+    matching_position_exists = match is not None
+    position_nonzero = match is not None and match.position_size != 0
+
+    prerequisites = (
+        ("buy_package_linked", buy_package_linked),
+        ("sell_package_unlinked", sell_package_unlinked),
+        ("runtime_campaign_exists", runtime_campaign_exists),
+        ("paper_account_linked", paper_account_linked),
+        ("buy_fill_accounting_exists", buy_fill_accounting_exists),
+        ("matching_position_exists", matching_position_exists),
+        ("position_nonzero", position_nonzero),
+    )
+    eligible = all(value for _name, value in prerequisites)
+    first_unmet = next((name for name, value in prerequisites if not value), None)
+    logger.info(
+        "controlled_proof_sell_evaluation proof_id=%s proof_status=%s "
+        "buy_package_linked=%s sell_package_unlinked=%s runtime_campaign_exists=%s "
+        "paper_account_linked=%s buy_fill_accounting_exists=%s matching_position_exists=%s "
+        "position_nonzero=%s eligible=%s",
+        proof.proof_id, proof.status,
+        str(buy_package_linked).lower(), str(sell_package_unlinked).lower(),
+        str(runtime_campaign_exists).lower(), str(paper_account_linked).lower(),
+        str(buy_fill_accounting_exists).lower(), str(matching_position_exists).lower(),
+        str(position_nonzero).lower(), str(eligible).lower(),
+    )
+    if not eligible:
+        logger.info(
+            "controlled_proof_sell_ineligible proof_id=%s proof_status=%s reason=%s",
+            proof.proof_id, proof.status, first_unmet,
+        )
+    return eligible
 
 
 @dataclass(frozen=True, slots=True)

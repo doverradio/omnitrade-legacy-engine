@@ -1787,6 +1787,11 @@ async def _attempt_operator_controlled_proof_entry(*, db: AsyncSession, proof_id
     if proof is None:
         return
     actor = "system:controlled_proof_worker"
+    logger.info(
+        "controlled_proof_selected_for_evaluation proof_id=%s proof_status=%s "
+        "buy_package_id=%s sell_package_id=%s",
+        proof.proof_id, proof.status, proof.package_id, proof.sell_package_id,
+    )
     try:
         if proof.sell_package_id is not None:
             # Supervision is part of the periodic operator workflow, not a
@@ -1795,8 +1800,19 @@ async def _attempt_operator_controlled_proof_entry(*, db: AsyncSession, proof_id
             await get_controlled_proof_view(db=db, proof_id=proof.proof_id)
             return
         is_sell = proof.package_id is not None
-        if is_sell and not await should_propose_controlled_sell(db=db, proof=proof):
-            return
+        if is_sell:
+            logger.info(
+                "controlled_proof_exit_evaluation_started proof_id=%s proof_status=%s "
+                "buy_package_id=%s sell_package_id=%s",
+                proof.proof_id, proof.status, proof.package_id, proof.sell_package_id,
+            )
+            sell_eligible = await should_propose_controlled_sell(db=db, proof=proof)
+            if not sell_eligible:
+                return
+            logger.info(
+                "controlled_proof_sell_eligible proof_id=%s proof_status=%s next_stage=sell_risk_evaluation",
+                proof.proof_id, proof.status,
+            )
         side = "SELL" if is_sell else "BUY"
         forced_action = "CLOSE_POSITION_PROPOSED" if is_sell else "OPEN_POSITION_PROPOSED"
         runtime = await _load_runtime_campaign(db=db, campaign_id=proof.campaign_id)

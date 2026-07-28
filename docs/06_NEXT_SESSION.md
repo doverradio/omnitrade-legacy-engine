@@ -53,7 +53,9 @@ Task 10 is complete.
 
 The next session should not redesign commissioned architecture.
 
-The next session should execute the read-only production proving-window evidence collection and prepare an explicit go/no-go recommendation.
+The next session should determine whether the remaining reconciliation
+blocker represents an intentional architectural policy or a repository
+defect before recommending any implementation.
 
 ---
 
@@ -249,27 +251,39 @@ Production evidence is more valuable than speculative architecture.
 
 # Next Task
 
-Investigate the Risk Engine rejection path.
+Determine whether the canonical reconciliation contract is intentionally
+designed to require historical pre-submit balance evidence for externally
+imported trades.
 
-Determine why production BUY proposals are rejected.
+Production has already proven:
 
-Collect:
+• the reconciliation scheduler repair is deployed
+• terminal FILLED orders are rediscovered
+• reconciliation executes successfully
+• Kraken returns authoritative FILLED status
 
-• Risk rejection reasons
-• Risk rule identifiers
-• Position sizing calculations
-• Minimum order calculations
-• Campaign authorization state
-• Account balance
-• Existing position state
-• Cooldown status
-• Drawdown status
+The remaining production blocker is:
 
-Determine whether the rejection is expected
-or caused by configuration.
+balance_evidence_outcome=missing
 
-Do not loosen any production safety rule until
-the exact rejection reason is proven.
+Mission:
+
+Determine whether externally imported manual trades are intended to
+remain reconciliation_required because the required historical balance
+evidence never existed inside OmniTrade, or whether a separate
+reconciliation policy exists (or should exist) for externally executed
+manual trades.
+
+Do not redesign reconciliation.
+
+Do not weaken fail-closed behavior.
+
+Do not fabricate historical evidence.
+
+Prefer repository evidence over assumptions.
+
+Only recommend implementation after the intended reconciliation contract
+has been conclusively established.
 
 ---
 
@@ -356,3 +370,18 @@ Then continue implementation from the Next Task section above.
 Do not redesign completed work unless a genuine architectural issue is identified.
 
 Do not activate the commissioned campaign without explicit operator approval after the proving window evidence is reviewed.
+
+Important:
+
+The reconciliation scheduler defect has already been repaired,
+deployed, and verified in production.
+
+Do not re-investigate scheduler candidate discovery.
+
+Begin from the current production evidence:
+
+balance_evidence_outcome=missing
+
+Determine whether this reflects the intended reconciliation contract for
+externally imported trades or an implementation defect requiring a
+targeted repository change.
