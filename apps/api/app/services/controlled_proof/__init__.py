@@ -29,6 +29,7 @@ from app.services.controlled_proof.exit_recovery import (
     record_exit_recovery_waiting,
     refresh_exit_recovery_completion,
     refresh_exit_recovery_outcomes,
+    supersede_stale_exit_recovery_sell_package,
 )
 
 __all__ = [
@@ -60,4 +61,5 @@ __all__ = [
     "record_exit_recovery_waiting",
     "refresh_exit_recovery_completion",
     "refresh_exit_recovery_outcomes",
+    "supersede_stale_exit_recovery_sell_package",
 ]

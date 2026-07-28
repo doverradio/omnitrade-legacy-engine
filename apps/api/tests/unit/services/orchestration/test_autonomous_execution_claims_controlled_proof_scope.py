@@ -85,15 +85,22 @@ async def test_terminal_proof_sell_resolves_only_with_active_exit_recovery() -> 
     async with _real_session() as session:
         package = await _make_package(db=session, campaign_id=campaign_id, campaign_version=1, side="SELL", **ids)
         proof = await _make_proof(db=session, campaign_id=campaign_id, campaign_version=1, package_id=uuid.uuid4(), sell_package_id=package.package_id, status="EXPIRED")
-        session.add(ControlledProofExitRecovery(
+        recovery = ControlledProofExitRecovery(
             proof_id=proof.proof_id, status="IN_PROGRESS", idempotency_key="execution-recovery",
             authorized_by="operator:human", authorized_at=datetime.now(timezone.utc),
             expires_at=datetime.now(timezone.utc) + timedelta(minutes=30),
-        ))
+        )
+        session.add(recovery)
+        await session.flush()
+        package.market_evidence_identity = {"controlled_proof_exit_recovery_id": str(recovery.recovery_id)}
         await session.flush()
         scope, blocker = await subject._resolve_autonomous_execution_scope(db=session, package=package)
         assert blocker is None
         assert scope is not None and scope.controlled_proof_id == proof.proof_id
+        package.market_evidence_identity = {"controlled_proof_exit_recovery_id": str(uuid.uuid4())}
+        await session.flush()
+        scope, blocker = await subject._resolve_autonomous_execution_scope(db=session, package=package)
+        assert scope is None and blocker == "controlled_proof_not_active"
 
 
 @pytest.mark.asyncio

@@ -234,6 +234,9 @@ async def _evaluate_exit_recovery_confirmation_authorization(
     ).limit(1))
     if recovery is None:
         return False, None
+    package_identity = package.market_evidence_identity if isinstance(package.market_evidence_identity, dict) else {}
+    if package_identity.get("controlled_proof_exit_recovery_id") != str(recovery.recovery_id):
+        return False, None
     logger.info(
         "controlled_proof_exit_recovery_confirmation_authorized "
         "recovery_id=%s proof_id=%s package_id=%s claim_id=%s live_crypto_order_id=%s side=SELL",

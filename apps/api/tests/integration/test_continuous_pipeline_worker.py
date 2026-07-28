@@ -5054,6 +5054,10 @@ async def test_exit_recovery_enters_existing_pipeline_as_sell_only(monkeypatch: 
     request = captured["request"]
     assert request.forced_action == "CLOSE_POSITION_PROPOSED"
     assert request.commissioning_entry_mode == "controlled_proof"
+    assert request.controlled_proof_exit_recovery_id == recovery.recovery_id
+    assert request.idempotency_key == worker_module.hashlib.sha256(
+        f"controlled-proof:{proof.proof_id}:SELL:exit-recovery:{recovery.recovery_id}".encode()
+    ).hexdigest()
     assert captured["preserve"] is True
     assert proof.status == "EXPIRED"
     assert proof.terminal_verdict == "FAILED"
@@ -5071,7 +5075,10 @@ async def test_exit_recovery_resumes_exact_linked_package_after_worker_restart(m
         provider="kraken_spot", environment="production", product_id="BTC-USD",
     )
     recovery = SimpleNamespace(recovery_id=uuid.uuid4(), status="IN_PROGRESS")
-    package = SimpleNamespace(package_id=package_id, decision_record_id=decision_id)
+    package = SimpleNamespace(
+        package_id=package_id, decision_record_id=decision_id,
+        authorization_expires_at=datetime.now(timezone.utc) + timedelta(minutes=5),
+    )
 
     class _Db(_FakeDB):
         async def get(self, model, identity):

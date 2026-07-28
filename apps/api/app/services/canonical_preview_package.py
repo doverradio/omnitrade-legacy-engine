@@ -110,6 +110,7 @@ class CanonicalPreviewPackageCreateRequest:
     # other mode.
     forced_action: str | None = None
     controlled_proof_id: uuid.UUID | None = None
+    controlled_proof_exit_recovery_id: uuid.UUID | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -223,6 +224,7 @@ def _input_fingerprint(request: CanonicalPreviewPackageCreateRequest) -> str:
             "mandate_id": _serialize_uuid(request.mandate_id),
             "mandate_version_id": _serialize_uuid(request.mandate_version_id),
             "mandate_evaluation_id": _serialize_uuid(request.mandate_evaluation_id),
+            "controlled_proof_exit_recovery_id": _serialize_uuid(request.controlled_proof_exit_recovery_id),
         },
         sort_keys=True,
         separators=(",", ":"),
@@ -1440,6 +1442,11 @@ async def create_canonical_preview_package(
             ),
             "controlled_proof_id": (
                 str(request.controlled_proof_id) if _is_controlled_proof_mode(request) and request.controlled_proof_id is not None else None
+            ),
+            "controlled_proof_exit_recovery_id": (
+                str(request.controlled_proof_exit_recovery_id)
+                if _is_controlled_proof_mode(request) and request.controlled_proof_exit_recovery_id is not None
+                else None
             ),
             "requested_quote_size": _serialize_decimal(request.max_proposed_order_amount),
             "reissued_from_package_id": (

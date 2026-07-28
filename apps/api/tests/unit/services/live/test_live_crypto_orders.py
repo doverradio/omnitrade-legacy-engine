@@ -2011,7 +2011,10 @@ async def test_exit_recovery_confirmation_resolver_requires_exact_sell_lineage(m
         },
     )
     claim = SimpleNamespace(claim_id=claim_id, campaign_id=uuid.uuid4(), campaign_version=1)
-    package = SimpleNamespace(package_id=package_id)
+    package = SimpleNamespace(
+        package_id=package_id,
+        market_evidence_identity={"controlled_proof_exit_recovery_id": str(recovery_id)},
+    )
     proof = SimpleNamespace(proof_id=proof_id, sell_live_crypto_order_id=None)
     recovery = SimpleNamespace(recovery_id=recovery_id)
 

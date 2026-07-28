@@ -14,6 +14,7 @@ from sqlalchemy import and_, func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import get_settings
+from app.core.errors import InvalidRequestError
 from app.models.audit_log import AuditLog
 from app.models.autonomous_capital_mandate import AutonomousCapitalMandate
 from app.models.autonomous_cycle_run import AutonomousCycleRun
@@ -59,6 +60,7 @@ from app.services.controlled_proof import (
     refresh_exit_recovery_outcomes,
     resolve_controlled_proof_strategy_identity,
     should_propose_controlled_sell,
+    supersede_stale_exit_recovery_sell_package,
 )
 from app.services.ai_coach.deterministic import evaluate_decision_quality_v0
 from app.services.data.binance_client import BinanceUSClient
@@ -1862,12 +1864,39 @@ async def _attempt_operator_controlled_proof_entry(
                     if sell_package is None or sell_package.decision_record_id is None:
                         await _record_block("linked_sell_package_unavailable")
                         await db.commit()
+                        return
+                    authorization_expires_at = sell_package.authorization_expires_at
+                    normalized_authorization_expires_at = (
+                        authorization_expires_at.replace(tzinfo=timezone.utc)
+                        if authorization_expires_at is not None and authorization_expires_at.tzinfo is None
+                        else authorization_expires_at
+                    )
+                    if (
+                        normalized_authorization_expires_at is not None
+                        and normalized_authorization_expires_at <= datetime.now(timezone.utc)
+                    ):
+                        try:
+                            await supersede_stale_exit_recovery_sell_package(
+                                db=db, recovery=recovery, proof=proof, package=sell_package,
+                            )
+                            await db.commit()
+                            logger.info(
+                                "controlled_proof_exit_recovery_fresh_sell_authority_started "
+                                "proof_id=%s recovery_id=%s superseded_package_id=%s side=SELL",
+                                proof.proof_id, recovery.recovery_id, sell_package.package_id,
+                            )
+                        except InvalidRequestError as exc:
+                            await _record_block(f"stale_sell_package_replacement_blocked:{exc.message}")
+                            await db.commit()
+                            return
                     else:
                         await _progress_package(
                             package_id=sell_package.package_id,
                             decision_record_id=sell_package.decision_record_id,
                         )
-            return
+                        return
+            else:
+                return
         is_sell = recovery is not None or proof.package_id is not None
         if is_sell:
             logger.info(
@@ -1956,7 +1985,11 @@ async def _attempt_operator_controlled_proof_entry(
                 evidence_age_seconds=0, kill_switch_engaged=False,
                 observed_at=datetime.now(timezone.utc), decision_id=decision_id,
                 request_context={"purpose": "controlled_proof", "controlled_proof_id": str(proof.proof_id)},
-                idempotency_key=f"controlled-proof-mandate-eval:{proof.proof_id}:{side}",
+                idempotency_key=(
+                    f"controlled-proof-mandate-eval:{proof.proof_id}:{side}:exit-recovery:{recovery.recovery_id}"
+                    if recovery is not None
+                    else f"controlled-proof-mandate-eval:{proof.proof_id}:{side}"
+                ),
                 audit_correlation_id=proof.audit_correlation_id, software_build_version=None,
             ),
         )
@@ -1965,7 +1998,12 @@ async def _attempt_operator_controlled_proof_entry(
             await db.commit()
             return
 
-        package_key = hashlib.sha256(f"controlled-proof:{proof.proof_id}:{side}".encode()).hexdigest()
+        package_identity = (
+            f"controlled-proof:{proof.proof_id}:{side}:exit-recovery:{recovery.recovery_id}"
+            if recovery is not None
+            else f"controlled-proof:{proof.proof_id}:{side}"
+        )
+        package_key = hashlib.sha256(package_identity.encode()).hexdigest()
         payload = await create_canonical_preview_package(
             db=db,
             request=CanonicalPreviewPackageCreateRequest(
@@ -1978,6 +2016,7 @@ async def _attempt_operator_controlled_proof_entry(
                 mandate_evaluation_id=evaluation.evaluation_id,
                 commissioning_entry_mode="controlled_proof", forced_action=forced_action,
                 controlled_proof_id=proof.proof_id,
+                controlled_proof_exit_recovery_id=None if recovery is None else recovery.recovery_id,
             ),
         )
         package_payload = payload.get("package") if isinstance(payload, dict) else None

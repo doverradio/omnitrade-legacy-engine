@@ -148,6 +148,101 @@ async def test_failed_claim_revalidation_commits_block_and_audit(monkeypatch) ->
 
 
 @pytest.mark.asyncio
+async def test_stale_unused_sell_package_is_superseded_for_fresh_recovery_authority(monkeypatch) -> None:
+    now = datetime.now(timezone.utc)
+    proof = _terminal_proof()
+    package = SimpleNamespace(
+        package_id=uuid.uuid4(), side="SELL", package_state="ACTIVATED",
+        authorization_source="MANDATE", authorization_expires_at=now - timedelta(minutes=1),
+        superseded_at=None, invalidated_reason=None,
+    )
+    proof.sell_package_id = package.package_id
+    proof.updated_at = now
+    recovery = SimpleNamespace(
+        recovery_id=uuid.uuid4(), proof_id=proof.proof_id, status="IN_PROGRESS",
+        expires_at=now + timedelta(minutes=30),
+    )
+    activation = SimpleNamespace(
+        activation_id=uuid.uuid4(), activation_state="ACTIVE",
+        expires_at=now - timedelta(seconds=1), updated_at=now,
+    )
+    db = _FakeDb([None, activation])
+    monkeypatch.setattr(exit_recovery, "_utcnow", lambda: now)
+
+    await exit_recovery.supersede_stale_exit_recovery_sell_package(
+        db=db, recovery=recovery, proof=proof, package=package,
+    )
+
+    assert package.package_state == "SUPERSEDED"
+    assert activation.activation_state == "EXPIRED"
+    assert proof.sell_package_id is None
+    assert any(
+        isinstance(item, AuditLog)
+        and item.action == "controlled_proof_exit_recovery.stale_sell_package_superseded"
+        for item in db.added
+    )
+
+
+@pytest.mark.asyncio
+async def test_stale_sell_package_with_execution_claim_cannot_be_replaced(monkeypatch) -> None:
+    now = datetime.now(timezone.utc)
+    proof = _terminal_proof()
+    package = SimpleNamespace(
+        package_id=uuid.uuid4(), side="SELL", package_state="ACTIVATED",
+        authorization_source="MANDATE", authorization_expires_at=now - timedelta(minutes=1),
+    )
+    proof.sell_package_id = package.package_id
+    recovery = SimpleNamespace(
+        recovery_id=uuid.uuid4(), proof_id=proof.proof_id, status="IN_PROGRESS",
+        expires_at=now + timedelta(minutes=30),
+    )
+    monkeypatch.setattr(exit_recovery, "_utcnow", lambda: now)
+
+    existing_claim = SimpleNamespace(claim_status="SUBMISSION_PENDING", live_order_id=uuid.uuid4())
+    with pytest.raises(InvalidRequestError, match="unresolved execution lineage"):
+        await exit_recovery.supersede_stale_exit_recovery_sell_package(
+            db=_FakeDb([existing_claim]), recovery=recovery, proof=proof, package=package,
+        )
+
+    assert proof.sell_package_id == package.package_id
+    assert package.package_state == "ACTIVATED"
+
+
+@pytest.mark.asyncio
+async def test_failed_pre_provider_claim_permits_fresh_package_only_with_terminal_order_evidence(monkeypatch) -> None:
+    now = datetime.now(timezone.utc)
+    proof = _terminal_proof()
+    package = SimpleNamespace(
+        package_id=uuid.uuid4(), side="SELL", package_state="ACTIVATED",
+        authorization_source="MANDATE", authorization_expires_at=now - timedelta(minutes=1),
+        superseded_at=None, invalidated_reason=None,
+    )
+    proof.sell_package_id = package.package_id
+    order_id = uuid.uuid4()
+    claim = SimpleNamespace(claim_status="FAILED_PRE_PROVIDER", live_order_id=order_id)
+    order = SimpleNamespace(
+        status="CANCELLED", provider_order_id=None, submitted_at=None,
+        safe_provider_response={"provider_call_made": False},
+    )
+    activation = SimpleNamespace(
+        activation_id=uuid.uuid4(), activation_state="ACTIVE",
+        expires_at=now - timedelta(seconds=1), updated_at=now,
+    )
+    recovery = SimpleNamespace(
+        recovery_id=uuid.uuid4(), proof_id=proof.proof_id, status="IN_PROGRESS",
+        expires_at=now + timedelta(minutes=30),
+    )
+    monkeypatch.setattr(exit_recovery, "_utcnow", lambda: now)
+
+    await exit_recovery.supersede_stale_exit_recovery_sell_package(
+        db=_FakeDb([claim, order, activation]), recovery=recovery, proof=proof, package=package,
+    )
+
+    assert package.package_state == "SUPERSEDED"
+    assert proof.sell_package_id is None
+
+
+@pytest.mark.asyncio
 async def test_authorization_predicates_accept_exact_authoritative_lineage(monkeypatch) -> None:
     import app.services.orchestration.continuous_pipeline_worker as worker
     proof = SimpleNamespace(

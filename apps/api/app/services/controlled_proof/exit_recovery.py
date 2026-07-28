@@ -11,6 +11,8 @@ from app.core.errors import InvalidRequestError, NotFoundError
 from app.models.audit_log import AuditLog
 from app.models.capital_campaign import CapitalCampaign
 from app.models.canonical_preview_package import CanonicalPreviewPackage
+from app.models.canonical_proving_activation import CanonicalProvingActivation
+from app.models.autonomous_execution_claim import AutonomousExecutionClaim
 from app.models.controlled_proof_exit_recovery import ControlledProofExitRecovery
 from app.models.controlled_proof_run import ControlledProofRun
 from app.models.live_accounting_record import LiveAccountingRecord
@@ -191,6 +193,110 @@ async def claim_exit_recovery_by_id(*, db: AsyncSession, recovery_id: uuid.UUID)
         db.add(AuditLog(actor="system:controlled_proof_worker", action="controlled_proof_exit_recovery.claimed", entity_type="controlled_proof_exit_recovery", entity_id=recovery.recovery_id, before_state={"status": "AUTHORIZED"}, after_state={"status": "IN_PROGRESS"}))
         await db.flush()
     return recovery, proof
+
+
+async def supersede_stale_exit_recovery_sell_package(
+    *, db: AsyncSession, recovery: ControlledProofExitRecovery,
+    proof: ControlledProofRun, package: CanonicalPreviewPackage,
+) -> None:
+    """Retire an unused stale SELL package so fresh governance can run.
+
+    An execution claim is the boundary: once one exists, this helper refuses
+    replacement and leaves recovery fail-closed. It never renews or mutates
+    the expired authority evidence on the historical package.
+    """
+    now = _utcnow()
+    if (
+        recovery.proof_id != proof.proof_id
+        or recovery.status != "IN_PROGRESS"
+        or recovery.expires_at <= now
+        or proof.sell_package_id != package.package_id
+        or package.side != "SELL"
+        or package.package_state != "ACTIVATED"
+        or package.authorization_source != "MANDATE"
+        or package.authorization_expires_at is None
+        or package.authorization_expires_at > now
+    ):
+        raise InvalidRequestError(message="Stale SELL package is not eligible for governed replacement", details={})
+    existing_claim = await db.scalar(select(AutonomousExecutionClaim).where(
+        AutonomousExecutionClaim.package_id == package.package_id,
+    ).with_for_update().limit(1))
+    if existing_claim is not None:
+        if existing_claim.claim_status != "FAILED_PRE_PROVIDER":
+            raise InvalidRequestError(message="Stale SELL package has unresolved execution lineage", details={})
+        if existing_claim.live_order_id is not None:
+            failed_order = await db.scalar(select(LiveCryptoOrder).where(
+                LiveCryptoOrder.live_crypto_order_id == existing_claim.live_order_id,
+            ).with_for_update().limit(1))
+            evidence = (
+                failed_order.safe_provider_response
+                if failed_order is not None and isinstance(failed_order.safe_provider_response, dict)
+                else {}
+            )
+            if (
+                failed_order is None
+                or failed_order.status != "CANCELLED"
+                or failed_order.provider_order_id is not None
+                or failed_order.submitted_at is not None
+                or evidence.get("provider_call_made") is not False
+            ):
+                raise InvalidRequestError(message="Stale SELL package provider boundary is unresolved", details={})
+    activation = await db.scalar(select(CanonicalProvingActivation).where(
+        CanonicalProvingActivation.package_id == package.package_id,
+    ).with_for_update().limit(1))
+    if activation is None or activation.expires_at > now:
+        raise InvalidRequestError(message="Stale SELL package activation is not authoritatively expired", details={})
+
+    old_package_id = package.package_id
+    package.package_state = "SUPERSEDED"
+    package.superseded_at = now
+    package.invalidated_reason = "controlled_proof_exit_recovery_fresh_authority_required"
+    before_activation_state = activation.activation_state
+    if activation.activation_state == "ACTIVE":
+        activation.activation_state = "EXPIRED"
+        activation.updated_at = now
+    proof.sell_package_id = None
+    proof.updated_at = now
+    db.add(AuditLog(
+        actor="system:controlled_proof_worker",
+        action="canonical_preview_package.superseded_for_exit_recovery",
+        entity_type="canonical_preview_package", entity_id=old_package_id,
+        before_state={"package_state": "ACTIVATED"},
+        after_state={
+            "package_state": "SUPERSEDED",
+            "reason": package.invalidated_reason,
+            "controlled_proof_id": str(proof.proof_id),
+            "exit_recovery_id": str(recovery.recovery_id),
+        },
+    ))
+    db.add(AuditLog(
+        actor="system:controlled_proof_worker",
+        action="canonical_proving_activation.expired_for_exit_recovery_reissue",
+        entity_type="canonical_proving_activation", entity_id=activation.activation_id,
+        before_state={"activation_state": before_activation_state},
+        after_state={
+            "activation_state": activation.activation_state,
+            "package_id": str(old_package_id),
+            "exit_recovery_id": str(recovery.recovery_id),
+        },
+    ))
+    db.add(AuditLog(
+        actor="system:controlled_proof_worker",
+        action="controlled_proof_exit_recovery.stale_sell_package_superseded",
+        entity_type="controlled_proof_exit_recovery", entity_id=recovery.recovery_id,
+        before_state={
+            "sell_package_id": str(old_package_id),
+            "package_state": "ACTIVATED",
+            "authorization_expires_at": package.authorization_expires_at.isoformat(),
+        },
+        after_state={
+            "sell_package_id": None,
+            "package_state": "SUPERSEDED",
+            "activation_state": activation.activation_state,
+            "replacement_requires_fresh_risk_mandate_preview_package": True,
+        },
+    ))
+    await db.flush()
 
 
 async def get_exit_recovery_view(*, db: AsyncSession, proof_id: uuid.UUID) -> dict:

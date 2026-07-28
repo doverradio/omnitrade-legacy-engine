@@ -149,8 +149,13 @@ async def _resolve_controlled_proof_execution_scope(
             ControlledProofExitRecovery.status.in_(("AUTHORIZED", "IN_PROGRESS")),
             ControlledProofExitRecovery.expires_at > now,
         ).limit(1))
+    raw_package_identity = getattr(package, "market_evidence_identity", None)
+    package_identity = raw_package_identity if isinstance(raw_package_identity, dict) else {}
     exit_recovery_authorized = bool(
-        recovery is not None and package.side == "SELL" and proof.sell_package_id == package.package_id
+        recovery is not None
+        and package.side == "SELL"
+        and proof.sell_package_id == package.package_id
+        and package_identity.get("controlled_proof_exit_recovery_id") == str(recovery.recovery_id)
     )
     if proof.status not in _CONTROLLED_PROOF_ACTIVE_STATES and not exit_recovery_authorized:
         return _blocked("controlled_proof_not_active")

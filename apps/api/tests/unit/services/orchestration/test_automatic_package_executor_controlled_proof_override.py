@@ -88,14 +88,20 @@ async def test_terminal_proof_sell_activation_requires_active_exit_recovery() ->
         proof = await _make_proof(db=session, campaign_id=campaign_id, campaign_version=1, package_id=uuid.uuid4(), sell_package_id=package.package_id, status="EXPIRED")
         request = executor.AutomaticPackageExecutionRequest(campaign_id=campaign_id, campaign_version=1, decision_record_id=package.decision_record_id, package_id=package.package_id)
         assert await executor._resolve_controlled_proof_activation_scope(db=session, request=request) is None
-        session.add(ControlledProofExitRecovery(
+        recovery = ControlledProofExitRecovery(
             proof_id=proof.proof_id, status="IN_PROGRESS", idempotency_key="activation-recovery",
             authorized_by="operator:human", authorized_at=datetime.now(timezone.utc),
             expires_at=datetime.now(timezone.utc) + timedelta(minutes=30),
-        ))
+        )
+        session.add(recovery)
+        await session.flush()
+        package.market_evidence_identity = {"controlled_proof_exit_recovery_id": str(recovery.recovery_id)}
         await session.flush()
         scope = await executor._resolve_controlled_proof_activation_scope(db=session, request=request)
         assert scope is not None and scope.controlled_proof_id == proof.proof_id
+        package.market_evidence_identity = {"controlled_proof_exit_recovery_id": str(uuid.uuid4())}
+        await session.flush()
+        assert await executor._resolve_controlled_proof_activation_scope(db=session, request=request) is None
 
 
 # --- _resolve_controlled_proof_activation_scope -----------------------------------

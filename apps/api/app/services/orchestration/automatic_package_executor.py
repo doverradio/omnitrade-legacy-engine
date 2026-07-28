@@ -216,10 +216,13 @@ async def _resolve_controlled_proof_activation_scope(
             ControlledProofExitRecovery.status.in_(("AUTHORIZED", "IN_PROGRESS")),
             ControlledProofExitRecovery.expires_at > now,
         ).limit(1))
+    raw_package_identity = getattr(package, "market_evidence_identity", None)
+    package_identity = raw_package_identity if isinstance(raw_package_identity, dict) else {}
     exit_recovery_authorized = bool(
         recovery is not None
         and package.side == "SELL"
         and proof.sell_package_id == package.package_id
+        and package_identity.get("controlled_proof_exit_recovery_id") == str(recovery.recovery_id)
     )
     # Fail closed if the proof is expired, cancelled, blocked, failed, or
     # otherwise terminal -- _ACTIVE_STATES is the exact same set
