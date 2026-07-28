@@ -54,6 +54,17 @@ class ExecutionRiskContext:
     runtime_no_trade_zone_state: str
     start_of_day_equity_source: str
     high_water_mark_equity_source: str
+    candle_latest_open_time: datetime | None = None
+    candle_stale_cutoff: datetime | None = None
+    candle_data_is_stale: bool = False
+    valuation_state: str | None = None
+    valuation_latest_price_timestamp: datetime | None = None
+    valuation_stale_cutoff: datetime | None = None
+    missing_price_assets: tuple[str, ...] = ()
+    stale_price_assets: tuple[str, ...] = ()
+    baseline_state: str | None = None
+    unresolved_reconciliation_count: int = 0
+    unknown_provider_order_count: int = 0
 
 
 @dataclass(frozen=True, slots=True)
@@ -128,15 +139,15 @@ async def _resolve_kill_switch_state(*, db: AsyncSession, scope: str, paper_acco
     return (bool(state.engaged), bool(state.rearm_required))
 
 
-async def _resolve_data_quality_inputs(*, db: AsyncSession, asset_id: uuid.UUID, evaluation_time: datetime) -> tuple[bool, bool]:
+async def _resolve_data_quality_inputs(*, db: AsyncSession, asset_id: uuid.UUID, evaluation_time: datetime) -> tuple[bool, bool, datetime | None, datetime]:
     latest_open_stmt = select(Candle.open_time).where(Candle.asset_id == asset_id).order_by(Candle.open_time.desc()).limit(1)
     latest_open = await db.scalar(latest_open_stmt)
+    stale_cutoff = evaluation_time - timedelta(hours=2)
     if latest_open is None:
-        return (False, False)
+        return (False, False, None, stale_cutoff)
 
     # Use a conservative stale threshold for execution-time gating input.
-    stale_cutoff = evaluation_time - timedelta(hours=2)
-    return (latest_open < stale_cutoff, False)
+    return (latest_open < stale_cutoff, False, latest_open, stale_cutoff)
 
 
 async def resolve_execution_risk_context(
@@ -162,7 +173,9 @@ async def resolve_execution_risk_context(
         max_price_age_seconds=settings.live_crypto_price_max_age_seconds,
     )
 
-    candle_data_is_stale, candle_data_has_gaps = await _resolve_data_quality_inputs(db=db, asset_id=asset.id, evaluation_time=now)
+    candle_data_is_stale, candle_data_has_gaps, candle_latest_open_time, candle_stale_cutoff = (
+        await _resolve_data_quality_inputs(db=db, asset_id=asset.id, evaluation_time=now)
+    )
     valuation_is_stale = equity_evidence.valuation.valuation_state == "stale_price_evidence"
     valuation_has_gaps = equity_evidence.valuation.valuation_state in {"missing_price_evidence", "inconsistent_account_state"}
     baseline_has_gaps = not equity_evidence.baseline.baseline_ready
@@ -204,4 +217,15 @@ async def resolve_execution_risk_context(
         runtime_no_trade_zone_state="unavailable_not_persisted",
         start_of_day_equity_source=equity_evidence.baseline.start_of_day_source,
         high_water_mark_equity_source=equity_evidence.baseline.high_water_mark_source,
+        candle_latest_open_time=candle_latest_open_time,
+        candle_stale_cutoff=candle_stale_cutoff,
+        candle_data_is_stale=candle_data_is_stale,
+        valuation_state=equity_evidence.valuation.valuation_state,
+        valuation_latest_price_timestamp=equity_evidence.valuation.latest_price_timestamp,
+        valuation_stale_cutoff=equity_evidence.valuation.stale_cutoff,
+        missing_price_assets=tuple(equity_evidence.valuation.missing_price_assets),
+        stale_price_assets=tuple(equity_evidence.valuation.stale_price_assets),
+        baseline_state=equity_evidence.baseline.baseline_state,
+        unresolved_reconciliation_count=equity_evidence.unresolved_reconciliation_count,
+        unknown_provider_order_count=equity_evidence.unknown_provider_order_count,
     )

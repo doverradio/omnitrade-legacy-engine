@@ -81,6 +81,7 @@ from app.operator_cli.service import (
     first_autonomous_profit_status,
     historical_buy_campaign_replay_audit,
     fetch_risk_ledger_diagnosis,
+    fetch_controlled_proof_risk_diagnosis,
     fetch_watch_status,
     mandate_bootstrap,
     mandate_bootstrap_commission,
@@ -149,6 +150,7 @@ def _build_parser() -> argparse.ArgumentParser:
             "  ./operator campaign-aggregator-activation-execute --campaign-id <campaign_uuid> --campaign-version 1 --actor operator:human --reason \"pre-deploy aggregator migration\" --idempotency-key aggregator-activation-1 --confirm --json\n"
             "  ./operator campaign-aggregator-activation-audit --campaign-id <campaign_uuid> --limit 20 --json\n"
             "  ./operator risk-ledger-diagnosis --account-id <paper_uuid> --json\n"
+            "  ./operator controlled-proof-risk-diagnosis --proof-id <proof_uuid> --json\n"
             "  ./operator mandate-bootstrap --owner-actor-id operator:human --autonomy-level LEVEL_2 --provider kraken_spot --environment production --exchange-connection-id <conn_uuid> --live-trading-profile-id <profile_uuid> --capital-campaign-id 2 --authorized-capital-usd 25 --max-order-notional-usd 5 --max-open-exposure-usd 10 --max-daily-deployed-usd 10 --max-daily-realized-loss-usd 3 --max-campaign-drawdown-usd 5 --max-consecutive-losses 2 --position-limit 1 --price-evidence-max-age-seconds 30 --max-slippage-bps 25 --max-fee-bps 10 --allowed-products BTC-USD --allowed-order-sides BUY,SELL,HOLD --allowed-strategy-versions ma_crossover@1.0.0 --approval-policy MANDATE_ALLOWED --policy-bundle-json @campaign-2-mandate-policy.json --authorization-method owner_signature --actor operator:human --reason campaign_2_bootstrap --idempotency-key mandate-bootstrap-campaign-2 --confirm --json\n"
             "  ./operator status --json\n"
             "  ./operator status --no-color --verbose"
@@ -651,6 +653,14 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     risk_diagnosis.add_argument("--account-id", type=UUID, required=True)
     risk_diagnosis.add_argument("--json", action="store_true", dest="json_output")
+
+    proof_risk_diagnosis = subparsers.add_parser(
+        "controlled-proof-risk-diagnosis", parents=[common],
+        help="Show immutable Risk inputs and outcome for one Controlled Proof",
+        description="Read-only Controlled Proof Risk evidence diagnosis.",
+    )
+    proof_risk_diagnosis.add_argument("--proof-id", type=UUID, required=True)
+    proof_risk_diagnosis.add_argument("--json", action="store_true", dest="json_output")
 
     campaign_readiness = subparsers.add_parser(
         "campaign-orchestration-readiness",
@@ -2180,6 +2190,10 @@ async def _run_async(args: argparse.Namespace) -> tuple[int, dict[str, Any], str
 
     if args.command == "risk-ledger-diagnosis":
         payload = await fetch_risk_ledger_diagnosis(account_id=args.account_id)
+        return 0, payload, render_json(payload)
+
+    if args.command == "controlled-proof-risk-diagnosis":
+        payload = await fetch_controlled_proof_risk_diagnosis(proof_id=args.proof_id)
         return 0, payload, render_json(payload)
 
     payload = await fetch_operator_status(

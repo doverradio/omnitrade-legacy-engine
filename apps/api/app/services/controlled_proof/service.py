@@ -683,7 +683,7 @@ async def evaluate_controlled_proof_risk(
         if paper_account is None:
             raise LookupError("paper_account_missing")
         candle_row = (await db.execute(
-            select(Candle.close)
+            select(Candle.close, Candle.open_time, Candle.close_time, Candle.interval, Candle.source)
             .where(Candle.asset_id == asset.id, Candle.interval == "15m")
             .order_by(Candle.open_time.desc())
             .limit(1)
@@ -748,6 +748,59 @@ async def evaluate_controlled_proof_risk(
         db=db,
         request=RiskDecisionPersistenceRequest(
             paper_account_id=paper_account_id, signal_id=None, actor=actor, evaluation_result=risk_result,
+            evidence_context={
+                "purpose": "controlled_proof",
+                "proof_id": proof_id,
+                "campaign_id": campaign_id,
+                "campaign_version": campaign_version,
+                "paper_account_id": paper_account_id,
+                "product_id": product_id,
+                "venue": ALLOWED_PROVIDER,
+                "side": side.upper(),
+                "requested_notional_usd": notional_usd,
+                "requested_quantity": quantity,
+                "reference_price": reference_price,
+                "reference_candle": {
+                    "open_time": candle_row[1], "close_time": candle_row[2],
+                    "interval": candle_row[3], "source": candle_row[4],
+                },
+                "evaluation_time": risk_context.evaluation_time,
+                "data_quality": {
+                    "data_is_stale": risk_context.data_is_stale,
+                    "data_has_gaps": risk_context.data_has_gaps,
+                    "candle_data_is_stale": risk_context.candle_data_is_stale,
+                    "candle_latest_open_time": risk_context.candle_latest_open_time,
+                    "candle_stale_cutoff": risk_context.candle_stale_cutoff,
+                    "valuation_state": risk_context.valuation_state,
+                    "valuation_latest_price_timestamp": risk_context.valuation_latest_price_timestamp,
+                    "valuation_stale_cutoff": risk_context.valuation_stale_cutoff,
+                    "missing_price_assets": risk_context.missing_price_assets,
+                    "stale_price_assets": risk_context.stale_price_assets,
+                    "baseline_state": risk_context.baseline_state,
+                    "unresolved_reconciliation_count": risk_context.unresolved_reconciliation_count,
+                    "unknown_provider_order_count": risk_context.unknown_provider_order_count,
+                },
+                "risk_policy": {
+                    "source": risk_context.risk_policy_source,
+                    "max_position_size_pct": risk_context.max_position_size_pct,
+                    "max_daily_loss_pct": risk_context.max_daily_loss_pct,
+                    "max_drawdown_pct": risk_context.max_drawdown_pct,
+                },
+                "equity": {
+                    "account_equity": risk_context.account_equity,
+                    "start_of_day_equity": risk_context.start_of_day_equity,
+                    "current_equity": risk_context.current_equity,
+                    "high_water_mark_equity": risk_context.high_water_mark_equity,
+                    "start_of_day_equity_source": risk_context.start_of_day_equity_source,
+                    "high_water_mark_equity_source": risk_context.high_water_mark_equity_source,
+                },
+                "kill_switches": {
+                    "global_engaged": risk_context.global_kill_switch_engaged_state,
+                    "global_rearm_required": risk_context.global_kill_switch_rearm_required,
+                    "account_engaged": risk_context.account_kill_switch_engaged_state,
+                    "account_rearm_required": risk_context.account_kill_switch_rearm_required,
+                },
+            },
         ),
     )
     approved_notional = risk_result.approved_quantity * reference_price if risk_result.approved_quantity else Decimal("0")

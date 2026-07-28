@@ -48,6 +48,7 @@ from app.models.live_reconciliation_event import LiveReconciliationEvent
 from app.models.live_trading_profile import LiveTradingProfile
 from app.models.paper_account import PaperAccount
 from app.models.risk_event import RiskEvent
+from app.models.controlled_proof_run import ControlledProofRun
 from app.models.risk_kill_switch import RiskKillSwitch
 from app.models.signal import Signal
 from app.models.venue_commissioning_run import VenueCommissioningRun
@@ -8112,6 +8113,39 @@ async def fetch_risk_ledger_diagnosis(*, account_id: UUID) -> dict[str, Any]:
                 "drawdown_baseline_source": equity_evidence.baseline.high_water_mark_source,
             },
         },
+    }
+
+
+async def fetch_controlled_proof_risk_diagnosis(*, proof_id: UUID) -> dict[str, Any]:
+    """Read-only lookup of the immutable Risk evidence for one Controlled Proof."""
+    async with AsyncSessionLocal() as db:
+        proof = await db.get(ControlledProofRun, proof_id)
+        if proof is None:
+            raise ValueError(f"Controlled Proof {proof_id} not found")
+        events = list(await db.scalars(select(RiskEvent).order_by(RiskEvent.created_at.desc()).limit(1000)))
+
+    matches = []
+    for event in events:
+        detail = event.detail if isinstance(event.detail, dict) else {}
+        evidence = detail.get("evidence_context")
+        if not isinstance(evidence, dict) or str(evidence.get("proof_id")) != str(proof_id):
+            continue
+        matches.append({
+            "risk_event_id": str(event.id), "created_at": event.created_at,
+            "event_type": event.event_type, "action_taken": event.action_taken,
+            "decision": detail.get("decision"), "reason_code": detail.get("reason_code"),
+            "approved_quantity": detail.get("approved_quantity"), "steps": detail.get("steps", []),
+            "evidence_context": evidence,
+        })
+
+    return {
+        "proof_id": str(proof.proof_id), "proof_status": proof.status,
+        "blocked_reason": proof.blocked_reason, "terminal_verdict": proof.terminal_verdict,
+        "risk_evidence_available": bool(matches), "risk_events": matches,
+        "diagnostic_limitation": (
+            None if matches else
+            "No proof-scoped evidence_context was persisted. Events created before the diagnostic evidence release cannot be reconstructed."
+        ),
     }
 
 

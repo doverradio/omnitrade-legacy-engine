@@ -1465,8 +1465,9 @@ async def test_evaluate_controlled_proof_risk_allows_and_persists_real_risk_even
         with pytest.MonkeyPatch.context() as mp:
             mp.setattr(controlled_proof_service, "resolve_execution_risk_context", _resolve)
 
+            proof_id = uuid.uuid4()
             outcome = await controlled_proof_service.evaluate_controlled_proof_risk(
-                db=session, proof_id=uuid.uuid4(), campaign_id=_CAMPAIGN_ID, campaign_version=1,
+                db=session, proof_id=proof_id, campaign_id=_CAMPAIGN_ID, campaign_version=1,
                 paper_account_id=paper_account_id, product_id="BTC-USD", side="BUY",
                 notional_usd=Decimal("5"), actor="system:test",
             )
@@ -1476,6 +1477,16 @@ async def test_evaluate_controlled_proof_risk_allows_and_persists_real_risk_even
         persisted = await session.get(RiskEvent, outcome.risk_event_id)
         assert persisted is not None
         assert persisted.action_taken == "approved"
+        evidence = persisted.detail["evidence_context"]
+        assert evidence["purpose"] == "controlled_proof"
+        assert evidence["proof_id"] == str(proof_id)
+        assert evidence["product_id"] == "BTC-USD"
+        assert evidence["side"] == "BUY"
+        assert evidence["requested_notional_usd"] == "5"
+        assert Decimal(evidence["reference_price"]) == Decimal("100")
+        assert evidence["data_quality"]["data_is_stale"] is False
+        assert evidence["data_quality"]["data_has_gaps"] is False
+        assert evidence["risk_policy"]["source"] == "test"
 
 
 @pytest.mark.asyncio

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import uuid
 from dataclasses import dataclass
+from datetime import date, datetime
 from decimal import Decimal
 from typing import Any
 
@@ -23,6 +24,7 @@ class RiskDecisionPersistenceRequest:
     state_change_entity_id: uuid.UUID | None = None
     state_before: dict[str, Any] | None = None
     state_after: dict[str, Any] | None = None
+    evidence_context: dict[str, Any] | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -38,6 +40,20 @@ def _serialize_decimal(value: Decimal | None) -> str | None:
     if value is None:
         return None
     return format(value, "f")
+
+
+def _serialize_evidence(value: Any) -> Any:
+    if isinstance(value, Decimal):
+        return format(value, "f")
+    if isinstance(value, uuid.UUID):
+        return str(value)
+    if isinstance(value, (datetime, date)):
+        return value.isoformat()
+    if isinstance(value, dict):
+        return {str(key): _serialize_evidence(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_serialize_evidence(item) for item in value]
+    return value
 
 
 def _map_risk_event_type(reason_code: str | None, action: RiskDecisionAction) -> str:
@@ -78,7 +94,7 @@ def _map_risk_action_taken(action: RiskDecisionAction) -> str:
 
 def _build_detail_payload(request: RiskDecisionPersistenceRequest) -> dict[str, Any]:
     result = request.evaluation_result
-    return {
+    payload = {
         "decision": result.action.value,
         "reason_code": result.reason_code,
         "approved_quantity": _serialize_decimal(result.approved_quantity),
@@ -91,6 +107,9 @@ def _build_detail_payload(request: RiskDecisionPersistenceRequest) -> dict[str, 
             for step in result.steps
         ],
     }
+    if request.evidence_context is not None:
+        payload["evidence_context"] = _serialize_evidence(request.evidence_context)
+    return payload
 
 
 async def persist_risk_decision(

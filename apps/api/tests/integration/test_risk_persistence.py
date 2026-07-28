@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import uuid
+from datetime import datetime, timezone
 from decimal import Decimal
 from typing import Any
 
@@ -272,6 +273,37 @@ async def test_persist_risk_decision_returns_populated_risk_event_identity() -> 
 
     assert persisted.risk_event_id is not None
     assert persisted.risk_event_id == session.risk_events[0].id
+
+
+@pytest.mark.asyncio
+async def test_persist_risk_decision_serializes_immutable_diagnostic_evidence() -> None:
+    session = _FakeSession()
+    observed_at = datetime.now(timezone.utc)
+    proof_id = uuid.uuid4()
+    result = RiskEvaluationResult(
+        action=RiskDecisionAction.REJECT,
+        reason_code="asset_in_no_trade_zone",
+        approved_quantity=Decimal("0"),
+        steps=[RiskEvaluationStep(step="no_trade_zone", status="reject", reason_code="asset_in_no_trade_zone")],
+    )
+
+    await persist_risk_decision(
+        db=session,
+        request=RiskDecisionPersistenceRequest(
+            paper_account_id=uuid.uuid4(), signal_id=None, actor="system:controlled_proof",
+            evaluation_result=result,
+            evidence_context={
+                "proof_id": proof_id, "reference_price": Decimal("50000.25"),
+                "observed_at": observed_at, "stale_assets": ("BTC",),
+            },
+        ),
+    )
+
+    evidence = session.risk_events[0].detail["evidence_context"]
+    assert evidence == {
+        "proof_id": str(proof_id), "reference_price": "50000.25",
+        "observed_at": observed_at.isoformat(), "stale_assets": ["BTC"],
+    }
 
 
 @pytest.mark.asyncio
