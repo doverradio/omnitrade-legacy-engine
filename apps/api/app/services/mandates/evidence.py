@@ -70,6 +70,22 @@ async def evaluate_and_record_mandate(
             .limit(1)
         )
         if existing is not None:
+            mismatched_fields: list[str] = []
+            if existing.mandate_id != request.mandate_id:
+                mismatched_fields.append("mandate_id")
+            if existing.decision_id != request.decision_id:
+                mismatched_fields.append("decision_id")
+            if existing.proposed_action != request.side:
+                mismatched_fields.append("side")
+            if mismatched_fields:
+                raise InvalidRequestError(
+                    message="Mandate evaluation idempotency key reuse must preserve authority lineage",
+                    details={
+                        "idempotency_key": request.idempotency_key,
+                        "existing_evaluation_id": str(existing.evaluation_id),
+                        "mismatched_fields": mismatched_fields,
+                    },
+                )
             return _to_record(existing)
 
     mandate = await get_mandate(db=db, mandate_id=request.mandate_id)

@@ -9,6 +9,7 @@ import pytest
 
 from app.models.audit_log import AuditLog
 from app.models.autonomous_capital_mandate_authorization import AutonomousCapitalMandateAuthorization
+from app.core.errors import InvalidRequestError
 from app.services.mandates.contracts import (
     MandateAuthorizationRequest,
     MandateLifecycleActionRequest,
@@ -545,6 +546,38 @@ async def test_evaluation_write_persists_correlation_and_is_atomic(monkeypatch: 
     audit_entries = [item for item in db.added if isinstance(item, AuditLog)]
     assert len(audit_entries) == 1
     assert audit_entries[0].after_state["audit_correlation_id"] == str(correlation_id)
+
+
+@pytest.mark.asyncio
+async def test_evaluation_idempotent_replay_rejects_different_decision_lineage() -> None:
+    mandate_id = uuid.uuid4()
+    existing_decision_id = uuid.uuid4()
+    existing = SimpleNamespace(
+        evaluation_id=uuid.uuid4(), mandate_id=mandate_id,
+        decision_id=existing_decision_id, proposed_action="SELL",
+    )
+
+    class _ReplayDb(_FakeDb):
+        async def scalar(self, _statement):
+            return existing
+
+    request = evidence.MandateEvaluationWriteRequest(
+        mandate_id=mandate_id, actor="system:controlled_proof", strategy_version="ma_crossover@1.0.0",
+        product="BTC-USD", side="SELL", proposed_notional_usd=Decimal("5"),
+        current_open_exposure_usd=Decimal("0"), daily_deployed_usd=Decimal("0"),
+        daily_realized_loss_usd=Decimal("0"), campaign_drawdown_usd=Decimal("0"),
+        consecutive_losses=0, current_position_count=0, risk_verdict="ACCEPTED",
+        evidence_age_seconds=0, kill_switch_engaged=False, observed_at=datetime.now(timezone.utc),
+        decision_id=uuid.uuid4(), request_context={"purpose": "controlled_proof"},
+        idempotency_key="recovery-evaluation", audit_correlation_id=uuid.uuid4(),
+        software_build_version=None,
+    )
+
+    with pytest.raises(InvalidRequestError) as raised:
+        await evidence.evaluate_and_record_mandate(db=_ReplayDb(), request=request)
+
+    assert raised.value.details["existing_evaluation_id"] == str(existing.evaluation_id)
+    assert raised.value.details["mismatched_fields"] == ["decision_id"]
 
 
 @pytest.mark.asyncio

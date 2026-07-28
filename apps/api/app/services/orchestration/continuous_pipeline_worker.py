@@ -1988,7 +1988,7 @@ async def _attempt_operator_controlled_proof_entry(
                 observed_at=datetime.now(timezone.utc), decision_id=decision_id,
                 request_context={"purpose": "controlled_proof", "controlled_proof_id": str(proof.proof_id)},
                 idempotency_key=(
-                    f"controlled-proof-mandate-eval:{proof.proof_id}:{side}:exit-recovery:{recovery.recovery_id}"
+                    f"controlled-proof-mandate-eval:{proof.proof_id}:{side}:exit-recovery:{recovery.recovery_id}:decision:{decision_id}"
                     if recovery is not None
                     else f"controlled-proof-mandate-eval:{proof.proof_id}:{side}"
                 ),
@@ -2051,6 +2051,11 @@ async def _attempt_operator_controlled_proof_entry(
                     await block_exit_recovery(
                         db=db, recovery=recovery,
                         reason="fresh_authority_persistence_integrity_failure",
+                    )
+                elif isinstance(exc, (LookupError, InvalidRequestError)):
+                    await block_exit_recovery(
+                        db=db, recovery=recovery,
+                        reason="fresh_authority_evidence_validation_failure",
                     )
                 else:
                     await record_exit_recovery_waiting(

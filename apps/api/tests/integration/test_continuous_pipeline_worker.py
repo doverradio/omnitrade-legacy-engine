@@ -8,8 +8,9 @@ from decimal import Decimal
 from types import SimpleNamespace
 
 import pytest
-from sqlalchemy.exc import PendingRollbackError
+from sqlalchemy.exc import IntegrityError, PendingRollbackError
 
+from app.core.errors import InvalidRequestError
 from app.services.orchestration.continuous_pipeline_worker import WorkerConfig, run_orchestration_cycle
 from app.services.strategies.base import Signal
 from app.services.strategies.registry import StrategyLookupError
@@ -5040,7 +5041,10 @@ async def test_exit_recovery_enters_existing_pipeline_as_sell_only(monkeypatch: 
         return uuid.uuid4()
     monkeypatch.setattr(worker_module, "create_controlled_proof_decision_record", _create_decision)
     evaluation = SimpleNamespace(authorization_result="AUTHORIZED", mandate_id=uuid.uuid4(), mandate_version_id=uuid.uuid4(), evaluation_id=uuid.uuid4())
-    monkeypatch.setattr(worker_module, "evaluate_and_record_mandate", _async_return(evaluation))
+    async def _evaluate(*, db, request):
+        captured["evaluation_request"] = request
+        return evaluation
+    monkeypatch.setattr(worker_module, "evaluate_and_record_mandate", _evaluate)
 
     async def _create(*, db, request):
         captured["request"] = request
@@ -5059,6 +5063,11 @@ async def test_exit_recovery_enters_existing_pipeline_as_sell_only(monkeypatch: 
     assert request.commissioning_entry_mode == "controlled_proof"
     assert request.controlled_proof_exit_recovery_id == recovery.recovery_id
     assert captured["decision_request"]["controlled_proof_exit_recovery_id"] == recovery.recovery_id
+    assert captured["evaluation_request"].decision_id == request.expected_decision_record_id
+    assert captured["evaluation_request"].idempotency_key == (
+        f"controlled-proof-mandate-eval:{proof.proof_id}:SELL:exit-recovery:"
+        f"{recovery.recovery_id}:decision:{request.expected_decision_record_id}"
+    )
     assert request.idempotency_key == worker_module.hashlib.sha256(
         f"controlled-proof:{proof.proof_id}:SELL:exit-recovery:{recovery.recovery_id}".encode()
     ).hexdigest()
@@ -5106,7 +5115,25 @@ async def test_exit_recovery_resumes_exact_linked_package_after_worker_restart(m
 
 
 @pytest.mark.asyncio
-async def test_exit_recovery_package_integrity_failure_rolls_back_and_blocks_cleanly(monkeypatch: pytest.MonkeyPatch) -> None:
+@pytest.mark.parametrize(
+    ("failure", "expected_reason"),
+    [
+        (
+            lambda: IntegrityError(
+                "INSERT canonical_preview_packages", {}, Exception("uq_cpp_decision_id")
+            ),
+            "fresh_authority_persistence_integrity_failure",
+        ),
+        (lambda: LookupError("canonical_mandate_evaluation_mismatch"), "fresh_authority_evidence_validation_failure"),
+        (
+            lambda: InvalidRequestError("Mandate evaluation authority lineage mismatch"),
+            "fresh_authority_evidence_validation_failure",
+        ),
+    ],
+)
+async def test_exit_recovery_package_failure_rolls_back_and_blocks_cleanly(
+    monkeypatch: pytest.MonkeyPatch, failure, expected_reason: str,
+) -> None:
     import app.services.orchestration.continuous_pipeline_worker as worker_module
     from app.services.controlled_proof import ControlledProofRiskOutcome
 
@@ -5133,7 +5160,7 @@ async def test_exit_recovery_package_integrity_failure_rolls_back_and_blocks_cle
     monkeypatch.setattr(worker_module, "evaluate_and_record_mandate", _async_return(evaluation))
 
     async def _insert_fails(**_kwargs):
-        raise worker_module.IntegrityError("INSERT canonical_preview_packages", {}, Exception("uq_cpp_decision_id"))
+        raise failure()
     async def _block(**kwargs):
         blocked.append(kwargs["reason"])
         recovery.status = "BLOCKED"
@@ -5145,4 +5172,4 @@ async def test_exit_recovery_package_integrity_failure_rolls_back_and_blocks_cle
     assert db.rollbacks == 1
     assert db.commits == 1
     assert recovery.status == "BLOCKED"
-    assert blocked == ["fresh_authority_persistence_integrity_failure"]
+    assert blocked == [expected_reason]
