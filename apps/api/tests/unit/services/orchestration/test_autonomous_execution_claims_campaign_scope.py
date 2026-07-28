@@ -158,7 +158,13 @@ async def test_insert_rejected_by_active_campaign_scope_reports_the_conflicting_
     )
     db = SimpleNamespace(
         scalar=AsyncMock(side_effect=[
-            package, None, None, activation, runtime, mandate, version, None, None, None, 0, None, None, conflicting_claim,
+            package, None, None, activation, runtime, mandate, version,
+            None,  # kill switch
+            None,  # recoverable historical pre-provider order
+            None,  # open order
+            None,  # unresolved reconciliation
+            0,     # owned quantity
+            None, None, conflicting_claim,
         ]),
         add=Mock(), flush=AsyncMock(),
     )
@@ -189,7 +195,13 @@ async def test_insert_rejected_with_no_identifiable_conflicting_claim_falls_back
     version = SimpleNamespace(is_active=True, is_authorized=True, mandate_id=package.mandate_id)
     db = SimpleNamespace(
         scalar=AsyncMock(side_effect=[
-            package, None, None, activation, runtime, mandate, version, None, None, None, 0, None, None, None,
+            package, None, None, activation, runtime, mandate, version,
+            None,  # kill switch
+            None,  # recoverable historical pre-provider order
+            None,  # open order
+            None,  # unresolved reconciliation
+            0,     # owned quantity
+            None, None, None,
         ]),
         add=Mock(), flush=AsyncMock(),
     )

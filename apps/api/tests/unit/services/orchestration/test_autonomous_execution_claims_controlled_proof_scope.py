@@ -377,7 +377,15 @@ async def test_full_claim_creates_exactly_one_claim_for_controlled_proof_package
     version = SimpleNamespace(is_active=True, is_authorized=True, mandate_id=package.mandate_id)
     claim = SimpleNamespace(claim_id=uuid.uuid4(), package_id=package.package_id, claim_status="CLAIMED")
     db = SimpleNamespace(
-        scalar=AsyncMock(side_effect=[package, None, proof, activation, runtime, mandate, version, None, None, None, 0, uuid.uuid4(), claim]),
+        scalar=AsyncMock(side_effect=[
+            package, None, proof, activation, runtime, mandate, version,
+            None,  # kill switch
+            None,  # recoverable historical pre-provider order
+            None,  # open order
+            None,  # unresolved reconciliation
+            0,     # owned quantity
+            uuid.uuid4(), claim,
+        ]),
         add=Mock(), flush=AsyncMock(),
     )
     # A global selector pointing at a completely unrelated campaign/mandate --

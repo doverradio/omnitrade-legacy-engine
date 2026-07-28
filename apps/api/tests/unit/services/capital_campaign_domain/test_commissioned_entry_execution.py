@@ -4,6 +4,7 @@ import asyncio
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 from types import SimpleNamespace
+from unittest.mock import AsyncMock
 from uuid import uuid4
 
 import pytest
@@ -533,6 +534,77 @@ async def test_existing_economic_key_mismatch_fails_closed(monkeypatch: pytest.M
             db=_FakeDb(),
             request=_execution_request(campaign_id, 1, readiness_request),
         )
+
+
+def test_execution_idempotency_exact_replay_preserves_intent() -> None:
+    request = _execution_request(uuid4(), 1, _readiness_request(uuid4(), 1))
+    intent = cee._build_economic_intent(request=request, commissioning_identity="canonical-package:one")
+    cee._require_execution_idempotency_intent(
+        idempotency_key="same-key",
+        seen={"same-key": {"economic_intent": intent, "live_crypto_order_id": str(request.live_crypto_order_id)}},
+        economic_intent=dict(intent),
+        new_resource_id=request.live_crypto_order_id,
+    )
+
+
+@pytest.mark.parametrize(
+    ("changed_field", "changed_value"),
+    [("authorized_quote_amount", "6"), ("side", "SELL")],
+)
+def test_execution_idempotency_same_key_changed_intent_fails(
+    changed_field: str, changed_value: str
+) -> None:
+    request = _execution_request(uuid4(), 1, _readiness_request(uuid4(), 1))
+    original = cee._build_economic_intent(request=request, commissioning_identity="canonical-package:one")
+    changed = {**original, changed_field: changed_value}
+    with pytest.raises(InvalidRequestError) as exc:
+        cee._require_execution_idempotency_intent(
+            idempotency_key="same-key",
+            seen={"same-key": {"economic_intent": original, "live_crypto_order_id": "old-order"}},
+            economic_intent=changed,
+            new_resource_id=request.live_crypto_order_id,
+        )
+    assert exc.value.details["differing_intent_fields"] == [changed_field]
+    assert exc.value.details["existing_resource_id"] == "old-order"
+
+
+def test_new_controlled_proof_order_has_distinct_economic_key() -> None:
+    campaign_id = uuid4()
+    readiness = _readiness_request(campaign_id, 1)
+    first = _execution_request(campaign_id, 1, readiness)
+    second = _execution_request(campaign_id, 1, readiness)
+    first_key = cee._build_economic_idempotency_key(
+        request=first, commissioning_identity=f"canonical-package:{first.live_crypto_order_id}"
+    )
+    second_key = cee._build_economic_idempotency_key(
+        request=second, commissioning_identity=f"canonical-package:{second.live_crypto_order_id}"
+    )
+    assert first.live_crypto_order_id != second.live_crypto_order_id
+    assert first_key != second_key
+
+
+@pytest.mark.asyncio
+async def test_only_cancelled_proven_pre_provider_attempt_can_be_superseded() -> None:
+    live_order_id = uuid4()
+    entry = {"live_crypto_order_id": str(live_order_id)}
+
+    safe_order = SimpleNamespace(
+        status="CANCELLED", provider_order_id=None, submitted_at=None,
+        safe_provider_response={"provider_call_made": False},
+    )
+    safe_db = _FakeDb()
+    safe_db.get = AsyncMock(return_value=safe_order)
+    assert await cee._is_recoverable_pre_provider_attempt(db=safe_db, entry_execution=entry) is True
+
+    for unsafe_order in (
+        SimpleNamespace(status="CANCELLED", provider_order_id="provider-1", submitted_at=None, safe_provider_response={"provider_call_made": False}),
+        SimpleNamespace(status="CANCELLED", provider_order_id=None, submitted_at=_now(), safe_provider_response={"provider_call_made": False}),
+        SimpleNamespace(status="CANCELLED", provider_order_id=None, submitted_at=None, safe_provider_response={"provider_call_made": True}),
+        SimpleNamespace(status="PENDING_CONFIRMATION", provider_order_id=None, submitted_at=None, safe_provider_response={"provider_call_made": False}),
+    ):
+        unsafe_db = _FakeDb()
+        unsafe_db.get = AsyncMock(return_value=unsafe_order)
+        assert await cee._is_recoverable_pre_provider_attempt(db=unsafe_db, entry_execution=entry) is False
 
 
 @pytest.mark.asyncio

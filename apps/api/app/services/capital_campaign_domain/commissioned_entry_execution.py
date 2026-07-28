@@ -163,7 +163,15 @@ def _build_economic_idempotency_key(
     request: CommissionedEntryExecutionRequest,
     commissioning_identity: str,
 ) -> str:
-    payload = {
+    return _hash_payload(_build_economic_intent(request=request, commissioning_identity=commissioning_identity))
+
+
+def _build_economic_intent(
+    *,
+    request: CommissionedEntryExecutionRequest,
+    commissioning_identity: str,
+) -> dict[str, Any]:
+    return {
         "campaign_id": str(request.campaign_id),
         "campaign_version": request.version,
         "commissioning_identity": commissioning_identity,
@@ -175,7 +183,61 @@ def _build_economic_idempotency_key(
         "authorized_quote_amount": format(request.readiness_request.requested_quote_amount, "f"),
         "entry_action": _ENTRY_ACTION if request.side == "BUY" else "CLOSE_POSITION_PROPOSED",
     }
-    return _hash_payload(payload)
+
+
+def _economic_intent_differences(*, existing: dict[str, Any], new: dict[str, Any]) -> list[str]:
+    return sorted(key for key in set(existing) | set(new) if existing.get(key) != new.get(key))
+
+
+def _require_execution_idempotency_intent(
+    *,
+    idempotency_key: str,
+    seen: dict[str, Any],
+    economic_intent: dict[str, Any],
+    new_resource_id: UUID,
+) -> None:
+    prior = seen.get(idempotency_key)
+    if not isinstance(prior, dict):
+        return
+    prior_intent = prior.get("economic_intent")
+    if prior_intent == economic_intent:
+        return
+    prior_intent = prior_intent if isinstance(prior_intent, dict) else {}
+    differing_fields = _economic_intent_differences(existing=prior_intent, new=economic_intent)
+    logger.warning(
+        "commissioned_execution_idempotency_key_conflict idempotency_key=%s "
+        "existing_resource_id=%s new_resource_id=%s differing_intent_fields=%s",
+        idempotency_key,
+        prior.get("live_crypto_order_id"),
+        new_resource_id,
+        ",".join(differing_fields),
+    )
+    raise InvalidRequestError(
+        message="Idempotency key reuse must preserve economic intent",
+        details={
+            "idempotency_key": idempotency_key,
+            "existing_resource_id": prior.get("live_crypto_order_id"),
+            "new_resource_id": str(new_resource_id),
+            "differing_intent_fields": differing_fields,
+        },
+    )
+
+
+async def _is_recoverable_pre_provider_attempt(
+    *, db: AsyncSession, entry_execution: dict[str, Any]
+) -> bool:
+    live_order_id = _optional_uuid(entry_execution.get("live_crypto_order_id"))
+    if live_order_id is None:
+        return False
+    order = await db.get(LiveCryptoOrder, live_order_id)
+    evidence = order.safe_provider_response if order is not None and isinstance(order.safe_provider_response, dict) else {}
+    return bool(
+        order is not None
+        and order.status == "CANCELLED"
+        and order.provider_order_id is None
+        and order.submitted_at is None
+        and evidence.get("provider_call_made") is False
+    )
 
 
 def _optional_uuid(value: object | None) -> UUID | None:
@@ -758,21 +820,64 @@ async def execute_commissioned_entry(
                 },
             )
 
-        economic_idempotency_key = _build_economic_idempotency_key(
+        economic_intent = _build_economic_intent(
             request=request,
             commissioning_identity=commissioning_identity,
+        )
+        economic_idempotency_key = _hash_payload(economic_intent)
+
+        seen_execution_keys = blob.get("execution_idempotency_keys")
+        seen_execution_keys = seen_execution_keys if isinstance(seen_execution_keys, dict) else {}
+        _require_execution_idempotency_intent(
+            idempotency_key=request.idempotency_key,
+            seen=seen_execution_keys,
+            economic_intent=economic_intent,
+            new_resource_id=request.live_crypto_order_id,
         )
 
         entry_execution = blob.get(execution_blob_key) if isinstance(blob.get(execution_blob_key), dict) else {}
         existing_key = str(entry_execution.get("economic_idempotency_key") or "").strip()
+        superseded_attempt: dict[str, Any] | None = None
         if existing_key and existing_key != economic_idempotency_key:
-            raise InvalidRequestError(
-                message="Idempotency key reuse must preserve economic intent",
-                details={
-                    "existing_economic_idempotency_key": existing_key,
-                    "new_economic_idempotency_key": economic_idempotency_key,
-                },
+            existing_intent = entry_execution.get("economic_intent")
+            if not isinstance(existing_intent, dict):
+                existing_intent = dict(economic_intent)
+                existing_live_order_id = _optional_uuid(entry_execution.get("live_crypto_order_id"))
+                if existing_live_order_id is not None:
+                    existing_intent["commissioning_identity"] = f"canonical-package:{existing_live_order_id}"
+            differing_fields = _economic_intent_differences(existing=existing_intent, new=economic_intent)
+            existing_resource_id = entry_execution.get("live_crypto_order_id")
+            logger.warning(
+                "commissioned_execution_idempotency_conflict economic_idempotency_key=%s "
+                "existing_economic_idempotency_key=%s existing_resource_id=%s new_resource_id=%s "
+                "differing_intent_fields=%s",
+                economic_idempotency_key,
+                existing_key,
+                existing_resource_id,
+                request.live_crypto_order_id,
+                ",".join(differing_fields),
             )
+            if not (
+                request.canonical_package_authorized
+                and await _is_recoverable_pre_provider_attempt(db=db, entry_execution=entry_execution)
+            ):
+                raise InvalidRequestError(
+                    message="Idempotency key reuse must preserve economic intent",
+                    details={
+                        "existing_economic_idempotency_key": existing_key,
+                        "new_economic_idempotency_key": economic_idempotency_key,
+                        "existing_resource_id": existing_resource_id,
+                        "new_resource_id": str(request.live_crypto_order_id),
+                        "differing_intent_fields": differing_fields,
+                    },
+                )
+            superseded_attempt = {
+                **entry_execution,
+                "superseded_at": _utcnow().isoformat(),
+                "superseded_by_live_crypto_order_id": str(request.live_crypto_order_id),
+            }
+            entry_execution = {}
+            existing_key = ""
 
         commissioned_state = str(blob.get("state") or "DRAFT")
         resume_from_buy_pending = (
@@ -974,8 +1079,22 @@ async def execute_commissioned_entry(
                 version=request.version,
             )
             blob_after_pending = _read_commissioned_blob(definition=definition_after_pending)
+            if superseded_attempt is not None:
+                attempt_history = list(blob_after_pending.get(f"{execution_blob_key}_attempt_history") or [])
+                attempt_history.append(superseded_attempt)
+                blob_after_pending[f"{execution_blob_key}_attempt_history"] = attempt_history
+            execution_keys = blob_after_pending.get("execution_idempotency_keys")
+            execution_keys = dict(execution_keys) if isinstance(execution_keys, dict) else {}
+            execution_keys[request.idempotency_key] = {
+                "economic_intent": economic_intent,
+                "economic_idempotency_key": economic_idempotency_key,
+                "live_crypto_order_id": str(request.live_crypto_order_id),
+                "recorded_at": _utcnow().isoformat(),
+            }
+            blob_after_pending["execution_idempotency_keys"] = execution_keys
             blob_after_pending[execution_blob_key] = {
                 "economic_idempotency_key": economic_idempotency_key,
+                "economic_intent": economic_intent,
                 "risk_event_id": str(persisted_risk.risk_event_id),
                 "risk_action": risk_result.action.value,
                 "decision_record_id": str(decision_record_id),
