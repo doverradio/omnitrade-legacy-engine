@@ -654,6 +654,7 @@ async def create_controlled_proof_decision_record(
     provider: str,
     actor: str,
     strategy_identity: str,
+    controlled_proof_exit_recovery_id: uuid.UUID | None = None,
 ) -> uuid.UUID:
     """A Controlled-Proof-forced action is never organically selected by the
     strategy ensemble -- the HOLD cycle's own selected_decision describes a
@@ -666,8 +667,10 @@ async def create_controlled_proof_decision_record(
     (see DecisionRecord's before_update/before_delete listeners) -- an
     inaccurate link can never be corrected in place, only superseded by a
     new, honest record. This creates exactly one such record per proof per
-    direction (BUY entry, SELL exit), idempotent on
-    (controlled_proof_id, forced_action) the same way the organic
+    direction (BUY entry, SELL exit), or one per explicit Exit Recovery
+    attempt when that attempt replaces an expired SELL package. It is
+    idempotent on (controlled_proof_id, forced_action, optional recovery_id)
+    the same way the organic
     aggregate decision is idempotent on its own roster-run-scoped key.
 
     Public (not module-private) and takes primitive fields rather than a
@@ -687,6 +690,8 @@ async def create_controlled_proof_decision_record(
     idempotency_key = _controlled_proof_decision_idempotency_key(
         controlled_proof_id=controlled_proof_id, forced_action=forced_action,
     )
+    if controlled_proof_exit_recovery_id is not None:
+        idempotency_key = f"{idempotency_key}:exit_recovery:{controlled_proof_exit_recovery_id}"
     existing = await db.scalar(select(DecisionRecord).where(DecisionRecord.idempotency_key == idempotency_key).limit(1))
     if existing is not None:
         return existing.decision_id
@@ -699,6 +704,10 @@ async def create_controlled_proof_decision_record(
             "strategy_roster_runs": [],
             "campaigns": [str(campaign_id)],
             "controlled_proof_runs": [str(controlled_proof_id)],
+            "controlled_proof_exit_recoveries": (
+                [] if controlled_proof_exit_recovery_id is None
+                else [str(controlled_proof_exit_recovery_id)]
+            ),
             # Deliberately not the risk_event_id from the Controlled Proof's
             # own fresh risk gate (evaluate_controlled_proof_risk): that is a
             # distinct risk evaluation from the one create_crypto_order_preview
@@ -735,6 +744,10 @@ async def create_controlled_proof_decision_record(
             "stage": "controlled_proof_forced_entry",
             "actor": actor,
             "controlled_proof_id": str(controlled_proof_id),
+            "controlled_proof_exit_recovery_id": (
+                None if controlled_proof_exit_recovery_id is None
+                else str(controlled_proof_exit_recovery_id)
+            ),
         },
         exit_details=None,
         pnl=None,
@@ -748,7 +761,6 @@ async def create_controlled_proof_decision_record(
         review_status=None,
         human_notes=None,
     )
-    db.add(record)
     # Mirrors the established organic pattern (see
     # _persist_strategy_aggregate_decision's caller in authoritative.py):
     # a savepoint, not the outer transaction, absorbs a concurrent
@@ -756,6 +768,7 @@ async def create_controlled_proof_decision_record(
     # everything else already flushed in this same call.
     try:
         async with db.begin_nested():
+            db.add(record)
             await db.flush()
     except IntegrityError:
         raced = await db.scalar(select(DecisionRecord).where(DecisionRecord.idempotency_key == idempotency_key).limit(1))
@@ -852,6 +865,7 @@ async def _create_crypto_order_preview_for_package(
             db=db, campaign_id=request.campaign_id, controlled_proof_id=request.controlled_proof_id,
             forced_action=request.forced_action, product=request.product, provider=request.provider,
             actor=request.actor, strategy_identity=strategy_identity,
+            controlled_proof_exit_recovery_id=request.controlled_proof_exit_recovery_id,
         )
     else:
         decision_record_id = _selected_decision_record_id(selected_decision)
@@ -1468,7 +1482,6 @@ async def create_canonical_preview_package(
         mandate_evaluation_id=None if mandate_evaluation is None else mandate_evaluation.evaluation_id,
     )
 
-    db.add(package)
     # Savepoint, not the outer transaction: the immediate API dispatch and
     # the timer-driven worker can now both reach this exact point for the
     # same Controlled Proof concurrently (two independent processes/
@@ -1480,6 +1493,11 @@ async def create_canonical_preview_package(
     # create_controlled_proof_decision_record for the same reason.
     try:
         async with db.begin_nested():
+            # Add only after the savepoint exists. AsyncSession.begin_nested
+            # flushes already-pending objects while entering; adding before
+            # it would let a uniqueness failure poison the outer transaction
+            # before the savepoint can contain it.
+            db.add(package)
             await db.flush()
     except IntegrityError:
         winner = await _load_package_by_idempotency(db=db, idempotency_key=request.idempotency_key)

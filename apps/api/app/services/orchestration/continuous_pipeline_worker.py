@@ -11,6 +11,7 @@ from datetime import datetime, timezone
 from decimal import Decimal
 
 from sqlalchemy import and_, func, select
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import get_settings
@@ -1973,6 +1974,7 @@ async def _attempt_operator_controlled_proof_entry(
             db=db, campaign_id=proof.campaign_id, controlled_proof_id=proof.proof_id,
             forced_action=forced_action, product=proof.product_id,
             provider=proof.provider, actor=actor, strategy_identity=strategy_identity,
+            controlled_proof_exit_recovery_id=None if recovery is None else recovery.recovery_id,
         )
         evaluation = await evaluate_and_record_mandate(
             db=db,
@@ -2045,7 +2047,16 @@ async def _attempt_operator_controlled_proof_entry(
             claimed_recovery = await claim_exit_recovery_by_id(db=db, recovery_id=recovery_id)
             if claimed_recovery is not None:
                 recovery, _proof = claimed_recovery
-                await record_exit_recovery_waiting(db=db, recovery=recovery, reason=f"entry_attempt_failed:{exc.__class__.__name__}")
+                if isinstance(exc, IntegrityError):
+                    await block_exit_recovery(
+                        db=db, recovery=recovery,
+                        reason="fresh_authority_persistence_integrity_failure",
+                    )
+                else:
+                    await record_exit_recovery_waiting(
+                        db=db, recovery=recovery,
+                        reason=f"entry_attempt_failed:{exc.__class__.__name__}",
+                    )
                 await db.commit()
         elif proof_id is not None:
             proof = await claim_controlled_proof_by_id(db=db, proof_id=proof_id)

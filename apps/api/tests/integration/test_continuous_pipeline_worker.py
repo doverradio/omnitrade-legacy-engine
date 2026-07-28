@@ -5035,7 +5035,10 @@ async def test_exit_recovery_enters_existing_pipeline_as_sell_only(monkeypatch: 
     monkeypatch.setattr(worker_module, "evaluate_controlled_proof_risk", _async_return(ControlledProofRiskOutcome(verdict="ALLOW", approved_notional_usd=Decimal("5"), reason_code=None, risk_event_id=uuid.uuid4())))
     monkeypatch.setattr(worker_module, "get_settings", lambda: SimpleNamespace(automatic_mandate_package_activation_mandate_id=uuid.uuid4()))
     monkeypatch.setattr(worker_module, "resolve_controlled_proof_strategy_identity", _async_return("ma_crossover@1.0.0"))
-    monkeypatch.setattr(worker_module, "create_controlled_proof_decision_record", _async_return(uuid.uuid4()))
+    async def _create_decision(**kwargs):
+        captured["decision_request"] = kwargs
+        return uuid.uuid4()
+    monkeypatch.setattr(worker_module, "create_controlled_proof_decision_record", _create_decision)
     evaluation = SimpleNamespace(authorization_result="AUTHORIZED", mandate_id=uuid.uuid4(), mandate_version_id=uuid.uuid4(), evaluation_id=uuid.uuid4())
     monkeypatch.setattr(worker_module, "evaluate_and_record_mandate", _async_return(evaluation))
 
@@ -5055,6 +5058,7 @@ async def test_exit_recovery_enters_existing_pipeline_as_sell_only(monkeypatch: 
     assert request.forced_action == "CLOSE_POSITION_PROPOSED"
     assert request.commissioning_entry_mode == "controlled_proof"
     assert request.controlled_proof_exit_recovery_id == recovery.recovery_id
+    assert captured["decision_request"]["controlled_proof_exit_recovery_id"] == recovery.recovery_id
     assert request.idempotency_key == worker_module.hashlib.sha256(
         f"controlled-proof:{proof.proof_id}:SELL:exit-recovery:{recovery.recovery_id}".encode()
     ).hexdigest()
@@ -5099,3 +5103,46 @@ async def test_exit_recovery_resumes_exact_linked_package_after_worker_restart(m
     assert len(progressed) == 1
     assert progressed[0].package_id == package_id
     assert progressed[0].decision_record_id == decision_id
+
+
+@pytest.mark.asyncio
+async def test_exit_recovery_package_integrity_failure_rolls_back_and_blocks_cleanly(monkeypatch: pytest.MonkeyPatch) -> None:
+    import app.services.orchestration.continuous_pipeline_worker as worker_module
+    from app.services.controlled_proof import ControlledProofRiskOutcome
+
+    proof = SimpleNamespace(
+        proof_id=uuid.uuid4(), status="EXPIRED", terminal_verdict="FAILED",
+        package_id=uuid.uuid4(), sell_package_id=None, campaign_id=uuid.uuid4(), campaign_version=1,
+        provider="kraken_spot", environment="production", product_id="BTC-USD",
+        max_notional_usd=Decimal("5"), audit_correlation_id=uuid.uuid4(),
+    )
+    recovery = SimpleNamespace(recovery_id=uuid.uuid4(), status="IN_PROGRESS")
+    db = _FakeDB()
+    blocked = []
+    monkeypatch.setattr(worker_module, "claim_exit_recovery_by_id", _async_return((recovery, proof)))
+    monkeypatch.setattr(worker_module, "should_propose_controlled_sell", _async_return(True))
+    monkeypatch.setattr(worker_module, "_load_runtime_campaign", _async_return(SimpleNamespace(paper_account_id=uuid.uuid4())))
+    monkeypatch.setattr(worker_module, "_load_live_trading_profile_for_paper_account", _async_return(SimpleNamespace(id=uuid.uuid4())))
+    monkeypatch.setattr(worker_module, "_has_open_live_order", _async_return(False))
+    monkeypatch.setattr(worker_module, "_has_unresolved_reconciliation", _async_return(False))
+    monkeypatch.setattr(worker_module, "evaluate_controlled_proof_risk", _async_return(ControlledProofRiskOutcome(verdict="ALLOW", approved_notional_usd=Decimal("5"), reason_code=None, risk_event_id=uuid.uuid4())))
+    monkeypatch.setattr(worker_module, "get_settings", lambda: SimpleNamespace(automatic_mandate_package_activation_mandate_id=uuid.uuid4()))
+    monkeypatch.setattr(worker_module, "resolve_controlled_proof_strategy_identity", _async_return("ma_crossover@1.0.0"))
+    monkeypatch.setattr(worker_module, "create_controlled_proof_decision_record", _async_return(uuid.uuid4()))
+    evaluation = SimpleNamespace(authorization_result="AUTHORIZED", mandate_id=uuid.uuid4(), mandate_version_id=uuid.uuid4(), evaluation_id=uuid.uuid4())
+    monkeypatch.setattr(worker_module, "evaluate_and_record_mandate", _async_return(evaluation))
+
+    async def _insert_fails(**_kwargs):
+        raise worker_module.IntegrityError("INSERT canonical_preview_packages", {}, Exception("uq_cpp_decision_id"))
+    async def _block(**kwargs):
+        blocked.append(kwargs["reason"])
+        recovery.status = "BLOCKED"
+    monkeypatch.setattr(worker_module, "create_canonical_preview_package", _insert_fails)
+    monkeypatch.setattr(worker_module, "block_exit_recovery", _block)
+
+    await worker_module._attempt_operator_controlled_proof_entry(db=db, recovery_id=recovery.recovery_id)
+
+    assert db.rollbacks == 1
+    assert db.commits == 1
+    assert recovery.status == "BLOCKED"
+    assert blocked == ["fresh_authority_persistence_integrity_failure"]

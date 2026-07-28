@@ -1778,6 +1778,28 @@ async def test_controlled_proof_decision_record_idempotent_reuse_does_not_duplic
 
 
 @pytest.mark.asyncio
+async def test_exit_recovery_gets_distinct_idempotent_decision_lineage() -> None:
+    proof_id, recovery_id = uuid4(), uuid4()
+    db = _FakeDb(scalar_values=[None])
+
+    decision_id = await cpp.create_controlled_proof_decision_record(
+        db=db, campaign_id=uuid4(), controlled_proof_id=proof_id,
+        forced_action="CLOSE_POSITION_PROPOSED", product="BTC-USD",
+        provider="kraken_spot", actor="system:controlled_proof_worker",
+        strategy_identity="ma_crossover@1.0.0",
+        controlled_proof_exit_recovery_id=recovery_id,
+    )
+
+    record = next(item for item in db.added if isinstance(item, DecisionRecord))
+    assert decision_id == record.decision_id
+    assert record.idempotency_key == (
+        f"controlled_proof_forced_entry:{proof_id}:CLOSE_POSITION_PROPOSED:exit_recovery:{recovery_id}"
+    )
+    assert record.source_lineage["controlled_proof_exit_recoveries"] == [str(recovery_id)]
+    assert record.execution_details["controlled_proof_exit_recovery_id"] == str(recovery_id)
+
+
+@pytest.mark.asyncio
 async def test_controlled_proof_forced_entry_never_touches_organic_decision_record(monkeypatch: pytest.MonkeyPatch) -> None:
     """The organic decision record is never read, written, or referenced by
     the controlled-proof forced-entry path -- only its own, separate,
