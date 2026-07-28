@@ -1167,7 +1167,10 @@ async def execute_commissioned_entry(
                 submit_response.live_crypto_order.provider_order_id, submit_response.live_crypto_order.status,
             )
             provider_order_id = submit_response.live_crypto_order.provider_order_id
-            if (
+            if submit_response.live_crypto_order.status == "REJECTED":
+                final_classification = "rejected"
+                final_state = "CANCELLED"
+            elif (
                 submit_response.live_crypto_order.status in {"RECONCILIATION_REQUIRED", "UNKNOWN"}
                 or submit_response.provider_create_order_responded is False
             ):
@@ -1233,7 +1236,7 @@ async def execute_commissioned_entry(
                 "live_crypto_order_id": str(request.live_crypto_order_id),
                 "provider_order_id": provider_order_id,
                 "provider_submission_classification": final_classification,
-                "terminal": final_state == reconciliation_pending_state,
+                "terminal": final_state in {reconciliation_pending_state, "CANCELLED"},
                 "updated_at": _utcnow().isoformat(),
             }
         )

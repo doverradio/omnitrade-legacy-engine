@@ -432,6 +432,55 @@ async def test_execute_success_transitions_to_buy_reconciliation_pending(monkeyp
 
 
 @pytest.mark.asyncio
+async def test_explicit_provider_rejection_is_terminal_not_ambiguous(monkeypatch: pytest.MonkeyPatch) -> None:
+    campaign_id = uuid4()
+    readiness_request = _readiness_request(campaign_id, 1)
+    definition = _definition(campaign_id, 1, state="COMMISSIONED")
+    definition.metadata_evidence["commissioned_seed_campaign"]["commissioning"] = {
+        "commissioning_identity": "commissioning-1",
+        "preview_identity_hash": "preview-hash-1",
+        "commissioned_until": (_now() + timedelta(minutes=10)).isoformat(),
+    }
+    runtime = _runtime(campaign_id, 1)
+    db = _FakeDb()
+    transitions = _TransitionRecorder(definition)
+
+    monkeypatch.setattr(cee, "assess_commissioned_campaign_readiness", _async_return(_readiness_response(campaign_id, 1)))
+    monkeypatch.setattr(cee, "generate_commissioned_campaign_preview", _async_return(_preview_response(campaign_id, 1)))
+    monkeypatch.setattr(cee, "_load_definition_and_runtime_for_update", lambda **_kwargs: asyncio.sleep(0, result=(definition, runtime)))
+    monkeypatch.setattr(cee, "transition_commissioned_campaign_state", transitions)
+    monkeypatch.setattr(
+        cee, "evaluate_signal_risk",
+        lambda **_kwargs: RiskEvaluationResult(
+            action=RiskDecisionAction.APPROVE, reason_code=None,
+            approved_quantity=Decimal("0.00009"), steps=[],
+        ),
+    )
+    monkeypatch.setattr(cee, "persist_risk_decision", lambda **_kwargs: asyncio.sleep(0, result=SimpleNamespace(risk_event_id=uuid4())))
+
+    async def _submit(self, *, db, request):
+        _ = (db, request)
+        return SimpleNamespace(
+            live_crypto_order=SimpleNamespace(status="REJECTED", provider_order_id=None),
+            provider_create_order_responded=True,
+            provider_reconciliation_status=None,
+            safe_provider_response={"create_order_error": {"code": "invalid_arguments"}},
+            order_submitted=False,
+        )
+
+    monkeypatch.setattr(cee.LiveCryptoOrderService, "submit", _submit)
+
+    response = await cee.execute_commissioned_entry(
+        db=db, request=_execution_request(campaign_id, 1, readiness_request),
+    )
+
+    assert response.current_state == "CANCELLED"
+    assert response.provider_submission_classification == "rejected"
+    entry = definition.metadata_evidence["commissioned_seed_campaign"]["entry_execution"]
+    assert entry["terminal"] is True
+
+
+@pytest.mark.asyncio
 async def test_risk_veto_blocks_provider_submission(monkeypatch: pytest.MonkeyPatch) -> None:
     campaign_id = uuid4()
     readiness_request = _readiness_request(campaign_id, 1)

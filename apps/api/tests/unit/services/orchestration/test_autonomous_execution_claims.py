@@ -251,6 +251,35 @@ async def test_advance_claimed_execution_reaches_submission_pending_on_success(m
 
 
 @pytest.mark.asyncio
+async def test_advance_does_not_overwrite_claim_released_by_authoritative_rejection(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    claim = _claim()
+    prepared = _prepared(claim)
+    prepared.order.status = "REJECTED"
+
+    async def _prepare(**_kwargs):
+        return prepared
+
+    async def _execute(**_kwargs):
+        # LiveCryptoOrderService's canonical terminal release occurs inside
+        # the execution call before the response returns to orchestration.
+        claim.claim_status = "CANCELLED"
+        return SimpleNamespace(current_state="CANCELLED")
+
+    monkeypatch.setattr(subject, "prepare_autonomous_claimed_order", _prepare)
+    monkeypatch.setattr(subject, "execute_prepared_autonomous_claim", _execute)
+    monkeypatch.setattr(subject, "_persist_provider_rejection_diagnostics", AsyncMock())
+    monkeypatch.setattr(subject, "get_settings", lambda: SimpleNamespace(live_crypto_order_submission_enabled=True))
+    db = SimpleNamespace(add=Mock(), flush=AsyncMock())
+
+    await subject.advance_claimed_execution(db=db, claim=claim)
+
+    assert claim.claim_status == "CANCELLED"
+    assert claim.reconciliation_state == "CANCELLED"
+
+
+@pytest.mark.asyncio
 async def test_advance_claimed_execution_reaches_reconciliation_required_on_success(monkeypatch: pytest.MonkeyPatch) -> None:
     claim = _claim()
     prepared = _prepared(claim)

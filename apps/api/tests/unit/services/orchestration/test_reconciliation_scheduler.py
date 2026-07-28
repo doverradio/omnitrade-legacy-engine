@@ -8,6 +8,7 @@ from types import SimpleNamespace
 from typing import AsyncIterator
 
 import pytest
+from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.models.live_crypto_order import LiveCryptoOrder
@@ -21,6 +22,13 @@ _ALL_TABLES = [LiveCryptoOrder.__table__, LiveReconciliationEvent.__table__]
 @asynccontextmanager
 async def _real_session() -> AsyncIterator[AsyncSession]:
     async with real_sqlite_session(_ALL_TABLES) as session:
+        # Candidate discovery intentionally correlates terminal orders with
+        # open execution claims.  A minimal table keeps these focused SQL
+        # tests independent of the claim model's large foreign-key graph.
+        await session.execute(text(
+            "CREATE TABLE autonomous_execution_claims ("
+            "claim_id VARCHAR(36) PRIMARY KEY, live_order_id VARCHAR(36), claim_status TEXT NOT NULL)"
+        ))
         yield session
 
 
@@ -137,6 +145,30 @@ async def test_terminal_latest_reconciliation_is_not_rediscovered() -> None:
         candidates = await subject.discover_reconciliation_candidates(db=session, limit=10)
 
         assert candidates == []
+
+
+@pytest.mark.asyncio
+async def test_rejected_order_with_unreleased_claim_is_discovered() -> None:
+    now = datetime.now(timezone.utc)
+    async with _real_session() as session:
+        order = _order(status="REJECTED", submitted_at=now)
+        session.add(order)
+        await session.flush()
+        await session.execute(
+            text(
+                "INSERT INTO autonomous_execution_claims "
+                "(claim_id, live_order_id, claim_status) VALUES (:claim_id, :order_id, :status)"
+            ),
+            {
+                "claim_id": str(uuid.uuid4()),
+                "order_id": order.live_crypto_order_id.hex,
+                "status": "RECONCILIATION_REQUIRED",
+            },
+        )
+
+        candidates = await subject.discover_reconciliation_candidates(db=session, limit=10)
+
+        assert candidates == [order.live_crypto_order_id]
 
 
 @pytest.mark.asyncio
@@ -382,6 +414,52 @@ async def test_cancelled_order_counts_as_reconciled_terminal(monkeypatch: pytest
     outcome = await subject.poll_unresolved_live_orders(db=_FakeDb())
 
     assert outcome == subject.ReconciliationPollOutcome(1, 1, 0, 0)
+
+
+@pytest.mark.asyncio
+async def test_terminal_rejected_order_releases_historical_open_claim_without_provider_query(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    order_id = uuid.uuid4()
+    order = SimpleNamespace(live_crypto_order_id=order_id, status="REJECTED")
+    claim = SimpleNamespace(claim_id=uuid.uuid4(), claim_status="RECONCILIATION_REQUIRED")
+    released: list[tuple[uuid.UUID, str]] = []
+
+    monkeypatch.setattr(subject, "get_settings", _enabled_settings)
+    monkeypatch.setattr(subject, "discover_reconciliation_candidates", lambda *, db, limit: _async([order_id]))
+    monkeypatch.setattr(
+        subject, "_terminal_unreleased_claim_context",
+        lambda **_kwargs: _async((order, claim)),
+    )
+    fake_service = _FakeReconcileService({})
+    monkeypatch.setattr(subject, "LiveCryptoOrderService", lambda: fake_service)
+
+    from app.services.orchestration import autonomous_execution_claims
+
+    async def _release(*, db, live_crypto_order_id, order_status):
+        released.append((live_crypto_order_id, order_status))
+
+    monkeypatch.setattr(
+        autonomous_execution_claims,
+        "release_execution_claim_scope_if_order_resolved",
+        _release,
+    )
+
+    class _Db(_FakeDb):
+        def __init__(self) -> None:
+            super().__init__()
+            self.commits = 0
+
+        async def commit(self) -> None:
+            self.commits += 1
+
+    db = _Db()
+    outcome = await subject.poll_unresolved_live_orders(db=db)
+
+    assert outcome == subject.ReconciliationPollOutcome(1, 1, 0, 0)
+    assert released == [(order_id, "REJECTED")]
+    assert fake_service.calls == []
+    assert db.commits == 1
 
 
 @pytest.mark.asyncio

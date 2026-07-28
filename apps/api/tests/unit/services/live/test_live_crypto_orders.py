@@ -1459,6 +1459,11 @@ async def test_explicit_provider_rejection_sets_rejected_without_blind_retry(mon
         return None, service.RiskDecisionAction.APPROVE, service.Decimal("5.00"), live_order.risk_event_id
 
     monkeypatch.setattr(service, "_build_real_risk_context", _risk_context)
+    release_scope = AsyncMock()
+    monkeypatch.setattr(
+        "app.services.orchestration.autonomous_execution_claims.release_execution_claim_scope_if_order_resolved",
+        release_scope,
+    )
 
     async def _reject(*_args, **_kwargs):
         return ExchangeOrderSubmissionResult(
@@ -1504,6 +1509,7 @@ async def test_explicit_provider_rejection_sets_rejected_without_blind_retry(mon
     assert response.live_crypto_order.status == "REJECTED"
     assert response.order_submitted is False
     assert response.live_crypto_order.failure_code == "provider_rejected"
+    assert response.provider_create_order_responded is True
     error = response.live_crypto_order.safe_provider_response["create_order_error"]
     assert error["code"] == "insufficient_funds"
     assert error["message"] == "EOrder:Insufficient funds"
@@ -1511,6 +1517,11 @@ async def test_explicit_provider_rejection_sets_rejected_without_blind_retry(mon
     assert error["provider_response_body"]["provider_errors"] == ["EOrder:Insufficient funds"]
     assert error["request_payload_summary"]["product_id"] == "BTC-USD"
     assert response.live_crypto_order.safe_provider_response["create_order_payload"]["side"] == "BUY"
+    release_scope.assert_awaited_once_with(
+        db=db,
+        live_crypto_order_id=live_order.live_crypto_order_id,
+        order_status="REJECTED",
+    )
 
 
 @pytest.mark.asyncio

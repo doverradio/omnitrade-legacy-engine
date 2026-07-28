@@ -10,6 +10,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.config import get_settings
 from app.models.live_crypto_order import LiveCryptoOrder
 from app.models.live_reconciliation_event import LiveReconciliationEvent
+from app.models.autonomous_execution_claim import AutonomousExecutionClaim
 from app.schemas.live_crypto_orders import LiveCryptoOrderReconcileRequest
 from app.services.exchange_connections import refresh_exchange_balances
 from app.services.live_crypto_orders import LiveCryptoOrderService
@@ -28,6 +29,10 @@ RECONCILIATION_SCHEDULER_ACTOR = "system:reconciliation_scheduler"
 # found and fixed once this session for AutonomousExecutionClaim's own
 # status set (the old, permanently-blocking campaign-version constraint).
 _TERMINAL_ORDER_STATUSES = {"FILLED", "CANCELLED", "REJECTED", "EXPIRED"}
+_NONTERMINAL_CLAIM_STATUSES = {
+    "CLAIMED", "EXECUTION_STARTED", "SUBMISSION_PENDING",
+    "RECONCILIATION_REQUIRED", "RECOVERY_REQUIRED",
+}
 
 
 @dataclass(frozen=True, slots=True)
@@ -74,6 +79,15 @@ async def discover_reconciliation_candidates(
         .correlate(LiveCryptoOrder)
         .exists()
     )
+    terminal_with_unreleased_claim = (
+        select(AutonomousExecutionClaim.claim_id)
+        .where(
+            AutonomousExecutionClaim.live_order_id == LiveCryptoOrder.live_crypto_order_id,
+            AutonomousExecutionClaim.claim_status.in_(_NONTERMINAL_CLAIM_STATUSES),
+        )
+        .correlate(LiveCryptoOrder)
+        .exists()
+    )
     statement = (
         select(LiveCryptoOrder.live_crypto_order_id)
         .where(
@@ -82,7 +96,7 @@ async def discover_reconciliation_candidates(
                 LiveCryptoOrder.status.not_in(_TERMINAL_ORDER_STATUSES),
                 and_(
                     LiveCryptoOrder.status.in_(_TERMINAL_ORDER_STATUSES),
-                    terminal_with_unresolved_evidence,
+                    or_(terminal_with_unresolved_evidence, terminal_with_unreleased_claim),
                 ),
             ),
         )
@@ -113,6 +127,34 @@ async def _terminal_unresolved_context(*, db: AsyncSession, live_crypto_order_id
     if event is None or event.reconciliation_status not in UNRESOLVED_RECONCILIATION_STATES:
         return None
     return order, event
+
+
+async def _terminal_unreleased_claim_context(*, db: AsyncSession, live_crypto_order_id: UUID):
+    """Return a contradictory terminal-order/open-claim pair, if present.
+
+    This is a recovery seam for rows written before authoritative provider
+    rejection released claims at submission time.  It never classifies a
+    nonterminal order (and therefore never resolves an ambiguous outcome).
+    """
+    if not hasattr(db, "scalar"):
+        return None
+    order = await db.scalar(
+        select(LiveCryptoOrder).where(
+            LiveCryptoOrder.live_crypto_order_id == live_crypto_order_id,
+            LiveCryptoOrder.status.in_(_TERMINAL_ORDER_STATUSES),
+        ).limit(1)
+    )
+    if order is None or getattr(order, "status", None) not in _TERMINAL_ORDER_STATUSES:
+        return None
+    claim = await db.scalar(
+        select(AutonomousExecutionClaim).where(
+            AutonomousExecutionClaim.live_order_id == live_crypto_order_id,
+            AutonomousExecutionClaim.claim_status.in_(_NONTERMINAL_CLAIM_STATUSES),
+        ).limit(1)
+    )
+    if claim is None or getattr(claim, "claim_status", None) not in _NONTERMINAL_CLAIM_STATUSES:
+        return None
+    return order, claim
 
 
 async def poll_unresolved_live_orders(
@@ -153,6 +195,28 @@ async def poll_unresolved_live_orders(
         logger.info("live_order_reconciliation_attempt_started live_crypto_order_id=%s", live_crypto_order_id)
         recovery_latest_status: str | None = None
         try:
+            terminal_claim_context = await _terminal_unreleased_claim_context(
+                db=db, live_crypto_order_id=live_crypto_order_id,
+            )
+            if terminal_claim_context is not None:
+                terminal_order, terminal_claim = terminal_claim_context
+                previous_claim_status = terminal_claim.claim_status
+                from app.services.orchestration.autonomous_execution_claims import release_execution_claim_scope_if_order_resolved
+                await release_execution_claim_scope_if_order_resolved(
+                    db=db,
+                    live_crypto_order_id=live_crypto_order_id,
+                    order_status=terminal_order.status,
+                )
+                if hasattr(db, "commit"):
+                    await db.commit()
+                reconciled += 1
+                logger.info(
+                    "terminal_order_execution_claim_released live_crypto_order_id=%s claim_id=%s "
+                    "order_status=%s previous_claim_status=%s",
+                    live_crypto_order_id, terminal_claim.claim_id,
+                    terminal_order.status, previous_claim_status,
+                )
+                continue
             recovery_context = await _terminal_unresolved_context(
                 db=db, live_crypto_order_id=live_crypto_order_id,
             )

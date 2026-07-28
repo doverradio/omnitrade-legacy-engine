@@ -2473,7 +2473,7 @@ class LiveCryptoOrderService:
                 "create_order": safe_provider_body,
                 "create_order_payload": request_payload,
                 "safe_request_summary": safe_payload_summary,
-                "create_order_responded": False,
+                "create_order_responded": True,
             }
             live_order.status = "REJECTED"
             live_order.failure_code = "provider_rejected"
@@ -2488,6 +2488,12 @@ class LiveCryptoOrderService:
             )
             live_order.updated_at = _utcnow()
             await db.flush()
+            from app.services.orchestration.autonomous_execution_claims import release_execution_claim_scope_if_order_resolved
+            await release_execution_claim_scope_if_order_resolved(
+                db=db,
+                live_crypto_order_id=live_order.live_crypto_order_id,
+                order_status=live_order.status,
+            )
             await _commit_if_supported(db=db)
             logger.warning(
                 "kraken_order_rejected live_crypto_order_id=%s risk_event_id=%s failure_code=%s "

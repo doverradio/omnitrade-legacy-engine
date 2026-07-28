@@ -802,6 +802,15 @@ async def advance_claimed_execution(*, db: AsyncSession, claim: AutonomousExecut
         await _persist_provider_rejection_diagnostics(
             db=db, claim=prepared.claim, order=prepared.order,
         )
+        # An authoritative terminal provider outcome may release the claim
+        # inside LiveCryptoOrderService.submit() via the canonical release
+        # helper. Never overwrite that terminal state with the commissioned
+        # response's ordinary post-submission state.
+        if prepared.claim.claim_status not in _CLAIM_SCOPE_NONTERMINAL_STATES:
+            prepared.claim.reconciliation_state = execution.current_state
+            prepared.claim.updated_at = _utcnow()
+            await db.flush()
+            return
         prepared.claim.claim_status = (
             "RECONCILIATION_REQUIRED"
             if execution.current_state == "RECONCILIATION_REQUIRED"
