@@ -1720,16 +1720,33 @@ async def test_controlled_proof_forced_sell_decision_record_reports_sell_action(
         controlled_proof_id=proof_id,
     )
 
+    captured: dict[str, object] = {}
+
+    async def _create_sell_preview(*, db, request, actor):
+        captured["side"] = request.side
+        captured["quote_size"] = request.quote_size
+        captured["base_size"] = request.base_size
+        captured["actor"] = actor
+        return SimpleNamespace(crypto_order_preview_id=preview_id)
+
     monkeypatch.setattr(cpp, "_load_exchange_connection_for_scope", _async_return(SimpleNamespace(exchange_connection_id=uuid4())))
     monkeypatch.setattr(cpp, "compute_signed_owned_quantity", _async_return(Decimal("0.05")))
     monkeypatch.setattr(cpp, "_resolve_strategy_and_parameter_binding", _async_return((strategy, parameter_set)))
-    monkeypatch.setattr(cpp, "create_crypto_order_preview", _async_return(SimpleNamespace(crypto_order_preview_id=preview_id)))
+    monkeypatch.setattr(cpp, "create_crypto_order_preview", _create_sell_preview)
     monkeypatch.setattr(cpp, "_load_preview_by_id", _async_return(preview))
 
     db = _FakeDb()
-    await cpp._create_crypto_order_preview_for_package(
+    resolved = await cpp._create_crypto_order_preview_for_package(
         db=db, request=request, profile=profile, composition=composition, selected_decision=selected_decision,
     )
+
+    assert resolved.status == "PREVIEW_READY"
+    assert captured == {
+        "side": "SELL",
+        "quote_size": None,
+        "base_size": Decimal("0.05"),
+        "actor": "operator:human",
+    }
 
     created_records = [obj for obj in db.added if isinstance(obj, DecisionRecord)]
     assert len(created_records) == 1

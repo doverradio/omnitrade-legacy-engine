@@ -825,7 +825,8 @@ class KrakenSpotClient:
     ) -> ExchangePreviewResult:
         _ = credentials
         _ = client_order_id
-        if side.upper() != "BUY":
+        normalized_side = side.upper()
+        if normalized_side not in {"BUY", "SELL"}:
             return ExchangePreviewResult(
                 preview_id=None,
                 success=False,
@@ -842,6 +843,11 @@ class KrakenSpotClient:
                 best_bid=None,
                 best_ask=None,
                 exchange_response_summary={"reason": "only_buy_supported"},
+            )
+        if normalized_side == "SELL" and (base_size is None or quote_size is not None):
+            raise InvalidRequestError(
+                message="Kraken SELL preview requires base_size only",
+                details={"product_id": product_id},
             )
         if quote_size is None and base_size is None:
             raise InvalidRequestError(
@@ -886,20 +892,23 @@ class KrakenSpotClient:
         bid_arr = ticker_row.get("b") if isinstance(ticker_row.get("b"), list) else []
         best_ask = _to_decimal(ask_arr[0] if len(ask_arr) > 0 else None)
         best_bid = _to_decimal(bid_arr[0] if len(bid_arr) > 0 else None)
-        if best_ask <= Decimal("0"):
+        if normalized_side == "BUY" and best_ask <= Decimal("0"):
             raise InvalidRequestError(message="Kraken best ask unavailable", details={"pair": altname})
+        if normalized_side == "SELL" and best_bid <= Decimal("0"):
+            raise InvalidRequestError(message="Kraken best bid unavailable", details={"pair": altname})
 
         pair_decimals = int(pair_info.get("pair_decimals") or 1)
         lot_decimals = int(pair_info.get("lot_decimals") or 8)
         ordermin = _to_decimal(pair_info.get("ordermin"))
         costmin = _to_decimal(pair_info.get("costmin"))
 
+        reference_price = best_bid if normalized_side == "SELL" else best_ask
         if quote_size is not None:
             estimated_quote_size = quote_size
             estimated_base_size = _quantize(quote_size / best_ask, lot_decimals)
         else:
             estimated_base_size = _quantize(base_size or Decimal("0"), lot_decimals)
-            estimated_quote_size = _quantize(estimated_base_size * best_ask, pair_decimals)
+            estimated_quote_size = _quantize(estimated_base_size * reference_price, pair_decimals)
 
         if ordermin > Decimal("0") and estimated_base_size < ordermin:
             return ExchangePreviewResult(
@@ -907,7 +916,7 @@ class KrakenSpotClient:
                 success=False,
                 failure_reason="below_min_order_size",
                 warning_messages=[],
-                estimated_average_price=best_ask,
+                estimated_average_price=reference_price,
                 estimated_total_value=estimated_quote_size,
                 estimated_base_size=estimated_base_size,
                 estimated_quote_size=estimated_quote_size,
@@ -932,7 +941,7 @@ class KrakenSpotClient:
                 success=False,
                 failure_reason="below_min_order_cost",
                 warning_messages=[],
-                estimated_average_price=best_ask,
+                estimated_average_price=reference_price,
                 estimated_total_value=estimated_quote_size,
                 estimated_base_size=estimated_base_size,
                 estimated_quote_size=estimated_quote_size,
@@ -956,13 +965,17 @@ class KrakenSpotClient:
             success=True,
             failure_reason=None,
             warning_messages=[],
-            estimated_average_price=best_ask,
+            estimated_average_price=reference_price,
             estimated_total_value=estimated_quote_size,
             estimated_base_size=estimated_base_size,
             estimated_quote_size=estimated_quote_size,
             estimated_fee=None,
             estimated_fee_currency="USD",
-            estimated_slippage=None if best_bid <= Decimal("0") else abs(best_ask - best_bid) / best_ask,
+            estimated_slippage=(
+                None
+                if best_bid <= Decimal("0") or best_ask <= Decimal("0")
+                else abs(best_ask - best_bid) / reference_price
+            ),
             estimated_commission_total=None,
             best_bid=best_bid,
             best_ask=best_ask,

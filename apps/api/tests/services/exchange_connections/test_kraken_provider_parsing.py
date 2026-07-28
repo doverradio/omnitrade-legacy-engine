@@ -122,8 +122,93 @@ async def test_kraken_preview_uses_asset_pairs_and_ticker(monkeypatch: pytest.Mo
     )
 
     assert preview.success is True
+    assert preview.estimated_average_price == Decimal("50000")
+    assert preview.estimated_quote_size == Decimal("5")
     assert preview.estimated_base_size is not None
     assert preview.exchange_response_summary["source"] == "kraken_public_assetpairs_ticker"
+
+
+def _kraken_preview_public_response(*, ordermin: str = "0.0001", costmin: str = "0.5"):
+    async def _public(*, path, **_kwargs):
+        if path == "/public/AssetPairs":
+            return {
+                "error": [],
+                "result": {
+                    "XXBTZUSD": {
+                        "altname": "XBTUSD",
+                        "wsname": "XBT/USD",
+                        "base": "BTC",
+                        "quote": "USD",
+                        "status": "online",
+                        "pair_decimals": 1,
+                        "lot_decimals": 8,
+                        "ordermin": ordermin,
+                        "costmin": costmin,
+                    }
+                },
+            }
+        return {"error": [], "result": {"XXBTZUSD": {"a": ["50000", "1", "1"], "b": ["49995", "1", "1"]}}}
+
+    return _public
+
+
+@pytest.mark.asyncio
+async def test_kraken_sell_preview_uses_best_bid(monkeypatch: pytest.MonkeyPatch) -> None:
+    client = KrakenSpotClient()
+    monkeypatch.setattr(client, "_public_request", _kraken_preview_public_response())
+
+    preview = await client.preview_market_order(
+        credentials={"api_key": "k", "api_secret": "s"},
+        environment="production",
+        product_id="BTC-USD",
+        side="SELL",
+        quote_size=None,
+        base_size=Decimal("0.0002"),
+    )
+
+    assert preview.success is True
+    assert preview.estimated_average_price == Decimal("49995")
+    assert preview.estimated_base_size == Decimal("0.00020000")
+    assert preview.estimated_quote_size == Decimal("9.9")
+
+
+@pytest.mark.asyncio
+async def test_kraken_sell_preview_below_minimum_order_size(monkeypatch: pytest.MonkeyPatch) -> None:
+    client = KrakenSpotClient()
+    monkeypatch.setattr(client, "_public_request", _kraken_preview_public_response(ordermin="0.001"))
+
+    preview = await client.preview_market_order(
+        credentials={}, environment="production", product_id="BTC-USD", side="SELL",
+        quote_size=None, base_size=Decimal("0.0002"),
+    )
+
+    assert preview.success is False
+    assert preview.failure_reason == "below_min_order_size"
+    assert preview.estimated_average_price == Decimal("49995")
+
+
+@pytest.mark.asyncio
+async def test_kraken_sell_preview_below_minimum_cost(monkeypatch: pytest.MonkeyPatch) -> None:
+    client = KrakenSpotClient()
+    monkeypatch.setattr(client, "_public_request", _kraken_preview_public_response(costmin="20"))
+
+    preview = await client.preview_market_order(
+        credentials={}, environment="production", product_id="BTC-USD", side="SELL",
+        quote_size=None, base_size=Decimal("0.0002"),
+    )
+
+    assert preview.success is False
+    assert preview.failure_reason == "below_min_order_cost"
+    assert preview.estimated_average_price == Decimal("49995")
+
+
+@pytest.mark.asyncio
+async def test_kraken_sell_preview_requires_base_size() -> None:
+    with pytest.raises(InvalidRequestError, match="SELL preview requires base_size only"):
+        await KrakenSpotClient().preview_market_order(
+            credentials={}, environment="production", product_id="BTC-USD", side="SELL",
+            quote_size=None, base_size=None,
+        )
 
 
 @pytest.mark.asyncio
