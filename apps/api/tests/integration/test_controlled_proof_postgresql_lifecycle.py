@@ -462,7 +462,8 @@ async def test_complete_controlled_proof_buy_sell_lifecycle_uses_canonical_servi
             await session.commit()
 
             view = await controlled_proof_service.get_controlled_proof_view(db=session, proof_id=proof_id)
-            assert view["status"] in {"RECONCILED", "EXITED", "PROFIT_CONFIRMED"}
+            assert view["status"] == "PROFIT_CONFIRMED"
+            assert view["terminal_verdict"] == "LIFECYCLE_PROVEN_PROFIT"
             assert view["net_pnl_usd"] == Decimal("0.008")
             assert [item[0] for item in boundary.submissions] == ["BUY", "SELL"]
 

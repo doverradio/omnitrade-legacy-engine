@@ -522,3 +522,48 @@ Always explain:
 - long-term consequences
 
 The goal is to preserve engineering reasoning for every future contributor, human or AI.
+
+---
+
+## 2026-07 — External Historical-Order Reconciliation Finality
+
+Decision
+
+An order carrying the exact `EXTERNALLY_EXECUTED_MANUAL_TRADE` authority
+classification may reach economic reconciliation finality without an
+OmniTrade pre-submit balance snapshot. The snapshot is classified as
+`not_applicable_external_provenance`, not fabricated, inferred, or reported as
+observed. Terminal provider order identity, authoritative fills and fees,
+canonical accounting and ownership projection, and durable audit evidence
+remain required. OmniTrade-submitted orders retain the existing fresh pre/post
+balance-causality requirement unchanged.
+
+Reason
+
+The production recovery bridge imports trades that were executed outside
+OmniTrade. Such a trade cannot truthfully possess decision-time evidence from a
+submission path it never traversed. Keeping it permanently unresolved conflates
+an impossible provenance datum with genuine provider or accounting ambiguity,
+leaving accurate accounting and ownership behind a gate no replay can clear.
+Economic reconciliation does not retroactively grant Risk, Decision, Mandate,
+Campaign, or Controlled Proof authority.
+
+Alternatives Considered
+
+Require the identical OmniTrade-submission evidence contract and leave every
+external historical order permanently unresolved. Rejected because it makes the
+operator recovery bridge non-convergent and makes `reconciliation_required`
+describe known inapplicability rather than unresolved economic evidence.
+
+Create a separate external-order reconciliation or accounting path. Rejected
+because provider lookup, fills, fees, accounting, ownership, audit, and
+idempotency must remain canonical and shared.
+
+Consequences
+
+The reconciliation scheduler can append a newer immutable terminal event for a
+fully evidenced external order and clear latest-event gates. Missing or
+conflicting provider identity, order state, fills, accounting, ownership, or
+audit evidence continues to fail closed. The terminal event and accounting
+evidence retain the external authority classification and never imply governed
+OmniTrade execution lineage.

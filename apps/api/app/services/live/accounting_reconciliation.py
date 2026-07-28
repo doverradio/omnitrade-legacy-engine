@@ -55,6 +55,7 @@ def build_live_reconciliation_idempotency_key(
 
 
 _RECONCILIATION_TERMINAL_STATUSES = {"filled", "canceled", "rejected"}
+_EXTERNAL_EXECUTION_AUTHORITY = "EXTERNALLY_EXECUTED_MANUAL_TRADE"
 
 
 def _utcnow() -> datetime:
@@ -580,6 +581,11 @@ async def reconcile_live_order_and_fills(
             pre_balance = _decimal(raw)
             break
 
+    authority_classification = str(
+        (live_order.safe_provider_response or {}).get("authority_classification") or ""
+    ).strip().upper()
+    is_external_execution = authority_classification == _EXTERNAL_EXECUTION_AUTHORITY
+
     post_balance = None
     for item in connection.balances or []:
         if str(item.get("currency", "")).upper() == quote_currency:
@@ -601,6 +607,16 @@ async def reconcile_live_order_and_fills(
     balance_mismatch_state = "ok"
     if total_quote_notional <= Decimal("0"):
         balance_mismatch_state = "not_required"
+    elif is_external_execution and pre_balance is None:
+        # External historical orders were executed outside OmniTrade, so an
+        # OmniTrade decision-time balance snapshot cannot truthfully exist.
+        # Their exact provenance classification permits economic finality from
+        # authoritative provider order/fill/fee evidence plus the canonical
+        # accounting, ownership, and audit writes below. This never grants
+        # Risk, Decision, Mandate, Campaign, or Controlled Proof lineage, and
+        # every OmniTrade-submitted order retains the normal pre/post balance
+        # causality requirement.
+        balance_mismatch_state = "not_applicable_external_provenance"
     elif post_balance is None:
         balance_mismatch_state = "missing"
     elif is_stale_balance:
@@ -615,7 +631,9 @@ async def reconcile_live_order_and_fills(
         elif delta > Decimal("0"):
             balance_mismatch_state = "tolerated"
 
-    balance_status = "ok" if balance_mismatch_state in {"ok", "tolerated", "not_required"} else "mismatch"
+    balance_status = "ok" if balance_mismatch_state in {
+        "ok", "tolerated", "not_required", "not_applicable_external_provenance",
+    } else "mismatch"
 
     preview_fee = _decimal(live_order.safe_provider_response.get("preview_estimated_fee", "0")) if live_order.safe_provider_response.get("preview_estimated_fee") is not None else Decimal("0")
     provider_fee_total = total_fees_by_currency.get("USD", Decimal("0"))
@@ -699,6 +717,8 @@ async def reconcile_live_order_and_fills(
                     "net_quote_capital_effect": format(expected_quote_cash_delta, "f"),
                     "campaign_correlation_status": campaign_correlation_status,
                     "accounting_projection_status": accounting_projection_status,
+                    "authority_classification": authority_classification or None,
+                    "balance_mismatch_state": balance_mismatch_state,
                 },
                 provenance_metadata={"phase": "10.6C"},
                 live_execution_event_id=source_event.id,
@@ -735,10 +755,26 @@ async def reconcile_live_order_and_fills(
         # persisted must append a newer terminal resolution; otherwise every
         # latest-event reconciliation guard remains blocked forever even
         # though this pass proved the accounting complete. The balance
-        # observation timestamp makes the immutable event idempotent for one
-        # exact external snapshot.
-        balance_resolution_identity = (
-            "none" if balance_observed_at is None else balance_observed_at.isoformat()
+        # observation timestamp makes ordinary balance resolution idempotent
+        # for one exact external snapshot. External-provenance resolution has
+        # one stable identity because the absent OmniTrade snapshot can never
+        # truthfully change on replay.
+        external_provenance_resolution = (
+            balance_mismatch_state == "not_applicable_external_provenance"
+        )
+        resolution_reason = (
+            "external_provenance_evidence_resolved"
+            if external_provenance_resolution
+            else "balance_evidence_resolved"
+        )
+        resolution_identity = (
+            "external-provenance"
+            if external_provenance_resolution
+            else (
+                "none"
+                if balance_observed_at is None
+                else balance_observed_at.isoformat()
+            )
         )
         await record_live_order_reconciliation(
             db=db,
@@ -754,12 +790,13 @@ async def reconcile_live_order_and_fills(
                 provider_recorded_at=balance_observed_at,
                 requested_by=operator_identity,
                 provenance_metadata={
-                    "reason": "balance_evidence_resolved",
+                    "reason": resolution_reason,
                     "balance_mismatch_state": balance_mismatch_state,
+                    "authority_classification": authority_classification or None,
                 },
                 idempotency_key=(
                     f"lco-reconcile:{live_order.live_crypto_order_id}:balance-resolved:"
-                    f"{balance_resolution_identity}"
+                    f"{resolution_identity}"
                 ),
             ),
         )

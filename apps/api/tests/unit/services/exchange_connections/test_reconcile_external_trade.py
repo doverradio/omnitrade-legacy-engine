@@ -23,6 +23,7 @@ from app.models.live_reconciliation_event import LiveReconciliationEvent
 from app.models.live_trading_profile import LiveTradingProfile
 from app.schemas.exchange_connections import ReconcileExternalTradeRequest
 from app.services.exchange_connections import service as exchange_connections_service
+from app.services.live.accounting_reconciliation import reconcile_live_order_and_fills
 from tests.support.real_sqlite_session import real_sqlite_session
 
 # LiveAuditEvidenceRecord is deliberately excluded: its
@@ -251,14 +252,12 @@ async def test_reconcile_external_trade_imports_filled_sell_and_zeroes_owned_qua
         assert response.live_crypto_order.status == "FILLED"
         assert response.live_crypto_order.side == "SELL"
         assert response.reconciliation_status == "FILLED"
-        # "unresolved" here is the honest, expected outcome for an
-        # externally-imported trade, not a defect: reconcile_live_order_and_
-        # fills' own balance-mismatch heuristic requires a pre-submit USD
-        # balance snapshot (usd_available_before_submit) that only a trade
-        # OmniTrade itself submitted would ever have recorded. It never
-        # blocks the accounting write below -- fills are persisted before
-        # this advisory field is computed.
-        assert response.accounting_completion_status == "unresolved"
+        # External provenance is not canonical submission lineage: the
+        # OmniTrade pre-submit balance snapshot truthfully never existed.
+        # Authoritative provider order/fill/fee evidence therefore completes
+        # economic reconciliation without fabricating Risk, Decision,
+        # Mandate, Campaign, or Controlled Proof authority.
+        assert response.accounting_completion_status == "complete"
         assert response.provider_fill_observed is True
 
         # Explicit external-trade provenance -- never implies Risk Engine,
@@ -272,6 +271,47 @@ async def test_reconcile_external_trade_imports_filled_sell_and_zeroes_owned_qua
         assert stored.validation_run_id is None
         assert stored.safe_provider_response.get("authority_classification") == "EXTERNALLY_EXECUTED_MANUAL_TRADE"
         assert stored.safe_provider_response.get("capital_campaign_id") is None
+        assert stored.safe_provider_response["reconciliation"]["balance_mismatch_state"] == "not_applicable_external_provenance"
+        assert stored.safe_provider_response["reconciliation"]["accounting_completion_status"] == "complete"
+
+        latest_reconciliation = await session.scalar(
+            select(LiveReconciliationEvent)
+            .where(LiveReconciliationEvent.live_crypto_order_id == stored.live_crypto_order_id)
+            .order_by(LiveReconciliationEvent.sequence_number.desc())
+            .limit(1)
+        )
+        assert latest_reconciliation is not None
+        assert latest_reconciliation.reconciliation_status == "filled"
+        assert latest_reconciliation.provenance["reason"] == "external_provenance_evidence_resolved"
+
+        # Canonical replay is convergent: the historical unresolved production
+        # shape can be retried by the scheduler without duplicating accounting
+        # or terminal evidence.
+        accounting_count = len((await session.scalars(
+            select(LiveAccountingRecord).where(
+                LiveAccountingRecord.live_crypto_order_id == stored.live_crypto_order_id,
+            )
+        )).all())
+        resolution_count = len((await session.scalars(
+            select(LiveReconciliationEvent).where(
+                LiveReconciliationEvent.live_crypto_order_id == stored.live_crypto_order_id,
+                LiveReconciliationEvent.idempotency_key.endswith(":balance-resolved:external-provenance"),
+            )
+        )).all())
+
+        replay = await reconcile_live_order_and_fills(
+            db=session,
+            live_crypto_order_id=stored.live_crypto_order_id,
+            operator_identity="system:reconciliation_scheduler",
+        )
+        assert replay["accounting_completion_status"] == "complete"
+        assert len((await session.scalars(select(LiveAccountingRecord).where(
+            LiveAccountingRecord.live_crypto_order_id == stored.live_crypto_order_id,
+        ))).all()) == accounting_count
+        assert len((await session.scalars(select(LiveReconciliationEvent).where(
+            LiveReconciliationEvent.live_crypto_order_id == stored.live_crypto_order_id,
+            LiveReconciliationEvent.idempotency_key.endswith(":balance-resolved:external-provenance"),
+        ))).all()) == resolution_count == 1
 
         # BUY 0.00007817 minus imported SELL 0.00007817 == 0 owned quantity --
         # verified by calling the actual production function
