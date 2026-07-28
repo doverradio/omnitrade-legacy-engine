@@ -30,6 +30,20 @@ def _db(*, campaign, orders=(), reconciliations=(), accounting=()):
     )
 
 
+def _order(*, status: str, submitted_at: datetime | None) -> SimpleNamespace:
+    return SimpleNamespace(
+        live_crypto_order_id=uuid4(), status=status,
+        submitted_at=submitted_at, created_at=submitted_at or datetime.now(timezone.utc),
+    )
+
+
+def _reconciliation(*, order, status: str, now: datetime) -> SimpleNamespace:
+    return SimpleNamespace(
+        id=uuid4(), live_crypto_order_id=order.live_crypto_order_id,
+        reconciliation_status=status, recorded_at=now,
+    )
+
+
 async def _snapshot(db, now):
     return await build_risk_accounting_snapshot(
         db=db, campaign_id=db.scalar.return_value.uuid, campaign_version=1,
@@ -73,6 +87,58 @@ async def test_unresolved_submission_prevents_optimistic_zero() -> None:
     db = SimpleNamespace(scalar=AsyncMock(return_value=campaign), scalars=AsyncMock(side_effect=[_Rows([order]), _Rows([])]))
     with pytest.raises(RiskAccountingUnavailableError) as exc:
         await _snapshot(db, now)
+    assert exc.value.reason_code == "unresolved_provider_exposure"
+
+
+@pytest.mark.asyncio
+async def test_authoritative_rejection_without_reconciliation_is_zero_exposure() -> None:
+    now = datetime.now(timezone.utc)
+    campaign = SimpleNamespace(id=11, uuid=uuid4(), definition_version=1, paper_account_id=uuid4(), starting_capital=10, current_equity=10)
+    order = _order(status="REJECTED", submitted_at=now)
+
+    result = await _snapshot(_db(campaign=campaign, orders=[order]), now)
+
+    assert result.current_open_exposure_usd == 0
+    assert result.current_position_count == 0
+    assert result.evidence_ids["live_crypto_order_ids"] == [str(order.live_crypto_order_id)]
+
+
+@pytest.mark.asyncio
+async def test_rejection_with_unresolved_reconciliation_remains_blocked() -> None:
+    now = datetime.now(timezone.utc)
+    campaign = SimpleNamespace(id=12, uuid=uuid4(), definition_version=1, paper_account_id=uuid4(), starting_capital=10, current_equity=10)
+    order = _order(status="REJECTED", submitted_at=now)
+    reconciliation = _reconciliation(order=order, status="reconciliation_required", now=now)
+
+    with pytest.raises(RiskAccountingUnavailableError) as exc:
+        await _snapshot(_db(campaign=campaign, orders=[order], reconciliations=[reconciliation]), now)
+
+    assert exc.value.reason_code == "unresolved_provider_exposure"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("status", ["UNKNOWN", "RECONCILIATION_REQUIRED"])
+async def test_explicitly_unresolved_order_status_remains_blocked(status: str) -> None:
+    now = datetime.now(timezone.utc)
+    campaign = SimpleNamespace(id=13, uuid=uuid4(), definition_version=1, paper_account_id=uuid4(), starting_capital=10, current_equity=10)
+    order = _order(status=status, submitted_at=now)
+
+    with pytest.raises(RiskAccountingUnavailableError) as exc:
+        await _snapshot(_db(campaign=campaign, orders=[order]), now)
+
+    assert exc.value.reason_code == "unresolved_provider_exposure"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("status", ["SUBMISSION_PENDING", "ACKNOWLEDGED", "PARTIALLY_FILLED", "FILLED"])
+async def test_submitted_order_without_authoritative_accounting_remains_blocked(status: str) -> None:
+    now = datetime.now(timezone.utc)
+    campaign = SimpleNamespace(id=14, uuid=uuid4(), definition_version=1, paper_account_id=uuid4(), starting_capital=10, current_equity=10)
+    order = _order(status=status, submitted_at=now)
+
+    with pytest.raises(RiskAccountingUnavailableError) as exc:
+        await _snapshot(_db(campaign=campaign, orders=[order]), now)
+
     assert exc.value.reason_code == "unresolved_provider_exposure"
 
 

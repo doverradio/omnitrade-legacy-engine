@@ -107,11 +107,27 @@ async def build_risk_accounting_snapshot(
             latest_reconciliation[row.live_crypto_order_id] = row
 
     unresolved_statuses = {"RECONCILIATION_REQUIRED", "UNKNOWN"}
+    unresolved_reconciliation_statuses = {
+        "open", "reconciliation_required", "unknown", "conflict", "balance_mismatch",
+    }
     for order in scoped_orders:
         latest = latest_reconciliation.get(order.live_crypto_order_id)
-        if order.status in unresolved_statuses or (
+        unresolved_reconciliation = (
+            latest is not None
+            and latest.reconciliation_status in unresolved_reconciliation_statuses
+        )
+        submitted_without_authoritative_outcome = (
             order.submitted_at is not None
-            and (latest is None or latest.reconciliation_status in {"open", "reconciliation_required", "unknown", "conflict", "balance_mismatch"})
+            and latest is None
+            # REJECTED is itself the authoritative provider disposition: the
+            # provider accepted no order, so there is no fill or exposure to
+            # reconcile. No other status receives this exemption.
+            and order.status != "REJECTED"
+        )
+        if (
+            order.status in unresolved_statuses
+            or unresolved_reconciliation
+            or submitted_without_authoritative_outcome
         ):
             raise RiskAccountingUnavailableError(
                 "unresolved_provider_exposure",
