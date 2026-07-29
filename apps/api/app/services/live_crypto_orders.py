@@ -8,7 +8,7 @@ from datetime import datetime, timedelta, timezone
 from decimal import Decimal, ROUND_DOWN
 from typing import Any
 
-from sqlalchemy import and_, func, select
+from sqlalchemy import and_, func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import get_settings
@@ -65,7 +65,12 @@ from app.services.live.resilience import evaluate_live_submission_guard
 from app.services.risk.risk_monitor import get_risk_rules
 from app.services.risk.risk_engine import RiskDecisionAction, RiskEvaluationContext, RiskEvaluationRequest, evaluate_signal_risk
 from app.services.risk.risk_persistence import RiskDecisionPersistenceRequest, persist_risk_decision
-from app.services.mandates.contracts import AUTONOMY_LEVEL_2, MANDATE_APPROVAL_RESULT_ACTIVE_MANDATE
+from app.services.mandates.contracts import (
+    AUTONOMY_LEVEL_2,
+    MANDATE_APPROVAL_RESULT_ACTIVE_MANDATE,
+    MANDATE_PURPOSE_CONTROLLED_PROOF,
+    MANDATE_PURPOSE_PRODUCTION,
+)
 from app.services.mandates.evidence import MandateEvaluationWriteRequest, evaluate_and_record_mandate
 from app.services.strategies.identity import parse_strategy_identity
 
@@ -460,6 +465,7 @@ async def _find_active_level2_mandate_for_scope(
     environment: str,
     exchange_connection_id: uuid.UUID,
     live_trading_profile_id: uuid.UUID,
+    purpose: str,
 ) -> AutonomousCapitalMandate | None:
     """Resolve the mandate (if any) that could exempt this submission from
     manual confirmation. Scoped exactly like _load_canonical_proving_activation_for_scope
@@ -467,8 +473,14 @@ async def _find_active_level2_mandate_for_scope(
     about which mandate applies can be spoofed by the submit request itself.
     ACTIVE and EXIT_ONLY both count as "active enough to evaluate": the
     deterministic checks inside evaluate_mandate_eligibility (status,
-    autonomy_level, expiry, revocation, scope, limits) make the final call,
-    not this lookup -- this only narrows to candidates worth evaluating."""
+    autonomy_level, expiry, revocation, scope, limits, purpose) make the
+    final call, not this lookup -- this only narrows to candidates worth
+    evaluating. purpose additionally scopes this to PRODUCTION or
+    CONTROLLED_PROOF mandates only, backed by the real
+    uq_ac_mandates_active_scope_purpose partial unique index, which
+    guarantees at most one ACTIVE match for a given
+    (scope, autonomy_level, purpose) -- this is never an ambiguous "latest
+    active" pick."""
     return await db.scalar(
         select(AutonomousCapitalMandate)
         .where(AutonomousCapitalMandate.provider == provider)
@@ -476,6 +488,7 @@ async def _find_active_level2_mandate_for_scope(
         .where(AutonomousCapitalMandate.exchange_connection_id == exchange_connection_id)
         .where(AutonomousCapitalMandate.live_trading_profile_id == live_trading_profile_id)
         .where(AutonomousCapitalMandate.autonomy_level == AUTONOMY_LEVEL_2)
+        .where(AutonomousCapitalMandate.purpose == purpose)
         .where(AutonomousCapitalMandate.status.in_(["ACTIVE", "EXIT_ONLY"]))
         .order_by(AutonomousCapitalMandate.created_at.desc())
         .limit(1)
@@ -1385,16 +1398,25 @@ async def _evaluate_level2_mandate_authorization(
     db: AsyncSession,
     live_order: LiveCryptoOrder,
     actor: str,
-) -> tuple[bool, uuid.UUID | None]:
+) -> tuple[bool, uuid.UUID | None, str | None]:
     """The single point where an active LEVEL_2 mandate may satisfy the
     manual confirmation-phrase requirement in submit() (ADR-0011,
     AUTONOMOUS_CAPITAL_MANAGEMENT_MODE_SPEC.md Phase E). Returns
-    (authorized, mandate_id). Every failure mode -- no mandate found, scope
-    unresolved, or evaluate_mandate_eligibility rejecting for any reason --
-    returns (False, ...) and logs why; the caller's existing manual-phrase
-    behavior then applies unchanged. This function never raises for an
-    absent or ineligible mandate -- only genuine unexpected errors should
-    propagate, since "no mandate" is an expected, common, safe outcome."""
+    (authorized, mandate_id, denial_reason). Every failure mode -- no
+    mandate found, scope unresolved, or evaluate_mandate_eligibility
+    rejecting for any reason -- returns (False, ...) and logs why; the
+    caller's existing manual-phrase behavior then applies unchanged. This
+    function never raises for an absent or ineligible mandate -- only
+    genuine unexpected errors should propagate, since "no mandate" is an
+    expected, common, safe outcome.
+
+    denial_reason is deliberately None whenever no real mandate was ever
+    found/resolvable, or evaluation itself failed unexpectedly (both
+    legitimate manual-confirmation fallbacks, unchanged) -- it is only ever
+    a concrete reason_code when a real, resolved mandate was evaluated and
+    explicitly denied, which is the one case the caller must never let fall
+    through to the confirmation-phrase check for an autonomous submission.
+    """
     # CryptoOrderPreview has no live_trading_profile_id column (confirmed by
     # introspecting CryptoOrderPreview.__table__.columns -- it genuinely does
     # not exist), so profile scope cannot be resolved from the preview
@@ -1412,7 +1434,7 @@ async def _evaluate_level2_mandate_authorization(
             "level2_mandate_denied live_crypto_order_id=%s authorization_source=MANUAL authorization_reason=preview_scope_unresolved",
             live_order.live_crypto_order_id,
         )
-        return False, None
+        return False, None, None
 
     scope_risk_event = await db.scalar(
         select(RiskEvent).where(RiskEvent.id == live_order.risk_event_id).limit(1)
@@ -1422,7 +1444,7 @@ async def _evaluate_level2_mandate_authorization(
             "level2_mandate_denied live_crypto_order_id=%s authorization_source=MANUAL authorization_reason=risk_event_scope_unresolved",
             live_order.live_crypto_order_id,
         )
-        return False, None
+        return False, None, None
 
     scope_profile = await db.scalar(
         select(LiveTradingProfile)
@@ -1434,25 +1456,59 @@ async def _evaluate_level2_mandate_authorization(
             "level2_mandate_denied live_crypto_order_id=%s authorization_source=MANUAL authorization_reason=profile_scope_unresolved",
             live_order.live_crypto_order_id,
         )
-        return False, None
+        return False, None, None
 
     live_trading_profile_id = scope_profile.id
     preview_created_at = scope_preview.created_at
     paper_account_id = scope_profile.paper_account_id
 
+    # Which purpose this order is required to have been authorized under:
+    # CONTROLLED_PROOF only when its package is linked (BUY or SELL side) to
+    # a ControlledProofRun, PRODUCTION otherwise. A missing package is
+    # treated as "not Controlled Proof" -- never a hard failure here; the
+    # purpose filter on the scope lookup below and evaluate_mandate_
+    # eligibility's mandate_purpose_match check are what actually enforce
+    # the separation between the two mandate purposes.
+    expected_mandate_purpose = MANDATE_PURPOSE_PRODUCTION
+    scope_package = await db.scalar(
+        select(CanonicalPreviewPackage)
+        .where(CanonicalPreviewPackage.crypto_order_preview_id == scope_preview.crypto_order_preview_id)
+        .limit(1)
+    )
+    if scope_package is not None:
+        controlled_proof_id = await db.scalar(
+            select(ControlledProofRun.proof_id).where(
+                or_(
+                    ControlledProofRun.package_id == scope_package.package_id,
+                    ControlledProofRun.sell_package_id == scope_package.package_id,
+                )
+            ).limit(1)
+        )
+        if controlled_proof_id is not None:
+            expected_mandate_purpose = MANDATE_PURPOSE_CONTROLLED_PROOF
+
+    # Scoped by identity (provider/environment/connection/profile/autonomy
+    # level) AND purpose -- never a caller-supplied mandate_id, so nothing
+    # about which mandate applies can be spoofed by the submit request
+    # itself. uq_ac_mandates_active_scope_purpose (a real partial unique
+    # index) guarantees at most one ACTIVE mandate can ever match this
+    # exact (scope, autonomy_level, purpose) combination, so this is no
+    # longer an ambiguous "pick the latest" lookup -- ORDER BY/LIMIT 1
+    # remains only as defense in depth.
     mandate = await _find_active_level2_mandate_for_scope(
         db=db,
         provider=live_order.provider,
         environment=live_order.environment,
         exchange_connection_id=live_order.exchange_connection_id,
         live_trading_profile_id=live_trading_profile_id,
+        purpose=expected_mandate_purpose,
     )
     if mandate is None:
         logger.info(
             "level2_mandate_denied live_crypto_order_id=%s authorization_source=MANUAL authorization_reason=no_active_mandate",
             live_order.live_crypto_order_id,
         )
-        return False, None
+        return False, None, None
 
     # A mandate matching scope was found. Everything from here on (loading
     # campaign/kill-switch/preview-identity evidence, evaluating and
@@ -1501,6 +1557,18 @@ async def _evaluate_level2_mandate_authorization(
             environment=live_order.environment,
             product=live_order.product_id,
         )
+        controlled_proof_open_exposure_usd = Decimal("0")
+        if expected_mandate_purpose == MANDATE_PURPOSE_CONTROLLED_PROOF:
+            # Lazy import: app.services.controlled_proof's package __init__
+            # transitively imports LiveCryptoOrderService (via
+            # asset_commissioning -> capital_campaign_domain ->
+            # commissioned_entry_execution), so a module-level import here
+            # would be circular.
+            from app.services.controlled_proof.exposure import compute_controlled_proof_open_exposure_usd
+
+            controlled_proof_open_exposure_usd = await compute_controlled_proof_open_exposure_usd(
+                db=db, live_trading_profile_id=live_trading_profile_id,
+            )
 
         mandate_eval = await evaluate_and_record_mandate(
             db=db,
@@ -1538,6 +1606,8 @@ async def _evaluate_level2_mandate_authorization(
                 idempotency_key=f"level2-submit-eval:{live_order.live_crypto_order_id}",
                 audit_correlation_id=uuid.uuid4(),
                 software_build_version=None,
+                expected_mandate_purpose=expected_mandate_purpose,
+                controlled_proof_open_exposure_usd=controlled_proof_open_exposure_usd,
             ),
         )
     except RiskAccountingUnavailableError as exc:
@@ -1555,20 +1625,20 @@ async def _evaluate_level2_mandate_authorization(
             live_order.live_crypto_order_id, mandate.mandate_id,
             exc_info=True,
         )
-        return False, mandate.mandate_id
+        return False, mandate.mandate_id, None
 
     if mandate_eval.approval_result == MANDATE_APPROVAL_RESULT_ACTIVE_MANDATE:
         logger.info(
             "level2_mandate_authorized live_crypto_order_id=%s mandate_id=%s authorization_source=LEVEL_2 authorization_reason=%s",
             live_order.live_crypto_order_id, mandate.mandate_id, mandate_eval.reason_code,
         )
-        return True, mandate.mandate_id
+        return True, mandate.mandate_id, None
 
     logger.info(
         "level2_mandate_denied live_crypto_order_id=%s mandate_id=%s authorization_source=MANUAL authorization_reason=%s",
         live_order.live_crypto_order_id, mandate.mandate_id, mandate_eval.reason_code,
     )
-    return False, mandate.mandate_id
+    return False, mandate.mandate_id, mandate_eval.reason_code
 
 
 class LiveCryptoOrderService:
@@ -2206,7 +2276,7 @@ class LiveCryptoOrderService:
         # authority, Risk Engine, idempotency, audit -- is unconditional and
         # unchanged regardless of which path satisfies this one check. If
         # neither authority resolves, the confirmation phrase is required.
-        mandate_authorized, mandate_id_for_audit = await _evaluate_level2_mandate_authorization(
+        mandate_authorized, mandate_id_for_audit, mandate_denial_reason = await _evaluate_level2_mandate_authorization(
             db=db, live_order=live_order, actor=request.operator_identity,
         )
         autonomous_prepared = bool(live_order.safe_provider_response.get("autonomous_prepared"))
@@ -2217,6 +2287,29 @@ class LiveCryptoOrderService:
             autonomous_prepared and (mandate_authorized or recovery_authorized)
         )
         if not mandate_authorized and not recovery_authorized:
+            # A genuine mandate DENIAL (a real mandate was found and
+            # evaluated, not merely absent/unresolvable) must stop
+            # immediately with its exact reason for an autonomous submission
+            # -- never fall through to the human confirmation-phrase check
+            # below, which no autonomous caller can ever satisfy (confirmation_
+            # phrase is always None here) and which previously surfaced as a
+            # misleading "confirmation phrase mismatch" PermissionError that
+            # hid the real cause (e.g. daily_deployed_exceeds_mandate_limit).
+            if autonomous_prepared and mandate_denial_reason is not None:
+                logger.error(
+                    "autonomous_submission_blocked_by_mandate_denial live_crypto_order_id=%s mandate_id=%s reason=%s",
+                    live_order.live_crypto_order_id, mandate_id_for_audit, mandate_denial_reason,
+                )
+                raise InvalidRequestError(
+                    message=(
+                        f"Autonomous submission blocked: mandate denied authorization "
+                        f"reason={mandate_denial_reason} mandate_id={mandate_id_for_audit}"
+                    ),
+                    details={
+                        "reason": mandate_denial_reason,
+                        "mandate_id": None if mandate_id_for_audit is None else str(mandate_id_for_audit),
+                    },
+                )
             if request.confirmation_phrase != CONFIRMATION_PHRASE:
                 raise PermissionError("confirmation phrase mismatch")
         if not autonomous_confirmation_authorized:

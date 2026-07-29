@@ -10,6 +10,7 @@ from app.db.session import get_db
 from app.schemas.controlled_proof import (
     ControlledProofCancelRequest,
     ControlledProofCreateRequest,
+    ControlledProofMandateReadinessResponse,
     ControlledProofStartResponse,
     ControlledProofExitRecoveryCreateRequest,
     ControlledProofExitRecoveryResponse,
@@ -17,6 +18,7 @@ from app.schemas.controlled_proof import (
 )
 from app.services.controlled_proof import (
     cancel_controlled_proof,
+    get_controlled_proof_mandate_readiness,
     start_live_controlled_proof,
     get_controlled_proof_view,
     authorize_controlled_proof_exit_recovery,
@@ -49,6 +51,15 @@ async def post_controlled_proof(
         new_proof_created=result.created, idempotent_replay=not result.created,
         reused_historical_execution=False, audit_correlation_id=proof.audit_correlation_id,
     )
+
+
+@router.get("/mandate/readiness", response_model=ControlledProofMandateReadinessResponse)
+async def get_controlled_proof_mandate_readiness_route(
+    current_user: dict[str, str] = Depends(get_authorized_operator),
+    db: AsyncSession = Depends(get_db),
+) -> ControlledProofMandateReadinessResponse:
+    report = await get_controlled_proof_mandate_readiness(db=db)
+    return ControlledProofMandateReadinessResponse(**report)
 
 
 @router.get("/{proof_id}", response_model=ControlledProofResponse)

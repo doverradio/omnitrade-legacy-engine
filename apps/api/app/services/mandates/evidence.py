@@ -50,6 +50,10 @@ class MandateEvaluationWriteRequest:
     idempotency_key: str | None
     audit_correlation_id: uuid.UUID | None
     software_build_version: str | None
+    # Defaults preserve every existing caller's prior behavior unchanged --
+    # see MandateEligibilityInput's identical fields in contracts.py.
+    expected_mandate_purpose: str = "PRODUCTION"
+    controlled_proof_open_exposure_usd: Decimal = Decimal("0")
 
 
 async def evaluate_and_record_mandate(
@@ -119,6 +123,8 @@ async def evaluate_and_record_mandate(
             evidence_age_seconds=request.evidence_age_seconds,
             kill_switch_engaged=request.kill_switch_engaged,
             observed_at=request.observed_at,
+            expected_mandate_purpose=request.expected_mandate_purpose,
+            controlled_proof_open_exposure_usd=request.controlled_proof_open_exposure_usd,
         ),
     )
 
@@ -238,6 +244,7 @@ def _to_mandate_domain(mandate: AutonomousCapitalMandate) -> MandateDomainModel:
         capital_campaign_id=mandate.capital_campaign_id,
         expires_at=mandate.expires_at,
         revoked_at=mandate.revoked_at,
+        purpose=mandate.purpose,
     )
 
 

@@ -23,6 +23,8 @@ from app.services.mandates.contracts import (
     AUTONOMY_LEVEL_2,
     MANDATE_APPROVAL_RESULT_ACTIVE_MANDATE,
     MANDATE_APPROVAL_RESULT_REQUIRED_HUMAN,
+    MANDATE_PURPOSE_PRODUCTION,
+    MANDATE_PURPOSES,
     MandateAuthorizationModel,
     MandateAuthorizationRequest,
     MandateLifecycleActionRequest,
@@ -60,6 +62,7 @@ async def list_mandates(
     db: AsyncSession,
     owner_actor_id: str | None = None,
     status: str | None = None,
+    purpose: str | None = None,
 ) -> list[AutonomousCapitalMandate]:
     stmt: Select[tuple[AutonomousCapitalMandate]] = select(AutonomousCapitalMandate).order_by(
         AutonomousCapitalMandate.created_at.desc()
@@ -68,6 +71,8 @@ async def list_mandates(
         stmt = stmt.where(AutonomousCapitalMandate.owner_actor_id == owner_actor_id)
     if status is not None:
         stmt = stmt.where(AutonomousCapitalMandate.status == status)
+    if purpose is not None:
+        stmt = stmt.where(AutonomousCapitalMandate.purpose == purpose)
 
     return list(await db.scalars(stmt))
 
@@ -94,7 +99,11 @@ async def create_mandate(
     actor: str,
     idempotency_key: str | None,
     reason: str | None,
+    purpose: str = MANDATE_PURPOSE_PRODUCTION,
 ) -> AutonomousCapitalMandate:
+    if purpose not in MANDATE_PURPOSES:
+        raise InvalidRequestError(message="Unsupported mandate purpose", details={"purpose": purpose, "allowed": sorted(MANDATE_PURPOSES)})
+
     await _validate_relationships(
         db=db,
         exchange_connection_id=exchange_connection_id,
@@ -125,6 +134,7 @@ async def create_mandate(
         paper_account_id=paper_account_id,
         capital_campaign_id=capital_campaign_id,
         expires_at=expires_at,
+        purpose=purpose,
     )
     db.add(mandate)
     await db.flush()
@@ -138,6 +148,7 @@ async def create_mandate(
             before_state=None,
             after_state={
                 "status": mandate.status,
+                "purpose": mandate.purpose,
                 "autonomy_level": mandate.autonomy_level,
                 "idempotency_key": idempotency_key,
                 "reason": reason,

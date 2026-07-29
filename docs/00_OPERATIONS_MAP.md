@@ -134,6 +134,7 @@ Do not assume this mirrors the orchestration service's config sources — confir
 - Known overlap: `LIVE_CRYPTO_ORDER_SUBMISSION_ENABLED` and `LIVE_CRYPTO_PREPARATION_ENABLED` are each defined in more than one of the three sources. Do not assume duplicate definitions currently agree — verify with Operational Commands before trusting a value. **[PROD]**
 - `scripts/activation_only_environment_selector.sh` owns `current.env`. Every state it can produce hardcodes `LIVE_CRYPTO_ORDER_SUBMISSION_ENABLED=false`, and it auto-rolls-back if the live process ever disagrees — the one source here with a built-in, self-verifying safety guarantee. Companion tooling: `scripts/activation_proof_watchdog.{py,sh}`. **[REPO]**
 - `venue-commissioning.conf` is named after `VENUE_COMMISSIONING_ENABLED` (`config.py`, default `false`), but unlike the activation-only file, no script or template in this repository produces it — its content is not repo-auditable. **[REPO]** for the field; **[UNRESOLVED]** for the drop-in's actual content
+- `CONTROLLED_PROOF_MANDATE_ID` (`config.py`, default `None`) is a distinct, dedicated mandate identity Controlled Proof entry pins its BUY/SELL evaluations to — deliberately separate from `AUTOMATIC_MANDATE_PACKAGE_ACTIVATION_MANDATE_ID` (ordinary production), so the two mandate purposes (`PRODUCTION` / `CONTROLLED_PROOF`, `autonomous_capital_mandates.purpose`) can never be conflated. Must be provisioned via `POST /autonomous-capital/mandates` with `purpose="CONTROLLED_PROOF"` before Controlled Proof entries can authorize; readiness is checkable via `GET /api/v1/operator/controlled-proofs/mandate/readiness`. **[REPO]**
 
 ### Known Gaps (configuration-specific)
 
@@ -248,7 +249,7 @@ Check selected non-secret runtime flags from the live process environment (never
 
 ```bash
 PID="$(systemctl show omnitrade-orchestration.service --property=MainPID --value)"
-sudo tr '\0' '\n' < /proc/${PID}/environ | grep -E '^(LIVE_CRYPTO_ORDER_SUBMISSION_ENABLED|LIVE_CRYPTO_PREPARATION_ENABLED|AUTOMATIC_MANDATE_PACKAGE_ACTIVATION_ENABLED|AUTOMATIC_MANDATE_PACKAGE_ACTIVATION_CAMPAIGN_ID|AUTOMATIC_MANDATE_PACKAGE_ACTIVATION_CAMPAIGN_VERSION|AUTOMATIC_MANDATE_PACKAGE_ACTIVATION_MANDATE_ID|AUTOMATIC_MANDATE_PACKAGE_ACTIVATION_MANDATE_VERSION_ID|VENUE_COMMISSIONING_ENABLED|ASSET_DISCOVERY_MODE)='
+sudo tr '\0' '\n' < /proc/${PID}/environ | grep -E '^(LIVE_CRYPTO_ORDER_SUBMISSION_ENABLED|LIVE_CRYPTO_PREPARATION_ENABLED|AUTOMATIC_MANDATE_PACKAGE_ACTIVATION_ENABLED|AUTOMATIC_MANDATE_PACKAGE_ACTIVATION_CAMPAIGN_ID|AUTOMATIC_MANDATE_PACKAGE_ACTIVATION_CAMPAIGN_VERSION|AUTOMATIC_MANDATE_PACKAGE_ACTIVATION_MANDATE_ID|AUTOMATIC_MANDATE_PACKAGE_ACTIVATION_MANDATE_VERSION_ID|CONTROLLED_PROOF_MANDATE_ID|VENUE_COMMISSIONING_ENABLED|ASSET_DISCOVERY_MODE)='
 ```
 
 Inspect activation-only selector state (self-verifying; the most trustworthy single check for submission/preparation/activation flags):

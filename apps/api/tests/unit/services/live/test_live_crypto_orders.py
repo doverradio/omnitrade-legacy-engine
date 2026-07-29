@@ -1565,7 +1565,7 @@ async def test_autonomous_sell_submits_owned_base_size_without_quote_size(monkey
 
     monkeypatch.setattr(service, "get_settings", _submit_settings)
     monkeypatch.setattr(service, "_utcnow", lambda: datetime(2026, 7, 9, 12, 0, tzinfo=timezone.utc))
-    monkeypatch.setattr(service, "_evaluate_level2_mandate_authorization", AsyncMock(return_value=(False, None)))
+    monkeypatch.setattr(service, "_evaluate_level2_mandate_authorization", AsyncMock(return_value=(False, None, None)))
     monkeypatch.setattr(service, "_evaluate_exit_recovery_confirmation_authorization", AsyncMock(return_value=(True, recovery_id)))
     monkeypatch.setattr(service, "_validate_autonomous_one_shot_submission", AsyncMock(return_value=(campaign.id, SimpleNamespace())))
     monkeypatch.setattr(service, "compute_signed_owned_quantity", AsyncMock(return_value=owned))
@@ -1618,7 +1618,7 @@ async def test_autonomous_sell_owned_quantity_change_fails_before_provider(monke
     provider_call = AsyncMock()
     monkeypatch.setattr(service, "get_settings", _submit_settings)
     monkeypatch.setattr(service, "_utcnow", lambda: datetime(2026, 7, 9, 12, 0, tzinfo=timezone.utc))
-    monkeypatch.setattr(service, "_evaluate_level2_mandate_authorization", AsyncMock(return_value=(True, uuid.uuid4())))
+    monkeypatch.setattr(service, "_evaluate_level2_mandate_authorization", AsyncMock(return_value=(True, uuid.uuid4(), None)))
     monkeypatch.setattr(service, "_validate_autonomous_one_shot_submission", AsyncMock(return_value=(campaign.id, SimpleNamespace())))
     monkeypatch.setattr(service, "compute_signed_owned_quantity", AsyncMock(return_value=service.Decimal("0.00007000")))
     monkeypatch.setattr(service, "get_exchange_provider", lambda *_args, **_kwargs: _provider_stub(submit_order=provider_call))
@@ -2007,7 +2007,7 @@ async def test_autonomous_one_shot_reaches_mocked_provider_exactly_once(monkeypa
 
     monkeypatch.setattr(service, "get_settings", _submit_settings)
     monkeypatch.setattr(service, "_utcnow", lambda: datetime(2026, 7, 9, 12, 0, tzinfo=timezone.utc))
-    monkeypatch.setattr(service, "_evaluate_level2_mandate_authorization", AsyncMock(return_value=(True, uuid.uuid4())))
+    monkeypatch.setattr(service, "_evaluate_level2_mandate_authorization", AsyncMock(return_value=(True, uuid.uuid4(), None)))
     monkeypatch.setattr(service, "_validate_autonomous_one_shot_submission", AsyncMock(return_value=(campaign.id, claim)))
     monkeypatch.setattr(service, "_load_decrypted_credentials", lambda _connection: {"api_key": "key", "api_secret": "secret"})
     monkeypatch.setattr(service, "get_exchange_provider", lambda *_args, **_kwargs: _provider_stub(create_order=_create_order))
@@ -2066,7 +2066,7 @@ async def test_exit_recovery_authority_satisfies_only_autonomous_sell_confirmati
 
     monkeypatch.setattr(service, "get_settings", _submit_settings)
     monkeypatch.setattr(service, "_utcnow", lambda: datetime(2026, 7, 9, 12, 0, tzinfo=timezone.utc))
-    monkeypatch.setattr(service, "_evaluate_level2_mandate_authorization", AsyncMock(return_value=(False, uuid.uuid4())))
+    monkeypatch.setattr(service, "_evaluate_level2_mandate_authorization", AsyncMock(return_value=(False, uuid.uuid4(), None)))
     monkeypatch.setattr(service, "_evaluate_exit_recovery_confirmation_authorization", AsyncMock(return_value=(True, recovery_id)))
     monkeypatch.setattr(service, "_validate_autonomous_one_shot_submission", AsyncMock(return_value=(campaign.id, claim)))
     monkeypatch.setattr(service, "compute_signed_owned_quantity", AsyncMock(return_value=owned))
@@ -2097,7 +2097,7 @@ async def test_missing_exit_recovery_authority_still_requires_confirmation_phras
     live_order.safe_provider_response["autonomous_prepared"] = True
     provider_call = AsyncMock()
     monkeypatch.setattr(service, "get_settings", _submit_settings)
-    monkeypatch.setattr(service, "_evaluate_level2_mandate_authorization", AsyncMock(return_value=(False, None)))
+    monkeypatch.setattr(service, "_evaluate_level2_mandate_authorization", AsyncMock(return_value=(False, None, None)))
     monkeypatch.setattr(service, "_evaluate_exit_recovery_confirmation_authorization", AsyncMock(return_value=(False, None)))
     monkeypatch.setattr(service, "get_exchange_provider", lambda *_args, **_kwargs: _provider_stub(create_order=provider_call))
 
@@ -2112,6 +2112,46 @@ async def test_missing_exit_recovery_authority_still_requires_confirmation_phras
             ),
         )
 
+    provider_call.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_autonomous_mandate_denial_never_falls_through_to_confirmation_phrase_mismatch(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Reproduces the production incident directly: a genuine mandate
+    denial (e.g. daily_deployed_exceeds_mandate_limit) for an autonomous
+    submission must stop immediately with the exact reason -- never fall
+    through to the generic, misleading "confirmation phrase mismatch"
+    PermissionError, which no autonomous caller (confirmation_phrase is
+    always None) could ever satisfy anyway."""
+    _profile, live_order, _preview, _connection, _campaign, _approval_event, db = _submit_authority_fixture()
+    live_order.safe_provider_response["autonomous_prepared"] = True
+    mandate_id = uuid.uuid4()
+    provider_call = AsyncMock()
+    monkeypatch.setattr(service, "get_settings", _submit_settings)
+    monkeypatch.setattr(
+        service, "_evaluate_level2_mandate_authorization",
+        AsyncMock(return_value=(False, mandate_id, "daily_deployed_exceeds_mandate_limit")),
+    )
+    monkeypatch.setattr(service, "_evaluate_exit_recovery_confirmation_authorization", AsyncMock(return_value=(False, None)))
+    monkeypatch.setattr(service, "get_exchange_provider", lambda *_args, **_kwargs: _provider_stub(create_order=provider_call))
+
+    with pytest.raises(InvalidRequestError) as exc_info:
+        await service.service.submit(
+            db=db,
+            request=service.LiveCryptoOrderSubmitRequest(
+                live_crypto_order_id=live_order.live_crypto_order_id,
+                confirmation_challenge_id=None, confirmation_phrase=None,
+                operator_identity="system:autonomous",
+                idempotency_token="autonomous-buy-mandate-denied",
+            ),
+        )
+
+    assert "daily_deployed_exceeds_mandate_limit" in str(exc_info.value)
+    assert str(mandate_id) in str(exc_info.value)
+    assert exc_info.value.details["reason"] == "daily_deployed_exceeds_mandate_limit"
+    assert exc_info.value.details["mandate_id"] == str(mandate_id)
     provider_call.assert_not_awaited()
 
 
@@ -2197,7 +2237,7 @@ async def test_submission_commit_failure_prevents_provider_boundary(
     db.commit = _commit_failure
     monkeypatch.setattr(service, "get_settings", _submit_settings)
     monkeypatch.setattr(service, "_utcnow", lambda: datetime(2026, 7, 9, 12, 0, tzinfo=timezone.utc))
-    monkeypatch.setattr(service, "_evaluate_level2_mandate_authorization", AsyncMock(return_value=(True, uuid.uuid4())))
+    monkeypatch.setattr(service, "_evaluate_level2_mandate_authorization", AsyncMock(return_value=(True, uuid.uuid4(), None)))
     monkeypatch.setattr(service, "_validate_autonomous_one_shot_submission", AsyncMock(return_value=(campaign.id, SimpleNamespace())))
     monkeypatch.setattr(service, "get_exchange_provider", lambda *_args, **_kwargs: _provider_stub(submit_order=provider_call))
 
@@ -2245,7 +2285,7 @@ async def test_process_cancellation_after_provider_boundary_keeps_durable_submis
 
     monkeypatch.setattr(service, "get_settings", _submit_settings)
     monkeypatch.setattr(service, "_utcnow", lambda: datetime(2026, 7, 9, 12, 0, tzinfo=timezone.utc))
-    monkeypatch.setattr(service, "_evaluate_level2_mandate_authorization", AsyncMock(return_value=(True, uuid.uuid4())))
+    monkeypatch.setattr(service, "_evaluate_level2_mandate_authorization", AsyncMock(return_value=(True, uuid.uuid4(), None)))
     monkeypatch.setattr(service, "_validate_autonomous_one_shot_submission", AsyncMock(return_value=(campaign.id, SimpleNamespace())))
     monkeypatch.setattr(service, "_load_decrypted_credentials", lambda _connection: {"api_key": "key", "api_secret": "secret"})
     monkeypatch.setattr(service, "get_exchange_provider", lambda *_args, **_kwargs: _provider_stub(submit_order=_cancel_after_boundary))
@@ -2295,7 +2335,7 @@ async def test_autonomous_execution_readiness_evidence_still_fails_when_stale(
     provider_call = AsyncMock()
     monkeypatch.setattr(service, "get_settings", _submit_settings)
     monkeypatch.setattr(service, "_utcnow", lambda: datetime(2026, 7, 9, 12, 0, tzinfo=timezone.utc))
-    monkeypatch.setattr(service, "_evaluate_level2_mandate_authorization", AsyncMock(return_value=(True, uuid.uuid4())))
+    monkeypatch.setattr(service, "_evaluate_level2_mandate_authorization", AsyncMock(return_value=(True, uuid.uuid4(), None)))
     monkeypatch.setattr(service, "_validate_autonomous_one_shot_submission", AsyncMock(return_value=(campaign.id, SimpleNamespace())))
     monkeypatch.setattr(service, "get_exchange_provider", lambda *_args, **_kwargs: _provider_stub(create_order=provider_call))
 

@@ -15,7 +15,9 @@ from app.models.autonomous_capital_mandate import AutonomousCapitalMandate
 from app.models.autonomous_capital_mandate_authorization import AutonomousCapitalMandateAuthorization
 from app.models.autonomous_capital_mandate_evaluation import AutonomousCapitalMandateEvaluation
 from app.models.autonomous_capital_mandate_version import AutonomousCapitalMandateVersion
+from app.models.canonical_preview_package import CanonicalPreviewPackage
 from app.models.capital_campaign import CapitalCampaign
+from app.models.controlled_proof_run import ControlledProofRun
 from app.models.crypto_order_preview import CryptoOrderPreview
 from app.models.decision_record import DecisionRecord
 from app.models.decision_snapshot import DecisionSnapshot
@@ -64,6 +66,8 @@ async def _real_session() -> AsyncIterator[AsyncSession]:
             AutonomousCapitalMandateAuthorization.__table__,
             AutonomousCapitalMandateEvaluation.__table__,
             AuditLog.__table__,
+            CanonicalPreviewPackage.__table__,
+            ControlledProofRun.__table__,
             CryptoOrderPreview.__table__,
             DecisionRecord.__table__,
             DecisionSnapshot.__table__,
@@ -154,6 +158,7 @@ async def _seed_active_level2_mandate(
     max_order_notional_usd: Decimal = Decimal("5"),
     allowed_strategy_versions: tuple[str, ...] = (_STRATEGY_IDENTITY,),
     expires_at: datetime | None = None,
+    purpose: str = "PRODUCTION",
 ) -> AutonomousCapitalMandate:
     """Drives a mandate through the exact real lifecycle a human operator
     uses (SUBMIT_FOR_AUTHORIZATION -> version -> authorize -> ACTIVATE),
@@ -166,6 +171,7 @@ async def _seed_active_level2_mandate(
         owner_actor_id="operator:owner",
         status="DRAFT",
         autonomy_level="LEVEL_2",
+        purpose=purpose,
         provider=_PROVIDER,
         exchange_environment=_ENVIRONMENT,
         exchange_connection_id=exchange_connection_id,
@@ -366,7 +372,7 @@ async def test_valid_active_level2_mandate_authorizes_execution_automatically() 
         await session.commit()
 
         live_order = _live_order(preview_id=preview_id, risk_event_id=risk_event_id, exchange_connection_id=exchange_connection_id)
-        authorized, mandate_id = await _evaluate_level2_mandate_authorization(db=session, live_order=live_order, actor="system:level2")
+        authorized, mandate_id, _reason = await _evaluate_level2_mandate_authorization(db=session, live_order=live_order, actor="system:level2")
 
         assert authorized is True
         assert mandate_id is not None
@@ -380,7 +386,7 @@ async def test_no_mandate_falls_back_to_manual_confirmation_required() -> None:
         await session.commit()
 
         live_order = _live_order(preview_id=preview_id, risk_event_id=risk_event_id, exchange_connection_id=exchange_connection_id)
-        authorized, mandate_id = await _evaluate_level2_mandate_authorization(db=session, live_order=live_order, actor="system:level2")
+        authorized, mandate_id, _reason = await _evaluate_level2_mandate_authorization(db=session, live_order=live_order, actor="system:level2")
 
         assert authorized is False
         assert mandate_id is None
@@ -414,7 +420,7 @@ async def test_active_level1_mandate_still_falls_back_to_manual_confirmation() -
             risk_event_id=risk_event_id,
             exchange_connection_id=exchange_connection_id,
         )
-        authorized, mandate_id = await _evaluate_level2_mandate_authorization(
+        authorized, mandate_id, _reason = await _evaluate_level2_mandate_authorization(
             db=session, live_order=live_order, actor="operator:owner",
         )
 
@@ -439,7 +445,7 @@ async def test_expired_mandate_is_blocked() -> None:
         await session.commit()
 
         live_order = _live_order(preview_id=preview_id, risk_event_id=risk_event_id, exchange_connection_id=exchange_connection_id)
-        authorized, mandate_id = await _evaluate_level2_mandate_authorization(db=session, live_order=live_order, actor="system:level2")
+        authorized, mandate_id, _reason = await _evaluate_level2_mandate_authorization(db=session, live_order=live_order, actor="system:level2")
 
         assert authorized is False
         assert mandate_id is not None  # mandate was found, but eligibility rejected it
@@ -468,7 +474,7 @@ async def test_disabled_mandate_is_blocked() -> None:
         await session.commit()
 
         live_order = _live_order(preview_id=preview_id, risk_event_id=risk_event_id, exchange_connection_id=exchange_connection_id)
-        authorized, mandate_id = await _evaluate_level2_mandate_authorization(db=session, live_order=live_order, actor="system:level2")
+        authorized, mandate_id, _reason = await _evaluate_level2_mandate_authorization(db=session, live_order=live_order, actor="system:level2")
 
         assert authorized is False
         assert mandate_id is None  # PAUSED mandate is not even found as a candidate
@@ -492,7 +498,7 @@ async def test_account_mismatch_is_blocked() -> None:
         await session.commit()
 
         live_order = _live_order(preview_id=preview_id, risk_event_id=risk_event_id, exchange_connection_id=exchange_connection_id)
-        authorized, mandate_id = await _evaluate_level2_mandate_authorization(db=session, live_order=live_order, actor="system:level2")
+        authorized, mandate_id, _reason = await _evaluate_level2_mandate_authorization(db=session, live_order=live_order, actor="system:level2")
 
         assert authorized is False
         assert mandate_id is None
@@ -521,7 +527,7 @@ async def test_strategy_mismatch_is_blocked() -> None:
         await session.commit()
 
         live_order = _live_order(preview_id=preview_id, risk_event_id=risk_event_id, exchange_connection_id=exchange_connection_id)
-        authorized, mandate_id = await _evaluate_level2_mandate_authorization(db=session, live_order=live_order, actor="system:level2")
+        authorized, mandate_id, _reason = await _evaluate_level2_mandate_authorization(db=session, live_order=live_order, actor="system:level2")
 
         assert authorized is False
         assert mandate_id is not None
@@ -551,7 +557,7 @@ async def test_canonical_strategy_identity_from_decision_record_authorizes() -> 
         await session.commit()
 
         live_order = _live_order(preview_id=preview_id, risk_event_id=risk_event_id, exchange_connection_id=exchange_connection_id)
-        authorized, mandate_id = await _evaluate_level2_mandate_authorization(db=session, live_order=live_order, actor="system:level2")
+        authorized, mandate_id, _reason = await _evaluate_level2_mandate_authorization(db=session, live_order=live_order, actor="system:level2")
 
         assert authorized is True
         assert mandate_id is not None
@@ -576,7 +582,7 @@ async def test_unresolvable_strategy_identity_is_blocked() -> None:
         await session.commit()
 
         live_order = _live_order(preview_id=preview_id, risk_event_id=risk_event_id, exchange_connection_id=exchange_connection_id)
-        authorized, mandate_id = await _evaluate_level2_mandate_authorization(db=session, live_order=live_order, actor="system:level2")
+        authorized, mandate_id, _reason = await _evaluate_level2_mandate_authorization(db=session, live_order=live_order, actor="system:level2")
 
         assert authorized is False
         assert mandate_id is not None
@@ -603,7 +609,7 @@ async def test_capital_limit_exceeded_is_blocked() -> None:
             preview_id=preview_id, risk_event_id=risk_event_id, exchange_connection_id=exchange_connection_id,
             requested_quote_size=Decimal("6"),
         )
-        authorized, mandate_id = await _evaluate_level2_mandate_authorization(db=session, live_order=live_order, actor="system:level2")
+        authorized, mandate_id, _reason = await _evaluate_level2_mandate_authorization(db=session, live_order=live_order, actor="system:level2")
 
         assert authorized is False
         assert mandate_id is not None
@@ -628,7 +634,7 @@ async def test_risk_rejected_verdict_is_blocked() -> None:
             preview_id=preview_id, risk_event_id=risk_event_id, exchange_connection_id=exchange_connection_id,
             risk_verdict="reject",
         )
-        authorized, mandate_id = await _evaluate_level2_mandate_authorization(db=session, live_order=live_order, actor="system:level2")
+        authorized, mandate_id, _reason = await _evaluate_level2_mandate_authorization(db=session, live_order=live_order, actor="system:level2")
 
         assert authorized is False
         assert mandate_id is not None
@@ -655,7 +661,7 @@ async def test_mandate_evaluation_is_recorded_for_audit_trail() -> None:
         await session.commit()
 
         live_order = _live_order(preview_id=preview_id, risk_event_id=risk_event_id, exchange_connection_id=exchange_connection_id)
-        authorized, _mandate_id = await _evaluate_level2_mandate_authorization(db=session, live_order=live_order, actor="system:level2")
+        authorized, _mandate_id, _reason = await _evaluate_level2_mandate_authorization(db=session, live_order=live_order, actor="system:level2")
         assert authorized is True
 
         evaluations = list(
@@ -701,7 +707,114 @@ async def test_mandate_evaluation_error_falls_back_to_manual_not_a_crash(monkeyp
         await session.commit()
 
         live_order = _live_order(preview_id=preview_id, risk_event_id=risk_event_id, exchange_connection_id=exchange_connection_id)
-        authorized, mandate_id = await _evaluate_level2_mandate_authorization(db=session, live_order=live_order, actor="system:level2")
+        authorized, mandate_id, _reason = await _evaluate_level2_mandate_authorization(db=session, live_order=live_order, actor="system:level2")
 
         assert authorized is False
+        assert mandate_id is not None
+
+
+async def _link_preview_to_controlled_proof(session: AsyncSession, *, preview_id: uuid.UUID) -> None:
+    """Creates a minimal CanonicalPreviewPackage for this exact preview and a
+    ControlledProofRun whose package_id points at it -- exactly the linkage
+    _evaluate_level2_mandate_authorization uses to classify an order as
+    Controlled-Proof-scoped. FKs to strategies/parameter_sets are
+    deliberately random UUIDs (sqlite in this harness never enforces FK
+    existence), mirroring the established pattern in
+    tests/unit/services/controlled_proof/test_exit_recovery.py."""
+    package_id = uuid.uuid4()
+    session.add(CanonicalPreviewPackage(
+        package_id=package_id, campaign_id=uuid.uuid4(), campaign_version=1,
+        runtime_campaign_id=uuid.uuid4(), paper_account_id=uuid.uuid4(), live_trading_profile_id=uuid.uuid4(),
+        provider=_PROVIDER, environment=_ENVIRONMENT, product=_PRODUCT, side="BUY",
+        proposed_order_amount=Decimal("5"), risk_approved_amount=Decimal("5"),
+        strategy_id=uuid.uuid4(), strategy_version="1.0.0", parameter_set_id=uuid.uuid4(), parameter_set_version="1",
+        decision_record_id=uuid.uuid4(), risk_event_id=uuid.uuid4(), crypto_order_preview_id=preview_id,
+        preview_expires_at=datetime.now(timezone.utc) + timedelta(minutes=5),
+        generated_at=datetime.now(timezone.utc), idempotency_key=f"pkg-{uuid.uuid4()}", input_fingerprint="fp",
+    ))
+    session.add(ControlledProofRun(
+        proof_id=uuid.uuid4(), status="CLAIMED", provider=_PROVIDER, environment=_ENVIRONMENT,
+        campaign_id=uuid.uuid4(), campaign_version=1, product_id=_PRODUCT, max_notional_usd=Decimal("5"),
+        idempotency_key=f"proof-{uuid.uuid4()}", requested_by="operator:owner",
+        expires_at=datetime.now(timezone.utc) + timedelta(hours=1), package_id=package_id,
+    ))
+    await session.flush()
+
+
+@pytest.mark.asyncio
+async def test_ordinary_trading_cannot_select_the_controlled_proof_mandate() -> None:
+    """An order NOT linked to any Controlled Proof resolves expected purpose
+    PRODUCTION; a CONTROLLED_PROOF-purpose mandate for the exact same scope
+    must never be found for it."""
+    async with _real_session() as session:
+        paper_account_id = uuid.uuid4()
+        exchange_connection_id, live_trading_profile_id, preview_id, risk_event_id = await _seed_scope(
+            session, paper_account_id=paper_account_id,
+        )
+        await _seed_active_level2_mandate(
+            session,
+            exchange_connection_id=exchange_connection_id,
+            live_trading_profile_id=live_trading_profile_id,
+            key_prefix="cp-purpose-mismatch",
+            purpose="CONTROLLED_PROOF",
+        )
+        await session.commit()
+
+        live_order = _live_order(preview_id=preview_id, risk_event_id=risk_event_id, exchange_connection_id=exchange_connection_id)
+        authorized, mandate_id, _reason = await _evaluate_level2_mandate_authorization(db=session, live_order=live_order, actor="system:level2")
+
+        assert authorized is False
+        assert mandate_id is None  # never found -- purpose filter excludes it
+
+
+@pytest.mark.asyncio
+async def test_controlled_proof_cannot_select_the_ordinary_production_mandate() -> None:
+    """An order linked to a Controlled Proof resolves expected purpose
+    CONTROLLED_PROOF; an ordinary PRODUCTION mandate for the exact same
+    scope must never be found for it."""
+    async with _real_session() as session:
+        paper_account_id = uuid.uuid4()
+        exchange_connection_id, live_trading_profile_id, preview_id, risk_event_id = await _seed_scope(
+            session, paper_account_id=paper_account_id,
+        )
+        await _link_preview_to_controlled_proof(session, preview_id=preview_id)
+        await _seed_active_level2_mandate(
+            session,
+            exchange_connection_id=exchange_connection_id,
+            live_trading_profile_id=live_trading_profile_id,
+            key_prefix="production-purpose-mismatch",
+            purpose="PRODUCTION",
+        )
+        await session.commit()
+
+        live_order = _live_order(preview_id=preview_id, risk_event_id=risk_event_id, exchange_connection_id=exchange_connection_id)
+        authorized, mandate_id, _reason = await _evaluate_level2_mandate_authorization(db=session, live_order=live_order, actor="system:level2")
+
+        assert authorized is False
+        assert mandate_id is None  # never found -- purpose filter excludes it
+
+
+@pytest.mark.asyncio
+async def test_controlled_proof_purpose_mandate_authorizes_its_own_linked_order() -> None:
+    """The positive case: a CONTROLLED_PROOF-purpose mandate DOES authorize
+    an order that is genuinely linked to a Controlled Proof."""
+    async with _real_session() as session:
+        paper_account_id = uuid.uuid4()
+        exchange_connection_id, live_trading_profile_id, preview_id, risk_event_id = await _seed_scope(
+            session, paper_account_id=paper_account_id,
+        )
+        await _link_preview_to_controlled_proof(session, preview_id=preview_id)
+        await _seed_active_level2_mandate(
+            session,
+            exchange_connection_id=exchange_connection_id,
+            live_trading_profile_id=live_trading_profile_id,
+            key_prefix="cp-authorizes-own-order",
+            purpose="CONTROLLED_PROOF",
+        )
+        await session.commit()
+
+        live_order = _live_order(preview_id=preview_id, risk_event_id=risk_event_id, exchange_connection_id=exchange_connection_id)
+        authorized, mandate_id, _reason = await _evaluate_level2_mandate_authorization(db=session, live_order=live_order, actor="system:level2")
+
+        assert authorized is True
         assert mandate_id is not None

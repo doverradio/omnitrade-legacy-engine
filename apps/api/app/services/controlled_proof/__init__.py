@@ -12,6 +12,7 @@ from app.services.controlled_proof.service import (
     controlled_proof_entry_blocker,
     evaluate_controlled_proof_risk,
     find_pending_controlled_proof_id,
+    get_controlled_proof_mandate_readiness,
     get_controlled_proof_view,
     link_controlled_proof_entry,
     link_controlled_proof_package,
@@ -21,6 +22,9 @@ from app.services.controlled_proof.service import (
     resolve_controlled_proof_strategy_identity,
     should_propose_controlled_sell,
     start_live_controlled_proof,
+)
+from app.services.controlled_proof.exposure import (
+    compute_controlled_proof_open_exposure_usd,
 )
 from app.services.controlled_proof.exit_recovery import (
     authorize_controlled_proof_exit_recovery,
@@ -48,6 +52,7 @@ __all__ = [
     "controlled_proof_entry_blocker",
     "evaluate_controlled_proof_risk",
     "find_pending_controlled_proof_id",
+    "get_controlled_proof_mandate_readiness",
     "get_controlled_proof_view",
     "link_controlled_proof_entry",
     "link_controlled_proof_package",
@@ -57,6 +62,7 @@ __all__ = [
     "resolve_controlled_proof_strategy_identity",
     "should_propose_controlled_sell",
     "start_live_controlled_proof",
+    "compute_controlled_proof_open_exposure_usd",
     "authorize_controlled_proof_exit_recovery",
     "block_exit_recovery",
     "claim_exit_recovery_by_id",

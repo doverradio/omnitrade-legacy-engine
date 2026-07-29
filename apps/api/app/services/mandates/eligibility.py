@@ -6,6 +6,7 @@ from app.services.mandates.contracts import (
     MANDATE_AUTHORIZATION_REJECTED,
     MANDATE_APPROVAL_RESULT_ACTIVE_MANDATE,
     MANDATE_APPROVAL_RESULT_REQUIRED_HUMAN,
+    MANDATE_PURPOSE_CONTROLLED_PROOF,
     MandateAuthorizationDecision,
     MandateDomainModel,
     MandateEligibilityInput,
@@ -24,8 +25,33 @@ def evaluate_mandate_eligibility(
     # another deployment is a historical BUY-only shortcut that prevents the
     # same mandate machinery from authorizing an exit.
     capital_increase_usd = request.proposed_notional_usd if request.side == "BUY" else 0
+    # CONTROLLED_PROOF's cumulative UTC-daily BUY turnover must never block a
+    # fresh proof once a prior proof has fully sold and reconciled back to
+    # zero exposure -- but ordinary_deployed_usd never decrements intraday
+    # (see build_risk_accounting_snapshot), so reusing it here would repeat
+    # the exact defect this purpose exists to fix. CONTROLLED_PROOF instead
+    # re-checks current *open* exposure (which does return to zero once a
+    # position is fully closed) against the same $5 max_open_exposure_usd
+    # cap the ordinary exposure_limit check below already enforces --
+    # belt-and-suspenders against the identical limit, not a separate or
+    # looser one. PRODUCTION's daily_deployment_limit is completely
+    # unchanged.
+    daily_deployment_check = (
+        ("controlled_proof_open_exposure_limit",
+         request.controlled_proof_open_exposure_usd + capital_increase_usd <= version.max_open_exposure_usd,
+         "controlled_proof_open_exposure_exceeds_mandate_limit")
+        if mandate.purpose == MANDATE_PURPOSE_CONTROLLED_PROOF
+        else ("daily_deployment_limit",
+              request.daily_deployed_usd + capital_increase_usd <= version.max_daily_deployed_usd,
+              "daily_deployed_exceeds_mandate_limit")
+    )
     checks: list[tuple[str, bool, str]] = [
         ("owner_match", mandate.owner_actor_id == request.owner_actor_id, "owner_mismatch"),
+        (
+            "mandate_purpose_match",
+            mandate.purpose == request.expected_mandate_purpose,
+            "mandate_purpose_mismatch",
+        ),
         ("mandate_status", mandate.status in {"ACTIVE", "EXIT_ONLY"}, "mandate_not_active"),
         (
             "mandate_not_revoked",
@@ -90,11 +116,7 @@ def evaluate_mandate_eligibility(
             request.current_open_exposure_usd + capital_increase_usd <= version.max_open_exposure_usd,
             "open_exposure_exceeds_mandate_limit",
         ),
-        (
-            "daily_deployment_limit",
-            request.daily_deployed_usd + capital_increase_usd <= version.max_daily_deployed_usd,
-            "daily_deployed_exceeds_mandate_limit",
-        ),
+        daily_deployment_check,
         (
             "daily_loss_limit",
             request.daily_realized_loss_usd <= version.max_daily_realized_loss_usd,

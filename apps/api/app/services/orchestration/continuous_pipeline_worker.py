@@ -46,6 +46,7 @@ from app.services.controlled_proof import (
     claim_exit_recovery_by_id,
     block_controlled_proof,
     claim_controlled_proof_by_id,
+    compute_controlled_proof_open_exposure_usd,
     controlled_proof_entry_blocker,
     evaluate_controlled_proof_risk,
     find_pending_controlled_proof_id,
@@ -83,7 +84,7 @@ from app.services.strategies.registry import StrategyLookupError
 from app.services.autonomous_cycle import AutonomousCycleRequest, run_autonomous_preview_cycle
 from app.services.capital_campaign_orchestration import run_campaign_orchestration_preview_for_candle
 from app.services.capital_campaign_orchestration.authoritative import ScorecardSessionRecoveryError
-from app.services.mandates.contracts import AUTONOMY_LEVEL_2
+from app.services.mandates.contracts import AUTONOMY_LEVEL_2, MANDATE_PURPOSE_CONTROLLED_PROOF, MANDATE_PURPOSE_PRODUCTION
 from app.services.mandates.evidence import MandateEvaluationWriteRequest, evaluate_and_record_mandate
 from app.services.orchestration import asset_roster
 from app.services.orchestration.venue_commissioning_bridge import service as venue_commissioning_service
@@ -861,6 +862,7 @@ async def _ensure_campaign_cycle_mandate_evaluation(
     side: str,
     proposed_notional: Decimal,
     decision_record_id: uuid.UUID | None = None,
+    controlled_proof_forced_entry: bool = False,
 ) -> str | None:
     if all(
         getattr(campaign_cycle, field, None) is not None
@@ -876,10 +878,41 @@ async def _ensure_campaign_cycle_mandate_evaluation(
         or str(autonomous_context.get("product_id") or "").upper() != product.upper()
     ):
         return "autonomous_campaign_cycle_correlation_mismatch"
-    if autonomous_cycle.mandate_id is None or autonomous_cycle.mandate_version_id is None:
-        return "originating_autonomous_mandate_identity_missing"
     if campaign_cycle.cycle_kind != "campaign" or campaign_cycle.decision_record_id is None:
         return "campaign_cycle_identity_invalid"
+
+    # A Controlled Proof forced entry must resolve, pin, and evaluate under
+    # the dedicated CONTROLLED_PROOF mandate -- it must never inherit
+    # autonomous_cycle.mandate_id, which is always the ordinary PRODUCTION
+    # mandate lineage of the ambient organic cycle this forced entry rides
+    # alongside. Fails closed (a distinct, diagnosable reason_code) rather
+    # than silently falling back to the organic mandate when the dedicated
+    # mandate is unconfigured -- this branch must never share a mandate_id
+    # with the else branch below.
+    controlled_proof_open_exposure_usd = Decimal("0")
+    expected_mandate_purpose = MANDATE_PURPOSE_PRODUCTION
+    if controlled_proof_forced_entry:
+        mandate_id = getattr(get_settings(), "controlled_proof_mandate_id", None)
+        if mandate_id is None:
+            return "controlled_proof_mandate_missing"
+        expected_mandate_purpose = MANDATE_PURPOSE_CONTROLLED_PROOF
+        if campaign_cycle.capital_campaign_id is not None:
+            runtime_campaign = await _load_runtime_campaign(db=db, campaign_id=campaign_cycle.capital_campaign_id)
+            if runtime_campaign is not None and runtime_campaign.paper_account_id is not None:
+                profile = await _load_live_trading_profile_for_paper_account(
+                    db=db, paper_account_id=runtime_campaign.paper_account_id,
+                )
+                if profile is not None:
+                    controlled_proof_open_exposure_usd = await compute_controlled_proof_open_exposure_usd(
+                        db=db, live_trading_profile_id=profile.id,
+                    )
+        pinned_mandate_version_id = None
+    else:
+        if autonomous_cycle.mandate_id is None or autonomous_cycle.mandate_version_id is None:
+            return "originating_autonomous_mandate_identity_missing"
+        mandate_id = autonomous_cycle.mandate_id
+        pinned_mandate_version_id = autonomous_cycle.mandate_version_id
+
     # For a controlled-proof-forced entry, the caller passes the freshly
     # created Controlled Proof DecisionRecord's id here -- never the
     # organic campaign_cycle.decision_record_id -- because that is the
@@ -894,7 +927,7 @@ async def _ensure_campaign_cycle_mandate_evaluation(
     evaluation = await evaluate_and_record_mandate(
         db=db,
         request=MandateEvaluationWriteRequest(
-            mandate_id=autonomous_cycle.mandate_id,
+            mandate_id=mandate_id,
             actor="orchestration_worker",
             strategy_version=strategy_identity,
             product=product,
@@ -917,15 +950,18 @@ async def _ensure_campaign_cycle_mandate_evaluation(
                 "campaign_orchestration_cycle_id": str(campaign_cycle.cycle_id),
                 "campaign_id": None if campaign_cycle.capital_campaign_id is None else str(campaign_cycle.capital_campaign_id),
                 "campaign_version": campaign_cycle.capital_campaign_version,
+                "controlled_proof_forced_entry": controlled_proof_forced_entry,
             },
             idempotency_key=f"campaign-cycle-mandate-eval:{campaign_cycle.cycle_id}",
             audit_correlation_id=campaign_cycle.audit_correlation_id,
             software_build_version=campaign_cycle.software_build_version,
+            expected_mandate_purpose=expected_mandate_purpose,
+            controlled_proof_open_exposure_usd=controlled_proof_open_exposure_usd,
         ),
     )
     if (
-        evaluation.mandate_id != autonomous_cycle.mandate_id
-        or evaluation.mandate_version_id != autonomous_cycle.mandate_version_id
+        evaluation.mandate_id != mandate_id
+        or (pinned_mandate_version_id is not None and evaluation.mandate_version_id != pinned_mandate_version_id)
         or evaluation.decision_id != effective_decision_id
         or evaluation.authorization_result != "AUTHORIZED"
         or evaluation.approval_result != "APPROVAL_SATISFIED_BY_ACTIVE_MANDATE"
@@ -1351,9 +1387,12 @@ async def _attempt_automatic_ready_package_creation(
                 if not strategy_identity and controlled_proof_forced_entry:
                     # The HOLD cycle's own composition never selected a
                     # winning strategy (nothing to select for a HOLD) --
-                    # resolve a real, mandate-authorized one independently,
-                    # the same way a genuine autonomous cycle would.
-                    governing_mandate_id = getattr(get_settings(), "automatic_mandate_package_activation_mandate_id", None)
+                    # resolve a real, mandate-authorized one independently.
+                    # The dedicated CONTROLLED_PROOF mandate, never the
+                    # ordinary production mandate setting -- its own
+                    # allowed_strategy_versions is the only list this forced
+                    # entry's strategy identity may ever be drawn from.
+                    governing_mandate_id = getattr(get_settings(), "controlled_proof_mandate_id", None)
                     if governing_mandate_id is not None:
                         try:
                             strategy_identity = await resolve_controlled_proof_strategy_identity(
@@ -1408,6 +1447,7 @@ async def _attempt_automatic_ready_package_creation(
                             side=side,
                             proposed_notional=final_amount,
                             decision_record_id=controlled_proof_decision_record_id,
+                            controlled_proof_forced_entry=controlled_proof_forced_entry,
                         )
 
         missing_evidence_fields = [
@@ -2005,9 +2045,15 @@ async def _attempt_operator_controlled_proof_entry(
             return
 
         settings = get_settings()
-        mandate_id = getattr(settings, "automatic_mandate_package_activation_mandate_id", None)
+        # Deliberately NOT automatic_mandate_package_activation_mandate_id
+        # (the ordinary production mandate setting): Controlled Proof pins
+        # its own dedicated CONTROLLED_PROOF-purpose mandate so it never
+        # competes with, or is blocked by, ordinary production's cumulative
+        # daily_deployed_usd -- and so ordinary production can never be
+        # governed by a mandate meant only for bounded $5 proofs.
+        mandate_id = getattr(settings, "controlled_proof_mandate_id", None)
         if mandate_id is None:
-            await _record_wait("governing_mandate_missing")
+            await _record_wait("controlled_proof_mandate_missing")
             await db.commit()
             return
         strategy_identity = await resolve_controlled_proof_strategy_identity(db=db, mandate_id=mandate_id)
@@ -2023,6 +2069,9 @@ async def _attempt_operator_controlled_proof_entry(
             controlled_proof_exit_recovery_id=None if recovery is None else recovery.recovery_id,
         )
         stage = "mandate_evaluation"
+        controlled_proof_open_exposure_usd = await compute_controlled_proof_open_exposure_usd(
+            db=db, live_trading_profile_id=profile.id,
+        )
         evaluation = await evaluate_and_record_mandate(
             db=db,
             request=MandateEvaluationWriteRequest(
@@ -2040,6 +2089,8 @@ async def _attempt_operator_controlled_proof_entry(
                     else f"controlled-proof-mandate-eval:{proof.proof_id}:{side}"
                 ),
                 audit_correlation_id=proof.audit_correlation_id, software_build_version=None,
+                expected_mandate_purpose=MANDATE_PURPOSE_CONTROLLED_PROOF,
+                controlled_proof_open_exposure_usd=controlled_proof_open_exposure_usd,
             ),
         )
         if evaluation.authorization_result != "AUTHORIZED":

@@ -13,6 +13,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.errors import InvalidRequestError, NotFoundError
 from app.models.asset import Asset
+from app.models.autonomous_capital_mandate import AutonomousCapitalMandate
 from app.models.autonomous_execution_claim import AutonomousExecutionClaim
 from app.models.audit_log import AuditLog
 from app.models.autonomous_capital_mandate_evaluation import AutonomousCapitalMandateEvaluation
@@ -229,6 +230,159 @@ def _available_usd(connection: ExchangeConnection) -> Decimal | None:
                 return None
             return value if value >= 0 else None
     return None
+
+
+async def get_controlled_proof_mandate_readiness(*, db: AsyncSession) -> dict:
+    """Read-only operator report: is the dedicated CONTROLLED_PROOF mandate
+    (settings.controlled_proof_mandate_id) configured, ACTIVE, authorized,
+    correctly scoped, and carrying the required $5 / position_limit=1 / BUY+SELL
+    limits -- i.e. is Controlled Proof actually able to launch right now.
+    Never mutates anything; a full eligibility re-check still happens for
+    real at entry time (evaluate_mandate_eligibility) -- this only reports
+    configuration state ahead of that."""
+    from app.services.mandates.contracts import MANDATE_PURPOSE_CONTROLLED_PROOF
+
+    settings = get_settings()
+    mandate_id = getattr(settings, "controlled_proof_mandate_id", None)
+    blockers: list[str] = []
+    report: dict = {
+        "configured": mandate_id is not None,
+        "mandate_id": mandate_id,
+        "mandate_found": False,
+        "purpose": None,
+        "status": None,
+        "autonomy_level": None,
+        "provider": None,
+        "environment": None,
+        "exchange_connection_id": None,
+        "live_trading_profile_id": None,
+        "paper_account_id": None,
+        "capital_campaign_id": None,
+        "governing_version_id": None,
+        "governing_version_found": False,
+        "max_order_notional_usd": None,
+        "max_open_exposure_usd": None,
+        "position_limit": None,
+        "allowed_products": None,
+        "allowed_order_sides": None,
+        "ready": False,
+        "blockers": blockers,
+    }
+    if mandate_id is None:
+        blockers.append("controlled_proof_mandate_id is not configured")
+        return report
+
+    mandate = await db.get(AutonomousCapitalMandate, mandate_id)
+    if mandate is None:
+        blockers.append("configured mandate_id does not exist")
+        return report
+
+    report.update(
+        mandate_found=True,
+        purpose=mandate.purpose,
+        status=mandate.status,
+        autonomy_level=mandate.autonomy_level,
+        provider=mandate.provider,
+        environment=mandate.exchange_environment,
+        exchange_connection_id=mandate.exchange_connection_id,
+        live_trading_profile_id=mandate.live_trading_profile_id,
+        paper_account_id=mandate.paper_account_id,
+        capital_campaign_id=mandate.capital_campaign_id,
+    )
+    if mandate.purpose != MANDATE_PURPOSE_CONTROLLED_PROOF:
+        blockers.append(f"mandate purpose is '{mandate.purpose}', expected 'CONTROLLED_PROOF'")
+    if mandate.status != "ACTIVE":
+        blockers.append(f"mandate status is '{mandate.status}', expected 'ACTIVE'")
+    if mandate.autonomy_level != "LEVEL_2":
+        blockers.append(f"mandate autonomy_level is '{mandate.autonomy_level}', expected 'LEVEL_2'")
+    if mandate.provider != ALLOWED_PROVIDER:
+        blockers.append(f"mandate provider is '{mandate.provider}', expected '{ALLOWED_PROVIDER}'")
+    if mandate.exchange_environment != ALLOWED_ENVIRONMENT:
+        blockers.append(f"mandate environment is '{mandate.exchange_environment}', expected '{ALLOWED_ENVIRONMENT}'")
+
+    # Runtime scope compatibility: the exact paper account / live trading
+    # profile / exchange connection / campaign Controlled Proof actually
+    # resolves at entry time (same chain create_controlled_proof and
+    # _live_capital_blocker use) must match what this mandate is pinned to
+    # -- a mandate scoped to a different profile/connection/campaign would
+    # never pass evaluate_mandate_eligibility's own scope checks at
+    # runtime, so a mismatch here is reported now rather than discovered
+    # only when a real BUY attempt fails.
+    runtime = await db.scalar(select(CapitalCampaign).where(CapitalCampaign.uuid == ALLOWED_CAMPAIGN_ID).limit(1))
+    if runtime is None or runtime.paper_account_id is None:
+        blockers.append("Controlled Proof runtime campaign/paper account cannot be resolved")
+    else:
+        if mandate.paper_account_id is not None and mandate.paper_account_id != runtime.paper_account_id:
+            blockers.append(
+                f"mandate paper_account_id is '{mandate.paper_account_id}', "
+                f"expected '{runtime.paper_account_id}' (Controlled Proof's runtime paper account)"
+            )
+        if mandate.capital_campaign_id is not None and mandate.capital_campaign_id != runtime.id:
+            blockers.append(
+                f"mandate capital_campaign_id is {mandate.capital_campaign_id}, "
+                f"expected {runtime.id} (Controlled Proof's pinned campaign)"
+            )
+        profile_id = await _resolve_live_trading_profile_id(db=db, paper_account_id=runtime.paper_account_id)
+        if profile_id is None:
+            blockers.append("no live trading profile found for Controlled Proof's runtime paper account")
+        elif mandate.live_trading_profile_id != profile_id:
+            blockers.append(
+                f"mandate live_trading_profile_id is '{mandate.live_trading_profile_id}', "
+                f"expected '{profile_id}' (Controlled Proof's runtime profile)"
+            )
+
+    connections = (await db.scalars(select(ExchangeConnection).where(
+        ExchangeConnection.provider == ALLOWED_PROVIDER,
+        ExchangeConnection.environment == ALLOWED_ENVIRONMENT,
+        ExchangeConnection.status == "connected",
+        ExchangeConnection.credentials_valid.is_(True),
+    ))).all()
+    if len(connections) != 1:
+        blockers.append(
+            f"{len(connections)} connected, credentials-valid exchange connections found for "
+            f"{ALLOWED_PROVIDER}/{ALLOWED_ENVIRONMENT}; Controlled Proof requires exactly one"
+        )
+    elif mandate.exchange_connection_id != connections[0].exchange_connection_id:
+        blockers.append(
+            f"mandate exchange_connection_id is '{mandate.exchange_connection_id}', "
+            f"expected '{connections[0].exchange_connection_id}' (the one authoritative production connection)"
+        )
+
+    version = await get_governing_authorized_mandate_version(db=db, mandate_id=mandate_id)
+    if version is None:
+        blockers.append("no ACTIVE, authorized governing mandate version found")
+        report["ready"] = False
+        return report
+
+    report.update(
+        governing_version_id=version.mandate_version_id,
+        governing_version_found=True,
+        max_order_notional_usd=version.max_order_notional_usd,
+        max_open_exposure_usd=version.max_open_exposure_usd,
+        position_limit=version.position_limit,
+        allowed_products=list(version.allowed_products),
+        allowed_order_sides=list(version.allowed_order_sides),
+    )
+    if Decimal(version.max_order_notional_usd) != MAX_NOTIONAL_USD:
+        blockers.append(f"max_order_notional_usd is {version.max_order_notional_usd}, expected {MAX_NOTIONAL_USD}")
+    if Decimal(version.max_open_exposure_usd) != MAX_NOTIONAL_USD:
+        blockers.append(f"max_open_exposure_usd is {version.max_open_exposure_usd}, expected {MAX_NOTIONAL_USD}")
+    if version.position_limit != 1:
+        blockers.append(f"position_limit is {version.position_limit}, expected 1")
+    # Mirrors AUTONOMOUS_CYCLE_PRODUCT_ID (services/orchestration/asset_roster.py)
+    # -- the sole product Controlled Proof's own pipeline actually trades
+    # today. Not imported directly to avoid pulling asset_roster's
+    # capital_campaign_domain -> commissioned_entry_execution ->
+    # live_crypto_orders import chain into this module.
+    if "BTC-USD" not in version.allowed_products:
+        blockers.append("allowed_products does not include BTC-USD")
+    if "BUY" not in version.allowed_order_sides:
+        blockers.append("allowed_order_sides does not include BUY")
+    if "SELL" not in version.allowed_order_sides:
+        blockers.append("allowed_order_sides does not include SELL")
+
+    report["ready"] = not blockers
+    return report
 
 
 async def start_live_controlled_proof(

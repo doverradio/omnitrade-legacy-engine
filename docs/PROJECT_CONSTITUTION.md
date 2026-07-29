@@ -94,6 +94,20 @@ Any operational capability expected to be performed more than once should be exp
 
 
 ---
+## Constitutional Principle: Maximize Risk-Adjusted Returns
+
+OmniTrade exists to maximize long-term risk-adjusted capital growth.
+
+All architectural, strategic, and operational decisions shall optimize for the highest sustainable risk-adjusted returns rather than maximizing trade count, raw profit, or excessive conservatism.
+
+Risk controls exist to prevent catastrophic loss—not to unnecessarily constrain profitable capital deployment.
+
+When multiple implementations satisfy the same safety objectives, the implementation that enables greater autonomous capital efficiency, scalability, and compounding shall be preferred.
+
+Every hard limit must have a clearly defined risk rationale. Rules that exist only because they are simple or conservative, rather than because they reduce meaningful risk, should be redesigned or removed.
+
+
+---
 ### Relationship to Other Documents
 
 This Constitution sits above the rest of the documentation set, but does not replace or duplicate any of it:

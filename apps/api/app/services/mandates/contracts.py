@@ -41,6 +41,11 @@ MANDATE_APPROVAL_POLICY_MANDATE_ALLOWED = "MANDATE_ALLOWED"
 MANDATE_AUTHORIZATION_ALLOWED = "AUTHORIZED"
 MANDATE_AUTHORIZATION_REJECTED = "REJECTED"
 
+MANDATE_PURPOSE_PRODUCTION = "PRODUCTION"
+MANDATE_PURPOSE_CONTROLLED_PROOF = "CONTROLLED_PROOF"
+
+MANDATE_PURPOSES = {MANDATE_PURPOSE_PRODUCTION, MANDATE_PURPOSE_CONTROLLED_PROOF}
+
 
 @dataclass(frozen=True)
 class MandateDomainModel:
@@ -56,6 +61,7 @@ class MandateDomainModel:
     capital_campaign_id: int | None
     expires_at: datetime | None
     revoked_at: datetime | None
+    purpose: str = MANDATE_PURPOSE_PRODUCTION
 
 
 @dataclass(frozen=True)
@@ -122,6 +128,17 @@ class MandateEligibilityInput:
     evidence_age_seconds: int
     kill_switch_engaged: bool
     observed_at: datetime
+    # The mandate purpose this specific evaluation is only ever allowed to
+    # resolve against (see MANDATE_PURPOSE_* above). Defaults to ordinary
+    # production so every pre-existing caller keeps its prior, unchanged
+    # behavior -- only Controlled Proof evaluation call sites pass
+    # MANDATE_PURPOSE_CONTROLLED_PROOF explicitly.
+    expected_mandate_purpose: str = MANDATE_PURPOSE_PRODUCTION
+    # Controlled-Proof-attributable current open exposure (see
+    # services/controlled_proof/exposure.py). Meaningless -- and never
+    # consulted -- for a PRODUCTION-purpose mandate; only replaces the
+    # ordinary daily_deployment_limit check for CONTROLLED_PROOF.
+    controlled_proof_open_exposure_usd: Decimal = Decimal("0")
 
 
 @dataclass(frozen=True)

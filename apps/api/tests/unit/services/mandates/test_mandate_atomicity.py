@@ -81,6 +81,7 @@ def _mandate(*, status: str = "PENDING_AUTHORIZATION") -> SimpleNamespace:
         owner_actor_id="operator:owner",
         status=status,
         autonomy_level="LEVEL_2",
+        purpose="PRODUCTION",
         provider="kraken_spot",
         exchange_environment="production",
         exchange_connection_id=uuid.uuid4(),

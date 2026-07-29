@@ -56,9 +56,10 @@ router = APIRouter(prefix="/autonomous-capital/mandates", tags=["autonomous-capi
 async def get_autonomous_capital_mandates(
     owner_actor_id: str | None = Query(default=None),
     status: str | None = Query(default=None),
+    purpose: str | None = Query(default=None),
     db: AsyncSession = Depends(get_db),
 ) -> AutonomousCapitalMandateListResponse:
-    rows = await list_mandates(db=db, owner_actor_id=owner_actor_id, status=status)
+    rows = await list_mandates(db=db, owner_actor_id=owner_actor_id, status=status, purpose=purpose)
     return AutonomousCapitalMandateListResponse(items=[_to_mandate_response(item) for item in rows])
 
 
@@ -82,6 +83,7 @@ async def post_autonomous_capital_mandate(
         actor=current_user["id"],
         idempotency_key=payload.idempotency_key,
         reason=payload.reason,
+        purpose=payload.purpose,
     )
     return _to_mandate_response(mandate)
 
@@ -373,6 +375,7 @@ def _to_mandate_response(mandate: AutonomousCapitalMandate) -> AutonomousCapital
         owner_actor_id=mandate.owner_actor_id,
         status=mandate.status,
         autonomy_level=mandate.autonomy_level,
+        purpose=mandate.purpose,
         provider=mandate.provider,
         exchange_environment=mandate.exchange_environment,
         exchange_connection_id=mandate.exchange_connection_id,

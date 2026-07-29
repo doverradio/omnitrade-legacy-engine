@@ -29,17 +29,41 @@ class AutonomousCapitalMandate(Base):
             "approval_mode_default = true",
             name="ck_ac_mandates_human_approval_default",
         ),
+        CheckConstraint(
+            "purpose IN ('PRODUCTION','CONTROLLED_PROOF')",
+            name="ck_ac_mandates_purpose",
+        ),
+        # Replaces "latest active LEVEL_2 mandate for scope" ORDER BY/LIMIT 1
+        # ambiguity with a real database-enforced invariant: at most one
+        # ACTIVE mandate per (scope, autonomy_level, purpose). Same
+        # partial-unique-index pattern as
+        # ControlledProofRun.uq_controlled_proof_runs_single_active /
+        # AutonomousExecutionClaim.uq_aec_active_campaign_scope.
+        Index(
+            "uq_ac_mandates_active_scope_purpose",
+            "provider", "exchange_environment", "exchange_connection_id",
+            "live_trading_profile_id", "autonomy_level", "purpose",
+            unique=True,
+            postgresql_where=text("status = 'ACTIVE'"),
+            sqlite_where=text("status = 'ACTIVE'"),
+        ),
         Index("ix_ac_mandates_owner_actor", "owner_actor_id"),
         Index("ix_ac_mandates_status", "status"),
         Index("ix_ac_mandates_autonomy_level", "autonomy_level"),
         Index("ix_ac_mandates_live_profile", "live_trading_profile_id"),
         Index("ix_ac_mandates_campaign", "capital_campaign_id"),
+        Index("ix_ac_mandates_purpose", "purpose"),
     )
 
     mandate_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, server_default=text("gen_random_uuid()"))
     owner_actor_id: Mapped[str] = mapped_column(Text, nullable=False)
     status: Mapped[str] = mapped_column(Text, nullable=False, server_default=text("'DRAFT'"))
     autonomy_level: Mapped[str] = mapped_column(Text, nullable=False, server_default=text("'LEVEL_1'"))
+    # PRODUCTION (default, backward-compatible for every pre-existing row) is
+    # the ordinary autonomous-trading mandate purpose; CONTROLLED_PROOF is a
+    # distinct, dedicated purpose so Controlled Proof entry never resolves --
+    # and ordinary autonomous trading never accepts -- the other's mandate.
+    purpose: Mapped[str] = mapped_column(Text, nullable=False, server_default=text("'PRODUCTION'"))
     provider: Mapped[str] = mapped_column(Text, nullable=False)
     exchange_environment: Mapped[str] = mapped_column(Text, nullable=False)
     exchange_connection_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), ForeignKey("exchange_connections.exchange_connection_id", ondelete="RESTRICT"), nullable=False)

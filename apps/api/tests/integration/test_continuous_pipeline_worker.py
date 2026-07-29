@@ -449,6 +449,156 @@ async def test_campaign_evaluation_rejects_mismatched_autonomous_cycle_correlati
     assert reason == "autonomous_campaign_cycle_correlation_mismatch"
 
 
+def _forced_entry_fixture() -> tuple[SimpleNamespace, SimpleNamespace]:
+    """A campaign_cycle/autonomous_cycle pair correlated well enough to pass
+    the trigger/product_id check, with autonomous_cycle carrying a real
+    (PRODUCTION-shaped) mandate identity -- exactly the identity a
+    controlled_proof_forced_entry evaluation must never inherit."""
+    campaign_cycle = _automatic_cycle()
+    campaign_cycle.cycle_kind = "campaign"
+    campaign_cycle.mandate_id = campaign_cycle.mandate_version_id = campaign_cycle.mandate_evaluation_id = None
+    campaign_cycle.audit_correlation_id = uuid.uuid4()
+    campaign_cycle.software_build_version = None
+    campaign_cycle.cycle_context["trigger"] = "kraken_btc_15m_candle_close"
+    autonomous_cycle = SimpleNamespace(
+        cycle_id=uuid.uuid4(),
+        mandate_id=uuid.uuid4(),  # the ordinary PRODUCTION mandate identity
+        mandate_version_id=uuid.uuid4(),
+        cycle_context={"trigger": "kraken_btc_15m_candle_close", "product_id": "BTC-USD"},
+    )
+    return campaign_cycle, autonomous_cycle
+
+
+@pytest.mark.asyncio
+async def test_forced_entry_fails_closed_when_controlled_proof_mandate_unconfigured(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import app.services.orchestration.continuous_pipeline_worker as worker_module
+
+    campaign_cycle, autonomous_cycle = _forced_entry_fixture()
+    evaluate_calls = 0
+
+    async def _evaluate(*, db, request):
+        nonlocal evaluate_calls
+        evaluate_calls += 1
+        raise AssertionError("evaluate_and_record_mandate must never be called when the mandate is unconfigured")
+
+    monkeypatch.setattr(worker_module, "get_settings", lambda: SimpleNamespace(controlled_proof_mandate_id=None))
+    monkeypatch.setattr(worker_module, "evaluate_and_record_mandate", _evaluate)
+
+    reason = await worker_module._ensure_campaign_cycle_mandate_evaluation(
+        db=object(), campaign_cycle=campaign_cycle, autonomous_cycle=autonomous_cycle,
+        strategy_identity="strategy_roster_aggregate@1.0.0", product="BTC-USD", side="BUY",
+        proposed_notional=Decimal("5"), controlled_proof_forced_entry=True,
+    )
+
+    assert reason == "controlled_proof_mandate_missing"
+    assert evaluate_calls == 0
+    # Fail-closed also means the campaign_cycle is never mutated with any
+    # mandate identity -- neither the missing dedicated one nor the
+    # autonomous cycle's production one.
+    assert campaign_cycle.mandate_id is None
+
+
+@pytest.mark.asyncio
+async def test_forced_entry_never_inherits_autonomous_cycle_production_mandate(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import app.services.orchestration.continuous_pipeline_worker as worker_module
+    from app.services.mandates.contracts import MANDATE_PURPOSE_CONTROLLED_PROOF
+
+    campaign_cycle, autonomous_cycle = _forced_entry_fixture()
+    controlled_proof_mandate_id = uuid.uuid4()
+    controlled_proof_mandate_version_id = uuid.uuid4()
+    evaluation_requests = []
+
+    async def _evaluate(*, db, request):
+        evaluation_requests.append(request)
+        return SimpleNamespace(
+            evaluation_id=uuid.uuid4(),
+            mandate_id=controlled_proof_mandate_id,
+            mandate_version_id=controlled_proof_mandate_version_id,
+            decision_id=campaign_cycle.decision_record_id,
+            authorization_result="AUTHORIZED",
+            approval_result="APPROVAL_SATISFIED_BY_ACTIVE_MANDATE",
+        )
+
+    monkeypatch.setattr(
+        worker_module, "get_settings",
+        lambda: SimpleNamespace(controlled_proof_mandate_id=controlled_proof_mandate_id),
+    )
+    monkeypatch.setattr(worker_module, "evaluate_and_record_mandate", _evaluate)
+    monkeypatch.setattr(worker_module, "_load_runtime_campaign", _async_return(None))
+
+    class _Db:
+        async def flush(self) -> None:
+            return None
+
+    reason = await worker_module._ensure_campaign_cycle_mandate_evaluation(
+        db=_Db(), campaign_cycle=campaign_cycle, autonomous_cycle=autonomous_cycle,
+        strategy_identity="strategy_roster_aggregate@1.0.0", product="BTC-USD", side="BUY",
+        proposed_notional=Decimal("5"), controlled_proof_forced_entry=True,
+    )
+
+    assert reason is None
+    assert len(evaluation_requests) == 1
+    request = evaluation_requests[0]
+    # The exact invariant under test: the mandate evaluated is the
+    # dedicated Controlled Proof mandate -- never autonomous_cycle.mandate_id.
+    assert request.mandate_id == controlled_proof_mandate_id
+    assert request.mandate_id != autonomous_cycle.mandate_id
+    assert request.expected_mandate_purpose == MANDATE_PURPOSE_CONTROLLED_PROOF
+    assert campaign_cycle.mandate_id == controlled_proof_mandate_id
+    assert campaign_cycle.mandate_version_id == controlled_proof_mandate_version_id
+    assert campaign_cycle.mandate_id != autonomous_cycle.mandate_id
+
+
+@pytest.mark.asyncio
+async def test_ordinary_entry_still_pins_autonomous_cycle_mandate_unchanged(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Regression guard: controlled_proof_forced_entry defaults to False, so
+    every pre-existing (ordinary) caller of this function keeps resolving
+    autonomous_cycle.mandate_id exactly as before this change."""
+    import app.services.orchestration.continuous_pipeline_worker as worker_module
+    from app.services.mandates.contracts import MANDATE_PURPOSE_PRODUCTION
+
+    campaign_cycle, autonomous_cycle = _forced_entry_fixture()
+    evaluation_requests = []
+
+    async def _evaluate(*, db, request):
+        evaluation_requests.append(request)
+        return SimpleNamespace(
+            evaluation_id=uuid.uuid4(),
+            mandate_id=autonomous_cycle.mandate_id,
+            mandate_version_id=autonomous_cycle.mandate_version_id,
+            decision_id=campaign_cycle.decision_record_id,
+            authorization_result="AUTHORIZED",
+            approval_result="APPROVAL_SATISFIED_BY_ACTIVE_MANDATE",
+        )
+
+    monkeypatch.setattr(worker_module, "evaluate_and_record_mandate", _evaluate)
+
+    class _Db:
+        async def flush(self) -> None:
+            return None
+
+    reason = await worker_module._ensure_campaign_cycle_mandate_evaluation(
+        db=_Db(), campaign_cycle=campaign_cycle, autonomous_cycle=autonomous_cycle,
+        strategy_identity="strategy_roster_aggregate@1.0.0", product="BTC-USD", side="BUY",
+        proposed_notional=Decimal("5"),
+    )
+
+    assert reason is None
+    assert len(evaluation_requests) == 1
+    request = evaluation_requests[0]
+    assert request.mandate_id == autonomous_cycle.mandate_id
+    assert request.expected_mandate_purpose == MANDATE_PURPOSE_PRODUCTION
+    assert request.controlled_proof_open_exposure_usd == Decimal("0")
+    assert campaign_cycle.mandate_id == autonomous_cycle.mandate_id
+    assert campaign_cycle.mandate_version_id == autonomous_cycle.mandate_version_id
+
+
 def _not_due_research_result() -> SimpleNamespace:
     return SimpleNamespace(
         started=False,
@@ -5034,7 +5184,8 @@ async def test_exit_recovery_enters_existing_pipeline_as_sell_only(monkeypatch: 
     monkeypatch.setattr(worker_module, "_has_open_live_order", _async_return(False))
     monkeypatch.setattr(worker_module, "_has_unresolved_reconciliation", _async_return(False))
     monkeypatch.setattr(worker_module, "evaluate_controlled_proof_risk", _async_return(ControlledProofRiskOutcome(verdict="ALLOW", approved_notional_usd=Decimal("5"), reason_code=None, risk_event_id=uuid.uuid4())))
-    monkeypatch.setattr(worker_module, "get_settings", lambda: SimpleNamespace(automatic_mandate_package_activation_mandate_id=uuid.uuid4()))
+    monkeypatch.setattr(worker_module, "get_settings", lambda: SimpleNamespace(automatic_mandate_package_activation_mandate_id=uuid.uuid4(), controlled_proof_mandate_id=uuid.uuid4()))
+    monkeypatch.setattr(worker_module, "compute_controlled_proof_open_exposure_usd", _async_return(Decimal("0")))
     monkeypatch.setattr(worker_module, "resolve_controlled_proof_strategy_identity", _async_return("ma_crossover@1.0.0"))
     async def _create_decision(**kwargs):
         captured["decision_request"] = kwargs
@@ -5153,7 +5304,8 @@ async def test_exit_recovery_package_failure_rolls_back_and_blocks_cleanly(
     monkeypatch.setattr(worker_module, "_has_open_live_order", _async_return(False))
     monkeypatch.setattr(worker_module, "_has_unresolved_reconciliation", _async_return(False))
     monkeypatch.setattr(worker_module, "evaluate_controlled_proof_risk", _async_return(ControlledProofRiskOutcome(verdict="ALLOW", approved_notional_usd=Decimal("5"), reason_code=None, risk_event_id=uuid.uuid4())))
-    monkeypatch.setattr(worker_module, "get_settings", lambda: SimpleNamespace(automatic_mandate_package_activation_mandate_id=uuid.uuid4()))
+    monkeypatch.setattr(worker_module, "get_settings", lambda: SimpleNamespace(automatic_mandate_package_activation_mandate_id=uuid.uuid4(), controlled_proof_mandate_id=uuid.uuid4()))
+    monkeypatch.setattr(worker_module, "compute_controlled_proof_open_exposure_usd", _async_return(Decimal("0")))
     monkeypatch.setattr(worker_module, "resolve_controlled_proof_strategy_identity", _async_return("ma_crossover@1.0.0"))
     monkeypatch.setattr(worker_module, "create_controlled_proof_decision_record", _async_return(uuid.uuid4()))
     evaluation = SimpleNamespace(authorization_result="AUTHORIZED", mandate_id=uuid.uuid4(), mandate_version_id=uuid.uuid4(), evaluation_id=uuid.uuid4())
@@ -5219,7 +5371,8 @@ async def test_exit_recovery_sell_package_link_dbapi_error_logs_full_diagnostics
     monkeypatch.setattr(worker_module, "_has_open_live_order", _async_return(False))
     monkeypatch.setattr(worker_module, "_has_unresolved_reconciliation", _async_return(False))
     monkeypatch.setattr(worker_module, "evaluate_controlled_proof_risk", _async_return(ControlledProofRiskOutcome(verdict="ALLOW", approved_notional_usd=Decimal("5"), reason_code=None, risk_event_id=uuid.uuid4())))
-    monkeypatch.setattr(worker_module, "get_settings", lambda: SimpleNamespace(automatic_mandate_package_activation_mandate_id=uuid.uuid4()))
+    monkeypatch.setattr(worker_module, "get_settings", lambda: SimpleNamespace(automatic_mandate_package_activation_mandate_id=uuid.uuid4(), controlled_proof_mandate_id=uuid.uuid4()))
+    monkeypatch.setattr(worker_module, "compute_controlled_proof_open_exposure_usd", _async_return(Decimal("0")))
     monkeypatch.setattr(worker_module, "resolve_controlled_proof_strategy_identity", _async_return("ma_crossover@1.0.0"))
     monkeypatch.setattr(worker_module, "create_controlled_proof_decision_record", _async_return(uuid.uuid4()))
     evaluation = SimpleNamespace(authorization_result="AUTHORIZED", mandate_id=uuid.uuid4(), mandate_version_id=uuid.uuid4(), evaluation_id=uuid.uuid4())

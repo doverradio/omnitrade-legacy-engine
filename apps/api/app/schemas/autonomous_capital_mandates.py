@@ -20,6 +20,11 @@ class AutonomousCapitalMandateCreateRequest(BaseModel):
     expires_at: datetime | None = None
     idempotency_key: str | None = None
     reason: str | None = None
+    # PRODUCTION is the ordinary autonomous-trading mandate purpose and stays
+    # the default for full backward compatibility; CONTROLLED_PROOF is a
+    # distinct, dedicated purpose (see MANDATE_PURPOSE_* in
+    # services/mandates/contracts.py).
+    purpose: str = "PRODUCTION"
 
 
 class AutonomousCapitalMandateResponse(BaseModel):
@@ -27,6 +32,7 @@ class AutonomousCapitalMandateResponse(BaseModel):
     owner_actor_id: str
     status: str
     autonomy_level: str
+    purpose: str
     provider: str
     exchange_environment: str
     exchange_connection_id: uuid.UUID

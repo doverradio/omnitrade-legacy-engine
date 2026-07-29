@@ -86,6 +86,15 @@ class Settings(BaseSettings):
         default=None,
         validation_alias="AUTOMATIC_MANDATE_PACKAGE_ACTIVATION_MANDATE_VERSION_ID",
     )
+    # Distinct, dedicated mandate Controlled Proof entry pins its BUY/SELL
+    # evaluations to -- deliberately separate from
+    # automatic_mandate_package_activation_mandate_id (ordinary production)
+    # so a Controlled Proof attempt can never resolve, and ordinary
+    # autonomous trading can never be governed by, the other's mandate.
+    controlled_proof_mandate_id: UUID | None = Field(
+        default=None,
+        validation_alias="CONTROLLED_PROOF_MANDATE_ID",
+    )
     # Unlike automatic_mandate_package_activation_enabled/live_crypto_order_
     # submission_enabled (both gate NEW live capital commitment and default
     # False), automatic reconciliation only reads provider order state and

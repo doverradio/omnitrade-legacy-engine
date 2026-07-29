@@ -35,6 +35,30 @@ class ControlledProofCancelRequest(BaseModel):
     reason: str | None = None
 
 
+class ControlledProofMandateReadinessResponse(BaseModel):
+    configured: bool
+    mandate_id: uuid.UUID | None
+    mandate_found: bool
+    purpose: str | None
+    status: str | None
+    autonomy_level: str | None
+    provider: str | None
+    environment: str | None
+    exchange_connection_id: uuid.UUID | None
+    live_trading_profile_id: uuid.UUID | None
+    paper_account_id: uuid.UUID | None
+    capital_campaign_id: int | None
+    governing_version_id: uuid.UUID | None
+    governing_version_found: bool
+    max_order_notional_usd: Decimal | None
+    max_open_exposure_usd: Decimal | None
+    position_limit: int | None
+    allowed_products: list[str] | None
+    allowed_order_sides: list[str] | None
+    ready: bool
+    blockers: list[str]
+
+
 class ControlledProofExitRecoveryCreateRequest(BaseModel):
     idempotency_key: str
     expires_in_minutes: int = Field(default=60, ge=1, le=180)
