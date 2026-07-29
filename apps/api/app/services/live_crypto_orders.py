@@ -2588,6 +2588,16 @@ class LiveCryptoOrderService:
 
         provider_response = submission.raw_response
         safe_response = submission.safe_headers
+        # The adapter has returned a classified result, so the provider
+        # boundary was reached even when the authoritative result is a
+        # rejection with no provider order ID. Persist this truthfully for
+        # later recovery/supersession audits. Ambiguous responses also retain
+        # provider_call_made=True and therefore can never masquerade as a
+        # pre-provider failure.
+        live_order.safe_provider_response = {
+            **live_order.safe_provider_response,
+            "provider_call_made": True,
+        }
 
         if submission.classification == "rejected":
             safe_provider_body = _redact_sensitive(submission.raw_response)

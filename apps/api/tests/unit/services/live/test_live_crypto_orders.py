@@ -1517,6 +1517,7 @@ async def test_explicit_provider_rejection_sets_rejected_without_blind_retry(mon
     assert error["provider_response_body"]["provider_errors"] == ["EOrder:Insufficient funds"]
     assert error["request_payload_summary"]["product_id"] == "BTC-USD"
     assert response.live_crypto_order.safe_provider_response["create_order_payload"]["side"] == "BUY"
+    assert response.live_crypto_order.safe_provider_response["provider_call_made"] is True
     release_scope.assert_awaited_once_with(
         db=db,
         live_crypto_order_id=live_order.live_crypto_order_id,

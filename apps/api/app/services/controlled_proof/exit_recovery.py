@@ -201,9 +201,11 @@ async def supersede_stale_exit_recovery_sell_package(
 ) -> None:
     """Retire an unused stale SELL package so fresh governance can run.
 
-    An execution claim is the boundary: once one exists, this helper refuses
-    replacement and leaves recovery fail-closed. It never renews or mutates
-    the expired authority evidence on the historical package.
+    An execution claim is the boundary. Replacement is permitted only for a
+    proven pre-provider failure or an authoritative explicit provider
+    rejection; ambiguous or potentially filled lineage remains fail-closed.
+    It never renews or mutates the expired authority evidence on the
+    historical package.
     """
     now = _utcnow()
     if (
@@ -221,9 +223,12 @@ async def supersede_stale_exit_recovery_sell_package(
     existing_claim = await db.scalar(select(AutonomousExecutionClaim).where(
         AutonomousExecutionClaim.package_id == package.package_id,
     ).with_for_update().limit(1))
+    terminal_rejection_audit: dict[str, object] | None = None
     if existing_claim is not None:
-        if existing_claim.claim_status != "FAILED_PRE_PROVIDER":
+        if existing_claim.claim_status not in {"FAILED_PRE_PROVIDER", "CANCELLED"}:
             raise InvalidRequestError(message="Stale SELL package has unresolved execution lineage", details={})
+        if existing_claim.claim_status == "CANCELLED" and existing_claim.live_order_id is None:
+            raise InvalidRequestError(message="Stale SELL package provider boundary is unresolved", details={})
         if existing_claim.live_order_id is not None:
             failed_order = await db.scalar(select(LiveCryptoOrder).where(
                 LiveCryptoOrder.live_crypto_order_id == existing_claim.live_order_id,
@@ -233,14 +238,37 @@ async def supersede_stale_exit_recovery_sell_package(
                 if failed_order is not None and isinstance(failed_order.safe_provider_response, dict)
                 else {}
             )
-            if (
-                failed_order is None
-                or failed_order.status != "CANCELLED"
-                or failed_order.provider_order_id is not None
-                or failed_order.submitted_at is not None
-                or evidence.get("provider_call_made") is not False
-            ):
+            rejected_error = evidence.get("create_order_error") if isinstance(evidence.get("create_order_error"), dict) else {}
+            is_proven_pre_provider = bool(
+                existing_claim.claim_status == "FAILED_PRE_PROVIDER"
+                and failed_order is not None
+                and failed_order.status == "CANCELLED"
+                and failed_order.provider_order_id is None
+                and failed_order.submitted_at is None
+                and evidence.get("provider_call_made") is False
+            )
+            is_authoritative_rejection = bool(
+                existing_claim.claim_status == "CANCELLED"
+                and failed_order is not None
+                and failed_order.status == "REJECTED"
+                and failed_order.provider_order_id is None
+                and failed_order.submitted_at is not None
+                and evidence.get("create_order_responded") is True
+                and rejected_error.get("rejection_reason") == "provider_explicit_rejection"
+                and str(rejected_error.get("code") or "").strip()
+                and str(rejected_error.get("message") or "").strip()
+            )
+            if not (is_proven_pre_provider or is_authoritative_rejection):
                 raise InvalidRequestError(message="Stale SELL package provider boundary is unresolved", details={})
+            if is_authoritative_rejection:
+                terminal_rejection_audit = {
+                    "execution_claim_id": str(existing_claim.claim_id),
+                    "live_crypto_order_id": str(failed_order.live_crypto_order_id),
+                    "provider_error_code": str(rejected_error["code"]),
+                    "rejection_message": str(rejected_error["message"]),
+                    "provider_order_id": None,
+                    "provider_outcome": "REJECTED",
+                }
     activation = await db.scalar(select(CanonicalProvingActivation).where(
         CanonicalProvingActivation.package_id == package.package_id,
     ).with_for_update().limit(1))
@@ -267,6 +295,7 @@ async def supersede_stale_exit_recovery_sell_package(
             "reason": package.invalidated_reason,
             "controlled_proof_id": str(proof.proof_id),
             "exit_recovery_id": str(recovery.recovery_id),
+            "terminal_rejection_lineage": terminal_rejection_audit,
         },
     ))
     db.add(AuditLog(
@@ -294,6 +323,10 @@ async def supersede_stale_exit_recovery_sell_package(
             "package_state": "SUPERSEDED",
             "activation_state": activation.activation_state,
             "replacement_requires_fresh_risk_mandate_preview_package": True,
+            "controlled_proof_id": str(proof.proof_id),
+            "exit_recovery_id": str(recovery.recovery_id),
+            "superseded_package_id": str(old_package_id),
+            "terminal_rejection_lineage": terminal_rejection_audit,
         },
     ))
     await db.flush()

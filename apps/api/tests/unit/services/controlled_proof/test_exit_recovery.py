@@ -243,6 +243,123 @@ async def test_failed_pre_provider_claim_permits_fresh_package_only_with_termina
 
 
 @pytest.mark.asyncio
+async def test_explicit_provider_rejection_permits_governed_stale_package_replacement(monkeypatch) -> None:
+    now = datetime.now(timezone.utc)
+    proof = _terminal_proof()
+    package = SimpleNamespace(
+        package_id=uuid.uuid4(), side="SELL", package_state="ACTIVATED",
+        authorization_source="MANDATE", authorization_expires_at=now - timedelta(minutes=1),
+        superseded_at=None, invalidated_reason=None,
+    )
+    proof.sell_package_id = package.package_id
+    recovery = SimpleNamespace(
+        recovery_id=uuid.uuid4(), proof_id=proof.proof_id, status="IN_PROGRESS",
+        expires_at=now + timedelta(minutes=30),
+    )
+    order_id = uuid.uuid4()
+    claim = SimpleNamespace(
+        claim_id=uuid.uuid4(), claim_status="CANCELLED", live_order_id=order_id,
+    )
+    order = SimpleNamespace(
+        live_crypto_order_id=order_id, status="REJECTED", provider_order_id=None,
+        submitted_at=now - timedelta(minutes=2),
+        safe_provider_response={
+            # Historical rows may still say false; the classified provider
+            # response, not this obsolete marker, is authoritative here.
+            "provider_call_made": False,
+            "create_order_responded": True,
+            "create_order_error": {
+                "code": "invalid_base_size",
+                "message": "Kraken market sell submission requires base_size > 0",
+                "rejection_reason": "provider_explicit_rejection",
+            },
+        },
+    )
+    activation = SimpleNamespace(
+        activation_id=uuid.uuid4(), activation_state="COMPLETED",
+        expires_at=now - timedelta(seconds=1), updated_at=now,
+    )
+    db = _FakeDb([claim, order, activation])
+    monkeypatch.setattr(exit_recovery, "_utcnow", lambda: now)
+
+    await exit_recovery.supersede_stale_exit_recovery_sell_package(
+        db=db, recovery=recovery, proof=proof, package=package,
+    )
+
+    assert package.package_state == "SUPERSEDED"
+    assert proof.sell_package_id is None
+    recovery_audit = next(
+        item for item in db.added
+        if isinstance(item, AuditLog)
+        and item.action == "controlled_proof_exit_recovery.stale_sell_package_superseded"
+    )
+    lineage = recovery_audit.after_state["terminal_rejection_lineage"]
+    assert lineage == {
+        "execution_claim_id": str(claim.claim_id),
+        "live_crypto_order_id": str(order_id),
+        "provider_error_code": "invalid_base_size",
+        "rejection_message": "Kraken market sell submission requires base_size > 0",
+        "provider_order_id": None,
+        "provider_outcome": "REJECTED",
+    }
+
+    audit_count = len(db.added)
+    with pytest.raises(InvalidRequestError, match="not eligible"):
+        await exit_recovery.supersede_stale_exit_recovery_sell_package(
+            db=db, recovery=recovery, proof=proof, package=package,
+        )
+    assert len(db.added) == audit_count
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("claim_status", "order_status", "provider_order_id", "responded", "rejection_reason"),
+    [
+        ("RECONCILIATION_REQUIRED", "RECONCILIATION_REQUIRED", None, False, None),
+        ("SUBMISSION_PENDING", "UNKNOWN", None, False, None),
+        ("COMPLETED", "FILLED", "KRAKEN-ORDER", True, None),
+        ("CANCELLED", "REJECTED", "KRAKEN-ORDER", True, "provider_explicit_rejection"),
+        ("CANCELLED", "REJECTED", None, False, "provider_explicit_rejection"),
+    ],
+)
+async def test_potentially_filled_or_ambiguous_lineage_still_blocks_replacement(
+    monkeypatch, claim_status, order_status, provider_order_id, responded, rejection_reason,
+) -> None:
+    now = datetime.now(timezone.utc)
+    proof = _terminal_proof()
+    package = SimpleNamespace(
+        package_id=uuid.uuid4(), side="SELL", package_state="ACTIVATED",
+        authorization_source="MANDATE", authorization_expires_at=now - timedelta(minutes=1),
+    )
+    proof.sell_package_id = package.package_id
+    recovery = SimpleNamespace(
+        recovery_id=uuid.uuid4(), proof_id=proof.proof_id, status="IN_PROGRESS",
+        expires_at=now + timedelta(minutes=30),
+    )
+    order_id = uuid.uuid4()
+    claim = SimpleNamespace(claim_id=uuid.uuid4(), claim_status=claim_status, live_order_id=order_id)
+    order = SimpleNamespace(
+        live_crypto_order_id=order_id, status=order_status, provider_order_id=provider_order_id,
+        submitted_at=now - timedelta(minutes=2),
+        safe_provider_response={
+            "create_order_responded": responded,
+            "create_order_error": {
+                "code": "provider_error", "message": "provider result",
+                "rejection_reason": rejection_reason,
+            },
+        },
+    )
+    monkeypatch.setattr(exit_recovery, "_utcnow", lambda: now)
+
+    with pytest.raises(InvalidRequestError, match="unresolved"):
+        await exit_recovery.supersede_stale_exit_recovery_sell_package(
+            db=_FakeDb([claim, order]), recovery=recovery, proof=proof, package=package,
+        )
+
+    assert proof.sell_package_id == package.package_id
+
+
+@pytest.mark.asyncio
 async def test_authorization_predicates_accept_exact_authoritative_lineage(monkeypatch) -> None:
     import app.services.orchestration.continuous_pipeline_worker as worker
     proof = SimpleNamespace(
