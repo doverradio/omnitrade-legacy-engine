@@ -1,9 +1,10 @@
 from __future__ import annotations
 
+import uuid
 from decimal import Decimal
 from pathlib import Path
 
-from app.config import DEFAULT_ENV_FILE, Settings, get_settings
+from app.config import DEFAULT_ENV_FILE, Settings, get_settings, set_controlled_proof_mandate_id_in_env_file
 
 
 def test_settings_allow_missing_future_phase_integration_credentials(monkeypatch) -> None:
@@ -88,3 +89,43 @@ def test_automatic_mandate_package_activation_is_independent_and_disabled_by_def
     assert settings.automatic_mandate_package_activation_enabled is True
     assert settings.live_crypto_preparation_enabled is False
     assert settings.live_crypto_order_submission_enabled is False
+
+
+def test_set_controlled_proof_mandate_id_in_env_file_creates_file_when_missing(tmp_path) -> None:
+    env_file = tmp_path / ".env"
+    mandate_id = uuid.uuid4()
+
+    set_controlled_proof_mandate_id_in_env_file(mandate_id, env_file=env_file)
+
+    assert env_file.read_text().strip() == f"CONTROLLED_PROOF_MANDATE_ID={mandate_id}"
+
+
+def test_set_controlled_proof_mandate_id_in_env_file_preserves_other_lines_and_replaces_existing(tmp_path) -> None:
+    env_file = tmp_path / ".env"
+    old_id = uuid.uuid4()
+    env_file.write_text(f"DATABASE_URL=sqlite:///x\nCONTROLLED_PROOF_MANDATE_ID={old_id}\nKRAKEN_API_KEY=abc\n")
+    new_id = uuid.uuid4()
+
+    set_controlled_proof_mandate_id_in_env_file(new_id, env_file=env_file)
+
+    lines = env_file.read_text().splitlines()
+    assert lines == ["DATABASE_URL=sqlite:///x", f"CONTROLLED_PROOF_MANDATE_ID={new_id}", "KRAKEN_API_KEY=abc"]
+
+
+def test_set_controlled_proof_mandate_id_in_env_file_clears_settings_cache(tmp_path) -> None:
+    """get_settings() is lru_cache'd (see get_settings.cache_clear() calls elsewhere in
+    this file) -- writing a new setting must invalidate that cache so the current
+    process observes it on the very next get_settings() call, not only after a
+    restart. The .env file this write targets is unrelated to the real DEFAULT_ENV_FILE
+    Settings.model_config actually points at, so this only proves cache invalidation:
+    a fresh Settings() instance is constructed on the next call, not the identical
+    cached one."""
+    env_file = tmp_path / ".env"
+    get_settings.cache_clear()
+    first = get_settings()
+
+    set_controlled_proof_mandate_id_in_env_file(uuid.uuid4(), env_file=env_file)
+
+    second = get_settings()
+    assert first is not second
+    get_settings.cache_clear()

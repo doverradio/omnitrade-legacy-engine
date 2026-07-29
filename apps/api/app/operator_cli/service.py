@@ -23,7 +23,7 @@ import uuid
 from pydantic import BaseModel
 from sqlalchemy import case, desc, func, select, text
 
-from app.config import get_settings
+from app.config import DEFAULT_ENV_FILE, get_settings, set_controlled_proof_mandate_id_in_env_file
 from app.db.session import AsyncSessionLocal
 from app.models.audit_log import AuditLog
 from app.models.asset import Asset
@@ -61,10 +61,18 @@ from app.models.strategy_roster_run import StrategyRosterRun
 from app.services.autonomous_cycle import AutonomousCycleRequest, run_autonomous_preview_cycle
 from app.services.autonomous_cycle.orchestrator import normalize_product_id
 from app.services.mandates.contracts import (
+    MANDATE_PURPOSE_CONTROLLED_PROOF,
+    MANDATE_PURPOSE_PRODUCTION,
     MandateAuthorizationRequest,
     MandateLifecycleActionRequest,
     MandateVersionCreateRequest,
     MandateVersionModel,
+)
+from app.services.controlled_proof.service import (
+    ALLOWED_ENVIRONMENT as _CONTROLLED_PROOF_ENVIRONMENT,
+    ALLOWED_PROVIDER as _CONTROLLED_PROOF_PROVIDER,
+    MAX_NOTIONAL_USD as _CONTROLLED_PROOF_MAX_NOTIONAL_USD,
+    resolve_controlled_proof_runtime_scope,
 )
 from app.services.mandates.lifecycle import (
     _build_version_hash,
@@ -756,6 +764,7 @@ async def mandate_bootstrap(
     idempotency_key: str,
     audit_correlation_id: UUID | None,
     confirm: bool,
+    purpose: str = MANDATE_PURPOSE_PRODUCTION,
 ) -> dict[str, Any]:
     """Governed orchestration of the existing, unmodified mandate lifecycle: create_mandate()
     -> create_mandate_version() -> apply_mandate_lifecycle_action(SUBMIT_FOR_AUTHORIZATION) ->
@@ -796,9 +805,10 @@ async def mandate_bootstrap(
                     actor=actor,
                     idempotency_key=f"{root_idempotency_key}:create-mandate",
                     reason=reason,
+                    purpose=purpose,
                 ),
             )
-            stages.append({"stage": current_stage, "mandate_id": str(mandate.mandate_id), "status": mandate.status})
+            stages.append({"stage": current_stage, "mandate_id": str(mandate.mandate_id), "status": mandate.status, "purpose": mandate.purpose})
 
             current_stage = "create_mandate_version"
             version = await _await_db_operation(
@@ -940,6 +950,7 @@ async def mandate_bootstrap(
         "mandate_version_number": version.version_number,
         "mandate_authorization_id": str(authorization.mandate_authorization_id),
         "status": activated.status,
+        "purpose": activated.purpose,
         "capital_campaign_id": activated.capital_campaign_id,
         "governing_version_is_authorized": bool(governing_version.is_authorized) if governing_version is not None else None,
         "governing_version_is_active": bool(governing_version.is_active) if governing_version is not None else None,
@@ -947,6 +958,94 @@ async def mandate_bootstrap(
         "root_idempotency_key": root_idempotency_key,
         "stages": stages,
     }
+
+
+async def controlled_proof_mandate_bootstrap(
+    *,
+    actor: str,
+    reason: str,
+    idempotency_key: str,
+    allowed_strategy_versions: tuple[str, ...],
+    confirm: bool,
+    audit_correlation_id: UUID | None = None,
+    env_file: Path | None = None,
+) -> dict[str, Any]:
+    """Operator entrypoint that provisions the dedicated CONTROLLED_PROOF mandate
+    Controlled Proof entry pins its evaluations to (settings.controlled_proof_mandate_id,
+    see get_controlled_proof_mandate_readiness) -- reusing mandate_bootstrap() above
+    unmodified for every actual lifecycle call (create_mandate -> create_mandate_version
+    -> SUBMIT_FOR_AUTHORIZATION -> authorize_mandate_version -> ACTIVATE), never SQL and
+    never a bypassed lifecycle API. The only things this adds on top: (1) resolving
+    Controlled Proof's fixed runtime scope (exchange connection / live trading profile /
+    paper account / campaign) the exact same way get_controlled_proof_mandate_readiness
+    does, so the mandate this produces is scoped correctly by construction rather than by
+    coincidence, and its exact required limits ($5 notional/exposure, position_limit=1,
+    BTC-USD, BUY+SELL); (2) writing the resulting mandate_id into the .env file via
+    set_controlled_proof_mandate_id_in_env_file -- the only durable configuration
+    mechanism CONTROLLED_PROOF_MANDATE_ID supports -- so a fresh deployment reaches
+    readiness.ready == True without any manual database intervention.
+
+    allowed_strategy_versions is deliberately a required caller input, never derived or
+    guessed here: per the Strategy Identity Architecture Review (see Stage 4 notes on
+    mandate_bootstrap_export below), which strategy identity a mandate authorizes is
+    always owner-decided, never auto-populated from campaign/runtime state."""
+    if not confirm:
+        raise PermissionError("confirm=true is required for controlled proof mandate bootstrap")
+
+    async with AsyncSessionLocal() as db:
+        scope = await resolve_controlled_proof_runtime_scope(db=db)
+
+    result = await mandate_bootstrap(
+        owner_actor_id=actor,
+        autonomy_level="LEVEL_2",
+        provider=_CONTROLLED_PROOF_PROVIDER,
+        environment=_CONTROLLED_PROOF_ENVIRONMENT,
+        exchange_connection_id=scope.exchange_connection_id,
+        live_trading_profile_id=scope.live_trading_profile_id,
+        paper_account_id=scope.paper_account_id,
+        capital_campaign_id=scope.capital_campaign_row_id,
+        mandate_expires_at=None,
+        base_currency="USD",
+        authorized_capital_usd=_CONTROLLED_PROOF_MAX_NOTIONAL_USD,
+        max_order_notional_usd=_CONTROLLED_PROOF_MAX_NOTIONAL_USD,
+        max_open_exposure_usd=_CONTROLLED_PROOF_MAX_NOTIONAL_USD,
+        max_daily_deployed_usd=_CONTROLLED_PROOF_MAX_NOTIONAL_USD,
+        max_daily_realized_loss_usd=_CONTROLLED_PROOF_MAX_NOTIONAL_USD,
+        max_campaign_drawdown_usd=_CONTROLLED_PROOF_MAX_NOTIONAL_USD,
+        max_consecutive_losses=1,
+        position_limit=1,
+        price_evidence_max_age_seconds=300,
+        max_slippage_bps=Decimal("50"),
+        max_fee_bps=Decimal("50"),
+        allowed_products=("BTC-USD",),
+        allowed_order_sides=("BUY", "SELL"),
+        allowed_strategy_versions=tuple(allowed_strategy_versions),
+        approval_policy="MANDATE_ALLOWED",
+        entry_policy={},
+        exit_policy={},
+        cooldown_policy={},
+        operating_schedule={},
+        reconciliation_policy={},
+        kill_switch_policy={},
+        owner_acknowledgements={"accepted": True},
+        authorization_evidence_summary={"source": "controlled_proof_mandate_bootstrap"},
+        authorization_method="owner_signature",
+        authorization_evidence={"source": "controlled_proof_mandate_bootstrap"},
+        deterministic_explanation={"reason": "dedicated_controlled_proof_mandate_provisioning"},
+        authorization_expires_at=None,
+        actor=actor,
+        reason=reason,
+        idempotency_key=idempotency_key,
+        audit_correlation_id=audit_correlation_id,
+        confirm=confirm,
+        purpose=MANDATE_PURPOSE_CONTROLLED_PROOF,
+    )
+
+    env_file_path = env_file or DEFAULT_ENV_FILE
+    set_controlled_proof_mandate_id_in_env_file(UUID(result["mandate_id"]), env_file=env_file_path)
+    result["env_file"] = str(env_file_path)
+    result["controlled_proof_mandate_id_written"] = True
+    return result
 
 
 _MANDATE_BOOTSTRAP_EXPORT_DEFINITION_NOTES = (
@@ -1318,6 +1417,17 @@ _MANDATE_BOOTSTRAP_EXPORT_STATIC_MANDATE_FIELDS: dict[str, dict[str, Any]] = {
         "value": None,
         "source": None,
         "notes": "Optional in the current contract (CLI default is omitted/None); an authorization created without this simply has no expiration.",
+    },
+    "purpose": {
+        "classification": "NOT_REQUIRED",
+        "value": MANDATE_PURPOSE_PRODUCTION,
+        "source": None,
+        "notes": (
+            "Optional in the current contract (default 'PRODUCTION'); mandate-bootstrap-export "
+            "and mandate-bootstrap-create are only ever used for ordinary PRODUCTION-purpose "
+            "mandates. A dedicated CONTROLLED_PROOF-purpose mandate is provisioned by the "
+            "separate controlled-proof-mandate-bootstrap command, never by overriding this field here."
+        ),
     },
 }
 

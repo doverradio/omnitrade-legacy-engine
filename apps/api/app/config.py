@@ -279,3 +279,29 @@ class Settings(BaseSettings):
 @lru_cache
 def get_settings() -> Settings:
     return Settings()
+
+
+def set_controlled_proof_mandate_id_in_env_file(mandate_id: UUID, *, env_file: Path = DEFAULT_ENV_FILE) -> None:
+    """Persists CONTROLLED_PROOF_MANDATE_ID the same way every setting in this file is
+    read: as a KEY=VALUE line in the .env file Settings.model_config's env_file already
+    loads on every Settings() construction. This is the only durable-configuration
+    mechanism CONTROLLED_PROOF_MANDATE_ID supports -- the mandate row itself must
+    already have been created exclusively through the mandate lifecycle APIs before
+    this is called; this function never touches the database, only the setting.
+    Clears get_settings()'s cache so the current process also observes the new value
+    immediately, not only after a restart."""
+    line_prefix = "CONTROLLED_PROOF_MANDATE_ID="
+    new_line = f"{line_prefix}{mandate_id}"
+    existing_lines = env_file.read_text().splitlines() if env_file.exists() else []
+    replaced = False
+    updated_lines: list[str] = []
+    for line in existing_lines:
+        if line.startswith(line_prefix):
+            updated_lines.append(new_line)
+            replaced = True
+        else:
+            updated_lines.append(line)
+    if not replaced:
+        updated_lines.append(new_line)
+    env_file.write_text("\n".join(updated_lines) + "\n")
+    get_settings.cache_clear()

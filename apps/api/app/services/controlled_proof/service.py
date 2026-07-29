@@ -216,6 +216,60 @@ async def controlled_proof_entry_blocker(*, db: AsyncSession, proof: ControlledP
 
 
 @dataclass(frozen=True, slots=True)
+class ControlledProofRuntimeScope:
+    paper_account_id: uuid.UUID
+    live_trading_profile_id: uuid.UUID
+    exchange_connection_id: uuid.UUID
+    capital_campaign_row_id: int
+
+
+async def resolve_controlled_proof_runtime_scope(*, db: AsyncSession) -> ControlledProofRuntimeScope:
+    """Resolves the exact scope get_controlled_proof_mandate_readiness checks a
+    configured mandate against -- ALLOWED_CAMPAIGN_ID's runtime paper account and live
+    trading profile, plus the single connected/credentials-valid ALLOWED_PROVIDER/
+    ALLOWED_ENVIRONMENT exchange connection. Used by mandate provisioning so a freshly
+    created CONTROLLED_PROOF mandate is scoped correctly by construction, never by
+    coincidence. Raises InvalidRequestError (never returns a partial/guessed scope) if
+    any part cannot be resolved -- the same conditions readiness reports as blockers are
+    fatal here, since there is nothing correct to provision against."""
+    runtime = await db.scalar(select(CapitalCampaign).where(CapitalCampaign.uuid == ALLOWED_CAMPAIGN_ID).limit(1))
+    if runtime is None or runtime.paper_account_id is None:
+        raise InvalidRequestError(
+            message="Controlled Proof runtime campaign/paper account cannot be resolved",
+            details={"campaign_id": str(ALLOWED_CAMPAIGN_ID)},
+        )
+
+    profile_id = await _resolve_live_trading_profile_id(db=db, paper_account_id=runtime.paper_account_id)
+    if profile_id is None:
+        raise InvalidRequestError(
+            message="no live trading profile found for Controlled Proof's runtime paper account",
+            details={"paper_account_id": str(runtime.paper_account_id)},
+        )
+
+    connections = (await db.scalars(select(ExchangeConnection).where(
+        ExchangeConnection.provider == ALLOWED_PROVIDER,
+        ExchangeConnection.environment == ALLOWED_ENVIRONMENT,
+        ExchangeConnection.status == "connected",
+        ExchangeConnection.credentials_valid.is_(True),
+    ))).all()
+    if len(connections) != 1:
+        raise InvalidRequestError(
+            message=(
+                f"{len(connections)} connected, credentials-valid exchange connections found for "
+                f"{ALLOWED_PROVIDER}/{ALLOWED_ENVIRONMENT}; Controlled Proof requires exactly one"
+            ),
+            details={"count": len(connections), "provider": ALLOWED_PROVIDER, "environment": ALLOWED_ENVIRONMENT},
+        )
+
+    return ControlledProofRuntimeScope(
+        paper_account_id=runtime.paper_account_id,
+        live_trading_profile_id=profile_id,
+        exchange_connection_id=connections[0].exchange_connection_id,
+        capital_campaign_row_id=runtime.id,
+    )
+
+
+@dataclass(frozen=True, slots=True)
 class ControlledProofStartResult:
     proof: ControlledProofRun
     created: bool

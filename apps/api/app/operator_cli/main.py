@@ -83,6 +83,7 @@ from app.operator_cli.service import (
     fetch_risk_ledger_diagnosis,
     fetch_controlled_proof_risk_diagnosis,
     fetch_watch_status,
+    controlled_proof_mandate_bootstrap,
     mandate_bootstrap,
     mandate_bootstrap_commission,
     mandate_bootstrap_create,
@@ -152,6 +153,7 @@ def _build_parser() -> argparse.ArgumentParser:
             "  ./operator risk-ledger-diagnosis --account-id <paper_uuid> --json\n"
             "  ./operator controlled-proof-risk-diagnosis --proof-id <proof_uuid> --json\n"
             "  ./operator mandate-bootstrap --owner-actor-id operator:human --autonomy-level LEVEL_2 --provider kraken_spot --environment production --exchange-connection-id <conn_uuid> --live-trading-profile-id <profile_uuid> --capital-campaign-id 2 --authorized-capital-usd 25 --max-order-notional-usd 5 --max-open-exposure-usd 10 --max-daily-deployed-usd 10 --max-daily-realized-loss-usd 3 --max-campaign-drawdown-usd 5 --max-consecutive-losses 2 --position-limit 1 --price-evidence-max-age-seconds 30 --max-slippage-bps 25 --max-fee-bps 10 --allowed-products BTC-USD --allowed-order-sides BUY,SELL,HOLD --allowed-strategy-versions ma_crossover@1.0.0 --approval-policy MANDATE_ALLOWED --policy-bundle-json @campaign-2-mandate-policy.json --authorization-method owner_signature --actor operator:human --reason campaign_2_bootstrap --idempotency-key mandate-bootstrap-campaign-2 --confirm --json\n"
+            "  ./operator controlled-proof-mandate-bootstrap --allowed-strategy-versions ma_crossover@1.0.0 --actor operator:human --reason controlled_proof_mandate_provisioning --idempotency-key controlled-proof-mandate-1 --confirm --json\n"
             "  ./operator status --json\n"
             "  ./operator status --no-color --verbose"
         ),
@@ -972,6 +974,33 @@ def _build_parser() -> argparse.ArgumentParser:
     mandate_bootstrap_parser.add_argument("--confirm", action="store_true")
     mandate_bootstrap_parser.add_argument("--json", action="store_true", dest="json_output")
 
+    controlled_proof_mandate_bootstrap_parser = subparsers.add_parser(
+        "controlled-proof-mandate-bootstrap",
+        parents=[common],
+        help="Provisions the dedicated CONTROLLED_PROOF mandate and writes CONTROLLED_PROOF_MANDATE_ID",
+        description=(
+            "Provisions the dedicated CONTROLLED_PROOF-purpose Autonomous Capital Mandate "
+            "Controlled Proof entry pins its evaluations to (settings.controlled_proof_mandate_id) "
+            "using nothing but mandate-bootstrap's existing, unmodified lifecycle sequence -- "
+            "create_mandate, create_mandate_version, SUBMIT_FOR_AUTHORIZATION, "
+            "authorize_mandate_version, ACTIVATE. Runtime scope (exchange connection, live "
+            "trading profile, paper account, campaign) is resolved automatically the same way "
+            "controlled-proof mandate readiness checks it; the fixed $5 notional/exposure, "
+            "position_limit=1, BTC-USD, BUY+SELL limits are applied automatically. "
+            "allowed-strategy-versions is the one owner-decided input this cannot derive on "
+            "its own. On success, writes CONTROLLED_PROOF_MANDATE_ID into the .env file "
+            "get_settings() already loads -- no database write of any kind, and no manual SQL. "
+            "Fully idempotent: rerunning with the same --idempotency-key resumes/no-ops."
+        ),
+    )
+    controlled_proof_mandate_bootstrap_parser.add_argument("--allowed-strategy-versions", type=_parse_csv_argument, required=True)
+    controlled_proof_mandate_bootstrap_parser.add_argument("--actor", type=str, default="operator:human")
+    controlled_proof_mandate_bootstrap_parser.add_argument("--reason", type=str, required=True)
+    controlled_proof_mandate_bootstrap_parser.add_argument("--idempotency-key", type=str, required=True)
+    controlled_proof_mandate_bootstrap_parser.add_argument("--audit-correlation-id", type=UUID, default=None)
+    controlled_proof_mandate_bootstrap_parser.add_argument("--confirm", action="store_true")
+    controlled_proof_mandate_bootstrap_parser.add_argument("--json", action="store_true", dest="json_output")
+
     mandate_bootstrap_export_parser = subparsers.add_parser(
         "mandate-bootstrap-export",
         parents=[common],
@@ -1663,6 +1692,17 @@ async def _run_async(args: argparse.Namespace) -> tuple[int, dict[str, Any], str
             idempotency_key=args.idempotency_key,
             audit_correlation_id=args.audit_correlation_id,
             confirm=bool(args.confirm),
+        )
+        return 0, payload, render_json(payload)
+
+    if args.command == "controlled-proof-mandate-bootstrap":
+        payload = await controlled_proof_mandate_bootstrap(
+            actor=args.actor,
+            reason=args.reason,
+            idempotency_key=args.idempotency_key,
+            allowed_strategy_versions=tuple(args.allowed_strategy_versions),
+            confirm=bool(args.confirm),
+            audit_correlation_id=args.audit_correlation_id,
         )
         return 0, payload, render_json(payload)
 
