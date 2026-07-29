@@ -3,6 +3,7 @@ from __future__ import annotations
 import uuid
 from datetime import datetime, timezone
 from decimal import Decimal
+from types import SimpleNamespace
 
 from fastapi.testclient import TestClient
 
@@ -24,6 +25,10 @@ def _create_client() -> TestClient:
 class _FakeProof:
     def __init__(self, proof_id: uuid.UUID) -> None:
         self.proof_id = proof_id
+        self.status = "REQUESTED"
+        self.product_id = "BTC-USD"
+        self.max_notional_usd = Decimal("5")
+        self.audit_correlation_id = uuid.uuid4()
 
 
 def _view_payload(proof_id: uuid.UUID) -> dict:
@@ -44,7 +49,7 @@ def test_create_endpoint_requires_operator_auth(monkeypatch) -> None:
     async def _unexpected(**kwargs):
         raise AssertionError("must not be called without authorization")
 
-    monkeypatch.setattr(route_module, "create_controlled_proof", _unexpected)
+    monkeypatch.setattr(route_module, "start_live_controlled_proof", _unexpected)
     client = _create_client()
 
     response = client.post(
@@ -79,30 +84,31 @@ def test_cancel_endpoint_requires_operator_auth(monkeypatch) -> None:
     assert response.status_code == 401
 
 
-def test_create_endpoint_succeeds_with_operator_auth_and_ignores_extra_fields(monkeypatch) -> None:
+def test_create_endpoint_succeeds_with_operator_auth_and_rejects_scope_overrides(monkeypatch) -> None:
     proof_id = uuid.uuid4()
     seen_kwargs: dict = {}
 
-    async def _fake_create(*, db, product_id, idempotency_key, expires_in_minutes, actor, replace_active=False):
+    async def _fake_create(*, db, product_id, notional_usd, idempotency_key, expires_in_minutes, actor):
         seen_kwargs.update(product_id=product_id, idempotency_key=idempotency_key, actor=actor)
-        return _FakeProof(proof_id), None
+        return SimpleNamespace(proof=_FakeProof(proof_id), created=True)
 
-    async def _fake_view(*, db, proof_id):
-        return _view_payload(proof_id)
-
-    monkeypatch.setattr(route_module, "create_controlled_proof", _fake_create)
-    monkeypatch.setattr(route_module, "get_controlled_proof_view", _fake_view)
+    monkeypatch.setattr(route_module, "start_live_controlled_proof", _fake_create)
+    monkeypatch.setattr(
+        route_module, "schedule_controlled_proof_immediate_dispatch",
+        lambda *, proof_id: seen_kwargs.update(dispatched=proof_id),
+    )
     client = _create_client()
 
-    # A caller attempting to smuggle in scope/provider/campaign/notional
-    # fields must have them silently ignored -- the schema simply has no
-    # such fields, so pydantic drops them rather than passing them through.
+    rejected = client.post(
+        "/api/v1/operator/controlled-proofs",
+        json={"product": "BTC-USD", "notional_usd": "5.00", "idempotency_key": "bad", "provider": "coinbase"},
+        headers={"Authorization": "Bearer operator:human"},
+    )
+    assert rejected.status_code == 422
+
     response = client.post(
         "/api/v1/operator/controlled-proofs",
-        json={
-            "product_id": "BTC-USD", "idempotency_key": "k-2",
-            "provider": "coinbase", "max_notional_usd": "500000", "campaign_id": str(uuid.uuid4()),
-        },
+        json={"product": "BTC-USD", "notional_usd": "5.00", "idempotency_key": "k-2"},
         headers={"Authorization": "Bearer operator:human"},
     )
 
@@ -110,6 +116,36 @@ def test_create_endpoint_succeeds_with_operator_auth_and_ignores_extra_fields(mo
     assert response.json()["proof_id"] == str(proof_id)
     assert seen_kwargs["actor"] == "operator:human"
     assert seen_kwargs["product_id"] == "BTC-USD"
+    assert seen_kwargs["dispatched"] == proof_id
+    assert response.json()["live_execution"] is True
+    assert response.json()["new_proof_created"] is True
+    assert response.json()["reused_historical_execution"] is False
+
+
+def test_create_endpoint_idempotent_replay_is_truthful(monkeypatch) -> None:
+    proof = _FakeProof(uuid.uuid4())
+
+    async def _replay(**_kwargs):
+        return SimpleNamespace(proof=proof, created=False)
+
+    dispatched = []
+    monkeypatch.setattr(route_module, "start_live_controlled_proof", _replay)
+    monkeypatch.setattr(
+        route_module, "schedule_controlled_proof_immediate_dispatch",
+        lambda *, proof_id: dispatched.append(proof_id),
+    )
+    response = _create_client().post(
+        "/api/v1/operator/controlled-proofs",
+        json={"product": "BTC-USD", "notional_usd": "5.00", "idempotency_key": "same-key"},
+        headers={"Authorization": "Bearer operator:human"},
+    )
+
+    assert response.status_code == 201
+    assert response.json()["proof_id"] == str(proof.proof_id)
+    assert response.json()["new_proof_created"] is False
+    assert response.json()["idempotent_replay"] is True
+    assert response.json()["reused_historical_execution"] is False
+    assert dispatched == [proof.proof_id]
 
 
 def test_get_endpoint_succeeds_with_operator_auth(monkeypatch) -> None:

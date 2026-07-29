@@ -5,23 +5,30 @@ from datetime import datetime
 from decimal import Decimal
 from typing import Any
 
-from pydantic import BaseModel, Field
+from pydantic import AliasChoices, BaseModel, ConfigDict, Field
 
 
 class ControlledProofCreateRequest(BaseModel):
-    """No scope, provider, environment, campaign, or notional fields here --
-    those are server-enforced constants for v1 (see controlled_proof.service),
-    never caller-supplied, so there is no arbitrary parameter surface for an
-    operator (or a compromised/buggy caller) to widen."""
+    """Thin live-start contract; every execution scope remains server-owned."""
 
-    product_id: str
+    model_config = ConfigDict(extra="forbid")
+
+    product: str = Field(validation_alias=AliasChoices("product", "product_id"))
+    notional_usd: Decimal = Decimal("5.00")
     idempotency_key: str
     expires_in_minutes: int = Field(default=60, ge=1, le=180)
-    # When true and another proof is currently active, atomically cancel it
-    # and create this one -- but only when the active proof has not crossed
-    # a live-capital boundary (no live BUY/SELL order, no open position).
-    # Otherwise fails closed with the exact live artifact blocking it.
-    replace_active: bool = False
+
+
+class ControlledProofStartResponse(BaseModel):
+    proof_id: uuid.UUID
+    status: str
+    product: str
+    notional_usd: Decimal
+    live_execution: bool
+    new_proof_created: bool
+    idempotent_replay: bool
+    reused_historical_execution: bool
+    audit_correlation_id: uuid.UUID
 
 
 class ControlledProofCancelRequest(BaseModel):

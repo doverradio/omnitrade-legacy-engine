@@ -19,6 +19,7 @@ from app.services.controlled_proof.service import (
     record_controlled_proof_waiting,
     resolve_controlled_proof_strategy_identity,
     should_propose_controlled_sell,
+    start_live_controlled_proof,
 )
 from app.services.controlled_proof.exit_recovery import (
     authorize_controlled_proof_exit_recovery,
@@ -53,6 +54,7 @@ __all__ = [
     "record_controlled_proof_waiting",
     "resolve_controlled_proof_strategy_identity",
     "should_propose_controlled_sell",
+    "start_live_controlled_proof",
     "authorize_controlled_proof_exit_recovery",
     "block_exit_recovery",
     "claim_exit_recovery_by_id",

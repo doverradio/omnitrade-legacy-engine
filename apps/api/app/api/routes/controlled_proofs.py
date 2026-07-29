@@ -10,35 +10,45 @@ from app.db.session import get_db
 from app.schemas.controlled_proof import (
     ControlledProofCancelRequest,
     ControlledProofCreateRequest,
+    ControlledProofStartResponse,
     ControlledProofExitRecoveryCreateRequest,
     ControlledProofExitRecoveryResponse,
     ControlledProofResponse,
 )
 from app.services.controlled_proof import (
     cancel_controlled_proof,
-    create_controlled_proof,
+    start_live_controlled_proof,
     get_controlled_proof_view,
     authorize_controlled_proof_exit_recovery,
     get_exit_recovery_view,
 )
-from app.services.orchestration.continuous_pipeline_worker import schedule_controlled_proof_exit_recovery_dispatch
+from app.services.orchestration.continuous_pipeline_worker import (
+    schedule_controlled_proof_exit_recovery_dispatch,
+    schedule_controlled_proof_immediate_dispatch,
+)
 
 router = APIRouter(prefix="/api/v1/operator/controlled-proofs", tags=["controlled-proofs"])
 
 
-@router.post("", response_model=ControlledProofResponse, status_code=201)
+@router.post("", response_model=ControlledProofStartResponse, status_code=201)
 async def post_controlled_proof(
     payload: ControlledProofCreateRequest,
     current_user: dict[str, str] = Depends(get_authorized_operator),
     db: AsyncSession = Depends(get_db),
-) -> ControlledProofResponse:
-    proof, _replaced_proof = await create_controlled_proof(
-        db=db, product_id=payload.product_id, idempotency_key=payload.idempotency_key,
-        expires_in_minutes=payload.expires_in_minutes, actor=current_user["id"],
-        replace_active=payload.replace_active,
+) -> ControlledProofStartResponse:
+    result = await start_live_controlled_proof(
+        db=db, product_id=payload.product, notional_usd=payload.notional_usd,
+        idempotency_key=payload.idempotency_key, expires_in_minutes=payload.expires_in_minutes,
+        actor=current_user["id"],
     )
-    view = await get_controlled_proof_view(db=db, proof_id=proof.proof_id)
-    return ControlledProofResponse(**view)
+    proof = result.proof
+    schedule_controlled_proof_immediate_dispatch(proof_id=proof.proof_id)
+    return ControlledProofStartResponse(
+        proof_id=proof.proof_id, status=proof.status, product=proof.product_id,
+        notional_usd=proof.max_notional_usd, live_execution=True,
+        new_proof_created=result.created, idempotent_replay=not result.created,
+        reused_historical_execution=False, audit_correlation_id=proof.audit_correlation_id,
+    )
 
 
 @router.get("/{proof_id}", response_model=ControlledProofResponse)

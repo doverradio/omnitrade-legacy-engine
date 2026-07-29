@@ -13,6 +13,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.errors import InvalidRequestError, NotFoundError
 from app.models.asset import Asset
+from app.models.autonomous_execution_claim import AutonomousExecutionClaim
 from app.models.audit_log import AuditLog
 from app.models.autonomous_capital_mandate_evaluation import AutonomousCapitalMandateEvaluation
 from app.models.candle import Candle
@@ -22,6 +23,7 @@ from app.models.controlled_proof_run import ControlledProofRun
 from app.models.decision_record import DecisionRecord
 from app.models.live_accounting_record import LiveAccountingRecord
 from app.models.live_crypto_order import LiveCryptoOrder
+from app.models.exchange_connection import ExchangeConnection
 from app.models.live_trading_profile import LiveTradingProfile
 from app.models.paper_account import PaperAccount
 from app.models.strategy import Strategy
@@ -40,6 +42,7 @@ from app.services.risk import (
 )
 from app.services.risk.risk_context import resolve_execution_risk_context
 from app.services.strategies.identity import build_strategy_identity
+from app.config import get_settings
 
 logger = logging.getLogger(__name__)
 
@@ -207,6 +210,106 @@ async def _live_capital_blocker(*, db: AsyncSession, proof: ControlledProofRun) 
 async def controlled_proof_entry_blocker(*, db: AsyncSession, proof: ControlledProofRun) -> str | None:
     """Public pre-entry use of the canonical live-capital ownership guard."""
     return await _live_capital_blocker(db=db, proof=proof)
+
+
+@dataclass(frozen=True, slots=True)
+class ControlledProofStartResult:
+    proof: ControlledProofRun
+    created: bool
+
+
+def _available_usd(connection: ExchangeConnection) -> Decimal | None:
+    for item in connection.balances or []:
+        if str(item.get("currency") or "").upper() == "USD":
+            try:
+                value = Decimal(str(item.get("available", item.get("balance"))))
+            except (ArithmeticError, TypeError, ValueError):
+                return None
+            return value if value >= 0 else None
+    return None
+
+
+async def start_live_controlled_proof(
+    *, db: AsyncSession, product_id: str, notional_usd: Decimal,
+    idempotency_key: str, expires_in_minutes: int, actor: str,
+) -> ControlledProofStartResult:
+    """Preflight and delegate one new live proof to canonical creation.
+
+    This function creates no execution artifacts. Packages, claims and live
+    orders remain exclusively owned by the existing worker pipeline.
+    """
+    product = product_id.strip().upper()
+    key = idempotency_key.strip()
+    try:
+        requested_notional = Decimal(str(notional_usd))
+    except (ArithmeticError, TypeError, ValueError) as exc:
+        raise InvalidRequestError(message="notional_usd is invalid", details={}) from exc
+    if requested_notional <= 0 or requested_notional != MAX_NOTIONAL_USD:
+        raise InvalidRequestError(
+            message="Controlled Proof requires the exact configured live notional",
+            details={"requested_notional_usd": str(requested_notional), "required_notional_usd": str(MAX_NOTIONAL_USD)},
+        )
+    if not product or not key:
+        raise InvalidRequestError(message="product and idempotency_key are required", details={})
+
+    # A replay returns the original proof before mutable readiness is checked:
+    # retrying an accepted request must never create a replacement merely
+    # because balance or flags changed afterward.
+    replay = await db.scalar(select(ControlledProofRun).where(ControlledProofRun.idempotency_key == key))
+    if replay is not None:
+        return ControlledProofStartResult(proof=replay, created=False)
+
+    settings = get_settings()
+    if not settings.live_crypto_order_submission_enabled:
+        raise InvalidRequestError(message="Live Controlled Proof execution is disabled", details={})
+
+    connections = (await db.scalars(select(ExchangeConnection).where(
+        ExchangeConnection.provider == ALLOWED_PROVIDER,
+        ExchangeConnection.environment == ALLOWED_ENVIRONMENT,
+        ExchangeConnection.status == "connected",
+        ExchangeConnection.credentials_valid.is_(True),
+    ))).all()
+    if len(connections) != 1:
+        raise InvalidRequestError(
+            message="Controlled Proof requires one authoritative production connection",
+            details={"matched_connections": len(connections)},
+        )
+    available = _available_usd(connections[0])
+    if available is None or available < requested_notional:
+        raise InvalidRequestError(
+            message="Insufficient authoritative USD balance for Controlled Proof",
+            details={"available_usd": None if available is None else str(available), "required_usd": str(requested_notional)},
+        )
+
+    from app.services.orchestration.continuous_pipeline_worker import (
+        _has_open_live_order,
+        _has_unresolved_reconciliation,
+    )
+    if await _has_open_live_order(
+        db=db, provider=ALLOWED_PROVIDER, environment=ALLOWED_ENVIRONMENT, product=product,
+    ):
+        raise InvalidRequestError(message="An open provider order blocks Controlled Proof", details={})
+    if await _has_unresolved_reconciliation(
+        db=db, provider=ALLOWED_PROVIDER, environment=ALLOWED_ENVIRONMENT, product=product,
+    ):
+        raise InvalidRequestError(message="Unresolved reconciliation blocks Controlled Proof", details={})
+    active_claim = await db.scalar(select(AutonomousExecutionClaim.claim_id).where(
+        AutonomousExecutionClaim.provider == ALLOWED_PROVIDER,
+        AutonomousExecutionClaim.environment == ALLOWED_ENVIRONMENT,
+        AutonomousExecutionClaim.product == product,
+        AutonomousExecutionClaim.claim_status.in_((
+            "CLAIMED", "EXECUTION_STARTED", "SUBMISSION_PENDING",
+            "RECONCILIATION_REQUIRED", "RECOVERY_REQUIRED",
+        )),
+    ).limit(1))
+    if active_claim is not None:
+        raise InvalidRequestError(message="Unresolved execution lineage blocks Controlled Proof", details={})
+
+    proof, _replaced = await create_controlled_proof(
+        db=db, product_id=product, idempotency_key=key,
+        expires_in_minutes=expires_in_minutes, actor=actor, replace_active=False,
+    )
+    return ControlledProofStartResult(proof=proof, created=True)
 
 
 async def create_controlled_proof(
