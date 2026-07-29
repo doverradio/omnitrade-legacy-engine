@@ -6,6 +6,7 @@ from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 from typing import AsyncIterator
+from types import SimpleNamespace
 
 import pytest
 from sqlalchemy import select
@@ -439,6 +440,16 @@ async def test_should_propose_controlled_sell_becomes_true_once_buy_is_filled_an
         )
         proof.package_id = uuid.uuid4()
         await session.flush()
+        exact_buy_accounting: list[LiveAccountingRecord] = []
+
+        async def _buy_lineage(**_kwargs):
+            return SimpleNamespace(package_id=proof.package_id), SimpleNamespace(), SimpleNamespace(live_crypto_order_id=uuid.uuid4())
+
+        async def _buy_accounting(**_kwargs):
+            return exact_buy_accounting
+
+        monkeypatch.setattr(controlled_proof_service, "_proof_leg_lineage", _buy_lineage)
+        monkeypatch.setattr(controlled_proof_service, "_order_accounting", _buy_accounting)
 
         # Before any fill exists, the BUY has not been reconciled yet.
         with caplog.at_level(logging.INFO, logger=controlled_proof_service.logger.name):
@@ -447,7 +458,6 @@ async def test_should_propose_controlled_sell_becomes_true_once_buy_is_filled_an
         assert any(
             "controlled_proof_sell_evaluation" in message
             and "buy_fill_accounting_exists=false" in message
-            and "matching_position_exists=false" in message
             and "position_nonzero=false" in message
             and "eligible=false" in message
             for message in false_messages
@@ -464,15 +474,17 @@ async def test_should_propose_controlled_sell_becomes_true_once_buy_is_filled_an
         # genuinely filled BUY -- this test does not re-implement or bypass
         # that logic, it proves the downstream consumer reacts correctly
         # once that authoritative record exists.
-        session.add(LiveAccountingRecord(
+        fill = LiveAccountingRecord(
             idempotency_key="fill-buy-1", live_trading_profile_id=profile.id, capital_campaign_id=runtime.id,
             reconciliation_event_id=uuid.uuid4(), source_execution_event_id=uuid.uuid4(),
             source_execution_event_type="execution_intent_created", record_type="fill_accounting", provider_order_id="kraken-order-1",
             symbol="BTC-USD", side="buy", filled_quantity=Decimal("0.0001"), fill_price=Decimal("50000"),
             gross_notional=Decimal("5"), fee_amount=Decimal("0.005"), fee_currency="USD",
             net_cash_impact=Decimal("-5.005"), provenance={}, recorded_at=datetime.now(timezone.utc),
-        ))
+        )
+        session.add(fill)
         await session.flush()
+        exact_buy_accounting.append(fill)
 
         caplog.clear()
         with caplog.at_level(logging.INFO, logger=controlled_proof_service.logger.name):
@@ -482,10 +494,9 @@ async def test_should_propose_controlled_sell_becomes_true_once_buy_is_filled_an
             "controlled_proof_sell_evaluation" in message
             and "buy_package_linked=true" in message
             and "sell_package_unlinked=true" in message
-            and "runtime_campaign_exists=true" in message
-            and "paper_account_linked=true" in message
+            and "buy_claim_linked=true" in message
+            and "buy_order_linked=true" in message
             and "buy_fill_accounting_exists=true" in message
-            and "matching_position_exists=true" in message
             and "position_nonzero=true" in message
             and "eligible=true" in message
             for message in true_messages
@@ -1261,6 +1272,43 @@ async def test_expired_proof_is_not_claimable_and_transitions_to_expired(monkeyp
 # --- status view: downstream linkage, reconciliation, net P&L derivation ------------
 
 @pytest.mark.asyncio
+async def test_status_view_never_borrows_cached_or_campaign_lineage(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A proof carrying the exact shape of the production contamination
+    incident must regress to its last provable state, never present cached
+    order/position/P&L fields whose package -> claim lineage is absent."""
+    async with _real_session() as session:
+        await _seed_fully_ready_scope(session, monkeypatch)
+        proof, _ = await controlled_proof_service.create_controlled_proof(
+            db=session, product_id="BTC-USD", idempotency_key="proof-no-foreign-lineage",
+            expires_in_minutes=30, actor="operator:alice",
+        )
+        proof.status = "RECONCILED"
+        proof.decision_record_id = uuid.uuid4()
+        proof.package_id = uuid.uuid4()
+        proof.buy_live_crypto_order_id = uuid.uuid4()
+        proof.sell_live_crypto_order_id = uuid.uuid4()
+        proof.position_id = "foreign-position"
+        proof.net_pnl_usd = Decimal("-0.055")
+        proof.terminal_verdict = "LIFECYCLE_PROVEN_LOSS"
+        await session.flush()
+
+        view = await controlled_proof_service.get_controlled_proof_view(
+            db=session, proof_id=proof.proof_id,
+        )
+
+        assert view["buy_order"] is None
+        assert view["sell_order"] is None
+        assert view["position"] is None
+        assert view["reconciliation"] is None
+        assert view["fees_usd"] is None
+        assert view["net_pnl_usd"] is None
+        assert view["terminal_verdict"] is None
+        assert view["status"] == "ENTRY_PROPOSED"
+
+
+@pytest.mark.asyncio
 async def test_status_view_derives_reconciled_without_fabricating_profit(monkeypatch: pytest.MonkeyPatch) -> None:
     async with _real_session() as session:
         await _seed_fully_ready_scope(session, monkeypatch)
@@ -1294,13 +1342,14 @@ async def test_status_view_derives_reconciled_without_fabricating_profit(monkeyp
             live_crypto_order_id=buy_order_id, crypto_order_preview_id=uuid.uuid4(), exchange_connection_id=uuid.uuid4(),
             provider="kraken_spot", environment="production", product_id="BTC-USD", side="BUY", order_type="MARKET",
             requested_quote_size=Decimal("5"), client_order_id="c-buy", status="FILLED",
-            decision_record_id=decision_id, filled_at=datetime.now(timezone.utc), audit_correlation_id=uuid.uuid4(),
+            decision_record_id=decision_id, provider_order_id="p-buy",
+            filled_at=datetime.now(timezone.utc), audit_correlation_id=uuid.uuid4(),
         ))
         session.add(LiveCryptoOrder(
             live_crypto_order_id=sell_order_id, crypto_order_preview_id=uuid.uuid4(), exchange_connection_id=uuid.uuid4(),
             provider="kraken_spot", environment="production", product_id="BTC-USD", side="SELL", order_type="MARKET",
             requested_quote_size=Decimal("5"), client_order_id="c-sell", status="FILLED",
-            filled_at=datetime.now(timezone.utc), audit_correlation_id=uuid.uuid4(),
+            provider_order_id="p-sell", filled_at=datetime.now(timezone.utc), audit_correlation_id=uuid.uuid4(),
         ))
         now = datetime.now(timezone.utc)
         session.add(LiveAccountingRecord(
@@ -1320,6 +1369,16 @@ async def test_status_view_derives_reconciled_without_fabricating_profit(monkeyp
             net_cash_impact=Decimal("4.961"), provenance={}, recorded_at=now + timedelta(minutes=1),
         ))
         await session.flush()
+
+        proof.sell_package_id = uuid.uuid4()
+        async def _exact_lineage(*, side, **_kwargs):
+            order = await _kwargs["db"].get(LiveCryptoOrder, buy_order_id if side == "BUY" else sell_order_id)
+            package = SimpleNamespace(package_id=proof.package_id if side == "BUY" else proof.sell_package_id, package_state="COMPLETED")
+            return package, SimpleNamespace(live_order_id=order.live_crypto_order_id), order
+        async def _resolved(**_kwargs):
+            return SimpleNamespace(reconciliation_status="filled")
+        monkeypatch.setattr(controlled_proof_service, "_proof_leg_lineage", _exact_lineage)
+        monkeypatch.setattr(controlled_proof_service, "_latest_order_reconciliation", _resolved)
 
         view = await controlled_proof_service.get_controlled_proof_view(db=session, proof_id=proof.proof_id)
 
@@ -1376,19 +1435,21 @@ async def _seed_reconciled_round_trip(
         live_crypto_order_id=buy_order_id, crypto_order_preview_id=uuid.uuid4(), exchange_connection_id=uuid.uuid4(),
         provider="kraken_spot", environment="production", product_id="BTC-USD", side="BUY", order_type="MARKET",
         requested_quote_size=Decimal("5"), client_order_id=f"{idempotency_prefix}-buy", status="FILLED",
-        decision_record_id=decision_id, filled_at=datetime.now(timezone.utc), audit_correlation_id=uuid.uuid4(),
+        decision_record_id=decision_id, provider_order_id=f"{idempotency_prefix}-p-buy",
+        filled_at=datetime.now(timezone.utc), audit_correlation_id=uuid.uuid4(),
     ))
     session.add(LiveCryptoOrder(
         live_crypto_order_id=sell_order_id, crypto_order_preview_id=uuid.uuid4(), exchange_connection_id=uuid.uuid4(),
         provider="kraken_spot", environment="production", product_id="BTC-USD", side="SELL", order_type="MARKET",
         requested_quote_size=Decimal("5"), client_order_id=f"{idempotency_prefix}-sell", status="FILLED",
+        provider_order_id=f"{idempotency_prefix}-p-sell",
         filled_at=datetime.now(timezone.utc), audit_correlation_id=uuid.uuid4(),
     ))
     now = datetime.now(timezone.utc)
     session.add(LiveAccountingRecord(
         idempotency_key=f"{idempotency_prefix}-fill-buy", live_trading_profile_id=profile.id, capital_campaign_id=runtime.id,
         live_crypto_order_id=buy_order_id, reconciliation_event_id=uuid.uuid4(), source_execution_event_id=uuid.uuid4(),
-        source_execution_event_type="execution_intent_created", record_type="fill_accounting", provider_order_id="p-buy",
+        source_execution_event_type="execution_intent_created", record_type="fill_accounting", provider_order_id=f"{idempotency_prefix}-p-buy",
         symbol="BTC-USD", side="buy", filled_quantity=Decimal("0.0001"), fill_price=Decimal("50000"),
         gross_notional=Decimal("5"), fee_amount=Decimal("0.02"), fee_currency="USD",
         net_cash_impact=Decimal("-5.02"), provenance={}, recorded_at=now,
@@ -1396,12 +1457,21 @@ async def _seed_reconciled_round_trip(
     session.add(LiveAccountingRecord(
         idempotency_key=f"{idempotency_prefix}-fill-sell", live_trading_profile_id=profile.id, capital_campaign_id=runtime.id,
         live_crypto_order_id=sell_order_id, reconciliation_event_id=uuid.uuid4(), source_execution_event_id=uuid.uuid4(),
-        source_execution_event_type="execution_intent_created", record_type="fill_accounting", provider_order_id="p-sell",
+        source_execution_event_type="execution_intent_created", record_type="fill_accounting", provider_order_id=f"{idempotency_prefix}-p-sell",
         symbol="BTC-USD", side="sell", filled_quantity=Decimal("0.0001"), fill_price=Decimal("50010"),
         gross_notional=Decimal("5.001"), fee_amount=Decimal("0.02"), fee_currency="USD",
         net_cash_impact=sell_net_cash_impact, provenance={}, recorded_at=now + timedelta(minutes=1),
     ))
     await session.flush()
+    proof.sell_package_id = uuid.uuid4()
+    async def _exact_lineage(*, side, **_kwargs):
+        order = await _kwargs["db"].get(LiveCryptoOrder, buy_order_id if side == "BUY" else sell_order_id)
+        package = SimpleNamespace(package_id=proof.package_id if side == "BUY" else proof.sell_package_id, package_state="COMPLETED")
+        return package, SimpleNamespace(live_order_id=order.live_crypto_order_id), order
+    async def _resolved(**_kwargs):
+        return SimpleNamespace(reconciliation_status="filled")
+    monkeypatch.setattr(controlled_proof_service, "_proof_leg_lineage", _exact_lineage)
+    monkeypatch.setattr(controlled_proof_service, "_latest_order_reconciliation", _resolved)
     return proof.proof_id
 
 

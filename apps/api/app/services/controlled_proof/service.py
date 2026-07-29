@@ -23,6 +23,7 @@ from app.models.controlled_proof_run import ControlledProofRun
 from app.models.decision_record import DecisionRecord
 from app.models.live_accounting_record import LiveAccountingRecord
 from app.models.live_crypto_order import LiveCryptoOrder
+from app.models.live_reconciliation_event import LiveReconciliationEvent
 from app.models.exchange_connection import ExchangeConnection
 from app.models.live_trading_profile import LiveTradingProfile
 from app.models.paper_account import PaperAccount
@@ -30,6 +31,7 @@ from app.models.strategy import Strategy
 from app.services.asset_commissioning import get_asset_readiness
 from app.services.capital_campaign_domain import get_governing_campaign_definition
 from app.services.live.position_quantity import owned_position_exists as shared_owned_position_exists
+from app.services.live.position_quantity import QUANTITY_BEARING_RECORD_TYPES
 from app.services.mandates.lifecycle import get_governing_authorized_mandate_version
 from app.services.position_lifecycle.source_adapter import load_position_snapshots
 from app.services.risk import (
@@ -735,47 +737,39 @@ async def should_propose_controlled_sell(*, db: AsyncSession, proof: ControlledP
     proposed yet. Read-only; never itself creates or submits anything."""
     buy_package_linked = proof.package_id is not None
     sell_package_unlinked = proof.sell_package_id is None
-    runtime = await db.scalar(select(CapitalCampaign).where(CapitalCampaign.uuid == proof.campaign_id).limit(1))
-    runtime_campaign_exists = runtime is not None
-    paper_account_linked = runtime is not None and runtime.paper_account_id is not None
-
-    accounting_records: list[LiveAccountingRecord] = []
-    if runtime_campaign_exists:
-        accounting_records = await _accounting_records_for_product(
-            db=db, runtime_campaign_id=runtime.id, product_id=proof.product_id,
-        )
-    buy_fill_accounting_exists = any(r.side.upper() == "BUY" for r in accounting_records)
-
-    snapshots = []
-    if paper_account_linked:
-        snapshots = await load_position_snapshots(
-            db=db, account_id=runtime.paper_account_id, campaign_id=runtime.id,
-        )
-    symbol_base = proof.product_id.split("-")[0]
-    match = next((s for s in snapshots if s.symbol.split("-")[0].upper() == symbol_base), None)
-    matching_position_exists = match is not None
-    position_nonzero = match is not None and match.position_size != 0
+    _package, buy_claim, buy_order = await _proof_leg_lineage(
+        db=db, proof=proof, package_id=proof.package_id, side="BUY",
+    )
+    buy_accounting = await _order_accounting(db=db, order=buy_order)
+    buy_claim_linked = buy_claim is not None
+    buy_order_linked = buy_order is not None
+    buy_fill_accounting_exists = any(r.side.upper() == "BUY" for r in buy_accounting)
+    proof_owned_quantity = sum(
+        (r.filled_quantity for r in buy_accounting
+         if r.side.upper() == "BUY" and r.record_type in QUANTITY_BEARING_RECORD_TYPES),
+        Decimal("0"),
+    )
+    position_nonzero = proof_owned_quantity > 0
 
     prerequisites = (
         ("buy_package_linked", buy_package_linked),
         ("sell_package_unlinked", sell_package_unlinked),
-        ("runtime_campaign_exists", runtime_campaign_exists),
-        ("paper_account_linked", paper_account_linked),
+        ("buy_claim_linked", buy_claim_linked),
+        ("buy_order_linked", buy_order_linked),
         ("buy_fill_accounting_exists", buy_fill_accounting_exists),
-        ("matching_position_exists", matching_position_exists),
         ("position_nonzero", position_nonzero),
     )
     eligible = all(value for _name, value in prerequisites)
     first_unmet = next((name for name, value in prerequisites if not value), None)
     logger.info(
         "controlled_proof_sell_evaluation proof_id=%s proof_status=%s "
-        "buy_package_linked=%s sell_package_unlinked=%s runtime_campaign_exists=%s "
-        "paper_account_linked=%s buy_fill_accounting_exists=%s matching_position_exists=%s "
+        "buy_package_linked=%s sell_package_unlinked=%s buy_claim_linked=%s "
+        "buy_order_linked=%s buy_fill_accounting_exists=%s "
         "position_nonzero=%s eligible=%s",
         proof.proof_id, proof.status,
         str(buy_package_linked).lower(), str(sell_package_unlinked).lower(),
-        str(runtime_campaign_exists).lower(), str(paper_account_linked).lower(),
-        str(buy_fill_accounting_exists).lower(), str(matching_position_exists).lower(),
+        str(buy_claim_linked).lower(), str(buy_order_linked).lower(),
+        str(buy_fill_accounting_exists).lower(),
         str(position_nonzero).lower(), str(eligible).lower(),
     )
     if not eligible:
@@ -1045,16 +1039,79 @@ async def cancel_controlled_proof(*, db: AsyncSession, proof_id: uuid.UUID, acto
     return proof
 
 
-async def _accounting_records_for_product(
-    *, db: AsyncSession, runtime_campaign_id: int, product_id: str,
+async def _proof_leg_lineage(
+    *, db: AsyncSession, proof: ControlledProofRun, package_id: uuid.UUID | None, side: str,
+) -> tuple[CanonicalPreviewPackage | None, AutonomousExecutionClaim | None, LiveCryptoOrder | None]:
+    """Resolve one proof leg exclusively through package -> claim -> order.
+
+    A cached order id on ``controlled_proof_runs`` is deliberately not an
+    input.  Those columns are projections, not execution authority, and a
+    campaign/product match is not proof ownership.
+    """
+    if package_id is None:
+        return None, None, None
+    package = await db.scalar(select(CanonicalPreviewPackage).where(
+        CanonicalPreviewPackage.package_id == package_id,
+        CanonicalPreviewPackage.campaign_id == proof.campaign_id,
+        CanonicalPreviewPackage.campaign_version == proof.campaign_version,
+        CanonicalPreviewPackage.provider == proof.provider,
+        CanonicalPreviewPackage.environment == proof.environment,
+        CanonicalPreviewPackage.product == proof.product_id,
+        CanonicalPreviewPackage.side == side,
+    ))
+    if package is None or str((package.market_evidence_identity or {}).get("controlled_proof_id")) != str(proof.proof_id):
+        return None, None, None
+    claim = await db.scalar(select(AutonomousExecutionClaim).where(
+        AutonomousExecutionClaim.package_id == package.package_id,
+        AutonomousExecutionClaim.campaign_id == proof.campaign_id,
+        AutonomousExecutionClaim.campaign_version == proof.campaign_version,
+        AutonomousExecutionClaim.provider == proof.provider,
+        AutonomousExecutionClaim.environment == proof.environment,
+        AutonomousExecutionClaim.product == proof.product_id,
+        AutonomousExecutionClaim.side == side,
+    ))
+    if claim is None or claim.live_order_id is None:
+        return package, claim, None
+    order = await db.scalar(select(LiveCryptoOrder).where(
+        LiveCryptoOrder.live_crypto_order_id == claim.live_order_id,
+        LiveCryptoOrder.provider == proof.provider,
+        LiveCryptoOrder.environment == proof.environment,
+        LiveCryptoOrder.product_id == proof.product_id,
+        LiveCryptoOrder.side == side,
+    ))
+    return package, claim, order
+
+
+async def _order_accounting(
+    *, db: AsyncSession, order: LiveCryptoOrder | None,
 ) -> list[LiveAccountingRecord]:
-    symbol_base = product_id.split("-")[0]
-    rows = (await db.scalars(
+    if order is None:
+        return []
+    if order.provider_order_id is None:
+        return []
+    return list((await db.scalars(
         select(LiveAccountingRecord)
-        .where(LiveAccountingRecord.capital_campaign_id == runtime_campaign_id)
-        .order_by(LiveAccountingRecord.recorded_at.asc())
-    )).all()
-    return [r for r in rows if r.symbol.split("-")[0].upper() == symbol_base]
+        .where(
+            LiveAccountingRecord.live_crypto_order_id == order.live_crypto_order_id,
+            LiveAccountingRecord.provider_order_id == order.provider_order_id,
+            LiveAccountingRecord.symbol == order.product_id,
+            LiveAccountingRecord.side == order.side.lower(),
+        )
+        .order_by(LiveAccountingRecord.recorded_at.asc(), LiveAccountingRecord.id.asc())
+    )).all())
+
+
+async def _latest_order_reconciliation(
+    *, db: AsyncSession, order: LiveCryptoOrder | None,
+) -> LiveReconciliationEvent | None:
+    if order is None:
+        return None
+    return await db.scalar(
+        select(LiveReconciliationEvent)
+        .where(LiveReconciliationEvent.live_crypto_order_id == order.live_crypto_order_id)
+        .order_by(LiveReconciliationEvent.sequence_number.desc(), LiveReconciliationEvent.created_at.desc())
+        .limit(1)
+    )
 
 
 async def get_controlled_proof_view(*, db: AsyncSession, proof_id: uuid.UUID) -> dict[str, Any]:
@@ -1094,82 +1151,136 @@ async def get_controlled_proof_view(*, db: AsyncSession, proof_id: uuid.UUID) ->
     elif proof.mandate_id is not None:
         mandate_payload = {"mandate_id": str(proof.mandate_id), "mandate_version_id": None if proof.mandate_version_id is None else str(proof.mandate_version_id)}
 
+    buy_package, buy_claim, buy_order = await _proof_leg_lineage(
+        db=db, proof=proof, package_id=proof.package_id, side="BUY",
+    )
+    sell_package, sell_claim, sell_order = await _proof_leg_lineage(
+        db=db, proof=proof, package_id=proof.sell_package_id, side="SELL",
+    )
     package_payload: dict[str, Any] | None = None
-    if proof.package_id is not None:
-        package = await db.scalar(select(CanonicalPreviewPackage).where(CanonicalPreviewPackage.package_id == proof.package_id))
-        if package is not None:
-            package_payload = {"package_id": str(package.package_id), "package_state": package.package_state}
+    if buy_package is not None:
+        package_payload = {"package_id": str(buy_package.package_id), "package_state": buy_package.package_state}
 
-    runtime = await db.scalar(select(CapitalCampaign).where(CapitalCampaign.uuid == proof.campaign_id).limit(1))
-    accounting_records: list[LiveAccountingRecord] = []
-    if runtime is not None:
-        accounting_records = await _accounting_records_for_product(db=db, runtime_campaign_id=runtime.id, product_id=proof.product_id)
-
-    buy_record = next((r for r in accounting_records if r.side.upper() == "BUY"), None)
-    sell_record = next((r for r in accounting_records if r.side.upper() == "SELL"), None)
+    buy_accounting = await _order_accounting(db=db, order=buy_order)
+    sell_accounting = await _order_accounting(db=db, order=sell_order)
+    accounting_records = [*buy_accounting, *sell_accounting]
 
     buy_order_payload: dict[str, Any] | None = None
-    buy_order_id = proof.buy_live_crypto_order_id or (buy_record.live_crypto_order_id if buy_record else None)
-    if buy_order_id is not None:
-        buy_order = await db.scalar(select(LiveCryptoOrder).where(LiveCryptoOrder.live_crypto_order_id == buy_order_id))
-        if buy_order is not None:
-            buy_order_payload = {
-                "live_crypto_order_id": str(buy_order.live_crypto_order_id), "status": buy_order.status,
-                "provider_order_id": buy_order.provider_order_id, "filled_at": buy_order.filled_at.isoformat() if buy_order.filled_at else None,
-            }
-            if proof.buy_live_crypto_order_id is None:
-                proof.buy_live_crypto_order_id = buy_order.live_crypto_order_id
+    buy_order_id = buy_order.live_crypto_order_id if buy_order is not None else None
+    if buy_order is not None:
+        buy_order_payload = {
+            "live_crypto_order_id": str(buy_order.live_crypto_order_id), "status": buy_order.status,
+            "provider_order_id": buy_order.provider_order_id, "filled_at": buy_order.filled_at.isoformat() if buy_order.filled_at else None,
+        }
+        if proof.buy_live_crypto_order_id != buy_order.live_crypto_order_id:
+            proof.buy_live_crypto_order_id = buy_order.live_crypto_order_id
 
     sell_order_payload: dict[str, Any] | None = None
-    sell_order_id = proof.sell_live_crypto_order_id or (sell_record.live_crypto_order_id if sell_record else None)
-    if sell_order_id is not None:
-        sell_order = await db.scalar(select(LiveCryptoOrder).where(LiveCryptoOrder.live_crypto_order_id == sell_order_id))
-        if sell_order is not None:
-            sell_order_payload = {
-                "live_crypto_order_id": str(sell_order.live_crypto_order_id), "status": sell_order.status,
-                "provider_order_id": sell_order.provider_order_id, "filled_at": sell_order.filled_at.isoformat() if sell_order.filled_at else None,
-            }
-            if proof.sell_live_crypto_order_id is None:
-                proof.sell_live_crypto_order_id = sell_order.live_crypto_order_id
+    sell_order_id = sell_order.live_crypto_order_id if sell_order is not None else None
+    if sell_order is not None:
+        sell_order_payload = {
+            "live_crypto_order_id": str(sell_order.live_crypto_order_id), "status": sell_order.status,
+            "provider_order_id": sell_order.provider_order_id, "filled_at": sell_order.filled_at.isoformat() if sell_order.filled_at else None,
+        }
+        if proof.sell_live_crypto_order_id != sell_order.live_crypto_order_id:
+            proof.sell_live_crypto_order_id = sell_order.live_crypto_order_id
 
     position_payload: dict[str, Any] | None = None
     position_open = False
-    if runtime is not None and runtime.paper_account_id is not None:
-        snapshots = await load_position_snapshots(db=db, account_id=runtime.paper_account_id, campaign_id=runtime.id)
-        symbol_base = proof.product_id.split("-")[0]
-        match = next((s for s in snapshots if s.symbol.split("-")[0].upper() == symbol_base), None)
-        if match is not None:
-            position_open = match.position_size != 0
-            position_payload = {
-                "position_id": match.position_id, "position_size": str(match.position_size),
-                "entry_price": str(match.entry_price), "opened_at": match.opened_at.isoformat() if match.opened_at else None,
-            }
-            if proof.position_id is None:
-                proof.position_id = match.position_id
+    bought_quantity = sum((
+        r.filled_quantity for r in buy_accounting
+        if r.side.lower() == "buy" and r.record_type in QUANTITY_BEARING_RECORD_TYPES
+    ), Decimal("0"))
+    sold_quantity = sum((
+        r.filled_quantity for r in sell_accounting
+        if r.side.lower() == "sell" and r.record_type in QUANTITY_BEARING_RECORD_TYPES
+    ), Decimal("0"))
+    position_size = bought_quantity - sold_quantity
+    if buy_accounting and position_size > 0:
+        position_open = True
+        buy_notional = sum((r.gross_notional for r in buy_accounting if r.side.lower() == "buy"), Decimal("0"))
+        entry_price = buy_notional / bought_quantity if bought_quantity > 0 else Decimal("0")
+        position_payload = {
+            "position_id": proof.position_id,
+            "position_size": str(position_size),
+            "entry_price": str(entry_price),
+            "opened_at": buy_accounting[0].recorded_at.isoformat() if buy_accounting[0].recorded_at else None,
+        }
 
     fees_usd = sum((r.fee_amount for r in accounting_records), Decimal("0")) if accounting_records else None
-    net_pnl_usd = sum((r.net_cash_impact for r in accounting_records), Decimal("0")) if accounting_records else None
+    # A BUY cash outflow is not proof P&L.  P&L exists only after both exact
+    # proof legs have authoritative accounting and the proof-owned quantity
+    # is closed.
+    net_pnl_usd = (
+        sum((r.net_cash_impact for r in accounting_records), Decimal("0"))
+        if buy_accounting and sell_accounting and position_size == 0
+        else None
+    )
 
     reconciliation_payload: dict[str, Any] | None = None
+    buy_reconciliation: LiveReconciliationEvent | None = None
+    sell_reconciliation: LiveReconciliationEvent | None = None
     if buy_order_id is not None or sell_order_id is not None:
-        from app.services.orchestration.continuous_pipeline_worker import _has_unresolved_reconciliation
-        unresolved = await _has_unresolved_reconciliation(
-            db=db, provider=proof.provider, environment=proof.environment, product=proof.product_id,
-        )
+        buy_reconciliation = await _latest_order_reconciliation(db=db, order=buy_order)
+        sell_reconciliation = await _latest_order_reconciliation(db=db, order=sell_order)
+        required = [buy_reconciliation]
+        if sell_order is not None:
+            required.append(sell_reconciliation)
+        resolved_statuses = {"filled", "canceled", "rejected"}
+        unresolved = any(event is None or event.reconciliation_status not in resolved_statuses for event in required)
         reconciliation_payload = {"unresolved": unresolved}
 
     derived_status = _derive_fine_grained_status(
         proof=proof, decision_linked=proof.decision_record_id is not None,
-        package_linked=proof.package_id is not None, position_open=position_open,
+        package_linked=buy_package is not None, position_open=position_open,
         sell_linked=sell_order_id is not None,
         reconciliation_unresolved=None if reconciliation_payload is None else reconciliation_payload["unresolved"],
-        net_pnl_usd=net_pnl_usd if sell_order_id is not None and not position_open else None,
+        net_pnl_usd=net_pnl_usd,
     )
     if derived_status != proof.status and proof.status not in _TERMINAL_PERSISTED_STATES:
+        before_status = proof.status
         proof.status = derived_status
         proof.updated_at = _utcnow()
-        if net_pnl_usd is not None and derived_status in {"RECONCILED", "PROFIT_CONFIRMED"}:
-            proof.net_pnl_usd = net_pnl_usd
+        db.add(AuditLog(
+            actor="system:controlled_proof_lineage_projection",
+            action="controlled_proof_run.status_projected",
+            entity_type="controlled_proof_run", entity_id=proof.proof_id,
+            before_state={"status": before_status}, after_state={"status": derived_status},
+        ))
+
+    lineage_terminal = (
+        derived_status in {"RECONCILED", "PROFIT_CONFIRMED"}
+        and net_pnl_usd is not None
+        and reconciliation_payload is not None
+        and reconciliation_payload["unresolved"] is False
+        and buy_reconciliation is not None
+        and buy_reconciliation.reconciliation_status == "filled"
+        and sell_reconciliation is not None
+        and sell_reconciliation.reconciliation_status == "filled"
+    )
+    if lineage_terminal:
+        proof.net_pnl_usd = net_pnl_usd
+    elif (
+        proof.net_pnl_usd is not None
+        or proof.terminal_verdict in {"LIFECYCLE_PROVEN_PROFIT", "LIFECYCLE_PROVEN_LOSS", "LIFECYCLE_PROVEN_FLAT"}
+    ):
+        before_projection = {
+            "net_pnl_usd": None if proof.net_pnl_usd is None else str(proof.net_pnl_usd),
+            "terminal_verdict": proof.terminal_verdict,
+        }
+        proof.net_pnl_usd = None
+        if proof.terminal_verdict in {
+            "LIFECYCLE_PROVEN_PROFIT", "LIFECYCLE_PROVEN_LOSS", "LIFECYCLE_PROVEN_FLAT",
+        }:
+            proof.terminal_verdict = None
+        proof.updated_at = _utcnow()
+        db.add(AuditLog(
+            actor="system:controlled_proof_lineage_projection",
+            action="controlled_proof_run.foreign_lineage_projection_cleared",
+            entity_type="controlled_proof_run", entity_id=proof.proof_id,
+            before_state=before_projection,
+            after_state={"net_pnl_usd": None, "terminal_verdict": proof.terminal_verdict},
+        ))
 
     # Terminal verdict: computed once from real, already-derived downstream
     # state and then frozen -- never recomputed once set, so a later read
@@ -1181,7 +1292,7 @@ async def get_controlled_proof_view(*, db: AsyncSession, proof_id: uuid.UUID) ->
     # silent no-op -- "do not call a loss a profit" also means never staying
     # silent about an outcome that did happen.
     if proof.terminal_verdict is None:
-        if proof.status in {"RECONCILED", "PROFIT_CONFIRMED"} and proof.net_pnl_usd is not None:
+        if lineage_terminal and proof.net_pnl_usd is not None:
             if proof.net_pnl_usd > 0:
                 proof.terminal_verdict = "LIFECYCLE_PROVEN_PROFIT"
             elif proof.net_pnl_usd < 0:
