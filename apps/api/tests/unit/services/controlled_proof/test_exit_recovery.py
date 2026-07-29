@@ -13,14 +13,26 @@ from app.models.controlled_proof_exit_recovery import ControlledProofExitRecover
 from app.services.controlled_proof import exit_recovery
 
 
+class _ScalarRows:
+    def __init__(self, values):
+        self.values = values
+
+    def all(self):
+        return self.values
+
+
 class _FakeDb:
-    def __init__(self, scalars):
+    def __init__(self, scalars, many=None):
         self.values = list(scalars)
+        self.many = list(many or [])
         self.added = []
         self.commits = 0
 
     async def scalar(self, _statement):
         return self.values.pop(0) if self.values else None
+
+    async def scalars(self, _statement):
+        return _ScalarRows(self.many.pop(0) if self.many else [])
 
     def add(self, value):
         if isinstance(value, ControlledProofExitRecovery) and value.recovery_id is None:
@@ -205,6 +217,259 @@ async def test_nonterminal_sell_or_claim_keeps_exit_recovery_in_progress(
 
     assert recovery.status == "IN_PROGRESS"
     assert db.added == []
+
+
+def _blocked_projection_fixture(*, net_pnl: Decimal = Decimal("0.17")):
+    now = datetime.now(timezone.utc)
+    proof_id, recovery_id, package_id = uuid.uuid4(), uuid.uuid4(), uuid.uuid4()
+    buy_order_id, sell_order_id, profile_id = uuid.uuid4(), uuid.uuid4(), uuid.uuid4()
+    reconciliation_id = uuid.uuid4()
+    proof = SimpleNamespace(
+        proof_id=proof_id, status="EXPIRED", terminal_verdict="FAILED",
+        campaign_id=uuid.uuid4(), campaign_version=1, provider="kraken_spot",
+        environment="production", product_id="BTC-USD", sell_package_id=package_id,
+        buy_live_crypto_order_id=buy_order_id, sell_live_crypto_order_id=sell_order_id,
+    )
+    recovery = SimpleNamespace(
+        recovery_id=recovery_id, proof_id=proof_id, status="BLOCKED",
+        blocked_reason="stale_sell_package_replacement_blocked", completed_at=None,
+        audit_correlation_id=uuid.uuid4(),
+    )
+    package = SimpleNamespace(
+        package_id=package_id, side="SELL", campaign_id=proof.campaign_id,
+        campaign_version=1, provider=proof.provider, environment=proof.environment,
+        product=proof.product_id, live_trading_profile_id=profile_id,
+        market_evidence_identity={
+            "controlled_proof_id": str(proof_id),
+            "controlled_proof_exit_recovery_id": str(recovery_id),
+        },
+    )
+    claim = SimpleNamespace(
+        claim_id=uuid.uuid4(), package_id=package_id, side="SELL", claim_status="COMPLETED",
+        live_order_id=sell_order_id, campaign_id=proof.campaign_id, campaign_version=1,
+        profile_id=profile_id, provider=proof.provider, environment=proof.environment,
+        product=proof.product_id,
+    )
+    order = SimpleNamespace(
+        live_crypto_order_id=sell_order_id, status="FILLED", provider_order_id="KRAKEN-ORDER",
+        side="SELL", provider=proof.provider, environment=proof.environment,
+        product_id=proof.product_id,
+    )
+    reconciliation = SimpleNamespace(
+        id=reconciliation_id, reconciliation_status="filled", sequence_number=2,
+    )
+    buy_cash = Decimal("-5")
+    accounting = [
+        SimpleNamespace(
+            live_crypto_order_id=buy_order_id, side="buy", symbol="BTC-USD",
+            reconciliation_event_id=uuid.uuid4(), net_cash_impact=buy_cash,
+        ),
+        SimpleNamespace(
+            live_crypto_order_id=sell_order_id, side="sell", symbol="BTC-USD",
+            reconciliation_event_id=reconciliation_id, net_cash_impact=-buy_cash + net_pnl,
+        ),
+    ]
+    return SimpleNamespace(
+        now=now, proof=proof, recovery=recovery, package=package, claim=claim,
+        order=order, reconciliation=reconciliation, accounting=accounting,
+        profile_id=profile_id,
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(("net_pnl", "verdict"), [
+    (Decimal("0.17"), "LIFECYCLE_PROVEN_PROFIT"),
+    (Decimal("0"), "LIFECYCLE_PROVEN_FLAT"),
+    (Decimal("-0.17"), "LIFECYCLE_PROVEN_LOSS"),
+])
+async def test_blocked_recovery_projects_separate_reconciled_outcome(
+    monkeypatch, net_pnl, verdict,
+) -> None:
+    import app.services.orchestration.continuous_pipeline_worker as worker
+
+    item = _blocked_projection_fixture(net_pnl=net_pnl)
+    db = _FakeDb(
+        [item.recovery, None, item.claim, item.order, item.reconciliation],
+        [[item.package], item.accounting],
+    )
+    monkeypatch.setattr(worker, "_has_unresolved_reconciliation", lambda **_kwargs: _async_false())
+    monkeypatch.setattr(
+        exit_recovery, "_load_scope",
+        lambda *_args, **_kwargs: _async((SimpleNamespace(id=7), item.profile_id)),
+    )
+    monkeypatch.setattr(
+        exit_recovery, "compute_signed_owned_quantity",
+        lambda **_kwargs: _async(Decimal("0")),
+    )
+    monkeypatch.setattr(exit_recovery, "_utcnow", lambda: item.now)
+
+    assert await exit_recovery.project_blocked_exit_recovery_outcome(
+        db=db, recovery=item.recovery, proof=item.proof,
+    ) is True
+
+    assert item.recovery.status == "BLOCKED"
+    assert item.recovery.blocked_reason == "stale_sell_package_replacement_blocked"
+    audit = next(value for value in db.added if isinstance(value, AuditLog))
+    assert audit.action == "controlled_proof_exit_recovery.recovered_outcome_published"
+    assert audit.after_state["original_recovery_id"] == str(item.recovery.recovery_id)
+    assert audit.after_state["sell_package_id"] == str(item.package.package_id)
+    assert audit.after_state["sell_live_crypto_order_id"] == str(item.order.live_crypto_order_id)
+    assert audit.after_state["provider_order_id"] == "KRAKEN-ORDER"
+    assert audit.after_state["execution_claim_id"] == str(item.claim.claim_id)
+    assert audit.after_state["reconciliation_event_id"] == str(item.reconciliation.id)
+    assert audit.after_state["recovered_terminal_verdict"] == verdict
+    assert Decimal(audit.after_state["recovered_net_pnl_usd"]) == net_pnl
+
+    replay_db = _FakeDb([item.recovery, audit])
+    assert await exit_recovery.project_blocked_exit_recovery_outcome(
+        db=replay_db, recovery=item.recovery, proof=item.proof,
+    ) is True
+    assert replay_db.added == []
+
+
+@pytest.mark.asyncio
+async def test_blocked_recovery_does_not_project_unrelated_package() -> None:
+    item = _blocked_projection_fixture()
+    item.package.market_evidence_identity["controlled_proof_exit_recovery_id"] = str(uuid.uuid4())
+    db = _FakeDb([item.recovery, None], [[item.package]])
+
+    assert await exit_recovery.project_blocked_exit_recovery_outcome(
+        db=db, recovery=item.recovery, proof=item.proof,
+    ) is False
+    assert item.recovery.status == "BLOCKED"
+    assert db.added == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(("field", "value"), [
+    ("claim_status", "RECONCILIATION_REQUIRED"),
+    ("order_status", "PARTIALLY_FILLED"),
+    ("reconciliation_status", "reconciliation_required"),
+])
+async def test_blocked_recovery_incomplete_lineage_does_not_project(field, value) -> None:
+    item = _blocked_projection_fixture()
+    if field == "claim_status":
+        item.claim.claim_status = value
+    elif field == "order_status":
+        item.order.status = value
+    else:
+        item.reconciliation.reconciliation_status = value
+    db = _FakeDb(
+        [item.recovery, None, item.claim, item.order, item.reconciliation],
+        [[item.package]],
+    )
+
+    assert await exit_recovery.project_blocked_exit_recovery_outcome(
+        db=db, recovery=item.recovery, proof=item.proof,
+    ) is False
+    assert db.added == []
+
+
+@pytest.mark.asyncio
+async def test_blocked_recovery_requires_zero_ownership_and_complete_accounting(monkeypatch) -> None:
+    import app.services.orchestration.continuous_pipeline_worker as worker
+
+    item = _blocked_projection_fixture()
+    monkeypatch.setattr(worker, "_has_unresolved_reconciliation", lambda **_kwargs: _async_false())
+    monkeypatch.setattr(
+        exit_recovery, "_load_scope",
+        lambda *_args, **_kwargs: _async((SimpleNamespace(id=7), item.profile_id)),
+    )
+    monkeypatch.setattr(
+        exit_recovery, "compute_signed_owned_quantity",
+        lambda **_kwargs: _async(Decimal("0.00001")),
+    )
+    nonzero_db = _FakeDb(
+        [item.recovery, None, item.claim, item.order, item.reconciliation], [[item.package]],
+    )
+    assert await exit_recovery.project_blocked_exit_recovery_outcome(
+        db=nonzero_db, recovery=item.recovery, proof=item.proof,
+    ) is False
+
+    monkeypatch.setattr(
+        exit_recovery, "compute_signed_owned_quantity",
+        lambda **_kwargs: _async(Decimal("0")),
+    )
+    missing_accounting_db = _FakeDb(
+        [item.recovery, None, item.claim, item.order, item.reconciliation],
+        [[item.package], item.accounting[:1]],
+    )
+    assert await exit_recovery.project_blocked_exit_recovery_outcome(
+        db=missing_accounting_db, recovery=item.recovery, proof=item.proof,
+    ) is False
+    assert nonzero_db.added == missing_accounting_db.added == []
+
+
+@pytest.mark.asyncio
+async def test_blocked_recovery_unresolved_reconciliation_does_not_project(monkeypatch) -> None:
+    import app.services.orchestration.continuous_pipeline_worker as worker
+
+    item = _blocked_projection_fixture()
+    monkeypatch.setattr(worker, "_has_unresolved_reconciliation", lambda **_kwargs: _async(True))
+    db = _FakeDb(
+        [item.recovery, None, item.claim, item.order, item.reconciliation], [[item.package]],
+    )
+    assert await exit_recovery.project_blocked_exit_recovery_outcome(
+        db=db, recovery=item.recovery, proof=item.proof,
+    ) is False
+    assert db.added == []
+
+
+@pytest.mark.asyncio
+async def test_exit_recovery_view_exposes_blocked_attempt_and_recovered_outcome() -> None:
+    item = _blocked_projection_fixture()
+    outcome = {
+        "status": "COMPLETED_RECONCILED",
+        "original_recovery_id": str(item.recovery.recovery_id),
+        "proof_id": str(item.proof.proof_id),
+        "sell_package_id": str(item.package.package_id),
+        "sell_live_crypto_order_id": str(item.order.live_crypto_order_id),
+        "provider_order_id": item.order.provider_order_id,
+        "execution_claim_id": str(item.claim.claim_id),
+        "reconciliation_event_id": str(item.reconciliation.id),
+        "recovered_terminal_verdict": "LIFECYCLE_PROVEN_PROFIT",
+        "recovered_net_pnl_usd": "0.17",
+        "completed_at": item.now.isoformat(),
+        "audit_correlation_id": str(item.recovery.audit_correlation_id),
+    }
+    item.recovery.idempotency_key = "historical"
+    item.recovery.authorized_by = "operator:human"
+    item.recovery.authorized_at = item.now
+    item.recovery.expires_at = item.now
+    item.recovery.claimed_at = item.now
+    item.recovery.failure_reason = None
+    audit = SimpleNamespace(after_state=outcome)
+    db = _FakeDb([None, item.recovery, audit], [[]])
+
+    view = await exit_recovery.get_exit_recovery_view(
+        db=db, proof_id=item.proof.proof_id,
+    )
+
+    assert view["status"] == "BLOCKED"
+    assert view["blocked_reason"] == "stale_sell_package_replacement_blocked"
+    assert view["completed_at"] is None
+    assert view["recovered_outcome"] == outcome
+
+
+@pytest.mark.asyncio
+async def test_periodic_refresh_projects_historical_blocked_recovery(monkeypatch) -> None:
+    item = _blocked_projection_fixture()
+    projected = []
+
+    async def _project(*, db, recovery, proof):
+        projected.append((recovery.recovery_id, proof.proof_id))
+        return True
+
+    monkeypatch.setattr(exit_recovery, "project_blocked_exit_recovery_outcome", _project)
+    db = _FakeDb([item.proof], [[item.recovery]])
+
+    await exit_recovery.refresh_exit_recovery_outcomes(db=db)
+
+    assert projected == [(item.recovery.recovery_id, item.proof.proof_id)]
+
+
+async def _async(value):
+    return value
 
 
 @pytest.mark.asyncio

@@ -24,6 +24,7 @@ from app.services.position_lifecycle.source_adapter import load_position_snapsho
 
 _RECOVERABLE_PROOF_STATES = {"EXPIRED", "FAILED"}
 _ACTIVE_RECOVERY_STATES = {"AUTHORIZED", "IN_PROGRESS"}
+_RECOVERED_OUTCOME_ACTION = "controlled_proof_exit_recovery.recovered_outcome_published"
 
 
 def _utcnow() -> datetime:
@@ -338,6 +339,11 @@ async def get_exit_recovery_view(*, db: AsyncSession, proof_id: uuid.UUID) -> di
     recovery = await db.scalar(select(ControlledProofExitRecovery).where(ControlledProofExitRecovery.proof_id == proof_id).order_by(ControlledProofExitRecovery.authorized_at.desc()).limit(1))
     if recovery is None:
         raise NotFoundError(message="Controlled Proof exit recovery not found", details={"proof_id": str(proof_id)})
+    outcome_audit = await db.scalar(select(AuditLog).where(
+        AuditLog.entity_type == "controlled_proof_exit_recovery",
+        AuditLog.entity_id == recovery.recovery_id,
+        AuditLog.action == _RECOVERED_OUTCOME_ACTION,
+    ).order_by(AuditLog.id.desc()).limit(1))
     return {
         "recovery_id": recovery.recovery_id, "proof_id": recovery.proof_id, "status": recovery.status,
         "idempotency_key": recovery.idempotency_key, "authorized_by": recovery.authorized_by,
@@ -345,6 +351,7 @@ async def get_exit_recovery_view(*, db: AsyncSession, proof_id: uuid.UUID) -> di
         "claimed_at": recovery.claimed_at, "completed_at": recovery.completed_at,
         "blocked_reason": recovery.blocked_reason, "failure_reason": recovery.failure_reason,
         "audit_correlation_id": recovery.audit_correlation_id,
+        "recovered_outcome": None if outcome_audit is None else outcome_audit.after_state,
     }
 
 
@@ -426,19 +433,160 @@ async def refresh_exit_recovery_completion(
     await db.flush()
 
 
+def _recovered_verdict(net_pnl: Decimal) -> str:
+    if net_pnl > 0:
+        return "LIFECYCLE_PROVEN_PROFIT"
+    if net_pnl < 0:
+        return "LIFECYCLE_PROVEN_LOSS"
+    return "LIFECYCLE_PROVEN_FLAT"
+
+
+async def project_blocked_exit_recovery_outcome(
+    *, db: AsyncSession, recovery: ControlledProofExitRecovery, proof: ControlledProofRun,
+) -> bool:
+    """Publish an accounting outcome without reopening a terminal recovery.
+
+    The canonical package's immutable recovery marker is the root of the
+    lineage.  Nothing is inferred from timestamps or merely sharing a proof.
+    Locking the recovery serializes projector replays; the append-only audit
+    row is the projection and the historical BLOCKED row is never mutated.
+    """
+    if recovery.status != "BLOCKED":
+        return False
+    locked = await db.scalar(select(ControlledProofExitRecovery).where(
+        ControlledProofExitRecovery.recovery_id == recovery.recovery_id,
+    ).with_for_update())
+    if locked is None or locked.status != "BLOCKED" or locked.proof_id != proof.proof_id:
+        return False
+    existing = await db.scalar(select(AuditLog).where(
+        AuditLog.entity_type == "controlled_proof_exit_recovery",
+        AuditLog.entity_id == locked.recovery_id,
+        AuditLog.action == _RECOVERED_OUTCOME_ACTION,
+    ).limit(1))
+    if existing is not None:
+        return True
+
+    packages = (await db.scalars(select(CanonicalPreviewPackage).where(
+        CanonicalPreviewPackage.side == "SELL",
+        CanonicalPreviewPackage.campaign_id == proof.campaign_id,
+        CanonicalPreviewPackage.campaign_version == proof.campaign_version,
+        CanonicalPreviewPackage.provider == proof.provider,
+        CanonicalPreviewPackage.environment == proof.environment,
+        CanonicalPreviewPackage.product == proof.product_id,
+    ))).all()
+    matches = [
+        package for package in packages
+        if str((package.market_evidence_identity or {}).get("controlled_proof_id")) == str(proof.proof_id)
+        and str((package.market_evidence_identity or {}).get("controlled_proof_exit_recovery_id")) == str(locked.recovery_id)
+    ]
+    if len(matches) != 1:
+        return False
+    package = matches[0]
+    if proof.sell_package_id != package.package_id:
+        return False
+
+    claim = await db.scalar(select(AutonomousExecutionClaim).where(
+        AutonomousExecutionClaim.package_id == package.package_id,
+        AutonomousExecutionClaim.side == "SELL",
+    ).limit(1))
+    if (
+        claim is None or claim.claim_status != "COMPLETED" or claim.live_order_id is None
+        or claim.campaign_id != package.campaign_id or claim.campaign_version != package.campaign_version
+        or claim.profile_id != package.live_trading_profile_id
+        or claim.provider != package.provider or claim.environment != package.environment
+        or claim.product != package.product
+    ):
+        return False
+    if proof.sell_live_crypto_order_id != claim.live_order_id:
+        return False
+    order = await db.scalar(select(LiveCryptoOrder).where(
+        LiveCryptoOrder.live_crypto_order_id == claim.live_order_id,
+    ).limit(1))
+    if (
+        order is None or order.status != "FILLED" or not order.provider_order_id
+        or order.side.upper() != "SELL" or order.provider != proof.provider
+        or order.environment != proof.environment or order.product_id != proof.product_id
+    ):
+        return False
+    reconciliation = await db.scalar(select(LiveReconciliationEvent).where(
+        LiveReconciliationEvent.live_crypto_order_id == order.live_crypto_order_id,
+    ).order_by(LiveReconciliationEvent.sequence_number.desc()).limit(1))
+    if reconciliation is None or reconciliation.reconciliation_status != "filled":
+        return False
+    from app.services.orchestration.continuous_pipeline_worker import _has_unresolved_reconciliation
+    if await _has_unresolved_reconciliation(
+        db=db, provider=proof.provider, environment=proof.environment, product=proof.product_id,
+    ):
+        return False
+    runtime, profile_id = await _load_scope(db, proof)
+    if profile_id != package.live_trading_profile_id:
+        return False
+    if await compute_signed_owned_quantity(
+        db=db, live_trading_profile_id=profile_id, symbol=proof.product_id,
+    ) != 0:
+        return False
+    if proof.buy_live_crypto_order_id is None:
+        return False
+    accounting = (await db.scalars(select(LiveAccountingRecord).where(
+        LiveAccountingRecord.live_trading_profile_id == profile_id,
+        LiveAccountingRecord.capital_campaign_id == runtime.id,
+        LiveAccountingRecord.live_crypto_order_id.in_((
+            proof.buy_live_crypto_order_id, order.live_crypto_order_id,
+        )),
+    ))).all()
+    base = proof.product_id.split("-")[0].upper()
+    accounting = [row for row in accounting if row.symbol.split("-")[0].upper() == base]
+    if not any(row.live_crypto_order_id == proof.buy_live_crypto_order_id and row.side == "buy" for row in accounting):
+        return False
+    sell_accounting = [
+        row for row in accounting
+        if row.live_crypto_order_id == order.live_crypto_order_id and row.side == "sell"
+    ]
+    if not sell_accounting or not any(row.reconciliation_event_id == reconciliation.id for row in sell_accounting):
+        return False
+    net_pnl = sum((row.net_cash_impact for row in accounting), Decimal("0"))
+    completed_at = _utcnow()
+    payload = {
+        "status": "COMPLETED_RECONCILED",
+        "original_recovery_id": str(locked.recovery_id),
+        "proof_id": str(proof.proof_id),
+        "sell_package_id": str(package.package_id),
+        "sell_live_crypto_order_id": str(order.live_crypto_order_id),
+        "provider_order_id": order.provider_order_id,
+        "execution_claim_id": str(claim.claim_id),
+        "reconciliation_event_id": str(reconciliation.id),
+        "recovered_terminal_verdict": _recovered_verdict(net_pnl),
+        "recovered_net_pnl_usd": str(net_pnl),
+        "completed_at": completed_at.isoformat(),
+        "audit_correlation_id": str(locked.audit_correlation_id),
+    }
+    db.add(AuditLog(
+        actor="system:controlled_proof_reconciliation_projector",
+        action=_RECOVERED_OUTCOME_ACTION,
+        entity_type="controlled_proof_exit_recovery", entity_id=locked.recovery_id,
+        before_state={
+            "status": locked.status,
+            "blocked_reason": locked.blocked_reason,
+            "completed_at": None if locked.completed_at is None else locked.completed_at.isoformat(),
+        },
+        after_state=payload,
+    ))
+    await db.flush()
+    return True
+
+
 async def refresh_exit_recovery_outcomes(*, db: AsyncSession) -> None:
     """Supervise post-package outcomes even after submission authority expires."""
     recoveries = (await db.scalars(select(ControlledProofExitRecovery).where(
-        ControlledProofExitRecovery.status.in_(("IN_PROGRESS", "EXPIRED")),
+        ControlledProofExitRecovery.status.in_(("IN_PROGRESS", "EXPIRED", "BLOCKED")),
     ).order_by(ControlledProofExitRecovery.authorized_at.desc()))).all()
-    seen_proofs: set[uuid.UUID] = set()
     for recovery in recoveries:
-        if recovery.proof_id in seen_proofs:
-            continue
-        seen_proofs.add(recovery.proof_id)
         proof = await db.scalar(select(ControlledProofRun).where(
             ControlledProofRun.proof_id == recovery.proof_id,
             ControlledProofRun.sell_package_id.is_not(None),
         ).limit(1))
         if proof is not None:
-            await refresh_exit_recovery_completion(db=db, recovery=recovery, proof=proof)
+            if recovery.status == "BLOCKED":
+                await project_blocked_exit_recovery_outcome(db=db, recovery=recovery, proof=proof)
+            else:
+                await refresh_exit_recovery_completion(db=db, recovery=recovery, proof=proof)

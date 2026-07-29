@@ -1656,6 +1656,11 @@ async def _run_autonomous_and_campaign_orchestration_attempt(*, db: AsyncSession
     if hasattr(db, "scalars") and hasattr(db, "scalar"):
         try:
             await refresh_exit_recovery_outcomes(db=db)
+            # Outcome projection is independently authoritative and must not
+            # depend on a later ambient orchestration stage reaching its own
+            # commit.  This also makes deployment self-heal already-reconciled
+            # historical recoveries on the first periodic pass.
+            await db.commit()
             pending_recovery_id = await find_pending_exit_recovery_id(db=db)
             if pending_recovery_id is not None:
                 await _attempt_operator_controlled_proof_entry(db=db, recovery_id=pending_recovery_id)
