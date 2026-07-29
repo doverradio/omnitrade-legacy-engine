@@ -22,6 +22,10 @@ from app.services.canonical_preview_package import (
     run_dry_run_for_canonical_preview_package,
 )
 from app.services.controlled_proof.service import _ACTIVE_STATES as _CONTROLLED_PROOF_ACTIVE_STATES
+from app.services.controlled_proof.service import (
+    repair_controlled_proof_cached_order_ids,
+    resolve_controlled_proof_leg_execution_lineage,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -269,8 +273,17 @@ async def _resolve_controlled_proof_activation_scope(
         is_sell_package = proof.sell_package_id == package.package_id
         if is_buy_package and (proof.buy_live_crypto_order_id is not None or proof.position_id is not None):
             return _blocked("controlled_proof_live_capital_already_exists")
-        if is_sell_package and proof.sell_live_crypto_order_id is not None:
-            return _blocked("controlled_proof_live_capital_already_exists")
+        if is_sell_package:
+            await repair_controlled_proof_cached_order_ids(db=db, proof=proof)
+            sell_lineage = await resolve_controlled_proof_leg_execution_lineage(
+                db=db, proof=proof, package_id=proof.sell_package_id, side="SELL",
+            )
+            if sell_lineage.state != "PACKAGE_ONLY":
+                return _blocked(
+                    "controlled_proof_sell_execution_lineage_exists"
+                    if sell_lineage.state in {"CLAIM_ONLY", "ORDER_LINKED"}
+                    else "controlled_proof_sell_execution_lineage_inconsistent"
+                )
 
     logger.info(
         "controlled_proof_activation_override_allowed campaign_id=%s campaign_version=%s decision_record_id=%s package_id=%s controlled_proof_id=%s product=%s provider=%s environment=%s",

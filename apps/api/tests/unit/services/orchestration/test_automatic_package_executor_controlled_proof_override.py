@@ -8,15 +8,23 @@ from types import SimpleNamespace
 from typing import AsyncIterator
 
 import pytest
+from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.models.canonical_preview_package import CanonicalPreviewPackage
+from app.models.autonomous_execution_claim import AutonomousExecutionClaim
+from app.models.audit_log import AuditLog
 from app.models.controlled_proof_run import ControlledProofRun
 from app.models.controlled_proof_exit_recovery import ControlledProofExitRecovery
+from app.models.live_crypto_order import LiveCryptoOrder
 from app.services.orchestration import automatic_package_executor as executor
+from app.services.controlled_proof import service as proof_service
 from tests.support.real_sqlite_session import real_sqlite_session
 
-_ALL_TABLES = [CanonicalPreviewPackage.__table__, ControlledProofRun.__table__, ControlledProofExitRecovery.__table__]
+_ALL_TABLES = [
+    CanonicalPreviewPackage.__table__, ControlledProofRun.__table__, ControlledProofExitRecovery.__table__,
+    AutonomousExecutionClaim.__table__, LiveCryptoOrder.__table__, AuditLog.__table__,
+]
 
 
 @asynccontextmanager
@@ -72,11 +80,52 @@ async def _make_proof(
     )
     db.add(proof)
     await db.flush()
+    for linked_package_id in (package_id, sell_package_id):
+        if linked_package_id is None:
+            continue
+        linked_package = await db.get(CanonicalPreviewPackage, linked_package_id)
+        if linked_package is not None:
+            linked_package.market_evidence_identity = {
+                **(linked_package.market_evidence_identity or {}),
+                "controlled_proof_id": str(proof.proof_id),
+            }
+    await db.flush()
     return proof
 
 
 def _mandate_ids() -> dict:
     return {"mandate_id": uuid.uuid4(), "mandate_version_id": uuid.uuid4(), "mandate_evaluation_id": uuid.uuid4()}
+
+
+async def _make_claim(
+    *, db: AsyncSession, proof: ControlledProofRun, package: CanonicalPreviewPackage,
+    with_order: bool = True, claim_status: str = "SUBMISSION_PENDING", side: str = "SELL",
+) -> tuple[AutonomousExecutionClaim, LiveCryptoOrder | None]:
+    order = None
+    if with_order:
+        order = LiveCryptoOrder(
+            live_crypto_order_id=uuid.uuid4(), crypto_order_preview_id=package.crypto_order_preview_id,
+            exchange_connection_id=uuid.uuid4(), provider=proof.provider, environment=proof.environment,
+            product_id=proof.product_id, side=side, order_type="MARKET", requested_quote_size=Decimal("5"),
+            client_order_id=f"{side.lower()}-{uuid.uuid4()}", status="ACKNOWLEDGED",
+            provider_order_id=f"provider-{uuid.uuid4()}", submitted_at=datetime.now(timezone.utc),
+            audit_correlation_id=proof.audit_correlation_id,
+        )
+        db.add(order)
+        await db.flush()
+    claim = AutonomousExecutionClaim(
+        claim_id=uuid.uuid4(), package_id=package.package_id, activation_id=uuid.uuid4(),
+        campaign_id=proof.campaign_id, campaign_version=proof.campaign_version,
+        mandate_id=package.mandate_id, mandate_version_id=package.mandate_version_id,
+        account_id=package.paper_account_id, profile_id=package.live_trading_profile_id,
+        connection_id=uuid.uuid4(), provider=proof.provider, environment=proof.environment,
+        product=proof.product_id, side=side, claim_status=claim_status,
+        claimed_at=datetime.now(timezone.utc), claim_owner="test",
+        live_order_id=None if order is None else order.live_crypto_order_id,
+    )
+    db.add(claim)
+    await db.flush()
+    return claim, order
 
 
 @pytest.mark.asyncio
@@ -95,11 +144,17 @@ async def test_terminal_proof_sell_activation_requires_active_exit_recovery() ->
         )
         session.add(recovery)
         await session.flush()
-        package.market_evidence_identity = {"controlled_proof_exit_recovery_id": str(recovery.recovery_id)}
+        package.market_evidence_identity = {
+            **(package.market_evidence_identity or {}),
+            "controlled_proof_exit_recovery_id": str(recovery.recovery_id),
+        }
         await session.flush()
         scope = await executor._resolve_controlled_proof_activation_scope(db=session, request=request)
         assert scope is not None and scope.controlled_proof_id == proof.proof_id
-        package.market_evidence_identity = {"controlled_proof_exit_recovery_id": str(uuid.uuid4())}
+        package.market_evidence_identity = {
+            **(package.market_evidence_identity or {}),
+            "controlled_proof_exit_recovery_id": str(uuid.uuid4()),
+        }
         await session.flush()
         assert await executor._resolve_controlled_proof_activation_scope(db=session, request=request) is None
 
@@ -353,18 +408,159 @@ async def test_override_blocked_when_sell_package_already_has_live_capital_evide
             db=session, campaign_id=campaign_id, campaign_version=campaign_version,
             package_state="DRY_RUN_PASSED", side="SELL", **_mandate_ids(),
         )
-        await _make_proof(
+        proof = await _make_proof(
             db=session, campaign_id=campaign_id, campaign_version=campaign_version,
             package_id=uuid.uuid4(), sell_package_id=sell_package.package_id,
             buy_live_crypto_order_id=uuid.uuid4(), position_id="pos-1",
             sell_live_crypto_order_id=uuid.uuid4(),
         )
+        _claim, exact_order = await _make_claim(db=session, proof=proof, package=sell_package)
+        proof.sell_live_crypto_order_id = exact_order.live_crypto_order_id
+        await session.flush()
         request = executor.AutomaticPackageExecutionRequest(
             campaign_id=campaign_id, campaign_version=campaign_version,
             decision_record_id=sell_package.decision_record_id, package_id=sell_package.package_id,
         )
         authority = await executor._resolve_controlled_proof_activation_scope(db=session, request=request)
         assert authority is None
+
+
+@pytest.mark.asyncio
+async def test_foreign_cached_sell_order_does_not_block_first_exact_sell_and_is_audited() -> None:
+    async with _real_session() as session:
+        campaign_id = uuid.uuid4()
+        sell_package = await _make_package(
+            db=session, campaign_id=campaign_id, campaign_version=1,
+            package_state="DRY_RUN_PASSED", side="SELL", **_mandate_ids(),
+        )
+        foreign_order_id = uuid.uuid4()
+        proof = await _make_proof(
+            db=session, campaign_id=campaign_id, campaign_version=1,
+            package_id=uuid.uuid4(), sell_package_id=sell_package.package_id,
+            status="WAITING_FOR_PROFITABLE_EXIT", sell_live_crypto_order_id=foreign_order_id,
+        )
+        request = executor.AutomaticPackageExecutionRequest(
+            campaign_id=campaign_id, campaign_version=1,
+            decision_record_id=sell_package.decision_record_id, package_id=sell_package.package_id,
+        )
+
+        authority = await executor._resolve_controlled_proof_activation_scope(db=session, request=request)
+
+        assert authority is not None
+        assert proof.sell_live_crypto_order_id is None
+        audits = (await session.scalars(select(AuditLog).where(
+            AuditLog.entity_id == proof.proof_id,
+            AuditLog.action == "controlled_proof_run.cached_order_lineage_repaired",
+        ))).all()
+        assert len(audits) == 1
+        assert audits[0].before_state["sell_live_crypto_order_id"] == str(foreign_order_id)
+        assert audits[0].after_state["sell_live_crypto_order_id"] is None
+        assert audits[0].after_state["canonical_lineage"]["sell"]["state"] == "PACKAGE_ONLY"
+
+
+@pytest.mark.asyncio
+async def test_claim_only_sell_lineage_remains_blocked_and_cache_is_not_cleared() -> None:
+    async with _real_session() as session:
+        campaign_id = uuid.uuid4()
+        sell_package = await _make_package(
+            db=session, campaign_id=campaign_id, campaign_version=1,
+            package_state="DRY_RUN_PASSED", side="SELL", **_mandate_ids(),
+        )
+        cached_id = uuid.uuid4()
+        proof = await _make_proof(
+            db=session, campaign_id=campaign_id, campaign_version=1,
+            package_id=uuid.uuid4(), sell_package_id=sell_package.package_id,
+            status="WAITING_FOR_PROFITABLE_EXIT", sell_live_crypto_order_id=cached_id,
+        )
+        await _make_claim(db=session, proof=proof, package=sell_package, with_order=False, claim_status="RECONCILIATION_REQUIRED")
+        request = executor.AutomaticPackageExecutionRequest(
+            campaign_id=campaign_id, campaign_version=1,
+            decision_record_id=sell_package.decision_record_id, package_id=sell_package.package_id,
+        )
+
+        assert await executor._resolve_controlled_proof_activation_scope(db=session, request=request) is None
+        assert proof.sell_live_crypto_order_id == cached_id
+
+
+@pytest.mark.asyncio
+async def test_ambiguous_multiple_claim_sell_lineage_fails_closed(monkeypatch: pytest.MonkeyPatch) -> None:
+    async with _real_session() as session:
+        campaign_id = uuid.uuid4()
+        sell_package = await _make_package(
+            db=session, campaign_id=campaign_id, campaign_version=1,
+            package_state="DRY_RUN_PASSED", side="SELL", **_mandate_ids(),
+        )
+        await _make_proof(
+            db=session, campaign_id=campaign_id, campaign_version=1,
+            package_id=uuid.uuid4(), sell_package_id=sell_package.package_id,
+            status="WAITING_FOR_PROFITABLE_EXIT",
+        )
+        async def _no_repair(**_kwargs):
+            return False
+        async def _ambiguous(**_kwargs):
+            return SimpleNamespace(state="INCONSISTENT", reason="multiple_execution_claims")
+        monkeypatch.setattr(executor, "repair_controlled_proof_cached_order_ids", _no_repair)
+        monkeypatch.setattr(executor, "resolve_controlled_proof_leg_execution_lineage", _ambiguous)
+        request = executor.AutomaticPackageExecutionRequest(
+            campaign_id=campaign_id, campaign_version=1,
+            decision_record_id=sell_package.decision_record_id, package_id=sell_package.package_id,
+        )
+
+        assert await executor._resolve_controlled_proof_activation_scope(db=session, request=request) is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("order_status", ["ACKNOWLEDGED", "RECONCILIATION_REQUIRED", "FILLED"])
+async def test_submitted_unresolved_or_filled_exact_sell_lineage_blocks_activation(order_status: str) -> None:
+    async with _real_session() as session:
+        campaign_id = uuid.uuid4()
+        sell_package = await _make_package(
+            db=session, campaign_id=campaign_id, campaign_version=1,
+            package_state="DRY_RUN_PASSED", side="SELL", **_mandate_ids(),
+        )
+        proof = await _make_proof(
+            db=session, campaign_id=campaign_id, campaign_version=1,
+            package_id=uuid.uuid4(), sell_package_id=sell_package.package_id,
+            status="WAITING_FOR_PROFITABLE_EXIT",
+        )
+        _claim, order = await _make_claim(db=session, proof=proof, package=sell_package)
+        order.status = order_status
+        await session.flush()
+        request = executor.AutomaticPackageExecutionRequest(
+            campaign_id=campaign_id, campaign_version=1,
+            decision_record_id=sell_package.decision_record_id, package_id=sell_package.package_id,
+        )
+
+        assert await executor._resolve_controlled_proof_activation_scope(db=session, request=request) is None
+
+
+@pytest.mark.asyncio
+async def test_cached_buy_and_sell_repair_is_idempotent_and_preserves_exact_buy() -> None:
+    async with _real_session() as session:
+        campaign_id = uuid.uuid4()
+        buy_package = await _make_package(db=session, campaign_id=campaign_id, campaign_version=1, **_mandate_ids())
+        sell_package = await _make_package(
+            db=session, campaign_id=campaign_id, campaign_version=1, side="SELL", **_mandate_ids(),
+        )
+        proof = await _make_proof(
+            db=session, campaign_id=campaign_id, campaign_version=1,
+            package_id=buy_package.package_id, sell_package_id=sell_package.package_id,
+            status="WAITING_FOR_PROFITABLE_EXIT", buy_live_crypto_order_id=uuid.uuid4(),
+            sell_live_crypto_order_id=uuid.uuid4(),
+        )
+        _claim, exact_buy = await _make_claim(
+            db=session, proof=proof, package=buy_package, side="BUY", claim_status="BUY_RECONCILED",
+        )
+
+        assert await proof_service.repair_controlled_proof_cached_order_ids(db=session, proof=proof) is True
+        assert proof.buy_live_crypto_order_id == exact_buy.live_crypto_order_id
+        assert proof.sell_live_crypto_order_id is None
+        assert await proof_service.repair_controlled_proof_cached_order_ids(db=session, proof=proof) is False
+        audits = (await session.scalars(select(AuditLog).where(
+            AuditLog.entity_id == proof.proof_id,
+            AuditLog.action == "controlled_proof_run.cached_order_lineage_repaired",
+        ))).all()
+        assert len(audits) == 1
 
 
 @pytest.mark.asyncio
@@ -415,8 +611,9 @@ def _disabled_settings() -> SimpleNamespace:
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("side", ["BUY", "SELL"])
 async def test_full_executor_progresses_controlled_proof_package_through_activation_when_flag_disabled(
-    monkeypatch: pytest.MonkeyPatch,
+    monkeypatch: pytest.MonkeyPatch, side: str,
 ) -> None:
     monkeypatch.setattr(executor, "get_settings", _disabled_settings)
     calls: list[str] = []
@@ -448,9 +645,15 @@ async def test_full_executor_progresses_controlled_proof_package_through_activat
         campaign_id, campaign_version = uuid.uuid4(), 1
         package = await _make_package(
             db=session, campaign_id=campaign_id, campaign_version=campaign_version, package_state="READY",
-            **_mandate_ids(),
+            side=side, **_mandate_ids(),
         )
-        await _make_proof(db=session, campaign_id=campaign_id, campaign_version=campaign_version, package_id=package.package_id)
+        proof = await _make_proof(
+            db=session, campaign_id=campaign_id, campaign_version=campaign_version,
+            package_id=package.package_id if side == "BUY" else uuid.uuid4(),
+            sell_package_id=package.package_id if side == "SELL" else None,
+            status="WAITING_FOR_PROFITABLE_EXIT" if side == "SELL" else "PACKAGE_CREATED",
+            sell_live_crypto_order_id=uuid.uuid4() if side == "SELL" else None,
+        )
 
         outcome = await executor.execute_automatic_ready_package_through_activation(
             db=session,
@@ -469,6 +672,8 @@ async def test_full_executor_progresses_controlled_proof_package_through_activat
         # discarded the package the override itself had already loaded.
         assert outcome.package_id == package.package_id
         assert outcome.mandate_id == package.mandate_id
+        if side == "SELL":
+            assert proof.sell_live_crypto_order_id is None
 
 
 def _partially_configured_settings() -> SimpleNamespace:

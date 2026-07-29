@@ -1048,38 +1048,128 @@ async def _proof_leg_lineage(
     input.  Those columns are projections, not execution authority, and a
     campaign/product match is not proof ownership.
     """
+    lineage = await resolve_controlled_proof_leg_execution_lineage(
+        db=db, proof=proof, package_id=package_id, side=side,
+    )
+    claim = lineage.claims[0] if len(lineage.claims) == 1 else None
+    return lineage.package, claim, lineage.order
+
+
+@dataclass(frozen=True, slots=True)
+class ControlledProofLegExecutionLineage:
+    package: CanonicalPreviewPackage | None
+    claims: tuple[AutonomousExecutionClaim, ...]
+    order: LiveCryptoOrder | None
+    state: str
+    reason: str | None = None
+
+
+async def resolve_controlled_proof_leg_execution_lineage(
+    *, db: AsyncSession, proof: ControlledProofRun, package_id: uuid.UUID | None, side: str,
+) -> ControlledProofLegExecutionLineage:
+    """Resolve an execution leg without consulting denormalized proof caches.
+
+    ``PACKAGE_ONLY`` is the sole state proving that first execution has not
+    crossed into claim/order lineage. Every inconsistency is explicit so an
+    activation caller can fail closed instead of mistaking missing evidence
+    for permission.
+    """
     if package_id is None:
-        return None, None, None
-    package = await db.scalar(select(CanonicalPreviewPackage).where(
-        CanonicalPreviewPackage.package_id == package_id,
-        CanonicalPreviewPackage.campaign_id == proof.campaign_id,
-        CanonicalPreviewPackage.campaign_version == proof.campaign_version,
-        CanonicalPreviewPackage.provider == proof.provider,
-        CanonicalPreviewPackage.environment == proof.environment,
-        CanonicalPreviewPackage.product == proof.product_id,
-        CanonicalPreviewPackage.side == side,
+        return ControlledProofLegExecutionLineage(None, (), None, "ABSENT")
+    package = await db.get(CanonicalPreviewPackage, package_id)
+    if package is None:
+        return ControlledProofLegExecutionLineage(None, (), None, "INCONSISTENT", "package_missing")
+    identity = package.market_evidence_identity if isinstance(package.market_evidence_identity, dict) else {}
+    package_matches = (
+        package.campaign_id == proof.campaign_id
+        and package.campaign_version == proof.campaign_version
+        and package.provider == proof.provider
+        and package.environment == proof.environment
+        and package.product == proof.product_id
+        and package.side == side
+        and identity.get("controlled_proof_id") == str(proof.proof_id)
+    )
+    if not package_matches:
+        return ControlledProofLegExecutionLineage(package, (), None, "INCONSISTENT", "package_scope_mismatch")
+
+    claims = tuple((await db.scalars(
+        select(AutonomousExecutionClaim).where(AutonomousExecutionClaim.package_id == package.package_id)
+    )).all())
+    if not claims:
+        return ControlledProofLegExecutionLineage(package, (), None, "PACKAGE_ONLY")
+    if len(claims) != 1:
+        return ControlledProofLegExecutionLineage(package, claims, None, "INCONSISTENT", "multiple_execution_claims")
+    claim = claims[0]
+    claim_matches = (
+        claim.campaign_id == proof.campaign_id
+        and claim.campaign_version == proof.campaign_version
+        and claim.provider == proof.provider
+        and claim.environment == proof.environment
+        and claim.product == proof.product_id
+        and claim.side == side
+    )
+    if not claim_matches:
+        return ControlledProofLegExecutionLineage(package, claims, None, "INCONSISTENT", "claim_scope_mismatch")
+    if claim.live_order_id is None:
+        return ControlledProofLegExecutionLineage(package, claims, None, "CLAIM_ONLY", "claim_order_unresolved")
+    order = await db.get(LiveCryptoOrder, claim.live_order_id)
+    if order is None:
+        return ControlledProofLegExecutionLineage(package, claims, None, "INCONSISTENT", "claimed_order_missing")
+    order_matches = (
+        order.provider == proof.provider
+        and order.environment == proof.environment
+        and order.product_id == proof.product_id
+        and order.side == side
+    )
+    if not order_matches:
+        return ControlledProofLegExecutionLineage(package, claims, order, "INCONSISTENT", "order_scope_mismatch")
+    return ControlledProofLegExecutionLineage(package, claims, order, "ORDER_LINKED")
+
+
+async def repair_controlled_proof_cached_order_ids(
+    *, db: AsyncSession, proof: ControlledProofRun,
+) -> bool:
+    """Auditably align denormalized order caches with exact canonical lineage.
+
+    Only conclusive ``ABSENT``, ``PACKAGE_ONLY``, and ``ORDER_LINKED`` states
+    are repairable. Claim-only or inconsistent lineage is deliberately left
+    untouched and must remain blocked by execution authority callers.
+    """
+    before = {
+        "buy_live_crypto_order_id": None if proof.buy_live_crypto_order_id is None else str(proof.buy_live_crypto_order_id),
+        "sell_live_crypto_order_id": None if proof.sell_live_crypto_order_id is None else str(proof.sell_live_crypto_order_id),
+    }
+    evidence: dict[str, Any] = {}
+    changed = False
+    for side, package_id, attribute in (
+        ("BUY", proof.package_id, "buy_live_crypto_order_id"),
+        ("SELL", proof.sell_package_id, "sell_live_crypto_order_id"),
+    ):
+        lineage = await resolve_controlled_proof_leg_execution_lineage(
+            db=db, proof=proof, package_id=package_id, side=side,
+        )
+        evidence[side.lower()] = {"state": lineage.state, "reason": lineage.reason}
+        if lineage.state not in {"ABSENT", "PACKAGE_ONLY", "ORDER_LINKED"}:
+            continue
+        expected = lineage.order.live_crypto_order_id if lineage.order is not None else None
+        if getattr(proof, attribute) != expected:
+            setattr(proof, attribute, expected)
+            changed = True
+    if not changed:
+        return False
+    proof.updated_at = _utcnow()
+    after = {
+        "buy_live_crypto_order_id": None if proof.buy_live_crypto_order_id is None else str(proof.buy_live_crypto_order_id),
+        "sell_live_crypto_order_id": None if proof.sell_live_crypto_order_id is None else str(proof.sell_live_crypto_order_id),
+    }
+    db.add(AuditLog(
+        actor="system:controlled_proof_lineage_projection",
+        action="controlled_proof_run.cached_order_lineage_repaired",
+        entity_type="controlled_proof_run", entity_id=proof.proof_id,
+        before_state=before, after_state={**after, "canonical_lineage": evidence},
     ))
-    if package is None or str((package.market_evidence_identity or {}).get("controlled_proof_id")) != str(proof.proof_id):
-        return None, None, None
-    claim = await db.scalar(select(AutonomousExecutionClaim).where(
-        AutonomousExecutionClaim.package_id == package.package_id,
-        AutonomousExecutionClaim.campaign_id == proof.campaign_id,
-        AutonomousExecutionClaim.campaign_version == proof.campaign_version,
-        AutonomousExecutionClaim.provider == proof.provider,
-        AutonomousExecutionClaim.environment == proof.environment,
-        AutonomousExecutionClaim.product == proof.product_id,
-        AutonomousExecutionClaim.side == side,
-    ))
-    if claim is None or claim.live_order_id is None:
-        return package, claim, None
-    order = await db.scalar(select(LiveCryptoOrder).where(
-        LiveCryptoOrder.live_crypto_order_id == claim.live_order_id,
-        LiveCryptoOrder.provider == proof.provider,
-        LiveCryptoOrder.environment == proof.environment,
-        LiveCryptoOrder.product_id == proof.product_id,
-        LiveCryptoOrder.side == side,
-    ))
-    return package, claim, order
+    await db.flush()
+    return True
 
 
 async def _order_accounting(
@@ -1121,6 +1211,7 @@ async def get_controlled_proof_view(*, db: AsyncSession, proof_id: uuid.UUID) ->
 
     await _reap_expired(db=db)
     await db.refresh(proof)
+    await repair_controlled_proof_cached_order_ids(db=db, proof=proof)
 
     decision_payload: dict[str, Any] | None = None
     if proof.decision_record_id is not None:

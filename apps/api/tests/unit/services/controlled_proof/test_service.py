@@ -423,6 +423,21 @@ async def test_create_rejects_when_open_position_already_exists(monkeypatch: pyt
 # --- BUY-to-position progression: the handoff automatic reconciliation feeds --------
 
 @pytest.mark.asyncio
+async def test_waiting_for_profitable_exit_remains_pending_for_periodic_processing(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async with _real_session() as session:
+        await _seed_fully_ready_scope(session, monkeypatch)
+        proof, _ = await controlled_proof_service.create_controlled_proof(
+            db=session, product_id="BTC-USD", idempotency_key="proof-periodic-sell-supervision",
+            expires_in_minutes=30, actor="operator:alice",
+        )
+        proof.status = "WAITING_FOR_PROFITABLE_EXIT"
+        await session.flush()
+
+        assert await controlled_proof_service.find_pending_controlled_proof_id(db=session) == proof.proof_id
+
+@pytest.mark.asyncio
 async def test_should_propose_controlled_sell_becomes_true_once_buy_is_filled_and_reconciled(
     monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture,
 ) -> None:
