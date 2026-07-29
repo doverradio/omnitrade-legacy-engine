@@ -5173,3 +5173,91 @@ async def test_exit_recovery_package_failure_rolls_back_and_blocks_cleanly(
     assert db.commits == 1
     assert recovery.status == "BLOCKED"
     assert blocked == [expected_reason]
+
+
+@pytest.mark.asyncio
+async def test_exit_recovery_sell_package_link_dbapi_error_logs_full_diagnostics_without_changing_outcome(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Reproduces the retryable:entry_attempt_failed:DBAPIError blocker: a
+    DBAPIError raised out of link_controlled_proof_sell_package() must still
+    classify/persist exactly as before (fail-closed, unchanged reason
+    string), while the worker's diagnostic log line now carries the full
+    underlying exception detail that the DB-facing failure_reason column
+    was never designed to hold."""
+    import app.services.orchestration.continuous_pipeline_worker as worker_module
+    from app.services.controlled_proof import ControlledProofRiskOutcome
+    from sqlalchemy.exc import DBAPIError
+
+    class _FakeAsyncpgUniqueViolationError(Exception):
+        pass
+
+    package_id = uuid.uuid4()
+    proof = SimpleNamespace(
+        proof_id=uuid.uuid4(), status="EXPIRED", terminal_verdict="FAILED",
+        package_id=uuid.uuid4(), sell_package_id=None, position_id="POS-777",
+        campaign_id=uuid.uuid4(), campaign_version=1,
+        provider="kraken_spot", environment="production", product_id="BTC-USD",
+        max_notional_usd=Decimal("5"), audit_correlation_id=uuid.uuid4(),
+    )
+    recovery = SimpleNamespace(recovery_id=uuid.uuid4(), status="IN_PROGRESS")
+    db = _FakeDB()
+
+    orig = _FakeAsyncpgUniqueViolationError(
+        'duplicate key value violates unique constraint "uq_controlled_proof_runs_sell_package_id"'
+    )
+    dbapi_error = DBAPIError(
+        "UPDATE controlled_proof_runs SET sell_package_id = %(sell_package_id)s WHERE proof_id = %(proof_id)s",
+        {"sell_package_id": str(package_id), "proof_id": str(proof.proof_id)},
+        orig,
+    )
+
+    monkeypatch.setattr(worker_module, "claim_exit_recovery_by_id", _async_return((recovery, proof)))
+    monkeypatch.setattr(worker_module, "should_propose_controlled_sell", _async_return(True))
+    monkeypatch.setattr(worker_module, "_load_runtime_campaign", _async_return(SimpleNamespace(paper_account_id=uuid.uuid4())))
+    monkeypatch.setattr(worker_module, "_load_live_trading_profile_for_paper_account", _async_return(SimpleNamespace(id=uuid.uuid4())))
+    monkeypatch.setattr(worker_module, "_has_open_live_order", _async_return(False))
+    monkeypatch.setattr(worker_module, "_has_unresolved_reconciliation", _async_return(False))
+    monkeypatch.setattr(worker_module, "evaluate_controlled_proof_risk", _async_return(ControlledProofRiskOutcome(verdict="ALLOW", approved_notional_usd=Decimal("5"), reason_code=None, risk_event_id=uuid.uuid4())))
+    monkeypatch.setattr(worker_module, "get_settings", lambda: SimpleNamespace(automatic_mandate_package_activation_mandate_id=uuid.uuid4()))
+    monkeypatch.setattr(worker_module, "resolve_controlled_proof_strategy_identity", _async_return("ma_crossover@1.0.0"))
+    monkeypatch.setattr(worker_module, "create_controlled_proof_decision_record", _async_return(uuid.uuid4()))
+    evaluation = SimpleNamespace(authorization_result="AUTHORIZED", mandate_id=uuid.uuid4(), mandate_version_id=uuid.uuid4(), evaluation_id=uuid.uuid4())
+    monkeypatch.setattr(worker_module, "evaluate_and_record_mandate", _async_return(evaluation))
+
+    async def _create(*, db, request):
+        return {"package": {"package_id": str(package_id)}}
+    monkeypatch.setattr(worker_module, "create_canonical_preview_package", _create)
+
+    async def _link_fails(*, db, proof, sell_package_id, preserve_terminal_status=False):
+        raise dbapi_error
+    monkeypatch.setattr(worker_module, "link_controlled_proof_sell_package", _link_fails)
+
+    with caplog.at_level(logging.ERROR, logger="app.services.orchestration.continuous_pipeline_worker"):
+        await worker_module._attempt_operator_controlled_proof_entry(db=db, recovery_id=recovery.recovery_id)
+
+    # Fail-closed outcome is unchanged: same classification, same rollback/commit shape.
+    assert db.rollbacks == 1
+    assert db.commits == 1
+    assert recovery.failure_reason == "retryable:entry_attempt_failed:DBAPIError"
+    assert proof.sell_package_id is None
+
+    [record] = [r for r in caplog.records if r.getMessage().startswith("controlled_proof_entry_attempt_failed")]
+    message = record.getMessage()
+    assert "stage=sell_package_linking" in message
+    assert f"recovery_id={recovery.recovery_id}" in message
+    assert f"proof_id={proof.proof_id}" in message
+    assert f"controlled_proof_run_id={proof.proof_id}" in message
+    assert f"sell_package_id={package_id}" in message
+    assert "position_id=POS-777" in message
+    assert "exception_class=sqlalchemy.exc.DBAPIError" in message
+    assert "orig_exception_class=" in message
+    assert "_FakeAsyncpgUniqueViolationError" in message
+    assert "uq_controlled_proof_runs_sell_package_id" in message
+    assert "sql_statement=" in message
+    assert "UPDATE controlled_proof_runs" in message
+    assert "sql_params=" in message
+    assert str(package_id) in record.getMessage()
+    # The traceback of the original exception is attached to the record.
+    assert record.exc_info is not None
+    assert record.exc_info[1] is dbapi_error

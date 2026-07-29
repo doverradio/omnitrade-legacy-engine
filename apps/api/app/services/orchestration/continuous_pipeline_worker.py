@@ -11,7 +11,7 @@ from datetime import datetime, timezone
 from decimal import Decimal
 
 from sqlalchemy import and_, func, select
-from sqlalchemy.exc import IntegrityError
+from sqlalchemy.exc import DBAPIError, IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import get_settings
@@ -1795,6 +1795,40 @@ async def _run_autonomous_and_campaign_orchestration_attempt(*, db: AsyncSession
             logger.exception("campaign_orchestration_failed trigger=%s", _AUTONOMOUS_CYCLE_TRIGGER)
 
 
+_SENSITIVE_BOUND_PARAM_KEY_FRAGMENTS = (
+    "password", "secret", "token", "api_key", "apikey", "credential", "authorization",
+)
+
+
+def _exception_qualname(exc: BaseException | None) -> str | None:
+    if exc is None:
+        return None
+    cls = type(exc)
+    return f"{cls.__module__}.{cls.__qualname__}"
+
+
+def _redact_bound_params(params: object) -> object:
+    """Best-effort secret-safe echo of DBAPIError.params for diagnostics.
+
+    Controlled Proof persistence never binds credentials, but this guards
+    against ever logging a sensitive value should one appear in a bound
+    parameter set in the future.
+    """
+    def _redact_mapping(mapping: dict) -> dict:
+        return {
+            key: "***REDACTED***"
+            if any(fragment in str(key).lower() for fragment in _SENSITIVE_BOUND_PARAM_KEY_FRAGMENTS)
+            else value
+            for key, value in mapping.items()
+        }
+
+    if isinstance(params, dict):
+        return _redact_mapping(params)
+    if isinstance(params, (list, tuple)):
+        return [_redact_mapping(item) if isinstance(item, dict) else item for item in params]
+    return params
+
+
 async def _attempt_operator_controlled_proof_entry(
     *, db: AsyncSession, proof_id: uuid.UUID | None = None,
     recovery_id: uuid.UUID | None = None,
@@ -1819,6 +1853,9 @@ async def _attempt_operator_controlled_proof_entry(
         if proof is None:
             return
     actor = "system:controlled_proof_worker"
+    stage = "claimed"
+    is_sell: bool | None = None
+    package_id: uuid.UUID | None = None
     async def _record_wait(reason: str) -> None:
         if recovery is not None:
             await record_exit_recovery_waiting(db=db, recovery=recovery, reason=reason)
@@ -1861,6 +1898,7 @@ async def _attempt_operator_controlled_proof_entry(
             # Supervision is part of the periodic operator workflow, not a
             # read-side accident: refresh terminal reconciliation/P&L state
             # even when no operator polls the HTTP view.
+            stage = "post_link_supervision_refresh"
             await get_controlled_proof_view(db=db, proof_id=proof.proof_id)
             if recovery is not None:
                 await refresh_exit_recovery_completion(db=db, recovery=recovery, proof=proof)
@@ -1910,6 +1948,7 @@ async def _attempt_operator_controlled_proof_entry(
                 "buy_package_id=%s sell_package_id=%s",
                 proof.proof_id, proof.status, proof.package_id, proof.sell_package_id,
             )
+            stage = "sell_eligibility_check"
             sell_eligible = await should_propose_controlled_sell(db=db, proof=proof)
             if not sell_eligible:
                 await _record_wait("sell_prerequisites_unmet")
@@ -1950,6 +1989,7 @@ async def _attempt_operator_controlled_proof_entry(
             await _record_block("controlled_proof_notional_below_canonical_bound")
             await db.commit()
             return
+        stage = "risk_evaluation"
         risk = await evaluate_controlled_proof_risk(
             db=db, proof_id=proof.proof_id, campaign_id=proof.campaign_id,
             campaign_version=proof.campaign_version, paper_account_id=runtime.paper_account_id,
@@ -1975,12 +2015,14 @@ async def _attempt_operator_controlled_proof_entry(
             await _record_wait("campaign_strategy_identity_missing")
             await db.commit()
             return
+        stage = "decision_record_creation"
         decision_id = await create_controlled_proof_decision_record(
             db=db, campaign_id=proof.campaign_id, controlled_proof_id=proof.proof_id,
             forced_action=forced_action, product=proof.product_id,
             provider=proof.provider, actor=actor, strategy_identity=strategy_identity,
             controlled_proof_exit_recovery_id=None if recovery is None else recovery.recovery_id,
         )
+        stage = "mandate_evaluation"
         evaluation = await evaluate_and_record_mandate(
             db=db,
             request=MandateEvaluationWriteRequest(
@@ -2011,6 +2053,7 @@ async def _attempt_operator_controlled_proof_entry(
             else f"controlled-proof:{proof.proof_id}:{side}"
         )
         package_key = hashlib.sha256(package_identity.encode()).hexdigest()
+        stage = "package_creation"
         payload = await create_canonical_preview_package(
             db=db,
             request=CanonicalPreviewPackageCreateRequest(
@@ -2033,18 +2076,22 @@ async def _attempt_operator_controlled_proof_entry(
             await db.commit()
             return
         if is_sell:
+            stage = "sell_package_linking"
             await link_controlled_proof_sell_package(
                 db=db, proof=proof, sell_package_id=package_id,
                 preserve_terminal_status=recovery is not None,
             )
         else:
+            stage = "entry_linking"
             await link_controlled_proof_entry(
                 db=db, proof=proof, decision_record_id=decision_id, mandate_id=evaluation.mandate_id,
                 mandate_version_id=evaluation.mandate_version_id, mandate_evaluation_id=evaluation.evaluation_id,
             )
             await link_controlled_proof_package(db=db, proof=proof, package_id=package_id)
+        stage = "post_link_commit"
         await db.commit()
 
+        stage = "package_activation_progression"
         await _progress_package(package_id=package_id, decision_record_id=decision_id)
     except Exception as exc:
         await _rollback_active_session(db=db)
@@ -2075,7 +2122,30 @@ async def _attempt_operator_controlled_proof_entry(
                 db=db, proof=proof, reason=f"entry_attempt_failed:{exc.__class__.__name__}", actor=actor,
             )
             await db.commit()
-        logger.exception("controlled_proof_entry_attempt_failed proof_id=%s", proof_id)
+        orig_exc = getattr(exc, "orig", None)
+        sell_package_id_for_log = (
+            package_id if (is_sell and package_id is not None)
+            else (getattr(proof, "sell_package_id", None) if proof is not None else None)
+        )
+        logger.exception(
+            "controlled_proof_entry_attempt_failed proof_id=%s recovery_id=%s stage=%s "
+            "controlled_proof_run_id=%s sell_package_id=%s position_id=%s "
+            "exception_class=%s exception_message=%s "
+            "orig_exception_class=%s orig_exception_message=%s "
+            "sql_statement=%s sql_params=%s",
+            proof_id,
+            recovery_id,
+            stage,
+            proof_id,
+            sell_package_id_for_log,
+            getattr(proof, "position_id", None) if proof is not None else None,
+            _exception_qualname(exc),
+            str(exc),
+            _exception_qualname(orig_exc),
+            str(orig_exc) if orig_exc is not None else None,
+            getattr(exc, "statement", None) if isinstance(exc, DBAPIError) else None,
+            _redact_bound_params(getattr(exc, "params", None)) if isinstance(exc, DBAPIError) else None,
+        )
 
 
 async def dispatch_controlled_proof_immediate_attempt(*, proof_id: uuid.UUID) -> None:
