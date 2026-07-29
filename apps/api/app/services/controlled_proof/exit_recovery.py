@@ -521,6 +521,14 @@ async def project_blocked_exit_recovery_outcome(
     runtime, profile_id = await _load_scope(db, proof)
     if profile_id != package.live_trading_profile_id:
         return False
+    if (
+        reconciliation.live_crypto_order_id != order.live_crypto_order_id
+        or reconciliation.live_trading_profile_id != profile_id
+        or reconciliation.capital_campaign_id != runtime.id
+        or reconciliation.provider_name != order.provider
+        or reconciliation.provider_order_id != order.provider_order_id
+    ):
+        return False
     if await compute_signed_owned_quantity(
         db=db, live_trading_profile_id=profile_id, symbol=proof.product_id,
     ) != 0:
@@ -542,7 +550,25 @@ async def project_blocked_exit_recovery_outcome(
         row for row in accounting
         if row.live_crypto_order_id == order.live_crypto_order_id and row.side == "sell"
     ]
-    if not sell_accounting or not any(row.reconciliation_event_id == reconciliation.id for row in sell_accounting):
+    final_sell_accounting = [row for row in sell_accounting if row.record_type == "fill_accounting"]
+    if not sell_accounting or not final_sell_accounting:
+        return False
+    accounting_reconciliation = await db.scalar(select(LiveReconciliationEvent).where(
+        LiveReconciliationEvent.id.in_(tuple(
+            row.reconciliation_event_id for row in final_sell_accounting
+        )),
+        LiveReconciliationEvent.live_crypto_order_id == order.live_crypto_order_id,
+    ).order_by(LiveReconciliationEvent.sequence_number.desc()).limit(1))
+    if (
+        accounting_reconciliation is None
+        or accounting_reconciliation.event_type != "fill_reconciled"
+        or accounting_reconciliation.reconciliation_status != "filled"
+        or accounting_reconciliation.live_crypto_order_id != order.live_crypto_order_id
+        or accounting_reconciliation.live_trading_profile_id != profile_id
+        or accounting_reconciliation.capital_campaign_id != runtime.id
+        or accounting_reconciliation.provider_name != order.provider
+        or accounting_reconciliation.provider_order_id != order.provider_order_id
+    ):
         return False
     net_pnl = sum((row.net_cash_impact for row in accounting), Decimal("0"))
     completed_at = _utcnow()
@@ -554,7 +580,7 @@ async def project_blocked_exit_recovery_outcome(
         "sell_live_crypto_order_id": str(order.live_crypto_order_id),
         "provider_order_id": order.provider_order_id,
         "execution_claim_id": str(claim.claim_id),
-        "reconciliation_event_id": str(reconciliation.id),
+        "reconciliation_event_id": str(accounting_reconciliation.id),
         "recovered_terminal_verdict": _recovered_verdict(net_pnl),
         "recovered_net_pnl_usd": str(net_pnl),
         "completed_at": completed_at.isoformat(),

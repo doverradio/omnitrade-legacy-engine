@@ -224,6 +224,7 @@ def _blocked_projection_fixture(*, net_pnl: Decimal = Decimal("0.17")):
     proof_id, recovery_id, package_id = uuid.uuid4(), uuid.uuid4(), uuid.uuid4()
     buy_order_id, sell_order_id, profile_id = uuid.uuid4(), uuid.uuid4(), uuid.uuid4()
     reconciliation_id = uuid.uuid4()
+    latest_reconciliation_id = uuid.uuid4()
     proof = SimpleNamespace(
         proof_id=proof_id, status="EXPIRED", terminal_verdict="FAILED",
         campaign_id=uuid.uuid4(), campaign_version=1, provider="kraken_spot",
@@ -256,22 +257,34 @@ def _blocked_projection_fixture(*, net_pnl: Decimal = Decimal("0.17")):
         product_id=proof.product_id,
     )
     reconciliation = SimpleNamespace(
+        id=latest_reconciliation_id, reconciliation_status="filled", sequence_number=3,
+        event_type="order_reconciled", live_trading_profile_id=profile_id,
+        capital_campaign_id=7, provider_name=proof.provider,
+        provider_order_id=order.provider_order_id, live_crypto_order_id=sell_order_id,
+    )
+    accounting_reconciliation = SimpleNamespace(
         id=reconciliation_id, reconciliation_status="filled", sequence_number=2,
+        event_type="fill_reconciled", live_trading_profile_id=profile_id,
+        capital_campaign_id=7, provider_name=proof.provider,
+        provider_order_id=order.provider_order_id, live_crypto_order_id=sell_order_id,
     )
     buy_cash = Decimal("-5")
     accounting = [
         SimpleNamespace(
             live_crypto_order_id=buy_order_id, side="buy", symbol="BTC-USD",
-            reconciliation_event_id=uuid.uuid4(), net_cash_impact=buy_cash,
+            reconciliation_event_id=uuid.uuid4(), record_type="fill_accounting",
+            net_cash_impact=buy_cash,
         ),
         SimpleNamespace(
             live_crypto_order_id=sell_order_id, side="sell", symbol="BTC-USD",
-            reconciliation_event_id=reconciliation_id, net_cash_impact=-buy_cash + net_pnl,
+            reconciliation_event_id=reconciliation_id, record_type="fill_accounting",
+            net_cash_impact=-buy_cash + net_pnl,
         ),
     ]
     return SimpleNamespace(
         now=now, proof=proof, recovery=recovery, package=package, claim=claim,
-        order=order, reconciliation=reconciliation, accounting=accounting,
+        order=order, reconciliation=reconciliation,
+        accounting_reconciliation=accounting_reconciliation, accounting=accounting,
         profile_id=profile_id,
     )
 
@@ -289,7 +302,8 @@ async def test_blocked_recovery_projects_separate_reconciled_outcome(
 
     item = _blocked_projection_fixture(net_pnl=net_pnl)
     db = _FakeDb(
-        [item.recovery, None, item.claim, item.order, item.reconciliation],
+        [item.recovery, None, item.claim, item.order, item.reconciliation,
+         item.accounting_reconciliation],
         [[item.package], item.accounting],
     )
     monkeypatch.setattr(worker, "_has_unresolved_reconciliation", lambda **_kwargs: _async_false())
@@ -316,7 +330,7 @@ async def test_blocked_recovery_projects_separate_reconciled_outcome(
     assert audit.after_state["sell_live_crypto_order_id"] == str(item.order.live_crypto_order_id)
     assert audit.after_state["provider_order_id"] == "KRAKEN-ORDER"
     assert audit.after_state["execution_claim_id"] == str(item.claim.claim_id)
-    assert audit.after_state["reconciliation_event_id"] == str(item.reconciliation.id)
+    assert audit.after_state["reconciliation_event_id"] == str(item.accounting_reconciliation.id)
     assert audit.after_state["recovered_terminal_verdict"] == verdict
     assert Decimal(audit.after_state["recovered_net_pnl_usd"]) == net_pnl
 
@@ -325,6 +339,65 @@ async def test_blocked_recovery_projects_separate_reconciled_outcome(
         db=replay_db, recovery=item.recovery, proof=item.proof,
     ) is True
     assert replay_db.added == []
+
+
+@pytest.mark.asyncio
+async def test_blocked_recovery_accepts_identical_latest_and_accounting_fill_event(monkeypatch) -> None:
+    import app.services.orchestration.continuous_pipeline_worker as worker
+
+    item = _blocked_projection_fixture()
+    item.reconciliation = item.accounting_reconciliation
+    db = _FakeDb(
+        [item.recovery, None, item.claim, item.order, item.reconciliation,
+         item.accounting_reconciliation],
+        [[item.package], item.accounting],
+    )
+    monkeypatch.setattr(worker, "_has_unresolved_reconciliation", lambda **_kwargs: _async_false())
+    monkeypatch.setattr(
+        exit_recovery, "_load_scope",
+        lambda *_args, **_kwargs: _async((SimpleNamespace(id=7), item.profile_id)),
+    )
+    monkeypatch.setattr(
+        exit_recovery, "compute_signed_owned_quantity",
+        lambda **_kwargs: _async(Decimal("0")),
+    )
+
+    assert await exit_recovery.project_blocked_exit_recovery_outcome(
+        db=db, recovery=item.recovery, proof=item.proof,
+    ) is True
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("mismatch", ["order", "provider"])
+async def test_blocked_recovery_rejects_mismatched_accounting_fill_provenance(
+    monkeypatch, mismatch,
+) -> None:
+    import app.services.orchestration.continuous_pipeline_worker as worker
+
+    item = _blocked_projection_fixture()
+    if mismatch == "order":
+        item.accounting_reconciliation.live_crypto_order_id = uuid.uuid4()
+    else:
+        item.accounting_reconciliation.provider_order_id = "UNRELATED-ORDER"
+    db = _FakeDb(
+        [item.recovery, None, item.claim, item.order, item.reconciliation,
+         item.accounting_reconciliation],
+        [[item.package], item.accounting],
+    )
+    monkeypatch.setattr(worker, "_has_unresolved_reconciliation", lambda **_kwargs: _async_false())
+    monkeypatch.setattr(
+        exit_recovery, "_load_scope",
+        lambda *_args, **_kwargs: _async((SimpleNamespace(id=7), item.profile_id)),
+    )
+    monkeypatch.setattr(
+        exit_recovery, "compute_signed_owned_quantity",
+        lambda **_kwargs: _async(Decimal("0")),
+    )
+
+    assert await exit_recovery.project_blocked_exit_recovery_outcome(
+        db=db, recovery=item.recovery, proof=item.proof,
+    ) is False
+    assert db.added == []
 
 
 @pytest.mark.asyncio
