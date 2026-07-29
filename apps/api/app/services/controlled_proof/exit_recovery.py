@@ -20,7 +20,7 @@ from app.models.live_accounting_record import LiveAccountingRecord
 from app.models.live_crypto_order import LiveCryptoOrder
 from app.models.live_reconciliation_event import LiveReconciliationEvent
 from app.services.live.position_quantity import compute_signed_owned_quantity
-from app.services.position_lifecycle.source_adapter import load_position_snapshots
+from app.services.position_lifecycle.source_adapter import _position_id, load_position_snapshots
 
 _RECOVERABLE_PROOF_STATES = {"EXPIRED", "FAILED"}
 _ACTIVE_RECOVERY_STATES = {"AUTHORIZED", "IN_PROGRESS"}
@@ -49,6 +49,18 @@ async def _validate_exit_recovery(
         raise InvalidRequestError(message="Controlled Proof is not eligible for exit recovery", details={"status": proof.status})
     if proof.package_id is None:
         raise InvalidRequestError(message="Controlled Proof BUY package is missing", details={})
+
+    # buy_live_crypto_order_id/sell_live_crypto_order_id are only an
+    # opportunistic read-side projection (see repair_controlled_proof_
+    # cached_order_ids's own docstring), written solely as a side effect of
+    # get_controlled_proof_view being called. A proof reaching exit
+    # recovery may never have had that view queried since its lineage was
+    # established -- refresh from canonical lineage before trusting either
+    # column below, exactly the repair get_controlled_proof_view already
+    # performs on every read. Idempotent no-op when already current.
+    from app.services.controlled_proof.service import repair_controlled_proof_cached_order_ids
+    await repair_controlled_proof_cached_order_ids(db=db, proof=proof)
+
     if proof.sell_live_crypto_order_id is not None:
         raise InvalidRequestError(message="Controlled Proof already has SELL lineage", details={})
     if proof.sell_package_id is not None:
@@ -97,8 +109,38 @@ async def _validate_exit_recovery(
     snapshots = await load_position_snapshots(db=db, account_id=runtime.paper_account_id, campaign_id=runtime.id)
     base = proof.product_id.split("-")[0].upper()
     position = next((item for item in snapshots if item.symbol.split("-")[0].upper() == base and item.position_size > 0), None)
-    if position is None or proof.position_id is None or str(position.position_id) != str(proof.position_id):
+    if position is None:
         raise InvalidRequestError(message="Open position linkage does not match this Controlled Proof", details={})
+    # proof.position_id is only ever a display-side cache (see
+    # get_controlled_proof_view's position_payload) -- nothing in this
+    # codebase ever writes it, so treating it as required authority here
+    # would fail closed on every single recovery, unconditionally, which is
+    # exactly the confirmed production defect this fixes. position_id is
+    # instead fully deterministic -- a pure function of
+    # (live_trading_profile_id, capital_campaign_id, symbol), see
+    # position_lifecycle.source_adapter._position_id -- so recompute the
+    # expected value directly from this exact, already-scoped ownership
+    # tuple (profile_id/runtime.id/proof.product_id all independently
+    # verified above) and compare against what load_position_snapshots
+    # actually returned, rather than trusting a column that may never have
+    # been populated. Still fails closed on a genuine mismatch.
+    expected_position_id = _position_id(
+        live_trading_profile_id=profile_id, capital_campaign_id=runtime.id, symbol=proof.product_id,
+    )
+    if str(position.position_id) != expected_position_id:
+        raise InvalidRequestError(message="Open position linkage does not match this Controlled Proof", details={})
+    if proof.position_id != expected_position_id:
+        before_position_id = proof.position_id
+        proof.position_id = expected_position_id
+        proof.updated_at = _utcnow()
+        db.add(AuditLog(
+            actor="system:controlled_proof_exit_recovery",
+            action="controlled_proof_run.position_lineage_repaired",
+            entity_type="controlled_proof_run", entity_id=proof.proof_id,
+            before_state={"position_id": before_position_id},
+            after_state={"position_id": expected_position_id},
+        ))
+        await db.flush()
 
 
 async def authorize_controlled_proof_exit_recovery(

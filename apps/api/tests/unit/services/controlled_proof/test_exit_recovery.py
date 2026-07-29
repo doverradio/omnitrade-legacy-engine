@@ -1,16 +1,42 @@
 from __future__ import annotations
 
 import uuid
+from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 from types import SimpleNamespace
+from typing import AsyncIterator
 
 import pytest
+from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.errors import InvalidRequestError
+from app.models.asset import Asset
 from app.models.audit_log import AuditLog
+from app.models.autonomous_execution_claim import AutonomousExecutionClaim
+from app.models.candle import Candle
+from app.models.canonical_preview_package import CanonicalPreviewPackage
 from app.models.controlled_proof_exit_recovery import ControlledProofExitRecovery
+from app.models.controlled_proof_run import ControlledProofRun
+from app.models.live_accounting_record import LiveAccountingRecord
+from app.models.live_crypto_order import LiveCryptoOrder
+from app.models.live_reconciliation_event import LiveReconciliationEvent
+from app.models.live_trading_profile import LiveTradingProfile
 from app.services.controlled_proof import exit_recovery
+from tests.support.real_sqlite_session import real_sqlite_session
+
+_RECOVERY_ALL_TABLES = [
+    Asset.__table__, AuditLog.__table__, AutonomousExecutionClaim.__table__, Candle.__table__,
+    CanonicalPreviewPackage.__table__, ControlledProofExitRecovery.__table__, ControlledProofRun.__table__,
+    LiveAccountingRecord.__table__, LiveCryptoOrder.__table__, LiveReconciliationEvent.__table__,
+    LiveTradingProfile.__table__,
+]
+
+
+@asynccontextmanager
+async def _real_recovery_session() -> AsyncIterator[AsyncSession]:
+    async with real_sqlite_session(_RECOVERY_ALL_TABLES) as session:
+        yield session
 
 
 class _ScalarRows:
@@ -796,9 +822,18 @@ async def test_authorization_predicates_accept_exact_authoritative_lineage(monke
     db = _FakeDb([order, reconciliation, accounting])
     monkeypatch.setattr(worker, "_has_open_live_order", _async_false)
     monkeypatch.setattr(worker, "_has_unresolved_reconciliation", _async_false)
+    monkeypatch.setattr(
+        "app.services.controlled_proof.service.repair_controlled_proof_cached_order_ids", _async_false,
+    )
     monkeypatch.setattr(exit_recovery, "_load_scope", _async_scope)
     monkeypatch.setattr(exit_recovery, "compute_signed_owned_quantity", _async_quantity)
     monkeypatch.setattr(exit_recovery, "load_position_snapshots", _async_positions)
+    # position_id is now recomputed deterministically from
+    # (profile_id, campaign_id, symbol) rather than trusted from
+    # proof.position_id -- _async_scope returns a fresh random profile_id
+    # each call, so pin the expected value directly rather than
+    # hand-deriving a matching uuid5.
+    monkeypatch.setattr(exit_recovery, "_position_id", lambda **_kwargs: "position-1")
 
     await exit_recovery._validate_exit_recovery(db, proof)
 
@@ -812,8 +847,11 @@ async def test_authorization_rejects_nonterminal_or_unapproved_terminal_status(s
 
 
 @pytest.mark.asyncio
-async def test_authorization_rejects_existing_sell_lineage() -> None:
+async def test_authorization_rejects_existing_sell_lineage(monkeypatch) -> None:
     proof = _terminal_proof(); proof.package_id = uuid.uuid4(); proof.sell_package_id = uuid.uuid4()
+    monkeypatch.setattr(
+        "app.services.controlled_proof.service.repair_controlled_proof_cached_order_ids", _async_false,
+    )
     with pytest.raises(InvalidRequestError, match="already has SELL lineage"):
         await exit_recovery._validate_exit_recovery(_FakeDb([]), proof)
 
@@ -832,6 +870,227 @@ async def _async_quantity(**_kwargs):
 
 async def _async_positions(**_kwargs):
     return [SimpleNamespace(symbol="BTC-USD", position_size=0.0001, position_id="position-1")]
+
+
+# --- regression: cached-column-only ownership evidence must never be required ---
+
+@pytest.mark.asyncio
+async def test_authorization_recovers_position_when_no_cache_column_was_ever_populated(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Direct regression test for the confirmed production defect: nothing
+    in this codebase ever writes ControlledProofRun.buy_live_crypto_order_id
+    or .position_id except get_controlled_proof_view's opportunistic
+    backfill (and, as of this fix, exit recovery's own repair) -- a proof
+    that expired without that view ever having been queried had both
+    columns permanently None, which made _validate_exit_recovery raise
+    unconditionally on every single authorization attempt, forever. Builds
+    real canonical lineage (package -> claim -> order -> accounting), not
+    mocks, so the repair and the deterministic position_id computation are
+    genuinely exercised end to end."""
+    import app.services.orchestration.continuous_pipeline_worker as worker
+
+    campaign_id = uuid.uuid4()
+    campaign_row_id = 7
+    paper_account_id = uuid.uuid4()
+    profile_id = uuid.uuid4()
+    product_id = "BTC-USD"
+
+    async with _real_recovery_session() as session:
+        package_id = uuid.uuid4()
+        proof = ControlledProofRun(
+            proof_id=uuid.uuid4(), status="EXPIRED", provider="kraken_spot", environment="production",
+            campaign_id=campaign_id, campaign_version=1, product_id=product_id,
+            max_notional_usd=Decimal("5"), idempotency_key=f"idem-{uuid.uuid4()}", requested_by="operator:alice",
+            expires_at=datetime.now(timezone.utc) - timedelta(minutes=5),
+            package_id=package_id,
+            # Exactly the confirmed production state: no cache column, and
+            # position_id, was ever populated.
+            buy_live_crypto_order_id=None, sell_live_crypto_order_id=None, position_id=None,
+        )
+        session.add(proof)
+        await session.flush()
+
+        package = CanonicalPreviewPackage(
+            package_id=package_id, campaign_id=campaign_id, campaign_version=1,
+            runtime_campaign_id=uuid.uuid4(), paper_account_id=paper_account_id, live_trading_profile_id=profile_id,
+            provider="kraken_spot", environment="production", product=product_id, side="BUY",
+            proposed_order_amount=Decimal("5"), risk_approved_amount=Decimal("5"),
+            strategy_id=uuid.uuid4(), strategy_version="1.0.0", parameter_set_id=uuid.uuid4(), parameter_set_version="1",
+            decision_record_id=uuid.uuid4(), risk_event_id=uuid.uuid4(), crypto_order_preview_id=uuid.uuid4(),
+            preview_expires_at=datetime.now(timezone.utc) + timedelta(minutes=5), package_state="ACTIVATED",
+            generated_at=datetime.now(timezone.utc), idempotency_key=f"pkg-{uuid.uuid4()}", input_fingerprint="fp",
+            market_evidence_identity={"controlled_proof_id": str(proof.proof_id)},
+        )
+        session.add(package)
+        await session.flush()
+
+        order = LiveCryptoOrder(
+            live_crypto_order_id=uuid.uuid4(), crypto_order_preview_id=package.crypto_order_preview_id,
+            exchange_connection_id=uuid.uuid4(), provider="kraken_spot", environment="production",
+            product_id=product_id, side="BUY", order_type="MARKET", requested_quote_size=Decimal("5"),
+            client_order_id=f"buy-{uuid.uuid4()}", status="FILLED",
+            provider_order_id=f"provider-{uuid.uuid4()}", submitted_at=datetime.now(timezone.utc),
+            filled_at=datetime.now(timezone.utc), audit_correlation_id=uuid.uuid4(),
+        )
+        session.add(order)
+        await session.flush()
+
+        claim = AutonomousExecutionClaim(
+            claim_id=uuid.uuid4(), package_id=package.package_id, activation_id=uuid.uuid4(),
+            campaign_id=campaign_id, campaign_version=1, mandate_id=uuid.uuid4(), mandate_version_id=uuid.uuid4(),
+            account_id=paper_account_id, profile_id=profile_id, connection_id=uuid.uuid4(),
+            provider="kraken_spot", environment="production", product=product_id, side="BUY",
+            claim_status="COMPLETED", claimed_at=datetime.now(timezone.utc), claim_owner="test",
+            live_order_id=order.live_crypto_order_id,
+        )
+        session.add(claim)
+
+        reconciliation = LiveReconciliationEvent(
+            idempotency_key="recon-buy-1", event_hash="hash-buy-1", live_trading_profile_id=profile_id,
+            live_crypto_order_id=order.live_crypto_order_id, capital_campaign_id=campaign_row_id,
+            source_execution_event_id=uuid.uuid4(), source_execution_event_type="execution_intent_created",
+            sequence_number=1, event_type="fill_reconciled", reconciliation_status="filled",
+            provider_name="kraken_spot", provider_order_id=order.provider_order_id,
+            event_payload={}, provenance={}, immutable_contract_version="1",
+            recorded_at=datetime.now(timezone.utc),
+        )
+        session.add(reconciliation)
+
+        fill = LiveAccountingRecord(
+            idempotency_key="buy-fill-1", live_trading_profile_id=profile_id, capital_campaign_id=campaign_row_id,
+            live_crypto_order_id=order.live_crypto_order_id,
+            reconciliation_event_id=uuid.uuid4(), source_execution_event_id=uuid.uuid4(),
+            source_execution_event_type="execution_intent_created", record_type="fill_accounting",
+            provider_order_id=order.provider_order_id, symbol=product_id, side="buy",
+            filled_quantity=Decimal("0.00007831"), fill_price=Decimal("64000"),
+            gross_notional=Decimal("5.01"), fee_amount=Decimal("0.005"), fee_currency="USD",
+            net_cash_impact=Decimal("-5.015"), provenance={}, recorded_at=datetime.now(timezone.utc),
+        )
+        session.add(fill)
+
+        session.add(LiveTradingProfile(
+            id=profile_id, paper_account_id=paper_account_id, operating_mode="live", lifecycle_state="enabled",
+            approval_state="approved", live_opt_in=True, human_approval_recorded=True, paper_default_mode=True,
+            governance_approved=True, risk_authority_model="risk_engine_final", autonomous_capital_allocation=False,
+            autonomous_strategy_evolution=False, automatic_promotion_enabled=False, provenance_metadata={},
+        ))
+        await session.flush()
+
+        monkeypatch.setattr(worker, "_has_open_live_order", _async_false)
+        monkeypatch.setattr(worker, "_has_unresolved_reconciliation", _async_false)
+
+        async def _scope(_db, _proof):
+            return SimpleNamespace(id=campaign_row_id, paper_account_id=paper_account_id), profile_id
+
+        monkeypatch.setattr(exit_recovery, "_load_scope", _scope)
+
+        recovery = await exit_recovery.authorize_controlled_proof_exit_recovery(
+            db=session, proof_id=proof.proof_id, idempotency_key="exit-recovery-real-1",
+            expires_in_minutes=60, actor="operator:alice",
+        )
+
+        assert recovery.status == "AUTHORIZED"
+        # The two previously-permanent blockers are now backfilled from
+        # real canonical lineage as a side effect of authorization
+        # succeeding -- never required as a precondition.
+        assert proof.buy_live_crypto_order_id == order.live_crypto_order_id
+        assert proof.position_id is not None
+
+        from sqlalchemy import select as sa_select
+        repair_audit_rows = (await session.scalars(
+            sa_select(AuditLog).where(
+                AuditLog.entity_type == "controlled_proof_run",
+                AuditLog.entity_id == proof.proof_id,
+                AuditLog.action == "controlled_proof_run.position_lineage_repaired",
+            )
+        )).all()
+        assert len(repair_audit_rows) == 1
+        assert repair_audit_rows[0].after_state["position_id"] == proof.position_id
+
+
+@pytest.mark.asyncio
+async def test_repeated_authorization_attempts_do_not_re_repair_or_duplicate_position_id(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Requirement: idempotency. Revalidating an already-recovered proof a
+    second time (e.g. claim_exit_recovery_by_id's own revalidation pass)
+    must not raise, must not change an already-correct position_id, and
+    must not write a duplicate repair audit row."""
+    proof = SimpleNamespace(
+        proof_id=uuid.uuid4(), status="EXPIRED", package_id=uuid.uuid4(), sell_package_id=None,
+        sell_live_crypto_order_id=None, buy_live_crypto_order_id=uuid.uuid4(), provider="kraken_spot",
+        environment="production", product_id="BTC-USD", campaign_id=uuid.uuid4(),
+    )
+    expected_position_id = "position-1"
+    proof.position_id = expected_position_id
+    order = SimpleNamespace(live_crypto_order_id=proof.buy_live_crypto_order_id, side="BUY", status="FILLED")
+    reconciliation = SimpleNamespace(reconciliation_status="filled")
+    accounting = SimpleNamespace(id=uuid.uuid4())
+    db = _FakeDb([order, reconciliation, accounting])
+    import app.services.orchestration.continuous_pipeline_worker as worker
+    monkeypatch.setattr(worker, "_has_open_live_order", _async_false)
+    monkeypatch.setattr(worker, "_has_unresolved_reconciliation", _async_false)
+    monkeypatch.setattr(
+        "app.services.controlled_proof.service.repair_controlled_proof_cached_order_ids", _async_false,
+    )
+    monkeypatch.setattr(exit_recovery, "_load_scope", _async_scope)
+    monkeypatch.setattr(exit_recovery, "compute_signed_owned_quantity", _async_quantity)
+    monkeypatch.setattr(exit_recovery, "load_position_snapshots", _async_positions)
+    monkeypatch.setattr(exit_recovery, "_position_id", lambda **_kwargs: expected_position_id)
+
+    await exit_recovery._validate_exit_recovery(db, proof)
+    assert proof.position_id == expected_position_id
+    assert not any(
+        isinstance(item, AuditLog) and item.action == "controlled_proof_run.position_lineage_repaired"
+        for item in db.added
+    )
+
+    # Second pass: unchanged state, still no re-write, still no raise.
+    db2 = _FakeDb([order, reconciliation, accounting])
+    await exit_recovery._validate_exit_recovery(db2, proof)
+    assert proof.position_id == expected_position_id
+    assert not any(
+        isinstance(item, AuditLog) and item.action == "controlled_proof_run.position_lineage_repaired"
+        for item in db2.added
+    )
+
+
+@pytest.mark.asyncio
+async def test_authorization_fails_closed_when_open_position_belongs_to_a_different_profile(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Requirement: fail closed on a genuine mismatch. A position computed
+    for a DIFFERENT (profile, campaign, symbol) tuple than this proof's own
+    must never be accepted as this proof's position -- the deterministic
+    position_id recomputation is a real check, not a rubber stamp."""
+    proof = SimpleNamespace(
+        proof_id=uuid.uuid4(), status="EXPIRED", package_id=uuid.uuid4(), sell_package_id=None,
+        sell_live_crypto_order_id=None, buy_live_crypto_order_id=uuid.uuid4(), provider="kraken_spot",
+        environment="production", product_id="BTC-USD", campaign_id=uuid.uuid4(), position_id=None,
+    )
+    order = SimpleNamespace(live_crypto_order_id=proof.buy_live_crypto_order_id, side="BUY", status="FILLED")
+    reconciliation = SimpleNamespace(reconciliation_status="filled")
+    accounting = SimpleNamespace(id=uuid.uuid4())
+    db = _FakeDb([order, reconciliation, accounting])
+    import app.services.orchestration.continuous_pipeline_worker as worker
+    monkeypatch.setattr(worker, "_has_open_live_order", _async_false)
+    monkeypatch.setattr(worker, "_has_unresolved_reconciliation", _async_false)
+    monkeypatch.setattr(
+        "app.services.controlled_proof.service.repair_controlled_proof_cached_order_ids", _async_false,
+    )
+    monkeypatch.setattr(exit_recovery, "_load_scope", _async_scope)
+    monkeypatch.setattr(exit_recovery, "compute_signed_owned_quantity", _async_quantity)
+    # A real, deterministic id for an unrelated (profile, campaign, symbol)
+    # -- never made to match this proof's own scope.
+    monkeypatch.setattr(exit_recovery, "load_position_snapshots", _async_positions)
+    monkeypatch.setattr(
+        exit_recovery, "_position_id",
+        lambda **_kwargs: str(uuid.uuid4()),
+    )
+
+    with pytest.raises(InvalidRequestError, match="Open position linkage does not match this Controlled Proof"):
+        await exit_recovery._validate_exit_recovery(db, proof)
 
 
 def test_model_declares_idempotency_and_one_active_recovery_per_proof() -> None:
