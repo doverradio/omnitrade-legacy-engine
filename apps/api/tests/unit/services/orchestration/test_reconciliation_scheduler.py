@@ -417,6 +417,40 @@ async def test_cancelled_order_counts_as_reconciled_terminal(monkeypatch: pytest
 
 
 @pytest.mark.asyncio
+async def test_terminal_reconciliation_immediately_refreshes_exit_recovery(monkeypatch: pytest.MonkeyPatch) -> None:
+    from app.services.controlled_proof import exit_recovery
+
+    order_id = uuid.uuid4()
+    calls = []
+    monkeypatch.setattr(subject, "get_settings", _enabled_settings)
+    monkeypatch.setattr(subject, "discover_reconciliation_candidates", lambda *, db, limit: _async([order_id]))
+    monkeypatch.setattr(subject, "_terminal_unreleased_claim_context", lambda **_kwargs: _async(None))
+    monkeypatch.setattr(subject, "_terminal_unresolved_context", lambda **_kwargs: _async(None))
+    monkeypatch.setattr(
+        subject, "LiveCryptoOrderService",
+        lambda: _FakeReconcileService({order_id: _response(status="FILLED", reconciliation_status="filled")}),
+    )
+
+    async def _refresh(*, db):
+        calls.append("recovery_refreshed")
+
+    monkeypatch.setattr(exit_recovery, "refresh_exit_recovery_outcomes", _refresh)
+
+    class _Db(_FakeDb):
+        async def scalar(self, _statement):
+            return None
+        async def scalars(self, _statement):
+            return []
+        async def commit(self):
+            calls.append("committed")
+
+    outcome = await subject.poll_unresolved_live_orders(db=_Db())
+
+    assert outcome == subject.ReconciliationPollOutcome(1, 1, 0, 0)
+    assert calls == ["recovery_refreshed", "committed"]
+
+
+@pytest.mark.asyncio
 async def test_terminal_rejected_order_releases_historical_open_claim_without_provider_query(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

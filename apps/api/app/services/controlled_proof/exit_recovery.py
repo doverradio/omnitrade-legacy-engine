@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import uuid
 from datetime import datetime, timedelta, timezone
+from decimal import Decimal
 
 from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
@@ -363,14 +364,22 @@ async def block_exit_recovery(*, db: AsyncSession, recovery: ControlledProofExit
 async def refresh_exit_recovery_completion(
     *, db: AsyncSession, recovery: ControlledProofExitRecovery, proof: ControlledProofRun,
 ) -> None:
+    if recovery.status == "COMPLETED":
+        return
+    proof_view = None
     if proof.sell_live_crypto_order_id is None:
         from app.services.controlled_proof.service import get_controlled_proof_view
-        await get_controlled_proof_view(db=db, proof_id=proof.proof_id)
+        proof_view = await get_controlled_proof_view(db=db, proof_id=proof.proof_id)
         await db.refresh(proof)
     if proof.sell_live_crypto_order_id is None:
         return
     sell_order = await db.scalar(select(LiveCryptoOrder).where(LiveCryptoOrder.live_crypto_order_id == proof.sell_live_crypto_order_id))
     if sell_order is None or sell_order.status != "FILLED":
+        return
+    execution_claim = await db.scalar(select(AutonomousExecutionClaim).where(
+        AutonomousExecutionClaim.live_order_id == sell_order.live_crypto_order_id,
+    ).limit(1))
+    if execution_claim is None or execution_claim.claim_status != "COMPLETED":
         return
     from app.services.orchestration.continuous_pipeline_worker import _has_unresolved_reconciliation
     if await _has_unresolved_reconciliation(db=db, provider=proof.provider, environment=proof.environment, product=proof.product_id):
@@ -378,9 +387,42 @@ async def refresh_exit_recovery_completion(
     _runtime, profile_id = await _load_scope(db, proof)
     if await compute_signed_owned_quantity(db=db, live_trading_profile_id=profile_id, symbol=proof.product_id) != 0:
         return
+    if proof_view is None:
+        from app.services.controlled_proof.service import get_controlled_proof_view
+        proof_view = await get_controlled_proof_view(db=db, proof_id=proof.proof_id)
+        await db.refresh(proof)
+    net_pnl_raw = proof_view.get("net_pnl_usd") if isinstance(proof_view, dict) else None
+    if net_pnl_raw is None:
+        return
+    net_pnl = Decimal(str(net_pnl_raw))
+    before_proof = {
+        "status": proof.status,
+        "terminal_verdict": proof.terminal_verdict,
+        "net_pnl_usd": None if proof.net_pnl_usd is None else str(proof.net_pnl_usd),
+    }
+    recovered_verdict = (
+        "LIFECYCLE_PROVEN_PROFIT" if net_pnl > 0
+        else "LIFECYCLE_PROVEN_LOSS" if net_pnl < 0
+        else "LIFECYCLE_PROVEN_FLAT"
+    )
+    db.add(AuditLog(
+        actor="system:controlled_proof_worker",
+        action="controlled_proof_run.exit_recovery_accounting_completed",
+        entity_type="controlled_proof_run", entity_id=proof.proof_id,
+        before_state=before_proof,
+        after_state={
+            "status": proof.status,
+            "terminal_verdict": proof.terminal_verdict,
+            "recovered_terminal_verdict": recovered_verdict,
+            "recovered_net_pnl_usd": str(net_pnl),
+            "sell_live_crypto_order_id": str(sell_order.live_crypto_order_id),
+            "execution_claim_id": str(execution_claim.claim_id),
+            "exit_recovery_id": str(recovery.recovery_id),
+        },
+    ))
     before = recovery.status
     recovery.status = "COMPLETED"; recovery.completed_at = _utcnow(); recovery.updated_at = recovery.completed_at
-    db.add(AuditLog(actor="system:controlled_proof_worker", action="controlled_proof_exit_recovery.completed", entity_type="controlled_proof_exit_recovery", entity_id=recovery.recovery_id, before_state={"status": before}, after_state={"status": "COMPLETED", "sell_live_crypto_order_id": str(sell_order.live_crypto_order_id)}))
+    db.add(AuditLog(actor="system:controlled_proof_worker", action="controlled_proof_exit_recovery.completed", entity_type="controlled_proof_exit_recovery", entity_id=recovery.recovery_id, before_state={"status": before}, after_state={"status": "COMPLETED", "sell_live_crypto_order_id": str(sell_order.live_crypto_order_id), "execution_claim_id": str(execution_claim.claim_id), "controlled_proof_status": proof.status, "controlled_proof_terminal_verdict": proof.terminal_verdict, "recovered_terminal_verdict": recovered_verdict, "recovered_net_pnl_usd": str(net_pnl)}))
     await db.flush()
 
 

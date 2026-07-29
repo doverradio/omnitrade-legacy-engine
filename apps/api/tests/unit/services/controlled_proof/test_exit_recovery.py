@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import uuid
 from datetime import datetime, timedelta, timezone
+from decimal import Decimal
 from types import SimpleNamespace
 
 import pytest
@@ -33,6 +34,9 @@ class _FakeDb:
         self.commits += 1
 
     async def rollback(self):
+        return None
+
+    async def refresh(self, _value):
         return None
 
 
@@ -120,6 +124,87 @@ async def test_claim_is_exit_only_and_does_not_change_terminal_proof(monkeypatch
     assert claimed == (recovery, proof)
     assert recovery.status == "IN_PROGRESS"
     assert proof.status == "EXPIRED"
+
+
+@pytest.mark.asyncio
+async def test_reconciled_filled_sell_completes_recovery_without_rewriting_proof_idempotently(monkeypatch) -> None:
+    import app.services.controlled_proof.service as proof_service
+    import app.services.orchestration.continuous_pipeline_worker as worker
+
+    now = datetime.now(timezone.utc)
+    sell_order_id = uuid.uuid4()
+    proof = SimpleNamespace(
+        proof_id=uuid.uuid4(), status="EXPIRED", terminal_verdict="FAILED",
+        net_pnl_usd=None, sell_live_crypto_order_id=sell_order_id,
+        provider="kraken_spot", environment="production", product_id="BTC-USD",
+        updated_at=now,
+    )
+    recovery = SimpleNamespace(
+        recovery_id=uuid.uuid4(), status="IN_PROGRESS", completed_at=None, updated_at=now,
+    )
+    order = SimpleNamespace(live_crypto_order_id=sell_order_id, status="FILLED")
+    claim = SimpleNamespace(claim_id=uuid.uuid4(), claim_status="COMPLETED")
+    db = _FakeDb([order, claim])
+
+    async def _view(**_kwargs):
+        return {"net_pnl_usd": Decimal("0.17")}
+    async def _scope(*_args, **_kwargs):
+        return SimpleNamespace(), uuid.uuid4()
+    async def _zero(**_kwargs):
+        return Decimal("0")
+
+    monkeypatch.setattr(proof_service, "get_controlled_proof_view", _view)
+    monkeypatch.setattr(worker, "_has_unresolved_reconciliation", lambda **_kwargs: _async_false())
+    monkeypatch.setattr(exit_recovery, "_load_scope", _scope)
+    monkeypatch.setattr(exit_recovery, "compute_signed_owned_quantity", _zero)
+    monkeypatch.setattr(exit_recovery, "_utcnow", lambda: now)
+
+    await exit_recovery.refresh_exit_recovery_completion(db=db, recovery=recovery, proof=proof)
+
+    assert proof.status == "EXPIRED"
+    assert proof.terminal_verdict == "FAILED"
+    assert proof.net_pnl_usd is None
+    assert recovery.status == "COMPLETED"
+    assert recovery.completed_at == now
+    assert any(
+        isinstance(item, AuditLog)
+        and item.action == "controlled_proof_run.exit_recovery_accounting_completed"
+        and item.before_state["status"] == "EXPIRED"
+        and item.after_state["status"] == "EXPIRED"
+        and item.after_state["recovered_terminal_verdict"] == "LIFECYCLE_PROVEN_PROFIT"
+        and item.after_state["recovered_net_pnl_usd"] == "0.17"
+        for item in db.added
+    )
+    audit_count = len(db.added)
+
+    await exit_recovery.refresh_exit_recovery_completion(db=db, recovery=recovery, proof=proof)
+    assert len(db.added) == audit_count
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(("order_status", "claim_status"), [
+    ("PARTIALLY_FILLED", "SUBMISSION_PENDING"),
+    ("ACKNOWLEDGED", "SUBMISSION_PENDING"),
+    ("FILLED", "RECONCILIATION_REQUIRED"),
+])
+async def test_nonterminal_sell_or_claim_keeps_exit_recovery_in_progress(
+    order_status, claim_status,
+) -> None:
+    sell_order_id = uuid.uuid4()
+    proof = SimpleNamespace(
+        proof_id=uuid.uuid4(), sell_live_crypto_order_id=sell_order_id,
+        provider="kraken_spot", environment="production", product_id="BTC-USD",
+    )
+    recovery = SimpleNamespace(recovery_id=uuid.uuid4(), status="IN_PROGRESS")
+    db = _FakeDb([
+        SimpleNamespace(live_crypto_order_id=sell_order_id, status=order_status),
+        SimpleNamespace(claim_id=uuid.uuid4(), claim_status=claim_status),
+    ])
+
+    await exit_recovery.refresh_exit_recovery_completion(db=db, recovery=recovery, proof=proof)
+
+    assert recovery.status == "IN_PROGRESS"
+    assert db.added == []
 
 
 @pytest.mark.asyncio

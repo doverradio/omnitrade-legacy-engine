@@ -247,6 +247,15 @@ async def poll_unresolved_live_orders(
                 live_crypto_order_id=live_crypto_order_id,
                 request=LiveCryptoOrderReconcileRequest(operator_identity=actor),
             )
+            # Reconciliation is the authoritative point at which provider
+            # fill, immutable accounting, and execution-claim release are all
+            # available together. Finalize any governed Controlled Proof Exit
+            # Recovery in this same pass instead of waiting for an unrelated
+            # later orchestration cycle or API read.
+            if all(hasattr(db, attr) for attr in ("scalar", "scalars", "commit")):
+                from app.services.controlled_proof.exit_recovery import refresh_exit_recovery_outcomes
+                await refresh_exit_recovery_outcomes(db=db)
+                await db.commit()
             if recovery_context is not None:
                 latest_event = await db.scalar(
                     select(LiveReconciliationEvent)
