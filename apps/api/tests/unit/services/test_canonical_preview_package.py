@@ -533,6 +533,12 @@ async def test_controlled_proof_mode_forces_sell_when_requested(monkeypatch: pyt
     monkeypatch.setattr(cpp, "_load_preview_for_package", _async_return(preview))
     monkeypatch.setattr(cpp, "_load_decision_record", _async_return(SimpleNamespace(decision_id=preview.decision_record_id)))
     monkeypatch.setattr(cpp, "_load_risk_event", _async_return(SimpleNamespace(id=preview.risk_event_id)))
+    # Canonical-lineage SELL sizing is exercised in its own focused suite
+    # (tests/unit/services/controlled_proof/test_service.py and
+    # tests/unit/services/live/test_position_quantity.py); this test is
+    # about package-creation plumbing, so it fixes the resolved quantity
+    # the same way it already fixes every other collaborator above.
+    monkeypatch.setattr(cpp, "compute_controlled_proof_owned_quantity", _async_return(Decimal("0.00005")))
 
     db = _FakeDb(scalar_values=[1, strategy, parameter_set])
     result = await cpp.create_canonical_preview_package(db=db, request=request)
@@ -541,6 +547,45 @@ async def test_controlled_proof_mode_forces_sell_when_requested(monkeypatch: pyt
     assert result["package"]["side"] == "SELL"
     assert result["package"]["entry_reason"] == "CONTROLLED_PROOF"
     assert result["package"]["market_evidence_identity"]["controlled_proof_id"] == str(proof_id)
+
+
+@pytest.mark.asyncio
+async def test_controlled_proof_sell_fails_closed_when_owned_quantity_unresolved(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Reproduces the exact production defect at the integration seam this
+    fix targets: _create_crypto_order_preview_for_package's own <= 0 guard
+    still raises canonical_owned_sell_quantity_missing when
+    compute_controlled_proof_owned_quantity cannot resolve a nonzero
+    quantity -- proving the guard itself was never weakened or bypassed,
+    only the resolver feeding it. Calls the preview-creation function
+    directly (rather than the full create_canonical_preview_package
+    orchestration wrapper, whose controlled_proof branch never reaches
+    this guard once an existing preview short-circuits it) so the test is
+    scoped exactly to the code path the bug and fix live in."""
+    proof_id = uuid4()
+    profile = _profile()
+    request = _create_request(
+        campaign_id=uuid4(), profile=profile, idempotency_key="pkg-controlled-proof-sell-unresolved",
+        commissioning_entry_mode="controlled_proof", forced_action="CLOSE_POSITION_PROPOSED",
+        controlled_proof_id=proof_id,
+    )
+    strategy_identity = cpp.build_strategy_identity(slug="ma_crossover", module_version="1.0.0")
+    strategy = SimpleNamespace(id=uuid4(), module_version="1.0.0")
+    parameter_set = SimpleNamespace(id=uuid4(), label="baseline")
+
+    monkeypatch.setattr(cpp, "_load_exchange_connection_for_scope", _async_return(SimpleNamespace(exchange_connection_id=uuid4())))
+    monkeypatch.setattr(cpp, "_resolve_strategy_and_parameter_binding", _async_return((strategy, parameter_set)))
+    monkeypatch.setattr(cpp, "create_controlled_proof_decision_record", _async_return(uuid4()))
+    # The exact failure mode: canonical lineage cannot prove a nonzero
+    # owned quantity (missing, ambiguous, or already fully closed).
+    monkeypatch.setattr(cpp, "compute_controlled_proof_owned_quantity", _async_return(Decimal("0")))
+
+    db = _FakeDb()
+    with pytest.raises(LookupError) as excinfo:
+        await cpp._create_crypto_order_preview_for_package(
+            db=db, request=request, profile=profile,
+            composition={}, selected_decision={"strategy_identity": strategy_identity},
+        )
+    assert "canonical_owned_sell_quantity_missing" in str(excinfo.value)
 
 
 @pytest.mark.asyncio

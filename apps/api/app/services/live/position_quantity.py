@@ -60,22 +60,25 @@ async def owned_position_exists(
 async def compute_controlled_proof_owned_quantity(
     *, db: AsyncSession, proof_id: uuid.UUID,
 ) -> Decimal:
-    """Quantity attributable only to one Controlled Proof's linked orders."""
+    """Quantity attributable only to one Controlled Proof's own canonical
+    lineage. Thin, proof_id-keyed wrapper: loads the proof row, then
+    delegates to app.services.controlled_proof.service.
+    resolve_controlled_proof_owned_quantity -- the authoritative
+    canonical-lineage (package -> claim -> order -> accounting) resolver
+    also used for SELL eligibility -- rather than resolving quantity from
+    this row's own buy_live_crypto_order_id/sell_live_crypto_order_id
+    columns, which are only an opportunistic read-side cache and can be
+    stale or still-unpopulated relative to canonical lineage.
+
+    Imported lazily: app.services.controlled_proof.service already
+    imports from this module, so a module-level import here would be
+    circular.
+    """
+    from app.services.controlled_proof.service import resolve_controlled_proof_owned_quantity
+
     proof = await db.scalar(
         select(ControlledProofRun).where(ControlledProofRun.proof_id == proof_id).limit(1)
     )
-    if proof is None or proof.buy_live_crypto_order_id is None:
+    if proof is None:
         return Decimal("0")
-    linked_order_ids = [proof.buy_live_crypto_order_id]
-    if proof.sell_live_crypto_order_id is not None:
-        linked_order_ids.append(proof.sell_live_crypto_order_id)
-    total = await db.scalar(
-        select(func.coalesce(func.sum(case(
-            (LiveAccountingRecord.side == "buy", LiveAccountingRecord.filled_quantity),
-            else_=-LiveAccountingRecord.filled_quantity,
-        )), Decimal("0"))).where(
-            LiveAccountingRecord.live_crypto_order_id.in_(linked_order_ids),
-            LiveAccountingRecord.record_type.in_(QUANTITY_BEARING_RECORD_TYPES),
-        )
-    )
-    return Decimal(str(total or 0))
+    return await resolve_controlled_proof_owned_quantity(db=db, proof=proof)

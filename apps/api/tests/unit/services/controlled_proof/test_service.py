@@ -519,6 +519,258 @@ async def test_should_propose_controlled_sell_becomes_true_once_buy_is_filled_an
         assert not any("controlled_proof_sell_ineligible" in message for message in true_messages)
 
 
+# --- resolve_controlled_proof_owned_quantity: canonical SELL sizing -----------------
+#
+# Regression coverage for the production defect where should_propose_
+# controlled_sell (above) correctly reported eligible=true from canonical
+# lineage while SELL preview creation still failed with
+# canonical_owned_sell_quantity_missing, because the quantity resolver read
+# the proof's buy_live_crypto_order_id/sell_live_crypto_order_id cache
+# columns instead of the same canonical lineage.
+
+def _fill(*, side: str, quantity: Decimal, record_type: str = "fill_accounting") -> SimpleNamespace:
+    return SimpleNamespace(side=side, filled_quantity=quantity, record_type=record_type)
+
+
+@pytest.mark.asyncio
+async def test_resolve_owned_quantity_uses_remaining_canonical_position_after_partial_exit(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Requirement 1: a controlled proof with reconciled BUY fill accounting
+    and a nonzero proof-owned position resolves exactly the remaining
+    canonical quantity (BUY fills minus any already-reconciled SELL fills),
+    via the same canonical lineage should_propose_controlled_sell trusts."""
+    async with _real_session() as session:
+        await _seed_fully_ready_scope(session, monkeypatch)
+        proof, _ = await controlled_proof_service.create_controlled_proof(
+            db=session, product_id="BTC-USD", idempotency_key="proof-owned-qty-remaining",
+            expires_in_minutes=30, actor="operator:alice",
+        )
+        proof.package_id = uuid.uuid4()
+        proof.sell_package_id = uuid.uuid4()
+        await session.flush()
+
+        buy_order = SimpleNamespace(live_crypto_order_id=uuid.uuid4())
+        sell_order = SimpleNamespace(live_crypto_order_id=uuid.uuid4())
+
+        async def _lineage(*, db, proof, package_id, side):
+            if side == "BUY":
+                return SimpleNamespace(package_id=proof.package_id), SimpleNamespace(), buy_order
+            return SimpleNamespace(package_id=proof.sell_package_id), SimpleNamespace(), sell_order
+
+        async def _accounting(*, db, order):
+            return [_fill(side="buy", quantity=Decimal("0.0002"))] if order is buy_order \
+                else [_fill(side="sell", quantity=Decimal("0.00005"))]
+
+        monkeypatch.setattr(controlled_proof_service, "_proof_leg_lineage", _lineage)
+        monkeypatch.setattr(controlled_proof_service, "_order_accounting", _accounting)
+
+        with caplog.at_level(logging.INFO, logger=controlled_proof_service.logger.name):
+            quantity = await controlled_proof_service.resolve_controlled_proof_owned_quantity(db=session, proof=proof)
+
+        assert quantity == Decimal("0.00015")
+        assert any(
+            "controlled_proof_owned_quantity_resolved" in record.getMessage()
+            and "bought_quantity=0.0002" in record.getMessage()
+            and "sold_quantity=0.00005" in record.getMessage()
+            and "net_quantity=0.00015" in record.getMessage()
+            for record in caplog.records
+        )
+
+
+@pytest.mark.asyncio
+async def test_resolve_owned_quantity_ignores_unrelated_wallet_or_position_activity(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Requirement 2: the SELL quantity must never pick up unrelated fill
+    accounting for the same symbol -- proven against the real, unmocked
+    _order_accounting query (only lineage resolution is faked), not just a
+    mock asserting isolation."""
+    async with _real_session() as session:
+        await _seed_fully_ready_scope(session, monkeypatch)
+        proof, _ = await controlled_proof_service.create_controlled_proof(
+            db=session, product_id="BTC-USD", idempotency_key="proof-owned-qty-isolated",
+            expires_in_minutes=30, actor="operator:alice",
+        )
+        proof.package_id = uuid.uuid4()
+        await session.flush()
+
+        own_order_id = uuid.uuid4()
+        own_order = SimpleNamespace(
+            live_crypto_order_id=own_order_id, provider_order_id="kraken-own-buy",
+            product_id="BTC-USD", side="BUY",
+        )
+
+        async def _lineage(*, db, proof, package_id, side):
+            assert side == "BUY"
+            return SimpleNamespace(package_id=proof.package_id), SimpleNamespace(), own_order
+
+        monkeypatch.setattr(controlled_proof_service, "_proof_leg_lineage", _lineage)
+        # _order_accounting is left real/unmocked here on purpose.
+
+        def _accounting_row(*, live_crypto_order_id, provider_order_id, quantity):
+            return LiveAccountingRecord(
+                idempotency_key=f"{provider_order_id}-fill", live_trading_profile_id=uuid.uuid4(),
+                live_crypto_order_id=live_crypto_order_id, capital_campaign_id=None,
+                reconciliation_event_id=uuid.uuid4(), source_execution_event_id=uuid.uuid4(),
+                source_execution_event_type="execution_intent_created", record_type="fill_accounting",
+                provider_order_id=provider_order_id, symbol="BTC-USD", side="buy",
+                filled_quantity=quantity, fill_price=Decimal("50000"),
+                gross_notional=quantity * Decimal("50000"), fee_amount=Decimal("0.01"),
+                fee_currency="USD", net_cash_impact=Decimal("0"), provenance={},
+                recorded_at=datetime.now(timezone.utc),
+            )
+
+        session.add(_accounting_row(
+            live_crypto_order_id=own_order_id, provider_order_id="kraken-own-buy", quantity=Decimal("0.0002"),
+        ))
+        # Unrelated order/wallet activity for the same symbol -- a much
+        # larger quantity that must never leak into this proof's own SELL
+        # sizing.
+        session.add(_accounting_row(
+            live_crypto_order_id=uuid.uuid4(), provider_order_id="kraken-unrelated-buy", quantity=Decimal("5"),
+        ))
+        await session.flush()
+
+        quantity = await controlled_proof_service.resolve_controlled_proof_owned_quantity(db=session, proof=proof)
+        assert quantity == Decimal("0.0002")
+
+
+@pytest.mark.asyncio
+async def test_resolve_owned_quantity_fails_closed_when_buy_lineage_missing(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Requirement 3: no resolvable BUY lineage (ABSENT/PACKAGE_ONLY/CLAIM_
+    ONLY -- _proof_leg_lineage resolves `order` to None in every one of
+    those states) fails closed to 0, the exact input the caller's existing
+    <= 0 guard turns into canonical_owned_sell_quantity_missing -- never
+    fabricates a nonzero quantity."""
+    async with _real_session() as session:
+        await _seed_fully_ready_scope(session, monkeypatch)
+        proof, _ = await controlled_proof_service.create_controlled_proof(
+            db=session, product_id="BTC-USD", idempotency_key="proof-owned-qty-missing-lineage",
+            expires_in_minutes=30, actor="operator:alice",
+        )
+        proof.package_id = uuid.uuid4()
+        await session.flush()
+
+        async def _absent_lineage(**_kwargs):
+            return None, None, None
+
+        monkeypatch.setattr(controlled_proof_service, "_proof_leg_lineage", _absent_lineage)
+
+        with caplog.at_level(logging.INFO, logger=controlled_proof_service.logger.name):
+            quantity = await controlled_proof_service.resolve_controlled_proof_owned_quantity(db=session, proof=proof)
+
+        assert quantity == Decimal("0")
+        assert any(
+            "controlled_proof_owned_quantity_unresolved" in record.getMessage()
+            and "reason=buy_lineage_unresolved" in record.getMessage()
+            for record in caplog.records
+        )
+
+
+@pytest.mark.asyncio
+async def test_resolve_owned_quantity_fails_closed_on_ambiguous_or_conflicting_lineage(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Requirement 4: an ambiguous/conflicting BUY leg -- multiple execution
+    claims, a scope-mismatched ("foreign") order, or any other INCONSISTENT
+    state -- resolves `order` to None inside _proof_leg_lineage itself
+    (resolve_controlled_proof_leg_execution_lineage's own state machine,
+    covered by its own test suite and unchanged by this fix). What this
+    test proves is that resolve_controlled_proof_owned_quantity treats that
+    None identically to "no provable quantity", the same as the missing-
+    lineage case, rather than e.g. falling back to a package-only guess."""
+    async with _real_session() as session:
+        await _seed_fully_ready_scope(session, monkeypatch)
+        proof, _ = await controlled_proof_service.create_controlled_proof(
+            db=session, product_id="BTC-USD", idempotency_key="proof-owned-qty-ambiguous",
+            expires_in_minutes=30, actor="operator:alice",
+        )
+        proof.package_id = uuid.uuid4()
+        await session.flush()
+
+        async def _inconsistent_lineage(**_kwargs):
+            # Mirrors resolve_controlled_proof_leg_execution_lineage's own
+            # INCONSISTENT return shape (package resolved, order is not).
+            return SimpleNamespace(package_id=proof.package_id), None, None
+
+        monkeypatch.setattr(controlled_proof_service, "_proof_leg_lineage", _inconsistent_lineage)
+
+        quantity = await controlled_proof_service.resolve_controlled_proof_owned_quantity(db=session, proof=proof)
+        assert quantity == Decimal("0")
+
+
+@pytest.mark.asyncio
+async def test_resolve_owned_quantity_is_zero_when_position_already_fully_closed(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Requirement 5: BUY and SELL fills that exactly net to zero (position
+    already fully closed) resolve to Decimal("0"), not a negative or stale
+    value -- the caller's existing <= 0 guard still fails closed on it."""
+    async with _real_session() as session:
+        await _seed_fully_ready_scope(session, monkeypatch)
+        proof, _ = await controlled_proof_service.create_controlled_proof(
+            db=session, product_id="BTC-USD", idempotency_key="proof-owned-qty-fully-closed",
+            expires_in_minutes=30, actor="operator:alice",
+        )
+        proof.package_id = uuid.uuid4()
+        proof.sell_package_id = uuid.uuid4()
+        await session.flush()
+
+        buy_order = SimpleNamespace(live_crypto_order_id=uuid.uuid4())
+        sell_order = SimpleNamespace(live_crypto_order_id=uuid.uuid4())
+
+        async def _lineage(*, db, proof, package_id, side):
+            return (
+                (SimpleNamespace(package_id=proof.package_id), SimpleNamespace(), buy_order) if side == "BUY"
+                else (SimpleNamespace(package_id=proof.sell_package_id), SimpleNamespace(), sell_order)
+            )
+
+        async def _accounting(*, db, order):
+            return [_fill(side="buy", quantity=Decimal("0.0002"))] if order is buy_order \
+                else [_fill(side="sell", quantity=Decimal("0.0002"))]
+
+        monkeypatch.setattr(controlled_proof_service, "_proof_leg_lineage", _lineage)
+        monkeypatch.setattr(controlled_proof_service, "_order_accounting", _accounting)
+
+        quantity = await controlled_proof_service.resolve_controlled_proof_owned_quantity(db=session, proof=proof)
+        assert quantity == Decimal("0")
+
+
+@pytest.mark.asyncio
+async def test_resolve_owned_quantity_is_a_pure_repeatable_read(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Requirement 6: repeated execution is idempotent -- calling the
+    resolver twice against unchanged state returns the same result and
+    performs no writes (no db.add/flush/commit anywhere in the function)."""
+    async with _real_session() as session:
+        await _seed_fully_ready_scope(session, monkeypatch)
+        proof, _ = await controlled_proof_service.create_controlled_proof(
+            db=session, product_id="BTC-USD", idempotency_key="proof-owned-qty-idempotent",
+            expires_in_minutes=30, actor="operator:alice",
+        )
+        proof.package_id = uuid.uuid4()
+        await session.flush()
+
+        buy_order = SimpleNamespace(live_crypto_order_id=uuid.uuid4())
+
+        async def _lineage(**_kwargs):
+            return SimpleNamespace(package_id=proof.package_id), SimpleNamespace(), buy_order
+
+        async def _accounting(**_kwargs):
+            return [_fill(side="buy", quantity=Decimal("0.0002"))]
+
+        monkeypatch.setattr(controlled_proof_service, "_proof_leg_lineage", _lineage)
+        monkeypatch.setattr(controlled_proof_service, "_order_accounting", _accounting)
+
+        first = await controlled_proof_service.resolve_controlled_proof_owned_quantity(db=session, proof=proof)
+        second = await controlled_proof_service.resolve_controlled_proof_owned_quantity(db=session, proof=proof)
+
+        assert first == second == Decimal("0.0002")
+        assert len(session.new) == 0 and len(session.dirty) == 0
+
+
 # --- replace-active: operator-safe supersede of a stalled active proof ---------------
 
 @pytest.mark.asyncio

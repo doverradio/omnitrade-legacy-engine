@@ -9,6 +9,7 @@ from typing import AsyncIterator
 import pytest
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.models.controlled_proof_run import ControlledProofRun
 from app.models.live_accounting_record import LiveAccountingRecord
 from app.services.live.position_quantity import (
     compute_controlled_proof_owned_quantity,
@@ -17,7 +18,7 @@ from app.services.live.position_quantity import (
 )
 from tests.support.real_sqlite_session import real_sqlite_session
 
-_ALL_TABLES = [LiveAccountingRecord.__table__]
+_ALL_TABLES = [ControlledProofRun.__table__, LiveAccountingRecord.__table__]
 _PROFILE_ID = uuid.uuid4()
 _SYMBOL = "BTC-USD"
 
@@ -132,31 +133,54 @@ async def test_fee_attribution_rows_remain_present_after_quantity_computation() 
         assert fee_rows[0].filled_quantity == Decimal("0.00007817")  # untouched, not deleted or zeroed
 
 
+def _minimal_proof_row(*, proof_id: uuid.UUID, package_id: uuid.UUID | None = None) -> ControlledProofRun:
+    now = datetime.now(timezone.utc)
+    return ControlledProofRun(
+        proof_id=proof_id, status="WAITING_FOR_PROFITABLE_EXIT", provider="kraken_spot", environment="production",
+        campaign_id=uuid.uuid4(), campaign_version=1, product_id=_SYMBOL, max_notional_usd=Decimal("5"),
+        idempotency_key=f"proof-{proof_id}", requested_by="operator:test", requested_at=now,
+        expires_at=now + timedelta(minutes=30), package_id=package_id,
+    )
+
+
 @pytest.mark.asyncio
-async def test_controlled_proof_quantity_uses_only_linked_buy_and_sell_orders() -> None:
-    proof_id, buy_order_id, sell_order_id = uuid.uuid4(), uuid.uuid4(), uuid.uuid4()
+async def test_compute_controlled_proof_owned_quantity_returns_zero_when_proof_missing() -> None:
+    """No matching ControlledProofRun row at all: fails closed to 0 without
+    ever reaching the canonical-lineage resolver."""
+    async with _real_session() as session:
+        quantity = await compute_controlled_proof_owned_quantity(db=session, proof_id=uuid.uuid4())
+        assert quantity == Decimal("0")
 
-    class _Db:
-        def __init__(self) -> None:
-            self.statements = []
-            self.results = [
-                type("Proof", (), {
-                    "buy_live_crypto_order_id": buy_order_id,
-                    "sell_live_crypto_order_id": sell_order_id,
-                })(),
-                Decimal("0.00007817"),
-            ]
 
-        async def scalar(self, statement):
-            self.statements.append(statement)
-            return self.results.pop(0)
+@pytest.mark.asyncio
+async def test_compute_controlled_proof_owned_quantity_delegates_to_canonical_lineage_resolver(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """This proof_id-keyed wrapper must load the real proof row and hand
+    ownership resolution to app.services.controlled_proof.service.
+    resolve_controlled_proof_owned_quantity -- never resolve quantity
+    itself from buy_live_crypto_order_id/sell_live_crypto_order_id, which
+    are only an opportunistic, possibly-stale read-side cache (see the
+    production defect this module's canonical_owned_sell_quantity_missing
+    regression was root-caused to)."""
+    async with _real_session() as session:
+        proof_id = uuid.uuid4()
+        session.add(_minimal_proof_row(proof_id=proof_id, package_id=uuid.uuid4()))
+        await session.flush()
 
-    db = _Db()
-    quantity = await compute_controlled_proof_owned_quantity(db=db, proof_id=proof_id)
+        captured: dict[str, object] = {}
 
-    assert quantity == Decimal("0.00007817")
-    compiled = db.statements[1].compile()
-    parameter_values = list(compiled.params.values())
-    assert any(buy_order_id == value or isinstance(value, list) and buy_order_id in value for value in parameter_values)
-    assert any(sell_order_id == value or isinstance(value, list) and sell_order_id in value for value in parameter_values)
-    assert "live_crypto_orders" not in str(db.statements[1])
+        async def _fake_resolve(*, db, proof):
+            captured["proof_id"] = proof.proof_id
+            captured["db_is_session"] = db is session
+            return Decimal("0.00007831")
+
+        monkeypatch.setattr(
+            "app.services.controlled_proof.service.resolve_controlled_proof_owned_quantity",
+            _fake_resolve,
+        )
+
+        quantity = await compute_controlled_proof_owned_quantity(db=session, proof_id=proof_id)
+
+        assert quantity == Decimal("0.00007831")
+        assert captured == {"proof_id": proof_id, "db_is_session": True}

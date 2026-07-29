@@ -780,6 +780,74 @@ async def should_propose_controlled_sell(*, db: AsyncSession, proof: ControlledP
     return eligible
 
 
+async def resolve_controlled_proof_owned_quantity(*, db: AsyncSession, proof: ControlledProofRun) -> Decimal:
+    """Canonical, lineage-derived owned base-asset quantity for one
+    Controlled Proof: BUY fills minus any already-reconciled SELL fills,
+    resolved exclusively through this proof's own canonical lineage
+    (package -> claim -> order -> reconciled accounting) via
+    _proof_leg_lineage/_order_accounting -- the exact same resolution
+    should_propose_controlled_sell already trusts for eligibility.
+
+    Deliberately never reads proof.buy_live_crypto_order_id /
+    sell_live_crypto_order_id. Those columns are only an opportunistic
+    read-side projection (see repair_controlled_proof_cached_order_ids's
+    own docstring) written solely as a side effect of get_controlled_proof_
+    view being called -- they can go stale relative to canonical lineage,
+    or simply never have been populated yet for a proof the worker has
+    only ever reached through its own periodic dispatch (which does not
+    call get_controlled_proof_view until a SELL package already exists).
+    That staleness gap is exactly what previously let
+    should_propose_controlled_sell report eligible=true for a real,
+    fully-reconciled BUY while a quantity resolver keyed off those cache
+    columns still returned 0, raising canonical_owned_sell_quantity_missing
+    for a genuinely owned, nonzero position.
+
+    Fails closed to Decimal("0") -- never raises -- for every lineage
+    state other than a single, unambiguous, scope-matched order: ABSENT,
+    PACKAGE_ONLY, CLAIM_ONLY, and every INCONSISTENT reason (missing
+    package, scope mismatch, multiple execution claims, a foreign order)
+    all resolve `order` to None in _proof_leg_lineage, which this treats
+    identically to "no provable quantity". Callers already reject a
+    result <= 0 as ineligible to sell -- this function does not duplicate
+    that guard, it only ever supplies the number for it to check.
+    """
+    _buy_package, _buy_claim, buy_order = await _proof_leg_lineage(
+        db=db, proof=proof, package_id=proof.package_id, side="BUY",
+    )
+    if buy_order is None:
+        logger.info(
+            "controlled_proof_owned_quantity_unresolved proof_id=%s reason=buy_lineage_unresolved",
+            proof.proof_id,
+        )
+        return Decimal("0")
+    buy_accounting = await _order_accounting(db=db, order=buy_order)
+    bought_quantity = sum(
+        (r.filled_quantity for r in buy_accounting
+         if r.side.upper() == "BUY" and r.record_type in QUANTITY_BEARING_RECORD_TYPES),
+        Decimal("0"),
+    )
+
+    sold_quantity = Decimal("0")
+    if proof.sell_package_id is not None:
+        _sell_package, _sell_claim, sell_order = await _proof_leg_lineage(
+            db=db, proof=proof, package_id=proof.sell_package_id, side="SELL",
+        )
+        if sell_order is not None:
+            sell_accounting = await _order_accounting(db=db, order=sell_order)
+            sold_quantity = sum(
+                (r.filled_quantity for r in sell_accounting
+                 if r.side.upper() == "SELL" and r.record_type in QUANTITY_BEARING_RECORD_TYPES),
+                Decimal("0"),
+            )
+
+    net_quantity = bought_quantity - sold_quantity
+    logger.info(
+        "controlled_proof_owned_quantity_resolved proof_id=%s bought_quantity=%s sold_quantity=%s net_quantity=%s",
+        proof.proof_id, bought_quantity, sold_quantity, net_quantity,
+    )
+    return net_quantity
+
+
 @dataclass(frozen=True, slots=True)
 class ControlledProofRiskOutcome:
     """Result of one genuine, fresh Risk Engine evaluation for a
