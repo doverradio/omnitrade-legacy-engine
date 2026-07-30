@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 import uuid
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
@@ -22,6 +23,8 @@ from app.models.live_reconciliation_event import LiveReconciliationEvent
 from app.services.live.position_quantity import compute_signed_owned_quantity
 from app.services.orchestration.reconciliation_guard import has_unresolved_reconciliation
 from app.services.position_lifecycle.source_adapter import _position_id, load_position_snapshots
+
+logger = logging.getLogger(__name__)
 
 _RECOVERABLE_PROOF_STATES = {"EXPIRED", "FAILED"}
 _ACTIVE_RECOVERY_STATES = {"AUTHORIZED", "IN_PROGRESS"}
@@ -592,6 +595,19 @@ async def project_blocked_exit_recovery_outcome(
         # order lineage and is a genuinely proven, reconciled result.
         # Fails closed (no mutation) on any missing/malformed/mismatched
         # field, or when the proof already carries a real verdict.
+        #
+        # proof.sell_live_crypto_order_id is only an opportunistic,
+        # denormalized read-side cache (see repair_controlled_proof_
+        # cached_order_ids's own docstring) -- for a proof reached purely
+        # through this historical sweep (never re-queried via
+        # get_controlled_proof_view since the BLOCKED transition), it can
+        # still be None/stale even though canonical lineage is complete.
+        # Confirmed root cause of a real production non-projection: the
+        # match below silently and permanently skipped backfill on every
+        # sweep pass, with no error, because this exact column was never
+        # refreshed. Repair it from canonical lineage before trusting it.
+        from app.services.controlled_proof.service import repair_controlled_proof_cached_order_ids
+        await repair_controlled_proof_cached_order_ids(db=db, proof=proof)
         payload = existing.after_state
         if (
             isinstance(payload, dict)
@@ -774,13 +790,40 @@ async def refresh_exit_recovery_outcomes(*, db: AsyncSession) -> None:
     recoveries = (await db.scalars(select(ControlledProofExitRecovery).where(
         ControlledProofExitRecovery.status.in_(("IN_PROGRESS", "EXPIRED", "BLOCKED")),
     ).order_by(ControlledProofExitRecovery.authorized_at.desc()))).all()
+    candidates = len(recoveries)
+    projected = 0
+    skipped = 0
+    failed = 0
     for recovery in recoveries:
-        proof = await db.scalar(select(ControlledProofRun).where(
-            ControlledProofRun.proof_id == recovery.proof_id,
-            ControlledProofRun.sell_package_id.is_not(None),
-        ).limit(1))
-        if proof is not None:
+        try:
+            proof = await db.scalar(select(ControlledProofRun).where(
+                ControlledProofRun.proof_id == recovery.proof_id,
+                ControlledProofRun.sell_package_id.is_not(None),
+            ).limit(1))
+            if proof is None:
+                skipped += 1
+                continue
             if recovery.status == "BLOCKED":
+                before_verdict = proof.terminal_verdict
                 await project_blocked_exit_recovery_outcome(db=db, recovery=recovery, proof=proof)
+                if proof.terminal_verdict != before_verdict:
+                    projected += 1
+                else:
+                    skipped += 1
             else:
+                before_status = recovery.status
                 await refresh_exit_recovery_completion(db=db, recovery=recovery, proof=proof)
+                if recovery.status != before_status:
+                    projected += 1
+                else:
+                    skipped += 1
+        except Exception:
+            failed += 1
+            logger.exception(
+                "exit_recovery_outcome_sweep_candidate_failed recovery_id=%s proof_id=%s",
+                recovery.recovery_id, recovery.proof_id,
+            )
+    logger.info(
+        "exit_recovery_outcome_sweep_completed candidates=%s projected=%s skipped=%s failed=%s",
+        candidates, projected, skipped, failed,
+    )
