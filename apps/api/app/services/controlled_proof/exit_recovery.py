@@ -585,6 +585,37 @@ async def project_blocked_exit_recovery_outcome(
         AuditLog.action == _RECOVERED_OUTCOME_ACTION,
     ).limit(1))
     if existing is not None:
+        # The audit row is never mutated or duplicated here -- only the
+        # proof's own net_pnl_usd/terminal_verdict may be backfilled from
+        # it, and only when every field proves this exact, already-
+        # published outcome belongs to this exact proof/recovery/package/
+        # order lineage and is a genuinely proven, reconciled result.
+        # Fails closed (no mutation) on any missing/malformed/mismatched
+        # field, or when the proof already carries a real verdict.
+        payload = existing.after_state
+        if (
+            isinstance(payload, dict)
+            and payload.get("status") == "COMPLETED_RECONCILED"
+            and payload.get("proof_id") == str(proof.proof_id)
+            and payload.get("original_recovery_id") == str(locked.recovery_id)
+            and proof.sell_package_id is not None
+            and payload.get("sell_package_id") == str(proof.sell_package_id)
+            and proof.sell_live_crypto_order_id is not None
+            and payload.get("sell_live_crypto_order_id") == str(proof.sell_live_crypto_order_id)
+            and payload.get("recovered_terminal_verdict") in {
+                "LIFECYCLE_PROVEN_PROFIT", "LIFECYCLE_PROVEN_LOSS", "LIFECYCLE_PROVEN_FLAT",
+            }
+            and proof.terminal_verdict not in {
+                "LIFECYCLE_PROVEN_PROFIT", "LIFECYCLE_PROVEN_LOSS", "LIFECYCLE_PROVEN_FLAT",
+            }
+        ):
+            try:
+                recovered_net_pnl = Decimal(str(payload.get("recovered_net_pnl_usd")))
+            except (TypeError, ArithmeticError, ValueError):
+                return True
+            proof.net_pnl_usd = recovered_net_pnl
+            proof.terminal_verdict = payload["recovered_terminal_verdict"]
+            proof.updated_at = _utcnow()
         return True
 
     packages = (await db.scalars(select(CanonicalPreviewPackage).where(
@@ -692,6 +723,23 @@ async def project_blocked_exit_recovery_outcome(
         return False
     net_pnl = sum((row.net_cash_impact for row in accounting), Decimal("0"))
     completed_at = _utcnow()
+    # The proof itself must finalize truthfully here, separately from the
+    # recovery's own immutable historical BLOCKED row (never mutated
+    # above). get_controlled_proof_view's terminal_verdict is frozen the
+    # first time it is computed (by design -- a real PROFIT/LOSS/FLAT
+    # verdict must never later flip) and, for a proof that reached this
+    # exact governed-replacement-SELL-filled state only after already
+    # expiring, that freeze can land on a stale "FAILED"/"BLOCKED" label
+    # written before this proven, reconciled outcome ever existed. Every
+    # invariant above (matching package/claim/order/reconciliation/
+    # accounting evidence, resolved reconciliation, zero owned quantity)
+    # is already exhaustively verified by this point, and this whole
+    # branch runs at most once (guarded by the existing-audit-row check
+    # above) -- so overwrite the proof's own net_pnl_usd/terminal_verdict
+    # with the real recovered outcome now. proof.status is left untouched.
+    proof.net_pnl_usd = net_pnl
+    proof.terminal_verdict = _recovered_verdict(net_pnl)
+    proof.updated_at = completed_at
     payload = {
         "status": "COMPLETED_RECONCILED",
         "original_recovery_id": str(locked.recovery_id),

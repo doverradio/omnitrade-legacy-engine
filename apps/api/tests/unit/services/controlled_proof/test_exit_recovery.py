@@ -349,6 +349,13 @@ async def test_blocked_recovery_projects_separate_reconciled_outcome(
 
     assert item.recovery.status == "BLOCKED"
     assert item.recovery.blocked_reason == "stale_sell_package_replacement_blocked"
+    # The proof finalizes truthfully -- separately from the recovery's own
+    # immutable BLOCKED row -- overwriting the stale "FAILED" verdict this
+    # fixture seeds (matching the confirmed production shape: an EXPIRED
+    # proof whose terminal_verdict was frozen to "FAILED" before the
+    # governed-replacement SELL ever filled).
+    assert item.proof.net_pnl_usd == net_pnl
+    assert item.proof.terminal_verdict == verdict
     audit = next(value for value in db.added if isinstance(value, AuditLog))
     assert audit.action == "controlled_proof_exit_recovery.recovered_outcome_published"
     assert audit.after_state["original_recovery_id"] == str(item.recovery.recovery_id)
@@ -365,6 +372,90 @@ async def test_blocked_recovery_projects_separate_reconciled_outcome(
         db=replay_db, recovery=item.recovery, proof=item.proof,
     ) is True
     assert replay_db.added == []
+    # Idempotent: replay short-circuits on the existing audit row and never
+    # recomputes or re-applies the proof finalization a second time.
+    assert item.proof.net_pnl_usd == net_pnl
+    assert item.proof.terminal_verdict == verdict
+
+
+@pytest.mark.asyncio
+async def test_existing_recovered_outcome_audit_backfills_null_proof_on_replay() -> None:
+    """Production upgrade case: the immutable recovered-outcome audit row
+    already exists (an older deploy published it before proof
+    finalization existed) while ControlledProofRun still shows
+    net_pnl_usd=null/terminal_verdict=FAILED. The existing-audit branch
+    must safely backfill the proof exactly once, without mutating or
+    duplicating the audit row."""
+    item = _blocked_projection_fixture(net_pnl=Decimal("0.16066"))
+    existing_audit = SimpleNamespace(
+        action="controlled_proof_exit_recovery.recovered_outcome_published",
+        after_state={
+            "status": "COMPLETED_RECONCILED",
+            "original_recovery_id": str(item.recovery.recovery_id),
+            "proof_id": str(item.proof.proof_id),
+            "sell_package_id": str(item.package.package_id),
+            "sell_live_crypto_order_id": str(item.order.live_crypto_order_id),
+            "recovered_terminal_verdict": "LIFECYCLE_PROVEN_PROFIT",
+            "recovered_net_pnl_usd": "0.16066",
+        },
+    )
+    item.proof.net_pnl_usd = None
+    item.proof.terminal_verdict = "FAILED"
+    db = _FakeDb([item.recovery, existing_audit])
+
+    assert await exit_recovery.project_blocked_exit_recovery_outcome(
+        db=db, recovery=item.recovery, proof=item.proof,
+    ) is True
+
+    assert db.added == []
+    assert item.proof.net_pnl_usd == Decimal("0.16066")
+    assert item.proof.terminal_verdict == "LIFECYCLE_PROVEN_PROFIT"
+
+    # Replay again: no additional audit row, values unchanged.
+    replay_db = _FakeDb([item.recovery, existing_audit])
+    assert await exit_recovery.project_blocked_exit_recovery_outcome(
+        db=replay_db, recovery=item.recovery, proof=item.proof,
+    ) is True
+    assert replay_db.added == []
+    assert item.proof.net_pnl_usd == Decimal("0.16066")
+    assert item.proof.terminal_verdict == "LIFECYCLE_PROVEN_PROFIT"
+
+
+@pytest.mark.asyncio
+async def test_existing_recovered_outcome_audit_fails_closed_on_mismatch_or_malformed_payload() -> None:
+    item = _blocked_projection_fixture(net_pnl=Decimal("0.16066"))
+    item.proof.net_pnl_usd = None
+    item.proof.terminal_verdict = "FAILED"
+    base_payload = {
+        "status": "COMPLETED_RECONCILED",
+        "original_recovery_id": str(item.recovery.recovery_id),
+        "proof_id": str(item.proof.proof_id),
+        "sell_package_id": str(item.package.package_id),
+        "sell_live_crypto_order_id": str(item.order.live_crypto_order_id),
+        "recovered_terminal_verdict": "LIFECYCLE_PROVEN_PROFIT",
+        "recovered_net_pnl_usd": "0.16066",
+    }
+    for broken in (
+        {**base_payload, "proof_id": str(uuid.uuid4())},
+        {**base_payload, "sell_package_id": str(uuid.uuid4())},
+        {**base_payload, "status": "SOMETHING_ELSE"},
+        {**base_payload, "recovered_terminal_verdict": "NOT_A_VERDICT"},
+        {**base_payload, "recovered_net_pnl_usd": "not-a-number"},
+        None,
+    ):
+        item.proof.net_pnl_usd = None
+        item.proof.terminal_verdict = "FAILED"
+        existing_audit = SimpleNamespace(
+            action="controlled_proof_exit_recovery.recovered_outcome_published", after_state=broken,
+        )
+        db = _FakeDb([item.recovery, existing_audit])
+
+        assert await exit_recovery.project_blocked_exit_recovery_outcome(
+            db=db, recovery=item.recovery, proof=item.proof,
+        ) is True
+        assert db.added == []
+        assert item.proof.net_pnl_usd is None
+        assert item.proof.terminal_verdict == "FAILED"
 
 
 @pytest.mark.asyncio
