@@ -60,6 +60,7 @@ from app.services.controlled_proof import (
     record_exit_recovery_waiting,
     refresh_exit_recovery_completion,
     refresh_exit_recovery_outcomes,
+    resolve_controlled_proof_leg_execution_lineage,
     resolve_controlled_proof_strategy_identity,
     should_propose_controlled_sell,
     supersede_stale_exit_recovery_sell_package,
@@ -1863,6 +1864,17 @@ def _redact_bound_params(params: object) -> object:
     return params
 
 
+# CanonicalPreviewPackage.package_state values a linked SELL package can
+# still legitimately progress from -- i.e. it has not yet reached a claim
+# (still PACKAGE_ONLY lineage) and has not been terminally resolved.
+# EXPIRED/INVALIDATED/SUPERSEDED/FAILED_CLOSED/COMPLETED are deliberately
+# excluded: those require the same operator-authorized exit-recovery
+# supersession this fix does not change.
+_SELL_PACKAGE_PROGRESSION_RETRYABLE_STATES = {
+    "CREATED", "READY", "AUTHORIZED", "DRY_RUN_PASSED", "ACTIVATED",
+}
+
+
 async def _attempt_operator_controlled_proof_entry(
     *, db: AsyncSession, proof_id: uuid.UUID | None = None,
     recovery_id: uuid.UUID | None = None,
@@ -1987,6 +1999,45 @@ async def _attempt_operator_controlled_proof_entry(
                         )
                         return
             else:
+                # Ordinary periodic supervision (no exit-recovery authority
+                # in play). A linked SELL package whose first _progress_
+                # package attempt did not reach ACTIVATED cleanly previously
+                # had no path back to execution here -- it sat as PACKAGE_
+                # ONLY forever, until an operator noticed and authorized
+                # exit-recovery, or the proof simply expired (confirmed
+                # production incident). Retry the same governed progression
+                # exactly once per cycle, but only when every condition
+                # below proves it is still safe and still this package's
+                # job to do: the package itself is loaded fresh, its state
+                # has not terminally resolved, its own authorization/
+                # preview window has not expired, and canonical lineage
+                # still shows no claim or order exists yet. Any other
+                # lineage state (claimed, ordered, or genuinely
+                # inconsistent) is left completely untouched -- retrying
+                # progression is never a substitute for exit-recovery
+                # supersession of a truly stale package.
+                sell_package = await db.get(CanonicalPreviewPackage, proof.sell_package_id)
+                if sell_package is not None and sell_package.package_state in _SELL_PACKAGE_PROGRESSION_RETRYABLE_STATES:
+                    authorization_expires_at = sell_package.authorization_expires_at
+                    normalized_authorization_expires_at = (
+                        authorization_expires_at.replace(tzinfo=timezone.utc)
+                        if authorization_expires_at is not None and authorization_expires_at.tzinfo is None
+                        else authorization_expires_at
+                    )
+                    not_yet_expired = (
+                        normalized_authorization_expires_at is None
+                        or normalized_authorization_expires_at > datetime.now(timezone.utc)
+                    )
+                    if not_yet_expired:
+                        sell_lineage = await resolve_controlled_proof_leg_execution_lineage(
+                            db=db, proof=proof, package_id=proof.sell_package_id, side="SELL",
+                        )
+                        if sell_lineage.state == "PACKAGE_ONLY":
+                            stage = "sell_package_progression_retry"
+                            await _progress_package(
+                                package_id=sell_package.package_id,
+                                decision_record_id=sell_package.decision_record_id,
+                            )
                 return
         is_sell = recovery is not None or proof.package_id is not None
         if is_sell:
