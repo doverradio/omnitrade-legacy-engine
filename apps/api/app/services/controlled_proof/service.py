@@ -1635,6 +1635,23 @@ async def _latest_order_reconciliation(
     )
 
 
+def _authoritative_fee_total(records: list[LiveAccountingRecord]) -> Decimal | None:
+    if not records:
+        return None
+    by_fill: dict[tuple[uuid.UUID | None, str], list[LiveAccountingRecord]] = {}
+    for record in records:
+        fill_identity = record.provider_fill_id or str(record.reconciliation_event_id)
+        by_fill.setdefault((record.live_crypto_order_id, fill_identity), []).append(record)
+    total = Decimal("0")
+    for fill_records in by_fill.values():
+        fee_attributions = [row for row in fill_records if row.record_type == "fee_attribution"]
+        authoritative = fee_attributions or [
+            row for row in fill_records if row.record_type in QUANTITY_BEARING_RECORD_TYPES
+        ]
+        total += sum((row.fee_amount for row in authoritative), Decimal("0"))
+    return total
+
+
 async def get_controlled_proof_view(*, db: AsyncSession, proof_id: uuid.UUID) -> dict[str, Any]:
     proof = await db.scalar(select(ControlledProofRun).where(ControlledProofRun.proof_id == proof_id))
     if proof is None:
@@ -1763,7 +1780,7 @@ async def get_controlled_proof_view(*, db: AsyncSession, proof_id: uuid.UUID) ->
             "opened_at": buy_accounting[0].recorded_at.isoformat() if buy_accounting[0].recorded_at else None,
         }
 
-    fees_usd = sum((r.fee_amount for r in accounting_records), Decimal("0")) if accounting_records else None
+    fees_usd = _authoritative_fee_total(accounting_records)
     # A BUY cash outflow is not proof P&L.  P&L exists only after both exact
     # proof legs have authoritative accounting and the proof-owned quantity
     # is closed.

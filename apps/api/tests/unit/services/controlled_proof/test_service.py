@@ -36,7 +36,7 @@ from app.models.risk_event import RiskEvent
 from app.models.strategy_roster_run import StrategyRosterRun
 from app.services.controlled_proof import service as controlled_proof_service
 from app.services.strategies.identity import build_strategy_identity
-from tests.support.real_sqlite_session import real_sqlite_session
+from tests.support.real_sqlite_session import real_sqlite_session, real_sqlite_session_factory
 
 _STRATEGY_IDENTITY = build_strategy_identity(slug="ma_crossover", module_version="1.0.0")
 _CAMPAIGN_ID = controlled_proof_service.ALLOWED_CAMPAIGN_ID
@@ -1541,6 +1541,17 @@ async def test_expired_proof_is_not_claimable_and_transitions_to_expired(monkeyp
 
 # --- status view: downstream linkage, reconciliation, net P&L derivation ------------
 
+
+def test_authoritative_fee_total_counts_paired_fill_and_fee_rows_once() -> None:
+    buy_order_id, sell_order_id = uuid.uuid4(), uuid.uuid4()
+    rows = [
+        SimpleNamespace(live_crypto_order_id=buy_order_id, provider_fill_id="buy-fill", reconciliation_event_id=uuid.uuid4(), record_type="fill_accounting", fee_amount=Decimal("0.04")),
+        SimpleNamespace(live_crypto_order_id=buy_order_id, provider_fill_id="buy-fill", reconciliation_event_id=uuid.uuid4(), record_type="fee_attribution", fee_amount=Decimal("0.04")),
+        SimpleNamespace(live_crypto_order_id=sell_order_id, provider_fill_id="sell-fill", reconciliation_event_id=uuid.uuid4(), record_type="fill_accounting", fee_amount=Decimal("0.03997")),
+        SimpleNamespace(live_crypto_order_id=sell_order_id, provider_fill_id="sell-fill", reconciliation_event_id=uuid.uuid4(), record_type="fee_attribution", fee_amount=Decimal("0.03997")),
+    ]
+    assert controlled_proof_service._authoritative_fee_total(rows) == Decimal("0.07997")
+
 @pytest.mark.asyncio
 async def test_status_view_never_borrows_cached_or_campaign_lineage(
     monkeypatch: pytest.MonkeyPatch,
@@ -1770,6 +1781,51 @@ async def test_status_view_computes_flat_verdict_from_real_fills(monkeypatch: py
         view = await controlled_proof_service.get_controlled_proof_view(db=session, proof_id=proof_id)
         assert view["net_pnl_usd"] == Decimal("0")
         assert view["terminal_verdict"] == "LIFECYCLE_PROVEN_FLAT"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("unresolved_side", ["BUY", "SELL"])
+async def test_post_sell_finalization_waits_for_both_latest_reconciliations_then_persists(
+    monkeypatch: pytest.MonkeyPatch,
+    unresolved_side: str,
+) -> None:
+    async with real_sqlite_session_factory(_ALL_TABLES) as session_factory:
+        async with session_factory() as session:
+            proof_id = await _seed_reconciled_round_trip(
+                session, monkeypatch, sell_net_cash_impact=Decimal("4.98"),
+                idempotency_prefix="proof-post-sell",
+            )
+
+            async def _unresolved(**kwargs):
+                status = "reconciliation_required" if kwargs["order"].side == unresolved_side else "filled"
+                return SimpleNamespace(reconciliation_status=status)
+
+            monkeypatch.setattr(controlled_proof_service, "_latest_order_reconciliation", _unresolved)
+            incomplete = await controlled_proof_service.get_controlled_proof_view(db=session, proof_id=proof_id)
+            assert incomplete["status"] == "EXITED"
+            assert incomplete["reconciliation"]["unresolved"] is True
+            assert incomplete["net_pnl_usd"] is None
+            assert incomplete["terminal_verdict"] is None
+
+        async with session_factory() as finalization_session:
+            async def _resolved(**_kwargs):
+                return SimpleNamespace(reconciliation_status="filled")
+
+            monkeypatch.setattr(controlled_proof_service, "_latest_order_reconciliation", _resolved)
+            completed = await controlled_proof_service.get_controlled_proof_view(
+                db=finalization_session, proof_id=proof_id,
+            )
+            assert completed["status"] == "RECONCILED"
+            assert completed["reconciliation"]["unresolved"] is False
+            assert completed["net_pnl_usd"] == Decimal("-0.04")
+            assert completed["terminal_verdict"] == "LIFECYCLE_PROVEN_LOSS"
+
+        async with session_factory() as replay_session:
+            replay = await controlled_proof_service.get_controlled_proof_view(
+                db=replay_session, proof_id=proof_id,
+            )
+            assert replay["net_pnl_usd"] == Decimal("-0.04")
+            assert replay["terminal_verdict"] == "LIFECYCLE_PROVEN_LOSS"
 
 
 @pytest.mark.asyncio
