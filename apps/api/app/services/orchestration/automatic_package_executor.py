@@ -355,11 +355,23 @@ async def execute_automatic_ready_package_through_activation(
         }
         configured_scope = [value is not None for value in scope_values.values()]
         if any(configured_scope) and not all(configured_scope):
+            logger.warning(
+                "automatic_package_progression_failed_closed campaign_id=%s campaign_version=%s decision_record_id=%s "
+                "package_id=%s reason=automatic_activation_scope_incomplete failed_closed=True",
+                request.campaign_id, request.campaign_version, request.decision_record_id, request.package_id,
+            )
             return _outcome(request=request, package=None, reason="automatic_activation_scope_incomplete", failed_closed=True)
         if all(configured_scope) and (
             request.campaign_id != scope_values["campaign_id"]
             or request.campaign_version != scope_values["campaign_version"]
         ):
+            logger.warning(
+                "automatic_package_progression_failed_closed campaign_id=%s campaign_version=%s decision_record_id=%s "
+                "package_id=%s reason=automatic_activation_campaign_scope_mismatch "
+                "configured_campaign_id=%s configured_campaign_version=%s failed_closed=True",
+                request.campaign_id, request.campaign_version, request.decision_record_id, request.package_id,
+                scope_values["campaign_id"], scope_values["campaign_version"],
+            )
             return _outcome(request=request, package=None, reason="automatic_activation_campaign_scope_mismatch", failed_closed=True)
 
         pinned_package_id = getattr(settings, "automatic_mandate_package_activation_package_id", None)
@@ -405,6 +417,14 @@ async def execute_automatic_ready_package_through_activation(
     starting_state = package.package_state
 
     if mandate_scope is not None and (package.mandate_id, package.mandate_version_id) != mandate_scope:
+        logger.warning(
+            "automatic_package_progression_failed_closed campaign_id=%s campaign_version=%s decision_record_id=%s "
+            "package_id=%s reason=automatic_activation_mandate_scope_mismatch "
+            "package_mandate_id=%s package_mandate_version_id=%s expected_mandate_id=%s expected_mandate_version_id=%s "
+            "failed_closed=True",
+            request.campaign_id, request.campaign_version, request.decision_record_id, request.package_id,
+            package.mandate_id, package.mandate_version_id, mandate_scope[0], mandate_scope[1],
+        )
         return _outcome(
             request=request, package=package, reason="automatic_activation_mandate_scope_mismatch",
             failed_closed=True, starting_state=starting_state,

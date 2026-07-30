@@ -1927,6 +1927,19 @@ async def _attempt_operator_controlled_proof_entry(
             )
             if claim_outcome.claim is not None:
                 await advance_claimed_execution(db=db, claim=claim_outcome.claim)
+        else:
+            # Observability only: execute_automatic_ready_package_through_activation
+            # did not report a clean ACTIVATED outcome, so nothing further in this
+            # branch ever runs (no claim, no advance, no provider call) -- previously
+            # this fell straight through to db.commit() with zero signal anywhere
+            # that the Ready Package was never consumed. No execution logic or
+            # fail-closed behavior changes here, only a named, grep-able log line.
+            logger.info(
+                "controlled_proof_package_activation_not_achieved proof_id=%s package_id=%s "
+                "activation_state=%s failed_closed=%s final_reason_code=%s starting_state=%s",
+                proof.proof_id, package_id, progression.activation_state,
+                progression.failed_closed, progression.final_reason_code, progression.starting_state,
+            )
         await db.commit()
     logger.info(
         "controlled_proof_selected_for_evaluation proof_id=%s proof_status=%s "
