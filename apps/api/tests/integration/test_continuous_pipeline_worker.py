@@ -8,13 +8,22 @@ from decimal import Decimal
 from types import SimpleNamespace
 
 import pytest
+from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError, PendingRollbackError
 
 from app.core.errors import InvalidRequestError
+from app.models.audit_log import AuditLog
+from app.models.autonomous_execution_claim import AutonomousExecutionClaim
+from app.models.canonical_preview_package import CanonicalPreviewPackage
+from app.models.controlled_proof_exit_recovery import ControlledProofExitRecovery
+from app.models.controlled_proof_run import ControlledProofRun
+from app.models.live_crypto_order import LiveCryptoOrder
+from app.services.controlled_proof import exit_recovery
 from app.services.orchestration.continuous_pipeline_worker import WorkerConfig, run_orchestration_cycle
 from app.services.strategies.base import Signal
 from app.services.strategies.registry import StrategyLookupError
 from app.services.strategy_roster.decision_aggregator import AGGREGATE_STRATEGY_SLUG
+from tests.support.real_sqlite_session import real_sqlite_session_factory
 
 
 class _FakeDB:
@@ -704,6 +713,7 @@ async def test_recovered_exit_recovery_outcome_sweep_runs_independent_of_reconci
     for a proof whose replacement SELL already reconciled before this
     process started. No order-submission path is touched by this sweep."""
     import app.services.orchestration.continuous_pipeline_worker as worker_module
+    from app.services.controlled_proof.exit_recovery import ExitRecoveryOutcomeSweepResult
 
     class _ScalarsCapableDB(_CampaignPreviewCapableDB):
         async def scalars(self, *_args, **_kwargs):
@@ -723,6 +733,7 @@ async def test_recovered_exit_recovery_outcome_sweep_runs_independent_of_reconci
 
     async def _sweep_spy(*, db):
         sweep_calls.append(db)
+        return ExitRecoveryOutcomeSweepResult(candidates=1, projected=1, skipped=0, failed=0)
 
     monkeypatch.setattr(worker_module, "refresh_exit_recovery_outcomes", _sweep_spy)
 
@@ -730,6 +741,124 @@ async def test_recovered_exit_recovery_outcome_sweep_runs_independent_of_reconci
 
     assert stats.ingestion_assets_ok == 1
     assert sweep_calls == [db]
+
+
+_SWEEP_PERSISTENCE_TABLES = [
+    AuditLog.__table__, AutonomousExecutionClaim.__table__, CanonicalPreviewPackage.__table__,
+    ControlledProofExitRecovery.__table__, ControlledProofRun.__table__, LiveCryptoOrder.__table__,
+]
+
+
+async def _seed_stuck_expired_proof(session_factory) -> tuple[uuid.UUID, uuid.UUID]:
+    proof_id, recovery_id, package_id, order_id = (
+        uuid.uuid4(), uuid.uuid4(), uuid.uuid4(), uuid.uuid4(),
+    )
+    async with session_factory() as seed_session:
+        seed_session.add(ControlledProofRun(
+            proof_id=proof_id, status="EXPIRED", provider="kraken_spot", environment="production",
+            campaign_id=uuid.uuid4(), campaign_version=1, product_id="BTC-USD",
+            max_notional_usd=Decimal("5"), idempotency_key=f"idem-{uuid.uuid4()}", requested_by="operator:alice",
+            expires_at=datetime.now(timezone.utc) - timedelta(minutes=5),
+            package_id=uuid.uuid4(), sell_package_id=package_id, sell_live_crypto_order_id=order_id,
+            net_pnl_usd=None, terminal_verdict="FAILED",
+        ))
+        seed_session.add(ControlledProofExitRecovery(
+            recovery_id=recovery_id, proof_id=proof_id, status="BLOCKED",
+            idempotency_key=f"idem-{uuid.uuid4()}", authorized_by="operator:alice",
+            authorized_at=datetime.now(timezone.utc), expires_at=datetime.now(timezone.utc) + timedelta(minutes=30),
+            blocked_reason="stale_sell_package_replacement_blocked:Stale SELL package has unresolved execution lineage",
+        ))
+        seed_session.add(AuditLog(
+            actor="system:controlled_proof_reconciliation_projector",
+            action=exit_recovery._RECOVERED_OUTCOME_ACTION,
+            entity_type="controlled_proof_exit_recovery", entity_id=recovery_id,
+            before_state={}, after_state={
+                "status": "COMPLETED_RECONCILED",
+                "original_recovery_id": str(recovery_id),
+                "proof_id": str(proof_id),
+                "sell_package_id": str(package_id),
+                "sell_live_crypto_order_id": str(order_id),
+                "recovered_terminal_verdict": "LIFECYCLE_PROVEN_LOSS",
+                "recovered_net_pnl_usd": "-0.0393333016409",
+            },
+        ))
+        await seed_session.commit()
+    return proof_id, recovery_id
+
+
+@pytest.mark.asyncio
+async def test_real_orchestration_cycle_durably_projects_stuck_proof_across_independent_sessions(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Reproduces the actual production path end to end: the real
+    run_orchestration_cycle entry point, with its real session/transaction
+    boundary, against a real database (not a fake). Proves whether a later
+    stage in the SAME cycle (on the SAME session) refreshes, expires,
+    overwrites, or otherwise undoes the sweep's proof mutation before the
+    cycle's own commit -- not just whether an isolated commit call
+    persists in isolation."""
+    import app.services.orchestration.continuous_pipeline_worker as worker_module
+
+    provider_calls: list[str] = []
+
+    async def _no_provider_call(*_args, **_kwargs):
+        provider_calls.append("submit")
+        raise AssertionError("no provider submission path may be invoked by this sweep")
+
+    monkeypatch.setattr(worker_module, "run_ingestion_cycle", _fake_ingestion_cycle)
+    monkeypatch.setattr(worker_module, "run_campaign_orchestration_preview_for_candle", _async_return({
+        "mode": "campaign_orchestration_preview", "trigger": "kraken_btc_15m_candle_close",
+        "ready": False, "reason": "latest_btc_15m_candle_not_found", "cycle_count": 0, "cycles": [],
+    }))
+    monkeypatch.setattr(worker_module, "_attempt_automatic_ready_package_creation", _async_return(None))
+    monkeypatch.setattr(worker_module, "_load_active_assets", _async_return([]))
+    monkeypatch.setattr(worker_module, "_load_active_strategies", _async_return([]))
+    monkeypatch.setattr(worker_module, "run_deterministic_research_cycle_if_due", _async_return(_not_due_research_result()))
+    monkeypatch.setattr(worker_module, "capture_system_intelligence_snapshot_if_due", _async_return(None))
+    # No provider/exchange client exists in this test at all; any attempt
+    # to reach one would raise AttributeError on object() well before this
+    # spy could even be reached -- present only as an explicit, asserted
+    # tripwire for requirement completeness.
+    monkeypatch.setattr(worker_module, "live_crypto_orders", SimpleNamespace(submit=_no_provider_call), raising=False)
+    monkeypatch.setattr(worker_module, "_record_research_cycle_status", _async_return(None))
+    monkeypatch.setattr(worker_module, "score_due_strategy_roster_proposal_outcomes", _async_return(
+        SimpleNamespace(scanned_proposals=0, inserted_outcomes=0, skipped_not_due=0, skipped_existing=0, skipped_missing_prices=0),
+    ))
+
+    async with real_sqlite_session_factory(_SWEEP_PERSISTENCE_TABLES) as session_factory:
+        proof_id, recovery_id = await _seed_stuck_expired_proof(session_factory)
+
+        async with session_factory() as cycle_session:
+            await run_orchestration_cycle(db=cycle_session, client=object(), config=_config())
+
+        assert provider_calls == []
+
+        async with session_factory() as read_session:
+            reloaded_proof = await read_session.get(ControlledProofRun, proof_id)
+            assert reloaded_proof.net_pnl_usd == Decimal("-0.0393333016")
+            assert reloaded_proof.terminal_verdict == "LIFECYCLE_PROVEN_LOSS"
+            reloaded_recovery = await read_session.get(ControlledProofExitRecovery, recovery_id)
+            assert reloaded_recovery.status == "BLOCKED"
+            outcome_audits = (await read_session.scalars(select(AuditLog).where(
+                AuditLog.entity_type == "controlled_proof_exit_recovery", AuditLog.entity_id == recovery_id,
+                AuditLog.action == exit_recovery._RECOVERED_OUTCOME_ACTION,
+            ))).all()
+            assert len(outcome_audits) == 1
+
+        # A second, complete cycle through another independent session:
+        # replay must be a no-op.
+        async with session_factory() as second_cycle_session:
+            await run_orchestration_cycle(db=second_cycle_session, client=object(), config=_config())
+
+        async with session_factory() as final_session:
+            final_proof = await final_session.get(ControlledProofRun, proof_id)
+            assert final_proof.net_pnl_usd == Decimal("-0.0393333016")
+            assert final_proof.terminal_verdict == "LIFECYCLE_PROVEN_LOSS"
+            outcome_audits = (await final_session.scalars(select(AuditLog).where(
+                AuditLog.entity_type == "controlled_proof_exit_recovery", AuditLog.entity_id == recovery_id,
+                AuditLog.action == exit_recovery._RECOVERED_OUTCOME_ACTION,
+            ))).all()
+            assert len(outcome_audits) == 1
 
 
 @pytest.mark.asyncio

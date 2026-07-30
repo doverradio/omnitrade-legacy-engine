@@ -93,3 +93,30 @@ async def real_sqlite_session(tables: Iterable[Table]) -> AsyncIterator[AsyncSes
             yield session
     finally:
         await engine.dispose()
+
+
+@asynccontextmanager
+async def real_sqlite_session_factory(tables: Iterable[Table]) -> AsyncIterator[async_sessionmaker]:
+    """Same real, in-memory sqlite setup as real_sqlite_session, but yields
+    the session factory itself instead of a single bound session -- for
+    tests that must prove state survives across a genuinely separate
+    AsyncSession (e.g. closing one session and opening a new one to prove
+    durable commit, not merely same-session visibility). StaticPool keeps
+    the single in-memory connection alive across every session opened from
+    this factory until the engine is disposed at context exit."""
+    tables = list(tables)
+    engine = create_async_engine("sqlite+aiosqlite:///:memory:", poolclass=StaticPool)
+
+    @event.listens_for(engine.sync_engine, "connect")
+    def _register_sqlite_functions(dbapi_conn, _record) -> None:
+        dbapi_conn.create_function("now", 0, lambda: datetime.now(timezone.utc).isoformat())
+        dbapi_conn.create_function("gen_random_uuid", 0, lambda: uuid.uuid4().hex)
+
+    async with engine.begin() as conn:
+        await conn.run_sync(tables[0].metadata.create_all, tables=tables)
+
+    session_factory = async_sessionmaker(engine, expire_on_commit=False, class_=AsyncSession)
+    try:
+        yield session_factory
+    finally:
+        await engine.dispose()

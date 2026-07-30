@@ -24,7 +24,7 @@ from app.models.live_crypto_order import LiveCryptoOrder
 from app.models.live_reconciliation_event import LiveReconciliationEvent
 from app.models.live_trading_profile import LiveTradingProfile
 from app.services.controlled_proof import exit_recovery
-from tests.support.real_sqlite_session import real_sqlite_session
+from tests.support.real_sqlite_session import real_sqlite_session, real_sqlite_session_factory
 
 _RECOVERY_ALL_TABLES = [
     Asset.__table__, AuditLog.__table__, AutonomousExecutionClaim.__table__, Candle.__table__,
@@ -1490,3 +1490,96 @@ async def test_sweep_projects_expired_proof_with_stale_cache_column_via_real_lin
             AuditLog.action == exit_recovery._RECOVERED_OUTCOME_ACTION,
         ))).all()
         assert len(replayed_audits) == 1
+
+
+@pytest.mark.asyncio
+async def test_sweep_projection_is_durably_committed_across_independent_sessions() -> None:
+    """Production defect: exit_recovery_outcome_sweep_completed reported
+    projected=2, but an independent read immediately afterward still
+    showed net_pnl_usd=null/terminal_verdict=FAILED -- the projector only
+    flushes (in-session visibility), and durability requires the caller's
+    own commit. This proves the real sweep entry point, followed by the
+    same commit call run_orchestration_cycle performs, is durably visible
+    to a completely separate, freshly opened AsyncSession -- not just the
+    session that ran it."""
+    campaign_id = uuid.uuid4()
+    package_id, order_id, recovery_id, proof_id = (
+        uuid.uuid4(), uuid.uuid4(), uuid.uuid4(), uuid.uuid4(),
+    )
+    tables = [
+        Asset.__table__, AuditLog.__table__, AutonomousExecutionClaim.__table__, Candle.__table__,
+        CanonicalPreviewPackage.__table__, ControlledProofExitRecovery.__table__, ControlledProofRun.__table__,
+        LiveAccountingRecord.__table__, LiveCryptoOrder.__table__, LiveReconciliationEvent.__table__,
+        LiveTradingProfile.__table__,
+    ]
+
+    async with real_sqlite_session_factory(tables) as session_factory:
+        async with session_factory() as write_session:
+            write_session.add(ControlledProofRun(
+                proof_id=proof_id, status="EXPIRED", provider="kraken_spot", environment="production",
+                campaign_id=campaign_id, campaign_version=1, product_id="BTC-USD",
+                max_notional_usd=Decimal("5"), idempotency_key=f"idem-{uuid.uuid4()}", requested_by="operator:alice",
+                expires_at=datetime.now(timezone.utc) - timedelta(minutes=5),
+                package_id=uuid.uuid4(), sell_package_id=package_id, sell_live_crypto_order_id=order_id,
+                net_pnl_usd=None, terminal_verdict="FAILED",
+            ))
+            write_session.add(ControlledProofExitRecovery(
+                recovery_id=recovery_id, proof_id=proof_id, status="BLOCKED",
+                idempotency_key=f"idem-{uuid.uuid4()}", authorized_by="operator:alice",
+                authorized_at=datetime.now(timezone.utc), expires_at=datetime.now(timezone.utc) + timedelta(minutes=30),
+                blocked_reason="stale_sell_package_replacement_blocked:Stale SELL package has unresolved execution lineage",
+            ))
+            write_session.add(AuditLog(
+                actor="system:controlled_proof_reconciliation_projector",
+                action=exit_recovery._RECOVERED_OUTCOME_ACTION,
+                entity_type="controlled_proof_exit_recovery", entity_id=recovery_id,
+                before_state={}, after_state={
+                    "status": "COMPLETED_RECONCILED",
+                    "original_recovery_id": str(recovery_id),
+                    "proof_id": str(proof_id),
+                    "sell_package_id": str(package_id),
+                    "sell_live_crypto_order_id": str(order_id),
+                    "recovered_terminal_verdict": "LIFECYCLE_PROVEN_LOSS",
+                    "recovered_net_pnl_usd": "-0.0393333016409",
+                },
+            ))
+            await write_session.commit()
+
+            # The real worker-level sweep entry point, followed by the
+            # exact same commit call run_orchestration_cycle's guarded
+            # hook performs -- commit ownership belongs to the caller.
+            result = await exit_recovery.refresh_exit_recovery_outcomes(db=write_session)
+            await write_session.commit()
+            assert result.projected == 1
+            assert result.failed == 0
+
+        # Close that session entirely; open a completely new, independent
+        # one from the same underlying database and reload.
+        async with session_factory() as read_session:
+            reloaded_proof = await read_session.get(ControlledProofRun, proof_id)
+            assert reloaded_proof.net_pnl_usd == Decimal("-0.0393333016")  # sqlite NUMERIC storage precision, not app logic
+            assert reloaded_proof.terminal_verdict == "LIFECYCLE_PROVEN_LOSS"
+            reloaded_recovery = await read_session.get(ControlledProofExitRecovery, recovery_id)
+            assert reloaded_recovery.status == "BLOCKED"
+            outcome_audits = (await read_session.scalars(select(AuditLog).where(
+                AuditLog.entity_type == "controlled_proof_exit_recovery", AuditLog.entity_id == recovery_id,
+                AuditLog.action == exit_recovery._RECOVERED_OUTCOME_ACTION,
+            ))).all()
+            assert len(outcome_audits) == 1
+
+        # Replay through yet another new session: no additional transition.
+        async with session_factory() as replay_session:
+            replay_result = await exit_recovery.refresh_exit_recovery_outcomes(db=replay_session)
+            await replay_session.commit()
+            assert replay_result.projected == 0
+            assert replay_result.skipped == 1
+
+        async with session_factory() as final_session:
+            final_proof = await final_session.get(ControlledProofRun, proof_id)
+            assert final_proof.net_pnl_usd == Decimal("-0.0393333016")  # sqlite NUMERIC storage precision, not app logic
+            assert final_proof.terminal_verdict == "LIFECYCLE_PROVEN_LOSS"
+            outcome_audits = (await final_session.scalars(select(AuditLog).where(
+                AuditLog.entity_type == "controlled_proof_exit_recovery", AuditLog.entity_id == recovery_id,
+                AuditLog.action == exit_recovery._RECOVERED_OUTCOME_ACTION,
+            ))).all()
+            assert len(outcome_audits) == 1

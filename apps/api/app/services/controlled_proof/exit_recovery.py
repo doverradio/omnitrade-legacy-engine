@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import logging
 import uuid
+from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 
@@ -785,8 +786,29 @@ async def project_blocked_exit_recovery_outcome(
     return True
 
 
-async def refresh_exit_recovery_outcomes(*, db: AsyncSession) -> None:
-    """Supervise post-package outcomes even after submission authority expires."""
+@dataclass(frozen=True, slots=True)
+class ExitRecoveryOutcomeSweepResult:
+    """Counts describe what this call *flushed* in-session, not what is
+    durably persisted -- this function never commits (see module-level
+    commit-ownership note on refresh_exit_recovery_outcomes). The caller
+    must only report/log these counts as authoritative after its own
+    surrounding db.commit() succeeds; a caller that logs them before or
+    without a successful commit misrepresents flushed-but-not-yet-durable
+    work as done."""
+
+    candidates: int
+    projected: int
+    skipped: int
+    failed: int
+
+
+async def refresh_exit_recovery_outcomes(*, db: AsyncSession) -> ExitRecoveryOutcomeSweepResult:
+    """Supervise post-package outcomes even after submission authority
+    expires. Flushes only -- never commits; commit ownership belongs to
+    the caller (run_orchestration_cycle), matching every adjacent sweep in
+    that function (sweep_stale_autonomous_execution_claims, poll_
+    unresolved_live_orders). Returns counts for the caller to log only
+    once its own commit has actually succeeded."""
     recoveries = (await db.scalars(select(ControlledProofExitRecovery).where(
         ControlledProofExitRecovery.status.in_(("IN_PROGRESS", "EXPIRED", "BLOCKED")),
     ).order_by(ControlledProofExitRecovery.authorized_at.desc()))).all()
@@ -823,7 +845,4 @@ async def refresh_exit_recovery_outcomes(*, db: AsyncSession) -> None:
                 "exit_recovery_outcome_sweep_candidate_failed recovery_id=%s proof_id=%s",
                 recovery.recovery_id, recovery.proof_id,
             )
-    logger.info(
-        "exit_recovery_outcome_sweep_completed candidates=%s projected=%s skipped=%s failed=%s",
-        candidates, projected, skipped, failed,
-    )
+    return ExitRecoveryOutcomeSweepResult(candidates=candidates, projected=projected, skipped=skipped, failed=failed)

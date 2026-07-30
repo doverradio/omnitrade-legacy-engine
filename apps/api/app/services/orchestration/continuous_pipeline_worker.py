@@ -2453,8 +2453,21 @@ async def run_orchestration_cycle(
     # project_blocked_exit_recovery_outcome.
     if hasattr(db, "scalars") and hasattr(db, "scalar") and hasattr(db, "commit"):
         try:
-            await refresh_exit_recovery_outcomes(db=db)
+            sweep_result = await refresh_exit_recovery_outcomes(db=db)
+            # Commit ownership stays here, matching every adjacent sweep
+            # above -- refresh_exit_recovery_outcomes only flushes. The
+            # completion log is deliberately emitted only after this
+            # commit succeeds: reporting "projected" from in-session
+            # flushed state before it is durably committed previously
+            # misrepresented flushed-but-not-yet-persisted work as done
+            # (confirmed production defect -- the sweep logged
+            # projected=2 while a later, independent read still showed
+            # the pre-projection proof values).
             await db.commit()
+            logger.info(
+                "exit_recovery_outcome_sweep_completed candidates=%s projected=%s skipped=%s failed=%s",
+                sweep_result.candidates, sweep_result.projected, sweep_result.skipped, sweep_result.failed,
+            )
         except Exception:
             await _rollback_active_session(db=db)
             logger.exception("recovered_exit_recovery_outcome_sweep_failed")
