@@ -26,6 +26,7 @@ from app.services.controlled_proof.service import (
     repair_controlled_proof_cached_order_ids,
     resolve_controlled_proof_leg_execution_lineage,
 )
+from app.services.mandates.contracts import MANDATE_PURPOSE_CONTROLLED_PROOF
 
 logger = logging.getLogger(__name__)
 
@@ -459,6 +460,22 @@ async def execute_automatic_ready_package_through_activation(
                     package_id=package.package_id,
                     idempotency_key=_phase_key(package_id=package.package_id, phase="authorize"),
                     software_build_version=request.software_build_version,
+                    # CONTROLLED_PROOF_DERIVED_SCOPE already resolved and
+                    # persisted the exact mandate this package must be
+                    # authorized under (see _resolve_controlled_proof_
+                    # activation_scope) -- constrain selection to it instead
+                    # of the general ACTIVE/LEVEL_2/scope search, which a
+                    # concurrently ACTIVE ordinary-production mandate for the
+                    # identical provider/environment/connection/profile/
+                    # paper_account/campaign can otherwise make ambiguous.
+                    # None for every other (ordinary automatic) caller,
+                    # leaving that search entirely unchanged.
+                    expected_mandate_id=(
+                        controlled_proof_scope.mandate_id if controlled_proof_scope is not None else None
+                    ),
+                    expected_mandate_purpose=(
+                        MANDATE_PURPOSE_CONTROLLED_PROOF if controlled_proof_scope is not None else None
+                    ),
                 ),
             )
             logger.info(

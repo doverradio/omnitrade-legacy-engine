@@ -86,6 +86,9 @@ class _FakeDb:
         self._execute_rows.clear()
         return _FakeResult(rows)
 
+    async def get(self, _model, _ident):
+        return self._scalar_values.pop(0) if self._scalar_values else None
+
 
 def _async_return(value: object):
     async def _inner(**_kwargs):
@@ -2523,7 +2526,7 @@ def _mandate_authority_fixture() -> tuple[SimpleNamespace, ...]:
         exchange_environment=package.environment, exchange_connection_id=connection_id,
         live_trading_profile_id=package.live_trading_profile_id, paper_account_id=package.paper_account_id,
         capital_campaign_id=runtime.id, revoked_at=None, expires_at=now + timedelta(hours=1),
-        created_at=now,
+        created_at=now, purpose="PRODUCTION",
     )
     authorization = SimpleNamespace(
         mandate_version_id=uuid4(), authorization_state="AUTHORIZED", revoked_at=None,
@@ -2689,6 +2692,122 @@ async def test_mandate_package_authority_requires_exactly_one_match(monkeypatch:
             request=cpp.CanonicalPreviewPackageMandateAuthorizeRequest(package_id=package.package_id, idempotency_key=f"count-{mandate_count}"),
         )
     assert package.package_state == "READY"
+
+
+@pytest.mark.asyncio
+async def test_expected_mandate_id_selects_exact_mandate_and_never_runs_the_ambiguous_scope_search(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Reproduces the exact production defect: a second, ordinary-production
+    mandate is ACTIVE for the identical scope (it would appear in the
+    scope-only query's execute_rows, making it ambiguous), but supplying
+    expected_mandate_id/expected_mandate_purpose bypasses that search
+    entirely and selects the Controlled-Proof-dedicated mandate directly."""
+    package, runtime, mandate, authorization, version, strategy, _evaluation = _mandate_authority_fixture()
+    mandate.purpose = "CONTROLLED_PROOF"
+    monkeypatch.setattr(cpp, "_load_package", _async_return(package))
+    # execute_rows deliberately left empty: if the fix regressed and still
+    # fell through to the scope-only search, that search would find zero
+    # rows here and raise "no matching ACTIVE LEVEL_2 mandate" -- proving
+    # the ambiguous search path is never reached when expected_mandate_id is set.
+    db = _FakeDb(scalar_values=[runtime, mandate, authorization, version, strategy], execute_rows=[])
+
+    result = await cpp.authorize_canonical_preview_package_under_mandate(
+        db=db,
+        request=cpp.CanonicalPreviewPackageMandateAuthorizeRequest(
+            package_id=package.package_id, idempotency_key="controlled-proof-expected-mandate",
+            expected_mandate_id=mandate.mandate_id, expected_mandate_purpose="CONTROLLED_PROOF",
+        ),
+    )
+
+    assert result["approval_result"] == "APPROVAL_SATISFIED_BY_ACTIVE_MANDATE"
+    assert package.package_state == "AUTHORIZED"
+    assert package.mandate_id == mandate.mandate_id
+
+
+@pytest.mark.asyncio
+async def test_expected_mandate_id_rejects_purpose_mismatch(monkeypatch: pytest.MonkeyPatch) -> None:
+    package, runtime, mandate, _authorization, _version, _strategy, _evaluation = _mandate_authority_fixture()
+    mandate.purpose = "PRODUCTION"
+    monkeypatch.setattr(cpp, "_load_package", _async_return(package))
+    db = _FakeDb(scalar_values=[runtime, mandate])
+
+    with pytest.raises(PermissionError, match="expected mandate purpose mismatch"):
+        await cpp.authorize_canonical_preview_package_under_mandate(
+            db=db,
+            request=cpp.CanonicalPreviewPackageMandateAuthorizeRequest(
+                package_id=package.package_id, idempotency_key="wrong-purpose",
+                expected_mandate_id=mandate.mandate_id, expected_mandate_purpose="CONTROLLED_PROOF",
+            ),
+        )
+    assert package.package_state == "READY"
+    assert package.authorization_source is None
+
+
+@pytest.mark.asyncio
+async def test_expected_mandate_id_not_found_fails_closed(monkeypatch: pytest.MonkeyPatch) -> None:
+    package, runtime, _mandate, _authorization, _version, _strategy, _evaluation = _mandate_authority_fixture()
+    monkeypatch.setattr(cpp, "_load_package", _async_return(package))
+    db = _FakeDb(scalar_values=[runtime, None])
+
+    with pytest.raises(PermissionError, match="expected mandate not found"):
+        await cpp.authorize_canonical_preview_package_under_mandate(
+            db=db,
+            request=cpp.CanonicalPreviewPackageMandateAuthorizeRequest(
+                package_id=package.package_id, idempotency_key="missing-expected-mandate",
+                expected_mandate_id=uuid4(), expected_mandate_purpose="CONTROLLED_PROOF",
+            ),
+        )
+    assert package.package_state == "READY"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("mutation", "expected"),
+    [
+        ("status", "expected mandate does not permit unattended authorization"),
+        ("autonomy_level", "expected mandate does not permit unattended authorization"),
+    ],
+)
+async def test_expected_mandate_id_requires_active_level2(
+    monkeypatch: pytest.MonkeyPatch, mutation: str, expected: str,
+) -> None:
+    package, runtime, mandate, _authorization, _version, _strategy, _evaluation = _mandate_authority_fixture()
+    if mutation == "status":
+        mandate.status = "PAUSED"
+    else:
+        mandate.autonomy_level = "LEVEL_1"
+    monkeypatch.setattr(cpp, "_load_package", _async_return(package))
+    db = _FakeDb(scalar_values=[runtime, mandate])
+
+    with pytest.raises(PermissionError, match=expected):
+        await cpp.authorize_canonical_preview_package_under_mandate(
+            db=db,
+            request=cpp.CanonicalPreviewPackageMandateAuthorizeRequest(
+                package_id=package.package_id, idempotency_key=f"expected-mandate-{mutation}",
+                expected_mandate_id=mandate.mandate_id,
+            ),
+        )
+    assert package.package_state == "READY"
+
+
+@pytest.mark.asyncio
+async def test_ordinary_selection_path_unaffected_when_expected_mandate_id_omitted(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Normal autonomous production authorization never supplies
+    expected_mandate_id -- confirms the original scope-only search still
+    runs unchanged and still resolves the single matching ACTIVE LEVEL_2
+    mandate exactly as before this fix."""
+    package, runtime, mandate, authorization, version, strategy, _evaluation = _mandate_authority_fixture()
+    monkeypatch.setattr(cpp, "_load_package", _async_return(package))
+    db = _FakeDb(scalar_values=[runtime, authorization, version, strategy], execute_rows=[mandate])
+
+    result = await cpp.authorize_canonical_preview_package_under_mandate(
+        db=db,
+        request=cpp.CanonicalPreviewPackageMandateAuthorizeRequest(package_id=package.package_id, idempotency_key="ordinary-path"),
+    )
+
+    assert result["approval_result"] == "APPROVAL_SATISFIED_BY_ACTIVE_MANDATE"
+    assert package.mandate_id == mandate.mandate_id
 
 
 def _mark_package_mandate_authorized(

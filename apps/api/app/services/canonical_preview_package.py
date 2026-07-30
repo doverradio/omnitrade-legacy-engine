@@ -134,6 +134,19 @@ class CanonicalPreviewPackageMandateAuthorizeRequest:
     package_id: uuid.UUID
     idempotency_key: str
     software_build_version: str | None = None
+    # When supplied, mandate selection is constrained to exactly this mandate
+    # (plus expected_mandate_purpose, if given) instead of the general
+    # ACTIVE/LEVEL_2/scope search below -- used by Controlled Proof, whose
+    # package already carries its own dedicated, already-resolved mandate
+    # identity (package.mandate_id, set at package-creation time from the
+    # Controlled-Proof-purpose mandate evaluation), so authorization must
+    # never re-derive "the" mandate from scope alone once a second,
+    # ordinary-production mandate can legitimately be ACTIVE for the exact
+    # same provider/environment/connection/profile/paper_account/campaign.
+    # None (the default) preserves the original, unmodified scope-only
+    # search for every other caller.
+    expected_mandate_id: uuid.UUID | None = None
+    expected_mandate_purpose: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -1677,29 +1690,49 @@ async def authorize_canonical_preview_package_under_mandate(
     except ValueError as exc:
         raise PermissionError("package exchange connection identity invalid") from exc
 
-    statement = (
-        select(AutonomousCapitalMandate)
-        .where(
-            AutonomousCapitalMandate.status == "ACTIVE",
-            AutonomousCapitalMandate.autonomy_level == "LEVEL_2",
-            AutonomousCapitalMandate.provider == package.provider,
-            AutonomousCapitalMandate.exchange_environment == package.environment,
-            AutonomousCapitalMandate.exchange_connection_id == connection_id,
-            AutonomousCapitalMandate.live_trading_profile_id == package.live_trading_profile_id,
-            AutonomousCapitalMandate.paper_account_id == package.paper_account_id,
-            AutonomousCapitalMandate.capital_campaign_id == runtime_campaign.id,
+    if request.expected_mandate_id is not None:
+        # Constrained selection: the caller (Controlled Proof, via
+        # execute_automatic_ready_package_through_activation) already
+        # resolved and persisted the exact mandate this package must be
+        # authorized under -- select by that identity alone, never by an
+        # ACTIVE/LEVEL_2/scope search that a second, ordinary-production
+        # mandate active for the identical scope could make ambiguous.
+        # Every downstream check below (revoked/expired/exact-identity/
+        # authorization/version/static capital+strategy checks) still runs
+        # unchanged against whatever mandate this resolves to -- this only
+        # changes how the candidate mandate is found, never what makes it
+        # eligible.
+        mandate = await db.get(AutonomousCapitalMandate, request.expected_mandate_id)
+        if mandate is None:
+            raise PermissionError("expected mandate not found")
+        if mandate.status != "ACTIVE" or mandate.autonomy_level != "LEVEL_2":
+            raise PermissionError("expected mandate does not permit unattended authorization")
+        if request.expected_mandate_purpose is not None and mandate.purpose != request.expected_mandate_purpose:
+            raise PermissionError("expected mandate purpose mismatch")
+    else:
+        statement = (
+            select(AutonomousCapitalMandate)
+            .where(
+                AutonomousCapitalMandate.status == "ACTIVE",
+                AutonomousCapitalMandate.autonomy_level == "LEVEL_2",
+                AutonomousCapitalMandate.provider == package.provider,
+                AutonomousCapitalMandate.exchange_environment == package.environment,
+                AutonomousCapitalMandate.exchange_connection_id == connection_id,
+                AutonomousCapitalMandate.live_trading_profile_id == package.live_trading_profile_id,
+                AutonomousCapitalMandate.paper_account_id == package.paper_account_id,
+                AutonomousCapitalMandate.capital_campaign_id == runtime_campaign.id,
+            )
+            .order_by(AutonomousCapitalMandate.created_at.asc())
+            .limit(2)
         )
-        .order_by(AutonomousCapitalMandate.created_at.asc())
-        .limit(2)
-    )
-    mandates = list((await db.execute(statement)).scalars().all())
-    if not mandates:
-        raise PermissionError("no matching ACTIVE LEVEL_2 mandate")
-    if len(mandates) != 1:
-        raise PermissionError("ambiguous matching ACTIVE LEVEL_2 mandates")
-    mandate = mandates[0]
-    if mandate.status != "ACTIVE" or mandate.autonomy_level != "LEVEL_2":
-        raise PermissionError("matching mandate does not permit unattended authorization")
+        mandates = list((await db.execute(statement)).scalars().all())
+        if not mandates:
+            raise PermissionError("no matching ACTIVE LEVEL_2 mandate")
+        if len(mandates) != 1:
+            raise PermissionError("ambiguous matching ACTIVE LEVEL_2 mandates")
+        mandate = mandates[0]
+        if mandate.status != "ACTIVE" or mandate.autonomy_level != "LEVEL_2":
+            raise PermissionError("matching mandate does not permit unattended authorization")
     if mandate.revoked_at is not None:
         raise PermissionError("matching mandate is revoked")
     if mandate.expires_at is not None and mandate.expires_at <= now:
