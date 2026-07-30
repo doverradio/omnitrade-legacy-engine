@@ -19,9 +19,12 @@ from app.schemas.live_crypto_orders import (
     LiveCryptoOrderReconcileRequest,
     LiveCryptoOrderReconcileResponse,
     LiveCryptoOrderResponse,
+    LiveCryptoOrderStaleViqcCorrectionRequest,
+    LiveCryptoOrderStaleViqcCorrectionResponse,
     LiveCryptoOrderSubmitRequest,
     LiveCryptoOrderSubmitResponse,
 )
+from app.services.live.reconciliation_correction import correct_stale_viqc_reconciliation
 from app.services.live_crypto_orders import service
 
 router = APIRouter(prefix="/live-crypto-orders", tags=["live-crypto-orders"])
@@ -96,6 +99,39 @@ async def reconcile_live_crypto_order(
     if current_user["id"] != payload.operator_identity:
         raise UnauthorizedError(message="Authenticated operator identity mismatch", details={})
     return await service.reconcile(db=db, live_crypto_order_id=live_crypto_order_id, request=payload)
+
+
+@router.post(
+    "/{live_crypto_order_id}/correct-stale-viqc-reconciliation",
+    response_model=LiveCryptoOrderStaleViqcCorrectionResponse,
+)
+async def correct_live_crypto_order_stale_viqc_reconciliation(
+    live_crypto_order_id: uuid.UUID,
+    payload: LiveCryptoOrderStaleViqcCorrectionRequest,
+    current_user: dict[str, str] = Depends(get_authorized_operator),
+    db: AsyncSession = Depends(get_db),
+) -> LiveCryptoOrderStaleViqcCorrectionResponse:
+    if current_user["id"] != payload.operator_identity:
+        raise UnauthorizedError(message="Authenticated operator identity mismatch", details={})
+    outcome = await correct_stale_viqc_reconciliation(
+        db=db,
+        live_crypto_order_id=live_crypto_order_id,
+        operator_identity=payload.operator_identity,
+        dry_run=payload.dry_run,
+    )
+    return LiveCryptoOrderStaleViqcCorrectionResponse(
+        eligible=outcome.eligible,
+        applied=outcome.applied,
+        already_applied=outcome.already_applied,
+        blocked_reason=outcome.blocked_reason,
+        live_crypto_order_id=outcome.live_crypto_order_id,
+        provider_order_id=outcome.provider_order_id,
+        prior_effective_status=outcome.prior_effective_status,
+        provider_confirmed_status=outcome.provider_confirmed_status,
+        reconciliation_event_id=outcome.reconciliation_event_id,
+        idempotency_key=outcome.idempotency_key,
+        checked_at=outcome.checked_at,
+    )
 
 
 @router.post("/{live_crypto_order_id}/cancel", response_model=LiveCryptoOrderResponse)

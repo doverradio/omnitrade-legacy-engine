@@ -195,3 +195,25 @@ class LiveCryptoOrderReconcileResponse(BaseModel):
     provider_fees: str | None = None
     net_quote_capital_effect: str | None = None
     safe_provider_response: dict[str, Any]
+
+
+class LiveCryptoOrderStaleViqcCorrectionRequest(BaseModel):
+    operator_identity: str = Field(min_length=1, max_length=120)
+    # When true, every eligibility check (including the live provider
+    # lookup) runs, but nothing is appended -- callers get a definitive
+    # eligible/blocked answer without any risk of mutating state.
+    dry_run: bool = False
+
+
+class LiveCryptoOrderStaleViqcCorrectionResponse(BaseModel):
+    eligible: bool
+    applied: bool
+    already_applied: bool
+    blocked_reason: str | None
+    live_crypto_order_id: UUID
+    provider_order_id: str | None
+    prior_effective_status: str | None
+    provider_confirmed_status: str | None
+    reconciliation_event_id: UUID | None
+    idempotency_key: str
+    checked_at: datetime

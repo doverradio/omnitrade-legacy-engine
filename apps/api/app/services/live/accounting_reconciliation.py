@@ -148,7 +148,7 @@ def _event_is_stale(*, now: datetime, observed_at: datetime | None, max_age_seco
     return (now - observed_at).total_seconds() > max_age_seconds
 
 
-async def _resolve_campaign_for_live_order(
+async def resolve_campaign_for_live_order(
     *,
     db: AsyncSession,
     live_order: LiveCryptoOrder,
@@ -191,7 +191,7 @@ async def _resolve_campaign_for_live_order(
     return campaign, "verified"
 
 
-async def _ensure_execution_source(
+async def ensure_execution_source(
     *,
     db: AsyncSession,
     live_order: LiveCryptoOrder,
@@ -355,8 +355,8 @@ async def reconcile_live_order_and_fills(
     if profile is None:
         raise LookupError("live trading profile not found")
 
-    source_event = await _ensure_execution_source(db=db, live_order=live_order, profile=profile)
-    campaign, campaign_correlation_status = await _resolve_campaign_for_live_order(
+    source_event = await ensure_execution_source(db=db, live_order=live_order, profile=profile)
+    campaign, campaign_correlation_status = await resolve_campaign_for_live_order(
         db=db,
         live_order=live_order,
         profile=profile,
