@@ -1727,3 +1727,131 @@ async def test_fill_reconciliation_persistence_failure_propagates_without_commit
         )
 
     assert session.commits == 0
+
+
+# --- regression: FILLED must never regress on a later, worse observation -----------
+
+@pytest.mark.asyncio
+async def test_filled_order_never_regresses_on_bad_reconciliation_reread(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Confirmed production regression: filled -> partially_filled ->
+    reconciliation_required. A later reconciliation pass whose own fresh
+    provider read reports something other than "filled" must never
+    downgrade an order that already reached genuine, provider-confirmed
+    economic finality."""
+    session, live_order = _build_reconciliation_fixture(monkeypatch)
+    live_order.status = "FILLED"
+    live_order.provider_order_id = "provider-order-1"
+
+    class _RegressedProvider(_NoSubmitProvider):
+        async def get_historical_order(self, **_kwargs):
+            return {
+                "order": {
+                    "order_id": "provider-order-1",
+                    "client_order_id": "client-order-1",
+                    "product_id": "BTC-USD",
+                    "status": "OPEN",
+                    "completion_time": "2026-07-10T12:05:00Z",
+                }
+            }, {}
+
+        async def list_historical_fills(self, **_kwargs):
+            return {"fills": []}, {}
+
+    monkeypatch.setattr(
+        "app.services.live.accounting_reconciliation.get_exchange_provider",
+        lambda *_args, **_kwargs: _RegressedProvider(),
+    )
+
+    outcome = await reconcile_live_order_and_fills(
+        db=session,
+        live_crypto_order_id=live_order.live_crypto_order_id,
+        operator_identity="operator:human",
+    )
+
+    assert outcome["reconciliation_status"] == "FILLED"
+    assert live_order.status == "FILLED"
+    assert len(session.reconciliation_events) == 1
+    event = session.reconciliation_events[0]
+    assert event.reconciliation_status == "filled"
+    assert event.provenance["reason"] == "regression_blocked_reaffirmed_filled"
+    assert event.provenance["attempted_provider_status"] == "OPEN"
+
+
+@pytest.mark.asyncio
+async def test_filled_order_regression_block_repeats_idempotently(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Two identical bad re-reads on the same day must not create duplicate
+    regression-blocked audit rows -- the append-only trail records one
+    truthful entry per distinct observation, not one per poll attempt."""
+    session, live_order = _build_reconciliation_fixture(monkeypatch)
+    live_order.status = "FILLED"
+    live_order.provider_order_id = "provider-order-1"
+    monkeypatch.setattr(
+        "app.services.live.accounting_reconciliation._utcnow",
+        lambda: datetime(2026, 7, 10, 12, 0, 0, tzinfo=timezone.utc),
+    )
+
+    class _RegressedProvider(_NoSubmitProvider):
+        async def get_historical_order(self, **_kwargs):
+            return {
+                "order": {
+                    "order_id": "provider-order-1",
+                    "client_order_id": "client-order-1",
+                    "product_id": "BTC-USD",
+                    "status": "OPEN",
+                    "completion_time": "2026-07-10T12:05:00Z",
+                }
+            }, {}
+
+        async def list_historical_fills(self, **_kwargs):
+            return {"fills": []}, {}
+
+    monkeypatch.setattr(
+        "app.services.live.accounting_reconciliation.get_exchange_provider",
+        lambda *_args, **_kwargs: _RegressedProvider(),
+    )
+
+    first = await reconcile_live_order_and_fills(
+        db=session, live_crypto_order_id=live_order.live_crypto_order_id, operator_identity="operator:human",
+    )
+    second = await reconcile_live_order_and_fills(
+        db=session, live_crypto_order_id=live_order.live_crypto_order_id, operator_identity="operator:human",
+    )
+
+    assert first["reconciliation_status"] == "FILLED"
+    assert second["reconciliation_status"] == "FILLED"
+    assert live_order.status == "FILLED"
+    assert len(session.reconciliation_events) == 1
+
+
+@pytest.mark.asyncio
+async def test_filled_order_never_regresses_when_provider_order_becomes_unmatched(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The same guard must also hold for the earlier identity-resolution
+    exit paths (provider order not found / client-order-id conflict /
+    provider-order-id conflict) -- not just the main normalized-status
+    branch."""
+    session, live_order = _build_reconciliation_fixture(monkeypatch)
+    live_order.status = "FILLED"
+    live_order.provider_order_id = "provider-order-1"
+
+    class _NotFoundProvider(_NoSubmitProvider):
+        async def get_historical_order(self, **_kwargs):
+            return {}, {}
+
+        async def list_historical_fills(self, **_kwargs):
+            return {"fills": []}, {}
+
+    monkeypatch.setattr(
+        "app.services.live.accounting_reconciliation.get_exchange_provider",
+        lambda *_args, **_kwargs: _NotFoundProvider(),
+    )
+
+    outcome = await reconcile_live_order_and_fills(
+        db=session,
+        live_crypto_order_id=live_order.live_crypto_order_id,
+        operator_identity="operator:human",
+    )
+
+    assert outcome["reconciliation_status"] == "FILLED"
+    assert live_order.status == "FILLED"
+    assert session.reconciliation_events[0].reconciliation_status == "filled"
+    assert session.reconciliation_events[0].provenance["attempted_reason"] == "provider_order_not_found"

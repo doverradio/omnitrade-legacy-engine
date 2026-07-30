@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 import uuid
 from datetime import datetime, timezone
 from decimal import Decimal
@@ -28,6 +29,20 @@ from app.services.live.contracts import (
     LiveOrderReconciliationRequest,
     LiveReconciliationResult,
 )
+
+logger = logging.getLogger(__name__)
+
+# The one order status representing genuine, provider-confirmed economic
+# finality: every unit of the order's requested size has been executed.
+# Once reached, it is the authoritative terminal reconciliation result for
+# this order -- nothing may ever downgrade it again, regardless of what a
+# later provider read, balance check, or campaign-correlation check reports.
+# CANCELLED/REJECTED/EXPIRED are deliberately NOT included here: a fully
+# filled order can never legitimately become "not filled" again, but this
+# guard is scoped exactly to the confirmed regression (filled -> partially_
+# filled -> reconciliation_required), not a broader redesign of every
+# terminal-status transition.
+_AUTHORITATIVE_FILLED_STATUS = "FILLED"
 
 
 def build_live_reconciliation_idempotency_key(
@@ -242,6 +257,69 @@ async def _ensure_execution_source(
     return event
 
 
+async def _reaffirm_filled_and_block_regression(
+    *,
+    db: AsyncSession,
+    live_order: LiveCryptoOrder,
+    profile: LiveTradingProfile,
+    source_event: LiveExecutionEvent,
+    campaign: CapitalCampaign | None,
+    operator_identity: str,
+    attempted_reason: str,
+    attempted_provider_status: str | None,
+) -> dict[str, object]:
+    """Called whenever this reconciliation pass's own fresh evidence would
+    downgrade an order away from FILLED. Never rewrites or deletes any
+    existing row -- the append-only reconciliation audit trail gains one
+    more truthful row recording exactly what this pass observed and why it
+    was rejected -- but the row's reconciliation_status is pinned to the
+    already-proven "filled" outcome, and live_order.status is left/restored
+    at FILLED, so every downstream reader that trusts "the latest event"
+    (Controlled Proof's projection, has_unresolved_reconciliation, the
+    scheduler's own discovery query) continues to see the correct,
+    authoritative terminal result instead of a transient regression."""
+    logger.warning(
+        "live_order_reconciliation_regression_blocked live_crypto_order_id=%s "
+        "previous_status=%s attempted_provider_status=%s reason=%s",
+        live_order.live_crypto_order_id, _AUTHORITATIVE_FILLED_STATUS,
+        attempted_provider_status, attempted_reason,
+    )
+    await record_live_order_reconciliation(
+        db=db,
+        request=LiveOrderReconciliationRequest(
+            live_trading_profile_id=profile.id,
+            source_execution_event_id=source_event.id,
+            provider_name=live_order.provider,
+            provider_order_id=live_order.provider_order_id,
+            client_order_id=live_order.client_order_id,
+            reconciliation_status="filled",
+            live_crypto_order_id=live_order.live_crypto_order_id,
+            capital_campaign_id=None if campaign is None else campaign.id,
+            provider_recorded_at=None,
+            requested_by=operator_identity,
+            provenance_metadata={
+                "reason": "regression_blocked_reaffirmed_filled",
+                "attempted_reason": attempted_reason,
+                "attempted_provider_status": attempted_provider_status,
+            },
+            idempotency_key=(
+                f"lco-reconcile:{live_order.live_crypto_order_id}:regression-blocked:"
+                f"{attempted_reason}:{_utcnow().date().isoformat()}"
+            ),
+        ),
+    )
+    live_order.status = _AUTHORITATIVE_FILLED_STATUS
+    live_order.updated_at = _utcnow()
+    await db.flush()
+    return {
+        "reconciliation_status": live_order.status,
+        "provider_status": live_order.provider_status,
+        "provider_order_id": live_order.provider_order_id,
+        "provider_fill_observed": True,
+        "safe_provider_response": _safe_json((live_order.safe_provider_response or {}).get("reconciliation", {})),
+    }
+
+
 async def reconcile_live_order_and_fills(
     *,
     db: AsyncSession,
@@ -255,6 +333,7 @@ async def reconcile_live_order_and_fills(
     )
     if live_order is None:
         raise LookupError("live crypto order not found")
+    previous_status = live_order.status
 
     profile_id_raw = (live_order.safe_provider_response or {}).get("live_trading_profile_id")
     profile_id: uuid.UUID | None = None
@@ -351,6 +430,12 @@ async def reconcile_live_order_and_fills(
                 raw=payload,
             )
     if provider_order is None:
+        if previous_status == _AUTHORITATIVE_FILLED_STATUS:
+            return await _reaffirm_filled_and_block_regression(
+                db=db, live_order=live_order, profile=profile, source_event=source_event,
+                campaign=campaign, operator_identity=operator_identity,
+                attempted_reason="provider_order_not_found", attempted_provider_status=None,
+            )
         await record_live_order_reconciliation(
             db=db,
             request=LiveOrderReconciliationRequest(
@@ -373,6 +458,13 @@ async def reconcile_live_order_and_fills(
         return {"reconciliation_status": live_order.status, "provider_status": live_order.provider_status, "provider_order_id": live_order.provider_order_id, "provider_fill_observed": False, "safe_provider_response": {"reason": "provider_order_not_found"}}
 
     if provider_order.client_order_id and provider_order.client_order_id != provider_client_order_id:
+        if previous_status == _AUTHORITATIVE_FILLED_STATUS:
+            return await _reaffirm_filled_and_block_regression(
+                db=db, live_order=live_order, profile=profile, source_event=source_event,
+                campaign=campaign, operator_identity=operator_identity,
+                attempted_reason="provider_client_order_id_conflict",
+                attempted_provider_status=provider_order.status,
+            )
         live_order.status = "RECONCILIATION_REQUIRED"
         live_order.failure_code = "provider_client_order_id_conflict"
         live_order.failure_reason = json.dumps(
@@ -406,6 +498,13 @@ async def reconcile_live_order_and_fills(
 
     discovered_provider_order_id = provider_order.provider_order_id
     if discovered_provider_order_id and live_order.provider_order_id and live_order.provider_order_id != discovered_provider_order_id:
+        if previous_status == _AUTHORITATIVE_FILLED_STATUS:
+            return await _reaffirm_filled_and_block_regression(
+                db=db, live_order=live_order, profile=profile, source_event=source_event,
+                campaign=campaign, operator_identity=operator_identity,
+                attempted_reason="provider_order_id_conflict",
+                attempted_provider_status=provider_order.status,
+            )
         await record_live_order_reconciliation(
             db=db,
             request=LiveOrderReconciliationRequest(
@@ -434,6 +533,21 @@ async def reconcile_live_order_and_fills(
     provider_status_raw = provider_order.status
     normalized_status = _normalize_provider_status(provider_status=provider_status_raw)
     provider_recorded_at = provider_order.submitted_at
+
+    if previous_status == _AUTHORITATIVE_FILLED_STATUS and normalized_status != "filled":
+        # The order already reached genuine, provider-confirmed economic
+        # finality on an earlier pass. This pass's own fresh provider read
+        # says otherwise (e.g. a transient/eventual-consistency provider
+        # response, or a stale snapshot) -- never let a single later
+        # observation overwrite already-proven fill evidence. This is the
+        # exact regression confirmed in production: filled -> partially_
+        # filled -> reconciliation_required.
+        return await _reaffirm_filled_and_block_regression(
+            db=db, live_order=live_order, profile=profile, source_event=source_event,
+            campaign=campaign, operator_identity=operator_identity,
+            attempted_reason=f"provider_status_regression:{normalized_status}",
+            attempted_provider_status=provider_status_raw,
+        )
 
     order_reconciliation = await record_live_order_reconciliation(
         db=db,
@@ -748,6 +862,24 @@ async def reconcile_live_order_and_fills(
                 idempotency_key=f"lco-reconcile:{live_order.live_crypto_order_id}:audit-unresolved",
             ),
         )
+
+    # Defense in depth: this pass's own fresh provider read already
+    # reconfirmed "filled" above (the early regression guard would have
+    # returned before here otherwise), but the balance-mismatch,
+    # campaign-correlation, and audit-persistence-failure branches above can
+    # each independently set live_order.status back to RECONCILIATION_
+    # REQUIRED for their own (real) reasons. None of them may downgrade an
+    # order that was already authoritatively FILLED on a prior pass -- those
+    # conditions get recorded as reconciliation events (already written
+    # above) for investigation, but never regress the order's own terminal
+    # status.
+    if previous_status == _AUTHORITATIVE_FILLED_STATUS and live_order.status != _AUTHORITATIVE_FILLED_STATUS:
+        logger.warning(
+            "live_order_reconciliation_regression_blocked live_crypto_order_id=%s "
+            "previous_status=%s attempted_status=%s reason=post_fill_check_downgrade",
+            live_order.live_crypto_order_id, _AUTHORITATIVE_FILLED_STATUS, live_order.status,
+        )
+        live_order.status = _AUTHORITATIVE_FILLED_STATUS
 
     if accounting_completion_status == "complete":
         # A prior pass may have appended an unresolved balance event after
