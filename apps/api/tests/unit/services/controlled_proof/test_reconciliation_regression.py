@@ -24,6 +24,7 @@ from app.models.live_reconciliation_event import LiveReconciliationEvent
 from app.models.live_trading_profile import LiveTradingProfile
 from app.services.controlled_proof.service import get_controlled_proof_view, should_propose_controlled_sell
 from app.services.live.accounting_reconciliation import reconcile_live_order_and_fills
+from app.services.orchestration.reconciliation_guard import has_unresolved_reconciliation
 from tests.support.real_sqlite_session import real_sqlite_session
 
 # LiveAuditEvidenceRecord is excluded for the same reason as
@@ -319,3 +320,60 @@ async def test_controlled_proof_sell_eligibility_survives_blocked_regression_att
         )
         assert latest_reconciliation is not None
         assert latest_reconciliation.reconciliation_status == "filled"
+
+
+@pytest.mark.asyncio
+async def test_viqc_buy_reconciliation_clears_unresolved_gate_and_sell_becomes_eligible(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The confirmed production incident: a Kraken quote-sized (viqc) market
+    BUY's raw "vol" is quote-currency (USD), not base-currency (BTC). Before
+    the fix, comparing that raw quantity against base-currency fill sizes
+    permanently misclassified the fill as partial, leaving the order's
+    latest reconciliation event at "partially_filled" -- which is exactly
+    what the worker's unresolved-reconciliation gate (the same
+    has_unresolved_reconciliation this test calls directly) checks before
+    ever proposing a SELL. This proves the gate now clears end-to-end for a
+    genuinely fully filled viqc BUY, so the Controlled Proof SELL becomes
+    eligible without any separate cache-repair step."""
+    async with _real_session() as session:
+        connection = await _seed_connection(session)
+        profile = await _seed_live_profile(session)
+        proof, order = await _seed_proof_with_pending_buy(session, connection=connection, profile=profile)
+
+        viqc_order = _FakeProviderOrder(
+            provider_order_id=_PROVIDER_ORDER_ID, client_order_id=None, product_id=None, side="BUY",
+            status="FILLED", submitted_at=datetime.now(timezone.utc) - timedelta(minutes=5), acknowledged_at=None,
+            raw={
+                "descr": {"pair": "XBTUSD", "type": "buy", "ordertype": "market"},
+                "oflags": "fciq,viqc", "vol": "5.00000000", "cost": "5.00000000", "status": "closed",
+            },
+        )
+        provider = _FakeProvider(order=viqc_order, fills=[_buy_fill()])
+        _patch_provider(monkeypatch, provider, connection=connection)
+
+        result = await reconcile_live_order_and_fills(
+            db=session, live_crypto_order_id=order.live_crypto_order_id, operator_identity=_ACTOR,
+        )
+        assert result["reconciliation_status"] == "FILLED"
+        await session.commit()
+
+        fill_record = await session.scalar(
+            select(LiveAccountingRecord).where(
+                LiveAccountingRecord.live_crypto_order_id == order.live_crypto_order_id,
+                LiveAccountingRecord.record_type.in_(("fill_accounting", "partial_fill_accounting")),
+            )
+        )
+        assert fill_record is not None
+        assert fill_record.record_type == "fill_accounting"
+
+        assert await has_unresolved_reconciliation(
+            db=session, provider="kraken_spot", environment="production", product="BTC-USD",
+        ) is False
+
+        refreshed_proof = await session.get(ControlledProofRun, proof.proof_id)
+        assert await should_propose_controlled_sell(db=session, proof=refreshed_proof) is True
+
+        view = await get_controlled_proof_view(db=session, proof_id=proof.proof_id)
+        assert view["buy_order"]["status"] == "FILLED"
+        assert view["reconciliation"]["unresolved"] is False

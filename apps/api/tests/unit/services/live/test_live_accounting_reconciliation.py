@@ -1855,3 +1855,160 @@ async def test_filled_order_never_regresses_when_provider_order_becomes_unmatche
     assert live_order.status == "FILLED"
     assert session.reconciliation_events[0].reconciliation_status == "filled"
     assert session.reconciliation_events[0].provenance["attempted_reason"] == "provider_order_not_found"
+
+
+class _KrakenFakeFee:
+    def __init__(self, amount: Decimal, currency: str) -> None:
+        self.amount = amount
+        self.currency = currency
+
+
+class _KrakenFakeFill:
+    def __init__(self, *, provider_fill_id: str, provider_order_id: str, size: Decimal, price: Decimal, fee: _KrakenFakeFee) -> None:
+        self.provider_fill_id = provider_fill_id
+        self.provider_order_id = provider_order_id
+        self.product_id = "BTC-USD"
+        self.size = size
+        self.price = price
+        self.fee = fee
+        self.occurred_at = datetime.now(timezone.utc)
+        self.raw: dict[str, Any] = {}
+
+
+class _KrakenViqcOrder:
+    """Mirrors what KrakenSpotClient.lookup_order already returns for a
+    quote-sized (viqc) market BUY: status is already correctly resolved
+    (via _kraken_execution_progress's vol/vol_exec-or-cost comparison), but
+    raw["vol"] remains quote-currency (USD), not base-currency (BTC)."""
+
+    def __init__(self, *, provider_order_id: str, status: str) -> None:
+        self.provider_order_id = provider_order_id
+        self.client_order_id = None
+        self.product_id = None
+        self.side = "BUY"
+        self.status = status
+        self.submitted_at = datetime.now(timezone.utc)
+        self.acknowledged_at = None
+        self.raw = {
+            "descr": {"pair": "XBTUSD", "type": "buy", "ordertype": "market"},
+            "oflags": "fciq,viqc",
+            "vol": "5.00000000",
+            "cost": "5.00000000",
+            "status": "closed" if status == "FILLED" else "open",
+        }
+
+
+class _KrakenLookupProvider(_NoSubmitProvider):
+    def __init__(self, *, order: _KrakenViqcOrder | None, fills: list[_KrakenFakeFill]) -> None:
+        self.order = order
+        self.fills = fills
+
+    async def lookup_order(self, **_kwargs):
+        return self.order
+
+    async def list_fills(self, **_kwargs):
+        return self.fills
+
+
+@pytest.mark.asyncio
+async def test_viqc_fully_filled_kraken_buy_classified_as_filled_not_partial(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The confirmed viqc bug: raw "vol" for a Kraken quote-sized market BUY
+    is in quote currency (USD), while fill sizes are in base currency (BTC).
+    Comparing them directly would make cumulative < order_quantity forever,
+    permanently misclassifying a genuinely fully filled order as partial.
+    Reconciliation must instead trust the provider's own already-correct
+    FILLED verdict (provider_order.status / normalized_status) rather than
+    re-deriving completeness from the raw quote-vs-base quantity field."""
+    session, live_order = _build_reconciliation_fixture(monkeypatch)
+    live_order.provider = "kraken_spot"
+    live_order.provider_order_id = None
+
+    provider = _KrakenLookupProvider(
+        order=_KrakenViqcOrder(provider_order_id="OQF3Z4-FA5SW-LSIQCE", status="FILLED"),
+        fills=[_KrakenFakeFill(
+            provider_fill_id="fill-1", provider_order_id="OQF3Z4-FA5SW-LSIQCE",
+            size=Decimal("0.0001"), price=Decimal("50000.00"), fee=_KrakenFakeFee(Decimal("0.01"), "USD"),
+        )],
+    )
+    monkeypatch.setattr("app.services.live.accounting_reconciliation.get_exchange_provider", lambda *_a, **_k: provider)
+
+    outcome = await reconcile_live_order_and_fills(
+        db=session, live_crypto_order_id=live_order.live_crypto_order_id, operator_identity="operator:human",
+    )
+
+    assert outcome["reconciliation_status"] == "FILLED"
+    fill_accounting = [r for r in session.accounting_records if r.record_type in {"fill_accounting", "partial_fill_accounting"}]
+    assert len(fill_accounting) == 1
+    assert fill_accounting[0].record_type == "fill_accounting"
+    fill_events = [e for e in session.reconciliation_events if e.event_type == "fill_reconciled"]
+    assert len(fill_events) == 1
+    assert fill_events[0].reconciliation_status == "filled"
+
+
+@pytest.mark.asyncio
+async def test_genuinely_partial_kraken_viqc_buy_remains_partial(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The fix must not blur genuine partial fills: when the provider's own
+    status is not yet FILLED, existing (unchanged) classification behavior
+    applies and the order/fill remain partial."""
+    session, live_order = _build_reconciliation_fixture(monkeypatch)
+    live_order.provider = "kraken_spot"
+    live_order.provider_order_id = None
+
+    provider = _KrakenLookupProvider(
+        order=_KrakenViqcOrder(provider_order_id="OPARTIAL-1", status="PARTIALLY_FILLED"),
+        fills=[_KrakenFakeFill(
+            provider_fill_id="fill-1", provider_order_id="OPARTIAL-1",
+            size=Decimal("0.00005"), price=Decimal("50000.00"), fee=_KrakenFakeFee(Decimal("0.005"), "USD"),
+        )],
+    )
+    monkeypatch.setattr("app.services.live.accounting_reconciliation.get_exchange_provider", lambda *_a, **_k: provider)
+
+    outcome = await reconcile_live_order_and_fills(
+        db=session, live_crypto_order_id=live_order.live_crypto_order_id, operator_identity="operator:human",
+    )
+
+    assert outcome["reconciliation_status"] == "PARTIALLY_FILLED"
+    fill_accounting = [r for r in session.accounting_records if r.record_type in {"fill_accounting", "partial_fill_accounting"}]
+    assert len(fill_accounting) == 1
+    assert fill_accounting[0].record_type == "partial_fill_accounting"
+    fill_events = [e for e in session.reconciliation_events if e.event_type == "fill_reconciled"]
+    assert fill_events[0].reconciliation_status == "partially_filled"
+
+
+@pytest.mark.asyncio
+async def test_viqc_filled_classification_still_protected_by_regression_guard(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The viqc classification fix and the terminal-FILLED regression guard
+    must compose correctly: once a viqc BUY is correctly reconciled as
+    FILLED (via this fix), a later worse/stale provider re-read must still
+    never downgrade it."""
+    session, live_order = _build_reconciliation_fixture(monkeypatch)
+    live_order.provider = "kraken_spot"
+    live_order.provider_order_id = None
+
+    provider = _KrakenLookupProvider(
+        order=_KrakenViqcOrder(provider_order_id="OQF3Z4-FA5SW-LSIQCE", status="FILLED"),
+        fills=[_KrakenFakeFill(
+            provider_fill_id="fill-1", provider_order_id="OQF3Z4-FA5SW-LSIQCE",
+            size=Decimal("0.0001"), price=Decimal("50000.00"), fee=_KrakenFakeFee(Decimal("0.01"), "USD"),
+        )],
+    )
+    monkeypatch.setattr("app.services.live.accounting_reconciliation.get_exchange_provider", lambda *_a, **_k: provider)
+
+    first = await reconcile_live_order_and_fills(
+        db=session, live_crypto_order_id=live_order.live_crypto_order_id, operator_identity="operator:human",
+    )
+    assert first["reconciliation_status"] == "FILLED"
+    assert live_order.status == "FILLED"
+
+    provider.order = _KrakenViqcOrder(provider_order_id="OQF3Z4-FA5SW-LSIQCE", status="OPEN")
+    provider.fills = []
+
+    second = await reconcile_live_order_and_fills(
+        db=session, live_crypto_order_id=live_order.live_crypto_order_id, operator_identity="operator:human",
+    )
+
+    assert second["reconciliation_status"] == "FILLED"
+    assert live_order.status == "FILLED"
+    latest_event = session.reconciliation_events[-1]
+    assert latest_event.reconciliation_status == "filled"
+    assert latest_event.provenance["reason"] == "regression_blocked_reaffirmed_filled"

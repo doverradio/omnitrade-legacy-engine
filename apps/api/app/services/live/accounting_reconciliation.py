@@ -611,9 +611,25 @@ async def reconcile_live_order_and_fills(
             (_decimal(fill.size) for fill in fills if fill.provider_fill_id is not None and _decimal(fill.size) > Decimal("0")),
             Decimal("0"),
         )
-        provider_order_quantity_raw = provider_order.raw.get("vol") if isinstance(provider_order.raw, dict) else None
-        provider_order_quantity = _decimal(provider_order_quantity_raw) if provider_order_quantity_raw is not None else Decimal("0")
-        order_fill_quantity = provider_order_quantity if provider_order_quantity > Decimal("0") else valid_fill_quantity
+        if normalized_status == "filled":
+            # normalized_status is this provider's own canonical execution-
+            # completeness result (e.g. Kraken's lookup_order already
+            # resolves quote-sized "viqc" market BUYs correctly by comparing
+            # vol against vol_exec-or-cost in matching units -- see
+            # _kraken_execution_progress). Once the provider has already
+            # authoritatively said "filled", reuse that single result rather
+            # than re-deriving completeness here from a raw provider field
+            # (Kraken's "vol") whose unit -- base or quote currency --
+            # depends on order-shape details generic accounting code has no
+            # business reinterpreting. Without this, a fully executed viqc
+            # BUY compares quote-currency "vol" against base-currency fill
+            # sizes and can never reach it, permanently misclassifying every
+            # fill as partial.
+            order_fill_quantity = valid_fill_quantity
+        else:
+            provider_order_quantity_raw = provider_order.raw.get("vol") if isinstance(provider_order.raw, dict) else None
+            provider_order_quantity = _decimal(provider_order_quantity_raw) if provider_order_quantity_raw is not None else Decimal("0")
+            order_fill_quantity = provider_order_quantity if provider_order_quantity > Decimal("0") else valid_fill_quantity
         cumulative = Decimal("0")
         for index, fill in enumerate(fills):
             provider_fill_id = fill.provider_fill_id
