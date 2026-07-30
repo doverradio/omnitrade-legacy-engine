@@ -374,7 +374,7 @@ async def test_blocked_recovery_projects_separate_reconciled_outcome(
     replay_db = _FakeDb([item.recovery, audit])
     assert await exit_recovery.project_blocked_exit_recovery_outcome(
         db=replay_db, recovery=item.recovery, proof=item.proof,
-    ) is True
+    ) is False
     assert replay_db.added == []
     # Idempotent: replay short-circuits on the existing audit row and never
     # recomputes or re-applies the proof finalization a second time.
@@ -422,7 +422,7 @@ async def test_existing_recovered_outcome_audit_backfills_null_proof_on_replay(m
     replay_db = _FakeDb([item.recovery, existing_audit])
     assert await exit_recovery.project_blocked_exit_recovery_outcome(
         db=replay_db, recovery=item.recovery, proof=item.proof,
-    ) is True
+    ) is False
     assert replay_db.added == []
     assert item.proof.net_pnl_usd == Decimal("0.16066")
     assert item.proof.terminal_verdict == "LIFECYCLE_PROVEN_PROFIT"
@@ -462,7 +462,7 @@ async def test_existing_recovered_outcome_audit_fails_closed_on_mismatch_or_malf
 
         assert await exit_recovery.project_blocked_exit_recovery_outcome(
             db=db, recovery=item.recovery, proof=item.proof,
-        ) is True
+        ) is False
         assert db.added == []
         assert item.proof.net_pnl_usd is None
         assert item.proof.terminal_verdict == "FAILED"

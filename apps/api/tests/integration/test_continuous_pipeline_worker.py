@@ -8,7 +8,7 @@ from decimal import Decimal
 from types import SimpleNamespace
 
 import pytest
-from sqlalchemy import select
+from sqlalchemy import event, select
 from sqlalchemy.exc import IntegrityError, PendingRollbackError
 
 from app.core.errors import InvalidRequestError
@@ -828,10 +828,33 @@ async def test_real_orchestration_cycle_durably_projects_stuck_proof_across_inde
     async with real_sqlite_session_factory(_SWEEP_PERSISTENCE_TABLES) as session_factory:
         proof_id, recovery_id = await _seed_stuck_expired_proof(session_factory)
 
+        proof_updates: list[str] = []
+        original_projector = exit_recovery.project_blocked_exit_recovery_outcome
+
+        async def _project_and_require_update(**kwargs):
+            before = len(proof_updates)
+            projected = await original_projector(**kwargs)
+            if projected:
+                assert len(proof_updates) == before + 1
+            return projected
+
+        monkeypatch.setattr(exit_recovery, "project_blocked_exit_recovery_outcome", _project_and_require_update)
+
         async with session_factory() as cycle_session:
+            @event.listens_for(cycle_session.bind.sync_engine, "after_cursor_execute")
+            def _capture_proof_update(_conn, _cursor, statement, _parameters, _context, _executemany):
+                normalized = " ".join(statement.lower().split())
+                if (
+                    normalized.startswith("update controlled_proof_runs")
+                    and "net_pnl_usd" in normalized
+                    and "terminal_verdict" in normalized
+                ):
+                    proof_updates.append(statement)
+
             await run_orchestration_cycle(db=cycle_session, client=object(), config=_config())
 
         assert provider_calls == []
+        assert len(proof_updates) == 1
 
         async with session_factory() as read_session:
             reloaded_proof = await read_session.get(ControlledProofRun, proof_id)
@@ -849,6 +872,7 @@ async def test_real_orchestration_cycle_durably_projects_stuck_proof_across_inde
         # replay must be a no-op.
         async with session_factory() as second_cycle_session:
             await run_orchestration_cycle(db=second_cycle_session, client=object(), config=_config())
+        assert len(proof_updates) == 1
 
         async with session_factory() as final_session:
             final_proof = await final_session.get(ControlledProofRun, proof_id)

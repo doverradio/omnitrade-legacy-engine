@@ -6,8 +6,8 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 
-from sqlalchemy import select
-from sqlalchemy.exc import IntegrityError
+from sqlalchemy import inspect, select
+from sqlalchemy.exc import IntegrityError, NoInspectionAvailable
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.errors import InvalidRequestError, NotFoundError
@@ -566,6 +566,25 @@ def _recovered_verdict(net_pnl: Decimal) -> str:
     return "LIFECYCLE_PROVEN_FLAT"
 
 
+async def _flush_and_verify_proof_projection(
+    *, db: AsyncSession, proof: ControlledProofRun, net_pnl: Decimal, verdict: str,
+) -> bool:
+    """Flush the proof UPDATE and verify its transaction-local row state."""
+    if not isinstance(db, AsyncSession):
+        await db.flush()
+        return True
+    await db.flush([proof])
+    persisted = (await db.execute(select(
+        ControlledProofRun.net_pnl_usd,
+        ControlledProofRun.terminal_verdict,
+    ).where(ControlledProofRun.proof_id == proof.proof_id))).one_or_none()
+    if persisted is None or persisted.terminal_verdict != verdict or persisted.net_pnl_usd is None:
+        return False
+    if db.bind is not None and db.bind.dialect.name == "sqlite":
+        return abs(persisted.net_pnl_usd - net_pnl) < Decimal("0.0000000001")
+    return persisted.net_pnl_usd == net_pnl
+
+
 async def project_blocked_exit_recovery_outcome(
     *, db: AsyncSession, recovery: ControlledProofExitRecovery, proof: ControlledProofRun,
 ) -> bool:
@@ -577,6 +596,16 @@ async def project_blocked_exit_recovery_outcome(
     row is the projection and the historical BLOCKED row is never mutated.
     """
     if recovery.status != "BLOCKED":
+        return False
+    try:
+        proof_state = inspect(proof)
+    except NoInspectionAvailable:
+        proof_state = None
+    if proof_state is not None and (
+        not proof_state.persistent
+        or proof_state.detached
+        or proof_state.session is not db.sync_session
+    ):
         return False
     locked = await db.scalar(select(ControlledProofExitRecovery).where(
         ControlledProofExitRecovery.recovery_id == recovery.recovery_id,
@@ -629,11 +658,15 @@ async def project_blocked_exit_recovery_outcome(
             try:
                 recovered_net_pnl = Decimal(str(payload.get("recovered_net_pnl_usd")))
             except (TypeError, ArithmeticError, ValueError):
-                return True
+                return False
             proof.net_pnl_usd = recovered_net_pnl
             proof.terminal_verdict = payload["recovered_terminal_verdict"]
             proof.updated_at = _utcnow()
-        return True
+            return await _flush_and_verify_proof_projection(
+                db=db, proof=proof, net_pnl=recovered_net_pnl,
+                verdict=payload["recovered_terminal_verdict"],
+            )
+        return False
 
     packages = (await db.scalars(select(CanonicalPreviewPackage).where(
         CanonicalPreviewPackage.side == "SELL",
@@ -783,7 +816,9 @@ async def project_blocked_exit_recovery_outcome(
         after_state=payload,
     ))
     await db.flush()
-    return True
+    return await _flush_and_verify_proof_projection(
+        db=db, proof=proof, net_pnl=net_pnl, verdict=_recovered_verdict(net_pnl),
+    )
 
 
 @dataclass(frozen=True, slots=True)
@@ -826,9 +861,8 @@ async def refresh_exit_recovery_outcomes(*, db: AsyncSession) -> ExitRecoveryOut
                 skipped += 1
                 continue
             if recovery.status == "BLOCKED":
-                before_verdict = proof.terminal_verdict
-                await project_blocked_exit_recovery_outcome(db=db, recovery=recovery, proof=proof)
-                if proof.terminal_verdict != before_verdict:
+                persisted = await project_blocked_exit_recovery_outcome(db=db, recovery=recovery, proof=proof)
+                if persisted:
                     projected += 1
                 else:
                     skipped += 1
