@@ -19,6 +19,7 @@ from app.models.candle import Candle
 from app.models.canonical_preview_package import CanonicalPreviewPackage
 from app.models.controlled_proof_exit_recovery import ControlledProofExitRecovery
 from app.models.controlled_proof_run import ControlledProofRun
+from app.models.decision_record import DecisionRecord
 from app.models.live_accounting_record import LiveAccountingRecord
 from app.models.live_crypto_order import LiveCryptoOrder
 from app.models.live_reconciliation_event import LiveReconciliationEvent
@@ -29,7 +30,7 @@ from tests.support.real_sqlite_session import real_sqlite_session, real_sqlite_s
 _RECOVERY_ALL_TABLES = [
     Asset.__table__, AuditLog.__table__, AutonomousExecutionClaim.__table__, Candle.__table__,
     CanonicalPreviewPackage.__table__, ControlledProofExitRecovery.__table__, ControlledProofRun.__table__,
-    LiveAccountingRecord.__table__, LiveCryptoOrder.__table__, LiveReconciliationEvent.__table__,
+    DecisionRecord.__table__, LiveAccountingRecord.__table__, LiveCryptoOrder.__table__, LiveReconciliationEvent.__table__,
     LiveTradingProfile.__table__,
 ]
 
@@ -1574,12 +1575,69 @@ async def test_sweep_projection_is_durably_committed_across_independent_sessions
             ))).all()
             assert len(outcome_audits) == 1
 
-        # Replay through yet another new session: no additional transition.
+
+@pytest.mark.asyncio
+async def test_later_ordinary_view_cannot_overwrite_recovered_projection() -> None:
+    """A new-session ordinary view cannot downgrade an immutable outcome."""
+    from app.services.controlled_proof.service import get_controlled_proof_view
+
+    proof_id, recovery_id, package_id, order_id = (
+        uuid.uuid4(), uuid.uuid4(), uuid.uuid4(), uuid.uuid4(),
+    )
+    async with real_sqlite_session_factory(_RECOVERY_ALL_TABLES) as session_factory:
+        async with session_factory() as session:
+            session.add(ControlledProofRun(
+                proof_id=proof_id, status="EXPIRED", provider="kraken_spot", environment="production",
+                campaign_id=uuid.uuid4(), campaign_version=1, product_id="BTC-USD",
+                max_notional_usd=Decimal("5"), idempotency_key=f"idem-{uuid.uuid4()}",
+                requested_by="operator:alice", expires_at=datetime.now(timezone.utc) - timedelta(minutes=5),
+                decision_record_id=uuid.uuid4(), package_id=uuid.uuid4(),
+                sell_package_id=package_id, sell_live_crypto_order_id=order_id,
+                net_pnl_usd=None, terminal_verdict="FAILED",
+            ))
+            session.add(ControlledProofExitRecovery(
+                recovery_id=recovery_id, proof_id=proof_id, status="BLOCKED",
+                idempotency_key=f"idem-{uuid.uuid4()}", authorized_by="operator:alice",
+                authorized_at=datetime.now(timezone.utc), expires_at=datetime.now(timezone.utc) + timedelta(minutes=30),
+            ))
+            session.add(AuditLog(
+                actor="system:controlled_proof_reconciliation_projector",
+                action=exit_recovery._RECOVERED_OUTCOME_ACTION,
+                entity_type="controlled_proof_exit_recovery", entity_id=recovery_id,
+                before_state={}, after_state={
+                    "status": "COMPLETED_RECONCILED", "original_recovery_id": str(recovery_id),
+                    "proof_id": str(proof_id), "sell_package_id": str(package_id),
+                    "sell_live_crypto_order_id": str(order_id),
+                    "recovered_terminal_verdict": "LIFECYCLE_PROVEN_LOSS",
+                    "recovered_net_pnl_usd": "-0.0393333016409",
+                },
+            ))
+            await session.commit()
+
+            recovery = await session.get(ControlledProofExitRecovery, recovery_id)
+            proof = await session.get(ControlledProofRun, proof_id)
+            diagnostics: dict[str, object] = {}
+            assert await exit_recovery.project_blocked_exit_recovery_outcome(
+                db=session, recovery=recovery, proof=proof, diagnostics=diagnostics,
+            )
+            assert diagnostics["flush_readback_verified"] is True
+
+        async with session_factory() as later_writer_session:
+            await get_controlled_proof_view(db=later_writer_session, proof_id=proof_id)
+
+        async with session_factory() as third_session:
+            overwritten = await third_session.get(ControlledProofRun, proof_id)
+            assert overwritten.net_pnl_usd == Decimal("-0.0393333016")
+            assert overwritten.terminal_verdict == "LIFECYCLE_PROVEN_LOSS"
+            assert (await third_session.get(ControlledProofExitRecovery, recovery_id)).status == "BLOCKED"
+
+        # Replay remains a no-op.
         async with session_factory() as replay_session:
             replay_result = await exit_recovery.refresh_exit_recovery_outcomes(db=replay_session)
             await replay_session.commit()
             assert replay_result.projected == 0
             assert replay_result.skipped == 1
+            assert replay_result.failed == 0
 
         async with session_factory() as final_session:
             final_proof = await final_session.get(ControlledProofRun, proof_id)

@@ -893,6 +893,7 @@ class ExitRecoveryOutcomeSweepResult:
     projected: int
     skipped: int
     failed: int
+    expected_projections: tuple[tuple[uuid.UUID, Decimal, str], ...] = ()
 
 
 async def refresh_exit_recovery_outcomes(*, db: AsyncSession) -> ExitRecoveryOutcomeSweepResult:
@@ -909,8 +910,19 @@ async def refresh_exit_recovery_outcomes(*, db: AsyncSession) -> ExitRecoveryOut
     projected = 0
     skipped = 0
     failed = 0
+    expected_projections: list[tuple[uuid.UUID, Decimal, str]] = []
+    projected_proof_ids: set[uuid.UUID] = set()
     for recovery in recoveries:
         try:
+            if recovery.proof_id in projected_proof_ids:
+                skipped += 1
+                logger.info(
+                    "exit_recovery_outcome_candidate proof_id=%s outcome=skipped "
+                    "reason=proof_already_projected_in_sweep proof_fields_matched_recovered_outcome=true "
+                    "orm_mutation_occurred=false flush_readback_verified=false",
+                    recovery.proof_id,
+                )
+                continue
             proof = await db.scalar(select(ControlledProofRun).where(
                 ControlledProofRun.proof_id == recovery.proof_id,
                 ControlledProofRun.sell_package_id.is_not(None),
@@ -932,6 +944,10 @@ async def refresh_exit_recovery_outcomes(*, db: AsyncSession) -> ExitRecoveryOut
                 if persisted:
                     projected += 1
                     outcome = "projected"
+                    projected_proof_ids.add(proof.proof_id)
+                    expected_projections.append((
+                        proof.proof_id, proof.net_pnl_usd, proof.terminal_verdict,
+                    ))
                 else:
                     skipped += 1
                     outcome = "skipped"
@@ -969,4 +985,7 @@ async def refresh_exit_recovery_outcomes(*, db: AsyncSession) -> ExitRecoveryOut
                 "flush_readback_verified=false recovery_id=%s",
                 recovery.proof_id, recovery.recovery_id,
             )
-    return ExitRecoveryOutcomeSweepResult(candidates=candidates, projected=projected, skipped=skipped, failed=failed)
+    return ExitRecoveryOutcomeSweepResult(
+        candidates=candidates, projected=projected, skipped=skipped, failed=failed,
+        expected_projections=tuple(expected_projections),
+    )

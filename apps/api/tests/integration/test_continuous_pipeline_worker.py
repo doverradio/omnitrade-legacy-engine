@@ -749,9 +749,11 @@ _SWEEP_PERSISTENCE_TABLES = [
 ]
 
 
-async def _seed_stuck_expired_proof(session_factory) -> tuple[uuid.UUID, uuid.UUID]:
-    proof_id, recovery_id, package_id, order_id = (
-        uuid.uuid4(), uuid.uuid4(), uuid.uuid4(), uuid.uuid4(),
+async def _seed_stuck_expired_proof(
+    session_factory, *, blocked_is_newest: bool = True,
+) -> tuple[uuid.UUID, uuid.UUID, uuid.UUID]:
+    proof_id, recovery_id, older_recovery_id, package_id, order_id = (
+        uuid.uuid4(), uuid.uuid4(), uuid.uuid4(), uuid.uuid4(), uuid.uuid4(),
     )
     async with session_factory() as seed_session:
         seed_session.add(ControlledProofRun(
@@ -765,8 +767,18 @@ async def _seed_stuck_expired_proof(session_factory) -> tuple[uuid.UUID, uuid.UU
         seed_session.add(ControlledProofExitRecovery(
             recovery_id=recovery_id, proof_id=proof_id, status="BLOCKED",
             idempotency_key=f"idem-{uuid.uuid4()}", authorized_by="operator:alice",
-            authorized_at=datetime.now(timezone.utc), expires_at=datetime.now(timezone.utc) + timedelta(minutes=30),
+            authorized_at=datetime.now(timezone.utc) + (
+                timedelta() if blocked_is_newest else -timedelta(days=1)
+            ), expires_at=datetime.now(timezone.utc) + timedelta(minutes=30),
             blocked_reason="stale_sell_package_replacement_blocked:Stale SELL package has unresolved execution lineage",
+        ))
+        seed_session.add(ControlledProofExitRecovery(
+            recovery_id=older_recovery_id, proof_id=proof_id, status="IN_PROGRESS",
+            idempotency_key=f"idem-{uuid.uuid4()}", authorized_by="operator:alice",
+            authorized_at=datetime.now(timezone.utc) + (
+                timedelta(days=1) if not blocked_is_newest else -timedelta(days=1)
+            ),
+            expires_at=datetime.now(timezone.utc) + timedelta(minutes=30),
         ))
         seed_session.add(AuditLog(
             actor="system:controlled_proof_reconciliation_projector",
@@ -783,13 +795,15 @@ async def _seed_stuck_expired_proof(session_factory) -> tuple[uuid.UUID, uuid.UU
             },
         ))
         await seed_session.commit()
-    return proof_id, recovery_id
+    return proof_id, recovery_id, older_recovery_id
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("blocked_is_newest", [True, False])
 async def test_real_orchestration_cycle_durably_projects_stuck_proof_across_independent_sessions(
     monkeypatch: pytest.MonkeyPatch,
     caplog: pytest.LogCaptureFixture,
+    blocked_is_newest: bool,
 ) -> None:
     """Reproduces the actual production path end to end: the real
     run_orchestration_cycle entry point, with its real session/transaction
@@ -800,6 +814,7 @@ async def test_real_orchestration_cycle_durably_projects_stuck_proof_across_inde
     persists in isolation."""
     import app.services.orchestration.continuous_pipeline_worker as worker_module
     caplog.set_level(logging.INFO, logger=exit_recovery.__name__)
+    caplog.set_level(logging.INFO, logger=worker_module.__name__)
 
     provider_calls: list[str] = []
 
@@ -828,15 +843,28 @@ async def test_real_orchestration_cycle_durably_projects_stuck_proof_across_inde
     ))
 
     async with real_sqlite_session_factory(_SWEEP_PERSISTENCE_TABLES) as session_factory:
-        proof_id, recovery_id = await _seed_stuck_expired_proof(session_factory)
+        proof_id, recovery_id, older_recovery_id = await _seed_stuck_expired_proof(
+            session_factory, blocked_is_newest=blocked_is_newest,
+        )
 
         proof_updates: list[str] = []
+        transaction_events: list[str] = []
         original_projector = exit_recovery.project_blocked_exit_recovery_outcome
 
+        projection_seen = False
+
+        async def _forbid_same_sweep_reprocessing(**_kwargs):
+            if projection_seen:
+                raise AssertionError("a later recovery candidate must not rewrite an already-projected proof")
+
+        monkeypatch.setattr(exit_recovery, "refresh_exit_recovery_completion", _forbid_same_sweep_reprocessing)
+
         async def _project_and_require_update(**kwargs):
+            nonlocal projection_seen
             before = len(proof_updates)
             projected = await original_projector(**kwargs)
             if projected:
+                projection_seen = True
                 assert len(proof_updates) == before + 1
             return projected
 
@@ -852,16 +880,32 @@ async def test_real_orchestration_cycle_durably_projects_stuck_proof_across_inde
                     and "terminal_verdict" in normalized
                 ):
                     proof_updates.append(statement)
+                    transaction_events.append("target_update")
+
+            @event.listens_for(cycle_session.bind.sync_engine, "commit")
+            def _capture_commit(_conn):
+                transaction_events.append("commit")
+
+            @event.listens_for(cycle_session.bind.sync_engine, "rollback")
+            def _capture_rollback(_conn):
+                transaction_events.append("rollback")
 
             await run_orchestration_cycle(db=cycle_session, client=object(), config=_config())
 
         assert provider_calls == []
         assert len(proof_updates) == 1
+        target_update_index = transaction_events.index("target_update")
+        assert "commit" in transaction_events[target_update_index + 1:]
+        assert transaction_events[target_update_index + 1] == "commit"
         assert any(
             f"proof_id={proof_id} outcome=projected reason=projection_verified" in message
             and "proof_fields_matched_recovered_outcome=true" in message
             and "orm_mutation_occurred=true" in message
             and "flush_readback_verified=true" in message
+            for message in caplog.messages
+        )
+        assert any(
+            "exit_recovery_outcome_sweep_completed candidates=2 projected=1 skipped=1 failed=0" in message
             for message in caplog.messages
         )
 
@@ -871,6 +915,7 @@ async def test_real_orchestration_cycle_durably_projects_stuck_proof_across_inde
             assert reloaded_proof.terminal_verdict == "LIFECYCLE_PROVEN_LOSS"
             reloaded_recovery = await read_session.get(ControlledProofExitRecovery, recovery_id)
             assert reloaded_recovery.status == "BLOCKED"
+            assert (await read_session.get(ControlledProofExitRecovery, older_recovery_id)).status == "IN_PROGRESS"
             outcome_audits = (await read_session.scalars(select(AuditLog).where(
                 AuditLog.entity_type == "controlled_proof_exit_recovery", AuditLog.entity_id == recovery_id,
                 AuditLog.action == exit_recovery._RECOVERED_OUTCOME_ACTION,
@@ -889,6 +934,11 @@ async def test_real_orchestration_cycle_durably_projects_stuck_proof_across_inde
             and "flush_readback_verified=false" in message
             for message in caplog.messages
         )
+        if blocked_is_newest:
+            assert any(
+                f"proof_id={proof_id} outcome=skipped reason=proof_already_projected_in_sweep" in message
+                for message in caplog.messages
+            )
 
         async with session_factory() as final_session:
             final_proof = await final_session.get(ControlledProofRun, proof_id)

@@ -6,6 +6,7 @@ import json
 import logging
 import os
 import uuid
+from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from decimal import Decimal
@@ -26,6 +27,7 @@ from app.core.logging import setup_logging
 from app.db.session import AsyncSessionLocal, dispose_database_engine, is_retryable_db_connection_error
 from app.models.asset import Asset
 from app.models.candle import Candle
+from app.models.controlled_proof_run import ControlledProofRun
 from app.models.decision_record import DecisionRecord
 from app.models.live_crypto_order import LiveCryptoOrder
 from app.models.live_reconciliation_event import LiveReconciliationEvent
@@ -88,6 +90,11 @@ from app.services.capital_campaign_orchestration import run_campaign_orchestrati
 from app.services.capital_campaign_orchestration.authoritative import ScorecardSessionRecoveryError
 from app.services.mandates.contracts import AUTONOMY_LEVEL_2, MANDATE_PURPOSE_CONTROLLED_PROOF, MANDATE_PURPOSE_PRODUCTION
 from app.services.mandates.evidence import MandateEvaluationWriteRequest, evaluate_and_record_mandate
+
+
+@asynccontextmanager
+async def _borrow_async_session(db: AsyncSession):
+    yield db
 from app.services.orchestration import asset_roster
 from app.services.orchestration.venue_commissioning_bridge import service as venue_commissioning_service
 from app.services.orchestration.automatic_package_executor import (
@@ -2464,9 +2471,42 @@ async def run_orchestration_cycle(
             # projected=2 while a later, independent read still showed
             # the pre-projection proof values).
             await db.commit()
+            durable_projected = 0
+            durable_failed = sweep_result.failed
+            if sweep_result.expected_projections:
+                verification_context = (
+                    _borrow_async_session(db)
+                    if db.bind is not None and db.bind.dialect.name == "sqlite"
+                    else AsyncSession(bind=db.bind, expire_on_commit=False)
+                )
+                async with verification_context as verification_db:
+                    for proof_id, expected_pnl, expected_verdict in sweep_result.expected_projections:
+                        persisted = (await verification_db.execute(select(
+                            ControlledProofRun.net_pnl_usd,
+                            ControlledProofRun.terminal_verdict,
+                        ).where(ControlledProofRun.proof_id == proof_id))).one_or_none()
+                        pnl_matches = (
+                            persisted is not None
+                            and persisted.net_pnl_usd is not None
+                            and (
+                                abs(persisted.net_pnl_usd - expected_pnl) < Decimal("0.0000000001")
+                                if db.bind is not None and db.bind.dialect.name == "sqlite"
+                                else persisted.net_pnl_usd == expected_pnl
+                            )
+                        )
+                        if pnl_matches and persisted.terminal_verdict == expected_verdict:
+                            durable_projected += 1
+                        else:
+                            durable_failed += 1
+                            logger.error(
+                                "exit_recovery_outcome_post_commit_verification_failed proof_id=%s",
+                                proof_id,
+                            )
             logger.info(
                 "exit_recovery_outcome_sweep_completed candidates=%s projected=%s skipped=%s failed=%s",
-                sweep_result.candidates, sweep_result.projected, sweep_result.skipped, sweep_result.failed,
+                sweep_result.candidates, durable_projected,
+                sweep_result.skipped + sweep_result.projected - durable_projected,
+                durable_failed,
             )
         except Exception:
             await _rollback_active_session(db=db)

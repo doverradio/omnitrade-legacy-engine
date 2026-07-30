@@ -21,6 +21,7 @@ from app.models.candle import Candle
 from app.models.canonical_preview_package import CanonicalPreviewPackage
 from app.models.capital_campaign import CapitalCampaign
 from app.models.controlled_proof_run import ControlledProofRun
+from app.models.controlled_proof_exit_recovery import ControlledProofExitRecovery
 from app.models.decision_record import DecisionRecord
 from app.models.live_accounting_record import LiveAccountingRecord
 from app.models.live_crypto_order import LiveCryptoOrder
@@ -1642,6 +1643,40 @@ async def get_controlled_proof_view(*, db: AsyncSession, proof_id: uuid.UUID) ->
     await _reap_expired(db=db)
     await db.refresh(proof)
     await repair_controlled_proof_cached_order_ids(db=db, proof=proof)
+    recovered_audit = await db.scalar(
+        select(AuditLog)
+        .join(
+            ControlledProofExitRecovery,
+            ControlledProofExitRecovery.recovery_id == AuditLog.entity_id,
+        )
+        .where(
+            ControlledProofExitRecovery.proof_id == proof.proof_id,
+            ControlledProofExitRecovery.status == "BLOCKED",
+            AuditLog.entity_type == "controlled_proof_exit_recovery",
+            AuditLog.action == "controlled_proof_exit_recovery.recovered_outcome_published",
+        )
+        .order_by(AuditLog.id.desc())
+        .limit(1)
+    )
+    recovered_projection: tuple[Decimal, str] | None = None
+    if recovered_audit is not None and isinstance(recovered_audit.after_state, dict):
+        recovered_payload = recovered_audit.after_state
+        recovered_recovery_id = recovered_payload.get("original_recovery_id")
+        recovered_verdict = recovered_payload.get("recovered_terminal_verdict")
+        if (
+            recovered_payload.get("status") == "COMPLETED_RECONCILED"
+            and recovered_payload.get("proof_id") == str(proof.proof_id)
+            and recovered_recovery_id == str(recovered_audit.entity_id)
+            and recovered_verdict in {
+                "LIFECYCLE_PROVEN_PROFIT", "LIFECYCLE_PROVEN_LOSS", "LIFECYCLE_PROVEN_FLAT",
+            }
+        ):
+            try:
+                recovered_projection = (
+                    Decimal(str(recovered_payload.get("recovered_net_pnl_usd"))), recovered_verdict,
+                )
+            except (TypeError, ArithmeticError, ValueError):
+                recovered_projection = None
 
     decision_payload: dict[str, Any] | None = None
     if proof.decision_record_id is not None:
@@ -1779,7 +1814,9 @@ async def get_controlled_proof_view(*, db: AsyncSession, proof_id: uuid.UUID) ->
         and sell_reconciliation is not None
         and sell_reconciliation.reconciliation_status == "filled"
     )
-    if lineage_terminal:
+    if recovered_projection is not None:
+        proof.net_pnl_usd, proof.terminal_verdict = recovered_projection
+    elif lineage_terminal:
         proof.net_pnl_usd = net_pnl_usd
     elif (
         proof.net_pnl_usd is not None
@@ -1812,7 +1849,7 @@ async def get_controlled_proof_view(*, db: AsyncSession, proof_id: uuid.UUID) ->
     # (mandate/risk/evidence correctly kept refusing it) is BLOCKED, not a
     # silent no-op -- "do not call a loss a profit" also means never staying
     # silent about an outcome that did happen.
-    if proof.terminal_verdict is None:
+    if recovered_projection is None and proof.terminal_verdict is None:
         if lineage_terminal and proof.net_pnl_usd is not None:
             if proof.net_pnl_usd > 0:
                 proof.terminal_verdict = "LIFECYCLE_PROVEN_PROFIT"
