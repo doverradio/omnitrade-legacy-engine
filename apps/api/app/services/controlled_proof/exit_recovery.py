@@ -566,6 +566,10 @@ def _recovered_verdict(net_pnl: Decimal) -> str:
     return "LIFECYCLE_PROVEN_FLAT"
 
 
+def _pnl_matches(left: Decimal, right: Decimal, *, sqlite: bool = False) -> bool:
+    return abs(left - right) < Decimal("0.0000000001") if sqlite else left == right
+
+
 async def _flush_and_verify_proof_projection(
     *, db: AsyncSession, proof: ControlledProofRun, net_pnl: Decimal, verdict: str,
 ) -> bool:
@@ -581,12 +585,13 @@ async def _flush_and_verify_proof_projection(
     if persisted is None or persisted.terminal_verdict != verdict or persisted.net_pnl_usd is None:
         return False
     if db.bind is not None and db.bind.dialect.name == "sqlite":
-        return abs(persisted.net_pnl_usd - net_pnl) < Decimal("0.0000000001")
-    return persisted.net_pnl_usd == net_pnl
+        return _pnl_matches(persisted.net_pnl_usd, net_pnl, sqlite=True)
+    return _pnl_matches(persisted.net_pnl_usd, net_pnl)
 
 
 async def project_blocked_exit_recovery_outcome(
     *, db: AsyncSession, recovery: ControlledProofExitRecovery, proof: ControlledProofRun,
+    diagnostics: dict[str, object] | None = None,
 ) -> bool:
     """Publish an accounting outcome without reopening a terminal recovery.
 
@@ -595,7 +600,15 @@ async def project_blocked_exit_recovery_outcome(
     Locking the recovery serializes projector replays; the append-only audit
     row is the projection and the historical BLOCKED row is never mutated.
     """
+    def record(reason: str, *, matched: bool = False, mutated: bool = False, verified: bool = False) -> None:
+        if diagnostics is not None:
+            diagnostics.update(
+                reason=reason, proof_fields_matched_recovered_outcome=matched,
+                orm_mutation_occurred=mutated, flush_readback_verified=verified,
+            )
+
     if recovery.status != "BLOCKED":
+        record("recovery_not_blocked")
         return False
     try:
         proof_state = inspect(proof)
@@ -606,11 +619,13 @@ async def project_blocked_exit_recovery_outcome(
         or proof_state.detached
         or proof_state.session is not db.sync_session
     ):
+        record("proof_not_persistent_in_worker_session")
         return False
     locked = await db.scalar(select(ControlledProofExitRecovery).where(
         ControlledProofExitRecovery.recovery_id == recovery.recovery_id,
     ).with_for_update())
     if locked is None or locked.status != "BLOCKED" or locked.proof_id != proof.proof_id:
+        record("locked_recovery_scope_mismatch")
         return False
     existing = await db.scalar(select(AuditLog).where(
         AuditLog.entity_type == "controlled_proof_exit_recovery",
@@ -639,33 +654,57 @@ async def project_blocked_exit_recovery_outcome(
         from app.services.controlled_proof.service import repair_controlled_proof_cached_order_ids
         await repair_controlled_proof_cached_order_ids(db=db, proof=proof)
         payload = existing.after_state
-        if (
-            isinstance(payload, dict)
-            and payload.get("status") == "COMPLETED_RECONCILED"
-            and payload.get("proof_id") == str(proof.proof_id)
-            and payload.get("original_recovery_id") == str(locked.recovery_id)
-            and proof.sell_package_id is not None
-            and payload.get("sell_package_id") == str(proof.sell_package_id)
-            and proof.sell_live_crypto_order_id is not None
-            and payload.get("sell_live_crypto_order_id") == str(proof.sell_live_crypto_order_id)
-            and payload.get("recovered_terminal_verdict") in {
-                "LIFECYCLE_PROVEN_PROFIT", "LIFECYCLE_PROVEN_LOSS", "LIFECYCLE_PROVEN_FLAT",
-            }
-            and proof.terminal_verdict not in {
-                "LIFECYCLE_PROVEN_PROFIT", "LIFECYCLE_PROVEN_LOSS", "LIFECYCLE_PROVEN_FLAT",
-            }
-        ):
+        valid_verdicts = {
+            "LIFECYCLE_PROVEN_PROFIT", "LIFECYCLE_PROVEN_LOSS", "LIFECYCLE_PROVEN_FLAT",
+        }
+        checks = (
+            (isinstance(payload, dict), "recovered_outcome_payload_not_object"),
+            (isinstance(payload, dict) and payload.get("status") == "COMPLETED_RECONCILED", "recovered_outcome_status_mismatch"),
+            (isinstance(payload, dict) and payload.get("proof_id") == str(proof.proof_id), "recovered_outcome_proof_id_mismatch"),
+            (isinstance(payload, dict) and payload.get("original_recovery_id") == str(locked.recovery_id), "recovered_outcome_recovery_id_mismatch"),
+            (proof.sell_package_id is not None, "proof_sell_package_missing"),
+            (isinstance(payload, dict) and proof.sell_package_id is not None and payload.get("sell_package_id") == str(proof.sell_package_id), "recovered_outcome_sell_package_mismatch"),
+            (proof.sell_live_crypto_order_id is not None, "proof_sell_order_missing_after_lineage_repair"),
+            (isinstance(payload, dict) and proof.sell_live_crypto_order_id is not None and payload.get("sell_live_crypto_order_id") == str(proof.sell_live_crypto_order_id), "recovered_outcome_sell_order_mismatch"),
+            (isinstance(payload, dict) and payload.get("recovered_terminal_verdict") in valid_verdicts, "recovered_outcome_verdict_invalid"),
+        )
+        failed_check = next((reason for passed, reason in checks if not passed), None)
+        if failed_check is not None:
+            record(failed_check)
+            return False
+        if proof.terminal_verdict in valid_verdicts:
+            try:
+                already_matched = (
+                    proof.net_pnl_usd is not None
+                    and _pnl_matches(
+                        proof.net_pnl_usd, Decimal(str(payload.get("recovered_net_pnl_usd"))),
+                        sqlite=isinstance(db, AsyncSession) and db.bind is not None and db.bind.dialect.name == "sqlite",
+                    )
+                    and proof.terminal_verdict == payload["recovered_terminal_verdict"]
+                )
+            except (TypeError, ArithmeticError, ValueError):
+                already_matched = False
+            record("proof_already_terminal", matched=already_matched)
+            return False
+        if isinstance(payload, dict):
             try:
                 recovered_net_pnl = Decimal(str(payload.get("recovered_net_pnl_usd")))
             except (TypeError, ArithmeticError, ValueError):
+                record("recovered_outcome_pnl_invalid")
                 return False
             proof.net_pnl_usd = recovered_net_pnl
             proof.terminal_verdict = payload["recovered_terminal_verdict"]
             proof.updated_at = _utcnow()
-            return await _flush_and_verify_proof_projection(
+            verified = await _flush_and_verify_proof_projection(
                 db=db, proof=proof, net_pnl=recovered_net_pnl,
                 verdict=payload["recovered_terminal_verdict"],
             )
+            record(
+                "projection_verified" if verified else "projection_readback_mismatch",
+                matched=verified, mutated=True, verified=verified,
+            )
+            return verified
+        record("recovered_outcome_payload_not_object")
         return False
 
     packages = (await db.scalars(select(CanonicalPreviewPackage).where(
@@ -682,9 +721,11 @@ async def project_blocked_exit_recovery_outcome(
         and str((package.market_evidence_identity or {}).get("controlled_proof_exit_recovery_id")) == str(locked.recovery_id)
     ]
     if len(matches) != 1:
+        record("canonical_sell_package_match_count_invalid")
         return False
     package = matches[0]
     if proof.sell_package_id != package.package_id:
+        record("proof_sell_package_mismatch")
         return False
 
     claim = await db.scalar(select(AutonomousExecutionClaim).where(
@@ -698,8 +739,10 @@ async def project_blocked_exit_recovery_outcome(
         or claim.provider != package.provider or claim.environment != package.environment
         or claim.product != package.product
     ):
+        record("canonical_sell_claim_invalid")
         return False
     if proof.sell_live_crypto_order_id != claim.live_order_id:
+        record("proof_sell_order_claim_mismatch")
         return False
     order = await db.scalar(select(LiveCryptoOrder).where(
         LiveCryptoOrder.live_crypto_order_id == claim.live_order_id,
@@ -709,18 +752,22 @@ async def project_blocked_exit_recovery_outcome(
         or order.side.upper() != "SELL" or order.provider != proof.provider
         or order.environment != proof.environment or order.product_id != proof.product_id
     ):
+        record("canonical_sell_order_invalid")
         return False
     reconciliation = await db.scalar(select(LiveReconciliationEvent).where(
         LiveReconciliationEvent.live_crypto_order_id == order.live_crypto_order_id,
     ).order_by(LiveReconciliationEvent.sequence_number.desc()).limit(1))
     if reconciliation is None or reconciliation.reconciliation_status != "filled":
+        record("latest_sell_reconciliation_not_filled")
         return False
     if await has_unresolved_reconciliation(
         db=db, provider=proof.provider, environment=proof.environment, product=proof.product_id,
     ):
+        record("unresolved_reconciliation")
         return False
     runtime, profile_id = await _load_scope(db, proof)
     if profile_id != package.live_trading_profile_id:
+        record("runtime_profile_package_mismatch")
         return False
     if (
         reconciliation.live_crypto_order_id != order.live_crypto_order_id
@@ -729,12 +776,15 @@ async def project_blocked_exit_recovery_outcome(
         or reconciliation.provider_name != order.provider
         or reconciliation.provider_order_id != order.provider_order_id
     ):
+        record("sell_reconciliation_scope_mismatch")
         return False
     if await compute_signed_owned_quantity(
         db=db, live_trading_profile_id=profile_id, symbol=proof.product_id,
     ) != 0:
+        record("position_not_closed")
         return False
     if proof.buy_live_crypto_order_id is None:
+        record("proof_buy_order_missing")
         return False
     accounting = (await db.scalars(select(LiveAccountingRecord).where(
         LiveAccountingRecord.live_trading_profile_id == profile_id,
@@ -746,6 +796,7 @@ async def project_blocked_exit_recovery_outcome(
     base = proof.product_id.split("-")[0].upper()
     accounting = [row for row in accounting if row.symbol.split("-")[0].upper() == base]
     if not any(row.live_crypto_order_id == proof.buy_live_crypto_order_id and row.side == "buy" for row in accounting):
+        record("buy_accounting_missing")
         return False
     sell_accounting = [
         row for row in accounting
@@ -753,6 +804,7 @@ async def project_blocked_exit_recovery_outcome(
     ]
     final_sell_accounting = [row for row in sell_accounting if row.record_type == "fill_accounting"]
     if not sell_accounting or not final_sell_accounting:
+        record("sell_accounting_incomplete")
         return False
     accounting_reconciliation = await db.scalar(select(LiveReconciliationEvent).where(
         LiveReconciliationEvent.id.in_(tuple(
@@ -770,6 +822,7 @@ async def project_blocked_exit_recovery_outcome(
         or accounting_reconciliation.provider_name != order.provider
         or accounting_reconciliation.provider_order_id != order.provider_order_id
     ):
+        record("accounting_reconciliation_scope_mismatch")
         return False
     net_pnl = sum((row.net_cash_impact for row in accounting), Decimal("0"))
     completed_at = _utcnow()
@@ -816,9 +869,14 @@ async def project_blocked_exit_recovery_outcome(
         after_state=payload,
     ))
     await db.flush()
-    return await _flush_and_verify_proof_projection(
+    verified = await _flush_and_verify_proof_projection(
         db=db, proof=proof, net_pnl=net_pnl, verdict=_recovered_verdict(net_pnl),
     )
+    record(
+        "projection_verified" if verified else "projection_readback_mismatch",
+        matched=verified, mutated=True, verified=verified,
+    )
+    return verified
 
 
 @dataclass(frozen=True, slots=True)
@@ -859,24 +917,56 @@ async def refresh_exit_recovery_outcomes(*, db: AsyncSession) -> ExitRecoveryOut
             ).limit(1))
             if proof is None:
                 skipped += 1
+                logger.info(
+                    "exit_recovery_outcome_candidate proof_id=%s outcome=skipped reason=proof_not_selected "
+                    "proof_fields_matched_recovered_outcome=false orm_mutation_occurred=false "
+                    "flush_readback_verified=false",
+                    recovery.proof_id,
+                )
                 continue
             if recovery.status == "BLOCKED":
-                persisted = await project_blocked_exit_recovery_outcome(db=db, recovery=recovery, proof=proof)
+                diagnostics: dict[str, object] = {}
+                persisted = await project_blocked_exit_recovery_outcome(
+                    db=db, recovery=recovery, proof=proof, diagnostics=diagnostics,
+                )
                 if persisted:
                     projected += 1
+                    outcome = "projected"
                 else:
                     skipped += 1
+                    outcome = "skipped"
+                logger.info(
+                    "exit_recovery_outcome_candidate proof_id=%s outcome=%s reason=%s "
+                    "proof_fields_matched_recovered_outcome=%s orm_mutation_occurred=%s "
+                    "flush_readback_verified=%s",
+                    proof.proof_id, outcome, diagnostics.get("reason", "projector_rejected"),
+                    str(bool(diagnostics.get("proof_fields_matched_recovered_outcome"))).lower(),
+                    str(bool(diagnostics.get("orm_mutation_occurred"))).lower(),
+                    str(bool(diagnostics.get("flush_readback_verified"))).lower(),
+                )
             else:
                 before_status = recovery.status
                 await refresh_exit_recovery_completion(db=db, recovery=recovery, proof=proof)
                 if recovery.status != before_status:
                     projected += 1
+                    outcome = "projected"
+                    reason = "recovery_status_transitioned"
                 else:
                     skipped += 1
+                    outcome = "skipped"
+                    reason = "recovery_status_unchanged"
+                logger.info(
+                    "exit_recovery_outcome_candidate proof_id=%s outcome=%s reason=%s "
+                    "proof_fields_matched_recovered_outcome=false orm_mutation_occurred=false "
+                    "flush_readback_verified=false",
+                    proof.proof_id, outcome, reason,
+                )
         except Exception:
             failed += 1
             logger.exception(
-                "exit_recovery_outcome_sweep_candidate_failed recovery_id=%s proof_id=%s",
-                recovery.recovery_id, recovery.proof_id,
+                "exit_recovery_outcome_candidate proof_id=%s outcome=failed reason=exception "
+                "proof_fields_matched_recovered_outcome=false orm_mutation_occurred=false "
+                "flush_readback_verified=false recovery_id=%s",
+                recovery.proof_id, recovery.recovery_id,
             )
     return ExitRecoveryOutcomeSweepResult(candidates=candidates, projected=projected, skipped=skipped, failed=failed)

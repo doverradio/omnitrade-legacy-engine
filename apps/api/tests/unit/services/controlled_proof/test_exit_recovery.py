@@ -445,13 +445,13 @@ async def test_existing_recovered_outcome_audit_fails_closed_on_mismatch_or_malf
         "recovered_terminal_verdict": "LIFECYCLE_PROVEN_PROFIT",
         "recovered_net_pnl_usd": "0.16066",
     }
-    for broken in (
-        {**base_payload, "proof_id": str(uuid.uuid4())},
-        {**base_payload, "sell_package_id": str(uuid.uuid4())},
-        {**base_payload, "status": "SOMETHING_ELSE"},
-        {**base_payload, "recovered_terminal_verdict": "NOT_A_VERDICT"},
-        {**base_payload, "recovered_net_pnl_usd": "not-a-number"},
-        None,
+    for broken, expected_reason in (
+        ({**base_payload, "proof_id": str(uuid.uuid4())}, "recovered_outcome_proof_id_mismatch"),
+        ({**base_payload, "sell_package_id": str(uuid.uuid4())}, "recovered_outcome_sell_package_mismatch"),
+        ({**base_payload, "status": "SOMETHING_ELSE"}, "recovered_outcome_status_mismatch"),
+        ({**base_payload, "recovered_terminal_verdict": "NOT_A_VERDICT"}, "recovered_outcome_verdict_invalid"),
+        ({**base_payload, "recovered_net_pnl_usd": "not-a-number"}, "recovered_outcome_pnl_invalid"),
+        (None, "recovered_outcome_payload_not_object"),
     ):
         item.proof.net_pnl_usd = None
         item.proof.terminal_verdict = "FAILED"
@@ -460,9 +460,16 @@ async def test_existing_recovered_outcome_audit_fails_closed_on_mismatch_or_malf
         )
         db = _FakeDb([item.recovery, existing_audit])
 
+        diagnostics: dict[str, object] = {}
         assert await exit_recovery.project_blocked_exit_recovery_outcome(
-            db=db, recovery=item.recovery, proof=item.proof,
+            db=db, recovery=item.recovery, proof=item.proof, diagnostics=diagnostics,
         ) is False
+        assert diagnostics == {
+            "reason": expected_reason,
+            "proof_fields_matched_recovered_outcome": False,
+            "orm_mutation_occurred": False,
+            "flush_readback_verified": False,
+        }
         assert db.added == []
         assert item.proof.net_pnl_usd is None
         assert item.proof.terminal_verdict == "FAILED"

@@ -789,6 +789,7 @@ async def _seed_stuck_expired_proof(session_factory) -> tuple[uuid.UUID, uuid.UU
 @pytest.mark.asyncio
 async def test_real_orchestration_cycle_durably_projects_stuck_proof_across_independent_sessions(
     monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
 ) -> None:
     """Reproduces the actual production path end to end: the real
     run_orchestration_cycle entry point, with its real session/transaction
@@ -798,6 +799,7 @@ async def test_real_orchestration_cycle_durably_projects_stuck_proof_across_inde
     cycle's own commit -- not just whether an isolated commit call
     persists in isolation."""
     import app.services.orchestration.continuous_pipeline_worker as worker_module
+    caplog.set_level(logging.INFO, logger=exit_recovery.__name__)
 
     provider_calls: list[str] = []
 
@@ -855,6 +857,13 @@ async def test_real_orchestration_cycle_durably_projects_stuck_proof_across_inde
 
         assert provider_calls == []
         assert len(proof_updates) == 1
+        assert any(
+            f"proof_id={proof_id} outcome=projected reason=projection_verified" in message
+            and "proof_fields_matched_recovered_outcome=true" in message
+            and "orm_mutation_occurred=true" in message
+            and "flush_readback_verified=true" in message
+            for message in caplog.messages
+        )
 
         async with session_factory() as read_session:
             reloaded_proof = await read_session.get(ControlledProofRun, proof_id)
@@ -873,6 +882,13 @@ async def test_real_orchestration_cycle_durably_projects_stuck_proof_across_inde
         async with session_factory() as second_cycle_session:
             await run_orchestration_cycle(db=second_cycle_session, client=object(), config=_config())
         assert len(proof_updates) == 1
+        assert any(
+            f"proof_id={proof_id} outcome=skipped reason=proof_already_terminal" in message
+            and "proof_fields_matched_recovered_outcome=true" in message
+            and "orm_mutation_occurred=false" in message
+            and "flush_readback_verified=false" in message
+            for message in caplog.messages
+        )
 
         async with session_factory() as final_session:
             final_proof = await final_session.get(ControlledProofRun, proof_id)
