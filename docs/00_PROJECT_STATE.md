@@ -291,47 +291,51 @@ Do not assume a .venv path on production.
 ✓ BUY candidates have been observed passing Strategy, Economics, and Risk
 and reaching OPEN_POSITION_PROPOSED.
 
-✓ Current production blocker (2026-07-28)
+✓ Current production blocker (2026-07-30)
 
-Production proving has advanced beyond package-progression diagnosis.
+Production proving has advanced beyond the external reconciliation
+investigation.
 
-The terminal unresolved reconciliation scheduler defect has been
+The external historical-order reconciliation policy has been
+implemented, deployed, and verified.
+
+The PACKAGE_ONLY SELL package progression defect has also been
 identified, repaired, deployed, and verified in production.
 
-The scheduler now correctly rediscovers terminal FILLED orders whose
-latest reconciliation event remains unresolved.
+Production evidence now confirms:
 
-Production evidence confirms:
+• Exit Recovery authorization succeeds.
 
-• historical terminal orders are rediscovered
-• reconciliation executes
-• Kraken returns authoritative FILLED status
-• reconciliation completes
+• Exit Recovery is successfully claimed by the orchestration worker.
 
-However, reconciliation still remains:
+• The worker rediscovers the READY SELL package.
 
-reconciliation_required
+• Ordinary supervision now retries PACKAGE_ONLY progression.
 
-because:
+• SELL package progression reaches automatic package activation.
 
-balance_evidence_outcome=missing
+The remaining production blocker is now:
 
-The imported external trade does not contain the historical
-pre-submit USD balance evidence required by the canonical accounting
-reconciliation contract.
+automatic_activation_mandate_scope_mismatch
 
-Current engineering work is therefore focused on determining whether
-this is:
+Runtime evidence further shows:
 
-• an intentional reconciliation-policy requirement for externally
-imported trades, or
+automatic_activation_scope_resolved
 
-• an unintended consequence of applying the canonical reconciliation
-contract to externally executed manual trades.
+authority_mode=GLOBAL_CONFIGURED_SCOPE
 
-No changes should weaken reconciliation, fabricate historical
-evidence, or bypass existing production safety guarantees until the
-intended repository behavior is conclusively established.
+controlled_proof_id=None
+
+during Controlled Proof Exit Recovery.
+
+Current engineering work is therefore focused on determining why the
+Controlled Proof authority context is lost before automatic package
+activation and implementing the smallest production-safe correction that
+preserves mandate governance, immutable audit evidence, idempotency,
+and fail-closed behavior.
+
+No implementation should bypass governance, weaken mandate authority,
+or reduce auditability.
 
 ✓ Bounded live multi-asset expansion foundation (2026-07-25): the
 autonomous worker (continuous_pipeline_worker.py) can now evaluate a

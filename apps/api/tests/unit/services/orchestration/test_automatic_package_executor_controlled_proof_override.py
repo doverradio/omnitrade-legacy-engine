@@ -930,3 +930,166 @@ async def test_full_executor_still_blocks_ordinary_package_without_controlled_pr
         assert outcome.activation_state == "NOT_ACTIVATED"
         refreshed = await session.get(CanonicalPreviewPackage, package.package_id)
         assert refreshed.package_state == "READY"
+
+
+# --- full executor: flag enabled (ordinary autonomous production) ---------------------
+
+
+def _enabled_settings_pinned_to_mismatched_mandate(*, campaign_id: uuid.UUID, campaign_version: int) -> SimpleNamespace:
+    """Reproduces production exactly: AUTOMATIC_MANDATE_PACKAGE_ACTIVATION_ENABLED=true
+    (the documented, supported configuration for ordinary autonomous
+    production -- AUTOMATIC_MANDATE_PACKAGE_ACTIVATION_RUNBOOK.md), with the
+    legacy global selector settings pinned to the *ordinary* production
+    mandate. That mandate is deliberately different from
+    controlled_proof_mandate_id (see config.py) so a Controlled Proof
+    attempt can never resolve, and ordinary autonomous trading can never be
+    governed by, the other's mandate -- exactly the mismatch that must
+    never leak into a Controlled Proof package's own scope resolution."""
+    return SimpleNamespace(
+        automatic_mandate_package_activation_enabled=True,
+        automatic_mandate_package_activation_package_id=None,
+        automatic_mandate_package_activation_campaign_id=campaign_id,
+        automatic_mandate_package_activation_campaign_version=campaign_version,
+        automatic_mandate_package_activation_mandate_id=uuid.uuid4(),
+        automatic_mandate_package_activation_mandate_version_id=uuid.uuid4(),
+    )
+
+
+@pytest.mark.asyncio
+async def test_full_executor_authorized_exit_recovery_activates_when_global_flag_enabled_with_mismatched_mandate(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Reproduces the exact confirmed production defect: with the global
+    activation switch on and the legacy global selector pinned to the
+    ordinary production mandate/campaign scope, an authorized Controlled
+    Proof Exit Recovery's SELL package -- authorized under the deliberately
+    separate controlled_proof_mandate_id -- must still resolve through its
+    own CONTROLLED_PROOF_DERIVED_SCOPE and activate. Before the fix,
+    _resolve_controlled_proof_activation_scope was never even attempted
+    once the flag was on, so this package fell straight through to
+    GLOBAL_CONFIGURED_SCOPE (logged as automatic_activation_scope_resolved
+    authority_mode=GLOBAL_CONFIGURED_SCOPE controlled_proof_id=None) and
+    failed closed on automatic_activation_mandate_scope_mismatch despite
+    valid, authorized Controlled Proof authority."""
+    campaign_id, campaign_version = uuid.uuid4(), 1
+    ids = _mandate_ids()
+    async with _real_session() as session:
+        sell_package = await _make_package(
+            db=session, campaign_id=campaign_id, campaign_version=campaign_version, side="SELL", **ids,
+        )
+        proof = await _make_proof(
+            db=session, campaign_id=campaign_id, campaign_version=campaign_version,
+            package_id=uuid.uuid4(), sell_package_id=sell_package.package_id, status="EXPIRED",
+        )
+        recovery = ControlledProofExitRecovery(
+            proof_id=proof.proof_id, status="IN_PROGRESS", idempotency_key="exit-recovery-enabled-flag",
+            authorized_by="operator:human", authorized_at=datetime.now(timezone.utc),
+            expires_at=datetime.now(timezone.utc) + timedelta(minutes=30),
+        )
+        session.add(recovery)
+        await session.flush()
+        sell_package.market_evidence_identity = {
+            **(sell_package.market_evidence_identity or {}),
+            "controlled_proof_exit_recovery_id": str(recovery.recovery_id),
+        }
+        await session.flush()
+
+        monkeypatch.setattr(
+            executor, "get_settings",
+            lambda: _enabled_settings_pinned_to_mismatched_mandate(
+                campaign_id=campaign_id, campaign_version=campaign_version,
+            ),
+        )
+
+        async def _fake_authorize(*, db, request):
+            package = await db.get(CanonicalPreviewPackage, request.package_id)
+            package.package_state = "AUTHORIZED"
+            package.authorization_source = "MANDATE"
+
+        async def _fake_dry_run(*, db, request):
+            package = await db.get(CanonicalPreviewPackage, request.package_id)
+            package.package_state = "DRY_RUN_PASSED"
+            package.dry_run_live_crypto_order_id = uuid.uuid4()
+
+        async def _fake_activate(*, db, request):
+            package = await db.get(CanonicalPreviewPackage, request.package_id)
+            package.package_state = "ACTIVATED"
+
+        monkeypatch.setattr(executor, "authorize_canonical_preview_package_under_mandate", _fake_authorize)
+        monkeypatch.setattr(executor, "run_dry_run_for_canonical_preview_package", _fake_dry_run)
+        monkeypatch.setattr(executor, "activate_canonical_proving_campaign", _fake_activate)
+
+        outcome = await executor.execute_automatic_ready_package_through_activation(
+            db=session,
+            request=executor.AutomaticPackageExecutionRequest(
+                campaign_id=campaign_id, campaign_version=campaign_version,
+                decision_record_id=sell_package.decision_record_id, package_id=sell_package.package_id,
+            ),
+        )
+
+        assert outcome.final_reason_code == "activated_under_mandate"
+        assert outcome.activation_state == "ACTIVATED"
+        assert outcome.failed_closed is False
+        assert outcome.package_id == sell_package.package_id
+        assert outcome.mandate_id == sell_package.mandate_id
+        assert outcome.mandate_id != executor.get_settings().automatic_mandate_package_activation_mandate_id
+
+
+@pytest.mark.asyncio
+async def test_full_executor_still_governed_by_global_scope_when_flag_enabled_and_no_controlled_proof_linkage(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Requirement preserved: an ordinary automatic package (no Controlled
+    Proof linkage at all) is completely unaffected by always attempting CP
+    scope resolution first -- it still resolves via GLOBAL_CONFIGURED_SCOPE
+    exactly as before, since _resolve_controlled_proof_activation_scope
+    itself returns None (no_controlled_proof_linkage) regardless of the
+    flag."""
+    campaign_id, campaign_version = uuid.uuid4(), 1
+    ids = _mandate_ids()
+    async with _real_session() as session:
+        package = await _make_package(
+            db=session, campaign_id=campaign_id, campaign_version=campaign_version, package_state="READY", **ids,
+        )
+        # Deliberately no ControlledProofRun row at all.
+        monkeypatch.setattr(
+            executor, "get_settings",
+            lambda: SimpleNamespace(
+                automatic_mandate_package_activation_enabled=True,
+                automatic_mandate_package_activation_package_id=None,
+                automatic_mandate_package_activation_campaign_id=campaign_id,
+                automatic_mandate_package_activation_campaign_version=campaign_version,
+                automatic_mandate_package_activation_mandate_id=ids["mandate_id"],
+                automatic_mandate_package_activation_mandate_version_id=ids["mandate_version_id"],
+            ),
+        )
+
+        async def _fake_authorize(*, db, request):
+            pkg = await db.get(CanonicalPreviewPackage, request.package_id)
+            pkg.package_state = "AUTHORIZED"
+            pkg.authorization_source = "MANDATE"
+
+        async def _fake_dry_run(*, db, request):
+            pkg = await db.get(CanonicalPreviewPackage, request.package_id)
+            pkg.package_state = "DRY_RUN_PASSED"
+            pkg.dry_run_live_crypto_order_id = uuid.uuid4()
+
+        async def _fake_activate(*, db, request):
+            pkg = await db.get(CanonicalPreviewPackage, request.package_id)
+            pkg.package_state = "ACTIVATED"
+
+        monkeypatch.setattr(executor, "authorize_canonical_preview_package_under_mandate", _fake_authorize)
+        monkeypatch.setattr(executor, "run_dry_run_for_canonical_preview_package", _fake_dry_run)
+        monkeypatch.setattr(executor, "activate_canonical_proving_campaign", _fake_activate)
+
+        outcome = await executor.execute_automatic_ready_package_through_activation(
+            db=session,
+            request=executor.AutomaticPackageExecutionRequest(
+                campaign_id=campaign_id, campaign_version=campaign_version,
+                decision_record_id=package.decision_record_id, package_id=package.package_id,
+            ),
+        )
+
+        assert outcome.activation_state == "ACTIVATED"
+        assert outcome.final_reason_code == "activated_under_mandate"
+        assert outcome.package_id == package.package_id

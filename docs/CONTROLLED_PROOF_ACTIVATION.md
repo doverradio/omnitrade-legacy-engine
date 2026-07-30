@@ -20,6 +20,26 @@ Proof's own authority and grants a narrow, package-scoped override -- only
 for the one package genuinely linked to that one proof, only while every
 invariant below holds, re-verified fresh against the database on every call.
 
+`execute_automatic_ready_package_through_activation` always attempts this
+resolution first, **regardless of the global switch's value**. A Controlled
+Proof's own authority must never depend on whether the unrelated global
+switch happens to be on (e.g. ordinary autonomous production, per
+`AUTOMATIC_MANDATE_PACKAGE_ACTIVATION_RUNBOOK.md`) or off, and it must never
+be evaluated against the legacy global selector's mandate/campaign scope --
+which is deliberately pinned to a *different*, ordinary-production mandate
+(`controlled_proof_mandate_id` is a separate setting; see `config.py`).
+Gating the resolution attempt itself on the global switch being off was a
+confirmed production defect: with the switch on and the global selector
+pinned to the ordinary mandate, an authorized Controlled Proof Exit
+Recovery's SELL package fell straight through to the global scope and
+failed closed on `automatic_activation_mandate_scope_mismatch` despite
+valid, authorized Controlled Proof authority. Only the *fallback* --
+what happens when this resolution returns `None` -- still depends on the
+global switch: `None` with the switch off returns
+`automatic_mandate_package_activation_disabled`; `None` with the switch on
+falls through to `GLOBAL_CONFIGURED_SCOPE`, exactly as for any ordinary
+automatic package.
+
 ## Governed exit recovery
 
 `POST /api/v1/operator/controlled-proofs/{proof_id}/exit-recovery` creates a
@@ -343,8 +363,9 @@ directly around the actual Kraken call in
 
 No new environment variable is introduced by this change; no systemd or
 `.env` change is required for a Controlled Proof to activate.
-`AUTOMATIC_MANDATE_PACKAGE_ACTIVATION_ENABLED` stays `false` in production.
-The existing scope-pinning settings
+`AUTOMATIC_MANDATE_PACKAGE_ACTIVATION_ENABLED` may be `true` or `false` --
+a Controlled Proof's own authority (see "Why this exists" above) resolves
+independently of this switch either way. The existing scope-pinning settings
 (`AUTOMATIC_MANDATE_PACKAGE_ACTIVATION_CAMPAIGN_ID/_CAMPAIGN_VERSION/_MANDATE_ID/_MANDATE_VERSION_ID`)
 must still be configured identically on both `omnitrade-api` and
 `omnitrade-orchestration` -- they already are, since asset-commissioning

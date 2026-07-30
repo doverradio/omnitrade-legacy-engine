@@ -53,9 +53,9 @@ Task 10 is complete.
 
 The next session should not redesign commissioned architecture.
 
-The next session should determine whether the remaining reconciliation
-blocker represents an intentional architectural policy or a repository
-defect before recommending any implementation.
+The next session should complete production validation of the Controlled
+Proof activation-scope correction and continue from the resulting runtime
+evidence.
 
 ---
 
@@ -251,39 +251,71 @@ Production evidence is more valuable than speculative architecture.
 
 # Next Task
 
-Determine whether the canonical reconciliation contract is intentionally
-designed to require historical pre-submit balance evidence for externally
-imported trades.
+The external reconciliation investigation is complete.
 
-Production has already proven:
+The PACKAGE_ONLY retry defect has been repaired, tested, deployed, and
+verified in production.
 
-• the reconciliation scheduler repair is deployed
-• terminal FILLED orders are rediscovered
-• reconciliation executes successfully
-• Kraken returns authoritative FILLED status
+Commit deployed:
 
-The remaining production blocker is:
+3da57cd
 
-balance_evidence_outcome=missing
+Production runtime now proves:
 
-Mission:
+• Exit Recovery authorization succeeds.
 
-Determine whether externally imported manual trades are intended to
-remain reconciliation_required because the required historical balance
-evidence never existed inside OmniTrade, or whether a separate
-reconciliation policy exists (or should exist) for externally executed
-manual trades.
+• Exit Recovery is claimed by the orchestration worker.
 
-Do not redesign reconciliation.
+• The worker rediscovers the READY SELL package.
 
-Do not weaken fail-closed behavior.
+• Ordinary supervision retries SELL package progression.
 
-Do not fabricate historical evidence.
+• SELL package progression reaches automatic activation.
 
-Prefer repository evidence over assumptions.
+The current production blocker is:
 
-Only recommend implementation after the intended reconciliation contract
-has been conclusively established.
+automatic_activation_mandate_scope_mismatch
+
+Runtime logs further show:
+
+automatic_activation_scope_resolved
+
+authority_mode=GLOBAL_CONFIGURED_SCOPE
+
+controlled_proof_id=None
+
+during Controlled Proof Exit Recovery.
+
+Mission
+
+Determine exactly why the Controlled Proof authority context is lost
+before automatic package activation.
+
+Implement the smallest production-safe correction that preserves:
+
+• Constitution
+
+• Risk Engine authority
+
+• mandate governance
+
+• immutable audit evidence
+
+• idempotency
+
+• fail-closed behavior
+
+Do not bypass governance.
+
+Do not weaken mandate authority.
+
+Do not fabricate runtime evidence.
+
+Prefer repository evidence and production runtime evidence over
+assumptions.
+
+Only implement the smallest targeted correction once the exact authority
+propagation defect has been conclusively identified.
 
 ---
 
@@ -373,15 +405,18 @@ Do not activate the commissioned campaign without explicit operator approval aft
 
 Important:
 
-The reconciliation scheduler defect has already been repaired,
-deployed, and verified in production.
+The external reconciliation investigation is complete.
 
-Do not re-investigate scheduler candidate discovery.
+The PACKAGE_ONLY SELL progression retry was deployed in commit 3da57cd.
 
-Begin from the current production evidence:
+The next correction changes activation-scope resolution so a valid
+Controlled Proof or Exit Recovery package is evaluated under
+CONTROLLED_PROOF_DERIVED_SCOPE before ordinary global configured scope
+is considered.
 
-balance_evidence_outcome=missing
+Begin from the latest production runtime evidence and verify whether the
+Controlled Proof SELL package activates, creates an execution claim,
+submits, reconciles, and completes successfully.
 
-Determine whether this reflects the intended reconciliation contract for
-externally imported trades or an implementation defect requiring a
-targeted repository change.
+Do not re-investigate external reconciliation or PACKAGE_ONLY retry
+unless new runtime evidence directly contradicts the established findings.

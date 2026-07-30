@@ -567,3 +567,44 @@ conflicting provider identity, order state, fills, accounting, ownership, or
 audit evidence continues to fail closed. The terminal event and accounting
 evidence retain the external authority classification and never imply governed
 OmniTrade execution lineage.
+
+---
+
+## 2026-07
+
+### Controlled Proof Exit Recovery Self-Healing
+
+Decision
+
+Ordinary orchestration supervision is permitted to retry SELL package
+progression when a Controlled Proof has already produced a READY SELL
+package whose lineage remains PACKAGE_ONLY, instead of requiring
+permanent operator intervention.
+
+Reason
+
+Production evidence demonstrated that a transient interruption after
+SELL package creation could leave an otherwise valid READY package
+orphaned indefinitely. The existing supervision logic detected the
+existing SELL package but never attempted package progression again,
+preventing autonomous recovery.
+
+Alternatives Considered
+
+Require every PACKAGE_ONLY occurrence to be recovered manually through
+operator intervention.
+
+Rejected because the condition represents an implementation gap rather
+than an intentional governance boundary.
+
+Consequences
+
+PACKAGE_ONLY SELL packages now self-heal through ordinary supervision
+while preserving all existing mandate evaluation, activation authority,
+audit logging, idempotency, and fail-closed behavior.
+
+Future Impact
+
+Controlled Proof Exit Recovery remains an operator-authorized recovery
+mechanism, but transient package progression failures no longer require
+manual intervention solely because a SELL package already exists.

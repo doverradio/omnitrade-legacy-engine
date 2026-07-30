@@ -130,24 +130,29 @@ def _outcome(
 async def _resolve_controlled_proof_activation_scope(
     *, db: AsyncSession, request: AutomaticPackageExecutionRequest,
 ) -> ResolvedAutomaticActivationScope | None:
-    """When the global automatic_mandate_package_activation_enabled feature
-    is off, a package created under an explicit, currently-active
-    Controlled Proof may still receive a narrow, package-scoped activation
-    override -- the Controlled Proof itself (an operator-issued,
-    fully-audited RUN_CONTROLLED_PROOF request) is its own explicit
-    authority to attempt exactly one BUY-to-SELL lifecycle, distinct from
-    (and much narrower than) permanently enabling unattended automatic
-    activation for every package the campaign ever produces. Every
-    invariant below is re-verified fresh against the DB on every call --
-    never cached, never assumed from an earlier check in this same
-    request -- and returns a ResolvedAutomaticActivationScope built
+    """A package created under an explicit, currently-active Controlled
+    Proof may receive a narrow, package-scoped activation override -- the
+    Controlled Proof itself (an operator-issued, fully-audited
+    RUN_CONTROLLED_PROOF request) is its own explicit authority to attempt
+    exactly one BUY-to-SELL lifecycle, distinct from (and much narrower
+    than) permanently enabling unattended automatic activation for every
+    package the campaign ever produces. This is evaluated unconditionally
+    by the caller, regardless of the global automatic_mandate_package_
+    activation_enabled feature's value -- a Controlled Proof's own
+    authority must never depend on whether that unrelated global switch
+    happens to be on (e.g. ordinary autonomous production) or off, and must
+    never be redirected to the legacy global selector's mandate/campaign
+    scope, which is deliberately pinned to a different, ordinary-production
+    mandate. Every invariant below is re-verified fresh against the DB on
+    every call -- never cached, never assumed from an earlier check in this
+    same request -- and returns a ResolvedAutomaticActivationScope built
     exclusively from this exact package's own persisted fields (never from
     global settings) only when all of them hold. Returns None, with one
-    precise logged reason, otherwise; callers must treat that exactly like
-    "the global feature is disabled", never as a softer outcome. Ordinary
-    automatic packages (no Controlled Proof linkage at all) always resolve
-    to None here and remain governed solely by the existing global feature
-    flag, unchanged."""
+    precise logged reason, otherwise; the caller falls back to the global
+    feature flag exactly as if no Controlled Proof authority applied.
+    Ordinary automatic packages (no Controlled Proof linkage at all) always
+    resolve to None here and remain governed solely by the existing global
+    feature flag, unchanged."""
     logger.info(
         "controlled_proof_activation_override_evaluated campaign_id=%s campaign_version=%s decision_record_id=%s package_id=%s",
         request.campaign_id, request.campaign_version, request.decision_record_id, request.package_id,
@@ -315,26 +320,40 @@ async def execute_automatic_ready_package_through_activation(
     request: AutomaticPackageExecutionRequest,
 ) -> AutomaticPackageExecutionOutcome:
     settings = get_settings()
+    # Resolved unconditionally -- never gated on automatic_mandate_package_
+    # activation_enabled. A Controlled Proof's own authority must never
+    # depend on whether that unrelated global switch happens to be on
+    # (ordinary autonomous production) or off; gating the attempt on it was
+    # the confirmed production defect: with the switch on (the documented,
+    # supported configuration for ordinary autonomy -- see
+    # AUTOMATIC_MANDATE_PACKAGE_ACTIVATION_RUNBOOK.md) and the legacy global
+    # selector settings pinned to the ordinary production mandate, an
+    # authorized Controlled Proof Exit Recovery's SELL package -- which is
+    # deliberately authorized under the separate controlled_proof_mandate_id
+    # (config.py) -- fell straight through to GLOBAL_CONFIGURED_SCOPE and
+    # was checked against the wrong mandate, failing closed on
+    # automatic_activation_mandate_scope_mismatch despite valid, authorized
+    # Controlled Proof authority. Only the *fallback* below (when this
+    # returns None) still depends on the flag, exactly as before.
     controlled_proof_scope: ResolvedAutomaticActivationScope | None = None
-    if not settings.automatic_mandate_package_activation_enabled:
-        try:
-            controlled_proof_scope = await _resolve_controlled_proof_activation_scope(db=db, request=request)
-        except Exception:
-            # An unexpected failure while resolving Controlled Proof
-            # authority must fail closed exactly like "the global feature
-            # is disabled" -- never surface as a different, more permissive
-            # outcome, and never as an unhandled crash either.
-            logger.exception(
-                "controlled_proof_activation_override_evaluation_failed campaign_id=%s campaign_version=%s decision_record_id=%s package_id=%s",
-                request.campaign_id, request.campaign_version, request.decision_record_id, request.package_id,
-            )
-            controlled_proof_scope = None
-        if controlled_proof_scope is None:
-            logger.info(
-                "automatic_package_progression_skipped campaign_id=%s campaign_version=%s decision_record_id=%s package_id=%s reason=feature_disabled failed_closed=False",
-                request.campaign_id, request.campaign_version, request.decision_record_id, request.package_id,
-            )
-            return _outcome(request=request, package=None, reason="automatic_mandate_package_activation_disabled")
+    try:
+        controlled_proof_scope = await _resolve_controlled_proof_activation_scope(db=db, request=request)
+    except Exception:
+        # An unexpected failure while resolving Controlled Proof authority
+        # must fail closed exactly like "no Controlled Proof authority
+        # applies" -- never surface as a different, more permissive
+        # outcome, and never as an unhandled crash either.
+        logger.exception(
+            "controlled_proof_activation_override_evaluation_failed campaign_id=%s campaign_version=%s decision_record_id=%s package_id=%s",
+            request.campaign_id, request.campaign_version, request.decision_record_id, request.package_id,
+        )
+        controlled_proof_scope = None
+    if controlled_proof_scope is None and not settings.automatic_mandate_package_activation_enabled:
+        logger.info(
+            "automatic_package_progression_skipped campaign_id=%s campaign_version=%s decision_record_id=%s package_id=%s reason=feature_disabled failed_closed=False",
+            request.campaign_id, request.campaign_version, request.decision_record_id, request.package_id,
+        )
+        return _outcome(request=request, package=None, reason="automatic_mandate_package_activation_disabled")
 
     mandate_scope: tuple[uuid.UUID, uuid.UUID] | None
     if controlled_proof_scope is not None:
