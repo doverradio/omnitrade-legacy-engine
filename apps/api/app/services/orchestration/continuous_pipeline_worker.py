@@ -1934,18 +1934,36 @@ async def _attempt_operator_controlled_proof_entry(
             if claim_outcome.claim is not None:
                 await advance_claimed_execution(db=db, claim=claim_outcome.claim)
         else:
-            # Observability only: execute_automatic_ready_package_through_activation
-            # did not report a clean ACTIVATED outcome, so nothing further in this
-            # branch ever runs (no claim, no advance, no provider call) -- previously
-            # this fell straight through to db.commit() with zero signal anywhere
-            # that the Ready Package was never consumed. No execution logic or
-            # fail-closed behavior changes here, only a named, grep-able log line.
+            # execute_automatic_ready_package_through_activation did not
+            # report a clean ACTIVATED outcome, so nothing further in this
+            # branch ever runs (no claim, no advance, no provider call).
             logger.info(
                 "controlled_proof_package_activation_not_achieved proof_id=%s package_id=%s "
                 "activation_state=%s failed_closed=%s final_reason_code=%s starting_state=%s",
                 proof.proof_id, package_id, progression.activation_state,
                 progression.failed_closed, progression.final_reason_code, progression.starting_state,
             )
+            # A claimed Exit Recovery must never fall through to db.commit()
+            # here with zero recorded reason -- previously it did, leaving
+            # an IN_PROGRESS recovery indistinguishable from one that is
+            # simply mid-flight (confirmed production incident: dispatch
+            # completed, recovery stayed IN_PROGRESS with no blocked_reason
+            # or failure_reason). progression.failed_closed distinguishes a
+            # definitive, config/scope-level stop (e.g. a mandate/campaign
+            # scope mismatch -- not retryable without an operator fixing
+            # the underlying condition or issuing a fresh authorization)
+            # from a softer non-achievement this exact recovery may still
+            # resolve on a later cycle within its own bounded, already-
+            # authorized expiry window -- the same distinction failed_closed
+            # already draws for every other caller of this executor.
+            # Ordinary (non-recovery) Controlled Proof progression is
+            # unchanged: this block only ever touches the recovery's own
+            # state, never proof.status or proof.failure_reason.
+            if recovery is not None:
+                if progression.failed_closed:
+                    await _record_block(f"activation_failed_closed:{progression.final_reason_code}")
+                else:
+                    await _record_wait(f"activation_not_achieved:{progression.final_reason_code}")
         await db.commit()
     logger.info(
         "controlled_proof_selected_for_evaluation proof_id=%s proof_status=%s "

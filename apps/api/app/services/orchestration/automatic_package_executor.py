@@ -221,18 +221,37 @@ async def _resolve_controlled_proof_activation_scope(
         and package.side == "SELL"
         and proof.sell_package_id == package.package_id
     ):
+        # status == "IN_PROGRESS" only, not "AUTHORIZED": eligibility
+        # requires the recovery to actually be claimed
+        # (claim_exit_recovery_by_id) before it can authorize an activation
+        # attempt -- an authorized-but-unclaimed recovery must fail closed.
         recovery = await db.scalar(select(ControlledProofExitRecovery).where(
             ControlledProofExitRecovery.proof_id == proof.proof_id,
-            ControlledProofExitRecovery.status.in_(("AUTHORIZED", "IN_PROGRESS")),
+            ControlledProofExitRecovery.status == "IN_PROGRESS",
             ControlledProofExitRecovery.expires_at > now,
         ).limit(1))
-    raw_package_identity = getattr(package, "market_evidence_identity", None)
-    package_identity = raw_package_identity if isinstance(raw_package_identity, dict) else {}
+    # Binding is (proof_id, package_id) alone -- proof.sell_package_id is
+    # the single, authoritative, exclusively-owned link between a proof and
+    # its one governed SELL package (set once by link_controlled_proof_
+    # sell_package, cleared only by supersede_stale_exit_recovery_sell_
+    # package, which also clears the old package's presence here entirely).
+    # A package's own persisted market_evidence_identity.controlled_proof_
+    # exit_recovery_id stamp must NOT additionally be required to equal
+    # this exact recovery's id: authorize_controlled_proof_exit_recovery's
+    # allow_existing_sell_package contract explicitly permits a fresh
+    # recovery to resume a SELL package that predates it entirely (stamp is
+    # None -- created before the proof ever expired) or that was stamped
+    # under an earlier, now-terminal recovery attempt for this exact same
+    # proof ("the later authority may resume only that package" --
+    # docs/CONTROLLED_PROOF_ACTIVATION.md). Requiring an exact stamp match
+    # here (added in 0a167eb) silently broke that documented resume path --
+    # confirmed production defect: an authorized, claimed Exit Recovery for
+    # a proof with a pre-existing linked SELL package reached
+    # controlled_proof_not_active on every retry, forever.
     exit_recovery_authorized = bool(
         recovery is not None
         and package.side == "SELL"
         and proof.sell_package_id == package.package_id
-        and package_identity.get("controlled_proof_exit_recovery_id") == str(recovery.recovery_id)
     )
     # Fail closed if the proof is expired, cancelled, blocked, failed, or
     # otherwise terminal -- _ACTIVE_STATES is the exact same set

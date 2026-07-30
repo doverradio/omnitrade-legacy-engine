@@ -144,18 +144,26 @@ async def _resolve_controlled_proof_execution_scope(
         and package.side == "SELL"
         and proof.sell_package_id == package.package_id
     ):
+        # status == "IN_PROGRESS" only: eligibility requires the recovery
+        # to actually be claimed (claim_exit_recovery_by_id) -- an
+        # authorized-but-unclaimed recovery must fail closed. Mirrors
+        # automatic_package_executor._resolve_controlled_proof_activation_scope.
         recovery = await db.scalar(select(ControlledProofExitRecovery).where(
             ControlledProofExitRecovery.proof_id == proof.proof_id,
-            ControlledProofExitRecovery.status.in_(("AUTHORIZED", "IN_PROGRESS")),
+            ControlledProofExitRecovery.status == "IN_PROGRESS",
             ControlledProofExitRecovery.expires_at > now,
         ).limit(1))
-    raw_package_identity = getattr(package, "market_evidence_identity", None)
-    package_identity = raw_package_identity if isinstance(raw_package_identity, dict) else {}
+    # No package-identity stamp match required -- see the identical, fuller
+    # comment in automatic_package_executor._resolve_controlled_proof_
+    # activation_scope. proof.sell_package_id == package.package_id is the
+    # single authoritative binding; a package's own creation-time
+    # controlled_proof_exit_recovery_id stamp does not need to equal the
+    # currently claimed recovery's id for a legitimate "resume" of a
+    # pre-existing SELL package to be authorized.
     exit_recovery_authorized = bool(
         recovery is not None
         and package.side == "SELL"
         and proof.sell_package_id == package.package_id
-        and package_identity.get("controlled_proof_exit_recovery_id") == str(recovery.recovery_id)
     )
     if proof.status not in _CONTROLLED_PROOF_ACTIVE_STATES and not exit_recovery_authorized:
         return _blocked("controlled_proof_not_active")

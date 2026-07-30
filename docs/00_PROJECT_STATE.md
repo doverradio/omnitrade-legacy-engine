@@ -127,6 +127,13 @@ Success is waking up to more money than when the campaign began.
 
 ✅ Terminal reconciliation recovery scheduler
 
+✅ Controlled Proof Exit Recovery authorization
+
+✅ Controlled Proof Exit Recovery claiming
+
+✅ PACKAGE_ONLY SELL progression recovery
+
+
 ## Decision Layer
 
 ✅ Decision Records
@@ -302,37 +309,34 @@ implemented, deployed, and verified.
 The PACKAGE_ONLY SELL package progression defect has also been
 identified, repaired, deployed, and verified in production.
 
-Production evidence now confirms:
+The Controlled Proof authority-propagation defect (automatic package
+activation losing Controlled Proof context and evaluating under
+`GLOBAL_CONFIGURED_SCOPE controlled_proof_id=None`) is now
+**production-confirmed fixed**: a fresh Exit Recovery dispatch reached
+`automatic_activation_scope_resolved authority_mode=CONTROLLED_PROOF_DERIVED_SCOPE`
+with the real `controlled_proof_id`.
 
-• Exit Recovery authorization succeeds.
+That same production evidence surfaced a second, deeper defect one step
+further into the same flow: activation then failed closed with
+`controlled_proof_activation_override_blocked reason=controlled_proof_not_active`,
+and the claimed recovery was left `IN_PROGRESS` indefinitely with no
+recorded reason. Root cause: the exit-recovery eligibility check
+required a SELL package's own creation-time
+`controlled_proof_exit_recovery_id` stamp to equal the currently claimed
+recovery's id — which is never true for the documented "resume a
+pre-existing SELL package" case Exit Recovery exists to handle. Fixed
+(see `docs/00_OPERATIONS_MAP.md`'s Controlled Proof Exit Recovery
+section for the full root cause and change list): eligibility now rests
+on the proof's own authoritative `sell_package_id` link plus a genuinely
+claimed, unexpired recovery for that exact proof — no stamp match
+required — and a claimed recovery that fails to activate now always
+receives an explicit `BLOCKED` or retryable `failure_reason` instead of
+sitting silently `IN_PROGRESS`.
 
-• Exit Recovery is successfully claimed by the orchestration worker.
-
-• The worker rediscovers the READY SELL package.
-
-• Ordinary supervision now retries PACKAGE_ONLY progression.
-
-• SELL package progression reaches automatic package activation.
-
-The remaining production blocker is now:
-
-automatic_activation_mandate_scope_mismatch
-
-Runtime evidence further shows:
-
-automatic_activation_scope_resolved
-
-authority_mode=GLOBAL_CONFIGURED_SCOPE
-
-controlled_proof_id=None
-
-during Controlled Proof Exit Recovery.
-
-Current engineering work is therefore focused on determining why the
-Controlled Proof authority context is lost before automatic package
-activation and implementing the smallest production-safe correction that
-preserves mandate governance, immutable audit evidence, idempotency,
-and fail-closed behavior.
+The next production validation is a **fresh** Exit Recovery dispatch
+(new authorization) confirming activation now succeeds end-to-end:
+execution claim created, order submitted, reconciliation completed,
+autonomous lifecycle continuing toward First Autonomous Profit.
 
 No implementation should bypass governance, weaken mandate authority,
 or reduce auditability.

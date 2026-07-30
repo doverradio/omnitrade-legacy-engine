@@ -136,6 +136,335 @@ Do not assume this mirrors the orchestration service's config sources — confir
 - `venue-commissioning.conf` is named after `VENUE_COMMISSIONING_ENABLED` (`config.py`, default `false`), but unlike the activation-only file, no script or template in this repository produces it — its content is not repo-auditable. **[REPO]** for the field; **[UNRESOLVED]** for the drop-in's actual content
 - `CONTROLLED_PROOF_MANDATE_ID` (`config.py`, default `None`) is a distinct, dedicated mandate identity Controlled Proof entry pins its BUY/SELL evaluations to — deliberately separate from `AUTOMATIC_MANDATE_PACKAGE_ACTIVATION_MANDATE_ID` (ordinary production), so the two mandate purposes (`PRODUCTION` / `CONTROLLED_PROOF`, `autonomous_capital_mandates.purpose`) can never be conflated. Provisioned via `./operator controlled-proof-mandate-bootstrap` (`operator_cli/service.py::controlled_proof_mandate_bootstrap`), which resolves Controlled Proof's runtime scope automatically, runs the existing governed mandate lifecycle (`create_mandate` with `purpose="CONTROLLED_PROOF"` through `ACTIVATE`), and writes the resulting mandate id into the `.env` file `get_settings()` loads — no manual SQL, and a process restart (or the same process's next `get_settings()` call, since the write clears its cache) picks it up. Equivalently provisionable via `POST /autonomous-capital/mandates` with `purpose="CONTROLLED_PROOF"` directly. Readiness is checkable via `GET /api/v1/operator/controlled-proofs/mandate/readiness`. **[REPO]**
 
+## Controlled Proof Exit Recovery
+
+Purpose
+
+Recover PACKAGE_ONLY SELL package progression without direct database
+intervention.
+
+Production Flow
+
+1. Operator authorizes Exit Recovery via authenticated API.
+2. Recovery is persisted.
+3. Orchestration worker claims recovery.
+4. READY SELL package is rediscovered.
+5. Ordinary package progression resumes.
+6. Automatic package activation begins.
+7. Normal execution pipeline resumes.
+
+### Operational API Contract
+
+The Controlled Proof API does not provide a collection-level list operation.
+
+The following request is not supported:
+
+GET /api/v1/operator/controlled-proofs
+
+A GET request to that collection path returns:
+
+405 Method Not Allowed
+
+This does not indicate an authentication failure. It indicates that the
+request used an unsupported HTTP method for the collection route.
+
+Use the proof-specific endpoints instead.
+
+Inspect a known Controlled Proof:
+
+GET /api/v1/operator/controlled-proofs/{proof_id}
+
+Inspect the Exit Recovery associated with a known Controlled Proof:
+
+GET /api/v1/operator/controlled-proofs/{proof_id}/exit-recovery
+
+Authorize Exit Recovery for a known Controlled Proof:
+
+POST /api/v1/operator/controlled-proofs/{proof_id}/exit-recovery
+
+Required authorization request body:
+
+{
+  "idempotency_key": "<unique recovery key>",
+  "expires_in_minutes": 60
+}
+
+**[PROD]** These proof-specific GET and POST operations have been
+successfully exercised against production.
+
+When a Controlled Proof ID is already present in the current runtime
+evidence, terminal output, handoff documentation, or saved command
+context, reuse that ID directly.
+
+Do not begin OpenAPI route discovery merely because the unsupported
+collection-level GET returns 405.
+
+Consult production OpenAPI only when the proof-specific contract itself
+is genuinely unknown or new runtime evidence indicates that the deployed
+API contract has changed.
+
+
+Current Production Validation Target (2026-07-30)
+
+**Authority-propagation correction: production-confirmed.** A fresh Exit
+Recovery dispatch (proof `345fc153-3db1-4514-8d0e-c7e0fe77790e`, recovery
+`819754a6-1566-4523-a2d4-b8447ab6868c`) reached
+`automatic_activation_scope_resolved authority_mode=CONTROLLED_PROOF_DERIVED_SCOPE
+controlled_proof_id=345fc153-...` — the `GLOBAL_CONFIGURED_SCOPE
+controlled_proof_id=None` symptom no longer occurs. No further validation
+needed on this specific correction.
+
+**Second, deeper defect found by that same evidence and now fixed.**
+Immediately after resolving `CONTROLLED_PROOF_DERIVED_SCOPE`, the same
+dispatch failed closed with
+`controlled_proof_activation_override_blocked reason=controlled_proof_not_active
+proof_status=EXPIRED`, and the claimed recovery was left `IN_PROGRESS`
+indefinitely with no `blocked_reason`/`failure_reason`. Root cause:
+`_resolve_controlled_proof_activation_scope` /
+`_resolve_controlled_proof_execution_scope`'s eligibility check
+(`exit_recovery_authorized`, added in commit `0a167eb`) additionally
+required the SELL package's own `market_evidence_identity.controlled_proof_exit_recovery_id`
+stamp to equal the freshly claimed recovery's id. That holds only when
+the package was created *under* that exact recovery — it does not, and
+was never meant to, hold for `authorize_controlled_proof_exit_recovery`'s
+documented "resume a pre-existing PACKAGE_ONLY SELL package" contract
+(`allow_existing_sell_package`, present since the very first Exit
+Recovery commit `c296baf`) — a package that predates the recovery (or
+was stamped under an earlier, now-terminal recovery attempt) is exactly
+the shape Exit Recovery exists to resume. Fixed in
+`apps/api/app/services/orchestration/automatic_package_executor.py` and
+`autonomous_execution_claims.py`: eligibility now rests solely on
+`proof.sell_package_id == package.package_id` for a genuinely claimed
+(`status == "IN_PROGRESS"`, not merely `AUTHORIZED`), unexpired recovery
+belonging to that exact proof — no package-identity stamp match required.
+Also fixed: `continuous_pipeline_worker.py`'s `_progress_package` now
+terminalizes a claimed recovery whenever activation is not achieved —
+`BLOCKED` (with the executor's `final_reason_code`) when the outcome was
+`failed_closed=True` (a definitive, config/scope-level stop), otherwise a
+retryable `failure_reason` recorded via the existing waiting mechanism
+(bounded by the recovery's own expiry, after which the pre-existing
+`find_pending_exit_recovery_id` reaper marks it `EXPIRED`) — so a claimed
+recovery can no longer sit `IN_PROGRESS` with zero recorded reason.
+Ordinary (non-recovery) Controlled Proof progression is unchanged.
+
+The next production validation is to confirm a **fresh** Exit Recovery
+dispatch (a new authorization — the two production ids above are now
+terminal/stale for retry purposes) reaches full activation:
+
+Successful validation should demonstrate:
+
+• `automatic_activation_scope_resolved authority_mode=CONTROLLED_PROOF_DERIVED_SCOPE` with the real `controlled_proof_id` (already confirmed above).
+
+• No `controlled_proof_activation_override_blocked reason=controlled_proof_not_active` for this recovery's own package.
+
+• Automatic package activation succeeds (`automatic_package_activated`).
+
+• Execution claim is created (`autonomous_execution_claimed`).
+
+• Order submission proceeds normally (`provider_submission_succeeded`).
+
+• Reconciliation completes.
+
+• The autonomous lifecycle continues toward First Autonomous Profit.
+
+If activation still does not succeed, the recovery itself will now carry
+an explicit `blocked_reason` or `failure_reason` (via
+`GET /api/v1/operator/controlled-proofs/{proof_id}/exit-recovery`) —
+read that first rather than re-diagnosing from worker logs alone.
+
+Until this runtime evidence is captured, production validation remains
+in progress.
+
+No implementation should weaken mandate governance, immutable audit
+evidence, idempotency, or fail-closed behavior.
+
+## Operator Authentication for Operational APIs
+
+Current Production Behavior
+
+Operational API endpoints authenticate operator requests using the
+operator authentication mechanism implemented by the API.
+
+**[PROD]** For normal operational workflows (Controlled Proofs, Exit
+Recovery, operator actions, and readiness endpoints), the operator token
+is provided directly by the shell before invoking the API, for example:
+
+export OPERATOR_TOKEN="operator:human"
+
+or another valid operator identity beginning with:
+
+operator:
+
+The current production workflow does not require discovering or loading
+an OPERATOR_TOKEN value from apps/api/.env before using these APIs.
+
+When troubleshooting operational workflows, do not begin by searching
+for an OPERATOR_TOKEN environment variable unless new runtime evidence
+indicates the authentication mechanism itself has changed.
+
+Prefer reproducing the established production workflow that has already
+been successfully validated.
+
+
+## Operational API Command Rules
+
+These rules preserve authoritative API evidence, prevent duplicate mutations,
+and avoid false conclusions during production operations.
+
+### Identifier Discipline
+
+Proof IDs, recovery IDs, action IDs, package IDs, order IDs, campaign IDs, and
+provider order IDs identify different resources and are not interchangeable.
+
+- Reuse known identifiers from authoritative API responses or correlated
+  runtime evidence.
+- Never substitute a recovery, action, package, order, or campaign ID for a
+  Controlled Proof ID.
+- Correlate identifiers and timestamps before deciding that two events belong
+  to the same execution path.
+- Sharing a broader campaign ID does not establish that an ordinary autonomous
+  SELL belongs to a Controlled Proof lifecycle.
+- Validate that a required shell variable is populated with:
+
+```bash
+test -n "${PROOF_ID}"
+```
+
+Do not compare the variable against the expected UUID with an inequality test.
+A command such as:
+
+```bash
+test "${PROOF_ID}" != "<expected-proof-uuid>"
+```
+
+prevents execution when the variable contains the correct value.
+
+### Shell-State Discipline
+
+Variables exported in one VPS terminal do not exist automatically in another
+terminal.
+
+Commands requiring `OPERATOR_TOKEN`, `API_BASE`, `PROOF_ID`, `ACTION_ID`, or
+an idempotency key must either:
+
+* export them in the same terminal session; or
+* define them in the same chained command.
+
+Operator commands should remain single copyable one-line command blocks with a
+trailing blank line.
+
+### Preserve HTTP Error Bodies
+
+An HTTP `400` can be correct fail-closed domain behavior rather than malformed
+syntax, incorrect authentication, or a wrong endpoint.
+
+Do not use `curl --fail` when the response body is needed to diagnose a
+non-2xx operational result. It can suppress the authoritative API explanation.
+
+Production examples of valid fail-closed responses include:
+
+```text
+Controlled Proof already has SELL lineage
+An open production position already exists for this product
+Campaign does not authorize this product
+```
+
+Read the response body before changing the endpoint, authentication,
+parameters, or architecture. **[PROD]**
+
+An HTTP `405` from:
+
+```text
+GET /api/v1/operator/controlled-proofs
+```
+
+means the collection-level GET operation is unsupported. It does not establish
+an authentication failure. **[PROD]**
+
+An HTTP `404` from an assumed readiness route does not prove that an asset,
+position, or commissioning record is absent. It may mean that the deployed
+route does not exist.
+
+### Canonical JSON-Safe Diagnostic Pattern
+
+Keep the HTTP response body separate from the HTTP status so that appended
+status text is never piped into `jq`.
+
+Use this pattern:
+
+```bash
+HTTP_STATUS="$(curl --silent --show-error -o /tmp/omnitrade-response.json -w '%{http_code}' -H "Authorization: Bearer ${OPERATOR_TOKEN}" "${API_BASE}/api/v1/operator/controlled-proofs/${PROOF_ID}")"; printf 'HTTP_STATUS=%s\n' "${HTTP_STATUS}"; jq '.' /tmp/omnitrade-response.json
+```
+
+For a POST, use the same separation while including the required method,
+headers, and request body.
+
+Do not use this invalid pattern:
+
+```bash
+curl ... -w '\nHTTP_STATUS=%{http_code}\n' | jq '.'
+```
+
+Appending `HTTP_STATUS=...` to the response makes the combined stream invalid
+JSON. Retain the saved `/tmp/omnitrade-*.json` response for log correlation.
+
+### Idempotent Mutation Discipline
+
+* Generate an idempotency key once before a mutation request.
+* Submit a mutation POST only once unless its result is ambiguous and the API
+  contract explicitly permits an idempotent replay.
+* If a failed request's body was concealed, reuse the same idempotency key when
+  revealing the response. Do not generate a second key.
+* After a successful POST, use proof-specific, recovery-specific, or
+  action-specific GET requests to inspect progress.
+* Do not repeat the mutation merely because a filtered live monitor shows no
+  matching event.
+* Never authorize another Exit Recovery while the existing recovery is
+  `AUTHORIZED` or `IN_PROGRESS`.
+
+### Log Investigation Discipline
+
+A filtered live monitor is useful for observation but is not sufficient for
+root-cause diagnosis. Its filter may omit tracebacks, correlation identifiers,
+and decisive preceding events.
+
+After a failure or unexplained stall:
+
+1. Retrieve the proof-specific and recovery-specific API resources.
+2. Identify authoritative timestamps such as `created_at`, `claimed_at`, and
+   `expires_at`.
+3. Convert or reconcile UTC timestamps ending in `Z` with the timezone shown by
+   the VPS journal.
+4. Capture a tightly bounded, unfiltered journal window.
+5. Include both `omnitrade-api.service` and
+   `omnitrade-orchestration.service` when the lifecycle crosses API
+   authorization and worker processing.
+6. Correlate proof, recovery, action, package, order, campaign, and provider
+   identifiers before classifying the execution path.
+
+Canonical bounded-log pattern:
+
+```bash
+sudo journalctl -u omnitrade-api.service -u omnitrade-orchestration.service --since "<VPS-local-start-time>" --until "<VPS-local-end-time>" -o short-iso --no-pager | tee /tmp/omnitrade-investigation-window.log
+```
+
+Do not classify a recovery as unclaimed, expired, or stalled using a journal
+window shifted into the wrong timezone.
+
+### Evidence Rules
+
+* Absence from a filtered log is not proof that an event did not occur.
+* A successful authorization response does not prove that the worker claimed
+  or completed the operation.
+* A claimed recovery remaining `IN_PROGRESS` does not prove that no dispatch
+  occurred.
+* Inspect authoritative API state and unfiltered correlated logs before
+  classifying lifecycle status.
+* Keep Controlled Proof proving infrastructure separate from ordinary
+  autonomous production trading unless identifiers establish that they share
+  the same trade lifecycle.
+
+
 ### Known Gaps (configuration-specific)
 
 - Effective precedence across the three sources above — not confirmed on host (mechanics: see Systemd section).

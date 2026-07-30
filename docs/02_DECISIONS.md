@@ -608,3 +608,88 @@ Future Impact
 Controlled Proof Exit Recovery remains an operator-authorized recovery
 mechanism, but transient package progression failures no longer require
 manual intervention solely because a SELL package already exists.
+
+---
+
+## 2026-07-30
+
+### Exit Recovery Activation Eligibility Is Not Bound to a Package's Creation-Time Recovery Stamp
+
+Decision
+
+A claimed (`IN_PROGRESS`), unexpired Controlled Proof Exit Recovery
+authorizes automatic activation of its proof's linked SELL package
+(`proof.sell_package_id == package.package_id`) regardless of which
+recovery, if any, was active when that package was originally created.
+A package's own `market_evidence_identity.controlled_proof_exit_recovery_id`
+stamp is no longer part of the eligibility check. A claimed recovery
+that fails to reach activation on a given dispatch is now always
+terminalized with an explicit reason: `BLOCKED` (with the executor's
+`final_reason_code`) when the outcome was a definitive, config/scope-
+level `failed_closed=True` stop, otherwise a retryable `failure_reason`
+recorded via the existing waiting mechanism, bounded by the recovery's
+own expiry.
+
+Reason
+
+Production evidence (proof `345fc153-3db1-4514-8d0e-c7e0fe77790e`,
+recovery `819754a6-1566-4523-a2d4-b8447ab6868c`) showed an authorized,
+claimed Exit Recovery failing closed on
+`controlled_proof_activation_override_blocked reason=controlled_proof_not_active`
+on every dispatch, with the claimed recovery left `IN_PROGRESS`
+indefinitely and no recorded reason. Root cause: the eligibility check
+(added in commit `0a167eb`, "Reissue expired exit recovery sell
+authority") additionally required the package's stamp to equal the
+currently claimed recovery's id. That is only ever true for a package
+freshly created (or reissued) under that exact recovery — it can never
+be true for `authorize_controlled_proof_exit_recovery`'s own documented
+`allow_existing_sell_package` contract (present since the first Exit
+Recovery commit, `c296baf`), which explicitly authorizes resuming a
+SELL package that predates the recovery entirely, or that was stamped
+under an earlier, now-terminal recovery attempt for the same proof
+("the later authority may resume only that package" —
+`docs/CONTROLLED_PROOF_ACTIVATION.md`). The stamp check was a
+regression against the original, correct, tested design, not a
+deliberate tightening: `proof.sell_package_id` is already the sole,
+authoritative, exclusively-owned binding between a proof and its one
+governed SELL package (set once, cleared only by
+`supersede_stale_exit_recovery_sell_package`), so it alone is
+sufficient; the stamp match added no real protection while silently
+foreclosing a contract the same commit's own authorization code still
+advertised as supported.
+
+Alternatives Considered
+
+Keep the stamp match but exempt only a `None` stamp (a package that
+never touched any recovery). Rejected: it would still incorrectly
+reject the "resume across two recovery attempts for the same proof"
+case, which `authorize_controlled_proof_exit_recovery` and
+`docs/CONTROLLED_PROOF_ACTIVATION.md` both explicitly document as
+supported, and which is the more likely production shape (a prior
+recovery attempt already existed and went terminal before this one was
+authorized).
+
+Immediately transition a claimed recovery to `BLOCKED` on any
+non-`ACTIVATED` dispatch outcome, regardless of cause. Rejected: it
+would foreclose legitimate multi-cycle retry within the recovery's own
+authorized 1–180 minute window for transient, self-resolving causes,
+turning every soft stall into a forced re-authorization. Used the
+executor's existing `failed_closed` distinction instead — already the
+codebase's own vocabulary for "definitive, not retryable" versus
+"no clean outcome this cycle, may still resolve."
+
+Consequences
+
+Exit Recovery's documented "resume a pre-existing package" behavior is
+restored and covered by regression tests exercising: a package with no
+recovery stamp, a package stamped under an earlier terminal recovery for
+the same proof, an unclaimed (`AUTHORIZED`-only) recovery failing
+closed, an expired recovery failing closed, and a recovery belonging to
+an unrelated proof failing closed. A claimed recovery can no longer sit
+`IN_PROGRESS` indefinitely with no recorded reason. Mandate governance,
+campaign/package/risk/reconciliation invariants, idempotency, and audit
+correlation are unchanged — only the exit-recovery-specific eligibility
+binding and terminalization were corrected. Not yet production-deployed
+or production-validated as of this writing; see
+`docs/00_OPERATIONS_MAP.md`'s Controlled Proof Exit Recovery section for
+the next validation step.

@@ -144,18 +144,126 @@ async def test_terminal_proof_sell_activation_requires_active_exit_recovery() ->
         )
         session.add(recovery)
         await session.flush()
-        package.market_evidence_identity = {
-            **(package.market_evidence_identity or {}),
-            "controlled_proof_exit_recovery_id": str(recovery.recovery_id),
-        }
-        await session.flush()
+        # Confirmed production defect: this package predates the recovery
+        # entirely (market_evidence_identity carries no
+        # controlled_proof_exit_recovery_id stamp at all -- exactly the
+        # shape of a SELL package that reached PACKAGE_ONLY under ordinary
+        # WAITING_FOR_PROFITABLE_EXIT before the proof expired, then was
+        # resumed via authorize_controlled_proof_exit_recovery's
+        # allow_existing_sell_package contract). A claimed, unexpired
+        # recovery for this exact proof and its exact linked SELL package
+        # must still authorize activation -- the package's own stamp is not
+        # part of the eligibility binding.
         scope = await executor._resolve_controlled_proof_activation_scope(db=session, request=request)
         assert scope is not None and scope.controlled_proof_id == proof.proof_id
+        assert scope.authority_mode == "CONTROLLED_PROOF_DERIVED_SCOPE"
+
+
+@pytest.mark.asyncio
+async def test_exit_recovery_activation_ignores_package_stamped_with_a_different_terminal_recovery() -> None:
+    """A SELL package stamped with an EARLIER, now-terminal recovery's id
+    for this exact same proof (the package/recovery-reissue shape) must
+    still be resumable by a freshly authorized, claimed recovery for that
+    same proof -- "the later authority may resume only that package" per
+    docs/CONTROLLED_PROOF_ACTIVATION.md."""
+    campaign_id = uuid.uuid4()
+    ids = _mandate_ids()
+    async with _real_session() as session:
+        package = await _make_package(db=session, campaign_id=campaign_id, campaign_version=1, side="SELL", **ids)
+        proof = await _make_proof(db=session, campaign_id=campaign_id, campaign_version=1, package_id=uuid.uuid4(), sell_package_id=package.package_id, status="EXPIRED")
         package.market_evidence_identity = {
-            **(package.market_evidence_identity or {}),
-            "controlled_proof_exit_recovery_id": str(uuid.uuid4()),
+            **(package.market_evidence_identity or {}), "controlled_proof_exit_recovery_id": str(uuid.uuid4()),
         }
         await session.flush()
+        new_recovery = ControlledProofExitRecovery(
+            proof_id=proof.proof_id, status="IN_PROGRESS", idempotency_key="fresh-recovery-attempt",
+            authorized_by="operator:human", authorized_at=datetime.now(timezone.utc),
+            expires_at=datetime.now(timezone.utc) + timedelta(minutes=30),
+        )
+        session.add(new_recovery)
+        await session.flush()
+        request = executor.AutomaticPackageExecutionRequest(
+            campaign_id=campaign_id, campaign_version=1,
+            decision_record_id=package.decision_record_id, package_id=package.package_id,
+        )
+
+        scope = await executor._resolve_controlled_proof_activation_scope(db=session, request=request)
+
+        assert scope is not None
+        assert scope.controlled_proof_id == proof.proof_id
+
+
+@pytest.mark.asyncio
+async def test_exit_recovery_activation_fails_closed_when_recovery_is_unclaimed() -> None:
+    """An AUTHORIZED-but-not-yet-claimed recovery (claim_exit_recovery_by_id
+    has not transitioned it to IN_PROGRESS) must not authorize activation."""
+    campaign_id = uuid.uuid4()
+    ids = _mandate_ids()
+    async with _real_session() as session:
+        package = await _make_package(db=session, campaign_id=campaign_id, campaign_version=1, side="SELL", **ids)
+        proof = await _make_proof(db=session, campaign_id=campaign_id, campaign_version=1, package_id=uuid.uuid4(), sell_package_id=package.package_id, status="EXPIRED")
+        session.add(ControlledProofExitRecovery(
+            proof_id=proof.proof_id, status="AUTHORIZED", idempotency_key="unclaimed-recovery",
+            authorized_by="operator:human", authorized_at=datetime.now(timezone.utc),
+            expires_at=datetime.now(timezone.utc) + timedelta(minutes=30),
+        ))
+        await session.flush()
+        request = executor.AutomaticPackageExecutionRequest(
+            campaign_id=campaign_id, campaign_version=1,
+            decision_record_id=package.decision_record_id, package_id=package.package_id,
+        )
+
+        assert await executor._resolve_controlled_proof_activation_scope(db=session, request=request) is None
+
+
+@pytest.mark.asyncio
+async def test_exit_recovery_activation_fails_closed_when_recovery_is_expired() -> None:
+    campaign_id = uuid.uuid4()
+    ids = _mandate_ids()
+    async with _real_session() as session:
+        package = await _make_package(db=session, campaign_id=campaign_id, campaign_version=1, side="SELL", **ids)
+        proof = await _make_proof(db=session, campaign_id=campaign_id, campaign_version=1, package_id=uuid.uuid4(), sell_package_id=package.package_id, status="EXPIRED")
+        session.add(ControlledProofExitRecovery(
+            proof_id=proof.proof_id, status="IN_PROGRESS", idempotency_key="expired-recovery",
+            authorized_by="operator:human", authorized_at=datetime.now(timezone.utc) - timedelta(minutes=40),
+            expires_at=datetime.now(timezone.utc) - timedelta(minutes=10),
+        ))
+        await session.flush()
+        request = executor.AutomaticPackageExecutionRequest(
+            campaign_id=campaign_id, campaign_version=1,
+            decision_record_id=package.decision_record_id, package_id=package.package_id,
+        )
+
+        assert await executor._resolve_controlled_proof_activation_scope(db=session, request=request) is None
+
+
+@pytest.mark.asyncio
+async def test_exit_recovery_activation_ignores_unrelated_proofs_recovery() -> None:
+    """A claimed, unexpired recovery that belongs to a DIFFERENT proof must
+    never authorize this proof's package -- eligibility is scoped by
+    ControlledProofExitRecovery.proof_id, not merely "any active recovery
+    exists somewhere"."""
+    campaign_id = uuid.uuid4()
+    ids = _mandate_ids()
+    async with _real_session() as session:
+        package = await _make_package(db=session, campaign_id=campaign_id, campaign_version=1, side="SELL", **ids)
+        proof = await _make_proof(db=session, campaign_id=campaign_id, campaign_version=1, package_id=uuid.uuid4(), sell_package_id=package.package_id, status="EXPIRED")
+        other_package = await _make_package(db=session, campaign_id=campaign_id, campaign_version=1, side="SELL", **_mandate_ids())
+        other_proof = await _make_proof(
+            db=session, campaign_id=campaign_id, campaign_version=1,
+            package_id=uuid.uuid4(), sell_package_id=other_package.package_id, status="EXPIRED",
+        )
+        session.add(ControlledProofExitRecovery(
+            proof_id=other_proof.proof_id, status="IN_PROGRESS", idempotency_key="unrelated-proof-recovery",
+            authorized_by="operator:human", authorized_at=datetime.now(timezone.utc),
+            expires_at=datetime.now(timezone.utc) + timedelta(minutes=30),
+        ))
+        await session.flush()
+        request = executor.AutomaticPackageExecutionRequest(
+            campaign_id=campaign_id, campaign_version=1,
+            decision_record_id=package.decision_record_id, package_id=package.package_id,
+        )
+
         assert await executor._resolve_controlled_proof_activation_scope(db=session, request=request) is None
 
 

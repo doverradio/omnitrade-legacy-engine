@@ -49,13 +49,36 @@ Avoid redesigning completed architecture unless a genuine defect is discovered.
 
 # Current Focus
 
-Task 10 is complete.
+The external reconciliation investigation is complete.
 
-The next session should not redesign commissioned architecture.
+The PACKAGE_ONLY SELL progression defect has been repaired,
+deployed, and production validated.
 
-The next session should complete production validation of the Controlled
-Proof activation-scope correction and continue from the resulting runtime
-evidence.
+The Controlled Proof authority-propagation defect
+(`GLOBAL_CONFIGURED_SCOPE controlled_proof_id=None`) is
+production-confirmed fixed: a fresh Exit Recovery dispatch reached
+`CONTROLLED_PROOF_DERIVED_SCOPE` with the real `controlled_proof_id`.
+
+That evidence surfaced a second, deeper defect immediately downstream:
+activation then failed closed with
+`controlled_proof_activation_override_blocked reason=controlled_proof_not_active`,
+and the claimed recovery stayed `IN_PROGRESS` indefinitely with no
+recorded reason. Root cause and fix are implemented, unit-tested, and
+documented in `docs/00_OPERATIONS_MAP.md`'s Controlled Proof Exit
+Recovery section — in short: the eligibility check wrongly required a
+SELL package's creation-time recovery-id stamp to match the currently
+claimed recovery, which is never true for Exit Recovery's documented
+"resume a pre-existing SELL package" case; and a claimed recovery that
+fails to activate now always gets an explicit `BLOCKED`/retryable
+reason instead of sitting silently `IN_PROGRESS`. **Not yet deployed or
+production-validated.**
+
+The next session should: (1) deploy this correction, (2) production-
+validate it with a **fresh** Exit Recovery authorization (the two ids
+already used for diagnosis are now terminal/stale for retry purposes),
+then (3) continue following the autonomous lifecycle from automatic
+package activation through execution, reconciliation, accounting
+completion, and First Autonomous Profit.
 
 ---
 
@@ -409,14 +432,16 @@ The external reconciliation investigation is complete.
 
 The PACKAGE_ONLY SELL progression retry was deployed in commit 3da57cd.
 
-The next correction changes activation-scope resolution so a valid
-Controlled Proof or Exit Recovery package is evaluated under
-CONTROLLED_PROOF_DERIVED_SCOPE before ordinary global configured scope
-is considered.
+The Controlled Proof authority-propagation correction is already
+production-confirmed. The recovery-aware activation-eligibility and
+truthful recovery-terminalization corrections are now implemented and
+tested but have not yet been committed, deployed, or production-validated.
 
-Begin from the latest production runtime evidence and verify whether the
-Controlled Proof SELL package activates, creates an execution claim,
-submits, reconciles, and completes successfully.
+Begin by reviewing and committing the existing working-tree changes.
+Then deploy them and authorize exactly one fresh Exit Recovery for the
+existing proof. Validate automatic activation, execution claim, provider
+submission, reconciliation, accounting, and the terminal Controlled Proof
+and Exit Recovery outcomes.
 
 Do not re-investigate external reconciliation or PACKAGE_ONLY retry
 unless new runtime evidence directly contradicts the established findings.
