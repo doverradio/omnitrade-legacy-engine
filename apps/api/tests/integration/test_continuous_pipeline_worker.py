@@ -695,6 +695,44 @@ async def test_campaign_preview_no_candidates_emits_exact_skip_reason(
 
 
 @pytest.mark.asyncio
+async def test_recovered_exit_recovery_outcome_sweep_runs_independent_of_reconciliation_candidates(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The recovered-outcome backfill sweep (refresh_exit_recovery_outcomes)
+    must be invoked on every orchestration cycle even when the live-order
+    reconciliation poll finds zero candidates -- the exact production shape
+    for a proof whose replacement SELL already reconciled before this
+    process started. No order-submission path is touched by this sweep."""
+    import app.services.orchestration.continuous_pipeline_worker as worker_module
+
+    class _ScalarsCapableDB(_CampaignPreviewCapableDB):
+        async def scalars(self, *_args, **_kwargs):
+            return SimpleNamespace(all=lambda: [])
+
+    db = _ScalarsCapableDB()
+    _patch_worker_for_campaign_preview_observability(
+        monkeypatch, worker_module,
+        {
+            "mode": "campaign_orchestration_preview", "trigger": "kraken_btc_15m_candle_close",
+            "ready": False, "reason": "latest_btc_15m_candle_not_found",
+            "cycle_count": 0, "cycles": [],
+        },
+    )
+
+    sweep_calls: list[object] = []
+
+    async def _sweep_spy(*, db):
+        sweep_calls.append(db)
+
+    monkeypatch.setattr(worker_module, "refresh_exit_recovery_outcomes", _sweep_spy)
+
+    stats = await run_orchestration_cycle(db=db, client=object(), config=_config())
+
+    assert stats.ingestion_assets_ok == 1
+    assert sweep_calls == [db]
+
+
+@pytest.mark.asyncio
 async def test_campaign_preview_success_logs_positive_cycle_count_and_no_mutating_ops(
     monkeypatch: pytest.MonkeyPatch,
     caplog: pytest.LogCaptureFixture,

@@ -8,6 +8,7 @@ from types import SimpleNamespace
 from typing import AsyncIterator
 
 import pytest
+from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.errors import InvalidRequestError
@@ -1276,3 +1277,73 @@ def test_model_declares_idempotency_and_one_active_recovery_per_proof() -> None:
     assert tuple(column.name for column in active_index.columns) == ("proof_id",)
     assert "AUTHORIZED" in str(active_index.dialect_options["postgresql"]["where"])
     assert "IN_PROGRESS" in str(active_index.dialect_options["postgresql"]["where"])
+
+
+@pytest.mark.asyncio
+async def test_refresh_exit_recovery_outcomes_sweep_backfills_stuck_proof_from_real_rows() -> None:
+    """refresh_exit_recovery_outcomes (the orchestration sweep entry point)
+    must backfill a stuck proof from its already-published, valid
+    COMPLETED_RECONCILED recovered-outcome audit -- with no live-order
+    reconciliation candidates involved at all -- and replay must be a
+    no-op (no duplicate audit, unchanged values)."""
+    async with _real_recovery_session() as session:
+        campaign_id = uuid.uuid4()
+        proof_id, recovery_id, package_id, order_id = (
+            uuid.uuid4(), uuid.uuid4(), uuid.uuid4(), uuid.uuid4(),
+        )
+        proof = ControlledProofRun(
+            proof_id=proof_id, status="FAILED", provider="kraken_spot", environment="production",
+            campaign_id=campaign_id, campaign_version=1, product_id="BTC-USD",
+            max_notional_usd=Decimal("5"), idempotency_key=f"idem-{uuid.uuid4()}", requested_by="operator:alice",
+            expires_at=datetime.now(timezone.utc) - timedelta(minutes=5),
+            package_id=uuid.uuid4(), sell_package_id=package_id, sell_live_crypto_order_id=order_id,
+            net_pnl_usd=None, terminal_verdict="FAILED",
+        )
+        session.add(proof)
+        recovery = ControlledProofExitRecovery(
+            recovery_id=recovery_id, proof_id=proof_id, status="BLOCKED",
+            idempotency_key=f"idem-{uuid.uuid4()}", authorized_by="operator:alice",
+            authorized_at=datetime.now(timezone.utc), expires_at=datetime.now(timezone.utc) + timedelta(minutes=30),
+            blocked_reason="stale_sell_package_replacement_blocked:Stale SELL package has unresolved execution lineage",
+        )
+        session.add(recovery)
+        session.add(AuditLog(
+            actor="system:controlled_proof_reconciliation_projector",
+            action=exit_recovery._RECOVERED_OUTCOME_ACTION,
+            entity_type="controlled_proof_exit_recovery", entity_id=recovery_id,
+            before_state={}, after_state={
+                "status": "COMPLETED_RECONCILED",
+                "original_recovery_id": str(recovery_id),
+                "proof_id": str(proof_id),
+                "sell_package_id": str(package_id),
+                "sell_live_crypto_order_id": str(order_id),
+                "recovered_terminal_verdict": "LIFECYCLE_PROVEN_LOSS",
+                "recovered_net_pnl_usd": "-0.0393333016409",
+            },
+        ))
+        await session.flush()
+
+        await exit_recovery.refresh_exit_recovery_outcomes(db=session)
+
+        refreshed_proof = await session.get(ControlledProofRun, proof_id)
+        assert refreshed_proof.net_pnl_usd == Decimal("-0.0393333016409")
+        assert refreshed_proof.terminal_verdict == "LIFECYCLE_PROVEN_LOSS"
+        refreshed_recovery = await session.get(ControlledProofExitRecovery, recovery_id)
+        assert refreshed_recovery.status == "BLOCKED"
+        outcome_audits = (await session.scalars(select(AuditLog).where(
+            AuditLog.entity_type == "controlled_proof_exit_recovery", AuditLog.entity_id == recovery_id,
+            AuditLog.action == exit_recovery._RECOVERED_OUTCOME_ACTION,
+        ))).all()
+        assert len(outcome_audits) == 1
+
+        # Replay: no-op, no duplicate audit, values unchanged.
+        await exit_recovery.refresh_exit_recovery_outcomes(db=session)
+
+        replayed_proof = await session.get(ControlledProofRun, proof_id)
+        assert replayed_proof.net_pnl_usd == Decimal("-0.0393333016409")
+        assert replayed_proof.terminal_verdict == "LIFECYCLE_PROVEN_LOSS"
+        replayed_audits = (await session.scalars(select(AuditLog).where(
+            AuditLog.entity_type == "controlled_proof_exit_recovery", AuditLog.entity_id == recovery_id,
+            AuditLog.action == exit_recovery._RECOVERED_OUTCOME_ACTION,
+        ))).all()
+        assert len(replayed_audits) == 1

@@ -1689,14 +1689,15 @@ async def _run_autonomous_and_campaign_orchestration_attempt(*, db: AsyncSession
     # Additive operator workflow: attempt it independently before ambient
     # strategy composition.  A failure is contained and cannot change the
     # autonomous cycle that follows.
+    #
+    # refresh_exit_recovery_outcomes() is deliberately NOT called here --
+    # it runs exactly once per cycle, unconditionally, from
+    # run_orchestration_cycle itself (before ingestion/venue-commissioning/
+    # claim-sweep/campaign-path stages can skip or fail it), independent of
+    # live-order reconciliation candidate count. Calling it again here
+    # would run it twice per cycle.
     if hasattr(db, "scalars") and hasattr(db, "scalar"):
         try:
-            await refresh_exit_recovery_outcomes(db=db)
-            # Outcome projection is independently authoritative and must not
-            # depend on a later ambient orchestration stage reaching its own
-            # commit.  This also makes deployment self-heal already-reconciled
-            # historical recoveries on the first periodic pass.
-            await db.commit()
             pending_recovery_id = await find_pending_exit_recovery_id(db=db)
             if pending_recovery_id is not None:
                 await _attempt_operator_controlled_proof_entry(db=db, recovery_id=pending_recovery_id)
@@ -2439,6 +2440,24 @@ async def run_orchestration_cycle(
         except Exception:
             await _rollback_active_session(db=db)
             logger.exception("live_order_reconciliation_cycle_failed")
+
+    # Recovered-outcome backfill sweep: its own guarded call site,
+    # deliberately independent of live-order reconciliation candidate
+    # count (poll_unresolved_live_orders above finds zero candidates for
+    # an order that already reconciled before this process started) and
+    # of whatever happens in ingestion/venue-commissioning/claim-sweep
+    # earlier in this cycle -- a transient failure there must never
+    # silently prevent an already-proven, already-published recovered
+    # outcome from being projected onto its stuck proof. Reuses the
+    # existing, fully idempotent projector/validation unchanged; see
+    # project_blocked_exit_recovery_outcome.
+    if hasattr(db, "scalars") and hasattr(db, "scalar") and hasattr(db, "commit"):
+        try:
+            await refresh_exit_recovery_outcomes(db=db)
+            await db.commit()
+        except Exception:
+            await _rollback_active_session(db=db)
+            logger.exception("recovered_exit_recovery_outcome_sweep_failed")
 
     await _run_autonomous_and_campaign_orchestration_attempt(db=db)
 
