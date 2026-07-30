@@ -390,6 +390,72 @@ async def supersede_stale_exit_recovery_sell_package(
     await db.flush()
 
 
+async def supersede_expired_preview_exit_recovery_sell_package(
+    *, db: AsyncSession, recovery: ControlledProofExitRecovery,
+    proof: ControlledProofRun, package: CanonicalPreviewPackage,
+) -> None:
+    """Retire a SELL package whose canonical preview window expired before
+    it ever reached ACTIVATED, so fresh governance can run.
+
+    Disjoint from supersede_stale_exit_recovery_sell_package, which handles
+    an already-ACTIVATED package whose post-activation authorization window
+    later elapsed. A package that never reached ACTIVATED can never have an
+    execution claim (claim_activated_package requires package_state ==
+    "ACTIVATED") or a CanonicalProvingActivation row (only created by
+    activate_canonical_proving_campaign) -- so neither is checked here.
+    """
+    now = _utcnow()
+    if (
+        recovery.proof_id != proof.proof_id
+        or recovery.status != "IN_PROGRESS"
+        or recovery.expires_at <= now
+        or proof.sell_package_id != package.package_id
+        or package.side != "SELL"
+        or package.package_state not in {"READY", "AUTHORIZED", "DRY_RUN_PASSED"}
+        or package.preview_expires_at > now
+    ):
+        raise InvalidRequestError(message="Stale SELL package preview is not eligible for governed replacement", details={})
+
+    old_package_id = package.package_id
+    before_package_state = package.package_state
+    package.package_state = "SUPERSEDED"
+    package.superseded_at = now
+    package.invalidated_reason = "controlled_proof_exit_recovery_fresh_authority_required"
+    proof.sell_package_id = None
+    proof.updated_at = now
+    db.add(AuditLog(
+        actor="system:controlled_proof_worker",
+        action="canonical_preview_package.superseded_for_exit_recovery",
+        entity_type="canonical_preview_package", entity_id=old_package_id,
+        before_state={"package_state": before_package_state},
+        after_state={
+            "package_state": "SUPERSEDED",
+            "reason": package.invalidated_reason,
+            "controlled_proof_id": str(proof.proof_id),
+            "exit_recovery_id": str(recovery.recovery_id),
+        },
+    ))
+    db.add(AuditLog(
+        actor="system:controlled_proof_worker",
+        action="controlled_proof_exit_recovery.stale_sell_package_superseded",
+        entity_type="controlled_proof_exit_recovery", entity_id=recovery.recovery_id,
+        before_state={
+            "sell_package_id": str(old_package_id),
+            "package_state": before_package_state,
+            "preview_expires_at": package.preview_expires_at.isoformat(),
+        },
+        after_state={
+            "sell_package_id": None,
+            "package_state": "SUPERSEDED",
+            "replacement_requires_fresh_risk_mandate_preview_package": True,
+            "controlled_proof_id": str(proof.proof_id),
+            "exit_recovery_id": str(recovery.recovery_id),
+            "superseded_package_id": str(old_package_id),
+        },
+    ))
+    await db.flush()
+
+
 async def get_exit_recovery_view(*, db: AsyncSession, proof_id: uuid.UUID) -> dict:
     await find_pending_exit_recovery_id(db=db)
     recovery = await db.scalar(select(ControlledProofExitRecovery).where(ControlledProofExitRecovery.proof_id == proof_id).order_by(ControlledProofExitRecovery.authorized_at.desc()).limit(1))

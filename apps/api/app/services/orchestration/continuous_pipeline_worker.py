@@ -63,6 +63,7 @@ from app.services.controlled_proof import (
     resolve_controlled_proof_leg_execution_lineage,
     resolve_controlled_proof_strategy_identity,
     should_propose_controlled_sell,
+    supersede_expired_preview_exit_recovery_sell_package,
     supersede_stale_exit_recovery_sell_package,
 )
 from app.services.ai_coach.deterministic import evaluate_decision_quality_v0
@@ -1992,6 +1993,21 @@ async def _attempt_operator_controlled_proof_entry(
                         if authorization_expires_at is not None and authorization_expires_at.tzinfo is None
                         else authorization_expires_at
                     )
+                    # Distinct staleness shapes, distinct supersession paths:
+                    # an already-ACTIVATED package whose post-activation
+                    # authorization window later elapsed (below) versus a
+                    # package that never reached ACTIVATED at all before its
+                    # own canonical preview window expired -- the latter is
+                    # a deterministic, permanent dead end for _progress_
+                    # package (authorize_canonical_preview_package_under_
+                    # mandate/run_dry_run_for_canonical_preview_package both
+                    # fail closed on preview_expires_at <= now with no path
+                    # to recovery), so it must also be reissued fresh rather
+                    # than retried.
+                    preview_expired_before_activation = (
+                        sell_package.package_state in {"READY", "AUTHORIZED", "DRY_RUN_PASSED"}
+                        and sell_package.preview_expires_at <= datetime.now(timezone.utc)
+                    )
                     if (
                         normalized_authorization_expires_at is not None
                         and normalized_authorization_expires_at <= datetime.now(timezone.utc)
@@ -2003,11 +2019,26 @@ async def _attempt_operator_controlled_proof_entry(
                             await db.commit()
                             logger.info(
                                 "controlled_proof_exit_recovery_fresh_sell_authority_started "
-                                "proof_id=%s recovery_id=%s superseded_package_id=%s side=SELL",
+                                "proof_id=%s recovery_id=%s superseded_package_id=%s side=SELL reason=authorization_expired",
                                 proof.proof_id, recovery.recovery_id, sell_package.package_id,
                             )
                         except InvalidRequestError as exc:
                             await _record_block(f"stale_sell_package_replacement_blocked:{exc.message}")
+                            await db.commit()
+                            return
+                    elif preview_expired_before_activation:
+                        try:
+                            await supersede_expired_preview_exit_recovery_sell_package(
+                                db=db, recovery=recovery, proof=proof, package=sell_package,
+                            )
+                            await db.commit()
+                            logger.info(
+                                "controlled_proof_exit_recovery_fresh_sell_authority_started "
+                                "proof_id=%s recovery_id=%s superseded_package_id=%s side=SELL reason=preview_expired",
+                                proof.proof_id, recovery.recovery_id, sell_package.package_id,
+                            )
+                        except InvalidRequestError as exc:
+                            await _record_block(f"stale_sell_package_preview_replacement_blocked:{exc.message}")
                             await db.commit()
                             return
                     else:

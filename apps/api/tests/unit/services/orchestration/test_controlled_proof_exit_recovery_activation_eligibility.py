@@ -4,6 +4,7 @@ import uuid
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
+from types import SimpleNamespace
 from typing import AsyncIterator
 
 import pytest
@@ -45,6 +46,7 @@ def _mandate_ids() -> dict:
 
 async def _seed_expired_proof_with_preexisting_sell_package(
     session: AsyncSession, *, sell_authorization_expires_at: datetime | None = None,
+    sell_preview_expires_at: datetime | None = None, sell_package_state: str = "READY",
 ) -> tuple[ControlledProofRun, CanonicalPreviewPackage]:
     """The exact confirmed production shape: a SELL package that reached
     PACKAGE_ONLY under *ordinary* WAITING_FOR_PROFITABLE_EXIT (no exit
@@ -65,7 +67,8 @@ async def _seed_expired_proof_with_preexisting_sell_package(
         proposed_order_amount=Decimal("5"), risk_approved_amount=Decimal("5"),
         strategy_id=uuid.uuid4(), strategy_version="1.0.0", parameter_set_id=uuid.uuid4(), parameter_set_version="1",
         decision_record_id=uuid.uuid4(), risk_event_id=uuid.uuid4(), crypto_order_preview_id=uuid.uuid4(),
-        preview_expires_at=datetime.now(timezone.utc) + timedelta(minutes=5), package_state="READY",
+        preview_expires_at=sell_preview_expires_at or (datetime.now(timezone.utc) + timedelta(minutes=5)),
+        package_state=sell_package_state,
         authorization_expires_at=sell_authorization_expires_at,
         generated_at=datetime.now(timezone.utc), idempotency_key=f"idem-{uuid.uuid4()}", input_fingerprint="fp",
         mandate_id=ids["mandate_id"], mandate_version_id=ids["mandate_version_id"],
@@ -307,3 +310,188 @@ async def test_unsuccessful_dispatch_never_touches_ordinary_non_recovery_proof(m
             AuditLog.action.in_(("controlled_proof_run.waiting", "controlled_proof_run.blocked")),
         ))).all()
         assert audits == []
+
+
+def _install_fresh_sell_package_creation_pipeline(
+    monkeypatch: pytest.MonkeyPatch, *, new_package_id: uuid.UUID,
+) -> list[int]:
+    """Stubs every stage between 'a fresh SELL package must be created' and
+    create_canonical_preview_package itself, so the real,
+    unstubbed link_controlled_proof_sell_package / _progress_package /
+    execute_automatic_ready_package_through_activation machinery proves
+    exactly-once fresh package creation and linkage. create_canonical_
+    preview_package is a call-counting spy returning a fixed payload
+    pointing at a package the test itself pre-inserts -- the real
+    create/validate machinery (risk, mandate, decision, preview) is
+    orthogonal to what this test verifies (no duplicate SELL lineage on
+    replay) and is exercised elsewhere."""
+    create_calls: list[int] = []
+
+    async def _sell_eligible(*, db, proof):
+        return True
+
+    async def _runtime(*, db, campaign_id):
+        return SimpleNamespace(paper_account_id=uuid.uuid4(), id=uuid.uuid4())
+
+    async def _profile(*, db, paper_account_id):
+        return SimpleNamespace(id=uuid.uuid4())
+
+    async def _no_open_order(*, db, provider, environment, product):
+        return False
+
+    async def _no_unresolved_reconciliation(*, db, provider, environment, product):
+        return False
+
+    async def _risk_allow(*, db, proof_id, campaign_id, campaign_version, paper_account_id, product_id, side, notional_usd, actor):
+        return SimpleNamespace(verdict="ALLOW", reason_code=None)
+
+    async def _strategy_identity(*, db, mandate_id):
+        return "strategy-v1"
+
+    async def _decision_record(*, db, campaign_id, controlled_proof_id, forced_action, product, provider, actor, strategy_identity, controlled_proof_exit_recovery_id):
+        return uuid.uuid4()
+
+    async def _open_exposure(*, db, live_trading_profile_id):
+        return Decimal("0")
+
+    async def _mandate_authorized(*, db, request):
+        return SimpleNamespace(
+            authorization_result="AUTHORIZED", mandate_id=uuid.uuid4(),
+            mandate_version_id=uuid.uuid4(), evaluation_id=uuid.uuid4(),
+        )
+
+    async def _create_package_spy(*, db, request):
+        create_calls.append(1)
+        return {"package": {"package_id": str(new_package_id)}}
+
+    async def _not_achieved(*, db, request):
+        return automatic_package_executor.AutomaticPackageExecutionOutcome(
+            package_id=request.package_id, campaign_id=request.campaign_id, campaign_version=request.campaign_version,
+            decision_record_id=request.decision_record_id, mandate_id=None, authorization_state="UNKNOWN",
+            dry_run_state="UNKNOWN", activation_state="NOT_ACTIVATED", authority_source=None,
+            replayed=False, final_reason_code="automatic_mandate_package_activation_disabled",
+            failed_closed=False, starting_state="READY",
+        )
+
+    monkeypatch.setattr(worker, "should_propose_controlled_sell", _sell_eligible)
+    monkeypatch.setattr(worker, "_load_runtime_campaign", _runtime)
+    monkeypatch.setattr(worker, "_load_live_trading_profile_for_paper_account", _profile)
+    monkeypatch.setattr(worker, "_has_open_live_order", _no_open_order)
+    monkeypatch.setattr(worker, "_has_unresolved_reconciliation", _no_unresolved_reconciliation)
+    monkeypatch.setattr(worker, "evaluate_controlled_proof_risk", _risk_allow)
+    monkeypatch.setattr(worker, "get_settings", lambda: SimpleNamespace(controlled_proof_mandate_id=uuid.uuid4()))
+    monkeypatch.setattr(worker, "resolve_controlled_proof_strategy_identity", _strategy_identity)
+    monkeypatch.setattr(worker, "create_controlled_proof_decision_record", _decision_record)
+    monkeypatch.setattr(worker, "compute_controlled_proof_open_exposure_usd", _open_exposure)
+    monkeypatch.setattr(worker, "evaluate_and_record_mandate", _mandate_authorized)
+    monkeypatch.setattr(worker, "create_canonical_preview_package", _create_package_spy)
+    monkeypatch.setattr(worker, "execute_automatic_ready_package_through_activation", _not_achieved)
+    return create_calls
+
+
+@pytest.mark.asyncio
+async def test_expired_preview_sell_package_is_superseded_and_exactly_one_fresh_package_created(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Reproduces the confirmed production blocker: SELL package
+    63cd5c1b-... sat READY with an expired canonical preview
+    (activation_failed_closed:canonical preview package expired). A
+    claimed, unexpired Exit Recovery must supersede it -- never retry or
+    revive it -- and create exactly one fresh governed SELL package."""
+    async with _real_session() as session:
+        proof, stale_package = await _seed_expired_proof_with_preexisting_sell_package(
+            session, sell_preview_expires_at=datetime.now(timezone.utc) - timedelta(minutes=1),
+        )
+        recovery = ControlledProofExitRecovery(
+            recovery_id=uuid.uuid4(), proof_id=proof.proof_id, status="IN_PROGRESS",
+            idempotency_key=f"idem-{uuid.uuid4()}", authorized_by="operator:alice",
+            expires_at=datetime.now(timezone.utc) + timedelta(minutes=30),
+            claimed_at=datetime.now(timezone.utc),
+        )
+        session.add(recovery)
+        await session.flush()
+
+        async def _claim_recovery_stub(*, db, recovery_id):
+            return recovery, proof
+
+        monkeypatch.setattr(worker, "claim_exit_recovery_by_id", _claim_recovery_stub)
+        _install_no_op_completion_refresh(monkeypatch)
+
+        new_package_id = uuid.uuid4()
+        new_package = CanonicalPreviewPackage(
+            package_id=new_package_id, campaign_id=proof.campaign_id, campaign_version=proof.campaign_version,
+            runtime_campaign_id=uuid.uuid4(), paper_account_id=uuid.uuid4(), live_trading_profile_id=uuid.uuid4(),
+            provider="kraken_spot", environment="production", product="BTC-USD", side="SELL",
+            proposed_order_amount=Decimal("5"), risk_approved_amount=Decimal("5"),
+            strategy_id=uuid.uuid4(), strategy_version="1.0.0", parameter_set_id=uuid.uuid4(), parameter_set_version="1",
+            decision_record_id=uuid.uuid4(), risk_event_id=uuid.uuid4(), crypto_order_preview_id=uuid.uuid4(),
+            preview_expires_at=datetime.now(timezone.utc) + timedelta(minutes=5), package_state="READY",
+            generated_at=datetime.now(timezone.utc), idempotency_key=f"idem-{uuid.uuid4()}", input_fingerprint="fp",
+        )
+        session.add(new_package)
+        await session.flush()
+
+        create_calls = _install_fresh_sell_package_creation_pipeline(monkeypatch, new_package_id=new_package_id)
+
+        await worker._attempt_operator_controlled_proof_entry(db=session, recovery_id=recovery.recovery_id)
+
+        refreshed_stale = await session.get(CanonicalPreviewPackage, stale_package.package_id)
+        refreshed_proof = await session.get(ControlledProofRun, proof.proof_id)
+        assert refreshed_stale.package_state == "SUPERSEDED"
+        assert refreshed_proof.sell_package_id == new_package_id
+        assert create_calls == [1]
+
+        # Replay: a second ordinary dispatch for the same still-IN_PROGRESS
+        # recovery must not create a second fresh package or duplicate SELL
+        # lineage -- the now-linked new_package's own preview has not
+        # expired, so branch selection must route to ordinary progression,
+        # not supersession/creation again.
+        await worker._attempt_operator_controlled_proof_entry(db=session, recovery_id=recovery.recovery_id)
+
+        refreshed_proof_again = await session.get(ControlledProofRun, proof.proof_id)
+        assert refreshed_proof_again.sell_package_id == new_package_id
+        assert create_calls == [1]
+
+
+@pytest.mark.asyncio
+async def test_unexpired_preview_sell_package_is_not_superseded(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A valid, unexpired canonical SELL package retains existing
+    behavior: ordinary progression, never supersession."""
+    async with _real_session() as session:
+        proof, sell_package = await _seed_expired_proof_with_preexisting_sell_package(session)
+        recovery = ControlledProofExitRecovery(
+            recovery_id=uuid.uuid4(), proof_id=proof.proof_id, status="IN_PROGRESS",
+            idempotency_key=f"idem-{uuid.uuid4()}", authorized_by="operator:alice",
+            expires_at=datetime.now(timezone.utc) + timedelta(minutes=30),
+            claimed_at=datetime.now(timezone.utc),
+        )
+        session.add(recovery)
+        await session.flush()
+
+        async def _claim_recovery_stub(*, db, recovery_id):
+            return recovery, proof
+
+        monkeypatch.setattr(worker, "claim_exit_recovery_by_id", _claim_recovery_stub)
+        _install_no_op_completion_refresh(monkeypatch)
+
+        progressed: list[uuid.UUID] = []
+
+        async def _spy_execute(*, db, request):
+            progressed.append(request.package_id)
+            return automatic_package_executor.AutomaticPackageExecutionOutcome(
+                package_id=request.package_id, campaign_id=request.campaign_id, campaign_version=request.campaign_version,
+                decision_record_id=request.decision_record_id, mandate_id=None, authorization_state="UNKNOWN",
+                dry_run_state="UNKNOWN", activation_state="NOT_ACTIVATED", authority_source=None,
+                replayed=False, final_reason_code="automatic_mandate_package_activation_disabled",
+                failed_closed=False, starting_state="READY",
+            )
+
+        monkeypatch.setattr(worker, "execute_automatic_ready_package_through_activation", _spy_execute)
+
+        await worker._attempt_operator_controlled_proof_entry(db=session, recovery_id=recovery.recovery_id)
+
+        assert progressed == [sell_package.package_id]
+        refreshed = await session.get(CanonicalPreviewPackage, sell_package.package_id)
+        assert refreshed.package_state == "READY"
+        refreshed_proof = await session.get(ControlledProofRun, proof.proof_id)
+        assert refreshed_proof.sell_package_id == sell_package.package_id

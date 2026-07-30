@@ -658,6 +658,85 @@ async def test_stale_sell_package_with_execution_claim_cannot_be_replaced(monkey
 
 
 @pytest.mark.asyncio
+async def test_expired_preview_unactivated_sell_package_is_superseded_for_fresh_recovery_authority(monkeypatch) -> None:
+    """The disjoint staleness shape: a SELL package that never reached
+    ACTIVATED before its own canonical preview window expired (the
+    confirmed production shape for package 63cd5c1b-...) must also be
+    superseded so a fresh governed SELL package can be created -- distinct
+    from supersede_stale_exit_recovery_sell_package, which only handles an
+    already-ACTIVATED package's post-activation authorization expiry."""
+    now = datetime.now(timezone.utc)
+    proof = _terminal_proof()
+    package = SimpleNamespace(
+        package_id=uuid.uuid4(), side="SELL", package_state="READY",
+        preview_expires_at=now - timedelta(minutes=1),
+        superseded_at=None, invalidated_reason=None,
+    )
+    proof.sell_package_id = package.package_id
+    proof.updated_at = now
+    recovery = SimpleNamespace(
+        recovery_id=uuid.uuid4(), proof_id=proof.proof_id, status="IN_PROGRESS",
+        expires_at=now + timedelta(minutes=30),
+    )
+    db = _FakeDb([])
+    monkeypatch.setattr(exit_recovery, "_utcnow", lambda: now)
+
+    await exit_recovery.supersede_expired_preview_exit_recovery_sell_package(
+        db=db, recovery=recovery, proof=proof, package=package,
+    )
+
+    assert package.package_state == "SUPERSEDED"
+    assert proof.sell_package_id is None
+    assert any(
+        isinstance(item, AuditLog)
+        and item.action == "controlled_proof_exit_recovery.stale_sell_package_superseded"
+        for item in db.added
+    )
+    assert any(
+        isinstance(item, AuditLog)
+        and item.action == "canonical_preview_package.superseded_for_exit_recovery"
+        for item in db.added
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("mutate", "match"),
+    [
+        (lambda proof, recovery, package: setattr(recovery, "proof_id", uuid.uuid4()), "not eligible"),
+        (lambda proof, recovery, package: setattr(recovery, "status", "AUTHORIZED"), "not eligible"),
+        (lambda proof, recovery, package: setattr(recovery, "expires_at", datetime.now(timezone.utc) - timedelta(minutes=1)), "not eligible"),
+        (lambda proof, recovery, package: setattr(proof, "sell_package_id", uuid.uuid4()), "not eligible"),
+        (lambda proof, recovery, package: setattr(package, "side", "BUY"), "not eligible"),
+        (lambda proof, recovery, package: setattr(package, "package_state", "ACTIVATED"), "not eligible"),
+        (lambda proof, recovery, package: setattr(package, "package_state", "COMPLETED"), "not eligible"),
+        (lambda proof, recovery, package: setattr(package, "preview_expires_at", datetime.now(timezone.utc) + timedelta(minutes=5)), "not eligible"),
+    ],
+)
+async def test_expired_preview_supersession_fails_closed_for_every_ineligible_case(mutate, match, monkeypatch) -> None:
+    now = datetime.now(timezone.utc)
+    proof = _terminal_proof()
+    package = SimpleNamespace(
+        package_id=uuid.uuid4(), side="SELL", package_state="READY",
+        preview_expires_at=now - timedelta(minutes=1),
+        superseded_at=None, invalidated_reason=None,
+    )
+    proof.sell_package_id = package.package_id
+    recovery = SimpleNamespace(
+        recovery_id=uuid.uuid4(), proof_id=proof.proof_id, status="IN_PROGRESS",
+        expires_at=now + timedelta(minutes=30),
+    )
+    monkeypatch.setattr(exit_recovery, "_utcnow", lambda: now)
+    mutate(proof, recovery, package)
+
+    with pytest.raises(InvalidRequestError, match=match):
+        await exit_recovery.supersede_expired_preview_exit_recovery_sell_package(
+            db=_FakeDb([]), recovery=recovery, proof=proof, package=package,
+        )
+    assert package.package_state != "SUPERSEDED"
+
+
+@pytest.mark.asyncio
 async def test_failed_pre_provider_claim_permits_fresh_package_only_with_terminal_order_evidence(monkeypatch) -> None:
     now = datetime.now(timezone.utc)
     proof = _terminal_proof()
