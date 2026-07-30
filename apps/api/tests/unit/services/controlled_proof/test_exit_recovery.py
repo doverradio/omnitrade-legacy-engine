@@ -192,7 +192,7 @@ async def test_reconciled_filled_sell_completes_recovery_without_rewriting_proof
         return Decimal("0")
 
     monkeypatch.setattr(proof_service, "get_controlled_proof_view", _view)
-    monkeypatch.setattr(worker, "_has_unresolved_reconciliation", lambda **_kwargs: _async_false())
+    monkeypatch.setattr(exit_recovery, "has_unresolved_reconciliation", lambda **_kwargs: _async_false())
     monkeypatch.setattr(exit_recovery, "_load_scope", _scope)
     monkeypatch.setattr(exit_recovery, "compute_signed_owned_quantity", _zero)
     monkeypatch.setattr(exit_recovery, "_utcnow", lambda: now)
@@ -332,7 +332,7 @@ async def test_blocked_recovery_projects_separate_reconciled_outcome(
          item.accounting_reconciliation],
         [[item.package], item.accounting],
     )
-    monkeypatch.setattr(worker, "_has_unresolved_reconciliation", lambda **_kwargs: _async_false())
+    monkeypatch.setattr(exit_recovery, "has_unresolved_reconciliation", lambda **_kwargs: _async_false())
     monkeypatch.setattr(
         exit_recovery, "_load_scope",
         lambda *_args, **_kwargs: _async((SimpleNamespace(id=7), item.profile_id)),
@@ -378,7 +378,7 @@ async def test_blocked_recovery_accepts_identical_latest_and_accounting_fill_eve
          item.accounting_reconciliation],
         [[item.package], item.accounting],
     )
-    monkeypatch.setattr(worker, "_has_unresolved_reconciliation", lambda **_kwargs: _async_false())
+    monkeypatch.setattr(exit_recovery, "has_unresolved_reconciliation", lambda **_kwargs: _async_false())
     monkeypatch.setattr(
         exit_recovery, "_load_scope",
         lambda *_args, **_kwargs: _async((SimpleNamespace(id=7), item.profile_id)),
@@ -410,7 +410,7 @@ async def test_blocked_recovery_rejects_mismatched_accounting_fill_provenance(
          item.accounting_reconciliation],
         [[item.package], item.accounting],
     )
-    monkeypatch.setattr(worker, "_has_unresolved_reconciliation", lambda **_kwargs: _async_false())
+    monkeypatch.setattr(exit_recovery, "has_unresolved_reconciliation", lambda **_kwargs: _async_false())
     monkeypatch.setattr(
         exit_recovery, "_load_scope",
         lambda *_args, **_kwargs: _async((SimpleNamespace(id=7), item.profile_id)),
@@ -469,7 +469,7 @@ async def test_blocked_recovery_requires_zero_ownership_and_complete_accounting(
     import app.services.orchestration.continuous_pipeline_worker as worker
 
     item = _blocked_projection_fixture()
-    monkeypatch.setattr(worker, "_has_unresolved_reconciliation", lambda **_kwargs: _async_false())
+    monkeypatch.setattr(exit_recovery, "has_unresolved_reconciliation", lambda **_kwargs: _async_false())
     monkeypatch.setattr(
         exit_recovery, "_load_scope",
         lambda *_args, **_kwargs: _async((SimpleNamespace(id=7), item.profile_id)),
@@ -504,7 +504,7 @@ async def test_blocked_recovery_unresolved_reconciliation_does_not_project(monke
     import app.services.orchestration.continuous_pipeline_worker as worker
 
     item = _blocked_projection_fixture()
-    monkeypatch.setattr(worker, "_has_unresolved_reconciliation", lambda **_kwargs: _async(True))
+    monkeypatch.setattr(exit_recovery, "has_unresolved_reconciliation", lambda **_kwargs: _async(True))
     db = _FakeDb(
         [item.recovery, None, item.claim, item.order, item.reconciliation], [[item.package]],
     )
@@ -821,7 +821,7 @@ async def test_authorization_predicates_accept_exact_authoritative_lineage(monke
     accounting = SimpleNamespace(id=uuid.uuid4())
     db = _FakeDb([order, reconciliation, accounting])
     monkeypatch.setattr(worker, "_has_open_live_order", _async_false)
-    monkeypatch.setattr(worker, "_has_unresolved_reconciliation", _async_false)
+    monkeypatch.setattr(exit_recovery, "has_unresolved_reconciliation", _async_false)
     monkeypatch.setattr(
         "app.services.controlled_proof.service.repair_controlled_proof_cached_order_ids", _async_false,
     )
@@ -978,7 +978,7 @@ async def test_authorization_recovers_position_when_no_cache_column_was_ever_pop
         await session.flush()
 
         monkeypatch.setattr(worker, "_has_open_live_order", _async_false)
-        monkeypatch.setattr(worker, "_has_unresolved_reconciliation", _async_false)
+        monkeypatch.setattr(exit_recovery, "has_unresolved_reconciliation", _async_false)
 
         async def _scope(_db, _proof):
             return SimpleNamespace(id=campaign_row_id, paper_account_id=paper_account_id), profile_id
@@ -1030,7 +1030,7 @@ async def test_repeated_authorization_attempts_do_not_re_repair_or_duplicate_pos
     db = _FakeDb([order, reconciliation, accounting])
     import app.services.orchestration.continuous_pipeline_worker as worker
     monkeypatch.setattr(worker, "_has_open_live_order", _async_false)
-    monkeypatch.setattr(worker, "_has_unresolved_reconciliation", _async_false)
+    monkeypatch.setattr(exit_recovery, "has_unresolved_reconciliation", _async_false)
     monkeypatch.setattr(
         "app.services.controlled_proof.service.repair_controlled_proof_cached_order_ids", _async_false,
     )
@@ -1075,7 +1075,7 @@ async def test_authorization_fails_closed_when_open_position_belongs_to_a_differ
     db = _FakeDb([order, reconciliation, accounting])
     import app.services.orchestration.continuous_pipeline_worker as worker
     monkeypatch.setattr(worker, "_has_open_live_order", _async_false)
-    monkeypatch.setattr(worker, "_has_unresolved_reconciliation", _async_false)
+    monkeypatch.setattr(exit_recovery, "has_unresolved_reconciliation", _async_false)
     monkeypatch.setattr(
         "app.services.controlled_proof.service.repair_controlled_proof_cached_order_ids", _async_false,
     )

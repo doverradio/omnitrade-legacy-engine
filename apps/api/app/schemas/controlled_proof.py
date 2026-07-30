@@ -35,6 +35,12 @@ class ControlledProofCancelRequest(BaseModel):
     reason: str | None = None
 
 
+class ControlledProofStaleRecoveryResponse(BaseModel):
+    proof_id: uuid.UUID
+    recovered: bool
+    blocker: str | None
+
+
 class ControlledProofMandateReadinessResponse(BaseModel):
     configured: bool
     mandate_id: uuid.UUID | None

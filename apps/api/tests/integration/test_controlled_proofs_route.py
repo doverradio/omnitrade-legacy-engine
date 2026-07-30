@@ -166,6 +166,39 @@ def test_get_endpoint_succeeds_with_operator_auth(monkeypatch) -> None:
     assert response.json()["status"] == "REQUESTED"
 
 
+def test_recover_stale_endpoint_requires_operator_auth(monkeypatch) -> None:
+    async def _unexpected(**kwargs):
+        raise AssertionError("must not be called without authorization")
+
+    monkeypatch.setattr(route_module, "recover_stale_controlled_proof", _unexpected)
+    client = _create_client()
+
+    response = client.post("/api/v1/operator/controlled-proofs/recover-stale")
+
+    assert response.status_code == 401
+
+
+def test_recover_stale_endpoint_succeeds_with_operator_auth(monkeypatch) -> None:
+    proof_id = uuid.uuid4()
+    seen_actor = {}
+
+    async def _fake_recover(*, db, actor):
+        seen_actor["actor"] = actor
+        return SimpleNamespace(proof_id=proof_id, recovered=True, blocker=None)
+
+    monkeypatch.setattr(route_module, "recover_stale_controlled_proof", _fake_recover)
+    client = _create_client()
+
+    response = client.post(
+        "/api/v1/operator/controlled-proofs/recover-stale",
+        headers={"Authorization": "Bearer operator:human"},
+    )
+
+    assert response.status_code == 200
+    assert response.json() == {"proof_id": str(proof_id), "recovered": True, "blocker": None}
+    assert seen_actor["actor"] == "operator:human"
+
+
 def test_cancel_endpoint_succeeds_with_operator_auth(monkeypatch) -> None:
     proof_id = uuid.uuid4()
     seen_actor = {}

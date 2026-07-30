@@ -31,6 +31,8 @@ from app.models.paper_account import PaperAccount
 from app.models.strategy import Strategy
 from app.services.asset_commissioning import get_asset_readiness
 from app.services.capital_campaign_domain import get_governing_campaign_definition
+from app.services.controlled_proof.exit_recovery import has_active_exit_recovery
+from app.services.orchestration.reconciliation_guard import has_unresolved_reconciliation
 from app.services.live.position_quantity import owned_position_exists as shared_owned_position_exists
 from app.services.live.position_quantity import QUANTITY_BEARING_RECORD_TYPES
 from app.services.mandates.lifecycle import get_governing_authorized_mandate_version
@@ -213,6 +215,144 @@ async def _live_capital_blocker(*, db: AsyncSession, proof: ControlledProofRun) 
 async def controlled_proof_entry_blocker(*, db: AsyncSession, proof: ControlledProofRun) -> str | None:
     """Public pre-entry use of the canonical live-capital ownership guard."""
     return await _live_capital_blocker(db=db, proof=proof)
+
+
+async def _stale_recovery_blocker(*, db: AsyncSession, proof: ControlledProofRun) -> str | None:
+    """Every condition governed stale-proof recovery requires before an
+    expired active proof may be automatically terminalized: everything
+    _live_capital_blocker already checks (cached and re-derived buy/sell
+    order evidence, open position), plus three conditions ordinary entry
+    never has to consider but a proof sitting past its own expires_at
+    specifically might: unresolved reconciliation, any not-yet-terminal
+    execution claim (a claim can exist before any LiveCryptoOrder row does,
+    so _live_capital_blocker's order-based checks alone would miss it), and
+    any still-active Controlled Proof exit recovery. Same fail-closed
+    contract as _live_capital_blocker: returns a precise reason, or None
+    only when every one of these is genuinely absent."""
+    blocker = await _live_capital_blocker(db=db, proof=proof)
+    if blocker is not None:
+        return blocker
+
+    if await has_unresolved_reconciliation(
+        db=db, provider=proof.provider, environment=proof.environment, product=proof.product_id,
+    ):
+        return "unresolved_reconciliation_exists"
+
+    # Scoped to this proof's own package lineage (package_id/sell_package_id),
+    # never by provider/environment/product alone -- an unrelated ordinary
+    # production claim for the same market (e.g. the normal autonomous cycle
+    # trading the identical BTC-USD/kraken_spot/production scope) would
+    # otherwise falsely block this proof's recovery. An AutonomousExecutionClaim
+    # is always created for a specific package_id (claim_activated_package), and
+    # a package only ever becomes "this proof's" via link_controlled_proof_package/
+    # link_controlled_proof_sell_package -- the same moment proof.package_id/
+    # sell_package_id are set -- so a claim genuinely belonging to this proof
+    # must reference one of exactly these two package ids. If neither is set,
+    # this proof has never been linked to any package, so no claim could exist
+    # for it either -- not an unresolvable ambiguity, a provable absence.
+    proof_package_ids = [pid for pid in (proof.package_id, proof.sell_package_id) if pid is not None]
+    if proof_package_ids:
+        active_claim = await db.scalar(select(AutonomousExecutionClaim.claim_id).where(
+            AutonomousExecutionClaim.package_id.in_(proof_package_ids),
+            AutonomousExecutionClaim.claim_status.in_((
+                "CLAIMED", "EXECUTION_STARTED", "SUBMISSION_PENDING",
+                "RECONCILIATION_REQUIRED", "RECOVERY_REQUIRED",
+            )),
+        ).limit(1))
+        if active_claim is not None:
+            return "unresolved_execution_claim_exists"
+
+    if await has_active_exit_recovery(db=db, proof_id=proof.proof_id):
+        return "exit_recovery_active"
+    return None
+
+
+@dataclass(frozen=True, slots=True)
+class StaleControlledProofRecoveryOutcome:
+    proof_id: uuid.UUID
+    recovered: bool
+    blocker: str | None
+
+
+async def _recover_stale_active_proof_if_safe(
+    *, db: AsyncSession, proof: ControlledProofRun, actor: str,
+    replacement_idempotency_key: str | None = None,
+) -> StaleControlledProofRecoveryOutcome:
+    """`proof` must already be locked (SELECT ... FOR UPDATE) by the caller
+    and known to still be in an active state. Terminalizes it to
+    EXPIRED/terminal_verdict=FAILED only when it is genuinely past its own
+    expires_at AND provably free of every condition _stale_recovery_blocker
+    checks. Never deletes the row, never cancels or otherwise touches a live
+    exchange order, and never guesses: any blocker at all -- including an
+    unresolvable ownership scope -- fails closed and leaves the proof
+    completely untouched, requiring explicit exit recovery or reconciliation
+    instead. Caller is responsible for committing (this only flushes),
+    matching every other controlled-proof state-transition helper in this
+    module."""
+    now = _utcnow()
+    # Postgres's TIMESTAMPTZ always round-trips timezone-aware; sqlite (used
+    # only by this module's own tests) has no native tz-aware type and can
+    # hand back a naive value after a flush-triggered reload -- normalize
+    # rather than let that test-environment quirk raise TypeError here.
+    expires_at = proof.expires_at if proof.expires_at.tzinfo is not None else proof.expires_at.replace(tzinfo=timezone.utc)
+    if expires_at > now:
+        return StaleControlledProofRecoveryOutcome(proof_id=proof.proof_id, recovered=False, blocker="not_expired")
+
+    blocker = await _stale_recovery_blocker(db=db, proof=proof)
+    if blocker is not None:
+        return StaleControlledProofRecoveryOutcome(proof_id=proof.proof_id, recovered=False, blocker=blocker)
+
+    before = proof.status
+    proof.status = "EXPIRED"
+    proof.terminal_verdict = "FAILED"
+    proof.failure_reason = "expired_before_execution_completion"
+    proof.updated_at = now
+    db.add(AuditLog(
+        actor=actor, action="controlled_proof_run.stale_recovery_expired", entity_type="controlled_proof_run",
+        entity_id=proof.proof_id,
+        before_state={"status": before, "expires_at": proof.expires_at.isoformat()},
+        after_state={
+            "status": "EXPIRED", "terminal_verdict": "FAILED",
+            "failure_reason": "expired_before_execution_completion",
+            "replacement_idempotency_key": replacement_idempotency_key,
+        },
+    ))
+    await db.flush()
+    return StaleControlledProofRecoveryOutcome(proof_id=proof.proof_id, recovered=True, blocker=None)
+
+
+async def recover_stale_controlled_proof(*, db: AsyncSession, actor: str) -> StaleControlledProofRecoveryOutcome:
+    """Explicit, operator-triggered counterpart to the automatic recovery
+    create_controlled_proof performs inline whenever a stale active proof
+    would otherwise block a new one -- same governed safety check, same
+    terminal transition, same audit trail, just invocable standalone without
+    also creating a replacement proof. Locks the current active proof (if
+    any) under SELECT ... FOR UPDATE, exactly like create_controlled_proof's
+    own active-proof check, so two concurrent recovery attempts (or a
+    recovery racing a create) can never both act on the same row. Raises a
+    specific, actionable InvalidRequestError rather than silently no-op-ing
+    when there is nothing to recover or recovery is not currently safe."""
+    existing_active = await db.scalar(
+        select(ControlledProofRun).where(ControlledProofRun.status.in_(_ACTIVE_STATES)).with_for_update().limit(1)
+    )
+    if existing_active is None:
+        raise NotFoundError(message="No active controlled proof to recover", details={})
+    outcome = await _recover_stale_active_proof_if_safe(db=db, proof=existing_active, actor=actor)
+    if not outcome.recovered:
+        if outcome.blocker == "not_expired":
+            raise InvalidRequestError(
+                message="Active controlled proof has not yet expired",
+                details={"proof_id": str(existing_active.proof_id), "expires_at": existing_active.expires_at.isoformat()},
+            )
+        raise InvalidRequestError(
+            message=(
+                f"Cannot automatically recover stale controlled proof: exit recovery or "
+                f"reconciliation is required ({outcome.blocker})"
+            ),
+            details={"proof_id": str(existing_active.proof_id), "blocker": outcome.blocker},
+        )
+    await db.commit()
+    return outcome
 
 
 @dataclass(frozen=True, slots=True)
@@ -491,15 +631,12 @@ async def start_live_controlled_proof(
             details={"available_usd": None if available is None else str(available), "required_usd": str(requested_notional)},
         )
 
-    from app.services.orchestration.continuous_pipeline_worker import (
-        _has_open_live_order,
-        _has_unresolved_reconciliation,
-    )
+    from app.services.orchestration.continuous_pipeline_worker import _has_open_live_order
     if await _has_open_live_order(
         db=db, provider=ALLOWED_PROVIDER, environment=ALLOWED_ENVIRONMENT, product=product,
     ):
         raise InvalidRequestError(message="An open provider order blocks Controlled Proof", details={})
-    if await _has_unresolved_reconciliation(
+    if await has_unresolved_reconciliation(
         db=db, provider=ALLOWED_PROVIDER, environment=ALLOWED_ENVIRONMENT, product=product,
     ):
         raise InvalidRequestError(message="Unresolved reconciliation blocks Controlled Proof", details={})
@@ -535,21 +672,6 @@ async def create_controlled_proof(
         raise InvalidRequestError(message="product_id is required", details={})
     if not idempotency_key:
         raise InvalidRequestError(message="idempotency_key is required", details={})
-
-    # Committed immediately, independent of whatever this call does next --
-    # otherwise a later failure in this same request (any InvalidRequestError
-    # below, including "already active" itself) propagates up through
-    # get_db()'s exception path and rolls back the whole transaction,
-    # silently undoing this reap's in-memory EXPIRED transition every time,
-    # permanently: the row is correctly identified and flipped on every
-    # attempt, but never durably persisted, so it blocks every subsequent
-    # attempt in exactly the same way, forever. This commit is scoped only
-    # to this call site -- claim_next_controlled_proof_for_scope and
-    # cancel_controlled_proof are untouched, since cancel already holds a
-    # row-level lock before reaping and an early commit there would release
-    # it prematurely.
-    await _reap_expired(db=db)
-    await db.commit()
 
     existing = await db.scalar(
         select(ControlledProofRun).where(ControlledProofRun.idempotency_key == idempotency_key)
@@ -633,36 +755,68 @@ async def create_controlled_proof(
     )
     replaced_proof: ControlledProofRun | None = None
     if existing_active is not None:
-        if not replace_active:
+        # Governed stale-proof recovery, attempted regardless of
+        # replace_active: only when this row is genuinely past its own
+        # expires_at AND provably free of every live-capital/unresolved-
+        # lineage condition _stale_recovery_blocker checks does it get
+        # terminalized here (EXPIRED, never CANCELLED -- this is expiry, not
+        # an operator replacement) -- see _recover_stale_active_proof_if_safe.
+        # A still-genuinely-active (non-expired) proof is entirely unaffected
+        # by this step ("not_expired" is returned immediately, before any
+        # capital check even runs) and falls through to the exact same
+        # replace_active semantics as before.
+        recovery = await _recover_stale_active_proof_if_safe(
+            db=db, proof=existing_active, actor=actor, replacement_idempotency_key=idempotency_key,
+        )
+        if recovery.recovered:
+            # Committed immediately, independent of whatever this call does
+            # next: a later failure in this same request (e.g. the new
+            # proof's own idempotency-key collision below) must never roll
+            # back and silently undo this proof's now-durable EXPIRED
+            # transition -- that would leave it blocking every subsequent
+            # attempt in exactly the same way, forever, the same class of
+            # bug the old unconditional _reap_expired()+commit() at this
+            # call site existed to prevent.
+            await db.commit()
+        elif not replace_active:
+            if recovery.blocker == "not_expired":
+                raise InvalidRequestError(
+                    message="Another controlled proof is already active",
+                    details={"active_proof_id": str(existing_active.proof_id)},
+                )
             raise InvalidRequestError(
-                message="Another controlled proof is already active",
-                details={"active_proof_id": str(existing_active.proof_id)},
+                message=(
+                    "Another controlled proof is active and past its expiry, but cannot be "
+                    f"automatically recovered: exit recovery or reconciliation is required ({recovery.blocker})"
+                ),
+                details={"active_proof_id": str(existing_active.proof_id), "blocker": recovery.blocker},
             )
-        blocker = await _live_capital_blocker(db=db, proof=existing_active)
-        if blocker is not None:
-            # Fail closed: never cancel or supersede a proof that may
-            # control real funds. The proof itself, and every real
-            # downstream row it references, is left completely untouched.
-            raise InvalidRequestError(
-                message=f"Cannot replace active controlled proof: live-capital evidence exists ({blocker})",
-                details={"active_proof_id": str(existing_active.proof_id), "blocker": blocker},
-            )
-        before = existing_active.status
-        existing_active.status = "CANCELLED"
-        existing_active.cancelled_at = _utcnow()
-        existing_active.cancelled_by = actor
-        existing_active.updated_at = _utcnow()
-        db.add(AuditLog(
-            actor=actor, action="controlled_proof_run.cancelled", entity_type="controlled_proof_run",
-            entity_id=existing_active.proof_id,
-            before_state={"status": before},
-            after_state={
-                "status": "CANCELLED", "reason": "replaced_by_operator_request",
-                "replacement_idempotency_key": idempotency_key,
-            },
-        ))
-        await db.flush()
-        replaced_proof = existing_active
+        else:
+            blocker = await _live_capital_blocker(db=db, proof=existing_active)
+            if blocker is not None:
+                # Fail closed: never cancel or supersede a proof that may
+                # control real funds. The proof itself, and every real
+                # downstream row it references, is left completely untouched.
+                raise InvalidRequestError(
+                    message=f"Cannot replace active controlled proof: live-capital evidence exists ({blocker})",
+                    details={"active_proof_id": str(existing_active.proof_id), "blocker": blocker},
+                )
+            before = existing_active.status
+            existing_active.status = "CANCELLED"
+            existing_active.cancelled_at = _utcnow()
+            existing_active.cancelled_by = actor
+            existing_active.updated_at = _utcnow()
+            db.add(AuditLog(
+                actor=actor, action="controlled_proof_run.cancelled", entity_type="controlled_proof_run",
+                entity_id=existing_active.proof_id,
+                before_state={"status": before},
+                after_state={
+                    "status": "CANCELLED", "reason": "replaced_by_operator_request",
+                    "replacement_idempotency_key": idempotency_key,
+                },
+            ))
+            await db.flush()
+            replaced_proof = existing_active
 
     proof = ControlledProofRun(
         status="REQUESTED",

@@ -61,7 +61,7 @@ def _ready(monkeypatch, *, created_proof=None):
 
     monkeypatch.setattr(service, "get_settings", _enabled_settings)
     monkeypatch.setattr(worker, "_has_open_live_order", _false)
-    monkeypatch.setattr(worker, "_has_unresolved_reconciliation", _false)
+    monkeypatch.setattr(service, "has_unresolved_reconciliation", _false)
     monkeypatch.setattr(service, "create_controlled_proof", _create)
     return proof, calls
 
@@ -126,7 +126,7 @@ async def test_live_start_rejects_unresolved_reconciliation(monkeypatch) -> None
     async def _true(**_kwargs):
         return True
 
-    monkeypatch.setattr(worker, "_has_unresolved_reconciliation", _true)
+    monkeypatch.setattr(service, "has_unresolved_reconciliation", _true)
     with pytest.raises(InvalidRequestError, match="Unresolved reconciliation"):
         await service.start_live_controlled_proof(
             db=_Db(scalar_values=[None], connections=[_connection()]),

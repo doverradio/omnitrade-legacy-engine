@@ -11,6 +11,7 @@ from app.schemas.controlled_proof import (
     ControlledProofCancelRequest,
     ControlledProofCreateRequest,
     ControlledProofMandateReadinessResponse,
+    ControlledProofStaleRecoveryResponse,
     ControlledProofStartResponse,
     ControlledProofExitRecoveryCreateRequest,
     ControlledProofExitRecoveryResponse,
@@ -19,6 +20,7 @@ from app.schemas.controlled_proof import (
 from app.services.controlled_proof import (
     cancel_controlled_proof,
     get_controlled_proof_mandate_readiness,
+    recover_stale_controlled_proof,
     start_live_controlled_proof,
     get_controlled_proof_view,
     authorize_controlled_proof_exit_recovery,
@@ -70,6 +72,23 @@ async def get_controlled_proof(
 ) -> ControlledProofResponse:
     view = await get_controlled_proof_view(db=db, proof_id=proof_id)
     return ControlledProofResponse(**view)
+
+
+@router.post("/recover-stale", response_model=ControlledProofStaleRecoveryResponse)
+async def post_controlled_proof_recover_stale(
+    current_user: dict[str, str] = Depends(get_authorized_operator),
+    db: AsyncSession = Depends(get_db),
+) -> ControlledProofStaleRecoveryResponse:
+    """Explicit counterpart to the automatic stale-proof recovery
+    create_controlled_proof performs inline: locks the current active proof
+    (if any) and terminalizes it only when genuinely expired and provably
+    free of any live-capital or unresolved-lineage exposure. Never deletes,
+    never cancels or ignores a live exchange order, and fails closed with a
+    specific reason otherwise."""
+    outcome = await recover_stale_controlled_proof(db=db, actor=current_user["id"])
+    return ControlledProofStaleRecoveryResponse(
+        proof_id=outcome.proof_id, recovered=outcome.recovered, blocker=outcome.blocker,
+    )
 
 
 @router.post("/{proof_id}/cancel", response_model=ControlledProofResponse)

@@ -20,6 +20,7 @@ from app.models.live_accounting_record import LiveAccountingRecord
 from app.models.live_crypto_order import LiveCryptoOrder
 from app.models.live_reconciliation_event import LiveReconciliationEvent
 from app.services.live.position_quantity import compute_signed_owned_quantity
+from app.services.orchestration.reconciliation_guard import has_unresolved_reconciliation
 from app.services.position_lifecycle.source_adapter import _position_id, load_position_snapshots
 
 _RECOVERABLE_PROOF_STATES = {"EXPIRED", "FAILED"}
@@ -86,10 +87,10 @@ async def _validate_exit_recovery(
     if latest_reconciliation is None or latest_reconciliation.reconciliation_status != "filled":
         raise InvalidRequestError(message="Controlled Proof BUY reconciliation is incomplete", details={})
 
-    from app.services.orchestration.continuous_pipeline_worker import _has_open_live_order, _has_unresolved_reconciliation
+    from app.services.orchestration.continuous_pipeline_worker import _has_open_live_order
     if await _has_open_live_order(db=db, provider=proof.provider, environment=proof.environment, product=proof.product_id):
         raise InvalidRequestError(message="An open provider order blocks exit recovery", details={})
-    if await _has_unresolved_reconciliation(db=db, provider=proof.provider, environment=proof.environment, product=proof.product_id):
+    if await has_unresolved_reconciliation(db=db, provider=proof.provider, environment=proof.environment, product=proof.product_id):
         raise InvalidRequestError(message="Unresolved reconciliation blocks exit recovery", details={})
 
     runtime, profile_id = await _load_scope(db, proof)
@@ -203,6 +204,19 @@ async def find_pending_exit_recovery_id(*, db: AsyncSession) -> uuid.UUID | None
     return await db.scalar(select(ControlledProofExitRecovery.recovery_id).where(
         ControlledProofExitRecovery.status.in_(_ACTIVE_RECOVERY_STATES), ControlledProofExitRecovery.expires_at > now,
     ).order_by(ControlledProofExitRecovery.authorized_at.asc()).limit(1))
+
+
+async def has_active_exit_recovery(*, db: AsyncSession, proof_id: uuid.UUID) -> bool:
+    """True when a Controlled Proof exit recovery for this proof is
+    currently AUTHORIZED or IN_PROGRESS -- the exact condition other
+    modules (e.g. Controlled Proof's stale-proof recovery safety check) need
+    to know before treating a proof as safe to automatically terminalize,
+    without depending on this module's private _ACTIVE_RECOVERY_STATES set."""
+    recovery_id = await db.scalar(select(ControlledProofExitRecovery.recovery_id).where(
+        ControlledProofExitRecovery.proof_id == proof_id,
+        ControlledProofExitRecovery.status.in_(_ACTIVE_RECOVERY_STATES),
+    ).limit(1))
+    return recovery_id is not None
 
 
 async def claim_exit_recovery_by_id(*, db: AsyncSession, recovery_id: uuid.UUID):
@@ -430,8 +444,7 @@ async def refresh_exit_recovery_completion(
     ).limit(1))
     if execution_claim is None or execution_claim.claim_status != "COMPLETED":
         return
-    from app.services.orchestration.continuous_pipeline_worker import _has_unresolved_reconciliation
-    if await _has_unresolved_reconciliation(db=db, provider=proof.provider, environment=proof.environment, product=proof.product_id):
+    if await has_unresolved_reconciliation(db=db, provider=proof.provider, environment=proof.environment, product=proof.product_id):
         return
     _runtime, profile_id = await _load_scope(db, proof)
     if await compute_signed_owned_quantity(db=db, live_trading_profile_id=profile_id, symbol=proof.product_id) != 0:
@@ -555,8 +568,7 @@ async def project_blocked_exit_recovery_outcome(
     ).order_by(LiveReconciliationEvent.sequence_number.desc()).limit(1))
     if reconciliation is None or reconciliation.reconciliation_status != "filled":
         return False
-    from app.services.orchestration.continuous_pipeline_worker import _has_unresolved_reconciliation
-    if await _has_unresolved_reconciliation(
+    if await has_unresolved_reconciliation(
         db=db, provider=proof.provider, environment=proof.environment, product=proof.product_id,
     ):
         return False

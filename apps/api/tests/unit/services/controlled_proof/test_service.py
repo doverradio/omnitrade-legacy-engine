@@ -19,10 +19,12 @@ from app.models.autonomous_capital_mandate import AutonomousCapitalMandate
 from app.models.autonomous_capital_mandate_authorization import AutonomousCapitalMandateAuthorization
 from app.models.autonomous_capital_mandate_evaluation import AutonomousCapitalMandateEvaluation
 from app.models.autonomous_capital_mandate_version import AutonomousCapitalMandateVersion
+from app.models.autonomous_execution_claim import AutonomousExecutionClaim
 from app.models.candle import Candle
 from app.models.canonical_preview_package import CanonicalPreviewPackage
 from app.models.capital_campaign import CapitalCampaign
 from app.models.capital_campaign_definition import CapitalCampaignDefinition
+from app.models.controlled_proof_exit_recovery import ControlledProofExitRecovery
 from app.models.controlled_proof_run import ControlledProofRun
 from app.models.decision_record import DecisionRecord
 from app.models.live_accounting_record import LiveAccountingRecord
@@ -41,9 +43,10 @@ _CAMPAIGN_ID = controlled_proof_service.ALLOWED_CAMPAIGN_ID
 _ALL_TABLES = [
     Asset.__table__, AuditLog.__table__, AutonomousCapitalMandate.__table__,
     AutonomousCapitalMandateVersion.__table__, AutonomousCapitalMandateAuthorization.__table__,
-    AutonomousCapitalMandateEvaluation.__table__, Candle.__table__,
+    AutonomousCapitalMandateEvaluation.__table__, AutonomousExecutionClaim.__table__, Candle.__table__,
     CanonicalPreviewPackage.__table__,
-    CapitalCampaign.__table__, CapitalCampaignDefinition.__table__, ControlledProofRun.__table__,
+    CapitalCampaign.__table__, CapitalCampaignDefinition.__table__, ControlledProofExitRecovery.__table__,
+    ControlledProofRun.__table__,
     DecisionRecord.__table__, LiveAccountingRecord.__table__, LiveCryptoOrder.__table__,
     LiveReconciliationEvent.__table__, LiveTradingProfile.__table__, StrategyRosterRun.__table__,
 ]
@@ -2027,6 +2030,422 @@ async def test_evaluate_controlled_proof_risk_fails_closed_when_risk_context_rai
 
         assert outcome.verdict == "UNAVAILABLE"
         assert outcome.risk_event_id is None
+
+
+# --- governed stale controlled proof recovery ----------------------------------------
+
+async def _seed_stale_active_proof(
+    session: AsyncSession, monkeypatch: pytest.MonkeyPatch, *, idempotency_key: str,
+) -> ControlledProofRun:
+    """A genuinely active (PACKAGE_CREATED) proof, past its own expires_at,
+    with no live-capital or lineage evidence of any kind -- the exact
+    production shape (buy_order=null, position=null, sell_order=null,
+    terminal_verdict=null) that must now be safe to automatically recover."""
+    await _seed_fully_ready_scope(session, monkeypatch)
+    proof, _ = await controlled_proof_service.create_controlled_proof(
+        db=session, product_id="BTC-USD", idempotency_key=idempotency_key, expires_in_minutes=30, actor="operator:alice",
+    )
+    proof.status = "PACKAGE_CREATED"
+    proof.package_id = uuid.uuid4()
+    proof.expires_at = datetime.now(timezone.utc) - timedelta(minutes=1)
+    await session.commit()
+    return proof
+
+
+@pytest.mark.asyncio
+async def test_expired_safe_proof_is_automatically_recovered_and_replaced(monkeypatch: pytest.MonkeyPatch) -> None:
+    async with _real_session() as session:
+        stale = await _seed_stale_active_proof(session, monkeypatch, idempotency_key="stale-safe")
+
+        new, replaced = await controlled_proof_service.create_controlled_proof(
+            db=session, product_id="BTC-USD", idempotency_key="stale-safe-new", expires_in_minutes=30, actor="operator:bob",
+        )
+
+        # Auto-recovery is expiry, not an operator replacement -- replaced_proof
+        # stays reserved for the explicit replace_active=True cancellation path.
+        assert replaced is None
+        assert new.proof_id != stale.proof_id
+        assert new.status == "REQUESTED"
+
+        refreshed_stale = await session.get(ControlledProofRun, stale.proof_id)
+        assert refreshed_stale.status == "EXPIRED"
+        assert refreshed_stale.terminal_verdict == "FAILED"
+        assert refreshed_stale.failure_reason == "expired_before_execution_completion"
+
+        rows = (await session.execute(select(ControlledProofRun))).scalars().all()
+        active = [r for r in rows if r.status in controlled_proof_service._ACTIVE_STATES]
+        assert [r.proof_id for r in active] == [new.proof_id]
+
+
+@pytest.mark.asyncio
+async def test_non_expired_active_proof_still_blocks_creation_unchanged(monkeypatch: pytest.MonkeyPatch) -> None:
+    async with _real_session() as session:
+        await _seed_fully_ready_scope(session, monkeypatch)
+        old, _ = await controlled_proof_service.create_controlled_proof(
+            db=session, product_id="BTC-USD", idempotency_key="fresh-active", expires_in_minutes=30, actor="operator:alice",
+        )
+
+        with pytest.raises(InvalidRequestError) as excinfo:
+            await controlled_proof_service.create_controlled_proof(
+                db=session, product_id="BTC-USD", idempotency_key="fresh-active-new", expires_in_minutes=30,
+                actor="operator:bob",
+            )
+
+        assert excinfo.value.message == "Another controlled proof is already active"
+        assert excinfo.value.details == {"active_proof_id": str(old.proof_id)}
+        refreshed_old = await session.get(ControlledProofRun, old.proof_id)
+        assert refreshed_old.status == old.status
+        assert refreshed_old.cancelled_at is None
+        rows = (await session.execute(select(ControlledProofRun))).scalars().all()
+        assert len(rows) == 1
+
+
+@pytest.mark.asyncio
+async def test_expired_proof_with_buy_order_blocks_and_requires_recovery(monkeypatch: pytest.MonkeyPatch) -> None:
+    async with _real_session() as session:
+        stale = await _seed_stale_active_proof(session, monkeypatch, idempotency_key="stale-buy")
+        stale.buy_live_crypto_order_id = uuid.uuid4()
+        await session.commit()
+
+        with pytest.raises(InvalidRequestError) as excinfo:
+            await controlled_proof_service.create_controlled_proof(
+                db=session, product_id="BTC-USD", idempotency_key="stale-buy-new", expires_in_minutes=30,
+                actor="operator:bob",
+            )
+
+        assert "exit recovery or reconciliation is required" in excinfo.value.message
+        assert excinfo.value.details.get("blocker") == "live_buy_order_exists"
+        refreshed_stale = await session.get(ControlledProofRun, stale.proof_id)
+        assert refreshed_stale.status == "PACKAGE_CREATED"
+        assert refreshed_stale.terminal_verdict is None
+        rows = (await session.execute(select(ControlledProofRun))).scalars().all()
+        assert len(rows) == 1
+
+
+@pytest.mark.asyncio
+async def test_expired_proof_with_open_position_blocks_and_requires_exit_recovery(monkeypatch: pytest.MonkeyPatch) -> None:
+    async with _real_session() as session:
+        stale = await _seed_stale_active_proof(session, monkeypatch, idempotency_key="stale-position")
+        stale.position_id = "pos-live-stale-1"
+        await session.commit()
+
+        with pytest.raises(InvalidRequestError) as excinfo:
+            await controlled_proof_service.create_controlled_proof(
+                db=session, product_id="BTC-USD", idempotency_key="stale-position-new", expires_in_minutes=30,
+                actor="operator:bob",
+            )
+
+        assert excinfo.value.details.get("blocker") == "open_position_exists"
+        refreshed_stale = await session.get(ControlledProofRun, stale.proof_id)
+        assert refreshed_stale.status == "PACKAGE_CREATED"
+        rows = (await session.execute(select(ControlledProofRun))).scalars().all()
+        assert len(rows) == 1
+
+
+@pytest.mark.asyncio
+async def test_expired_proof_with_unresolved_execution_claim_blocks(monkeypatch: pytest.MonkeyPatch) -> None:
+    async with _real_session() as session:
+        stale = await _seed_stale_active_proof(session, monkeypatch, idempotency_key="stale-claim")
+        session.add(AutonomousExecutionClaim(
+            claim_id=uuid.uuid4(), package_id=stale.package_id, activation_id=uuid.uuid4(),
+            campaign_id=stale.campaign_id, campaign_version=stale.campaign_version,
+            mandate_id=uuid.uuid4(), mandate_version_id=uuid.uuid4(), account_id=uuid.uuid4(),
+            profile_id=uuid.uuid4(), connection_id=uuid.uuid4(),
+            provider=stale.provider, environment=stale.environment, product=stale.product_id,
+            side="BUY", claim_status="SUBMISSION_PENDING",
+            claimed_at=datetime.now(timezone.utc), claim_owner="system:test",
+        ))
+        await session.commit()
+
+        with pytest.raises(InvalidRequestError) as excinfo:
+            await controlled_proof_service.create_controlled_proof(
+                db=session, product_id="BTC-USD", idempotency_key="stale-claim-new", expires_in_minutes=30,
+                actor="operator:bob",
+            )
+
+        assert excinfo.value.details.get("blocker") == "unresolved_execution_claim_exists"
+        refreshed_stale = await session.get(ControlledProofRun, stale.proof_id)
+        assert refreshed_stale.status == "PACKAGE_CREATED"
+        rows = (await session.execute(select(ControlledProofRun))).scalars().all()
+        assert len(rows) == 1
+
+
+@pytest.mark.asyncio
+async def test_unrelated_production_execution_claim_for_same_market_does_not_block_recovery(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Regression: an unresolved execution claim for the identical
+    provider/environment/product (e.g. an ordinary autonomous production
+    cycle trading the same BTC-USD/kraken_spot/production scope) but a
+    DIFFERENT package_id -- never linked to this proof at all -- must not
+    falsely block this proof's stale recovery. Only a claim referencing this
+    proof's own package_id/sell_package_id counts."""
+    async with _real_session() as session:
+        stale = await _seed_stale_active_proof(session, monkeypatch, idempotency_key="stale-unrelated-claim")
+        unrelated_package_id = uuid.uuid4()
+        assert unrelated_package_id != stale.package_id
+        session.add(AutonomousExecutionClaim(
+            claim_id=uuid.uuid4(), package_id=unrelated_package_id, activation_id=uuid.uuid4(),
+            campaign_id=stale.campaign_id, campaign_version=stale.campaign_version,
+            mandate_id=uuid.uuid4(), mandate_version_id=uuid.uuid4(), account_id=uuid.uuid4(),
+            profile_id=uuid.uuid4(), connection_id=uuid.uuid4(),
+            provider=stale.provider, environment=stale.environment, product=stale.product_id,
+            side="BUY", claim_status="SUBMISSION_PENDING",
+            claimed_at=datetime.now(timezone.utc), claim_owner="system:test",
+        ))
+        await session.commit()
+
+        new, replaced = await controlled_proof_service.create_controlled_proof(
+            db=session, product_id="BTC-USD", idempotency_key="stale-unrelated-claim-new", expires_in_minutes=30,
+            actor="operator:bob",
+        )
+
+        assert replaced is None
+        assert new.proof_id != stale.proof_id
+        refreshed_stale = await session.get(ControlledProofRun, stale.proof_id)
+        assert refreshed_stale.status == "EXPIRED"
+        assert refreshed_stale.terminal_verdict == "FAILED"
+
+
+@pytest.mark.asyncio
+async def test_expired_proof_with_reconciliation_required_blocks(monkeypatch: pytest.MonkeyPatch) -> None:
+    async with _real_session() as session:
+        stale = await _seed_stale_active_proof(session, monkeypatch, idempotency_key="stale-recon")
+        # FILLED is a terminal LiveCryptoOrder status (passes _live_capital_
+        # blocker's own order check) -- but its reconciliation event is still
+        # in an unresolved state, exactly the gap _stale_recovery_blocker adds
+        # on top of _live_capital_blocker.
+        order = LiveCryptoOrder(
+            live_crypto_order_id=uuid.uuid4(), crypto_order_preview_id=uuid.uuid4(), exchange_connection_id=uuid.uuid4(),
+            provider=stale.provider, environment=stale.environment, product_id=stale.product_id, side="BUY",
+            order_type="market", requested_quote_size=Decimal("5"), client_order_id=str(uuid.uuid4()),
+            status="FILLED", submitted_at=datetime.now(timezone.utc), audit_correlation_id=uuid.uuid4(),
+        )
+        session.add(order)
+        await session.flush()
+        session.add(LiveReconciliationEvent(
+            idempotency_key=f"{order.live_crypto_order_id}:recon-1", event_hash="h1",
+            live_trading_profile_id=uuid.uuid4(), live_crypto_order_id=order.live_crypto_order_id,
+            source_execution_event_id=uuid.uuid4(), source_execution_event_type="execution_intent_created",
+            sequence_number=1, event_type="fill_reconciled", reconciliation_status="reconciliation_required",
+            provider_name=stale.provider, event_payload={}, provenance={}, immutable_contract_version="1",
+            recorded_at=datetime.now(timezone.utc),
+        ))
+        await session.commit()
+
+        with pytest.raises(InvalidRequestError) as excinfo:
+            await controlled_proof_service.create_controlled_proof(
+                db=session, product_id="BTC-USD", idempotency_key="stale-recon-new", expires_in_minutes=30,
+                actor="operator:bob",
+            )
+
+        assert excinfo.value.details.get("blocker") == "unresolved_reconciliation_exists"
+        refreshed_stale = await session.get(ControlledProofRun, stale.proof_id)
+        assert refreshed_stale.status == "PACKAGE_CREATED"
+        rows = (await session.execute(select(ControlledProofRun))).scalars().all()
+        assert len(rows) == 1
+
+
+@pytest.mark.asyncio
+async def test_expired_proof_with_active_exit_recovery_blocks(monkeypatch: pytest.MonkeyPatch) -> None:
+    async with _real_session() as session:
+        stale = await _seed_stale_active_proof(session, monkeypatch, idempotency_key="stale-exit-recovery")
+        session.add(ControlledProofExitRecovery(
+            proof_id=stale.proof_id, status="AUTHORIZED", idempotency_key="stale-exit-recovery-authz",
+            authorized_by="operator:alice", authorized_at=datetime.now(timezone.utc),
+            expires_at=datetime.now(timezone.utc) + timedelta(minutes=30),
+        ))
+        await session.commit()
+
+        with pytest.raises(InvalidRequestError) as excinfo:
+            await controlled_proof_service.create_controlled_proof(
+                db=session, product_id="BTC-USD", idempotency_key="stale-exit-recovery-new", expires_in_minutes=30,
+                actor="operator:bob",
+            )
+
+        assert excinfo.value.details.get("blocker") == "exit_recovery_active"
+        refreshed_stale = await session.get(ControlledProofRun, stale.proof_id)
+        assert refreshed_stale.status == "PACKAGE_CREATED"
+        rows = (await session.execute(select(ControlledProofRun))).scalars().all()
+        assert len(rows) == 1
+
+
+@pytest.mark.asyncio
+async def test_stale_recovery_writes_immutable_audit_event(monkeypatch: pytest.MonkeyPatch) -> None:
+    async with _real_session() as session:
+        stale = await _seed_stale_active_proof(session, monkeypatch, idempotency_key="stale-audit")
+
+        new, _ = await controlled_proof_service.create_controlled_proof(
+            db=session, product_id="BTC-USD", idempotency_key="stale-audit-new", expires_in_minutes=30,
+            actor="operator:bob",
+        )
+
+        audits = (await session.execute(
+            select(AuditLog).where(
+                AuditLog.entity_id == stale.proof_id,
+                AuditLog.action == "controlled_proof_run.stale_recovery_expired",
+            )
+        )).scalars().all()
+        assert len(audits) == 1
+        audit = audits[0]
+        assert audit.actor == "operator:bob"
+        assert audit.entity_type == "controlled_proof_run"
+        assert audit.before_state["status"] == "PACKAGE_CREATED"
+        assert audit.after_state["status"] == "EXPIRED"
+        assert audit.after_state["terminal_verdict"] == "FAILED"
+        assert audit.after_state["failure_reason"] == "expired_before_execution_completion"
+        # Replacement request correlation: ties this recovery to exactly the
+        # new-proof creation request that triggered it.
+        assert audit.after_state["replacement_idempotency_key"] == "stale-audit-new"
+        assert new.idempotency_key == "stale-audit-new"
+
+
+@pytest.mark.asyncio
+async def test_old_proof_remains_queryable_as_expired_after_recovery(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Requirement 6: never delete proof records."""
+    async with _real_session() as session:
+        stale = await _seed_stale_active_proof(session, monkeypatch, idempotency_key="stale-queryable")
+
+        await controlled_proof_service.create_controlled_proof(
+            db=session, product_id="BTC-USD", idempotency_key="stale-queryable-new", expires_in_minutes=30,
+            actor="operator:bob",
+        )
+
+        view = await controlled_proof_service.get_controlled_proof_view(db=session, proof_id=stale.proof_id)
+        assert view["status"] == "EXPIRED"
+        assert view["terminal_verdict"] == "FAILED"
+        assert view["failure_reason"] == "expired_before_execution_completion"
+
+
+@pytest.mark.asyncio
+async def test_new_proof_creation_fails_if_recovery_itself_is_unsafe_and_new_proof_never_persists(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """New proof is created only after safe recovery -- when recovery is
+    blocked, no new proof row is ever inserted at all."""
+    async with _real_session() as session:
+        stale = await _seed_stale_active_proof(session, monkeypatch, idempotency_key="stale-unsafe-no-new")
+        stale.buy_live_crypto_order_id = uuid.uuid4()
+        await session.commit()
+
+        with pytest.raises(InvalidRequestError):
+            await controlled_proof_service.create_controlled_proof(
+                db=session, product_id="BTC-USD", idempotency_key="stale-unsafe-no-new-new", expires_in_minutes=30,
+                actor="operator:bob",
+            )
+
+        rows = (await session.execute(select(ControlledProofRun))).scalars().all()
+        assert [r.idempotency_key for r in rows] == ["stale-unsafe-no-new"]
+
+
+@pytest.mark.asyncio
+async def test_recovery_commit_survives_a_later_unrelated_failure_in_the_same_request(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The recovered old proof's EXPIRED transition must be durable
+    independent of whatever happens next in the same create_controlled_proof
+    call -- mirrors the exact regression this call site was already once
+    fixed for with the old unconditional _reap_expired()+commit(). Fails
+    synchronously, before any further I/O, at the exact point the new
+    ControlledProofRun is registered with the session -- simulating an
+    unrelated downstream error without disturbing the connection's own
+    async/greenlet state (unlike interrupting an in-flight flush)."""
+    async with _real_session() as session:
+        stale = await _seed_stale_active_proof(session, monkeypatch, idempotency_key="stale-durable")
+
+        real_add = session.add
+
+        def _add_and_fail_on_new_proof(obj, *args, **kwargs):
+            if isinstance(obj, ControlledProofRun) and obj.status == "REQUESTED":
+                raise RuntimeError("simulated unrelated failure after recovery committed")
+            return real_add(obj, *args, **kwargs)
+
+        monkeypatch.setattr(session, "add", _add_and_fail_on_new_proof)
+        with pytest.raises(RuntimeError):
+            await controlled_proof_service.create_controlled_proof(
+                db=session, product_id="BTC-USD", idempotency_key="stale-durable-new", expires_in_minutes=30,
+                actor="operator:bob",
+            )
+        monkeypatch.undo()
+
+        refreshed_stale = await session.get(ControlledProofRun, stale.proof_id)
+        assert refreshed_stale.status == "EXPIRED"
+        assert refreshed_stale.terminal_verdict == "FAILED"
+        assert refreshed_stale.failure_reason == "expired_before_execution_completion"
+
+
+@pytest.mark.asyncio
+async def test_sequential_creation_attempts_never_leave_two_active_proofs_after_stale_recovery(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Proxy for the two-simultaneous-requests race requirement (real
+    concurrent-transaction testing is not exercisable under sqlite's single
+    shared connection, per this file's other documented sqlite-limitation
+    notes): proves the invariant SELECT ... FOR UPDATE plus
+    uq_controlled_proof_runs_single_active exist to protect -- at most one
+    active proof ever exists, no matter how many creation attempts land
+    against the same stale, safe, expired row."""
+    async with _real_session() as session:
+        stale = await _seed_stale_active_proof(session, monkeypatch, idempotency_key="stale-race")
+
+        first, _ = await controlled_proof_service.create_controlled_proof(
+            db=session, product_id="BTC-USD", idempotency_key="stale-race-a", expires_in_minutes=30, actor="operator:alice",
+        )
+        second, _ = await controlled_proof_service.create_controlled_proof(
+            db=session, product_id="BTC-USD", idempotency_key="stale-race-a", expires_in_minutes=30, actor="operator:bob",
+        )
+
+        assert first.proof_id == second.proof_id  # idempotent replay, not a duplicate
+        rows = (await session.execute(select(ControlledProofRun))).scalars().all()
+        active = [r for r in rows if r.status in controlled_proof_service._ACTIVE_STATES]
+        assert [r.proof_id for r in active] == [first.proof_id]
+        assert len([r for r in rows if r.status == "EXPIRED"]) == 1
+
+
+@pytest.mark.asyncio
+async def test_recover_stale_controlled_proof_explicit_endpoint_recovers_safe_stale_proof(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The standalone, explicit service operation the operator API endpoint
+    calls -- same governed check, invocable without also creating a new
+    proof."""
+    async with _real_session() as session:
+        stale = await _seed_stale_active_proof(session, monkeypatch, idempotency_key="stale-explicit")
+
+        outcome = await controlled_proof_service.recover_stale_controlled_proof(db=session, actor="operator:alice")
+
+        assert outcome.recovered is True
+        assert outcome.proof_id == stale.proof_id
+        refreshed = await session.get(ControlledProofRun, stale.proof_id)
+        assert refreshed.status == "EXPIRED"
+        assert refreshed.terminal_verdict == "FAILED"
+
+
+@pytest.mark.asyncio
+async def test_recover_stale_controlled_proof_explicit_endpoint_fails_closed_when_unsafe(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async with _real_session() as session:
+        stale = await _seed_stale_active_proof(session, monkeypatch, idempotency_key="stale-explicit-unsafe")
+        stale.position_id = "pos-live-explicit-1"
+        await session.commit()
+
+        with pytest.raises(InvalidRequestError) as excinfo:
+            await controlled_proof_service.recover_stale_controlled_proof(db=session, actor="operator:alice")
+
+        assert "exit recovery or" in excinfo.value.message
+        refreshed = await session.get(ControlledProofRun, stale.proof_id)
+        assert refreshed.status == "PACKAGE_CREATED"
+
+
+@pytest.mark.asyncio
+async def test_recover_stale_controlled_proof_explicit_endpoint_raises_when_nothing_active(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async with _real_session() as session:
+        await _seed_fully_ready_scope(session, monkeypatch)
+        with pytest.raises(NotFoundError):
+            await controlled_proof_service.recover_stale_controlled_proof(db=session, actor="operator:alice")
 
 
 # --- no direct provider submission ---------------------------------------------------

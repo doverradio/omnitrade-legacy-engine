@@ -99,6 +99,7 @@ from app.services.orchestration.autonomous_execution_claims import (
 )
 from app.services.orchestration.reconciliation_guard import (
     UNRESOLVED_RECONCILIATION_STATES,
+    has_unresolved_reconciliation as _shared_has_unresolved_reconciliation,
     latest_reconciliation_event_per_order,
 )
 from app.services.orchestration.reconciliation_scheduler import poll_unresolved_live_orders
@@ -1126,22 +1127,15 @@ async def _log_unresolved_reconciliation_diagnostics(*, db: AsyncSession, provid
 
 
 async def _has_unresolved_reconciliation(*, db: AsyncSession, provider: str, environment: str, product: str) -> bool:
-    latest = _latest_reconciliation_event_per_order(provider=provider, environment=environment, product=product)
-    row = await db.scalar(
-        select(LiveReconciliationEvent.id)
-        .join(
-            latest,
-            and_(
-                LiveReconciliationEvent.live_crypto_order_id == latest.c.order_id,
-                LiveReconciliationEvent.sequence_number == latest.c.max_seq,
-            ),
-        )
-        .where(LiveReconciliationEvent.reconciliation_status.in_(_UNRESOLVED_RECONCILIATION_STATES))
-        .limit(1)
-    )
-    if row is not None:
+    # Query itself now lives in reconciliation_guard.has_unresolved_reconciliation
+    # (shared with Controlled Proof's stale-proof recovery safety check, so
+    # both agree on the identical definition of "unresolved" for the same
+    # market scope) -- this thin wrapper only adds the worker's own
+    # diagnostics logging on top.
+    result = await _shared_has_unresolved_reconciliation(db=db, provider=provider, environment=environment, product=product)
+    if result:
         await _log_unresolved_reconciliation_diagnostics(db=db, provider=provider, environment=environment, product=product)
-    return row is not None
+    return result
 
 
 async def _attempt_automatic_ready_package_creation(
