@@ -16,6 +16,7 @@ from app.models.autonomous_execution_claim import AutonomousExecutionClaim
 from app.models.canonical_preview_package import CanonicalPreviewPackage
 from app.models.capital_campaign import CapitalCampaign
 from app.models.controlled_proof_run import ControlledProofRun
+from app.models.controlled_proof_exit_recovery import ControlledProofExitRecovery
 from app.models.exchange_connection import ExchangeConnection
 from app.models.live_accounting_record import LiveAccountingRecord
 from app.models.live_crypto_order import LiveCryptoOrder
@@ -25,7 +26,7 @@ from app.models.live_trading_profile import LiveTradingProfile
 from app.services.controlled_proof.service import get_controlled_proof_view, should_propose_controlled_sell
 from app.services.live.accounting_reconciliation import reconcile_live_order_and_fills
 from app.services.orchestration.reconciliation_guard import has_unresolved_reconciliation
-from tests.support.real_sqlite_session import real_sqlite_session
+from tests.support.real_sqlite_session import real_sqlite_session, real_sqlite_session_factory
 
 # LiveAuditEvidenceRecord is excluded for the same reason as
 # test_reconcile_external_trade.py: its CHECK constraint uses Postgres's
@@ -40,6 +41,7 @@ _ALL_TABLES = [
     LiveReconciliationEvent.__table__,
     LiveExecutionEvent.__table__,
     CanonicalPreviewPackage.__table__,
+    ControlledProofExitRecovery.__table__,
     ControlledProofRun.__table__,
     AutonomousExecutionClaim.__table__,
     AuditLog.__table__,
@@ -377,3 +379,82 @@ async def test_viqc_buy_reconciliation_clears_unresolved_gate_and_sell_becomes_e
         view = await get_controlled_proof_view(db=session, proof_id=proof.proof_id)
         assert view["buy_order"]["status"] == "FILLED"
         assert view["reconciliation"]["unresolved"] is False
+
+
+@pytest.mark.asyncio
+async def test_replayed_filled_reconciliation_supersedes_later_unresolved_event_across_sessions(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A replayed terminal observation must append new current authority."""
+    provider = _FakeProvider(order=_filled_buy_order(), fills=[_buy_fill()])
+
+    async with real_sqlite_session_factory(_ALL_TABLES) as session_factory:
+        async with session_factory() as seed_session:
+            connection = await _seed_connection(seed_session)
+            profile = await _seed_live_profile(seed_session)
+            proof, order = await _seed_proof_with_pending_buy(
+                seed_session, connection=connection, profile=profile,
+            )
+            _patch_provider(monkeypatch, provider, connection=connection)
+            await reconcile_live_order_and_fills(
+                db=seed_session, live_crypto_order_id=order.live_crypto_order_id,
+                operator_identity=_ACTOR,
+            )
+            await seed_session.commit()
+
+            filled_event = await seed_session.scalar(
+                select(LiveReconciliationEvent)
+                .where(
+                    LiveReconciliationEvent.live_crypto_order_id == order.live_crypto_order_id,
+                    LiveReconciliationEvent.event_type == "order_reconciled",
+                    LiveReconciliationEvent.reconciliation_status == "filled",
+                )
+                .order_by(LiveReconciliationEvent.sequence_number.desc())
+                .limit(1)
+            )
+            latest_sequence = await seed_session.scalar(
+                select(LiveReconciliationEvent.sequence_number)
+                .where(LiveReconciliationEvent.live_trading_profile_id == profile.id)
+                .order_by(LiveReconciliationEvent.sequence_number.desc())
+                .limit(1)
+            )
+            stale_unresolved = LiveReconciliationEvent(
+                idempotency_key=f"later-unresolved-{uuid.uuid4()}", event_hash=f"hash-{uuid.uuid4()}",
+                live_trading_profile_id=profile.id, live_crypto_order_id=order.live_crypto_order_id,
+                capital_campaign_id=None, source_execution_event_id=filled_event.source_execution_event_id,
+                source_execution_event_type="execution_intent_created",
+                sequence_number=latest_sequence + 1, event_type="order_reconciled",
+                reconciliation_status="reconciliation_required", provider_name="kraken_spot",
+                provider_order_id=_PROVIDER_ORDER_ID, provider_fill_id=None,
+                event_payload={}, provenance={}, immutable_contract_version="v1",
+                recorded_at=datetime.now(timezone.utc),
+            )
+            seed_session.add(stale_unresolved)
+            await seed_session.commit()
+            historical_ids = set((await seed_session.scalars(
+                select(LiveReconciliationEvent.id).where(
+                    LiveReconciliationEvent.live_crypto_order_id == order.live_crypto_order_id,
+                )
+            )).all())
+
+        async with session_factory() as reconciliation_session:
+            result = await reconcile_live_order_and_fills(
+                db=reconciliation_session, live_crypto_order_id=order.live_crypto_order_id,
+                operator_identity=_ACTOR,
+            )
+            assert result["reconciliation_status"] == "FILLED"
+            await reconciliation_session.commit()
+
+        async with session_factory() as gate_session:
+            assert await has_unresolved_reconciliation(
+                db=gate_session, provider="kraken_spot", environment="production", product="BTC-USD",
+            ) is False
+            refreshed_proof = await gate_session.get(ControlledProofRun, proof.proof_id)
+            assert await should_propose_controlled_sell(db=gate_session, proof=refreshed_proof) is True
+            events = (await gate_session.scalars(
+                select(LiveReconciliationEvent).where(
+                    LiveReconciliationEvent.live_crypto_order_id == order.live_crypto_order_id,
+                )
+            )).all()
+            assert historical_ids.issubset({event.id for event in events})
+            assert max(events, key=lambda event: event.sequence_number).reconciliation_status == "filled"

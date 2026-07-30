@@ -70,6 +70,9 @@ def build_live_reconciliation_idempotency_key(
 
 
 _RECONCILIATION_TERMINAL_STATUSES = {"filled", "canceled", "rejected"}
+_RECONCILIATION_UNRESOLVED_STATUSES = {
+    "open", "partially_filled", "reconciliation_required", "unknown", "conflict", "balance_mismatch",
+}
 _EXTERNAL_EXECUTION_AUTHORITY = "EXTERNALLY_EXECUTED_MANUAL_TRADE"
 
 
@@ -1046,16 +1049,43 @@ async def record_live_order_reconciliation(
         .limit(1)
     )
     if existing is not None:
-        return LiveReconciliationResult(
-            accepted=True,
-            status="replayed",
-            reason=None,
-            live_trading_profile_id=existing.live_trading_profile_id,
-            source_execution_event_id=existing.source_execution_event_id,
-            reconciliation_event_id=existing.id,
-            accounting_record_ids=tuple(),
-            idempotency_key=idempotency_key,
+        latest_event = await db.scalar(
+            select(LiveReconciliationEvent)
+            .where(LiveReconciliationEvent.live_crypto_order_id == request.live_crypto_order_id)
+            .order_by(LiveReconciliationEvent.sequence_number.desc())
+            .limit(1)
         )
+        replay_is_superseded_terminal_truth = (
+            request.reconciliation_status in _RECONCILIATION_TERMINAL_STATUSES
+            and latest_event is not None
+            and latest_event.reconciliation_status in _RECONCILIATION_UNRESOLVED_STATUSES
+            and existing.sequence_number < latest_event.sequence_number
+        )
+        if not replay_is_superseded_terminal_truth:
+            return LiveReconciliationResult(
+                accepted=True,
+                status="replayed",
+                reason=None,
+                live_trading_profile_id=existing.live_trading_profile_id,
+                source_execution_event_id=existing.source_execution_event_id,
+                reconciliation_event_id=existing.id,
+                accounting_record_ids=tuple(),
+                idempotency_key=idempotency_key,
+            )
+        idempotency_key = f"{idempotency_key}:reaffirmed-after:{latest_event.sequence_number}"
+        reaffirmed = await db.scalar(
+            select(LiveReconciliationEvent)
+            .where(LiveReconciliationEvent.idempotency_key == idempotency_key)
+            .limit(1)
+        )
+        if reaffirmed is not None:
+            return LiveReconciliationResult(
+                accepted=True, status="replayed", reason=None,
+                live_trading_profile_id=reaffirmed.live_trading_profile_id,
+                source_execution_event_id=reaffirmed.source_execution_event_id,
+                reconciliation_event_id=reaffirmed.id, accounting_record_ids=tuple(),
+                idempotency_key=idempotency_key,
+            )
 
     source_event = await db.scalar(
         select(LiveExecutionEvent)
