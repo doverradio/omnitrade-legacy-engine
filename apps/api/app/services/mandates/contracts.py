@@ -139,6 +139,7 @@ class MandateEligibilityInput:
     # consulted -- for a PRODUCTION-purpose mandate; only replaces the
     # ordinary daily_deployment_limit check for CONTROLLED_PROOF.
     controlled_proof_open_exposure_usd: Decimal = Decimal("0")
+    continuing_exit_authority: bool = False
 
 
 @dataclass(frozen=True)

@@ -220,7 +220,7 @@ async def find_pending_exit_recovery_id(*, db: AsyncSession) -> uuid.UUID | None
     ))).all()
     for item in expired:
         before = item.status
-        item.status = "EXPIRED"; item.updated_at = now
+        item.status = "EXPIRED"; item.completed_at = now; item.updated_at = now
         db.add(AuditLog(actor="system:controlled_proof_worker", action="controlled_proof_exit_recovery.expired", entity_type="controlled_proof_exit_recovery", entity_id=item.recovery_id, before_state={"status": before}, after_state={"status": "EXPIRED"}))
     if expired:
         await db.flush()
@@ -257,6 +257,8 @@ async def claim_exit_recovery_by_id(*, db: AsyncSession, recovery_id: uuid.UUID)
             before = recovery.status
             recovery.status = "BLOCKED"
             recovery.blocked_reason = f"authority_revalidation_failed:{exc.message}"
+            recovery.failure_reason = None
+            recovery.completed_at = now
             recovery.updated_at = now
             db.add(AuditLog(
                 actor="system:controlled_proof_worker",
@@ -508,7 +510,9 @@ async def record_exit_recovery_waiting(*, db: AsyncSession, recovery: Controlled
 
 async def block_exit_recovery(*, db: AsyncSession, recovery: ControlledProofExitRecovery, reason: str) -> None:
     before = recovery.status
-    recovery.status = "BLOCKED"; recovery.blocked_reason = reason; recovery.updated_at = _utcnow()
+    completed_at = _utcnow()
+    recovery.status = "BLOCKED"; recovery.blocked_reason = reason
+    recovery.failure_reason = None; recovery.completed_at = completed_at; recovery.updated_at = completed_at
     db.add(AuditLog(actor="system:controlled_proof_worker", action="controlled_proof_exit_recovery.blocked", entity_type="controlled_proof_exit_recovery", entity_id=recovery.recovery_id, before_state={"status": before}, after_state={"status": "BLOCKED", "reason": reason}))
     await db.flush()
 

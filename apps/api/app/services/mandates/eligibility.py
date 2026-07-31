@@ -45,6 +45,7 @@ def evaluate_mandate_eligibility(
               request.daily_deployed_usd + capital_increase_usd <= version.max_daily_deployed_usd,
               "daily_deployed_exceeds_mandate_limit")
     )
+    continuing_exit = request.continuing_exit_authority and request.side == "SELL"
     checks: list[tuple[str, bool, str]] = [
         ("owner_match", mandate.owner_actor_id == request.owner_actor_id, "owner_mismatch"),
         (
@@ -52,7 +53,7 @@ def evaluate_mandate_eligibility(
             mandate.purpose == request.expected_mandate_purpose,
             "mandate_purpose_mismatch",
         ),
-        ("mandate_status", mandate.status in {"ACTIVE", "EXIT_ONLY"}, "mandate_not_active"),
+        ("mandate_status", mandate.status in {"ACTIVE", "EXIT_ONLY"} or (continuing_exit and mandate.status == "EXPIRED"), "mandate_not_active"),
         (
             "mandate_not_revoked",
             mandate.revoked_at is None and mandate.status not in {"REVOKED", "KILLED"},
@@ -60,7 +61,7 @@ def evaluate_mandate_eligibility(
         ),
         (
             "mandate_not_expired",
-            mandate.expires_at is None or mandate.expires_at > request.observed_at,
+            continuing_exit or mandate.expires_at is None or mandate.expires_at > request.observed_at,
             "mandate_expired",
         ),
         ("provider_match", mandate.provider == request.provider, "provider_mismatch"),
@@ -90,7 +91,7 @@ def evaluate_mandate_eligibility(
             "paper_account_mismatch",
         ),
         ("version_authorized", version.is_authorized, "mandate_version_not_authorized"),
-        ("version_active", version.is_active, "mandate_version_not_active"),
+        ("version_active", version.is_active or (continuing_exit and mandate.status == "EXPIRED"), "mandate_version_not_active"),
         (
             "product_allowed",
             request.product in version.allowed_products,

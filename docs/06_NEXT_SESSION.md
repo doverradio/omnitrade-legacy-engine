@@ -60,6 +60,18 @@ canonical proof-owned quantity, scoped position quantity, and profile custody.
 Next action is review, deploy, then read-only validation; authorization remains
 a separate operator checkpoint.
 
+That authorization produced recovery `bf2c040d-4ee6-4091-adeb-9dbb633d2b65`,
+which was claimed and passed SELL eligibility plus Risk ALLOW but blocked on
+the expired original CONTROLLED_PROOF mandate before creating a SELL package.
+It is terminal and must not be resumed or replayed. The reviewed correction
+must be deployed first; after read-only validation, exactly one replacement
+recovery with a new persisted key may be considered. Continuing exit authority
+is typed, recovery-bound, SELL-only, and does not restore entry authority.
+Proof #3 remains outside the clean five-proof streak (still 0 of 5).
+Preserve the historical recovery's pre-fix `completed_at=null` as immutable
+legacy evidence. It remains unclaimable and does not block a different-key
+replacement because only AUTHORIZED/IN_PROGRESS rows are unique per proof.
+
 The external reconciliation investigation is complete.
 
 The PACKAGE_ONLY SELL progression defect has been repaired,

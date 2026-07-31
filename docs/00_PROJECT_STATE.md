@@ -311,6 +311,21 @@ custody quantities and every existing reconciliation/provider guard passes.
 Implementation is local and awaiting review/deployment; no recovery has been
 authorized under this correction.
 
+The resulting production recovery (`bf2c040d-4ee6-4091-adeb-9dbb633d2b65`)
+was authorized and claimed, passed SELL eligibility and Risk ALLOW, then became
+BLOCKED with `controlled_proof_mandate_not_authorized` before package creation.
+Root cause was ordinary mandate evaluation applying the expired entry mandate
+without typed recovery context. The local correction recognizes only verified
+unexpired recovery-owned SELL as continuing exit authority and makes terminal
+recovery timestamps and dispatch outcome logs truthful. The existing BLOCKED
+recovery is not resumable and must not be replayed; one replacement requires a
+new post-deployment operator checkpoint. Proof #3 remains a hardening/recovery
+proof and the clean qualification streak remains 0 of 5.
+The row's historical `completed_at=null` is retained unchanged: it is a legacy
+terminal anomaly, not an active state. New BLOCKED/EXPIRED transitions record
+`completed_at`; replacement authorization is permitted because per-proof
+uniqueness covers only AUTHORIZED/IN_PROGRESS recoveries.
+
 Production proving has advanced beyond the external reconciliation
 investigation.
 

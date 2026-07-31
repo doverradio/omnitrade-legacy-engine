@@ -124,6 +124,65 @@ def test_sell_exit_does_not_redeploy_capital_or_increase_open_exposure() -> None
     assert "daily_deployment_limit" in decision.passed_checks
 
 
+def test_verified_continuing_exit_authority_allows_only_sell_under_expired_controlled_proof_mandate() -> None:
+    base = _mandate(status="EXPIRED")
+    mandate = MandateDomainModel(**{
+        **base.__dict__, "purpose": "CONTROLLED_PROOF",
+        "expires_at": _NOW - timedelta(seconds=1),
+    })
+    request = MandateEligibilityInput(**{
+        **_request(mandate).__dict__, "side": "SELL",
+        "expected_mandate_purpose": "CONTROLLED_PROOF",
+        "continuing_exit_authority": True,
+    })
+
+    decision = evaluate_mandate_eligibility(
+        mandate=mandate, version=_version(is_active=False), request=request,
+    )
+
+    assert decision.result == "AUTHORIZED"
+    assert "mandate_status" in decision.passed_checks
+    assert "mandate_not_expired" in decision.passed_checks
+    assert "version_active" in decision.passed_checks
+
+
+def test_continuing_exit_authority_never_authorizes_buy() -> None:
+    base = _mandate(status="EXPIRED")
+    mandate = MandateDomainModel(**{
+        **base.__dict__, "purpose": "CONTROLLED_PROOF",
+        "expires_at": _NOW - timedelta(seconds=1),
+    })
+    request = MandateEligibilityInput(**{
+        **_request(mandate).__dict__, "side": "BUY",
+        "expected_mandate_purpose": "CONTROLLED_PROOF",
+        "continuing_exit_authority": True,
+    })
+
+    decision = evaluate_mandate_eligibility(
+        mandate=mandate, version=_version(is_active=False), request=request,
+    )
+
+    assert decision.result == "REJECTED"
+    assert decision.reason_code == "mandate_not_active"
+
+
+def test_continuing_exit_authority_does_not_override_revocation_or_unrelated_mandate_denial() -> None:
+    base = _mandate(status="REVOKED")
+    mandate = MandateDomainModel(**{
+        **base.__dict__, "purpose": "CONTROLLED_PROOF", "revoked_at": _NOW - timedelta(seconds=1),
+    })
+    request = MandateEligibilityInput(**{
+        **_request(mandate).__dict__, "side": "SELL",
+        "expected_mandate_purpose": "CONTROLLED_PROOF",
+        "continuing_exit_authority": True,
+    })
+
+    decision = evaluate_mandate_eligibility(mandate=mandate, version=_version(), request=request)
+
+    assert decision.result == "REJECTED"
+    assert any("mandate_revoked_or_killed" in item for item in decision.deterministic_explanation)
+
+
 def test_invalid_mandate_version_rejected_by_validation_service() -> None:
     invalid = _version()
     invalid = MandateVersionModel(**{**invalid.__dict__, "max_order_notional_usd": Decimal("0")})

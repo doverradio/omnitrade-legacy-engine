@@ -613,6 +613,32 @@ manual intervention solely because a SELL package already exists.
 
 ## 2026-07-30
 
+### Exit Recovery Is Continuing SELL Authority, Not Renewed Entry Authority
+
+A valid, unexpired, claimed Exit Recovery may satisfy only the expiry-derived
+mandate checks needed to close verified proof-owned exposure. The mandate
+evidence service independently resolves the typed recovery/proof identity and
+enables this rule only for SELL under a CONTROLLED_PROOF-purpose mandate.
+Revoked or killed mandates, unauthorized versions, scope mismatches, BUY,
+disallowed products/sides, excessive notional, Risk denial, and kill switches
+remain rejecting conditions.
+
+Production recovery `bf2c040d-4ee6-4091-adeb-9dbb633d2b65` passed exposure,
+SELL eligibility, and Risk but was blocked before package creation because its
+recovery ID existed only in untyped context/idempotency text; ordinary mandate
+evaluation therefore rejected the expired entry mandate. A BLOCKED or EXPIRED
+recovery is terminal, carries `completed_at`, and cannot be claimed or resumed.
+Dispatch completion means only an actual final outcome and is logged with that
+outcome. The production recovery remains terminal; any later replacement must
+use one new persisted key after deployment and read-only review.
+
+The production row's pre-fix `completed_at=null` is preserved under treatment
+A as immutable historical evidence. `status=BLOCKED` is authoritative for
+claimability, and the database's per-proof unique index applies only to
+AUTHORIZED/IN_PROGRESS rows. GET returns the newest recovery by
+`authorized_at`; replay remains key-specific. Future terminal transitions set
+`completed_at`, but the legacy row is neither rewritten nor reactivated.
+
 ### BLOCKED Proofs May Receive Exposure-Conditional SELL-Only Recovery Authority
 
 Decision

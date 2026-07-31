@@ -14,6 +14,7 @@ from app.models.autonomous_capital_mandate import AutonomousCapitalMandate
 from app.models.autonomous_capital_mandate_authorization import AutonomousCapitalMandateAuthorization
 from app.models.autonomous_capital_mandate_evaluation import AutonomousCapitalMandateEvaluation
 from app.models.autonomous_capital_mandate_version import AutonomousCapitalMandateVersion
+from app.models.controlled_proof_exit_recovery import ControlledProofExitRecovery
 from app.services.mandates.contracts import (
     MANDATE_APPROVAL_RESULT_REQUIRED_HUMAN,
     MandateDomainModel,
@@ -54,6 +55,8 @@ class MandateEvaluationWriteRequest:
     # see MandateEligibilityInput's identical fields in contracts.py.
     expected_mandate_purpose: str = "PRODUCTION"
     controlled_proof_open_exposure_usd: Decimal = Decimal("0")
+    controlled_proof_id: uuid.UUID | None = None
+    controlled_proof_exit_recovery_id: uuid.UUID | None = None
 
 
 async def evaluate_and_record_mandate(
@@ -95,6 +98,20 @@ async def evaluate_and_record_mandate(
     mandate = await get_mandate(db=db, mandate_id=request.mandate_id)
     version, is_authorized = await _resolve_version_for_evaluation(db=db, mandate_id=mandate.mandate_id)
 
+    continuing_exit_authority = False
+    if request.controlled_proof_exit_recovery_id is not None:
+        recovery = await db.scalar(select(ControlledProofExitRecovery).where(
+            ControlledProofExitRecovery.recovery_id == request.controlled_proof_exit_recovery_id,
+            ControlledProofExitRecovery.proof_id == request.controlled_proof_id,
+            ControlledProofExitRecovery.status == "IN_PROGRESS",
+            ControlledProofExitRecovery.expires_at > request.observed_at,
+        ).limit(1))
+        continuing_exit_authority = bool(
+            recovery is not None
+            and request.side == "SELL"
+            and request.expected_mandate_purpose == "CONTROLLED_PROOF"
+        )
+
     domain_mandate = _to_mandate_domain(mandate)
     domain_version = _to_version_domain(version=version, mandate=mandate, is_authorized=is_authorized)
 
@@ -125,6 +142,7 @@ async def evaluate_and_record_mandate(
             observed_at=request.observed_at,
             expected_mandate_purpose=request.expected_mandate_purpose,
             controlled_proof_open_exposure_usd=request.controlled_proof_open_exposure_usd,
+            continuing_exit_authority=continuing_exit_authority,
         ),
     )
 

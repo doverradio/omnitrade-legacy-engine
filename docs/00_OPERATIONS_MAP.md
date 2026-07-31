@@ -155,6 +155,23 @@ BUY authority. Zero exposure, mismatched quantity or ownership, unresolved
 reconciliation, existing SELL execution, or ambiguous provider state still
 fails closed before recovery authorization.
 
+Production recovery `bf2c040d-4ee6-4091-adeb-9dbb633d2b65` then proved a
+second boundary: authorization and Risk ALLOW succeeded, but ordinary mandate
+evaluation reapplied the expired entry mandate and blocked before SELL package
+creation with `controlled_proof_mandate_not_authorized`. Exit Recovery now
+passes a typed recovery identity into mandate evidence. Only an independently
+verified, unexpired `IN_PROGRESS` recovery for the same proof may treat an
+expired CONTROLLED_PROOF mandate as continuing SELL-only exit authority;
+revocation, version authorization, scope, product, side, notional, Risk, and
+kill-switch checks remain mandatory. A blocked/expired recovery is terminal,
+records `completed_at`, and is never resumed. Recovery `bf2c040d-...` must stay
+terminal and be replaced once, with a new key, only after deployment review.
+Its pre-fix `completed_at=null` is preserved as an immutable legacy terminal
+anomaly: `BLOCKED` makes it unclaimable and the active-recovery partial unique
+index excludes it, so it cannot prevent one different-key replacement.
+Dispatch logs use `controlled_proof_exit_recovery_dispatch_finished` with the
+actual outcome instead of reporting unconditional completion.
+
 Production Flow
 
 1. Operator authorizes Exit Recovery via authenticated API.

@@ -5476,6 +5476,8 @@ async def test_exit_recovery_enters_existing_pipeline_as_sell_only(monkeypatch: 
         f"controlled-proof-mandate-eval:{proof.proof_id}:SELL:exit-recovery:"
         f"{recovery.recovery_id}:decision:{request.expected_decision_record_id}"
     )
+    assert captured["evaluation_request"].controlled_proof_id == proof.proof_id
+    assert captured["evaluation_request"].controlled_proof_exit_recovery_id == recovery.recovery_id
     assert request.idempotency_key == worker_module.hashlib.sha256(
         f"controlled-proof:{proof.proof_id}:SELL:exit-recovery:{recovery.recovery_id}".encode()
     ).hexdigest()

@@ -707,6 +707,8 @@ async def test_failed_claim_revalidation_commits_block_and_audit(monkeypatch) ->
 
     assert await exit_recovery.claim_exit_recovery_by_id(db=db, recovery_id=recovery.recovery_id) is None
     assert recovery.status == "BLOCKED"
+    assert recovery.completed_at is not None
+    assert recovery.failure_reason is None
     assert db.commits == 1
     assert any(
         isinstance(item, AuditLog) and item.action == "controlled_proof_exit_recovery.blocked"
@@ -1231,6 +1233,81 @@ async def test_rejected_blocked_request_key_is_reusable_because_no_recovery_was_
         expires_in_minutes=60, actor="operator:human",
     )
     assert recovery.idempotency_key == "reusable-rejected-key"
+
+
+@pytest.mark.asyncio
+async def test_historical_blocked_recovery_allows_one_distinct_replacement_and_remains_immutable(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    now = datetime.now(timezone.utc)
+    proof_id = uuid.uuid4()
+    historical_id = uuid.uuid4()
+    async with _real_recovery_session() as session:
+        proof = ControlledProofRun(
+            proof_id=proof_id, status="BLOCKED", provider="kraken_spot", environment="production",
+            campaign_id=uuid.uuid4(), campaign_version=1, product_id="BTC-USD",
+            max_notional_usd=Decimal("5"), idempotency_key=f"proof-{uuid.uuid4()}",
+            requested_by="operator:human", expires_at=now - timedelta(minutes=10),
+            package_id=uuid.uuid4(), terminal_verdict="FAILED",
+        )
+        historical = ControlledProofExitRecovery(
+            recovery_id=historical_id, proof_id=proof_id, status="BLOCKED",
+            idempotency_key="historical-blocked-key", authorized_by="operator:human",
+            authorized_at=now - timedelta(hours=1), expires_at=now - timedelta(minutes=30),
+            claimed_at=now - timedelta(minutes=59), completed_at=None,
+            blocked_reason="controlled_proof_mandate_not_authorized", failure_reason=None,
+            audit_correlation_id=uuid.uuid4(), created_at=now - timedelta(hours=1),
+            updated_at=now - timedelta(minutes=58),
+        )
+        session.add_all([proof, historical])
+        await session.commit()
+        await session.refresh(historical)
+        historical_snapshot = (
+            historical.status, historical.claimed_at, historical.completed_at,
+            historical.blocked_reason, historical.failure_reason, historical.updated_at,
+        )
+
+        monkeypatch.setattr(exit_recovery, "_validate_exit_recovery", lambda *_args, **_kwargs: _async_none())
+        replacement = await exit_recovery.authorize_controlled_proof_exit_recovery(
+            db=session, proof_id=proof_id, idempotency_key="replacement-key",
+            expires_in_minutes=60, actor="operator:human",
+        )
+
+        assert replacement.recovery_id != historical_id
+        assert replacement.status == "AUTHORIZED"
+        rows = list(await session.scalars(select(ControlledProofExitRecovery).where(
+            ControlledProofExitRecovery.proof_id == proof_id,
+        )))
+        assert len(rows) == 2
+        assert sum(row.status in {"AUTHORIZED", "IN_PROGRESS"} for row in rows) == 1
+        await session.refresh(historical)
+        assert (
+            historical.status, historical.claimed_at, historical.completed_at,
+            historical.blocked_reason, historical.failure_reason, historical.updated_at,
+        ) == historical_snapshot
+
+        assert await exit_recovery.authorize_controlled_proof_exit_recovery(
+            db=session, proof_id=proof_id, idempotency_key="historical-blocked-key",
+            expires_in_minutes=60, actor="operator:human",
+        ) is historical
+        assert await exit_recovery.authorize_controlled_proof_exit_recovery(
+            db=session, proof_id=proof_id, idempotency_key="replacement-key",
+            expires_in_minutes=60, actor="operator:human",
+        ) is replacement
+
+        latest = await exit_recovery.get_exit_recovery_view(db=session, proof_id=proof_id)
+        assert latest["recovery_id"] == replacement.recovery_id
+        assert await exit_recovery.claim_exit_recovery_by_id(
+            db=session, recovery_id=historical.recovery_id,
+        ) is None
+        claimed = await exit_recovery.claim_exit_recovery_by_id(
+            db=session, recovery_id=replacement.recovery_id,
+        )
+        assert claimed is not None
+        assert claimed[0].recovery_id == replacement.recovery_id
+        assert claimed[0].status == "IN_PROGRESS"
+        assert await session.scalar(select(CanonicalPreviewPackage.package_id).limit(1)) is None
+        assert await session.scalar(select(LiveCryptoOrder.live_crypto_order_id).limit(1)) is None
 
 
 async def _async_raises(exc: Exception):

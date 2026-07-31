@@ -2206,6 +2206,8 @@ async def _attempt_operator_controlled_proof_entry(
                 audit_correlation_id=proof.audit_correlation_id, software_build_version=None,
                 expected_mandate_purpose=MANDATE_PURPOSE_CONTROLLED_PROOF,
                 controlled_proof_open_exposure_usd=controlled_proof_open_exposure_usd,
+                controlled_proof_id=proof.proof_id,
+                controlled_proof_exit_recovery_id=None if recovery is None else recovery.recovery_id,
             ),
         )
         if evaluation.authorization_result != "AUTHORIZED":
@@ -2374,10 +2376,15 @@ async def dispatch_controlled_proof_exit_recovery_attempt(*, proof_id: uuid.UUID
         async with AsyncSessionLocal() as db:
             view = await get_exit_recovery_view(db=db, proof_id=proof_id)
             await _attempt_operator_controlled_proof_entry(db=db, recovery_id=view["recovery_id"])
+            final_view = await get_exit_recovery_view(db=db, proof_id=proof_id)
     except Exception:
         logger.exception("controlled_proof_exit_recovery_dispatch_failed proof_id=%s", proof_id)
         return
-    logger.info("controlled_proof_exit_recovery_dispatch_completed proof_id=%s", proof_id)
+    logger.info(
+        "controlled_proof_exit_recovery_dispatch_finished proof_id=%s recovery_id=%s outcome=%s blocked_reason=%s failure_reason=%s",
+        proof_id, final_view["recovery_id"], final_view["status"],
+        final_view["blocked_reason"], final_view["failure_reason"],
+    )
 
 
 def schedule_controlled_proof_exit_recovery_dispatch(*, proof_id: uuid.UUID) -> None:
