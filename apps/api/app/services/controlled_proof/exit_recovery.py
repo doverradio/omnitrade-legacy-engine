@@ -28,6 +28,7 @@ from app.services.position_lifecycle.source_adapter import _position_id, load_po
 logger = logging.getLogger(__name__)
 
 _RECOVERABLE_PROOF_STATES = {"EXPIRED", "FAILED"}
+_EXPOSURE_CONDITIONAL_RECOVERABLE_PROOF_STATES = {"BLOCKED"}
 _ACTIVE_RECOVERY_STATES = {"AUTHORIZED", "IN_PROGRESS"}
 _RECOVERED_OUTCOME_ACTION = "controlled_proof_exit_recovery.recovered_outcome_published"
 
@@ -50,7 +51,8 @@ async def _load_scope(db: AsyncSession, proof: ControlledProofRun):
 async def _validate_exit_recovery(
     db: AsyncSession, proof: ControlledProofRun, *, allow_existing_sell_package: bool = False,
 ) -> None:
-    if proof.status not in _RECOVERABLE_PROOF_STATES:
+    blocked_with_exposure = proof.status in _EXPOSURE_CONDITIONAL_RECOVERABLE_PROOF_STATES
+    if proof.status not in _RECOVERABLE_PROOF_STATES and not blocked_with_exposure:
         raise InvalidRequestError(message="Controlled Proof is not eligible for exit recovery", details={"status": proof.status})
     if proof.package_id is None:
         raise InvalidRequestError(message="Controlled Proof BUY package is missing", details={})
@@ -134,6 +136,23 @@ async def _validate_exit_recovery(
     )
     if str(position.position_id) != expected_position_id:
         raise InvalidRequestError(message="Open position linkage does not match this Controlled Proof", details={})
+    if blocked_with_exposure:
+        # BLOCKED remains terminal and never regains ordinary BUY authority.
+        # It receives narrowly scoped exit authority only when the quantity
+        # attributable to this proof's canonical BUY/SELL lineage agrees
+        # exactly with both the profile-wide custody ledger and this
+        # campaign's position projection. Any ambiguity fails closed before
+        # a recovery row or SELL package can exist.
+        from app.services.controlled_proof.service import resolve_controlled_proof_owned_quantity
+        proof_owned_quantity = await resolve_controlled_proof_owned_quantity(db=db, proof=proof)
+        position_quantity = Decimal(str(position.position_size))
+        if proof_owned_quantity <= 0:
+            raise InvalidRequestError(message="No positive authoritative proof-owned quantity exists", details={})
+        if proof_owned_quantity != owned_quantity or proof_owned_quantity != position_quantity:
+            raise InvalidRequestError(
+                message="Controlled Proof owned quantity disagrees with authoritative custody",
+                details={},
+            )
     if proof.position_id != expected_position_id:
         before_position_id = proof.position_id
         proof.position_id = expected_position_id

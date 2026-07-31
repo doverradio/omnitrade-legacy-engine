@@ -673,7 +673,7 @@ async def test_periodic_refresh_projects_historical_blocked_recovery(monkeypatch
     item = _blocked_projection_fixture()
     projected = []
 
-    async def _project(*, db, recovery, proof):
+    async def _project(*, db, recovery, proof, diagnostics=None):
         projected.append((recovery.recovery_id, proof.proof_id))
         return True
 
@@ -1036,11 +1036,205 @@ async def test_authorization_predicates_accept_exact_authoritative_lineage(monke
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("status", ["REQUESTED", "CLAIMED", "POSITION_OPEN", "CANCELLED", "BLOCKED"])
+@pytest.mark.parametrize("status", ["REQUESTED", "CLAIMED", "POSITION_OPEN", "CANCELLED"])
 async def test_authorization_rejects_nonterminal_or_unapproved_terminal_status(status: str) -> None:
     proof = _terminal_proof(); proof.status = status; proof.package_id = uuid.uuid4()
     with pytest.raises(InvalidRequestError, match="not eligible"):
         await exit_recovery._validate_exit_recovery(_FakeDb([]), proof)
+
+
+def _blocked_proof() -> SimpleNamespace:
+    return SimpleNamespace(
+        proof_id=uuid.uuid4(), status="BLOCKED", terminal_verdict="FAILED",
+        package_id=uuid.uuid4(), sell_package_id=None, sell_live_crypto_order_id=None,
+        buy_live_crypto_order_id=uuid.uuid4(), provider="kraken_spot",
+        environment="production", product_id="BTC-USD", campaign_id=uuid.uuid4(),
+        position_id="position-1", updated_at=datetime.now(timezone.utc),
+    )
+
+
+def _install_blocked_recovery_authority(
+    monkeypatch: pytest.MonkeyPatch, *, owned_quantity: Decimal = Decimal("0.0001"),
+    proof_quantity: Decimal = Decimal("0.0001"), position_quantity: Decimal = Decimal("0.0001"),
+    unresolved: bool = False, open_order: bool = False,
+) -> None:
+    import app.services.orchestration.continuous_pipeline_worker as worker
+
+    monkeypatch.setattr(
+        "app.services.controlled_proof.service.repair_controlled_proof_cached_order_ids", _async_false,
+    )
+    monkeypatch.setattr(worker, "_has_open_live_order", lambda **_kwargs: _async_value(open_order))
+    monkeypatch.setattr(
+        exit_recovery, "has_unresolved_reconciliation", lambda **_kwargs: _async_value(unresolved),
+    )
+    monkeypatch.setattr(exit_recovery, "_load_scope", _async_scope)
+    monkeypatch.setattr(
+        exit_recovery, "compute_signed_owned_quantity", lambda **_kwargs: _async_value(owned_quantity),
+    )
+    monkeypatch.setattr(
+        exit_recovery, "load_position_snapshots",
+        lambda **_kwargs: _async_value([SimpleNamespace(
+            symbol="BTC-USD", position_size=position_quantity, position_id="position-1",
+        )]),
+    )
+    monkeypatch.setattr(exit_recovery, "_position_id", lambda **_kwargs: "position-1")
+    monkeypatch.setattr(
+        "app.services.controlled_proof.service.resolve_controlled_proof_owned_quantity",
+        lambda **_kwargs: _async_value(proof_quantity),
+    )
+
+
+async def _async_value(value):
+    return value
+
+
+@pytest.mark.asyncio
+async def test_blocked_proof_with_verified_owned_exposure_authorizes_once_and_preserves_terminal_state(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    proof = _blocked_proof()
+    order = SimpleNamespace(live_crypto_order_id=proof.buy_live_crypto_order_id, side="BUY", status="FILLED")
+    reconciliation = SimpleNamespace(reconciliation_status="filled")
+    accounting = SimpleNamespace(id=uuid.uuid4())
+    _install_blocked_recovery_authority(monkeypatch)
+    db = _FakeDb([None, proof, None, order, reconciliation, accounting])
+
+    recovery = await exit_recovery.authorize_controlled_proof_exit_recovery(
+        db=db, proof_id=proof.proof_id, idempotency_key="blocked-proof-recovery",
+        expires_in_minutes=60, actor="operator:human",
+    )
+
+    assert recovery.status == "AUTHORIZED"
+    assert proof.status == "BLOCKED"
+    assert proof.terminal_verdict == "FAILED"
+    assert len([item for item in db.added if isinstance(item, ControlledProofExitRecovery)]) == 1
+    replay_db = _FakeDb([recovery])
+    assert await exit_recovery.authorize_controlled_proof_exit_recovery(
+        db=replay_db, proof_id=proof.proof_id, idempotency_key="blocked-proof-recovery",
+        expires_in_minutes=60, actor="operator:human",
+    ) is recovery
+    assert not [item for item in replay_db.added if isinstance(item, ControlledProofExitRecovery)]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("owned_quantity", "proof_quantity", "position_quantity", "message"),
+    [
+        (Decimal("0"), Decimal("0"), Decimal("0.0001"), "No positive authoritative owned quantity exists"),
+        (Decimal("0.0001"), Decimal("0"), Decimal("0.0001"), "No positive authoritative proof-owned quantity exists"),
+        (Decimal("0.0001"), Decimal("0.00009"), Decimal("0.0001"), "disagrees with authoritative custody"),
+        (Decimal("0.0001"), Decimal("0.0001"), Decimal("0.00009"), "disagrees with authoritative custody"),
+    ],
+)
+async def test_blocked_proof_without_exact_positive_owned_quantity_is_rejected(
+    monkeypatch: pytest.MonkeyPatch, owned_quantity, proof_quantity, position_quantity, message,
+) -> None:
+    proof = _blocked_proof()
+    order = SimpleNamespace(live_crypto_order_id=proof.buy_live_crypto_order_id, side="BUY", status="FILLED")
+    reconciliation = SimpleNamespace(reconciliation_status="filled")
+    accounting = SimpleNamespace(id=uuid.uuid4())
+    _install_blocked_recovery_authority(
+        monkeypatch, owned_quantity=owned_quantity, proof_quantity=proof_quantity,
+        position_quantity=position_quantity,
+    )
+    with pytest.raises(InvalidRequestError, match=message):
+        await exit_recovery._validate_exit_recovery(_FakeDb([order, reconciliation, accounting]), proof)
+
+
+@pytest.mark.asyncio
+async def test_blocked_proof_with_unresolved_buy_reconciliation_is_rejected(monkeypatch: pytest.MonkeyPatch) -> None:
+    proof = _blocked_proof()
+    order = SimpleNamespace(live_crypto_order_id=proof.buy_live_crypto_order_id, side="BUY", status="FILLED")
+    _install_blocked_recovery_authority(monkeypatch)
+    with pytest.raises(InvalidRequestError, match="BUY reconciliation is incomplete"):
+        await exit_recovery._validate_exit_recovery(
+            _FakeDb([order, SimpleNamespace(reconciliation_status="reconciliation_required")]), proof,
+        )
+
+
+@pytest.mark.asyncio
+async def test_blocked_proof_with_ambiguous_provider_order_is_rejected(monkeypatch: pytest.MonkeyPatch) -> None:
+    proof = _blocked_proof()
+    order = SimpleNamespace(live_crypto_order_id=proof.buy_live_crypto_order_id, side="BUY", status="FILLED")
+    _install_blocked_recovery_authority(monkeypatch, open_order=True)
+    with pytest.raises(InvalidRequestError, match="open provider order"):
+        await exit_recovery._validate_exit_recovery(
+            _FakeDb([order, SimpleNamespace(reconciliation_status="filled")]), proof,
+        )
+
+
+@pytest.mark.asyncio
+async def test_blocked_proof_with_existing_sell_order_is_rejected_without_validation_side_effects(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    proof = _blocked_proof()
+    proof.sell_live_crypto_order_id = uuid.uuid4()
+    monkeypatch.setattr(
+        "app.services.controlled_proof.service.repair_controlled_proof_cached_order_ids", _async_false,
+    )
+    with pytest.raises(InvalidRequestError, match="already has SELL lineage"):
+        await exit_recovery._validate_exit_recovery(_FakeDb([]), proof)
+
+
+@pytest.mark.asyncio
+async def test_blocked_proof_with_existing_active_recovery_rejects_a_different_key(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    proof = _blocked_proof()
+    active = SimpleNamespace(recovery_id=uuid.uuid4(), proof_id=proof.proof_id, status="AUTHORIZED")
+    monkeypatch.setattr(
+        exit_recovery, "_validate_exit_recovery",
+        lambda *_args, **_kwargs: _async_raises(AssertionError("validation must not run")),
+    )
+    with pytest.raises(InvalidRequestError, match="already has an active exit recovery authority"):
+        await exit_recovery.authorize_controlled_proof_exit_recovery(
+            db=_FakeDb([None, proof, active]), proof_id=proof.proof_id,
+            idempotency_key="different-key", expires_in_minutes=60, actor="operator:human",
+        )
+
+
+@pytest.mark.asyncio
+async def test_blocked_proof_resumes_only_its_exact_existing_sell_package(monkeypatch: pytest.MonkeyPatch) -> None:
+    proof = _blocked_proof()
+    proof.sell_package_id = uuid.uuid4()
+    sell_package = SimpleNamespace(package_id=proof.sell_package_id, side="SELL")
+    order = SimpleNamespace(live_crypto_order_id=proof.buy_live_crypto_order_id, side="BUY", status="FILLED")
+    reconciliation = SimpleNamespace(reconciliation_status="filled")
+    accounting = SimpleNamespace(id=uuid.uuid4())
+    _install_blocked_recovery_authority(monkeypatch)
+    await exit_recovery._validate_exit_recovery(
+        _FakeDb([sell_package, order, reconciliation, accounting]), proof, allow_existing_sell_package=True,
+    )
+
+
+@pytest.mark.asyncio
+async def test_rejected_blocked_request_key_is_reusable_because_no_recovery_was_persisted(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    proof = _blocked_proof()
+    rejected_db = _FakeDb([None, proof, None])
+    monkeypatch.setattr(
+        exit_recovery, "_validate_exit_recovery",
+        lambda *_args, **_kwargs: _async_raises(InvalidRequestError(message="pre-fix rejection", details={})),
+    )
+    with pytest.raises(InvalidRequestError, match="pre-fix rejection"):
+        await exit_recovery.authorize_controlled_proof_exit_recovery(
+            db=rejected_db, proof_id=proof.proof_id, idempotency_key="reusable-rejected-key",
+            expires_in_minutes=60, actor="operator:human",
+        )
+    assert not [item for item in rejected_db.added if isinstance(item, ControlledProofExitRecovery)]
+
+    monkeypatch.setattr(exit_recovery, "_validate_exit_recovery", lambda *_args, **_kwargs: _async_none())
+    accepted_db = _FakeDb([None, proof, None])
+    recovery = await exit_recovery.authorize_controlled_proof_exit_recovery(
+        db=accepted_db, proof_id=proof.proof_id, idempotency_key="reusable-rejected-key",
+        expires_in_minutes=60, actor="operator:human",
+    )
+    assert recovery.idempotency_key == "reusable-rejected-key"
+
+
+async def _async_raises(exc: Exception):
+    raise exc
 
 
 @pytest.mark.asyncio

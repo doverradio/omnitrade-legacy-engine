@@ -613,6 +613,39 @@ manual intervention solely because a SELL package already exists.
 
 ## 2026-07-30
 
+### BLOCKED Proofs May Receive Exposure-Conditional SELL-Only Recovery Authority
+
+Decision
+
+`BLOCKED` remains a terminal Controlled Proof status and never regains BUY
+authority. A separate Exit Recovery may nevertheless be authorized when, and
+only when, the proof has a canonical reconciled FILLED BUY, no SELL execution,
+and the positive quantity derived from its package/claim/order/accounting
+lineage exactly equals both its scoped position projection and profile custody
+quantity. All existing open-order, reconciliation, mandate, Risk, audit,
+idempotency, and provider-boundary gates remain authoritative.
+
+Reason
+
+Proof `ef0ca4df-e520-4764-b6a5-71bcf165f43a` crossed the live-capital boundary
+and was later terminalized `BLOCKED`. Exit Recovery's original status set,
+unchanged since `c296baf`, contained only `EXPIRED` and `FAILED`, so its POST
+returned HTTP `400` (`Controlled Proof is not eligible for exit recovery`,
+`details.status=BLOCKED`) before evaluating the verified exposure. No recovery
+or authorization audit was persisted. Treating every BLOCKED proof as eligible
+would weaken terminal semantics; conditioning the separate recovery authority
+on exact, independently scoped exposure evidence closes only the stranded-live-
+capital gap and fails closed on any disagreement.
+
+Consequences
+
+An ordinary BLOCKED proof with no exposure remains ineligible. A qualifying
+proof stays BLOCKED while the existing recovery lifecycle creates or resumes
+exactly one governed SELL package. A rejected request's idempotency key is not
+consumed because no recovery row exists before successful validation, so the
+same persisted key may be replayed after deployment once read-only production
+checks reconfirm eligibility and absence of a recovery.
+
 ### Exit Recovery Activation Eligibility Is Not Bound to a Package's Creation-Time Recovery Stamp
 
 Decision

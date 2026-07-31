@@ -49,6 +49,17 @@ Avoid redesigning completed architecture unless a genuine defect is discovered.
 
 # Current Focus
 
+Controlled Proof #3 (`ef0ca4df-e520-4764-b6a5-71bcf165f43a`) remains
+`BLOCKED` with verified reconciled BUY exposure and no SELL lineage. Its single
+Exit Recovery POST returned HTTP `400` with `Controlled Proof is not eligible
+for exit recovery` and `details.status=BLOCKED`; no recovery was created and
+the POST must not be repeated before the reviewed correction is deployed.
+The local correction conditionally admits `BLOCKED` without changing proof
+status or restoring BUY authority, and requires exact agreement between
+canonical proof-owned quantity, scoped position quantity, and profile custody.
+Next action is review, deploy, then read-only validation; authorization remains
+a separate operator checkpoint.
+
 The external reconciliation investigation is complete.
 
 The PACKAGE_ONLY SELL progression defect has been repaired,

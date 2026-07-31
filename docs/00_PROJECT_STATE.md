@@ -300,6 +300,17 @@ and reaching OPEN_POSITION_PROPOSED.
 
 ✓ Current production blocker (2026-07-30)
 
+Controlled Proof #3 (`ef0ca4df-e520-4764-b6a5-71bcf165f43a`) exposed an Exit
+Recovery authorization gap: its governed POST returned HTTP `400`,
+`Controlled Proof is not eligible for exit recovery`, with
+`details.status=BLOCKED`, despite a reconciled FILLED BUY and verified open
+proof-owned exposure. The rejected request created no recovery. The correction
+keeps `BLOCKED` terminal but permits separate SELL-only recovery authority only
+when canonical proof quantity exactly equals scoped position and profile
+custody quantities and every existing reconciliation/provider guard passes.
+Implementation is local and awaiting review/deployment; no recovery has been
+authorized under this correction.
+
 Production proving has advanced beyond the external reconciliation
 investigation.
 

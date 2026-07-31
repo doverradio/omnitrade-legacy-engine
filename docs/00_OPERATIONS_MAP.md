@@ -140,8 +140,20 @@ Do not assume this mirrors the orchestration service's config sources — confir
 
 Purpose
 
-Recover PACKAGE_ONLY SELL package progression without direct database
-intervention.
+Recover verified proof-owned live exposure, including creation or resumption
+of its governed SELL package, without direct database intervention.
+
+On 2026-07-30, proof `ef0ca4df-e520-4764-b6a5-71bcf165f43a` returned HTTP
+`400` with `Controlled Proof is not eligible for exit recovery` and
+`details.status=BLOCKED`. No recovery row was created. The original eligibility
+set admitted only `EXPIRED` and `FAILED`; that historical set predated the
+proof's ability to become `BLOCKED` after crossing the live-capital boundary.
+`BLOCKED` is now conditionally eligible only when canonical proof lineage,
+scoped position accounting, and profile custody all prove the same positive
+quantity. The proof remains `BLOCKED`; recovery is SELL-only and cannot restore
+BUY authority. Zero exposure, mismatched quantity or ownership, unresolved
+reconciliation, existing SELL execution, or ambiguous provider state still
+fails closed before recovery authorization.
 
 Production Flow
 
@@ -358,8 +370,21 @@ trailing blank line.
 An HTTP `400` can be correct fail-closed domain behavior rather than malformed
 syntax, incorrect authentication, or a wrong endpoint.
 
-Do not use `curl --fail` when the response body is needed to diagnose a
-non-2xx operational result. It can suppress the authoritative API explanation.
+**Global operator-command rule: never use `curl --fail` or `curl -f` in an
+OmniTrade operational API command.** This applies to both read-only requests
+and mutations, including Controlled Proof, Exit Recovery, readiness,
+commissioning, reconciliation, and operator-action endpoints.
+
+Non-2xx response bodies are authoritative operational evidence. `curl --fail`
+can suppress that evidence and has repeatedly caused avoidable diagnostic
+delay. Always capture the response body and HTTP status separately using the
+canonical pattern below.
+
+On 2026-07-30, an Exit Recovery request for Controlled Proof
+`ef0ca4df-e520-4764-b6a5-71bcf165f43a` returned HTTP `400`; the supplied
+command used `curl --fail`, so the API's explanatory body was hidden. This
+incident reconfirmed that `--fail` is prohibited in all future OmniTrade
+operator commands.
 
 Production examples of valid fail-closed responses include:
 
@@ -397,7 +422,8 @@ HTTP_STATUS="$(curl --silent --show-error -o /tmp/omnitrade-response.json -w '%{
 ```
 
 For a POST, use the same separation while including the required method,
-headers, and request body.
+headers, and request body. Inspect the saved body for every HTTP status before
+retrying, changing parameters, or generating a new idempotency key.
 
 Do not use this invalid pattern:
 
@@ -407,6 +433,11 @@ curl ... -w '\nHTTP_STATUS=%{http_code}\n' | jq '.'
 
 Appending `HTTP_STATUS=...` to the response makes the combined stream invalid
 JSON. Retain the saved `/tmp/omnitrade-*.json` response for log correlation.
+
+Before supplying or approving an OmniTrade operator command, verify both:
+
+* the command contains neither `--fail` nor `-f`; and
+* HTTP status text is not appended to a stream sent directly to `jq`.
 
 ### Idempotent Mutation Discipline
 

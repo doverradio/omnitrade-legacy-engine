@@ -5425,7 +5425,7 @@ async def test_exit_recovery_enters_existing_pipeline_as_sell_only(monkeypatch: 
     from app.services.orchestration.automatic_package_executor import AutomaticPackageExecutionOutcome
 
     proof = SimpleNamespace(
-        proof_id=uuid.uuid4(), status="EXPIRED", terminal_verdict="FAILED",
+        proof_id=uuid.uuid4(), status="BLOCKED", terminal_verdict="FAILED",
         package_id=uuid.uuid4(), sell_package_id=None, campaign_id=uuid.uuid4(), campaign_version=1,
         provider="kraken_spot", environment="production", product_id="BTC-USD",
         max_notional_usd=Decimal("5"), audit_correlation_id=uuid.uuid4(),
@@ -5480,7 +5480,7 @@ async def test_exit_recovery_enters_existing_pipeline_as_sell_only(monkeypatch: 
         f"controlled-proof:{proof.proof_id}:SELL:exit-recovery:{recovery.recovery_id}".encode()
     ).hexdigest()
     assert captured["preserve"] is True
-    assert proof.status == "EXPIRED"
+    assert proof.status == "BLOCKED"
     assert proof.terminal_verdict == "FAILED"
 
 
@@ -5498,6 +5498,7 @@ async def test_exit_recovery_resumes_exact_linked_package_after_worker_restart(m
     recovery = SimpleNamespace(recovery_id=uuid.uuid4(), status="IN_PROGRESS")
     package = SimpleNamespace(
         package_id=package_id, decision_record_id=decision_id,
+        package_state="ACTIVATED",
         authorization_expires_at=datetime.now(timezone.utc) + timedelta(minutes=5),
     )
 
