@@ -5429,10 +5429,11 @@ async def test_exit_recovery_enters_existing_pipeline_as_sell_only(monkeypatch: 
         package_id=uuid.uuid4(), sell_package_id=None, campaign_id=uuid.uuid4(), campaign_version=1,
         provider="kraken_spot", environment="production", product_id="BTC-USD",
         max_notional_usd=Decimal("5"), audit_correlation_id=uuid.uuid4(),
+        mandate_version_id=uuid.uuid4(),
     )
     recovery = SimpleNamespace(recovery_id=uuid.uuid4(), status="IN_PROGRESS")
     package_id = uuid.uuid4()
-    captured = {}
+    captured = {"package_create_calls": 0}
 
     monkeypatch.setattr(worker_module, "claim_exit_recovery_by_id", _async_return((recovery, proof)))
     monkeypatch.setattr(worker_module, "should_propose_controlled_sell", _async_return(True))
@@ -5442,19 +5443,72 @@ async def test_exit_recovery_enters_existing_pipeline_as_sell_only(monkeypatch: 
     monkeypatch.setattr(worker_module, "_has_unresolved_reconciliation", _async_return(False))
     monkeypatch.setattr(worker_module, "evaluate_controlled_proof_risk", _async_return(ControlledProofRiskOutcome(verdict="ALLOW", approved_notional_usd=Decimal("5"), reason_code=None, risk_event_id=uuid.uuid4())))
     monkeypatch.setattr(worker_module, "get_settings", lambda: SimpleNamespace(automatic_mandate_package_activation_mandate_id=uuid.uuid4(), controlled_proof_mandate_id=uuid.uuid4()))
-    monkeypatch.setattr(worker_module, "compute_controlled_proof_open_exposure_usd", _async_return(Decimal("0")))
+    monkeypatch.setattr(worker_module, "compute_controlled_proof_open_exposure_usd", _async_return(Decimal("5.0049")))
     monkeypatch.setattr(worker_module, "resolve_controlled_proof_strategy_identity", _async_return("ma_crossover@1.0.0"))
     async def _create_decision(**kwargs):
         captured["decision_request"] = kwargs
         return uuid.uuid4()
     monkeypatch.setattr(worker_module, "create_controlled_proof_decision_record", _create_decision)
-    evaluation = SimpleNamespace(authorization_result="AUTHORIZED", mandate_id=uuid.uuid4(), mandate_version_id=uuid.uuid4(), evaluation_id=uuid.uuid4())
+    evaluation = SimpleNamespace(
+        authorization_result="AUTHORIZED", mandate_id=uuid.uuid4(),
+        mandate_version_id=proof.mandate_version_id, evaluation_id=uuid.uuid4(),
+    )
     async def _evaluate(*, db, request):
+        from app.services.mandates import evidence as mandate_evidence
+        from app.services.mandates.contracts import MandateDomainModel, MandateEligibilityInput, MandateVersionModel
+        from app.services.mandates.eligibility import evaluate_mandate_eligibility
+        observed_at = request.observed_at
+        mandate = MandateDomainModel(
+            mandate_id=request.mandate_id, owner_actor_id="operator:human", status="EXPIRED",
+            autonomy_level="LEVEL_2", provider="kraken_spot", exchange_environment="production",
+            exchange_connection_id=uuid.uuid4(), live_trading_profile_id=uuid.uuid4(),
+            paper_account_id=uuid.uuid4(), capital_campaign_id=None,
+            expires_at=observed_at - timedelta(seconds=1), revoked_at=None, purpose="CONTROLLED_PROOF",
+        )
+        version = MandateVersionModel(
+            mandate_version_id=evaluation.mandate_version_id, mandate_id=request.mandate_id,
+            version_number=1, base_currency="USD", authorized_capital_usd=Decimal("25"),
+            max_order_notional_usd=Decimal("5"), max_open_exposure_usd=Decimal("5"),
+            max_daily_deployed_usd=Decimal("10"), max_daily_realized_loss_usd=Decimal("3"),
+            max_campaign_drawdown_usd=Decimal("5"), max_consecutive_losses=2, position_limit=1,
+            price_evidence_max_age_seconds=30, max_slippage_bps=Decimal("25"), max_fee_bps=Decimal("50"),
+            allowed_products=("BTC-USD",), allowed_order_sides=("SELL",),
+            allowed_strategy_versions=(request.strategy_version,), approval_policy="MANDATE_ALLOWED",
+            is_authorized=True, is_active=False,
+        )
+        continuing_exit_authority = await mandate_evidence._has_continuing_exit_authority(
+            db=db, request=request,
+        )
+        decision = evaluate_mandate_eligibility(
+            mandate=mandate, version=version,
+            request=MandateEligibilityInput(
+                owner_actor_id=mandate.owner_actor_id, provider=mandate.provider,
+                exchange_environment=mandate.exchange_environment,
+                exchange_connection_id=mandate.exchange_connection_id,
+                live_trading_profile_id=mandate.live_trading_profile_id,
+                paper_account_id=mandate.paper_account_id, capital_campaign_id=mandate.capital_campaign_id,
+                strategy_version=request.strategy_version, product=request.product, side=request.side,
+                proposed_notional_usd=request.proposed_notional_usd,
+                current_open_exposure_usd=request.current_open_exposure_usd,
+                daily_deployed_usd=request.daily_deployed_usd,
+                daily_realized_loss_usd=request.daily_realized_loss_usd,
+                campaign_drawdown_usd=request.campaign_drawdown_usd,
+                consecutive_losses=request.consecutive_losses,
+                current_position_count=request.current_position_count,
+                risk_verdict=request.risk_verdict, evidence_age_seconds=request.evidence_age_seconds,
+                kill_switch_engaged=request.kill_switch_engaged, observed_at=request.observed_at,
+                expected_mandate_purpose=request.expected_mandate_purpose,
+                controlled_proof_open_exposure_usd=request.controlled_proof_open_exposure_usd,
+                continuing_exit_authority=continuing_exit_authority,
+            ),
+        )
+        assert decision.result == "AUTHORIZED"
         captured["evaluation_request"] = request
         return evaluation
     monkeypatch.setattr(worker_module, "evaluate_and_record_mandate", _evaluate)
 
     async def _create(*, db, request):
+        captured["package_create_calls"] += 1
         captured["request"] = request
         return {"package": {"package_id": str(package_id)}}
     async def _link(*, db, proof, sell_package_id, preserve_terminal_status=False):
@@ -5464,10 +5518,16 @@ async def test_exit_recovery_enters_existing_pipeline_as_sell_only(monkeypatch: 
     monkeypatch.setattr(worker_module, "link_controlled_proof_sell_package", _link)
     monkeypatch.setattr(worker_module, "execute_automatic_ready_package_through_activation", _async_return(AutomaticPackageExecutionOutcome(package_id=package_id, campaign_id=proof.campaign_id, campaign_version=1, decision_record_id=uuid.uuid4(), mandate_id=evaluation.mandate_id, authorization_state="AUTHORIZED", dry_run_state="NOT_RUN", activation_state="NOT_ACTIVATED", authority_source="MANDATE", replayed=False, final_reason_code="test", failed_closed=True, starting_state="READY")))
 
-    await worker_module._attempt_operator_controlled_proof_entry(db=_FakeDB(), recovery_id=recovery.recovery_id)
+    class _MandateBoundaryDB(_FakeDB):
+        async def scalar(self, _statement):
+            return recovery
+
+    db = _MandateBoundaryDB()
+    await worker_module._attempt_operator_controlled_proof_entry(db=db, recovery_id=recovery.recovery_id)
 
     request = captured["request"]
     assert request.forced_action == "CLOSE_POSITION_PROPOSED"
+    assert captured["package_create_calls"] == 1
     assert request.commissioning_entry_mode == "controlled_proof"
     assert request.controlled_proof_exit_recovery_id == recovery.recovery_id
     assert captured["decision_request"]["controlled_proof_exit_recovery_id"] == recovery.recovery_id
@@ -5484,6 +5544,62 @@ async def test_exit_recovery_enters_existing_pipeline_as_sell_only(monkeypatch: 
     assert captured["preserve"] is True
     assert proof.status == "BLOCKED"
     assert proof.terminal_verdict == "FAILED"
+    assert not any(isinstance(item, (AutonomousExecutionClaim, LiveCryptoOrder)) for item in db.added)
+
+
+@pytest.mark.asyncio
+async def test_exit_recovery_rejects_superseded_pinned_mandate_version(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import app.services.orchestration.continuous_pipeline_worker as worker_module
+    from app.services.controlled_proof import ControlledProofRiskOutcome
+
+    pinned_version_id = uuid.uuid4()
+    current_authoritative_version_id = uuid.uuid4()
+    proof = SimpleNamespace(
+        proof_id=uuid.uuid4(), status="BLOCKED", terminal_verdict="FAILED",
+        package_id=uuid.uuid4(), sell_package_id=None, campaign_id=uuid.uuid4(), campaign_version=1,
+        provider="kraken_spot", environment="production", product_id="BTC-USD",
+        max_notional_usd=Decimal("5"), audit_correlation_id=uuid.uuid4(),
+        mandate_version_id=pinned_version_id,
+    )
+    recovery = SimpleNamespace(recovery_id=uuid.uuid4(), status="IN_PROGRESS")
+    blocked: list[str] = []
+
+    monkeypatch.setattr(worker_module, "claim_exit_recovery_by_id", _async_return((recovery, proof)))
+    monkeypatch.setattr(worker_module, "should_propose_controlled_sell", _async_return(True))
+    monkeypatch.setattr(worker_module, "_load_runtime_campaign", _async_return(SimpleNamespace(paper_account_id=uuid.uuid4())))
+    monkeypatch.setattr(worker_module, "_load_live_trading_profile_for_paper_account", _async_return(SimpleNamespace(id=uuid.uuid4())))
+    monkeypatch.setattr(worker_module, "_has_open_live_order", _async_return(False))
+    monkeypatch.setattr(worker_module, "_has_unresolved_reconciliation", _async_return(False))
+    monkeypatch.setattr(worker_module, "evaluate_controlled_proof_risk", _async_return(ControlledProofRiskOutcome(verdict="ALLOW", approved_notional_usd=Decimal("5"), reason_code=None, risk_event_id=uuid.uuid4())))
+    monkeypatch.setattr(worker_module, "get_settings", lambda: SimpleNamespace(controlled_proof_mandate_id=uuid.uuid4()))
+    monkeypatch.setattr(worker_module, "compute_controlled_proof_open_exposure_usd", _async_return(Decimal("5.0049")))
+    monkeypatch.setattr(worker_module, "resolve_controlled_proof_strategy_identity", _async_return("ma_crossover@1.0.0"))
+    monkeypatch.setattr(worker_module, "create_controlled_proof_decision_record", _async_return(uuid.uuid4()))
+    monkeypatch.setattr(
+        worker_module, "evaluate_and_record_mandate",
+        _async_return(SimpleNamespace(
+            authorization_result="AUTHORIZED", mandate_id=uuid.uuid4(),
+            mandate_version_id=current_authoritative_version_id, evaluation_id=uuid.uuid4(),
+            reason_code="authorized_under_active_mandate", checks_failed=(),
+        )),
+    )
+    async def _unexpected_package(**_kwargs):
+        raise AssertionError("superseded recovery version must not create a package")
+    async def _record_block(*, db, recovery, reason):
+        blocked.append(reason)
+        recovery.status = "BLOCKED"
+    monkeypatch.setattr(worker_module, "create_canonical_preview_package", _unexpected_package)
+    monkeypatch.setattr(worker_module, "block_exit_recovery", _record_block)
+
+    await worker_module._attempt_operator_controlled_proof_entry(
+        db=_FakeDB(), recovery_id=recovery.recovery_id,
+    )
+
+    assert pinned_version_id != current_authoritative_version_id
+    assert blocked == ["controlled_proof_mandate_not_authorized"]
+    assert recovery.status == "BLOCKED"
 
 
 @pytest.mark.asyncio
@@ -5569,6 +5685,7 @@ async def test_exit_recovery_package_failure_rolls_back_and_blocks_cleanly(
     monkeypatch.setattr(worker_module, "resolve_controlled_proof_strategy_identity", _async_return("ma_crossover@1.0.0"))
     monkeypatch.setattr(worker_module, "create_controlled_proof_decision_record", _async_return(uuid.uuid4()))
     evaluation = SimpleNamespace(authorization_result="AUTHORIZED", mandate_id=uuid.uuid4(), mandate_version_id=uuid.uuid4(), evaluation_id=uuid.uuid4())
+    proof.mandate_version_id = evaluation.mandate_version_id
     monkeypatch.setattr(worker_module, "evaluate_and_record_mandate", _async_return(evaluation))
 
     async def _insert_fails(**_kwargs):
@@ -5636,6 +5753,7 @@ async def test_exit_recovery_sell_package_link_dbapi_error_logs_full_diagnostics
     monkeypatch.setattr(worker_module, "resolve_controlled_proof_strategy_identity", _async_return("ma_crossover@1.0.0"))
     monkeypatch.setattr(worker_module, "create_controlled_proof_decision_record", _async_return(uuid.uuid4()))
     evaluation = SimpleNamespace(authorization_result="AUTHORIZED", mandate_id=uuid.uuid4(), mandate_version_id=uuid.uuid4(), evaluation_id=uuid.uuid4())
+    proof.mandate_version_id = evaluation.mandate_version_id
     monkeypatch.setattr(worker_module, "evaluate_and_record_mandate", _async_return(evaluation))
 
     async def _create(*, db, request):

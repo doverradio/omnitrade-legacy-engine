@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
-from dataclasses import replace
+from dataclasses import fields, replace
 from decimal import Decimal
 from types import SimpleNamespace
 from uuid import UUID, uuid4
@@ -509,8 +509,8 @@ async def test_controlled_proof_mode_forces_sell_when_requested(monkeypatch: pyt
     preview = _preview(package_id=package_id)
     preview.side = "SELL"
     preview.quote_size = None
-    preview.base_size = Decimal("0.00005")
-    preview.estimated_base_size = Decimal("0.00005")
+    preview.base_size = Decimal("0.00007708")
+    preview.estimated_base_size = Decimal("0.00007708")
     strategy = SimpleNamespace(id=preview.strategy_id, module_version="strategy-v9")
     parameter_set = SimpleNamespace(id=preview.parameter_set_id, label="ps-v3")
     cycle = _cycle(proposed_action="HOLD", termination_stage="hold_no_package_created")
@@ -541,13 +541,15 @@ async def test_controlled_proof_mode_forces_sell_when_requested(monkeypatch: pyt
     # tests/unit/services/live/test_position_quantity.py); this test is
     # about package-creation plumbing, so it fixes the resolved quantity
     # the same way it already fixes every other collaborator above.
-    monkeypatch.setattr(cpp, "compute_controlled_proof_owned_quantity", _async_return(Decimal("0.00005")))
+    monkeypatch.setattr(cpp, "compute_controlled_proof_owned_quantity", _async_return(Decimal("0.00007708")))
 
     db = _FakeDb(scalar_values=[1, strategy, parameter_set])
     result = await cpp.create_canonical_preview_package(db=db, request=request)
 
     assert result["package"]["package_state"] == "READY"
     assert result["package"]["side"] == "SELL"
+    assert preview.base_size == Decimal("0.00007708")
+    assert preview.estimated_base_size == Decimal("0.00007708")
     assert result["package"]["entry_reason"] == "CONTROLLED_PROOF"
     assert result["package"]["market_evidence_identity"]["controlled_proof_id"] == str(proof_id)
 
@@ -1773,6 +1775,11 @@ async def test_controlled_proof_forced_sell_decision_record_reports_sell_action(
         forced_action="CLOSE_POSITION_PROPOSED",
         controlled_proof_id=proof_id,
     )
+    # A caller can supply only a quote-denominated maximum; it cannot supply
+    # a SELL base size.  Make that input deliberately much larger than the
+    # proof's position to prove it cannot influence canonical SELL sizing.
+    request = replace(request, max_proposed_order_amount=Decimal("500"))
+    assert "base_size" not in {field.name for field in fields(type(request))}
 
     captured: dict[str, object] = {}
 
@@ -1784,7 +1791,12 @@ async def test_controlled_proof_forced_sell_decision_record_reports_sell_action(
         return SimpleNamespace(crypto_order_preview_id=preview_id)
 
     monkeypatch.setattr(cpp, "_load_exchange_connection_for_scope", _async_return(SimpleNamespace(exchange_connection_id=uuid4())))
-    monkeypatch.setattr(cpp, "compute_controlled_proof_owned_quantity", _async_return(Decimal("0.05")))
+    verified_remaining_owned_quantity = Decimal("0.00007708")
+    monkeypatch.setattr(
+        cpp,
+        "compute_controlled_proof_owned_quantity",
+        _async_return(verified_remaining_owned_quantity),
+    )
     monkeypatch.setattr(cpp, "_resolve_strategy_and_parameter_binding", _async_return((strategy, parameter_set)))
     monkeypatch.setattr(cpp, "create_crypto_order_preview", _create_sell_preview)
     monkeypatch.setattr(cpp, "_load_preview_by_id", _async_return(preview))
@@ -1798,7 +1810,7 @@ async def test_controlled_proof_forced_sell_decision_record_reports_sell_action(
     assert captured == {
         "side": "SELL",
         "quote_size": None,
-        "base_size": Decimal("0.05"),
+        "base_size": verified_remaining_owned_quantity,
         "actor": "operator:human",
     }
 

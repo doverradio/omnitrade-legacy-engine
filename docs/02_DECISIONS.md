@@ -639,6 +639,18 @@ AUTHORIZED/IN_PROGRESS rows. GET returns the newest recovery by
 `authorized_at`; replay remains key-specific. Future terminal transitions set
 `completed_at`, but the legacy row is neither rewritten nor reactivated.
 
+Production replacement recovery `31a927a6-f7ea-4ea2-9966-426bfe659b64`
+established that continuing-exit identity alone was insufficient: the
+CONTROLLED_PROOF-specific open-exposure check still rejected a SELL when the
+existing fill-value exposure was slightly above its $5 entry cap. A SELL does
+not deploy or increment exposure, so that predicate evaluates zero for SELL;
+BUY remains `existing controlled-proof exposure + proposed BUY notional`.
+This is not an exposure-limit waiver for entry. Both failed recoveries remain
+immutable terminal evidence and Proof #3 remains a recovery/hardening proof.
+The SELL comparison is explicitly incremental (`0 <= cap`), while canonical
+preview sizing separately binds `base_size` to the verified proof-owned
+quantity. It is therefore neither `existing + 0` nor an unbounded SELL.
+
 ### BLOCKED Proofs May Receive Exposure-Conditional SELL-Only Recovery Authority
 
 Decision

@@ -72,6 +72,13 @@ Preserve the historical recovery's pre-fix `completed_at=null` as immutable
 legacy evidence. It remains unclaimable and does not block a different-key
 replacement because only AUTHORIZED/IN_PROGRESS rows are unique per proof.
 
+The first replacement (`31a927a6-f7ea-4ea2-9966-426bfe659b64`) is also
+terminal BLOCKED and must not be replayed. Continuing recovery context reached
+mandate evaluation, but `controlled_proof_open_exposure_limit` still treated
+already-owned fill-value exposure as an entry violation during SELL. The local
+correction treats SELL as zero incremental exposure while preserving the full
+BUY calculation. A third recovery is prohibited until review and deployment.
+
 The external reconciliation investigation is complete.
 
 The PACKAGE_ONLY SELL progression defect has been repaired,

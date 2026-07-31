@@ -172,6 +172,21 @@ index excludes it, so it cannot prevent one different-key replacement.
 Dispatch logs use `controlled_proof_exit_recovery_dispatch_finished` with the
 actual outcome instead of reporting unconditional completion.
 
+Deployment `c8c93ab75b4048ceca5e2fc7c2eec6b3670b5dae` proved recovery context
+reached mandate evaluation, but replacement recovery
+`31a927a6-f7ea-4ea2-9966-426bfe659b64` still blocked before package creation.
+The remaining predicate was `controlled_proof_open_exposure_limit`: it compared
+the already-owned fill-value exposure (slightly above the $5 entry cap after
+fill precision) against the entry cap even for SELL. CONTROLLED_PROOF SELL now
+contributes zero deployed/incremental exposure to that check; BUY continues to
+use existing exposure plus proposed notional. Both production recoveries remain
+terminal BLOCKED and must never be replayed.
+Precisely, BUY compares `existing_exposure + proposed_buy_notional` with the
+cap; SELL compares incremental exposure `0` with the cap. SELL base quantity is
+not inferred from that USD check: canonical preview creation independently sets
+it to the exact lineage-derived proof-owned quantity, preventing an oversized
+close.
+
 Production Flow
 
 1. Operator authorizes Exit Recovery via authenticated API.

@@ -100,7 +100,11 @@ def _install_no_op_completion_refresh(monkeypatch: pytest.MonkeyPatch) -> None:
     async def _refresh(*, db, recovery, proof):
         return None
 
+    async def _view(*, db, proof_id):
+        return {}
+
     monkeypatch.setattr(worker, "refresh_exit_recovery_completion", _refresh)
+    monkeypatch.setattr(worker, "get_controlled_proof_view", _view)
 
 
 @pytest.mark.asyncio
@@ -313,7 +317,7 @@ async def test_unsuccessful_dispatch_never_touches_ordinary_non_recovery_proof(m
 
 
 def _install_fresh_sell_package_creation_pipeline(
-    monkeypatch: pytest.MonkeyPatch, *, new_package_id: uuid.UUID,
+    monkeypatch: pytest.MonkeyPatch, *, new_package_id: uuid.UUID, mandate_version_id: uuid.UUID,
 ) -> list[int]:
     """Stubs every stage between 'a fresh SELL package must be created' and
     create_canonical_preview_package itself, so the real,
@@ -357,7 +361,7 @@ def _install_fresh_sell_package_creation_pipeline(
     async def _mandate_authorized(*, db, request):
         return SimpleNamespace(
             authorization_result="AUTHORIZED", mandate_id=uuid.uuid4(),
-            mandate_version_id=uuid.uuid4(), evaluation_id=uuid.uuid4(),
+            mandate_version_id=mandate_version_id, evaluation_id=uuid.uuid4(),
         )
 
     async def _create_package_spy(*, db, request):
@@ -402,6 +406,7 @@ async def test_expired_preview_sell_package_is_superseded_and_exactly_one_fresh_
         proof, stale_package = await _seed_expired_proof_with_preexisting_sell_package(
             session, sell_preview_expires_at=datetime.now(timezone.utc) - timedelta(minutes=1),
         )
+        proof.mandate_version_id = stale_package.mandate_version_id
         recovery = ControlledProofExitRecovery(
             recovery_id=uuid.uuid4(), proof_id=proof.proof_id, status="IN_PROGRESS",
             idempotency_key=f"idem-{uuid.uuid4()}", authorized_by="operator:alice",
@@ -431,7 +436,10 @@ async def test_expired_preview_sell_package_is_superseded_and_exactly_one_fresh_
         session.add(new_package)
         await session.flush()
 
-        create_calls = _install_fresh_sell_package_creation_pipeline(monkeypatch, new_package_id=new_package_id)
+        create_calls = _install_fresh_sell_package_creation_pipeline(
+            monkeypatch, new_package_id=new_package_id,
+            mandate_version_id=proof.mandate_version_id,
+        )
 
         await worker._attempt_operator_controlled_proof_entry(db=session, recovery_id=recovery.recovery_id)
 

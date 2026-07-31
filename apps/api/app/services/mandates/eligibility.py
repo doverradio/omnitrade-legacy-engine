@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from decimal import Decimal
+
 from app.services.mandates.contracts import (
     AUTONOMY_LEVEL_2,
     MANDATE_AUTHORIZATION_ALLOWED,
@@ -38,7 +40,11 @@ def evaluate_mandate_eligibility(
     # unchanged.
     daily_deployment_check = (
         ("controlled_proof_open_exposure_limit",
-         request.controlled_proof_open_exposure_usd + capital_increase_usd <= version.max_open_exposure_usd,
+         (
+             request.controlled_proof_open_exposure_usd + capital_increase_usd
+             if request.side == "BUY"
+             else Decimal("0")
+         ) <= version.max_open_exposure_usd,
          "controlled_proof_open_exposure_exceeds_mandate_limit")
         if mandate.purpose == MANDATE_PURPOSE_CONTROLLED_PROOF
         else ("daily_deployment_limit",

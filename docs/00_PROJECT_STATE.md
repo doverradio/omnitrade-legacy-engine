@@ -326,6 +326,15 @@ terminal anomaly, not an active state. New BLOCKED/EXPIRED transitions record
 `completed_at`; replacement authorization is permitted because per-proof
 uniqueness covers only AUTHORIZED/IN_PROGRESS recoveries.
 
+Replacement recovery `31a927a6-f7ea-4ea2-9966-426bfe659b64` under deployed
+commit `c8c93ab75b4048ceca5e2fc7c2eec6b3670b5dae` again passed ownership, SELL
+eligibility, and Risk ALLOW, then blocked before package creation. Terminal
+timestamps were truthful. The missed production predicate was the
+CONTROLLED_PROOF open-exposure entry cap being applied to already-owned
+exposure during SELL. The correction makes SELL incremental exposure zero;
+BUY behavior is unchanged. Both recovery IDs remain terminal and Proof #3
+remains outside the clean streak (0 of 5).
+
 Production proving has advanced beyond the external reconciliation
 investigation.
 

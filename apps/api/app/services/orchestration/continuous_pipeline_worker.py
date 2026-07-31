@@ -2210,7 +2210,20 @@ async def _attempt_operator_controlled_proof_entry(
                 controlled_proof_exit_recovery_id=None if recovery is None else recovery.recovery_id,
             ),
         )
-        if evaluation.authorization_result != "AUTHORIZED":
+        pinned_recovery_version_matches = (
+            recovery is None
+            or (
+                getattr(proof, "mandate_version_id", None) is not None
+                and evaluation.mandate_version_id == proof.mandate_version_id
+            )
+        )
+        if evaluation.authorization_result != "AUTHORIZED" or not pinned_recovery_version_matches:
+            logger.info(
+                "controlled_proof_mandate_rejected proof_id=%s recovery_id=%s side=%s reason_code=%s checks_failed=%s pinned_version_matches=%s",
+                proof.proof_id, None if recovery is None else recovery.recovery_id,
+                side, getattr(evaluation, "reason_code", None),
+                getattr(evaluation, "checks_failed", ()), pinned_recovery_version_matches,
+            )
             await _record_block("controlled_proof_mandate_not_authorized")
             await db.commit()
             return

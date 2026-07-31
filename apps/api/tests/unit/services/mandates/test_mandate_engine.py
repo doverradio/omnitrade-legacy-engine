@@ -4,6 +4,8 @@ from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 import uuid
 
+import pytest
+
 from app.services.mandates.contracts import (
     AUTONOMY_LEVEL_1,
     AUTONOMY_LEVEL_2,
@@ -134,7 +136,23 @@ def test_verified_continuing_exit_authority_allows_only_sell_under_expired_contr
         **_request(mandate).__dict__, "side": "SELL",
         "expected_mandate_purpose": "CONTROLLED_PROOF",
         "continuing_exit_authority": True,
+        "controlled_proof_open_exposure_usd": Decimal("5.0049"),
     })
+
+    pre_fix_left_hand_value = (
+        request.controlled_proof_open_exposure_usd
+        + (request.proposed_notional_usd if request.side == "BUY" else Decimal("0"))
+    )
+    post_fix_left_hand_value = (
+        request.controlled_proof_open_exposure_usd
+        + (request.proposed_notional_usd if request.side == "BUY" else Decimal("0"))
+        if request.side == "BUY"
+        else Decimal("0")
+    )
+    assert pre_fix_left_hand_value == Decimal("5.0049")
+    assert pre_fix_left_hand_value > Decimal("5")
+    assert post_fix_left_hand_value == Decimal("0")
+    assert post_fix_left_hand_value <= Decimal("5")
 
     decision = evaluate_mandate_eligibility(
         mandate=mandate, version=_version(is_active=False), request=request,
@@ -144,6 +162,28 @@ def test_verified_continuing_exit_authority_allows_only_sell_under_expired_contr
     assert "mandate_status" in decision.passed_checks
     assert "mandate_not_expired" in decision.passed_checks
     assert "version_active" in decision.passed_checks
+    assert "controlled_proof_open_exposure_limit" in decision.passed_checks
+
+
+def test_production_shaped_controlled_proof_sell_without_recovery_still_rejects_expired_mandate() -> None:
+    base = _mandate(status="EXPIRED")
+    mandate = MandateDomainModel(**{
+        **base.__dict__, "purpose": "CONTROLLED_PROOF",
+        "expires_at": _NOW - timedelta(seconds=1),
+    })
+    request = MandateEligibilityInput(**{
+        **_request(mandate).__dict__, "side": "SELL",
+        "expected_mandate_purpose": "CONTROLLED_PROOF",
+        "controlled_proof_open_exposure_usd": Decimal("5.0049"),
+        "continuing_exit_authority": False,
+    })
+
+    decision = evaluate_mandate_eligibility(
+        mandate=mandate, version=_version(is_active=False), request=request,
+    )
+
+    assert decision.result == "REJECTED"
+    assert decision.reason_code == "mandate_not_active"
 
 
 def test_continuing_exit_authority_never_authorizes_buy() -> None:
@@ -181,6 +221,34 @@ def test_continuing_exit_authority_does_not_override_revocation_or_unrelated_man
 
     assert decision.result == "REJECTED"
     assert any("mandate_revoked_or_killed" in item for item in decision.deterministic_explanation)
+
+
+@pytest.mark.parametrize("authorization_state", ["UNAUTHORIZED", "AUTHORIZATION_REVOKED"])
+def test_continuing_exit_authority_requires_current_version_authorization(
+    authorization_state: str,
+) -> None:
+    """Both a never-authorized version and a version whose authorization row
+    was revoked reach eligibility as is_authorized=False. Exit authority may
+    reinterpret expiry, but never this version-authorization predicate."""
+    base = _mandate(status="EXPIRED")
+    mandate = MandateDomainModel(**{
+        **base.__dict__, "purpose": "CONTROLLED_PROOF",
+        "expires_at": _NOW - timedelta(seconds=1),
+    })
+    request = MandateEligibilityInput(**{
+        **_request(mandate).__dict__, "side": "SELL",
+        "expected_mandate_purpose": "CONTROLLED_PROOF",
+        "continuing_exit_authority": True,
+    })
+
+    decision = evaluate_mandate_eligibility(
+        mandate=mandate, version=_version(is_authorized=False, is_active=False), request=request,
+    )
+
+    assert authorization_state in {"UNAUTHORIZED", "AUTHORIZATION_REVOKED"}
+    assert decision.result == "REJECTED"
+    assert decision.reason_code == "mandate_version_not_authorized"
+    assert "version_authorized" in decision.failed_checks
 
 
 def test_invalid_mandate_version_rejected_by_validation_service() -> None:

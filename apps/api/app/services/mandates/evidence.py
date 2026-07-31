@@ -59,6 +59,24 @@ class MandateEvaluationWriteRequest:
     controlled_proof_exit_recovery_id: uuid.UUID | None = None
 
 
+async def _has_continuing_exit_authority(
+    *, db: AsyncSession, request: MandateEvaluationWriteRequest,
+) -> bool:
+    if request.controlled_proof_exit_recovery_id is None:
+        return False
+    recovery = await db.scalar(select(ControlledProofExitRecovery).where(
+        ControlledProofExitRecovery.recovery_id == request.controlled_proof_exit_recovery_id,
+        ControlledProofExitRecovery.proof_id == request.controlled_proof_id,
+        ControlledProofExitRecovery.status == "IN_PROGRESS",
+        ControlledProofExitRecovery.expires_at > request.observed_at,
+    ).limit(1))
+    return bool(
+        recovery is not None
+        and request.side == "SELL"
+        and request.expected_mandate_purpose == "CONTROLLED_PROOF"
+    )
+
+
 async def evaluate_and_record_mandate(
     *,
     db: AsyncSession,
@@ -98,19 +116,7 @@ async def evaluate_and_record_mandate(
     mandate = await get_mandate(db=db, mandate_id=request.mandate_id)
     version, is_authorized = await _resolve_version_for_evaluation(db=db, mandate_id=mandate.mandate_id)
 
-    continuing_exit_authority = False
-    if request.controlled_proof_exit_recovery_id is not None:
-        recovery = await db.scalar(select(ControlledProofExitRecovery).where(
-            ControlledProofExitRecovery.recovery_id == request.controlled_proof_exit_recovery_id,
-            ControlledProofExitRecovery.proof_id == request.controlled_proof_id,
-            ControlledProofExitRecovery.status == "IN_PROGRESS",
-            ControlledProofExitRecovery.expires_at > request.observed_at,
-        ).limit(1))
-        continuing_exit_authority = bool(
-            recovery is not None
-            and request.side == "SELL"
-            and request.expected_mandate_purpose == "CONTROLLED_PROOF"
-        )
+    continuing_exit_authority = await _has_continuing_exit_authority(db=db, request=request)
 
     domain_mandate = _to_mandate_domain(mandate)
     domain_version = _to_version_domain(version=version, mandate=mandate, is_authorized=is_authorized)
