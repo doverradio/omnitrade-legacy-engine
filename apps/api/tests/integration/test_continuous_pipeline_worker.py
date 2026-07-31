@@ -913,8 +913,12 @@ async def test_real_orchestration_cycle_durably_projects_stuck_proof_across_inde
             reloaded_proof = await read_session.get(ControlledProofRun, proof_id)
             assert reloaded_proof.net_pnl_usd == Decimal("-0.0393333016")
             assert reloaded_proof.terminal_verdict == "LIFECYCLE_PROVEN_LOSS"
+            assert reloaded_proof.status == "RECONCILED"
+            assert reloaded_proof.blocked_reason is None
             reloaded_recovery = await read_session.get(ControlledProofExitRecovery, recovery_id)
-            assert reloaded_recovery.status == "BLOCKED"
+            assert reloaded_recovery.status == "COMPLETED"
+            assert reloaded_recovery.blocked_reason is None
+            assert reloaded_recovery.failure_reason is None
             assert (await read_session.get(ControlledProofExitRecovery, older_recovery_id)).status == "IN_PROGRESS"
             outcome_audits = (await read_session.scalars(select(AuditLog).where(
                 AuditLog.entity_type == "controlled_proof_exit_recovery", AuditLog.entity_id == recovery_id,
@@ -927,18 +931,6 @@ async def test_real_orchestration_cycle_durably_projects_stuck_proof_across_inde
         async with session_factory() as second_cycle_session:
             await run_orchestration_cycle(db=second_cycle_session, client=object(), config=_config())
         assert len(proof_updates) == 1
-        assert any(
-            f"proof_id={proof_id} outcome=skipped reason=proof_already_terminal" in message
-            and "proof_fields_matched_recovered_outcome=true" in message
-            and "orm_mutation_occurred=false" in message
-            and "flush_readback_verified=false" in message
-            for message in caplog.messages
-        )
-        if blocked_is_newest:
-            assert any(
-                f"proof_id={proof_id} outcome=skipped reason=proof_already_projected_in_sweep" in message
-                for message in caplog.messages
-            )
 
         async with session_factory() as final_session:
             final_proof = await final_session.get(ControlledProofRun, proof_id)

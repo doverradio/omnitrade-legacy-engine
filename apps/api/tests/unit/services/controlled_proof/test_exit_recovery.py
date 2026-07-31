@@ -469,6 +469,214 @@ async def test_blocked_recovery_two_provider_submitted_sell_lineages_fail_closed
 
 
 @pytest.mark.asyncio
+async def test_blocked_recovery_completion_persists_atomically_across_fresh_session(monkeypatch) -> None:
+    campaign_id, proof_id, recovery_id = uuid.uuid4(), uuid.uuid4(), uuid.uuid4()
+    profile_id, package_id = uuid.uuid4(), uuid.uuid4()
+    buy_order_id, sell_order_id = uuid.uuid4(), uuid.uuid4()
+    reconciliation_id = uuid.uuid4()
+    completion_time = datetime(2026, 7, 31, 7, 24, 2, tzinfo=timezone.utc)
+
+    monkeypatch.setattr(exit_recovery, "has_unresolved_reconciliation", lambda **_kwargs: _async_false())
+    monkeypatch.setattr(exit_recovery, "_load_scope", lambda *_args, **_kwargs: _async((SimpleNamespace(id=7), profile_id)))
+    monkeypatch.setattr(exit_recovery, "compute_signed_owned_quantity", lambda **_kwargs: _async(Decimal("0")))
+    monkeypatch.setattr(exit_recovery, "_utcnow", lambda: completion_time)
+
+    async with real_sqlite_session_factory(_RECOVERY_ALL_TABLES) as session_factory:
+        async with session_factory() as session:
+            proof = ControlledProofRun(
+                proof_id=proof_id, status="BLOCKED", provider="kraken_spot", environment="production",
+                campaign_id=campaign_id, campaign_version=1, product_id="BTC-USD",
+                max_notional_usd=Decimal("5"), idempotency_key=f"proof-{uuid.uuid4()}",
+                requested_by="operator:alice", expires_at=completion_time - timedelta(hours=1),
+                package_id=uuid.uuid4(), sell_package_id=package_id,
+                buy_live_crypto_order_id=buy_order_id, sell_live_crypto_order_id=sell_order_id,
+                blocked_reason="controlled_proof_mandate_not_authorized",
+                net_pnl_usd=None, terminal_verdict="BLOCKED",
+            )
+            recovery = ControlledProofExitRecovery(
+                recovery_id=recovery_id, proof_id=proof_id, status="BLOCKED",
+                idempotency_key=f"recovery-{uuid.uuid4()}", authorized_by="operator:alice",
+                authorized_at=completion_time - timedelta(hours=1), expires_at=completion_time - timedelta(minutes=10),
+                claimed_at=completion_time - timedelta(minutes=30),
+                completed_at=completion_time - timedelta(minutes=22),
+                blocked_reason="stale_sell_package_replacement_blocked:Stale SELL package has unresolved execution lineage",
+                failure_reason=None, audit_correlation_id=uuid.uuid4(),
+            )
+            package = CanonicalPreviewPackage(
+                package_id=package_id, campaign_id=campaign_id, campaign_version=1,
+                runtime_campaign_id=uuid.uuid4(), paper_account_id=uuid.uuid4(), live_trading_profile_id=profile_id,
+                provider="kraken_spot", environment="production", product="BTC-USD", side="SELL",
+                proposed_order_amount=Decimal("5"), risk_approved_amount=Decimal("5"),
+                strategy_id=uuid.uuid4(), strategy_version="1.0.0", parameter_set_id=uuid.uuid4(), parameter_set_version="1",
+                decision_record_id=uuid.uuid4(), risk_event_id=uuid.uuid4(), crypto_order_preview_id=uuid.uuid4(),
+                preview_expires_at=completion_time, package_state="ACTIVATED", generated_at=completion_time - timedelta(minutes=40),
+                idempotency_key=f"package-{uuid.uuid4()}", input_fingerprint="fp",
+                market_evidence_identity={"controlled_proof_id": str(proof_id), "controlled_proof_exit_recovery_id": str(recovery_id)},
+            )
+            order = LiveCryptoOrder(
+                live_crypto_order_id=sell_order_id, crypto_order_preview_id=package.crypto_order_preview_id,
+                exchange_connection_id=uuid.uuid4(), provider="kraken_spot", environment="production",
+                product_id="BTC-USD", side="SELL", order_type="MARKET", requested_quote_size=Decimal("5"),
+                client_order_id=f"sell-{uuid.uuid4()}", status="FILLED", provider_order_id="ONJESU-CVFF3-TOIZEI",
+                submitted_at=completion_time - timedelta(minutes=28), filled_at=completion_time - timedelta(minutes=27),
+                audit_correlation_id=uuid.uuid4(),
+            )
+            claim = AutonomousExecutionClaim(
+                claim_id=uuid.uuid4(), package_id=package_id, activation_id=uuid.uuid4(),
+                campaign_id=campaign_id, campaign_version=1, mandate_id=uuid.uuid4(), mandate_version_id=uuid.uuid4(),
+                account_id=package.paper_account_id, profile_id=profile_id, connection_id=uuid.uuid4(),
+                provider="kraken_spot", environment="production", product="BTC-USD", side="SELL",
+                claim_status="COMPLETED", claimed_at=completion_time - timedelta(minutes=30), claim_owner="worker",
+                live_order_id=sell_order_id,
+            )
+            reconciliation = LiveReconciliationEvent(
+                id=reconciliation_id, idempotency_key=f"recon-{uuid.uuid4()}", event_hash=f"hash-{uuid.uuid4()}",
+                live_trading_profile_id=profile_id, live_crypto_order_id=sell_order_id, capital_campaign_id=7,
+                source_execution_event_id=uuid.uuid4(), source_execution_event_type="execution_intent_created",
+                sequence_number=1, event_type="fill_reconciled", reconciliation_status="filled",
+                provider_name="kraken_spot", provider_order_id=order.provider_order_id,
+                event_payload={}, provenance={}, immutable_contract_version="1", recorded_at=completion_time,
+            )
+            accounting = [
+                LiveAccountingRecord(
+                    idempotency_key=f"buy-{uuid.uuid4()}", live_trading_profile_id=profile_id, capital_campaign_id=7,
+                    live_crypto_order_id=buy_order_id, reconciliation_event_id=uuid.uuid4(),
+                    source_execution_event_id=uuid.uuid4(), source_execution_event_type="execution_intent_created",
+                    record_type="fill_accounting", provider_order_id="BUY-PROVIDER", provider_fill_id="buy-fill",
+                    symbol="BTC-USD", side="buy", filled_quantity=Decimal("0.00007708"), fill_price=Decimal("64930"),
+                    gross_notional=Decimal("5.0048044"), fee_amount=Decimal("0.04"), fee_currency="USD",
+                    net_cash_impact=Decimal("-5.0448044"), provenance={}, recorded_at=completion_time - timedelta(hours=1),
+                ),
+                LiveAccountingRecord(
+                    idempotency_key=f"sell-{uuid.uuid4()}", live_trading_profile_id=profile_id, capital_campaign_id=7,
+                    live_crypto_order_id=sell_order_id, reconciliation_event_id=reconciliation_id,
+                    source_execution_event_id=uuid.uuid4(), source_execution_event_type="execution_intent_created",
+                    record_type="fill_accounting", provider_order_id=order.provider_order_id, provider_fill_id="sell-fill",
+                    symbol="BTC-USD", side="sell", filled_quantity=Decimal("0.00007708"), fill_price=Decimal("64253.7"),
+                    gross_notional=Decimal("4.952628528"), fee_amount=Decimal("0.03958"), fee_currency="USD",
+                    net_cash_impact=Decimal("4.913048948"), provenance={}, recorded_at=completion_time,
+                ),
+            ]
+            session.add_all([proof, recovery, package, order, claim, reconciliation, *accounting])
+            await session.commit()
+            artifact_counts_before = {
+                "packages": len((await session.scalars(select(CanonicalPreviewPackage))).all()),
+                "claims": len((await session.scalars(select(AutonomousExecutionClaim))).all()),
+                "orders": len((await session.scalars(select(LiveCryptoOrder))).all()),
+                "reconciliations": len((await session.scalars(select(LiveReconciliationEvent))).all()),
+            }
+
+            assert await exit_recovery.project_blocked_exit_recovery_outcome(
+                db=session, recovery=recovery, proof=proof,
+            ) is True
+            await session.commit()
+
+        async with session_factory() as reload_session:
+            reloaded_recovery = await reload_session.get(ControlledProofExitRecovery, recovery_id)
+            reloaded_proof = await reload_session.get(ControlledProofRun, proof_id)
+            assert reloaded_recovery.status == "COMPLETED"
+            assert reloaded_recovery.completed_at.replace(tzinfo=timezone.utc) == completion_time
+            assert reloaded_recovery.blocked_reason is None
+            assert reloaded_recovery.failure_reason is None
+            assert reloaded_proof.status == "RECONCILED"
+            assert reloaded_proof.blocked_reason is None
+            assert reloaded_proof.failure_reason is None
+            assert reloaded_proof.net_pnl_usd == Decimal("-0.1317554520")
+            assert reloaded_proof.terminal_verdict == "LIFECYCLE_PROVEN_LOSS"
+            outcome_audits = (await reload_session.scalars(select(AuditLog).where(
+                AuditLog.entity_type == "controlled_proof_exit_recovery",
+                AuditLog.entity_id == recovery_id,
+                AuditLog.action == exit_recovery._RECOVERED_OUTCOME_ACTION,
+            ))).all()
+            assert len(outcome_audits) == 1
+            assert outcome_audits[0].before_state["status"] == "BLOCKED"
+            assert outcome_audits[0].before_state["blocked_reason"].startswith("stale_sell_package_replacement_blocked")
+            assert Decimal(outcome_audits[0].after_state["recovered_net_pnl_usd"]) == Decimal("-0.1317554520000")
+            assert artifact_counts_before == {
+                "packages": len((await reload_session.scalars(select(CanonicalPreviewPackage))).all()),
+                "claims": len((await reload_session.scalars(select(AutonomousExecutionClaim))).all()),
+                "orders": len((await reload_session.scalars(select(LiveCryptoOrder))).all()),
+                "reconciliations": len((await reload_session.scalars(select(LiveReconciliationEvent))).all()),
+            }
+
+
+@pytest.mark.asyncio
+async def test_existing_recovered_outcome_terminalizes_blocked_recovery_after_fresh_reload(monkeypatch) -> None:
+    """Exact deployed partial state: accounting/audit already projected, but
+    the owning recovery still carries its earlier BLOCKED row fields."""
+    proof_id, recovery_id, package_id, order_id = (
+        uuid.uuid4(), uuid.uuid4(), uuid.uuid4(), uuid.uuid4(),
+    )
+    outcome_completed_at = datetime(2026, 7, 31, 7, 24, 2, 894890, tzinfo=timezone.utc)
+    monkeypatch.setattr(
+        "app.services.controlled_proof.service.repair_controlled_proof_cached_order_ids",
+        lambda **_kwargs: _async_false(),
+    )
+    async with real_sqlite_session_factory(_RECOVERY_ALL_TABLES) as session_factory:
+        async with session_factory() as session:
+            session.add(ControlledProofRun(
+                proof_id=proof_id, status="BLOCKED", provider="kraken_spot", environment="production",
+                campaign_id=uuid.uuid4(), campaign_version=1, product_id="BTC-USD",
+                max_notional_usd=Decimal("5"), idempotency_key=f"proof-{uuid.uuid4()}", requested_by="operator:alice",
+                expires_at=outcome_completed_at - timedelta(hours=1), package_id=uuid.uuid4(),
+                sell_package_id=package_id, sell_live_crypto_order_id=order_id,
+                net_pnl_usd=Decimal("-0.1317554520000"), terminal_verdict="LIFECYCLE_PROVEN_LOSS",
+                blocked_reason="controlled_proof_mandate_not_authorized",
+            ))
+            session.add(ControlledProofExitRecovery(
+                recovery_id=recovery_id, proof_id=proof_id, status="BLOCKED",
+                idempotency_key=f"recovery-{uuid.uuid4()}", authorized_by="operator:alice",
+                authorized_at=outcome_completed_at - timedelta(hours=1), expires_at=outcome_completed_at - timedelta(minutes=10),
+                claimed_at=outcome_completed_at - timedelta(minutes=30),
+                completed_at=outcome_completed_at - timedelta(minutes=22),
+                blocked_reason="stale_sell_package_replacement_blocked:Stale SELL package has unresolved execution lineage",
+                failure_reason=None, audit_correlation_id=uuid.uuid4(),
+            ))
+            session.add(AuditLog(
+                actor="system:controlled_proof_reconciliation_projector", action=exit_recovery._RECOVERED_OUTCOME_ACTION,
+                entity_type="controlled_proof_exit_recovery", entity_id=recovery_id,
+                before_state={"status": "BLOCKED", "blocked_reason": "stale_sell_package_replacement_blocked"},
+                after_state={
+                    "status": "COMPLETED_RECONCILED", "original_recovery_id": str(recovery_id),
+                    "proof_id": str(proof_id), "sell_package_id": str(package_id),
+                    "sell_live_crypto_order_id": str(order_id), "provider_order_id": "ONJESU-CVFF3-TOIZEI",
+                    "execution_claim_id": str(uuid.uuid4()), "reconciliation_event_id": str(uuid.uuid4()),
+                    "recovered_terminal_verdict": "LIFECYCLE_PROVEN_LOSS",
+                    "recovered_net_pnl_usd": "-0.1317554520000",
+                    "completed_at": outcome_completed_at.isoformat(), "audit_correlation_id": str(uuid.uuid4()),
+                },
+            ))
+            await session.commit()
+            recovery = await session.get(ControlledProofExitRecovery, recovery_id)
+            proof = await session.get(ControlledProofRun, proof_id)
+            diagnostics: dict[str, object] = {}
+            assert await exit_recovery.project_blocked_exit_recovery_outcome(
+                db=session, recovery=recovery, proof=proof, diagnostics=diagnostics,
+            ) is True
+            assert diagnostics["reason"] == "terminal_state_repair_verified"
+            await session.commit()
+
+        async with session_factory() as reload_session:
+            reloaded = await reload_session.get(ControlledProofExitRecovery, recovery_id)
+            reloaded_proof = await reload_session.get(ControlledProofRun, proof_id)
+            assert reloaded.status == "COMPLETED"
+            assert reloaded.completed_at.replace(tzinfo=timezone.utc) == outcome_completed_at
+            assert reloaded.blocked_reason is None
+            assert reloaded.failure_reason is None
+            assert reloaded_proof.status == "RECONCILED"
+            assert reloaded_proof.blocked_reason is None
+            assert reloaded_proof.failure_reason is None
+            assert reloaded_proof.net_pnl_usd == Decimal("-0.1317554520000")
+            assert reloaded_proof.terminal_verdict == "LIFECYCLE_PROVEN_LOSS"
+            audits = (await reload_session.scalars(select(AuditLog).where(
+                AuditLog.entity_type == "controlled_proof_exit_recovery",
+                AuditLog.entity_id == recovery_id,
+                AuditLog.action == exit_recovery._RECOVERED_OUTCOME_ACTION,
+            ))).all()
+            assert len(audits) == 1
+
+
+@pytest.mark.asyncio
 async def test_existing_recovered_outcome_audit_backfills_null_proof_on_replay(monkeypatch) -> None:
     """Production upgrade case: the immutable recovered-outcome audit row
     already exists (an older deploy published it before proof
@@ -1711,7 +1919,8 @@ async def test_refresh_exit_recovery_outcomes_sweep_backfills_stuck_proof_from_r
         assert refreshed_proof.net_pnl_usd == Decimal("-0.0393333016409")
         assert refreshed_proof.terminal_verdict == "LIFECYCLE_PROVEN_LOSS"
         refreshed_recovery = await session.get(ControlledProofExitRecovery, recovery_id)
-        assert refreshed_recovery.status == "BLOCKED"
+        assert refreshed_recovery.status == "COMPLETED"
+        assert refreshed_recovery.blocked_reason is None
         outcome_audits = (await session.scalars(select(AuditLog).where(
             AuditLog.entity_type == "controlled_proof_exit_recovery", AuditLog.entity_id == recovery_id,
             AuditLog.action == exit_recovery._RECOVERED_OUTCOME_ACTION,
@@ -1837,7 +2046,8 @@ async def test_sweep_projects_expired_proof_with_stale_cache_column_via_real_lin
         assert refreshed_proof.net_pnl_usd == Decimal("-0.0393333016409")
         assert refreshed_proof.terminal_verdict == "LIFECYCLE_PROVEN_LOSS"
         refreshed_recovery = await session.get(ControlledProofExitRecovery, recovery_id)
-        assert refreshed_recovery.status == "BLOCKED"
+        assert refreshed_recovery.status == "COMPLETED"
+        assert refreshed_recovery.blocked_reason is None
         outcome_audits = (await session.scalars(select(AuditLog).where(
             AuditLog.entity_type == "controlled_proof_exit_recovery", AuditLog.entity_id == recovery_id,
             AuditLog.action == exit_recovery._RECOVERED_OUTCOME_ACTION,
@@ -1924,7 +2134,8 @@ async def test_sweep_projection_is_durably_committed_across_independent_sessions
             assert reloaded_proof.net_pnl_usd == Decimal("-0.0393333016")  # sqlite NUMERIC storage precision, not app logic
             assert reloaded_proof.terminal_verdict == "LIFECYCLE_PROVEN_LOSS"
             reloaded_recovery = await read_session.get(ControlledProofExitRecovery, recovery_id)
-            assert reloaded_recovery.status == "BLOCKED"
+            assert reloaded_recovery.status == "COMPLETED"
+            assert reloaded_recovery.blocked_reason is None
             outcome_audits = (await read_session.scalars(select(AuditLog).where(
                 AuditLog.entity_type == "controlled_proof_exit_recovery", AuditLog.entity_id == recovery_id,
                 AuditLog.action == exit_recovery._RECOVERED_OUTCOME_ACTION,
@@ -1977,6 +2188,7 @@ async def test_later_ordinary_view_cannot_overwrite_recovered_projection() -> No
                 db=session, recovery=recovery, proof=proof, diagnostics=diagnostics,
             )
             assert diagnostics["flush_readback_verified"] is True
+            await session.commit()
 
         async with session_factory() as later_writer_session:
             await get_controlled_proof_view(db=later_writer_session, proof_id=proof_id)
@@ -1985,14 +2197,14 @@ async def test_later_ordinary_view_cannot_overwrite_recovered_projection() -> No
             overwritten = await third_session.get(ControlledProofRun, proof_id)
             assert overwritten.net_pnl_usd == Decimal("-0.0393333016")
             assert overwritten.terminal_verdict == "LIFECYCLE_PROVEN_LOSS"
-            assert (await third_session.get(ControlledProofExitRecovery, recovery_id)).status == "BLOCKED"
+            assert (await third_session.get(ControlledProofExitRecovery, recovery_id)).status == "COMPLETED"
 
         # Replay remains a no-op.
         async with session_factory() as replay_session:
             replay_result = await exit_recovery.refresh_exit_recovery_outcomes(db=replay_session)
             await replay_session.commit()
             assert replay_result.projected == 0
-            assert replay_result.skipped == 1
+            assert replay_result.skipped == 0
             assert replay_result.failed == 0
 
         async with session_factory() as final_session:

@@ -1668,7 +1668,7 @@ async def get_controlled_proof_view(*, db: AsyncSession, proof_id: uuid.UUID) ->
         )
         .where(
             ControlledProofExitRecovery.proof_id == proof.proof_id,
-            ControlledProofExitRecovery.status == "BLOCKED",
+            ControlledProofExitRecovery.status.in_(("BLOCKED", "COMPLETED")),
             AuditLog.entity_type == "controlled_proof_exit_recovery",
             AuditLog.action == "controlled_proof_exit_recovery.recovered_outcome_published",
         )

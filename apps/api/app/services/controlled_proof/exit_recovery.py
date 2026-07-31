@@ -695,26 +695,58 @@ async def project_blocked_exit_recovery_outcome(
         if failed_check is not None:
             record(failed_check)
             return False
-        if proof.terminal_verdict in valid_verdicts:
-            try:
-                already_matched = (
-                    proof.net_pnl_usd is not None
-                    and _pnl_matches(
-                        proof.net_pnl_usd, Decimal(str(payload.get("recovered_net_pnl_usd"))),
-                        sqlite=isinstance(db, AsyncSession) and db.bind is not None and db.bind.dialect.name == "sqlite",
-                    )
-                    and proof.terminal_verdict == payload["recovered_terminal_verdict"]
-                )
-            except (TypeError, ArithmeticError, ValueError):
-                already_matched = False
-            record("proof_already_terminal", matched=already_matched)
+        try:
+            recovered_net_pnl = Decimal(str(payload.get("recovered_net_pnl_usd")))
+        except (TypeError, ArithmeticError, ValueError):
+            record("recovered_outcome_pnl_invalid")
             return False
-        if isinstance(payload, dict):
+        outcome_completed_at = _utcnow()
+        if payload.get("completed_at") is not None:
             try:
-                recovered_net_pnl = Decimal(str(payload.get("recovered_net_pnl_usd")))
-            except (TypeError, ArithmeticError, ValueError):
-                record("recovered_outcome_pnl_invalid")
+                outcome_completed_at = datetime.fromisoformat(str(payload["completed_at"]).replace("Z", "+00:00"))
+            except ValueError:
+                record("recovered_outcome_completed_at_invalid")
                 return False
+        recovery_mutated = (
+            locked.status != "COMPLETED"
+            or locked.blocked_reason is not None
+            or getattr(locked, "failure_reason", None) is not None
+            or locked.completed_at != outcome_completed_at
+        )
+        if recovery_mutated:
+            locked.status = "COMPLETED"
+            locked.completed_at = outcome_completed_at
+            locked.blocked_reason = None
+            locked.failure_reason = None
+            locked.updated_at = _utcnow()
+        proof_state_mutated = (
+            proof.status != "RECONCILED"
+            or getattr(proof, "blocked_reason", None) is not None
+            or getattr(proof, "failure_reason", None) is not None
+        )
+        if proof_state_mutated:
+            proof.status = "RECONCILED"
+            proof.blocked_reason = None
+            proof.failure_reason = None
+            proof.updated_at = _utcnow()
+        if recovery_mutated or proof_state_mutated:
+            await db.flush()
+        if proof.terminal_verdict in valid_verdicts:
+            already_matched = (
+                proof.net_pnl_usd is not None
+                and _pnl_matches(
+                    proof.net_pnl_usd, recovered_net_pnl,
+                    sqlite=isinstance(db, AsyncSession) and db.bind is not None and db.bind.dialect.name == "sqlite",
+                )
+                and proof.terminal_verdict == payload["recovered_terminal_verdict"]
+            )
+            record(
+                "terminal_state_repair_verified" if recovery_mutated or proof_state_mutated else "proof_already_terminal",
+                matched=already_matched, mutated=recovery_mutated or proof_state_mutated,
+                verified=recovery_mutated or proof_state_mutated,
+            )
+            return recovery_mutated or proof_state_mutated
+        if isinstance(payload, dict):
             proof.net_pnl_usd = recovered_net_pnl
             proof.terminal_verdict = payload["recovered_terminal_verdict"]
             proof.updated_at = _utcnow()
@@ -878,9 +910,12 @@ async def project_blocked_exit_recovery_outcome(
     # is already exhaustively verified by this point, and this whole
     # branch runs at most once (guarded by the existing-audit-row check
     # above) -- so overwrite the proof's own net_pnl_usd/terminal_verdict
-    # with the real recovered outcome now. proof.status is left untouched.
+    # with the real recovered outcome now and expose the reconciled terminal state.
     proof.net_pnl_usd = net_pnl
     proof.terminal_verdict = _recovered_verdict(net_pnl)
+    proof.status = "RECONCILED"
+    proof.blocked_reason = None
+    proof.failure_reason = None
     proof.updated_at = completed_at
     recovery_before_state = {
         "status": locked.status,
