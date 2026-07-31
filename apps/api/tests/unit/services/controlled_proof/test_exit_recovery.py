@@ -301,12 +301,12 @@ def _blocked_projection_fixture(*, net_pnl: Decimal = Decimal("0.17")):
         SimpleNamespace(
             live_crypto_order_id=buy_order_id, side="buy", symbol="BTC-USD",
             reconciliation_event_id=uuid.uuid4(), record_type="fill_accounting",
-            net_cash_impact=buy_cash,
+            provider_fill_id="buy-fill", fee_amount=Decimal("0.04"), net_cash_impact=buy_cash,
         ),
         SimpleNamespace(
             live_crypto_order_id=sell_order_id, side="sell", symbol="BTC-USD",
             reconciliation_event_id=reconciliation_id, record_type="fill_accounting",
-            net_cash_impact=-buy_cash + net_pnl,
+            provider_fill_id="sell-fill", fee_amount=Decimal("0.03997"), net_cash_impact=-buy_cash + net_pnl,
         ),
     ]
     return SimpleNamespace(
@@ -352,8 +352,9 @@ async def test_blocked_recovery_projects_separate_reconciled_outcome(
         db=db, recovery=item.recovery, proof=item.proof,
     ) is True
 
-    assert item.recovery.status == "BLOCKED"
-    assert item.recovery.blocked_reason == "stale_sell_package_replacement_blocked"
+    assert item.recovery.status == "COMPLETED"
+    assert item.recovery.completed_at == item.now
+    assert item.recovery.blocked_reason is None
     # The proof finalizes truthfully -- separately from the recovery's own
     # immutable BLOCKED row -- overwriting the stale "FAILED" verdict this
     # fixture seeds (matching the confirmed production shape: an EXPIRED
@@ -381,6 +382,90 @@ async def test_blocked_recovery_projects_separate_reconciled_outcome(
     # recomputes or re-applies the proof finalization a second time.
     assert item.proof.net_pnl_usd == net_pnl
     assert item.proof.terminal_verdict == verdict
+
+
+@pytest.mark.asyncio
+async def test_blocked_recovery_selects_only_provider_executed_sell_lineage(monkeypatch) -> None:
+    """Production shape: abandoned historical SELL packages coexist with one
+    later package whose claim reached a reconciled provider FILLED order."""
+    item = _blocked_projection_fixture(net_pnl=Decimal("-0.0393333016409"))
+    stale_package = SimpleNamespace(
+        **{
+            **item.package.__dict__, "package_id": uuid.uuid4(),
+            "market_evidence_identity": {
+                "controlled_proof_id": str(item.proof.proof_id),
+                "controlled_proof_exit_recovery_id": str(uuid.uuid4()),
+            },
+        }
+    )
+    item.proof.sell_package_id = stale_package.package_id
+    item.proof.sell_live_crypto_order_id = None
+    ownership_checks: list[Decimal] = []
+    db = _FakeDb(
+        [item.recovery, None, None, item.claim, item.order, item.reconciliation,
+         item.accounting_reconciliation],
+        [[stale_package, item.package], item.accounting],
+    )
+    monkeypatch.setattr(exit_recovery, "has_unresolved_reconciliation", lambda **_kwargs: _async_false())
+    monkeypatch.setattr(exit_recovery, "_load_scope", lambda *_args, **_kwargs: _async((SimpleNamespace(id=7), item.profile_id)))
+    async def _zero_ownership(**_kwargs):
+        ownership_checks.append(Decimal("0"))
+        return Decimal("0")
+    monkeypatch.setattr(exit_recovery, "compute_signed_owned_quantity", _zero_ownership)
+
+    diagnostics: dict[str, object] = {}
+    assert await exit_recovery.project_blocked_exit_recovery_outcome(
+        db=db, recovery=item.recovery, proof=item.proof, diagnostics=diagnostics,
+    ) is True
+    assert item.proof.sell_package_id == item.package.package_id
+    assert item.proof.sell_live_crypto_order_id == item.order.live_crypto_order_id
+    assert ownership_checks == [Decimal("0")]
+    assert item.reconciliation.reconciliation_status == "filled"
+    assert item.accounting_reconciliation.reconciliation_status == "filled"
+    from app.services.controlled_proof.service import _authoritative_fee_total
+    assert _authoritative_fee_total(item.accounting) == Decimal("0.07997")
+    assert item.proof.net_pnl_usd == Decimal("-0.0393333016409")
+    assert item.proof.terminal_verdict == "LIFECYCLE_PROVEN_LOSS"
+    assert item.recovery.status == "COMPLETED"
+    assert item.recovery.completed_at is not None
+    assert item.recovery.blocked_reason is None
+    assert item.recovery.failure_reason is None
+    assert diagnostics["reason"] == "projection_verified"
+    outcome_audits = [row for row in db.added if isinstance(row, AuditLog)]
+    assert len(outcome_audits) == 1
+    assert outcome_audits[0].before_state["status"] == "BLOCKED"
+    assert outcome_audits[0].before_state["blocked_reason"] == "stale_sell_package_replacement_blocked"
+    assert outcome_audits[0].after_state["status"] == "COMPLETED_RECONCILED"
+    assert outcome_audits[0].after_state["original_recovery_id"] == str(item.recovery.recovery_id)
+    assert outcome_audits[0].after_state["sell_package_id"] == str(item.package.package_id)
+    assert outcome_audits[0].after_state["sell_live_crypto_order_id"] == str(item.order.live_crypto_order_id)
+    assert not any(isinstance(row, (CanonicalPreviewPackage, AutonomousExecutionClaim, LiveCryptoOrder)) for row in db.added)
+
+
+@pytest.mark.asyncio
+async def test_blocked_recovery_two_provider_submitted_sell_lineages_fail_closed() -> None:
+    item = _blocked_projection_fixture()
+    competing_package = SimpleNamespace(**{**item.package.__dict__, "package_id": uuid.uuid4()})
+    competing_order = SimpleNamespace(**{
+        **item.order.__dict__, "live_crypto_order_id": uuid.uuid4(),
+        "provider_order_id": "KRAKEN-COMPETING-SELL",
+    })
+    competing_claim = SimpleNamespace(**{
+        **item.claim.__dict__, "claim_id": uuid.uuid4(),
+        "package_id": competing_package.package_id,
+        "live_order_id": competing_order.live_crypto_order_id,
+    })
+    db = _FakeDb(
+        [item.recovery, None, item.claim, item.order, competing_claim, competing_order],
+        [[item.package, competing_package]],
+    )
+    diagnostics: dict[str, object] = {}
+
+    assert await exit_recovery.project_blocked_exit_recovery_outcome(
+        db=db, recovery=item.recovery, proof=item.proof, diagnostics=diagnostics,
+    ) is False
+    assert diagnostics["reason"] == "canonical_authoritative_sell_lineage_ambiguous"
+    assert db.added == []
 
 
 @pytest.mark.asyncio

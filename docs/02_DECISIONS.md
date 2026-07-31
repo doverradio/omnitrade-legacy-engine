@@ -651,6 +651,20 @@ The SELL comparison is explicitly incremental (`0 <= cap`), while canonical
 preview sizing separately binds `base_size` to the verified proof-owned
 quantity. It is therefore neither `existing + 0` nor an unbounded SELL.
 
+### Completed Recovery Outcomes Select Provider-Executed SELL Lineage
+
+Immutable package history is not itself execution ambiguity. Post-fill
+recovery projection considers package-only, unclaimed, and unsubmitted SELL
+attempts historical; the authoritative candidate is the unique package whose
+claim links to a provider-identified SELL order. More than one such submitted
+lineage remains ambiguous and fails closed. A selected lineage must still have
+a completed claim, FILLED order, FILLED reconciliation, zero ownership, and
+complete BUY/SELL accounting before terminal P&L is published.
+On successful publication, `ControlledProofExitRecovery.status` becomes
+`COMPLETED`, `completed_at` records projection completion, and active
+`blocked_reason`/`failure_reason` are cleared. The audit `before_state`
+preserves the earlier BLOCKED classification and explanation.
+
 ### BLOCKED Proofs May Receive Exposure-Conditional SELL-Only Recovery Authority
 
 Decision

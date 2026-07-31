@@ -79,6 +79,17 @@ already-owned fill-value exposure as an entry violation during SELL. The local
 correction treats SELL as zero incremental exposure while preserving the full
 BUY calculation. A third recovery is prohibited until review and deployment.
 
+The third recovery (`825c2010-cad9-4de7-af0c-019f16a8e617`) was subsequently
+authorized after deployment and completed the real Kraken SELL
+`ONJESU-CVFF3-TOIZEI`. Provider and internal orders are FILLED, reconciliation
+completed, the claim is COMPLETED, and position is zero. Do not authorize any
+additional recovery or SELL. The remaining local fix is post-fill only:
+historical SELL packages caused `canonical_sell_package_match_count_invalid`
+before the sole provider-executed lineage could be selected and projected.
+The reviewed local correction makes the recovered current state `COMPLETED`
+and clears the stale blocker only after all reconciliation, accounting, and
+zero-ownership invariants pass; the old BLOCKED explanation remains audited.
+
 The external reconciliation investigation is complete.
 
 The PACKAGE_ONLY SELL progression defect has been repaired,

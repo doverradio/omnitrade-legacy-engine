@@ -741,20 +741,37 @@ async def project_blocked_exit_recovery_outcome(
     matches = [
         package for package in packages
         if str((package.market_evidence_identity or {}).get("controlled_proof_id")) == str(proof.proof_id)
-        and str((package.market_evidence_identity or {}).get("controlled_proof_exit_recovery_id")) == str(locked.recovery_id)
     ]
-    if len(matches) != 1:
-        record("canonical_sell_package_match_count_invalid")
+    # Package history is immutable and may contain several abandoned or
+    # superseded recovery attempts.  Authority begins only once a package's
+    # SELL claim reached a provider-identified order.  Package-only,
+    # unclaimed, and unsubmitted attempts are history, not competing exits.
+    # Conversely, two provider-submitted SELL lineages are genuinely
+    # ambiguous even if only one later reports FILLED, and must fail closed.
+    executed_lineages: list[tuple[CanonicalPreviewPackage, AutonomousExecutionClaim, LiveCryptoOrder]] = []
+    for candidate in matches:
+        candidate_claim = await db.scalar(select(AutonomousExecutionClaim).where(
+            AutonomousExecutionClaim.package_id == candidate.package_id,
+            AutonomousExecutionClaim.side == "SELL",
+        ).limit(1))
+        if candidate_claim is None or candidate_claim.live_order_id is None:
+            continue
+        candidate_order = await db.scalar(select(LiveCryptoOrder).where(
+            LiveCryptoOrder.live_crypto_order_id == candidate_claim.live_order_id,
+        ).limit(1))
+        if (
+            candidate_order is None or not candidate_order.provider_order_id
+            or str(candidate_order.side or "").upper() != "SELL"
+        ):
+            continue
+        executed_lineages.append((candidate, candidate_claim, candidate_order))
+    if not executed_lineages:
+        record("canonical_authoritative_sell_lineage_missing")
         return False
-    package = matches[0]
-    if proof.sell_package_id != package.package_id:
-        record("proof_sell_package_mismatch")
+    if len(executed_lineages) != 1:
+        record("canonical_authoritative_sell_lineage_ambiguous")
         return False
-
-    claim = await db.scalar(select(AutonomousExecutionClaim).where(
-        AutonomousExecutionClaim.package_id == package.package_id,
-        AutonomousExecutionClaim.side == "SELL",
-    ).limit(1))
+    package, claim, order = executed_lineages[0]
     if (
         claim is None or claim.claim_status != "COMPLETED" or claim.live_order_id is None
         or claim.campaign_id != package.campaign_id or claim.campaign_version != package.campaign_version
@@ -764,12 +781,6 @@ async def project_blocked_exit_recovery_outcome(
     ):
         record("canonical_sell_claim_invalid")
         return False
-    if proof.sell_live_crypto_order_id != claim.live_order_id:
-        record("proof_sell_order_claim_mismatch")
-        return False
-    order = await db.scalar(select(LiveCryptoOrder).where(
-        LiveCryptoOrder.live_crypto_order_id == claim.live_order_id,
-    ).limit(1))
     if (
         order is None or order.status != "FILLED" or not order.provider_order_id
         or order.side.upper() != "SELL" or order.provider != proof.provider
@@ -777,6 +788,11 @@ async def project_blocked_exit_recovery_outcome(
     ):
         record("canonical_sell_order_invalid")
         return False
+    # These are denormalized canonical caches. Once exactly one provider-
+    # executed lineage survives the ambiguity check, repair stale pointers
+    # rather than letting an abandoned historical package conceal it.
+    proof.sell_package_id = package.package_id
+    proof.sell_live_crypto_order_id = order.live_crypto_order_id
     reconciliation = await db.scalar(select(LiveReconciliationEvent).where(
         LiveReconciliationEvent.live_crypto_order_id == order.live_crypto_order_id,
     ).order_by(LiveReconciliationEvent.sequence_number.desc()).limit(1))
@@ -849,9 +865,9 @@ async def project_blocked_exit_recovery_outcome(
         return False
     net_pnl = sum((row.net_cash_impact for row in accounting), Decimal("0"))
     completed_at = _utcnow()
-    # The proof itself must finalize truthfully here, separately from the
-    # recovery's own immutable historical BLOCKED row (never mutated
-    # above). get_controlled_proof_view's terminal_verdict is frozen the
+    # The proof itself must finalize truthfully here. The recovery's earlier
+    # BLOCKED classification is retained in immutable audit history below,
+    # while its current row transitions to COMPLETED. get_controlled_proof_view's terminal_verdict is frozen the
     # first time it is computed (by design -- a real PROFIT/LOSS/FLAT
     # verdict must never later flip) and, for a proof that reached this
     # exact governed-replacement-SELL-filled state only after already
@@ -866,6 +882,21 @@ async def project_blocked_exit_recovery_outcome(
     proof.net_pnl_usd = net_pnl
     proof.terminal_verdict = _recovered_verdict(net_pnl)
     proof.updated_at = completed_at
+    recovery_before_state = {
+        "status": locked.status,
+        "blocked_reason": locked.blocked_reason,
+        "failure_reason": getattr(locked, "failure_reason", None),
+        "completed_at": None if locked.completed_at is None else locked.completed_at.isoformat(),
+    }
+    # BLOCKED described the earlier package-replacement attempt, not the
+    # now-proven financial outcome. Preserve that history in the immutable
+    # audit below, while making the recovery row's current terminal truth
+    # unambiguously successful.
+    locked.status = "COMPLETED"
+    locked.completed_at = completed_at
+    locked.blocked_reason = None
+    locked.failure_reason = None
+    locked.updated_at = completed_at
     payload = {
         "status": "COMPLETED_RECONCILED",
         "original_recovery_id": str(locked.recovery_id),
@@ -884,11 +915,7 @@ async def project_blocked_exit_recovery_outcome(
         actor="system:controlled_proof_reconciliation_projector",
         action=_RECOVERED_OUTCOME_ACTION,
         entity_type="controlled_proof_exit_recovery", entity_id=locked.recovery_id,
-        before_state={
-            "status": locked.status,
-            "blocked_reason": locked.blocked_reason,
-            "completed_at": None if locked.completed_at is None else locked.completed_at.isoformat(),
-        },
+        before_state=recovery_before_state,
         after_state=payload,
     ))
     await db.flush()

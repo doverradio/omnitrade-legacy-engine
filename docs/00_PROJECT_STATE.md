@@ -335,6 +335,19 @@ exposure during SELL. The correction makes SELL incremental exposure zero;
 BUY behavior is unchanged. Both recovery IDs remain terminal and Proof #3
 remains outside the clean streak (0 of 5).
 
+Third recovery `825c2010-cad9-4de7-af0c-019f16a8e617` successfully executed
+the governed Kraken SELL (`ONJESU-CVFF3-TOIZEI`): package, claim, internal
+order, provider fill, reconciliation, and claim completion all succeeded and
+remaining position is zero. Terminal projection then failed with
+`canonical_sell_package_match_count_invalid` because the projector counted
+historical SELL-package attempts before distinguishing provider-executed
+lineage. The local correction preserves every attempt but selects the sole
+provider-identified SELL lineage, failing closed if more than one submitted
+lineage exists. When the complete reconciled outcome is proven, the recovery's
+current state becomes `COMPLETED`, its stale blocker is cleared, and the prior
+BLOCKED state remains in immutable audit history. No further recovery or SELL
+is authorized.
+
 Production proving has advanced beyond the external reconciliation
 investigation.
 

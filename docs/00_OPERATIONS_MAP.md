@@ -187,6 +187,16 @@ not inferred from that USD check: canonical preview creation independently sets
 it to the exact lineage-derived proof-owned quantity, preventing an oversized
 close.
 
+Production recovery `825c2010-cad9-4de7-af0c-019f16a8e617` completed its real
+Kraken SELL, but post-fill projection initially treated multiple historical
+SELL packages as equal canonical matches. Outcome resolution now ignores
+package-only/unclaimed/unsubmitted attempts, selects exactly one
+provider-identified SELL lineage, and fails closed on multiple submitted
+lineages. Projection transitions a historically BLOCKED recovery to current
+`COMPLETED`, clears its active blocker/failure fields, and preserves the old
+BLOCKED explanation in the recovered-outcome audit. Projection is
+read/accounting-only and creates no execution artifact.
+
 Production Flow
 
 1. Operator authorizes Exit Recovery via authenticated API.
