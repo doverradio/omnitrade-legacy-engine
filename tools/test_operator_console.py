@@ -149,3 +149,93 @@ def test_ep3_failed_closed_reason_is_displayed() -> None:
     cycle = oc.Cycle()
     cycle.absorb(event, fields, time_str)
     assert "mandate_expired" in oc.render_card(cycle)
+
+
+def _absorb_lifecycle(state: oc.ProfitLifecycle, message: str) -> bool:
+    line = f"2024-01-15T23:09:00+0000 host proc[1]: {message}"
+    parsed = oc.parse_line(line)
+    assert parsed is not None
+    _time_str, event, fields = parsed
+    return state.absorb(event, fields)
+
+
+def test_lifecycle_requires_affirmative_buy_execution_events() -> None:
+    state = oc.ProfitLifecycle()
+    _absorb_lifecycle(state, "strategy_aggregate_completed action=BUY reason=buy_agreement_threshold_met")
+    rendered = oc.render_profit_lifecycle(state)
+    assert "Strategy BUY proposed" in rendered
+    assert "Live Kraken BUY submitted: Not yet confirmed" in rendered
+    assert "BUY filled: Not yet confirmed" in rendered
+    assert "FIRST AUTONOMOUS PROFIT VERIFIED: Not yet confirmed" in rendered
+
+
+def test_lifecycle_progresses_only_from_correlated_submission_and_fill_evidence() -> None:
+    state = oc.ProfitLifecycle()
+    events = [
+        "strategy_aggregate_completed action=BUY reason=buy_agreement_threshold_met",
+        "net_edge_evaluated final_reason_code=accepted expected_net_profit=0.01",
+        "automatic_ready_package_created package_id=package-1 cycle_id=cycle-1",
+        "automatic_package_activated package_id=package-1 activation_id=activation-1",
+        "kraken_order_submission_started live_crypto_order_id=buy-1 provider=kraken environment=live product_id=BTC-USD side=BUY client_order_id=client-buy",
+        "kraken_order_submitted live_crypto_order_id=buy-1 provider_order_id=provider-buy",
+        "reconciliation_completed live_crypto_order_id=buy-1 reconciliation_status=filled provider_fill_observed=True",
+        "autonomous_proof_sell_worker_cycle action=selected attempt_id=attempt-1 stage=SELECTED provider_call_made=False",
+        "kraken_order_submission_started live_crypto_order_id=sell-1 provider=kraken environment=live product_id=BTC-USD side=SELL client_order_id=client-sell",
+        "kraken_order_submitted live_crypto_order_id=sell-1 provider_order_id=provider-sell",
+        "reconciliation_completed live_crypto_order_id=sell-1 reconciliation_status=filled provider_fill_observed=True",
+    ]
+    for event in events:
+        assert _absorb_lifecycle(state, event) is True
+
+    rendered = oc.render_profit_lifecycle(state)
+    for milestone in (
+        "Economics approved", "READY package created", "Package activated",
+        "Live Kraken BUY submitted", "BUY filled", "BUY reconciled",
+        "SELL candidate selected", "Live Kraken SELL submitted", "SELL filled", "SELL reconciled",
+    ):
+        assert any("✅" in line and milestone in line for line in rendered.splitlines())
+    assert "Risk explicitly approved: Not yet confirmed" in rendered
+    assert "BUY accounting completed: Not yet confirmed" in rendered
+    assert "Eligible autonomous custody established: Not yet confirmed" in rendered
+    assert "Realized gross P&L, total costs, and realized net P&L: Not yet confirmed" in rendered
+    assert state.positive_profit_verified is False
+
+
+def test_lifecycle_replay_is_idempotent() -> None:
+    state = oc.ProfitLifecycle()
+    event = "kraken_order_submission_started live_crypto_order_id=buy-1 side=BUY"
+    assert _absorb_lifecycle(state, event) is True
+    assert _absorb_lifecycle(state, event) is False
+    assert state.buy_order_id == "buy-1"
+    assert len(state.seen_event_keys) == 1
+
+
+def test_unrelated_or_unfilled_reconciliation_does_not_claim_completion() -> None:
+    state = oc.ProfitLifecycle()
+    _absorb_lifecycle(state, "kraken_order_submission_started live_crypto_order_id=buy-1 side=BUY")
+    _absorb_lifecycle(state, "reconciliation_completed live_crypto_order_id=other reconciliation_status=filled provider_fill_observed=True")
+    _absorb_lifecycle(state, "reconciliation_completed live_crypto_order_id=buy-1 reconciliation_status=pending provider_fill_observed=False")
+    assert state.buy_filled is False
+    assert state.buy_reconciled is False
+
+
+def test_sell_package_never_means_sell_execution_or_profit() -> None:
+    cycle = oc.Cycle(action="SELL", package_created=True)
+    assert "completed successfully" not in oc.banner_for(cycle)
+
+    state = oc.ProfitLifecycle()
+    _absorb_lifecycle(state, "automatic_ready_package_created package_id=sell-package")
+    rendered = oc.render_profit_lifecycle(state)
+    assert "Live Kraken SELL submitted: Not yet confirmed" in rendered
+    assert "FIRST AUTONOMOUS PROFIT VERIFIED: Not yet confirmed" in rendered
+
+
+def test_positive_profit_banner_requires_affirmative_positive_realized_net_pnl_evidence() -> None:
+    state = oc.ProfitLifecycle(realized_gross_pnl="0.25", total_costs="0.05", realized_net_pnl="0")
+    assert "🎉 FIRST AUTONOMOUS PROFIT VERIFIED" not in oc.render_profit_lifecycle(state)
+    state.realized_net_pnl = "-0.01"
+    assert "🎉 FIRST AUTONOMOUS PROFIT VERIFIED" not in oc.render_profit_lifecycle(state)
+    state.realized_net_pnl = "0.20"
+    assert "🎉 FIRST AUTONOMOUS PROFIT VERIFIED" not in oc.render_profit_lifecycle(state)
+    state.realized_pnl_evidence_observed = True
+    assert "🎉 FIRST AUTONOMOUS PROFIT VERIFIED" in oc.render_profit_lifecycle(state)

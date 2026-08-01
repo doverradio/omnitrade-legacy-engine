@@ -66,6 +66,10 @@ EVENT_NAMES = (
     "automatic_package_progression_failed_closed",
     "unresolved_reconciliation_gate_triggered",
     "unresolved_reconciliation_record_detail",
+    "kraken_order_submission_started",
+    "kraken_order_submitted",
+    "reconciliation_completed",
+    "autonomous_proof_sell_worker_cycle",
 )
 _EVENT_RE = re.compile(r"\b(" + "|".join(EVENT_NAMES) + r")\b(.*)$")
 _TIMESTAMP_RE = re.compile(r"^(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:Z|[+-]\d{2}:?\d{2}))")
@@ -323,10 +327,14 @@ def _is_reconciliation_blocked(cycle: Cycle) -> bool:
 
 
 def _status_lines(cycle: Cycle) -> list[str]:
-    lines = [c("✅ Strategy Approved", BRIGHT_GREEN)]
-    econ_ok = cycle.final_reason_code not in {"non_positive_net_edge", "expected_edge_unavailable"}
-    lines.append(c("✅ Economics Approved", BRIGHT_GREEN) if econ_ok else c(f"❌ Economics Rejected ({cycle.final_reason_code})", BRIGHT_RED))
-    lines.append(c("✅ Risk Approved", BRIGHT_GREEN) if econ_ok else c("⬜ Risk Not Reached", DIM))
+    lines = [c("✅ Strategy BUY Proposed", BRIGHT_GREEN)]
+    if cycle.final_reason_code == "accepted":
+        lines.append(c("✅ Economics Approved", BRIGHT_GREEN))
+    elif cycle.final_reason_code in {"non_positive_net_edge", "expected_edge_unavailable"}:
+        lines.append(c(f"❌ Economics Rejected ({cycle.final_reason_code})", BRIGHT_RED))
+    else:
+        lines.append(c("⬜ Economics: Not yet confirmed", DIM))
+    lines.append(c("⬜ Risk explicitly approved: Not yet confirmed", DIM))
     proposed = cycle.decision_kind or cycle.proposed_action
     if proposed:
         lines.append(c(f"🟦 {proposed}", BLUE))
@@ -360,7 +368,7 @@ def render_card(cycle: Cycle) -> str:
             out += ["Profit", c(_money(cycle.expected_net_profit), CYAN), ""]
         if cycle.fees_amount is not None:
             out += ["Fees", c(f"${cycle.fees_amount}", CYAN), ""]
-        out += ["Reconciliation", c("❌ Blocked", BRIGHT_RED) if _is_reconciliation_blocked(cycle) else c("✅ Complete", BRIGHT_GREEN)]
+        out += ["Reconciliation", c("❌ Blocked", BRIGHT_RED) if _is_reconciliation_blocked(cycle) else c("Not yet confirmed", DIM)]
     else:  # BUY, or any future action -- same shape, future-proof by default
         emoji = "🟢" if action == "BUY" else "🔷"
         out += [c(f"{emoji} {action or 'UNKNOWN'}", BRIGHT_GREEN if action == "BUY" else BLUE), ""]
@@ -387,7 +395,7 @@ def banner_for(cycle: Cycle) -> str:
     if action == "HOLD":
         return c("🟡 HOLD cycle completed", YELLOW)
     if action == "SELL":
-        return c("🎉 SELL completed successfully", BRIGHT_GREEN) if cycle.package_created else c("🔴 SELL blocked", BRIGHT_RED)
+        return c("🔴 SELL proposed; execution not yet confirmed", YELLOW)
     if action == "BUY":
         if cycle.package_created:
             return c("🟣 Ready package created", MAGENTA)
@@ -395,6 +403,129 @@ def banner_for(cycle: Cycle) -> str:
             return c(f"🔴 BUY blocked by {_display_reason(cycle)}", BRIGHT_RED)
         return c("🟢 BUY signal seen, awaiting resolution...", BRIGHT_GREEN)
     return c("🟢 Waiting for BUY signal...", BRIGHT_GREEN)
+
+
+# --- First Autonomous Profit lifecycle ---
+
+
+@dataclass
+class ProfitLifecycle:
+    """Affirmative journal evidence only; replaying a line is idempotent."""
+
+    strategy_buy_proposed: bool = False
+    economics: str | None = None
+    ready_package_created: bool = False
+    package_activated: bool = False
+    buy_order_id: str | None = None
+    buy_provider_order_id: str | None = None
+    buy_filled: bool = False
+    buy_reconciled: bool = False
+    sell_candidate_selected: bool = False
+    sell_order_id: str | None = None
+    sell_provider_order_id: str | None = None
+    sell_filled: bool = False
+    sell_reconciled: bool = False
+    realized_gross_pnl: str | None = None
+    total_costs: str | None = None
+    realized_net_pnl: str | None = None
+    realized_pnl_evidence_observed: bool = False
+    seen_event_keys: set[tuple[str, tuple[tuple[str, str | None], ...]]] = field(default_factory=set)
+
+    def absorb(self, event: str, f: dict[str, str | None]) -> bool:
+        key = (event, tuple(sorted(f.items())))
+        if key in self.seen_event_keys:
+            return False
+        self.seen_event_keys.add(key)
+        if event == "strategy_aggregate_completed" and (f.get("action") or "").upper() == "BUY":
+            self.strategy_buy_proposed = True
+        elif event == "net_edge_evaluated":
+            reason = f.get("final_reason_code")
+            if reason == "accepted":
+                self.economics = "approved"
+            elif reason:
+                self.economics = f"rejected ({reason})"
+        elif event == "non_positive_net_edge_rejection_explained":
+            self.economics = f"rejected ({f.get('final_reason_code') or 'non_positive_net_edge'})"
+        elif event == "automatic_ready_package_created":
+            self.ready_package_created = True
+        elif event == "automatic_package_activated":
+            self.package_activated = True
+        elif event == "kraken_order_submission_started":
+            side, order_id = (f.get("side") or "").upper(), f.get("live_crypto_order_id")
+            if side == "BUY":
+                self.buy_order_id = order_id or self.buy_order_id
+            elif side == "SELL":
+                self.sell_order_id = order_id or self.sell_order_id
+        elif event == "kraken_order_submitted":
+            order_id = f.get("live_crypto_order_id")
+            if order_id and order_id == self.buy_order_id:
+                self.buy_provider_order_id = f.get("provider_order_id")
+            elif order_id and order_id == self.sell_order_id:
+                self.sell_provider_order_id = f.get("provider_order_id")
+        elif event == "reconciliation_completed":
+            order_id = f.get("live_crypto_order_id")
+            filled = f.get("reconciliation_status") == "filled" and f.get("provider_fill_observed") == "True"
+            if order_id and order_id == self.buy_order_id and filled:
+                self.buy_filled = self.buy_reconciled = True
+            elif order_id and order_id == self.sell_order_id and filled:
+                self.sell_filled = self.sell_reconciled = True
+        elif event == "autonomous_proof_sell_worker_cycle" and f.get("action") == "selected":
+            self.sell_candidate_selected = True
+        return True
+
+    @property
+    def positive_profit_verified(self) -> bool:
+        try:
+            return (
+                self.realized_pnl_evidence_observed
+                and self.realized_gross_pnl is not None
+                and self.total_costs is not None
+                and self.realized_net_pnl is not None
+                and float(self.realized_net_pnl) > 0
+            )
+        except ValueError:
+            return False
+
+
+def render_profit_lifecycle(state: ProfitLifecycle) -> str:
+    yes = lambda label: c(f"✅ {label}", BRIGHT_GREEN)
+    no = lambda label: c(f"⬜ {label}: Not yet confirmed", DIM)
+    lines = ["First Autonomous Profit lifecycle"]
+    lines.append(yes("1. Strategy BUY proposed") if state.strategy_buy_proposed else no("1. Strategy BUY proposed"))
+    if state.economics == "approved":
+        lines.append(yes("2. Economics approved"))
+    elif state.economics:
+        lines.append(c(f"❌ 2. Economics {state.economics}", BRIGHT_RED))
+    else:
+        lines.append(no("2. Economics approved or rejected"))
+    lines.append(no("3. Risk explicitly approved"))  # no authoritative deployed journal event
+    lines.append(yes("4. READY package created") if state.ready_package_created else no("4. READY package created"))
+    lines.append(yes("5. Package activated") if state.package_activated else no("5. Package activated"))
+    lines.append(yes("6. Live Kraken BUY submitted") if state.buy_provider_order_id else no("6. Live Kraken BUY submitted"))
+    lines.append(yes("7. BUY filled") if state.buy_filled else no("7. BUY filled"))
+    lines.append(yes("8. BUY reconciled") if state.buy_reconciled else no("8. BUY reconciled"))
+    lines.append(no("9. BUY accounting completed"))
+    lines.append(no("10. Eligible autonomous custody established"))
+    lines.append(no("11. Waiting for a profitable exit"))
+    lines.append(yes("12. SELL candidate selected") if state.sell_candidate_selected else no("12. SELL candidate selected"))
+    lines.append(yes("13. Live Kraken SELL submitted") if state.sell_provider_order_id else no("13. Live Kraken SELL submitted"))
+    lines.append(yes("14. SELL filled") if state.sell_filled else no("14. SELL filled"))
+    lines.append(yes("15. SELL reconciled") if state.sell_reconciled else no("15. SELL reconciled"))
+    if (
+        state.realized_pnl_evidence_observed
+        and state.realized_gross_pnl is not None
+        and state.total_costs is not None
+        and state.realized_net_pnl is not None
+    ):
+        lines.append(yes(f"16. Realized gross P&L={state.realized_gross_pnl}; total costs={state.total_costs}; realized net P&L={state.realized_net_pnl}"))
+    else:
+        lines.append(no("16. Realized gross P&L, total costs, and realized net P&L"))
+    lines.append(
+        c("🎉 FIRST AUTONOMOUS PROFIT VERIFIED", BRIGHT_GREEN)
+        if state.positive_profit_verified
+        else no("17. FIRST AUTONOMOUS PROFIT VERIFIED")
+    )
+    return "\n".join(lines)
 
 
 # --- Totals / runtime ---
@@ -485,6 +616,7 @@ def run() -> None:
 
     totals = Totals()
     current = Cycle()
+    lifecycle = ProfitLifecycle()
 
     def flush() -> None:
         nonlocal current
@@ -508,6 +640,9 @@ def run() -> None:
         if event == "strategy_aggregate_completed":
             flush()
         current.absorb(event, fields, time_str)
+        if lifecycle.absorb(event, fields):
+            print(render_profit_lifecycle(lifecycle))
+            print()
         if event in _TERMINAL_EVENTS:
             flush()
 
