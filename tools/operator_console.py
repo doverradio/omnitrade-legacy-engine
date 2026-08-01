@@ -412,6 +412,7 @@ def banner_for(cycle: Cycle) -> str:
 class ProfitLifecycle:
     """Affirmative journal evidence only; replaying a line is idempotent."""
 
+    product_id: str | None = None
     strategy_buy_proposed: bool = False
     economics: str | None = None
     ready_package_created: bool = False
@@ -432,6 +433,12 @@ class ProfitLifecycle:
     seen_event_keys: set[tuple[str, tuple[tuple[str, str | None], ...]]] = field(default_factory=set)
 
     def absorb(self, event: str, f: dict[str, str | None]) -> bool:
+        event_product = f.get("product_id") or f.get("instrument") or f.get("product")
+        if event_product:
+            event_product = event_product.upper()
+            if self.product_id is not None and event_product != self.product_id:
+                return False
+            self.product_id = event_product
         key = (event, tuple(sorted(f.items())))
         if key in self.seen_event_keys:
             return False
@@ -490,7 +497,7 @@ class ProfitLifecycle:
 def render_profit_lifecycle(state: ProfitLifecycle) -> str:
     yes = lambda label: c(f"✅ {label}", BRIGHT_GREEN)
     no = lambda label: c(f"⬜ {label}: Not yet confirmed", DIM)
-    lines = ["First Autonomous Profit lifecycle"]
+    lines = [f"First Autonomous Profit lifecycle [{state.product_id or 'product unconfirmed'}]"]
     lines.append(yes("1. Strategy BUY proposed") if state.strategy_buy_proposed else no("1. Strategy BUY proposed"))
     if state.economics == "approved":
         lines.append(yes("2. Economics approved"))
@@ -616,7 +623,7 @@ def run() -> None:
 
     totals = Totals()
     current = Cycle()
-    lifecycle = ProfitLifecycle()
+    lifecycles: dict[str, ProfitLifecycle] = {}
 
     def flush() -> None:
         nonlocal current
@@ -640,9 +647,24 @@ def run() -> None:
         if event == "strategy_aggregate_completed":
             flush()
         current.absorb(event, fields, time_str)
-        if lifecycle.absorb(event, fields):
-            print(render_profit_lifecycle(lifecycle))
-            print()
+        event_product = fields.get("product_id") or fields.get("instrument") or fields.get("product")
+        if event_product:
+            product_id = event_product.upper()
+            lifecycle = lifecycles.setdefault(product_id, ProfitLifecycle(product_id=product_id))
+            if lifecycle.absorb(event, fields):
+                print(render_profit_lifecycle(lifecycle))
+                print()
+        else:
+            package_id = fields.get("package_id")
+            order_id = fields.get("live_crypto_order_id")
+            for lifecycle in lifecycles.values():
+                correlated = (
+                    (package_id is not None and package_id == lifecycle.package_id)
+                    or (order_id is not None and order_id in {lifecycle.buy_order_id, lifecycle.sell_order_id})
+                )
+                if correlated and lifecycle.absorb(event, fields):
+                    print(render_profit_lifecycle(lifecycle))
+                    print()
         if event in _TERMINAL_EVENTS:
             flush()
 

@@ -37,14 +37,14 @@ class _DB:
                 value.custody_id = uuid.uuid4()
 
 
-def _lineage():
+def _lineage(product: str = "BTC-USD"):
     now = datetime.now(timezone.utc)
     claim = SimpleNamespace(
         claim_id=uuid.uuid4(), package_id=uuid.uuid4(), activation_id=uuid.uuid4(),
         campaign_id=uuid.uuid4(), campaign_version=1, mandate_id=uuid.uuid4(),
         mandate_version_id=uuid.uuid4(), account_id=uuid.uuid4(), profile_id=uuid.uuid4(),
         connection_id=uuid.uuid4(), provider="kraken_spot", environment="production",
-        product="BTC-USD", side="BUY", live_order_id=uuid.uuid4(),
+        product=product, side="BUY", live_order_id=uuid.uuid4(),
         claim_status="RECONCILIATION_REQUIRED", updated_at=now,
     )
     package = SimpleNamespace(
@@ -64,8 +64,9 @@ def _lineage():
 
 
 @pytest.mark.asyncio
-async def test_eligible_scheduled_buy_establishes_one_active_custody(monkeypatch):
-    claim, package, mandate, origin, campaign_cycle, reconciliation = _lineage()
+@pytest.mark.parametrize("product", ["BTC-USD", "ETH-USD", "SOL-USD"])
+async def test_eligible_scheduled_buy_establishes_one_active_custody(monkeypatch, product):
+    claim, package, mandate, origin, campaign_cycle, reconciliation = _lineage(product)
     db = _DB(
         scalars=[None, package, mandate, None, origin, reconciliation],
         rows=[[campaign_cycle]],
@@ -77,6 +78,7 @@ async def test_eligible_scheduled_buy_establishes_one_active_custody(monkeypatch
 
     assert result.custody_state == "ACTIVE"
     assert result.buy_claim_id == claim.claim_id
+    assert result.product == product
     assert result.original_acquired_quantity == Decimal("0.00008")
     assert result.provenance_classification == custody.SCHEDULED_PRODUCTION_PROVENANCE
     assert result.proof_eligible is True

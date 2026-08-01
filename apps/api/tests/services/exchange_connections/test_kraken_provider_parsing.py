@@ -15,6 +15,7 @@ from app.services.exchange_connections.providers.kraken_spot import (
     _encode_form_payload,
     build_kraken_signature,
     build_kraken_signature_from_encoded_payload,
+    product_id_from_kraken_pair,
 )
 
 
@@ -32,6 +33,45 @@ async def test_kraken_balance_parser_maps_assets(monkeypatch: pytest.MonkeyPatch
     assert by_currency["USD"].total == Decimal("11.25")
     assert by_currency["BTC"].total == Decimal("0.001")
     assert by_currency["ETH"].total == Decimal("2.0")
+    assert by_currency["SOL"].total == Decimal("1")
+
+
+@pytest.mark.asyncio
+async def test_kraken_product_lookup_supports_sol_usd(monkeypatch: pytest.MonkeyPatch) -> None:
+    client = KrakenSpotClient()
+
+    async def _public(**_kwargs):
+        return {
+            "error": [],
+            "result": {
+                "SOLUSD": {
+                    "altname": "SOLUSD",
+                    "wsname": "SOL/USD",
+                    "base": "SOL",
+                    "quote": "USD",
+                    "status": "online",
+                    "pair_decimals": 3,
+                    "lot_decimals": 8,
+                    "ordermin": "0.02",
+                    "costmin": "0.5",
+                }
+            },
+        }
+
+    monkeypatch.setattr(client, "_public_request", _public)
+    product = await client.fetch_product(
+        credentials={"api_key": "k", "api_secret": "s"},
+        environment="production",
+        product_id="SOL-USD",
+    )
+
+    assert product.product_id == "SOL-USD"
+    assert product.available is True
+    assert product.trading_enabled is True
+    assert product.min_order_notional == Decimal("0.5")
+    assert product.min_order_quantity == Decimal("0.02")
+    assert product_id_from_kraken_pair("SOL/USD") == "SOL-USD"
+    assert product_id_from_kraken_pair("SOLUSD") == "SOL-USD"
 
 
 @pytest.mark.asyncio

@@ -269,6 +269,8 @@ def _normalize_intent_product(product_id: str) -> tuple[str, str]:
         return "BTC-USD", "XBT/USD"
     if normalized == "ETH-USD":
         return "ETH-USD", "ETH/USD"
+    if normalized == "SOL-USD":
+        return "SOL-USD", "SOL/USD"
     raise InvalidRequestError(
         message="Unsupported Kraken product mapping",
         details={"product_id": product_id},
@@ -283,6 +285,7 @@ def _normalize_intent_product(product_id: str) -> tuple[str, str]:
 _KRAKEN_PAIR_KEY_TO_PRODUCT_ID = {
     _kraken_pair_key("XBT/USD"): "BTC-USD",
     _kraken_pair_key("ETH/USD"): "ETH-USD",
+    _kraken_pair_key("SOL/USD"): "SOL-USD",
 }
 
 
@@ -666,6 +669,7 @@ class KrakenSpotClient:
             "USD": ExchangeBalanceItem(currency="USD", available=Decimal("0"), reserved=Decimal("0"), total=Decimal("0")),
             "BTC": ExchangeBalanceItem(currency="BTC", available=Decimal("0"), reserved=Decimal("0"), total=Decimal("0")),
             "ETH": ExchangeBalanceItem(currency="ETH", available=Decimal("0"), reserved=Decimal("0"), total=Decimal("0")),
+            "SOL": ExchangeBalanceItem(currency="SOL", available=Decimal("0"), reserved=Decimal("0"), total=Decimal("0")),
         }
 
         if isinstance(result, dict):
@@ -682,7 +686,7 @@ class KrakenSpotClient:
                     total=prior.total + available,
                 )
 
-        balances = [by_currency["USD"], by_currency["BTC"], by_currency["ETH"]]
+        balances = [by_currency["USD"], by_currency["BTC"], by_currency["ETH"], by_currency["SOL"]]
         return ExchangeBalanceSnapshot(balances=balances, total_equity_usd=by_currency["USD"].total)
 
     async def fetch_account(self, *, credentials: dict[str, str], environment: str) -> ExchangeAccountSnapshot:

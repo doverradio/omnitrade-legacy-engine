@@ -210,6 +210,20 @@ def test_lifecycle_replay_is_idempotent() -> None:
     assert len(state.seen_event_keys) == 1
 
 
+def test_lifecycle_rejects_events_from_another_product() -> None:
+    state = oc.ProfitLifecycle(product_id="BTC-USD")
+    assert _absorb_lifecycle(
+        state,
+        "strategy_aggregate_completed product_id=ETH-USD action=BUY reason=buy_agreement_threshold_met",
+    ) is False
+    assert _absorb_lifecycle(
+        state,
+        "kraken_order_submission_started product_id=SOL-USD live_crypto_order_id=sol-buy side=BUY",
+    ) is False
+    assert state.strategy_buy_proposed is False
+    assert state.buy_order_id is None
+
+
 def test_unrelated_or_unfilled_reconciliation_does_not_claim_completion() -> None:
     state = oc.ProfitLifecycle()
     _absorb_lifecycle(state, "kraken_order_submission_started live_crypto_order_id=buy-1 side=BUY")

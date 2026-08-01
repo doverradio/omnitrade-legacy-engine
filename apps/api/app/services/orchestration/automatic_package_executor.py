@@ -482,8 +482,8 @@ async def execute_automatic_ready_package_through_activation(
                 raise PermissionError("activated package has conflicting authority source")
             await _validate_canonical_package_authority(db=db, package=package, requested_approval_event_id=None)
             logger.info(
-                "automatic_package_activated campaign_id=%s campaign_version=%s decision_record_id=%s package_id=%s mandate_id=%s replayed=True",
-                request.campaign_id, request.campaign_version, request.decision_record_id, package.package_id, package.mandate_id,
+                "automatic_package_activated campaign_id=%s campaign_version=%s product_id=%s decision_record_id=%s package_id=%s mandate_id=%s replayed=True",
+                request.campaign_id, request.campaign_version, package.product, request.decision_record_id, package.package_id, package.mandate_id,
             )
             return _outcome(request=request, package=package, reason="already_activated", replayed=True, starting_state=starting_state)
 
@@ -553,8 +553,8 @@ async def execute_automatic_ready_package_through_activation(
                 ),
             )
             logger.info(
-                "automatic_package_activated campaign_id=%s campaign_version=%s decision_record_id=%s package_id=%s mandate_id=%s replayed=False",
-                request.campaign_id, request.campaign_version, request.decision_record_id, package.package_id, package.mandate_id,
+                "automatic_package_activated campaign_id=%s campaign_version=%s product_id=%s decision_record_id=%s package_id=%s mandate_id=%s replayed=False",
+                request.campaign_id, request.campaign_version, package.product, request.decision_record_id, package.package_id, package.mandate_id,
             )
 
         if package.package_state != "ACTIVATED":

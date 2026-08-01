@@ -585,6 +585,7 @@ def _seed_outcome_row(
     actual_fee_adjusted_return_pct: Decimal,
     mfe_pct: Decimal,
     mae_pct: Decimal,
+    strategy_identity: str | None = None,
 ) -> None:
     now = datetime(2026, 7, 21, 12, 0, tzinfo=timezone.utc)
     proposal_id = uuid.uuid4()
@@ -599,7 +600,7 @@ def _seed_outcome_row(
             product_id="BTC-USD",
             interval="15m",
             strategy_slug=strategy_slug,
-            strategy_identity=f"{strategy_slug}@1.0.0",
+            strategy_identity=strategy_identity or f"{strategy_slug}@1.0.0",
             action=action,
             proposal_evaluation_status="EVALUATED",
             horizon_label=horizon_label,
@@ -762,6 +763,7 @@ async def _reference_fetch_strategy_scorecards_full_entity(
         scorecards.append(
             StrategyScorecard(
                 strategy_slug=strategy_slug,
+                strategy_identity=f"{strategy_slug}@1.0.0",
                 per_horizon=per_horizon,
                 aggregate=aggregate,
                 best_regime=best_regime,
@@ -879,6 +881,41 @@ async def test_scorecard_query_bounds_each_current_strategy_action_horizon_bucke
     assert aggregate.buy_evaluations == 2
     assert aggregate.sell_evaluations == 2
     assert aggregate.hold_evaluations == 2
+
+
+@pytest.mark.asyncio
+async def test_scorecard_query_does_not_mix_strategy_versions() -> None:
+    async with _real_outcomes_session() as raw_session:
+        for strategy_identity, return_pct in (("momentum@1.0.0", Decimal("2")), ("momentum@2.0.0", Decimal("-3"))):
+            _seed_outcome_row(
+                raw_session,
+                strategy_slug="momentum",
+                strategy_identity=strategy_identity,
+                action="BUY",
+                horizon_label="15m",
+                horizon_minutes=15,
+                regime_trend="TRENDING",
+                actual_action_correct=return_pct > 0,
+                actual_raw_return_pct=return_pct,
+                actual_fee_adjusted_return_pct=return_pct,
+                mfe_pct=Decimal("1"),
+                mae_pct=Decimal("-1"),
+            )
+        raw_session.commit()
+
+        scorecards = await fetch_strategy_scorecards(
+            db=_AwaitableOutcomesSession(raw_session),
+            provider="kraken_spot",
+            product_id="BTC-USD",
+            interval="15m",
+            strategy_slugs=["momentum"],
+            strategy_identities=["momentum@2.0.0"],
+        )
+
+    assert len(scorecards) == 1
+    assert scorecards[0].strategy_identity == "momentum@2.0.0"
+    assert scorecards[0].aggregate.total_evaluated == 1
+    assert scorecards[0].aggregate.buy_average_raw_return_pct == Decimal("-3.0000")
 
 
 async def _reference_fetch_strategy_scorecards_multi_pass(
@@ -1022,6 +1059,7 @@ async def _reference_fetch_strategy_scorecards_multi_pass(
         scorecards.append(
             StrategyScorecard(
                 strategy_slug=strategy_slug,
+                strategy_identity=f"{strategy_slug}@1.0.0",
                 per_horizon=per_horizon,
                 aggregate=aggregate,
                 best_regime=best_regime,

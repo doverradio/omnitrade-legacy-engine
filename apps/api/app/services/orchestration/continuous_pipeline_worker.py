@@ -1572,9 +1572,10 @@ async def _attempt_automatic_ready_package_creation(
                         )
                     else:
                         logger.info(
-                            "automatic_ready_package_created campaign_id=%s campaign_version=%s cycle_id=%s candle_close_time=%s decision_record_id=%s package_id=%s idempotency_key=%s controlled_proof_id=%s",
+                            "automatic_ready_package_created campaign_id=%s campaign_version=%s product_id=%s cycle_id=%s candle_close_time=%s decision_record_id=%s package_id=%s idempotency_key=%s controlled_proof_id=%s",
                             campaign_id,
                             campaign_version,
+                            product,
                             cycle_id,
                             candle_close_time,
                             linked_decision_record_id,

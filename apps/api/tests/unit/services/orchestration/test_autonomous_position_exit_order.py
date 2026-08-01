@@ -31,7 +31,7 @@ class _Db:
 async def _value(value): return value
 
 
-def _rows(*, proceeds="7.20", proof=True, step="0.00001"):
+def _rows(*, proceeds="7.20", proof=True, step="0.00001", product="BTC-USD"):
     now = datetime(2026, 8, 1, 12, tzinfo=timezone.utc); quantity = Decimal("0.00008")
     ids = {name: uuid.uuid4() for name in ("claim", "custody", "authority", "package", "activation", "preview", "risk", "audit", "decision", "account", "profile", "connection", "campaign", "mandate", "mandate_version", "buy_claim", "reconciliation")}
     evaluation = {"evaluated_at": now.isoformat(), "disposition": "EXIT_RECOMMENDED", "price_fresh": True}
@@ -42,7 +42,7 @@ def _rows(*, proceeds="7.20", proof=True, step="0.00001"):
         provider_submission_connected=False, custody_id=ids["custody"], exit_authority_id=ids["authority"], exit_authority_version=1,
         package_id=ids["package"], activation_id=ids["activation"], evaluation_integrity_hash=subject._digest(evaluation),
         profile_id=ids["profile"], account_id=ids["account"], connection_id=ids["connection"],
-        provider="kraken_spot", environment="production", product="BTC-USD",
+        provider="kraken_spot", environment="production", product=product,
         claimed_base_quantity=quantity, maximum_authorized_base_quantity=quantity,
         expected_quote_proceeds=Decimal(proceeds), originating_buy_claim_id=ids["buy_claim"],
         originating_reconciliation_event_id=ids["reconciliation"], proof_eligible=proof,
@@ -56,7 +56,7 @@ def _rows(*, proceeds="7.20", proof=True, step="0.00001"):
         audit_metadata={"latest_exit_evaluation": evaluation}, observed_remaining_quantity=quantity,
         paper_account_id=ids["account"], live_trading_profile_id=ids["profile"],
         exchange_connection_id=ids["connection"], provider="kraken_spot", environment="production",
-        product="BTC-USD", buy_claim_id=ids["buy_claim"], buy_reconciliation_event_id=ids["reconciliation"],
+        product=product, buy_claim_id=ids["buy_claim"], buy_reconciliation_event_id=ids["reconciliation"],
         proof_eligible=proof, disqualification_reason=claim.disqualification_reason,
         active_sell_order_id=None, updated_at=now,
     )
@@ -81,14 +81,16 @@ def _rows(*, proceeds="7.20", proof=True, step="0.00001"):
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("proceeds", ["5.20", "7.20"])
-async def test_valid_claim_constructs_one_nonsubmitted_canonical_sell_order(monkeypatch, proceeds):
-    now, quantity, claim, custody, authority, package, activation, asset, gets = _rows(proceeds=proceeds)
+@pytest.mark.parametrize("product", ["BTC-USD", "ETH-USD", "SOL-USD"])
+async def test_valid_claim_constructs_one_nonsubmitted_canonical_sell_order(monkeypatch, proceeds, product):
+    now, quantity, claim, custody, authority, package, activation, asset, gets = _rows(proceeds=proceeds, product=product)
     db = _Db([claim, custody, authority, package, activation, asset, None, None], gets)
     monkeypatch.setattr(subject, "compute_signed_owned_quantity", lambda **_kw: _value(quantity))
     result = await subject.construct_autonomous_exit_order(db=db, claim_id=claim.claim_id, now=now)
     order = next(row for row in db.added if isinstance(row, LiveCryptoOrder))
     assert result.order_id == order.live_crypto_order_id and result.idempotent is False
     assert order.side == "SELL" and order.exposure_effect == "REDUCE_ONLY"
+    assert order.product_id == product
     assert order.requested_base_quantity == order.normalized_base_quantity == quantity
     assert order.expected_quote_proceeds == Decimal(proceeds)
     assert order.capital_deployment_amount == 0 and order.status == "PENDING_CONFIRMATION"

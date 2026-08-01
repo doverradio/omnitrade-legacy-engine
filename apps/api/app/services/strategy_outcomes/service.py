@@ -74,6 +74,7 @@ class StrategyScorecardBucket:
 @dataclass(frozen=True, slots=True)
 class StrategyScorecard:
     strategy_slug: str
+    strategy_identity: str
     per_horizon: list[StrategyScorecardBucket]
     aggregate: StrategyScorecardBucket
     best_regime: str | None
@@ -523,6 +524,7 @@ async def fetch_strategy_scorecards(
     product_id: str,
     interval: str,
     strategy_slugs: Collection[str] | None = None,
+    strategy_identities: Collection[str] | None = None,
 ) -> list[StrategyScorecard]:
     settings = get_settings()
     regime_min_evidence_required = int(
@@ -532,6 +534,9 @@ async def fetch_strategy_scorecards(
         getattr(settings, "outcome_scorecards_max_samples_per_action_horizon", 100)
     )
     normalized_strategy_slugs = sorted({str(item).strip() for item in (strategy_slugs or ()) if str(item).strip()})
+    normalized_strategy_identities = sorted(
+        {str(item).strip() for item in (strategy_identities or ()) if str(item).strip()}
+    )
 
     # Phase-timed diagnostic instrumentation (production performance
     # investigation into fetch_strategy_scorecards() timeouts). Each phase
@@ -553,6 +558,7 @@ async def fetch_strategy_scorecards(
     ranked_outcomes = (
         select(
             StrategyRosterProposalOutcome.strategy_slug,
+            StrategyRosterProposalOutcome.strategy_identity,
             StrategyRosterProposalOutcome.action,
             StrategyRosterProposalOutcome.actual_action_correct,
             StrategyRosterProposalOutcome.actual_raw_return_pct,
@@ -567,6 +573,7 @@ async def fetch_strategy_scorecards(
             func.row_number().over(
                 partition_by=(
                     StrategyRosterProposalOutcome.strategy_slug,
+                    StrategyRosterProposalOutcome.strategy_identity,
                     StrategyRosterProposalOutcome.action,
                     StrategyRosterProposalOutcome.horizon_label,
                 ),
@@ -585,10 +592,15 @@ async def fetch_strategy_scorecards(
         ranked_outcomes = ranked_outcomes.where(
             StrategyRosterProposalOutcome.strategy_slug.in_(normalized_strategy_slugs)
         )
+    if normalized_strategy_identities:
+        ranked_outcomes = ranked_outcomes.where(
+            StrategyRosterProposalOutcome.strategy_identity.in_(normalized_strategy_identities)
+        )
     ranked_outcomes = ranked_outcomes.subquery()
     result = await db.execute(
         select(
             ranked_outcomes.c.strategy_slug,
+            ranked_outcomes.c.strategy_identity,
             ranked_outcomes.c.action,
             ranked_outcomes.c.actual_action_correct,
             ranked_outcomes.c.actual_raw_return_pct,
@@ -602,6 +614,7 @@ async def fetch_strategy_scorecards(
         .where(ranked_outcomes.c.scorecard_rank <= max_samples_per_bucket)
         .order_by(
             ranked_outcomes.c.strategy_slug.asc(),
+            ranked_outcomes.c.strategy_identity.asc(),
             ranked_outcomes.c.evaluated_at.asc(),
             ranked_outcomes.c.outcome_id.asc(),
         )
@@ -615,14 +628,14 @@ async def fetch_strategy_scorecards(
     ]
     t_hydration_done = time.perf_counter()
 
-    grouped: dict[str, list[Any]] = {}
+    grouped: dict[tuple[str, str], list[Any]] = {}
     for row in rows:
-        grouped.setdefault(row.strategy_slug, []).append(row)
+        grouped.setdefault((row.strategy_slug, row.strategy_identity), []).append(row)
     t_grouping_done = time.perf_counter()
 
     scorecards: list[StrategyScorecard] = []
-    for strategy_slug in sorted(grouped):
-        items = grouped[strategy_slug]
+    for strategy_slug, strategy_identity in sorted(grouped):
+        items = grouped[(strategy_slug, strategy_identity)]
         scored_items = [item for item in items if item.actual_action_correct is not None]
 
         horizon_accumulators: dict[str, _StrategyBucketAccumulator] = {
@@ -662,6 +675,7 @@ async def fetch_strategy_scorecards(
         scorecards.append(
             StrategyScorecard(
                 strategy_slug=strategy_slug,
+                strategy_identity=strategy_identity,
                 per_horizon=per_horizon,
                 aggregate=aggregate,
                 best_regime=best_regime,

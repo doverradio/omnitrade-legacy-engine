@@ -1177,7 +1177,7 @@ async def resolve_or_create_strategy_aggregate_evidence(
     # never a reason to leave the ambient transaction unusable for the writes
     # that follow.
     data_quality_failed = False
-    scorecard_by_slug: dict[str, Any] = {}
+    scorecard_by_identity: dict[str, Any] = {}
     scorecard_started = time.perf_counter()
     try:
         async with db.begin_nested():
@@ -1187,8 +1187,9 @@ async def resolve_or_create_strategy_aggregate_evidence(
                 product_id=product_id,
                 interval=interval,
                 strategy_slugs=[proposal.strategy_slug for proposal in proposal_snapshots],
+                strategy_identities=[proposal.strategy_identity for proposal in proposal_snapshots],
             )
-            scorecard_by_slug = {item.strategy_slug: item for item in scorecards}
+            scorecard_by_identity = {item.strategy_identity: item for item in scorecards}
     except Exception as exc:
         recovery = await _recover_session_after_scorecard_failure(db=db)
         logger.warning(
@@ -1212,7 +1213,7 @@ async def resolve_or_create_strategy_aggregate_evidence(
     proposal_inputs: list[StrategyProposalInput] = []
     for proposal in proposal_snapshots:
         outcome_evidence = None
-        scorecard = scorecard_by_slug.get(proposal.strategy_slug)
+        scorecard = scorecard_by_identity.get(proposal.strategy_identity)
         if scorecard is not None:
             outcome_evidence = StrategyOutcomeSummary(
                 sample_size=scorecard.aggregate.total_evaluated,
@@ -1340,8 +1341,8 @@ async def resolve_or_create_strategy_aggregate_evidence(
     log_event = "strategy_aggregate_failed_closed" if result.failed_closed else "strategy_aggregate_completed"
 
     logger.info(
-        "%s roster_run_id=%s campaign_id=%s candle_close=%s eligible=%s buy=%s sell=%s hold=%s action=%s reason=%s",
-        log_event, roster_run_id, campaign_id, candle_close_time.isoformat(),
+        "%s roster_run_id=%s campaign_id=%s product_id=%s candle_close=%s eligible=%s buy=%s sell=%s hold=%s action=%s reason=%s",
+        log_event, roster_run_id, campaign_id, product_id, candle_close_time.isoformat(),
         result.eligible_strategy_count, result.weighted_buy_score, result.weighted_sell_score,
         result.weighted_hold_score, result.final_action, result.explanation,
     )
