@@ -40,6 +40,13 @@ def _decimal(value: Decimal | None) -> str | None:
     return None if value is None else format(value, "f")
 
 
+def persisted_exit_evaluation(row: AutonomousPositionCustody) -> dict[str, Any]:
+    """Return the evaluator's authoritative persisted evidence without recomputing it."""
+    metadata = row.audit_metadata if isinstance(row.audit_metadata, dict) else {}
+    value = metadata.get("latest_exit_evaluation")
+    return value if isinstance(value, dict) else {}
+
+
 async def discover_due_custodies(
     *, db: AsyncSession, now: datetime, limit: int,
 ) -> list[AutonomousPositionCustody]:

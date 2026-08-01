@@ -34,6 +34,7 @@ class AutonomousCycleRequest:
     candle_id: uuid.UUID | None = None
     candle_close_time: datetime | None = None
     canonical_identity: dict[str, Any] | None = None
+    allow_paper_execution_handoff: bool = True
 
 
 @dataclass(frozen=True)

@@ -1340,6 +1340,70 @@ async def test_cycle_paper_handoff_replay_is_idempotent(monkeypatch: pytest.Monk
     assert calls["execute"] == 1
 
 
+@pytest.mark.asyncio
+async def test_cycle_can_stop_before_paper_execution_handoff(monkeypatch: pytest.MonkeyPatch) -> None:
+    db = _FakeDb()
+    mandate = _mandate()
+    version = _version()
+    db.connection = SimpleNamespace(last_readiness_verdict="READY_FOR_PREVIEW", provider="kraken_spot", environment="production")
+    _patch_happy_path(monkeypatch, mandate, version, action="BUY")
+
+    async def _execute_fail(*_args, **_kwargs):
+        raise AssertionError("paper execution handoff must remain disabled")
+
+    monkeypatch.setattr("app.services.autonomous_cycle.orchestrator.orchestrate_paper_signal_execution", _execute_fail)
+    result = await run_autonomous_preview_cycle(
+        db=db,
+        request=AutonomousCycleRequest(
+            mandate_id=mandate.mandate_id,
+            actor="operator:owner",
+            forced_action="BUY",
+            idempotency_seed="handoff-disabled-1",
+            allow_paper_execution_handoff=False,
+        ),
+    )
+
+    assert result.proposed_action == "BUY"
+    handoff = result.cycle_context["execution_handoff"]
+    assert handoff["attempted"] is False
+    assert handoff["status"] == "PAPER_EXECUTION_DISABLED"
+    assert handoff["exact_result"] == "DISABLED_BY_REQUEST"
+    assert handoff["canonical_signal"]["action"] == "BUY"
+
+
+@pytest.mark.asyncio
+async def test_cycle_mandate_evaluation_uses_observed_price_age(monkeypatch: pytest.MonkeyPatch) -> None:
+    db = _FakeDb()
+    mandate = _mandate()
+    version = _version()
+    db.connection = SimpleNamespace(last_readiness_verdict="READY_FOR_PREVIEW", provider="kraken_spot", environment="production")
+    _patch_happy_path(monkeypatch, mandate, version, action="BUY")
+    observed_ages: list[int] = []
+
+    async def _evaluate(*, request, **_kwargs):
+        observed_ages.append(request.evidence_age_seconds)
+        return SimpleNamespace(
+            evaluation_id=uuid.uuid4(),
+            approval_result="APPROVAL_SATISFIED_BY_ACTIVE_MANDATE",
+            reason_code=None,
+            deterministic_explanation=[],
+        )
+
+    monkeypatch.setattr("app.services.autonomous_cycle.orchestrator.evaluate_and_record_mandate", _evaluate)
+    await run_autonomous_preview_cycle(
+        db=db,
+        request=AutonomousCycleRequest(
+            mandate_id=mandate.mandate_id,
+            actor="operator:owner",
+            forced_action="BUY",
+            idempotency_seed="observed-price-age-1",
+            allow_paper_execution_handoff=False,
+        ),
+    )
+
+    assert observed_ages == [0]
+
+
 def test_resolve_runtime_strategy_identity_never_returns_none_for_selected_strategy() -> None:
     version = _version()
     proposal = StrategyProposal(

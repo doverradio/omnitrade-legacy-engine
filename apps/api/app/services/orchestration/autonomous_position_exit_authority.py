@@ -16,6 +16,7 @@ from app.models.audit_log import AuditLog
 from app.models.autonomous_position_custody import AutonomousPositionCustody
 from app.models.autonomous_position_exit_authority import AutonomousPositionExitAuthority
 from app.services.live.position_quantity import compute_signed_owned_quantity
+from app.services.orchestration.autonomous_position_exit_evaluation import persisted_exit_evaluation
 
 AUTHORITY_TTL = timedelta(minutes=15)
 RESERVATION_TTL = timedelta(minutes=5)
@@ -42,9 +43,7 @@ def validate_authority_transition(current: str, target: str) -> None:
 
 
 def _evaluation(row: AutonomousPositionCustody) -> dict[str, Any]:
-    metadata = row.audit_metadata if isinstance(row.audit_metadata, dict) else {}
-    value = metadata.get("latest_exit_evaluation")
-    return value if isinstance(value, dict) else {}
+    return persisted_exit_evaluation(row)
 
 
 def _digest(value: dict[str, Any]) -> str:

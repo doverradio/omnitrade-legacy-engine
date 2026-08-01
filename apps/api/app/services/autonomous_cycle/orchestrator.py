@@ -517,7 +517,7 @@ async def run_autonomous_preview_cycle(
                 consecutive_losses=0,
                 current_position_count=0,
                 risk_verdict=risk_summary.risk_verdict,
-                evidence_age_seconds=version.price_evidence_max_age_seconds,
+                evidence_age_seconds=evidence_age_minutes * 60,
                 kill_switch_engaged=False,
                 observed_at=datetime.now(timezone.utc),
                 decision_id=decision_record_id,
@@ -777,6 +777,20 @@ async def _attempt_autonomous_paper_execution_handoff(
     risk_summary: RiskEvaluationSummary,
     signal: Signal | None,
 ) -> dict[str, object]:
+    if not request.allow_paper_execution_handoff:
+        return {
+            "execution_handoff": "PAPER_EXECUTION",
+            "attempted": False,
+            "status": "PAPER_EXECUTION_DISABLED",
+            "exact_result": "DISABLED_BY_REQUEST",
+            "canonical_signal": {
+                "signal_id": None if signal is None else str(signal.id),
+                "action": proposal.action,
+                "executable": "NO",
+                "mode": "PAPER",
+            },
+        }
+
     if proposal.action == "HOLD":
         return {
             "execution_handoff": "PAPER_EXECUTION",

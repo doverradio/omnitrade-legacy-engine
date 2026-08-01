@@ -6,7 +6,7 @@ from datetime import datetime, timezone
 from decimal import Decimal, ROUND_DOWN
 from typing import Any
 
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.errors import InvalidRequestError
@@ -171,7 +171,17 @@ async def _construct_locked(*, db: AsyncSession, claim_id: uuid.UUID, now: datet
         LiveCryptoOrder.custody_id == custody.custody_id,
         LiveCryptoOrder.status.in_(OPEN_ORDER_STATES),
     ).limit(1))
-    unresolved_reconciliation = await db.scalar(select(LiveReconciliationEvent.id).where(
+    latest_reconciliations = select(
+        LiveReconciliationEvent.live_crypto_order_id.label("order_id"),
+        func.max(LiveReconciliationEvent.sequence_number).label("sequence_number"),
+    ).where(
+        LiveReconciliationEvent.live_trading_profile_id == claim.profile_id,
+    ).group_by(LiveReconciliationEvent.live_crypto_order_id).subquery()
+    unresolved_reconciliation = await db.scalar(select(LiveReconciliationEvent.id).join(
+        latest_reconciliations,
+        (latest_reconciliations.c.order_id == LiveReconciliationEvent.live_crypto_order_id)
+        & (latest_reconciliations.c.sequence_number == LiveReconciliationEvent.sequence_number),
+    ).where(
         LiveReconciliationEvent.live_trading_profile_id == claim.profile_id,
         LiveReconciliationEvent.reconciliation_status.in_(("open", "partially_filled", "reconciliation_required", "unknown", "conflict", "balance_mismatch")),
     ).limit(1))

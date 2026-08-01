@@ -6,7 +6,7 @@ from datetime import datetime, timezone
 from decimal import Decimal
 from typing import Any
 
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import get_settings
@@ -220,7 +220,17 @@ async def submit_autonomous_exit_order(
     )
     if freshly_normalized != normalized or Decimal(str(order.expected_quote_proceeds)) < Decimal(str(asset.min_order_notional)):
         _fail("Provider precision or minimum-notional evidence changed")
-    competing_reconciliation = await db.scalar(select(LiveReconciliationEvent.id).where(
+    latest_reconciliations = select(
+        LiveReconciliationEvent.live_crypto_order_id.label("order_id"),
+        func.max(LiveReconciliationEvent.sequence_number).label("sequence_number"),
+    ).where(
+        LiveReconciliationEvent.live_trading_profile_id == claim.profile_id,
+    ).group_by(LiveReconciliationEvent.live_crypto_order_id).subquery()
+    competing_reconciliation = await db.scalar(select(LiveReconciliationEvent.id).join(
+        latest_reconciliations,
+        (latest_reconciliations.c.order_id == LiveReconciliationEvent.live_crypto_order_id)
+        & (latest_reconciliations.c.sequence_number == LiveReconciliationEvent.sequence_number),
+    ).where(
         LiveReconciliationEvent.live_trading_profile_id == claim.profile_id,
         LiveReconciliationEvent.id != claim.originating_reconciliation_event_id,
         LiveReconciliationEvent.reconciliation_status.in_(("open", "partially_filled", "reconciliation_required", "unknown", "conflict", "balance_mismatch")),

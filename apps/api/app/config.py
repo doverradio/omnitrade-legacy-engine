@@ -66,6 +66,22 @@ class Settings(BaseSettings):
         default=False,
         validation_alias="AUTONOMOUS_POSITION_EXIT_SUBMISSION_ENABLED",
     )
+    autonomous_proof_sell_worker_enabled: bool = Field(
+        default=False,
+        validation_alias="AUTONOMOUS_PROOF_SELL_WORKER_ENABLED",
+    )
+    autonomous_proof_sell_campaign_id: UUID | None = Field(
+        default=None,
+        validation_alias="AUTONOMOUS_PROOF_SELL_CAMPAIGN_ID",
+    )
+    autonomous_proof_sell_campaign_version: int | None = Field(
+        default=None,
+        validation_alias="AUTONOMOUS_PROOF_SELL_CAMPAIGN_VERSION",
+    )
+    autonomous_proof_sell_runtime_campaign_id: UUID | None = Field(
+        default=None,
+        validation_alias="AUTONOMOUS_PROOF_SELL_RUNTIME_CAMPAIGN_ID",
+    )
     automatic_mandate_package_activation_enabled: bool = Field(
         default=False,
         validation_alias="AUTOMATIC_MANDATE_PACKAGE_ACTIVATION_ENABLED",

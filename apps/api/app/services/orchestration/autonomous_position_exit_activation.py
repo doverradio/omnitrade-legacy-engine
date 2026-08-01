@@ -6,7 +6,7 @@ from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 from typing import Any
 
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.errors import InvalidRequestError
@@ -200,7 +200,17 @@ async def _activate_locked(*, db: AsyncSession, authority_id: uuid.UUID, now: da
         LiveCryptoOrder.product_id == custody.product, LiveCryptoOrder.side == "SELL",
         LiveCryptoOrder.status.in_(OPEN_ORDERS),
     ).limit(1))
-    existing_reconciliation = await db.scalar(select(LiveReconciliationEvent.id).where(
+    latest_reconciliations = select(
+        LiveReconciliationEvent.live_crypto_order_id.label("order_id"),
+        func.max(LiveReconciliationEvent.sequence_number).label("sequence_number"),
+    ).where(
+        LiveReconciliationEvent.live_trading_profile_id == custody.live_trading_profile_id,
+    ).group_by(LiveReconciliationEvent.live_crypto_order_id).subquery()
+    existing_reconciliation = await db.scalar(select(LiveReconciliationEvent.id).join(
+        latest_reconciliations,
+        (latest_reconciliations.c.order_id == LiveReconciliationEvent.live_crypto_order_id)
+        & (latest_reconciliations.c.sequence_number == LiveReconciliationEvent.sequence_number),
+    ).where(
         LiveReconciliationEvent.live_trading_profile_id == custody.live_trading_profile_id,
         LiveReconciliationEvent.reconciliation_status.in_(("open", "partially_filled", "reconciliation_required", "unknown", "conflict", "balance_mismatch")),
     ).limit(1))
@@ -246,7 +256,12 @@ async def _activate_locked(*, db: AsyncSession, authority_id: uuid.UUID, now: da
         claim_owner="system:autonomous_position_exit_activation", recover_after=now + CLAIM_TTL,
         attempt_count=1,
     )
-    db.add(activation); db.add(claim)
+    # Persist the FK parent first. Both rows remain inside the caller-owned
+    # savepoint, but PostgreSQL must see the activation before the claim's
+    # immediate activation_id foreign key is checked.
+    db.add(activation)
+    await db.flush()
+    db.add(claim)
     await db.flush()
     package.package_state = "ACTIVATED"
     custody.active_sell_claim_id = claim.claim_id
