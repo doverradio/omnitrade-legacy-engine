@@ -27,6 +27,7 @@ from app.models.live_reconciliation_event import LiveReconciliationEvent
 from app.models.live_trading_profile import LiveTradingProfile
 from app.models.strategy import Strategy
 from app.models.strategy_roster_run import StrategyRosterRun
+from app.services.mandates.contracts import MANDATE_PURPOSE_PRODUCTION
 from app.services.strategies.identity import build_strategy_identity
 
 _PACKAGE_STATES = {"READY", "AUTHORIZED", "DRY_RUN_PASSED", "ACTIVATED"}
@@ -187,13 +188,14 @@ async def inspect_automatic_mandate_activation_readiness(
         .where(
             AutonomousCapitalMandate.status == "ACTIVE",
             AutonomousCapitalMandate.autonomy_level == "LEVEL_2",
+            AutonomousCapitalMandate.purpose == MANDATE_PURPOSE_PRODUCTION,
             AutonomousCapitalMandate.provider == provider,
             AutonomousCapitalMandate.exchange_environment == environment,
         )
         .order_by(AutonomousCapitalMandate.created_at.asc()).limit(2)
     )).all())
     if len(mandates) != 1:
-        reasons.append({"code": "missing_active_level2_mandate" if not mandates else "ambiguous_active_level2_mandates", "action": "Commission exactly one matching ACTIVE LEVEL_2 mandate."})
+        reasons.append({"code": "missing_active_level2_mandate" if not mandates else "ambiguous_active_level2_mandates", "action": "Commission exactly one matching ACTIVE LEVEL_2 PRODUCTION mandate."})
 
     mandate_payload = None
     if len(mandates) == 1:
@@ -297,7 +299,8 @@ async def inspect_automatic_mandate_activation_readiness(
             reasons.append({"code": "package_identity_mismatch", "action": "Generate a package whose account, profile, venue, strategy, side, product, and capital scope match the mandate."})
         mandate_payload = {
             "mandate_id": str(mandate.mandate_id), "status": mandate.status,
-            "autonomy_level": mandate.autonomy_level, "expires_at": _iso(mandate.expires_at),
+            "autonomy_level": mandate.autonomy_level, "purpose": mandate.purpose,
+            "expires_at": _iso(mandate.expires_at),
             "revoked": mandate.revoked_at is not None,
             "authorization_active": authorization is not None,
             "mandate_version_id": None if version is None else str(version.mandate_version_id),

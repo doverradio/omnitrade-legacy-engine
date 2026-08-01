@@ -18,8 +18,16 @@ class _Db:
     def __init__(self, *, rows=(), scalars=()):
         self.rows = list(rows)
         self.values = list(scalars)
+        self.compiled_sql = ""
+        self.compiled_statements = []
 
-    async def scalars(self, _statement): return _Rows(self.rows.pop(0))
+    async def scalars(self, statement):
+        self.compiled_sql = str(statement.compile(compile_kwargs={"literal_binds": True}))
+        self.compiled_statements.append(self.compiled_sql)
+        rows = self.rows.pop(0)
+        if "autonomous_capital_mandates.purpose = 'PRODUCTION'" in self.compiled_sql:
+            rows = [row for row in rows if row.purpose == "PRODUCTION"]
+        return _Rows(rows)
     async def scalar(self, _statement): return self.values.pop(0)
 
 
@@ -49,10 +57,10 @@ def _package(state="READY", *, authority=None):
     )
 
 
-def _mandate(level="LEVEL_2", *, expired=False, revoked=False):
+def _mandate(level="LEVEL_2", *, purpose="PRODUCTION", expired=False, revoked=False):
     now = datetime.now(timezone.utc)
     return SimpleNamespace(
-        mandate_id=uuid.uuid4(), status="ACTIVE", autonomy_level=level,
+        mandate_id=uuid.uuid4(), status="ACTIVE", autonomy_level=level, purpose=purpose,
         expires_at=now - timedelta(seconds=1) if expired else now + timedelta(days=1),
         revoked_at=now if revoked else None,
         capital_campaign_id=2, paper_account_id=uuid.uuid4(), live_trading_profile_id=uuid.uuid4(),
@@ -195,6 +203,29 @@ async def test_readiness_fails_closed_with_precise_reasons(monkeypatch, mandates
     )
     assert result["verdict"] == "NOT_READY"
     assert code in {item["code"] for item in result["reason_codes"]}
+
+
+@pytest.mark.asyncio
+async def test_readiness_ignores_active_controlled_proof_mandate(monkeypatch):
+    package = _package()
+    production = _mandate(purpose="PRODUCTION")
+    controlled_proof = _mandate(purpose="CONTROLLED_PROOF")
+    package.paper_account_id = production.paper_account_id
+    package.live_trading_profile_id = production.live_trading_profile_id
+    auth = _authorization(production)
+    version = _version(auth, production)
+    evaluation = _evaluation(package, production, version)
+    identity_rows = _identity_rows(package, production)
+    monkeypatch.setattr(inspection, "get_settings", lambda: _settings())
+    db = _Db(rows=[[package], [production, controlled_proof], []], scalars=[auth, version, evaluation, *identity_rows, None])
+
+    result = await inspection.inspect_automatic_mandate_activation_readiness(
+        db=db, provider="kraken_spot", environment="production", product="BTC-USD",
+    )
+
+    assert result["verdict"] == "READY_TO_ENABLE"
+    assert result["mandate"]["mandate_id"] == str(production.mandate_id)
+    assert any("autonomous_capital_mandates.purpose = 'PRODUCTION'" in sql for sql in db.compiled_statements)
 
 
 @pytest.mark.asyncio
