@@ -35,6 +35,7 @@ from app.services.pipeline_contracts.identifiers import (
     LineageReference,
     PackageId,
     ProofId,
+    ProviderFillId,
     ProviderOrderId,
 )
 from app.services.pipeline_contracts.serialization import canonical_json
@@ -70,6 +71,8 @@ class LegacySubmissionRequest(Protocol):
 class LegacyProviderOrder(Protocol):
     provider_order_id: str | None
     client_order_id: str | None
+    product_id: str | None
+    side: str | None
     status: str | None
     submitted_at: datetime | None
     acknowledged_at: datetime | None
@@ -206,12 +209,14 @@ def execution_intent_from_legacy_request(
     )
 
 
-def _safe_string_fields(values: Mapping[str, object]) -> dict[str, str]:
-    result: dict[str, str] = {}
+def _safe_typed_fields(values: Mapping[str, object]) -> list[tuple[str, str, str]]:
+    result: list[tuple[str, str, str]] = []
     for key, value in values.items():
         if not isinstance(key, str):
             raise ValueError("legacy safe detail keys must be strings")
-        result[key] = value if isinstance(value, str) else canonical_json(value)
+        if value is None:
+            raise ValueError("legacy safe detail values cannot be null")
+        result.append((key, "text", value) if isinstance(value, str) else (key, "canonical_json", canonical_json(value)))
     return result
 
 
@@ -219,15 +224,24 @@ def provider_submission_result_from_legacy(
     result: LegacySubmissionResult,
     *,
     envelope: CanonicalEnvelopeV1,
-    internal_client_order_id: str,
+    execution_intent: ExecutionIntentV1,
 ) -> ProviderSubmissionResultV1:
     """Adapt ``ExchangeOrderSubmissionResult`` without interpreting ambiguity."""
+
+    internal_client_order_id = execution_intent.internal_client_order_id
+
+    def validate_order_identity(order: LegacyProviderOrder) -> None:
+        if order.client_order_id != internal_client_order_id:
+            raise ValueError("provider result client order identity mismatch")
+        if order.product_id != execution_intent.instrument.internal_product:
+            raise ValueError("provider result product identity mismatch")
+        if order.side != execution_intent.side.value:
+            raise ValueError("provider result side mismatch")
 
     if result.classification == "success":
         if result.order is None or result.rejection is not None or result.ambiguous is not None:
             raise ValueError("contradictory successful provider result")
-        if result.order.client_order_id != internal_client_order_id:
-            raise ValueError("provider result client order identity mismatch")
+        validate_order_identity(result.order)
         return ProviderSubmissionResultV1(
             schema_version=PROVIDER_SUBMISSION_RESULT_VERSION,
             envelope=envelope,
@@ -242,15 +256,19 @@ def provider_submission_result_from_legacy(
     if result.classification == "rejected":
         if result.rejection is None or result.ambiguous is not None:
             raise ValueError("contradictory rejected provider result")
-        errors = _safe_string_fields(result.rejection.safe_details)
-        errors.update({
-            "code": result.rejection.code,
-            "message": result.rejection.message,
-            "retryable": "true" if result.rejection.retryable else "false",
-        })
+        reserved = {"code", "message", "retryable"}
+        collisions = reserved.intersection(result.rejection.safe_details)
+        if collisions:
+            raise ValueError(f"legacy safe details contain reserved keys: {sorted(collisions)}")
+        errors = _safe_typed_fields(result.rejection.safe_details)
+        errors.extend((
+            ("code", "text", result.rejection.code),
+            ("message", "text", result.rejection.message),
+            ("retryable", "text", "true" if result.rejection.retryable else "false"),
+        ))
         rejection_order = result.order
-        if rejection_order and rejection_order.client_order_id not in {None, internal_client_order_id}:
-            raise ValueError("provider result client order identity mismatch")
+        if rejection_order:
+            validate_order_identity(rejection_order)
         return ProviderSubmissionResultV1(
             schema_version=PROVIDER_SUBMISSION_RESULT_VERSION,
             envelope=envelope,
@@ -270,9 +288,9 @@ def provider_submission_result_from_legacy(
     if result.classification == "ambiguous":
         if result.ambiguous is None or result.rejection is not None:
             raise ValueError("contradictory ambiguous provider result")
-        errors = _safe_string_fields(result.ambiguous.safe_details)
-        if result.order and result.order.client_order_id not in {None, internal_client_order_id}:
-            raise ValueError("provider result client order identity mismatch")
+        errors = _safe_typed_fields(result.ambiguous.safe_details)
+        if result.order:
+            validate_order_identity(result.order)
         return ProviderSubmissionResultV1(
             schema_version=PROVIDER_SUBMISSION_RESULT_VERSION,
             envelope=envelope,
@@ -297,7 +315,7 @@ def provider_fill_reference_from_legacy(fill: LegacyProviderFill) -> ProviderFil
         raise ValueError("provider fill identity is required")
     return ProviderFillReferenceV1(
         schema_version=PROVIDER_FILL_REFERENCE_VERSION,
-        provider_fill_id=fill.provider_fill_id,
+        provider_fill_id=ProviderFillId(value=fill.provider_fill_id),
         quantity=fill.size,
         price=fill.price,
         fee_amount=fill.fee.amount if fill.fee else None,

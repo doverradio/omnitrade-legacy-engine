@@ -13,7 +13,6 @@ from decimal import Decimal
 from enum import Enum
 from collections.abc import Mapping
 from typing import Annotated, Literal
-from uuid import UUID
 
 from pydantic import BaseModel, ConfigDict, StringConstraints, field_validator, model_validator
 
@@ -24,11 +23,15 @@ from app.services.pipeline_contracts.identifiers import (
     CampaignId,
     ExecutionClaimId,
     InstrumentIdentity,
+    LiveOrderId,
     LineageAuthority,
     LineageKind,
     LineageReference,
+    MandateId,
+    MandateVersionId,
     PackageId,
     ProofId,
+    ProviderFillId,
     ProviderOrderId,
     ReconciliationId,
 )
@@ -81,8 +84,16 @@ class BtcKrakenInstrumentV1(_Contract):
     canonical_base_asset: Literal["BTC"]
     quote_asset: Literal["USD"]
     provider: Literal["kraken_spot"]
-    provider_asset_code: NonEmptyText
-    provider_pair: NonEmptyText
+    provider_asset_code: Literal["XBT", "XXBT"]
+    provider_pair: Literal["XBTUSD", "XXBTZUSD", "XBT/USD"]
+
+    @model_validator(mode="after")
+    def validate_nested_identity(self) -> "BtcKrakenInstrumentV1":
+        if self.asset_identity.symbol not in {None, "BTC"}:
+            raise ValueError("asset identity symbol must be BTC")
+        if self.instrument_identity.canonical_symbol not in {None, "BTC-USD"}:
+            raise ValueError("instrument identity symbol must be BTC-USD")
+        return self
 
 
 class CandleObservationV1(_Contract):
@@ -197,8 +208,8 @@ class GovernanceAuthorizationReferenceV1(_Contract):
     campaign_id: CampaignId
     campaign_version: int
     runtime_campaign_id: int | None = None
-    mandate_id: UUID
-    mandate_version_id: UUID
+    mandate_id: MandateId
+    mandate_version_id: MandateVersionId
     mandate_version_number: int
     authorization_evidence: LineageReference
     commissioning_evidence: LineageReference | None = None
@@ -281,7 +292,7 @@ class ProviderSubmissionResultV1(_Contract):
 
     ``safe_error_fields=None`` means no error collection was supplied, while
     ``()`` means one was supplied and was explicitly empty. Non-empty input is
-    normalized to immutable key-sorted pairs for stable canonical JSON.
+    normalized to immutable key-sorted typed entries for stable canonical JSON.
     """
 
     schema_version: Literal[PROVIDER_SUBMISSION_RESULT_VERSION]
@@ -292,7 +303,7 @@ class ProviderSubmissionResultV1(_Contract):
     provider_order_id: ProviderOrderId | None = None
     provider_status: NonEmptyText | None = None
     reason_code: NonEmptyText | None = None
-    safe_error_fields: tuple[tuple[NonEmptyText, NonEmptyText], ...] | None = None
+    safe_error_fields: tuple[tuple[NonEmptyText, Literal["text", "canonical_json"], NonEmptyText], ...] | None = None
     provider_timestamp: datetime | None = None
     reconciliation_required: bool
     blind_resubmission_permitted: Literal[False] = False
@@ -305,13 +316,21 @@ class ProviderSubmissionResultV1(_Contract):
         if value is None:
             return None
         entries = value.items() if isinstance(value, Mapping) else value
-        normalized: list[tuple[str, str]] = []
+        normalized: list[tuple[str, str, str]] = []
         seen: set[str] = set()
         try:
             for entry in entries:  # type: ignore[union-attr]
-                key, item = entry
+                if len(entry) == 2:
+                    key, item = entry
+                    value_type = "text"
+                elif len(entry) == 3:
+                    key, value_type, item = entry
+                else:
+                    raise ValueError("safe error entries must have two or three values")
                 if not isinstance(key, str) or not isinstance(item, str):
                     raise ValueError("safe error keys and values must be strings")
+                if value_type not in {"text", "canonical_json"}:
+                    raise ValueError("safe error value type is unsupported")
                 key = key.strip()
                 item = item.strip()
                 if not key or not item:
@@ -319,7 +338,7 @@ class ProviderSubmissionResultV1(_Contract):
                 if key in seen:
                     raise ValueError("safe error keys must be unique")
                 seen.add(key)
-                normalized.append((key, item))
+                normalized.append((key, value_type, item))
         except (TypeError, ValueError) as exc:
             if isinstance(exc, ValueError) and str(exc).startswith("safe error"):
                 raise
@@ -351,7 +370,7 @@ class ReconciliationStatus(str, Enum):
 
 class ProviderFillReferenceV1(_Contract):
     schema_version: Literal[PROVIDER_FILL_REFERENCE_VERSION]
-    provider_fill_id: NonEmptyText
+    provider_fill_id: ProviderFillId
     quantity: Decimal
     price: Decimal
     fee_amount: Decimal | None = None
@@ -361,11 +380,23 @@ class ProviderFillReferenceV1(_Contract):
     _validate_amounts = field_validator("quantity", "price", "fee_amount", mode="before")(_decimal)
     _validate_time = field_validator("occurred_at")(_aware)
 
+    @model_validator(mode="after")
+    def validate_fill(self) -> "ProviderFillReferenceV1":
+        if self.quantity <= 0:
+            raise ValueError("provider fill quantity must be positive")
+        if self.price <= 0:
+            raise ValueError("provider fill price must be positive")
+        if self.fee_amount is not None and self.fee_amount < 0:
+            raise ValueError("provider fill fee cannot be negative")
+        if (self.fee_amount is None) != (self.fee_asset is None):
+            raise ValueError("provider fill fee amount and asset must be present together")
+        return self
+
 
 class ReconciliationResultReferenceV1(_Contract):
     schema_version: Literal[RECONCILIATION_RESULT_REFERENCE_VERSION]
     envelope: CanonicalEnvelopeV1
-    live_order_id: UUID
+    live_order_id: LiveOrderId
     provider_order_id: ProviderOrderId | None = None
     reconciliation_id: ReconciliationId
     status: ReconciliationStatus
@@ -383,6 +414,10 @@ class ReconciliationResultReferenceV1(_Contract):
     def validate_reconciliation(self) -> "ReconciliationResultReferenceV1":
         if self.evidence.kind is not LineageKind.RECONCILIATION:
             raise ValueError("evidence must be RECONCILIATION lineage")
+        if self.filled_quantity < 0:
+            raise ValueError("reconciliation filled quantity cannot be negative")
+        if self.remaining_quantity is not None and self.remaining_quantity < 0:
+            raise ValueError("reconciliation remaining quantity cannot be negative")
         if self.status is ReconciliationStatus.FILLED and self.remaining_quantity not in {None, Decimal("0")}:
             raise ValueError("filled reconciliation cannot have remaining quantity")
         if self.status is ReconciliationStatus.PARTIALLY_FILLED:
@@ -396,7 +431,7 @@ class AccountingResultReferenceV1(_Contract):
     envelope: CanonicalEnvelopeV1
     accounting_id: AccountingId
     reconciliation_id: ReconciliationId
-    source_fill_ids: tuple[NonEmptyText, ...]
+    source_fill_ids: tuple[ProviderFillId, ...]
     gross_amount: Decimal
     fee_amount: Decimal
     fee_asset: NonEmptyText

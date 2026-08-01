@@ -53,6 +53,10 @@ class ProofId(_UUIDIdentity):
     pass
 
 
+class LiveOrderId(_UUIDIdentity):
+    pass
+
+
 class ReconciliationId(_UUIDIdentity):
     pass
 
@@ -65,11 +69,24 @@ class CampaignId(_UUIDIdentity):
     pass
 
 
+class MandateId(_UUIDIdentity):
+    pass
+
+
+class MandateVersionId(_UUIDIdentity):
+    pass
+
+
 class PortfolioId(_UUIDIdentity):
     pass
 
 
 class ProviderOrderId(BaseModel):
+    model_config = ConfigDict(frozen=True, extra="forbid")
+    value: NonEmptyText
+
+
+class ProviderFillId(BaseModel):
     model_config = ConfigDict(frozen=True, extra="forbid")
     value: NonEmptyText
 
@@ -136,10 +153,14 @@ IdentityReference = Annotated[
     | PackageId
     | ExecutionClaimId
     | ProofId
+    | LiveOrderId
     | ReconciliationId
     | AccountingId
     | CampaignId
+    | MandateId
+    | MandateVersionId
     | PortfolioId
-    | ProviderOrderId,
+    | ProviderOrderId
+    | ProviderFillId,
     Field(discriminator=None),
 ]

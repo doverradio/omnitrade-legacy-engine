@@ -11,8 +11,12 @@ from app.services.pipeline_contracts.identifiers import (
     LineageAuthority,
     LineageKind,
     LineageReference,
+    LiveOrderId,
+    MandateId,
+    MandateVersionId,
     PackageId,
     ProviderOrderId,
+    ProviderFillId,
     RunId,
 )
 
@@ -36,6 +40,18 @@ def test_provider_order_and_internal_package_identity_are_not_interchangeable() 
     assert ProviderOrderId(value="KRAKEN-ORDER-1").value == "KRAKEN-ORDER-1"
     with pytest.raises(ValidationError):
         PackageId.model_validate({"value": "KRAKEN-ORDER-1"})
+
+
+def test_mandate_live_order_and_provider_fill_identity_families_are_distinct() -> None:
+    class RequiresMandateVersion(BaseModel):
+        mandate_version_id: MandateVersionId
+
+    mandate = MandateId(value=VALUE)
+    assert mandate != MandateVersionId(value=VALUE)
+    assert LiveOrderId(value=VALUE) != MandateId(value=VALUE)
+    assert ProviderFillId(value="fill-1") != ProviderOrderId(value="fill-1")
+    with pytest.raises(ValidationError):
+        RequiresMandateVersion(mandate_version_id=mandate)
 
 
 def test_lineage_authorities_remain_distinguishable() -> None:

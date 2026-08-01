@@ -56,11 +56,15 @@ from app.services.pipeline_contracts.identifiers import (
     ExecutionClaimId,
     InstrumentId,
     InstrumentIdentity,
+    LiveOrderId,
     LineageAuthority,
     LineageKind,
     LineageReference,
+    MandateId,
+    MandateVersionId,
     PackageId,
     ProofId,
+    ProviderFillId,
     ProviderOrderId,
     ReconciliationId,
 )
@@ -128,7 +132,7 @@ def _governance(disposition: GovernanceDisposition = GovernanceDisposition.AUTHO
     return GovernanceAuthorizationReferenceV1(
         schema_version=GOVERNANCE_AUTHORIZATION_REFERENCE_VERSION, envelope=_envelope(4), disposition=disposition,
         campaign_id=CampaignId(value=_uuid(20)), campaign_version=3, runtime_campaign_id=17,
-        mandate_id=_uuid(21), mandate_version_id=_uuid(22), mandate_version_number=7,
+        mandate_id=MandateId(value=_uuid(21)), mandate_version_id=MandateVersionId(value=_uuid(22)), mandate_version_number=7,
         authorization_evidence=_lineage(LineageKind.APPROVAL), reason_code="authorized_under_active_mandate",
         recorded_at=AT,
     )
@@ -163,13 +167,13 @@ def _provider(outcome: ProviderOutcome = ProviderOutcome.ACCEPTED) -> ProviderSu
 
 def _reconciliation(status: ReconciliationStatus = ReconciliationStatus.PARTIALLY_FILLED) -> ReconciliationResultReferenceV1:
     return ReconciliationResultReferenceV1(
-        schema_version=RECONCILIATION_RESULT_REFERENCE_VERSION, envelope=_envelope(7), live_order_id=_uuid(40),
+        schema_version=RECONCILIATION_RESULT_REFERENCE_VERSION, envelope=_envelope(7), live_order_id=LiveOrderId(value=_uuid(40)),
         provider_order_id=ProviderOrderId(value="KRAKEN-1"), reconciliation_id=ReconciliationId(value=_uuid(41)),
         status=status, filled_quantity=Decimal("0.00004000"),
         remaining_quantity=Decimal("0.00006000") if status is ReconciliationStatus.PARTIALLY_FILLED else Decimal("0"),
         fills=(
-            ProviderFillReferenceV1(schema_version=PROVIDER_FILL_REFERENCE_VERSION, provider_fill_id="fill-2", quantity=Decimal("0.00002000"), price=Decimal("50010.00"), occurred_at=AT),
-            ProviderFillReferenceV1(schema_version=PROVIDER_FILL_REFERENCE_VERSION, provider_fill_id="fill-1", quantity=Decimal("0.00002000"), price=Decimal("50000.00"), occurred_at=AT),
+            ProviderFillReferenceV1(schema_version=PROVIDER_FILL_REFERENCE_VERSION, provider_fill_id=ProviderFillId(value="fill-2"), quantity=Decimal("0.00002000"), price=Decimal("50010.00"), occurred_at=AT),
+            ProviderFillReferenceV1(schema_version=PROVIDER_FILL_REFERENCE_VERSION, provider_fill_id=ProviderFillId(value="fill-1"), quantity=Decimal("0.00002000"), price=Decimal("50000.00"), occurred_at=AT),
         ),
         provider_truth_at=AT, idempotency_key="reconciliation-key-1", evidence=_lineage(LineageKind.RECONCILIATION),
     )
@@ -179,7 +183,7 @@ def _accounting() -> AccountingResultReferenceV1:
     return AccountingResultReferenceV1(
         schema_version=ACCOUNTING_RESULT_REFERENCE_VERSION, envelope=_envelope(8),
         accounting_id=AccountingId(value=_uuid(50)), reconciliation_id=ReconciliationId(value=_uuid(41)),
-        source_fill_ids=("fill-2", "fill-1"), gross_amount=Decimal("5.00000000"),
+        source_fill_ids=(ProviderFillId(value="fill-2"), ProviderFillId(value="fill-1")), gross_amount=Decimal("5.00000000"),
         fee_amount=Decimal("0.01250000"), fee_asset="USD", net_amount=Decimal("4.98750000"),
         currency="USD", realized_pnl=None, position_reference="position-1",
         evidence=_lineage(LineageKind.ACCOUNTING), recorded_at=AT,
@@ -189,7 +193,7 @@ def _accounting() -> AccountingResultReferenceV1:
 def _fill() -> ProviderFillReferenceV1:
     return ProviderFillReferenceV1(
         schema_version=PROVIDER_FILL_REFERENCE_VERSION,
-        provider_fill_id="fill-1", quantity=Decimal("0.00002000"),
+        provider_fill_id=ProviderFillId(value="fill-1"), quantity=Decimal("0.00002000"),
         price=Decimal("50000.00"), occurred_at=AT,
     )
 
@@ -238,6 +242,21 @@ def test_btc_xbt_product_pair_asset_uuid_and_quote_remain_distinct() -> None:
     assert instrument.quote_asset == "USD"
 
 
+def test_btc_kraken_instrument_rejects_contradictory_nested_identities_and_pair() -> None:
+    values = _instrument().model_dump(mode="python")
+    values["asset_identity"] = AssetIdentity(asset_id=AssetId(value=_uuid(10)), symbol="ETH")
+    with pytest.raises(ValidationError, match="must be BTC"):
+        BtcKrakenInstrumentV1.model_validate(values)
+    values = _instrument().model_dump(mode="python")
+    values["instrument_identity"] = InstrumentIdentity(
+        instrument_id=InstrumentId(value=_uuid(11)), canonical_symbol="ETH-USD"
+    )
+    with pytest.raises(ValidationError, match="BTC-USD"):
+        BtcKrakenInstrumentV1.model_validate(values)
+    with pytest.raises(ValidationError):
+        BtcKrakenInstrumentV1.model_validate({**_instrument().model_dump(), "provider_pair": "ETHUSD"})
+
+
 def test_strategy_actions_are_distinct_and_hold_is_not_execution_side() -> None:
     assert set(StrategyAction) == {StrategyAction.BUY, StrategyAction.SELL, StrategyAction.HOLD}
     assert set(ExecutionSide) == {ExecutionSide.BUY, ExecutionSide.SELL}
@@ -264,7 +283,7 @@ def test_governance_approval_rejection_and_versions_remain_distinct() -> None:
     assert approved.disposition is GovernanceDisposition.AUTHORIZED
     assert rejected.disposition is GovernanceDisposition.REJECTED
     assert approved.campaign_version == 3
-    assert approved.mandate_version_id == _uuid(22)
+    assert approved.mandate_version_id == MandateVersionId(value=_uuid(22))
     assert approved.mandate_version_number == 7
     values = approved.model_dump(mode="python")
     values["authorization_evidence"] = _lineage(LineageKind.APPROVAL, LineageAuthority.LEGACY_UNVERIFIED)
@@ -303,9 +322,9 @@ def test_safe_error_fields_are_deeply_immutable_and_detached_from_input() -> Non
     source = {"code": "EOrder:Invalid price", "category": "provider_rejection"}
     result = ProviderSubmissionResultV1.model_validate({**_provider().model_dump(), "safe_error_fields": source})
     source["code"] = "changed"
-    assert result.safe_error_fields == (("category", "provider_rejection"), ("code", "EOrder:Invalid price"))
+    assert result.safe_error_fields == (("category", "text", "provider_rejection"), ("code", "text", "EOrder:Invalid price"))
     with pytest.raises(TypeError):
-        result.safe_error_fields[0] = ("code", "changed")  # type: ignore[index]
+        result.safe_error_fields[0] = ("code", "text", "changed")  # type: ignore[index]
 
 
 def test_safe_error_fields_are_order_independent_hash_protected_and_json_compatible() -> None:
@@ -325,7 +344,7 @@ def test_safe_error_fields_are_order_independent_hash_protected_and_json_compati
     assert first.integrity_hash() == second.integrity_hash()
     assert first.integrity_hash() != changed.integrity_hash()
     assert first.integrity_hash() != changed_key.integrity_hash()
-    assert b'"safe_error_fields":[["a","first"],["z","last"]]' in first.canonical_bytes()
+    assert b'"safe_error_fields":[["a","text","first"],["z","text","last"]]' in first.canonical_bytes()
     assert ProviderSubmissionResultV1.model_validate({**_provider().model_dump(), "safe_error_fields": None}).safe_error_fields is None
     assert ProviderSubmissionResultV1.model_validate({**_provider().model_dump(), "safe_error_fields": {}}).safe_error_fields == ()
     for invalid in ({"": "value"}, {"key": ""}, {"key": 1}):
@@ -336,8 +355,8 @@ def test_safe_error_fields_are_order_independent_hash_protected_and_json_compati
 def test_reconciliation_statuses_fill_order_and_contradictions_are_preserved() -> None:
     assert {ReconciliationStatus.OPEN, ReconciliationStatus.PARTIALLY_FILLED, ReconciliationStatus.FILLED}.issubset(set(ReconciliationStatus))
     partial = _reconciliation()
-    assert partial.fills[0].provider_fill_id == "fill-2"
-    assert partial.fills[1].provider_fill_id == "fill-1"
+    assert partial.fills[0].provider_fill_id == ProviderFillId(value="fill-2")
+    assert partial.fills[1].provider_fill_id == ProviderFillId(value="fill-1")
     filled = _reconciliation(ReconciliationStatus.FILLED)
     assert filled.remaining_quantity == Decimal("0")
     with pytest.raises(ValidationError, match="cannot have remaining"):
@@ -346,9 +365,58 @@ def test_reconciliation_statuses_fill_order_and_contradictions_are_preserved() -
     assert ReconciliationStatus.OPEN is not ReconciliationStatus.RECONCILIATION_REQUIRED
 
 
+@pytest.mark.parametrize(("field", "value"), [
+    ("quantity", Decimal("0")), ("quantity", Decimal("-0.1")),
+    ("price", Decimal("0")), ("price", Decimal("-1")),
+    ("fee_amount", Decimal("-0.01")),
+])
+def test_provider_fill_rejects_nonpositive_values_and_negative_fees(field: str, value: Decimal) -> None:
+    values = _fill().model_dump(mode="python")
+    values[field] = value
+    if field == "fee_amount":
+        values["fee_asset"] = "USD"
+    with pytest.raises(ValidationError):
+        ProviderFillReferenceV1.model_validate(values)
+
+
+def test_provider_fill_fee_amount_and_asset_must_be_present_together() -> None:
+    values = _fill().model_dump(mode="python")
+    with pytest.raises(ValidationError, match="present together"):
+        ProviderFillReferenceV1.model_validate({**values, "fee_amount": Decimal("0.01")})
+    with pytest.raises(ValidationError, match="present together"):
+        ProviderFillReferenceV1.model_validate({**values, "fee_asset": "USD"})
+    valid = ProviderFillReferenceV1.model_validate({
+        **values, "fee_amount": Decimal("0.0100"), "fee_asset": "USD",
+    })
+    assert valid.fee_amount == Decimal("0.0100")
+    zero_fee = ProviderFillReferenceV1.model_validate({
+        **values, "fee_amount": Decimal("0.0000"), "fee_asset": "USD",
+    })
+    assert zero_fee.fee_amount == Decimal("0.0000")
+
+
+@pytest.mark.parametrize(("field", "value"), [
+    ("filled_quantity", Decimal("-0.1")), ("remaining_quantity", Decimal("-0.1")),
+])
+def test_reconciliation_rejects_negative_quantities(field: str, value: Decimal) -> None:
+    values = _reconciliation(ReconciliationStatus.OPEN).model_dump(mode="python")
+    values[field] = value
+    with pytest.raises(ValidationError, match="cannot be negative"):
+        ReconciliationResultReferenceV1.model_validate(values)
+
+
+def test_reconciliation_allows_coherent_zero_and_positive_quantities() -> None:
+    values = _reconciliation(ReconciliationStatus.OPEN).model_dump(mode="python")
+    zero = ReconciliationResultReferenceV1.model_validate({
+        **values, "filled_quantity": Decimal("0.0000"), "remaining_quantity": Decimal("1.0000"),
+    })
+    assert zero.filled_quantity == Decimal("0.0000")
+    assert _reconciliation().filled_quantity > 0
+
+
 def test_accounting_values_sources_and_lineage_authorities_are_exact() -> None:
     accounting = _accounting()
-    assert accounting.source_fill_ids == ("fill-2", "fill-1")
+    assert accounting.source_fill_ids == (ProviderFillId(value="fill-2"), ProviderFillId(value="fill-1"))
     assert accounting.gross_amount == Decimal("5.00000000")
     assert accounting.fee_amount == Decimal("0.01250000")
     assert accounting.fee_asset == "USD" and accounting.currency == "USD"
@@ -385,27 +453,26 @@ def test_isolated_module_import_has_no_application_side_effects() -> None:
         import sys
         import time
         import uuid
-        from pydantic import BaseModel
 
-        import app.services.pipeline_contracts.envelope
-        import app.services.pipeline_contracts.identifiers
-        import app.services.pipeline_contracts.serialization
-
-        class _WarmPydanticPluginDiscovery(BaseModel):
-            value: int
-
-        target_module = "app.services.pipeline_contracts.btc_kraken"
+        package_name = "app.services.pipeline_contracts"
+        contract_name = f"{package_name}.btc_kraken"
 
         def guard(original):
             def guarded(*args, **kwargs):
-                if sys._getframe(1).f_globals.get("__name__") == target_module:
+                caller = sys._getframe(1).f_globals.get("__name__", "")
+                if caller == package_name or caller.startswith(f"{package_name}."):
                     raise AssertionError("application-level access during btc_kraken import")
                 return original(*args, **kwargs)
             return guarded
 
         class ForbiddenApplicationImport(importlib.abc.MetaPathFinder):
             def find_spec(self, fullname, path=None, target=None):
-                if fullname.startswith(("app.db", "app.services.data", "app.services.live")):
+                if fullname.startswith((
+                    "app.api", "app.config", "app.db", "app.models",
+                    "app.services.controlled_proof", "app.services.data",
+                    "app.services.exchange_connections", "app.services.live",
+                    "app.services.orchestration",
+                )):
                     raise AssertionError(f"forbidden production import: {fullname}")
                 return None
 
@@ -420,9 +487,18 @@ def test_isolated_module_import_has_no_application_side_effects() -> None:
         pathlib.Path.open = guard(pathlib.Path.open)
         pathlib.Path.read_text = guard(pathlib.Path.read_text)
         pathlib.Path.read_bytes = guard(pathlib.Path.read_bytes)
-        sys.modules.pop(target_module, None)
-        module = importlib.import_module(target_module)
-        assert module.ProviderSubmissionResultV1.__module__ == module.__name__
+        assert package_name not in sys.modules
+        assert contract_name not in sys.modules
+        package = importlib.import_module(package_name)
+        assert contract_name in sys.modules
+        for name in (
+            "BtcKrakenInstrumentV1", "CandleObservationV1",
+            "StrategyEvaluationResultV1", "RiskDecisionReferenceV1",
+            "GovernanceAuthorizationReferenceV1", "ExecutionIntentV1",
+            "ProviderSubmissionResultV1", "ProviderFillReferenceV1",
+            "ReconciliationResultReferenceV1", "AccountingResultReferenceV1",
+        ):
+            assert isinstance(getattr(package, name), type)
         """
     )
     completed = subprocess.run(

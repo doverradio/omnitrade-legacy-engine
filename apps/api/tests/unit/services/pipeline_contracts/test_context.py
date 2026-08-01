@@ -17,6 +17,7 @@ from app.services.pipeline_contracts.context import (
     VersionManifest,
 )
 from app.services.pipeline_contracts.identifiers import CampaignId, CorrelationId, RunId
+from app.services.pipeline_contracts.serialization import integrity_sha256
 
 
 FIXED_AT = datetime(2026, 7, 15, 12, 0, tzinfo=timezone.utc)
@@ -50,6 +51,26 @@ def test_injected_clock_and_mapping_construction_are_deterministic() -> None:
     })
     assert first.effective_at == FIXED_AT
     assert first.canonical_bytes() == reordered.canonical_bytes()
+
+
+def test_version_manifest_is_deeply_immutable_detached_and_hash_stable() -> None:
+    source = {"z": "v2", "a": "v1"}
+    manifest = VersionManifest(schema_versions=source)
+    context = ExecutionContextV1.from_clock(
+        clock=FixedClock(FIXED_AT), mode=OperatingMode.UNIT_TEST, run_id=RUN_ID,
+        pipeline_version="pipeline/v1", version_manifest=manifest,
+    )
+    digest = integrity_sha256(context)
+    source["a"] = "changed"
+    assert manifest.schema_versions == (("a", "v1"), ("z", "v2"))
+    assert integrity_sha256(context) == digest
+    with pytest.raises(TypeError):
+        manifest.schema_versions[0] = ("a", "changed")  # type: ignore[index]
+    reordered = VersionManifest(schema_versions={"a": "v1", "z": "v2"})
+    assert manifest.model_dump_json() == reordered.model_dump_json()
+    changed = VersionManifest(schema_versions={"a": "v3", "z": "v2"})
+    assert integrity_sha256(manifest) != integrity_sha256(changed)
+    assert VersionManifest().schema_versions == VersionManifest(schema_versions={}).schema_versions == ()
 
 
 def test_all_governed_modes_are_descriptive_and_grant_no_authority() -> None:

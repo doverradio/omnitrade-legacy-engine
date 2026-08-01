@@ -52,6 +52,7 @@ from app.services.pipeline_contracts.identifiers import (
     LineageKind,
     LineageReference,
     PackageId,
+    ProviderFillId,
 )
 from app.services.strategies.base import Signal
 
@@ -191,14 +192,16 @@ def _submission(classification: str) -> ExchangeOrderSubmissionResult:
     [("success", ProviderOutcome.ACCEPTED), ("rejected", ProviderOutcome.REJECTED), ("ambiguous", ProviderOutcome.AMBIGUOUS)],
 )
 def test_provider_submission_classes_remain_distinct(classification: str, outcome: ProviderOutcome) -> None:
-    adapted = provider_submission_result_from_legacy(_submission(classification), envelope=_envelope(), internal_client_order_id="client-1")
+    adapted = provider_submission_result_from_legacy(
+        _submission(classification), envelope=_envelope(), execution_intent=_intent(_request()),
+    )
     assert adapted.outcome is outcome
     assert adapted.blind_resubmission_permitted is False
     if outcome is ProviderOutcome.ACCEPTED:
         assert adapted.provider_order_id is not None
     if outcome is ProviderOutcome.AMBIGUOUS:
         assert adapted.provider_order_id is None and adapted.reconciliation_required is True
-        assert ("result_keys", '["descr"]') in adapted.safe_error_fields
+        assert ("result_keys", "canonical_json", '["descr"]') in adapted.safe_error_fields
 
 
 def test_provider_mapping_order_is_deterministic_and_input_is_detached() -> None:
@@ -206,8 +209,8 @@ def test_provider_mapping_order_is_deterministic_and_input_is_detached() -> None
     rejection = _submission("rejected").rejection
     first_legacy = replace(_submission("rejected"), rejection=replace(rejection, safe_details=source))
     second_legacy = replace(_submission("rejected"), rejection=replace(rejection, safe_details={"a": "first", "z": "last"}))
-    first = provider_submission_result_from_legacy(first_legacy, envelope=_envelope(), internal_client_order_id="client-1")
-    second = provider_submission_result_from_legacy(second_legacy, envelope=_envelope(), internal_client_order_id="client-1")
+    first = provider_submission_result_from_legacy(first_legacy, envelope=_envelope(), execution_intent=_intent(_request()))
+    second = provider_submission_result_from_legacy(second_legacy, envelope=_envelope(), execution_intent=_intent(_request()))
     source["a"] = "changed"
     assert first.canonical_bytes() == second.canonical_bytes()
     assert first.integrity_hash() == second.integrity_hash()
@@ -220,11 +223,49 @@ def test_provider_contradictions_and_missing_identity_fail() -> None:
         rejection=_submission("rejected").rejection, ambiguous=None,
     )
     with pytest.raises(ValueError, match="contradictory"):
-        provider_submission_result_from_legacy(contradictory, envelope=_envelope(), internal_client_order_id="client-1")
+        provider_submission_result_from_legacy(contradictory, envelope=_envelope(), execution_intent=_intent(_request()))
     successful = _submission("success")
     missing = replace(successful, order=replace(successful.order, provider_order_id=None))
     with pytest.raises(ValidationError, match="provider_order_id"):
-        provider_submission_result_from_legacy(missing, envelope=_envelope(), internal_client_order_id="client-1")
+        provider_submission_result_from_legacy(missing, envelope=_envelope(), execution_intent=_intent(_request()))
+
+
+def test_provider_safe_details_preserve_types_and_reject_reserved_collisions() -> None:
+    structured = _submission("ambiguous")
+    literal = replace(
+        structured,
+        ambiguous=replace(structured.ambiguous, safe_details={"result_keys": '["descr"]'}),
+    )
+    structured_result = provider_submission_result_from_legacy(
+        structured, envelope=_envelope(), execution_intent=_intent(_request()),
+    )
+    literal_result = provider_submission_result_from_legacy(
+        literal, envelope=_envelope(), execution_intent=_intent(_request()),
+    )
+    assert structured_result.safe_error_fields != literal_result.safe_error_fields
+    assert structured_result.integrity_hash() != literal_result.integrity_hash()
+
+    rejected = _submission("rejected")
+    collision = replace(
+        rejected,
+        rejection=replace(rejected.rejection, safe_details={"code": "detail-code"}),
+    )
+    with pytest.raises(ValueError, match="reserved keys"):
+        provider_submission_result_from_legacy(
+            collision, envelope=_envelope(), execution_intent=_intent(_request()),
+        )
+
+
+@pytest.mark.parametrize(("field", "value", "message"), [
+    ("product_id", "ETH-USD", "product"), ("side", "SELL", "side"),
+])
+def test_provider_result_rejects_product_and_side_mismatches(field: str, value: str, message: str) -> None:
+    result = _submission("success")
+    result = replace(result, order=replace(result.order, **{field: value}))
+    with pytest.raises(ValueError, match=message):
+        provider_submission_result_from_legacy(
+            result, envelope=_envelope(), execution_intent=_intent(_request()),
+        )
 
 
 def test_provider_fill_preserves_decimal_fee_identity_time_and_order() -> None:
@@ -233,7 +274,9 @@ def test_provider_fill_preserves_decimal_fee_identity_time_and_order() -> None:
         ExchangeProviderFill("fill-1", "order-1", "BTC-USD", Decimal("0.10"), Decimal("50000.00"), None, AT),
     ]
     adapted = tuple(provider_fill_reference_from_legacy(fill) for fill in fills)
-    assert tuple(fill.provider_fill_id for fill in adapted) == ("fill-2", "fill-1")
+    assert tuple(fill.provider_fill_id for fill in adapted) == (
+        ProviderFillId(value="fill-2"), ProviderFillId(value="fill-1"),
+    )
     assert adapted[0].quantity == Decimal("0.20") and adapted[0].fee_amount == Decimal("0.01")
     assert adapted[0].fee_asset == "USD" and adapted[0].occurred_at == AT
     with pytest.raises(ValueError, match="identity"):
@@ -249,8 +292,21 @@ def test_adapter_calls_have_no_external_or_generated_state(monkeypatch: pytest.M
     monkeypatch.setattr(builtins, "open", forbidden)
     monkeypatch.setattr("uuid.uuid4", forbidden)
     monkeypatch.setattr("time.time", forbidden)
-    assert _intent(_request()).internal_client_order_id == "client-1"
-    assert provider_submission_result_from_legacy(_submission("ambiguous"), envelope=_envelope(), internal_client_order_id="client-1").outcome is ProviderOutcome.AMBIGUOUS
+    candle = NormalizedCandle(
+        open_time=AT, close_time=datetime(2026, 7, 15, 12, 15, tzinfo=timezone.utc),
+        open=Decimal("1.00"), high=Decimal("2.00"), low=Decimal("1.00"),
+        close=Decimal("2.00"), volume=Decimal("3.00"), source="kraken_spot",
+    )
+    signal = Signal(action="hold", strength=Decimal("0.40"), reason="hold", indicators={}, timestamp=AT)
+    intent = _intent(_request())
+    fill = ExchangeProviderFill(
+        "fill-1", "order-1", "BTC-USD", Decimal("0.1"), Decimal("50000"), None, AT,
+    )
+    assert candle_observation_from_legacy(candle, envelope=_envelope(), instrument=_instrument(), interval="15m").volume == Decimal("3.00")
+    assert strategy_evaluation_from_legacy(signal, envelope=_envelope(), instrument=_instrument(), strategy_identity="s", strategy_version="1").action is StrategyAction.HOLD
+    assert intent.internal_client_order_id == "client-1"
+    assert provider_submission_result_from_legacy(_submission("ambiguous"), envelope=_envelope(), execution_intent=intent).outcome is ProviderOutcome.AMBIGUOUS
+    assert provider_fill_reference_from_legacy(fill).provider_fill_id == ProviderFillId(value="fill-1")
 
 
 def test_isolated_adapter_import_has_no_application_side_effects() -> None:
