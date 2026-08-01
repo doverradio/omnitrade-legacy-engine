@@ -112,6 +112,7 @@ from app.services.orchestration.reconciliation_guard import (
     latest_reconciliation_event_per_order,
 )
 from app.services.orchestration.reconciliation_scheduler import poll_unresolved_live_orders
+from app.services.orchestration.autonomous_position_exit_evaluation import evaluate_due_custodies
 from app.services.strategy_outcomes import score_due_strategy_roster_proposal_outcomes
 from app.services.strategy_roster import StrategyRosterRequest, run_strategy_roster_for_candle
 from app.services.strategy_roster.decision_aggregator import AGGREGATE_STRATEGY_SLUG
@@ -2468,6 +2469,26 @@ async def run_orchestration_cycle(
         except Exception:
             await _rollback_active_session(db=db)
             logger.exception("live_order_reconciliation_cycle_failed")
+
+    # Restart-safe, advisory-only custody evaluation. This runs after BUY
+    # reconciliation may have established custody and before new campaign
+    # composition. It persists evidence only; it creates no SELL authority,
+    # decision, package, activation, claim, order, or provider call.
+    if hasattr(db, "scalars") and hasattr(db, "scalar") and hasattr(db, "commit"):
+        try:
+            custody_outcome = await evaluate_due_custodies(db=db)
+            await db.commit()
+            if custody_outcome.discovered:
+                logger.info(
+                    "autonomous_custody_evaluation_cycle_completed discovered=%s evaluated=%s "
+                    "blocked=%s exit_recommended=%s closed_candidate=%s",
+                    custody_outcome.discovered, custody_outcome.evaluated,
+                    custody_outcome.blocked, custody_outcome.exit_recommended,
+                    custody_outcome.closed_candidate,
+                )
+        except Exception:
+            await _rollback_active_session(db=db)
+            logger.exception("autonomous_custody_evaluation_cycle_failed")
 
     # Recovered-outcome backfill sweep: its own guarded call site,
     # deliberately independent of live-order reconciliation candidate

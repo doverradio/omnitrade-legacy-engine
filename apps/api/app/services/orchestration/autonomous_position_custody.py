@@ -403,6 +403,11 @@ async def custody_status(
     items = []
     for row in rows:
         projection = projections.get(row.custody_id)
+        raw_metadata = getattr(row, "audit_metadata", None)
+        metadata = raw_metadata if isinstance(raw_metadata, dict) else {}
+        exit_evaluation = metadata.get("latest_exit_evaluation")
+        if not isinstance(exit_evaluation, dict):
+            exit_evaluation = {}
         campaign = await db.scalar(select(CapitalCampaign).where(
             CapitalCampaign.uuid == row.runtime_campaign_id,
         ).limit(1))
@@ -434,6 +439,18 @@ async def custody_status(
             "active_sell_order_id": row.active_sell_order_id,
             "continuing_exit_authority": row.continuing_exit_authority_state,
             "sell_supervisor_connected": False,
+            "evaluation_scheduler_connected": row.latest_exit_evaluation_at is not None,
+            "evaluation_disposition": exit_evaluation.get("disposition"),
+            "price": exit_evaluation.get("price"),
+            "price_observed_at": exit_evaluation.get("price_observed_at"),
+            "price_fresh": bool(exit_evaluation.get("price_fresh", False)),
+            "estimated_net_exit_result": exit_evaluation.get("estimated_net_exit_result"),
+            "profitable_exit": bool(exit_evaluation.get("profitable_exit", False)),
+            "stop_loss_triggered": bool(exit_evaluation.get("stop_loss_triggered", False)),
+            "maximum_hold_exceeded": bool(exit_evaluation.get("maximum_hold_exceeded", False)),
+            "mandatory_safety_exit": bool(exit_evaluation.get("mandatory_safety_exit", False)),
+            "evaluation_reason_codes": exit_evaluation.get("reason_codes", []),
+            "automatic_sell_execution": False,
             "blockers": [] if projection is None else list(projection.blockers),
             "positive_inventory_supervised": bool(
                 projection is not None

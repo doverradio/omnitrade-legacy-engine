@@ -3,11 +3,14 @@ from __future__ import annotations
 import asyncio
 import os
 import uuid
+from datetime import datetime, timezone
 
 import pytest
 from sqlalchemy import text
 from sqlalchemy.exc import IntegrityError
-from sqlalchemy.ext.asyncio import create_async_engine
+from sqlalchemy.ext.asyncio import AsyncSession, create_async_engine
+
+from app.services.orchestration.autonomous_position_exit_evaluation import discover_due_custodies
 
 
 TEST_DATABASE_URL = os.getenv("OMNITRADE_CUSTODY_TEST_DATABASE_URL")
@@ -214,5 +217,33 @@ async def test_postgresql_uniqueness_and_audit_failures_roll_back_complete_hando
                 "audit_failure_id": audit_failure["custody_id"],
             })
             assert failed_rows == 0
+    finally:
+        await engine.dispose()
+
+
+async def test_postgresql_exit_evaluation_claims_skip_locked_and_recover_after_rollback() -> None:
+    engine = create_async_engine(TEST_DATABASE_URL)
+    rows = [_custody(profile_id=uuid.uuid4()), _custody(profile_id=uuid.uuid4())]
+    now = datetime.now(timezone.utc)
+    try:
+        async with engine.begin() as connection:
+            await _reset(connection)
+            await connection.execute(text("SET session_replication_role = replica"))
+            for row in rows:
+                await connection.execute(_INSERT_CUSTODY, row)
+
+        async with AsyncSession(engine, expire_on_commit=False) as first_session:
+            first = await discover_due_custodies(db=first_session, now=now, limit=1)
+            async with AsyncSession(engine, expire_on_commit=False) as second_session:
+                second = await discover_due_custodies(db=second_session, now=now, limit=1)
+                assert len(first) == len(second) == 1
+                assert first[0].custody_id != second[0].custody_id
+                await second_session.rollback()
+            await first_session.rollback()
+
+        async with AsyncSession(engine, expire_on_commit=False) as restarted_session:
+            rediscovered = await discover_due_custodies(db=restarted_session, now=now, limit=2)
+            assert {item.custody_id for item in rediscovered} == {row["custody_id"] for row in rows}
+            await restarted_session.rollback()
     finally:
         await engine.dispose()
