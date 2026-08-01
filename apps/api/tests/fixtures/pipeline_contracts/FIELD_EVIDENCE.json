@@ -1,0 +1,221 @@
+{
+  "classification_precedence": "Most specific matching field pattern wins; '*' is the explicit fallback for every otherwise unclassified leaf.",
+  "allowed_classifications": [
+    "DIRECTLY OBSERVED",
+    "DERIVED FROM CURRENT BEHAVIOR",
+    "TEST EXPECTATION FROM EXISTING COVERAGE",
+    "DOCUMENTARY ONLY",
+    "NOT YET VERIFIED"
+  ],
+  "scenarios": {
+    "buy": {
+      "executable_parity": false,
+      "sources": [
+        "apps/api/tests/integration/test_continuous_pipeline_worker.py::_automatic_cycle",
+        "apps/api/tests/integration/test_continuous_pipeline_worker.py::test_automatic_ready_package_executable_buy_creates_one_ready_package",
+        "apps/api/tests/unit/services/capital_campaign_domain/test_commissioned_entry_execution.py::_readiness_request",
+        "apps/api/tests/unit/services/capital_campaign_domain/test_commissioned_entry_execution.py::_preview_response",
+        "apps/api/tests/unit/services/capital_campaign_domain/test_commissioned_entry_execution.py::test_execute_success_transitions_to_buy_reconciliation_pending"
+      ],
+      "field_rules": {
+        "scenario": "TEST EXPECTATION FROM EXISTING COVERAGE",
+        "decimal_fields.requested_notional_usd": "TEST EXPECTATION FROM EXISTING COVERAGE",
+        "expected.action": "DERIVED FROM CURRENT BEHAVIOR",
+        "expected.transitions": "DOCUMENTARY ONLY",
+        "expected.provider_submission_count": "TEST EXPECTATION FROM EXISTING COVERAGE",
+        "*": "DOCUMENTARY ONLY"
+      }
+    },
+    "hold": {
+      "executable_parity": false,
+      "sources": [
+        "apps/api/tests/unit/services/autonomous_cycle/test_orchestrator.py::test_hold_proposal_does_not_generate_preview",
+        "apps/api/tests/unit/services/autonomous_cycle/test_orchestrator.py::test_cycle_hold_does_not_attempt_paper_execution"
+      ],
+      "field_rules": {
+        "scenario": "TEST EXPECTATION FROM EXISTING COVERAGE",
+        "expected.action": "TEST EXPECTATION FROM EXISTING COVERAGE",
+        "expected.provider_submission_count": "TEST EXPECTATION FROM EXISTING COVERAGE",
+        "*": "DOCUMENTARY ONLY"
+      }
+    },
+    "risk_rejection": {
+      "executable_parity": false,
+      "sources": [
+        "apps/api/tests/unit/services/autonomous_cycle/test_orchestrator.py::test_risk_rejection_blocks_preview",
+        "apps/api/tests/unit/services/capital_campaign_domain/test_commissioned_entry_execution.py::test_risk_veto_blocks_provider_submission"
+      ],
+      "field_rules": {
+        "expected.action": "DERIVED FROM CURRENT BEHAVIOR",
+        "expected.reason_code": "TEST EXPECTATION FROM EXISTING COVERAGE",
+        "expected.provider_submission_count": "TEST EXPECTATION FROM EXISTING COVERAGE",
+        "decimal_fields.approved_notional_usd": "TEST EXPECTATION FROM EXISTING COVERAGE",
+        "*": "DOCUMENTARY ONLY"
+      }
+    },
+    "risk_resize": {
+      "executable_parity": false,
+      "sources": [
+        "apps/api/tests/unit/services/controlled_proof/test_service.py::test_evaluate_controlled_proof_risk_resize_never_reports_full_notional",
+        "apps/api/app/services/controlled_proof/service.py::evaluate_controlled_proof_risk"
+      ],
+      "field_rules": {
+        "expected.action": "DERIVED FROM CURRENT BEHAVIOR",
+        "expected.reason_code": "TEST EXPECTATION FROM EXISTING COVERAGE",
+        "decimal_fields.requested_notional_usd": "TEST EXPECTATION FROM EXISTING COVERAGE",
+        "decimal_fields.approved_notional_usd": "TEST EXPECTATION FROM EXISTING COVERAGE",
+        "decimal_fields.reference_price": "TEST EXPECTATION FROM EXISTING COVERAGE",
+        "decimal_fields.approved_quantity": "TEST EXPECTATION FROM EXISTING COVERAGE",
+        "*": "DOCUMENTARY ONLY"
+      }
+    },
+    "governance_rejection": {
+      "executable_parity": false,
+      "sources": [
+        "apps/api/tests/unit/services/autonomous_cycle/test_orchestrator.py::test_cycle_holds_when_exact_version_authorization_missing",
+        "apps/api/tests/unit/services/autonomous_cycle/test_orchestrator.py::test_mandate_rejection_blocks_preview"
+      ],
+      "field_rules": {
+        "expected.action": "DERIVED FROM CURRENT BEHAVIOR",
+        "expected.reason_code": "TEST EXPECTATION FROM EXISTING COVERAGE",
+        "expected.provider_submission_count": "TEST EXPECTATION FROM EXISTING COVERAGE",
+        "*": "DOCUMENTARY ONLY"
+      }
+    },
+    "sell": {
+      "executable_parity": false,
+      "sources": [
+        "apps/api/tests/unit/services/capital_campaign_domain/test_commissioned_entry_execution.py::test_exit_recommendation_profitable_sell_and_risk_called",
+        "apps/api/app/services/capital_campaign_domain/commissioned_entry_execution.py::recommend_commissioned_exit"
+      ],
+      "field_rules": {
+        "expected.action": "TEST EXPECTATION FROM EXISTING COVERAGE",
+        "expected.reason_code": "TEST EXPECTATION FROM EXISTING COVERAGE",
+        "decimal_fields.*": "TEST EXPECTATION FROM EXISTING COVERAGE",
+        "expected.provider_submission_count": "DOCUMENTARY ONLY",
+        "*": "DOCUMENTARY ONLY"
+      }
+    },
+    "provider_rejection": {
+      "executable_parity": true,
+      "sources": [
+        "apps/api/app/services/exchange_connections/providers/kraken_spot.py::KrakenSpotClient.submit_order",
+        "apps/api/tests/services/exchange_connections/test_provider_conformance_kraken.py::test_conformance_20_submission_explicit_rejection_classification"
+      ],
+      "field_rules": {
+        "expected.provider_outcome": "DIRECTLY OBSERVED",
+        "expected.provider_submission_classification": "DIRECTLY OBSERVED",
+        "expected.provider_submission_count": "DIRECTLY OBSERVED",
+        "expected.reason_code": "NOT YET VERIFIED",
+        "*": "DOCUMENTARY ONLY"
+      }
+    },
+    "provider_timeout_before_confirmation": {
+      "executable_parity": false,
+      "sources": [
+        "apps/api/tests/unit/services/capital_campaign_domain/test_commissioned_entry_execution.py::test_execute_ambiguous_timeout_enters_reconciliation_required",
+        "apps/api/app/services/capital_campaign_domain/commissioned_entry_execution.py::execute_commissioned_entry"
+      ],
+      "field_rules": {
+        "expected.provider_submission_classification": "TEST EXPECTATION FROM EXISTING COVERAGE",
+        "expected.transitions": "TEST EXPECTATION FROM EXISTING COVERAGE",
+        "expected.provider_submission_count": "DERIVED FROM CURRENT BEHAVIOR",
+        "expected.retry_policy": "DOCUMENTARY ONLY",
+        "*": "DOCUMENTARY ONLY"
+      }
+    },
+    "ambiguous_provider_result": {
+      "executable_parity": true,
+      "sources": [
+        "apps/api/app/services/exchange_connections/providers/kraken_spot.py::KrakenSpotClient.submit_order",
+        "apps/api/tests/services/exchange_connections/test_provider_conformance_kraken.py::test_conformance_21_submission_missing_provider_identity_is_ambiguous"
+      ],
+      "field_rules": {
+        "expected.provider_outcome": "DIRECTLY OBSERVED",
+        "expected.reason_code": "DIRECTLY OBSERVED",
+        "expected.provider_submission_count": "DIRECTLY OBSERVED",
+        "expected.retry_policy": "DOCUMENTARY ONLY",
+        "*": "DOCUMENTARY ONLY"
+      }
+    },
+    "partial_or_delayed_order": {
+      "executable_parity": true,
+      "sources": [
+        "apps/api/app/services/live/accounting_reconciliation.py::record_live_fill_reconciliation",
+        "apps/api/tests/unit/services/live/test_live_accounting_reconciliation.py::_execution_event",
+        "apps/api/tests/unit/services/live/test_live_accounting_reconciliation.py::_fill_request",
+        "apps/api/tests/unit/services/live/test_live_accounting_reconciliation.py::test_fill_reconciliation_records_partial_fill_and_fee_attribution"
+      ],
+      "field_rules": {
+        "expected.provider_outcome": "DIRECTLY OBSERVED",
+        "expected.database_effects": "DERIVED FROM CURRENT BEHAVIOR",
+        "expected.provider_submission_count": "DIRECTLY OBSERVED",
+        "decimal_fields.*": "NOT YET VERIFIED",
+        "*": "DOCUMENTARY ONLY"
+      }
+    },
+    "reconciliation": {
+      "executable_parity": true,
+      "sources": [
+        "apps/api/app/services/live/accounting_reconciliation.py::record_live_fill_reconciliation",
+        "apps/api/tests/unit/services/live/test_live_accounting_reconciliation.py::_execution_event",
+        "apps/api/tests/unit/services/live/test_live_accounting_reconciliation.py::_fill_request",
+        "apps/api/tests/unit/services/live/test_live_accounting_reconciliation.py::test_fill_reconciliation_is_idempotent_and_replays_accounting_record_ids"
+      ],
+      "field_rules": {
+        "expected.idempotency.duplicate_fill_replays_existing_ids": "DIRECTLY OBSERVED",
+        "expected.database_effects": "DERIVED FROM CURRENT BEHAVIOR",
+        "expected.provider_submission_count": "DIRECTLY OBSERVED",
+        "expected.idempotency.terminal_state_must_not_regress": "TEST EXPECTATION FROM EXISTING COVERAGE",
+        "decimal_fields.*": "NOT YET VERIFIED",
+        "*": "DOCUMENTARY ONLY"
+      }
+    },
+    "accounting": {
+      "executable_parity": true,
+      "sources": [
+        "apps/api/app/services/live/accounting_reconciliation.py::record_live_fill_reconciliation",
+        "apps/api/tests/unit/services/live/test_live_accounting_reconciliation.py::_execution_event",
+        "apps/api/tests/unit/services/live/test_live_accounting_reconciliation.py::_fill_request",
+        "apps/api/tests/unit/services/live/test_live_accounting_reconciliation.py::test_fill_reconciliation_fee_and_net_cash_impact_for_buy_and_sell"
+      ],
+      "field_rules": {
+        "expected.idempotency.duplicate_fill_replays_existing_ids": "DIRECTLY OBSERVED",
+        "expected.database_effects": "DERIVED FROM CURRENT BEHAVIOR",
+        "expected.provider_submission_count": "DIRECTLY OBSERVED",
+        "lineage_authority.*": "DERIVED FROM CURRENT BEHAVIOR",
+        "decimal_fields.*": "NOT YET VERIFIED",
+        "*": "DOCUMENTARY ONLY"
+      }
+    },
+    "controlled_proof": {
+      "executable_parity": false,
+      "sources": [
+        "apps/api/tests/unit/services/controlled_proof/test_service.py::test_create_requires_full_readiness_and_returns_server_scope",
+        "apps/api/tests/unit/services/controlled_proof/test_service.py::test_link_entry_and_package_are_idempotent_no_duplicate_buy",
+        "apps/api/tests/unit/services/controlled_proof/test_service.py::test_status_view_computes_profit_verdict_from_real_fills",
+        "apps/api/tests/unit/services/controlled_proof/test_service.py::test_service_module_never_references_provider_submission"
+      ],
+      "field_rules": {
+        "expected.action": "DOCUMENTARY ONLY",
+        "expected.provider_submission_count": "DOCUMENTARY ONLY",
+        "decimal_fields.*": "DOCUMENTARY ONLY",
+        "*": "DOCUMENTARY ONLY"
+      }
+    },
+    "exit_recovery": {
+      "executable_parity": false,
+      "sources": [
+        "apps/api/tests/unit/services/controlled_proof/test_exit_recovery.py::test_authorization_is_idempotent_and_preserves_terminal_proof",
+        "apps/api/tests/unit/services/controlled_proof/test_exit_recovery.py::test_reconciled_filled_sell_completes_recovery_without_rewriting_proof_idempotently",
+        "apps/api/tests/unit/services/controlled_proof/test_exit_recovery.py::test_potentially_filled_or_ambiguous_lineage_still_blocks_replacement"
+      ],
+      "field_rules": {
+        "decimal_fields.net_pnl_usd": "TEST EXPECTATION FROM EXISTING COVERAGE",
+        "expected.idempotency.*": "TEST EXPECTATION FROM EXISTING COVERAGE",
+        "expected.provider_submission_count": "DOCUMENTARY ONLY",
+        "*": "DOCUMENTARY ONLY"
+      }
+    }
+  }
+}

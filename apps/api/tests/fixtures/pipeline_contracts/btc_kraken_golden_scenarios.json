@@ -1,0 +1,119 @@
+{
+  "fixture_version": "phase1-commit1-v1",
+  "scope": "authoritative-btc-kraken-baseline",
+  "scenarios": [
+    {
+      "scenario": "buy",
+      "occurred_at": "2026-07-15T12:00:00+00:00",
+      "identifiers": {"cycle_id": "10000000-0000-4000-8000-000000000001", "decision_id": "20000000-0000-4000-8000-000000000001", "risk_event_id": "30000000-0000-4000-8000-000000000001", "campaign_id": "40000000-0000-4000-8000-000000000001", "mandate_id": "50000000-0000-4000-8000-000000000001", "package_id": "60000000-0000-4000-8000-000000000001", "claim_id": "70000000-0000-4000-8000-000000000001", "client_order_id": "80000000-0000-4000-8000-000000000001"},
+      "decimal_fields": {"requested_notional_usd": "5.00", "approved_notional_usd": "5.00", "reference_price": "100000.00", "base_quantity": "0.00005000"},
+      "expected": {"action": "BUY", "reason_code": "risk_approved", "explanation": ["strategy_buy", "risk_approved", "governance_authorized"], "transitions": ["READY", "AUTHORIZED", "DRY_RUN_PASSED", "ACTIVATED", "BUY_PENDING", "BUY_SUBMITTED", "BUY_RECONCILIATION_PENDING"], "events": ["decision_recorded", "risk_recorded", "mandate_evaluated", "package_activated", "execution_claimed", "provider_submission_attempted"], "provider_submission_count": 1, "provider_outcome": "acknowledged", "database_effects": ["decision_record_insert", "risk_event_insert", "mandate_evaluation_insert", "package_state_updates", "execution_claim_insert", "live_order_insert", "execution_event_insert"], "external_side_effects": ["kraken_submit_order_once"]},
+      "limitations": ["freezes the seam contract, not a live Kraken response"]
+    },
+    {
+      "scenario": "hold",
+      "occurred_at": "2026-07-15T12:15:00+00:00",
+      "identifiers": {"cycle_id": "10000000-0000-4000-8000-000000000002", "decision_id": "20000000-0000-4000-8000-000000000002"},
+      "decimal_fields": {"signal_strength": "0.40", "requested_notional_usd": "0.00"},
+      "expected": {"action": "HOLD", "reason_code": "hold_action", "explanation": ["strategy_hold_signal"], "transitions": ["STARTED", "HOLD_NO_TRADE", "COMPLETED"], "events": ["decision_recorded"], "provider_submission_count": 0, "provider_outcome": "not_called", "database_effects": ["cycle_terminal_update", "decision_record_insert"], "external_side_effects": []},
+      "limitations": ["does not represent the generic paper loop"]
+    },
+    {
+      "scenario": "risk_rejection",
+      "occurred_at": "2026-07-15T12:30:00+00:00",
+      "identifiers": {"cycle_id": "10000000-0000-4000-8000-000000000003", "decision_id": "20000000-0000-4000-8000-000000000003", "risk_event_id": "30000000-0000-4000-8000-000000000003"},
+      "decimal_fields": {"requested_notional_usd": "5.00", "approved_notional_usd": "0.00", "account_equity": "25.00"},
+      "expected": {"action": "HOLD", "reason_code": "risk_veto", "explanation": ["risk_veto"], "transitions": ["STARTED", "VETOED", "HOLD_NO_TRADE"], "events": ["decision_recorded", "risk_recorded"], "provider_submission_count": 0, "provider_outcome": "not_called", "database_effects": ["risk_event_insert", "cycle_terminal_update", "decision_record_insert"], "external_side_effects": []},
+      "limitations": ["one representative veto; individual Risk rules retain their existing unit coverage"]
+    },
+    {
+      "scenario": "risk_resize",
+      "occurred_at": "2026-07-15T12:45:00+00:00",
+      "identifiers": {"cycle_id": "10000000-0000-4000-8000-000000000004", "risk_event_id": "30000000-0000-4000-8000-000000000004"},
+      "decimal_fields": {"requested_notional_usd": "5.00", "approved_notional_usd": "1.00", "reference_price": "100.00", "approved_quantity": "0.01"},
+      "expected": {"action": "BUY", "reason_code": "position_resized_by_risk_engine", "explanation": ["risk_resize_applied"], "transitions": ["RISK_EVALUATED", "RESIZE"], "events": ["risk_recorded"], "provider_submission_count": 0, "provider_outcome": "not_represented_at_this_seam", "database_effects": ["risk_event_insert"], "external_side_effects": []},
+      "limitations": ["current authoritative evidence supports resize; no delayed-order verdict is frozen"]
+    },
+    {
+      "scenario": "governance_rejection",
+      "occurred_at": "2026-07-15T13:00:00+00:00",
+      "identifiers": {"cycle_id": "10000000-0000-4000-8000-000000000005", "decision_id": "20000000-0000-4000-8000-000000000005", "campaign_id": "40000000-0000-4000-8000-000000000005", "mandate_id": "50000000-0000-4000-8000-000000000005", "mandate_version_id": "51000000-0000-4000-8000-000000000005"},
+      "decimal_fields": {"requested_notional_usd": "5.00", "approved_notional_usd": "5.00"},
+      "expected": {"action": "HOLD", "reason_code": "active_mandate_policy_requires_authorized_version", "explanation": ["mandate_rejected"], "transitions": ["RISK_APPROVED", "GOVERNANCE_REJECTED", "HOLD_NO_TRADE"], "events": ["decision_recorded", "risk_recorded", "mandate_evaluated"], "provider_submission_count": 0, "provider_outcome": "not_called", "database_effects": ["mandate_evaluation_insert", "cycle_terminal_update", "decision_record_insert"], "external_side_effects": []},
+      "limitations": ["represents exact-version rejection; commissioning and paused-campaign variants remain in existing tests"]
+    },
+    {
+      "scenario": "sell",
+      "occurred_at": "2026-07-15T13:15:00+00:00",
+      "identifiers": {"proof_id": "90000000-0000-4000-8000-000000000006", "decision_id": "20000000-0000-4000-8000-000000000006", "risk_event_id": "30000000-0000-4000-8000-000000000006", "package_id": "60000000-0000-4000-8000-000000000006", "claim_id": "70000000-0000-4000-8000-000000000006", "client_order_id": "80000000-0000-4000-8000-000000000006"},
+      "decimal_fields": {"owned_quantity": "0.0002", "approved_quantity": "0.0002", "entry_price": "50000", "current_price": "60000", "expected_net_realized_pnl": "2.0"},
+      "expected": {"action": "SELL_NOW", "reason_code": "Profitable now.", "explanation": ["position_lifecycle_sell", "risk_approved", "governance_authorized"], "transitions": ["ACTIVE_POSITION", "SELL_EVALUATION", "SELL_PENDING", "SELL_SUBMITTED", "SELL_RECONCILIATION_PENDING"], "events": ["sell_decision_recorded", "risk_recorded", "sell_package_activated", "execution_claimed", "provider_submission_attempted"], "provider_submission_count": 1, "provider_outcome": "acknowledged", "database_effects": ["decision_record_insert", "risk_event_insert", "sell_package_state_updates", "execution_claim_insert", "live_order_insert"], "external_side_effects": ["kraken_submit_order_once"]},
+      "limitations": ["uses Controlled Proof lineage to freeze the governed production SELL seam"]
+    },
+    {
+      "scenario": "provider_rejection",
+      "occurred_at": "2026-07-15T13:30:00+00:00",
+      "identifiers": {"package_id": "60000000-0000-4000-8000-000000000007", "claim_id": "70000000-0000-4000-8000-000000000007", "client_order_id": "80000000-0000-4000-8000-000000000007"},
+      "decimal_fields": {"requested_notional_usd": "5.00", "requested_quantity": "0.00005000"},
+      "expected": {"action": "BUY", "reason_code": "invalid_arguments", "explanation": ["explicit_provider_rejection"], "transitions": ["BUY_PENDING", "CANCELLED"], "events": ["provider_submission_attempted", "provider_rejection_recorded"], "provider_submission_count": 1, "provider_outcome": "rejected", "provider_submission_classification": "rejected", "database_effects": ["live_order_terminal_update", "provider_rejection_audit_insert"], "external_side_effects": ["kraken_submit_order_once"]},
+      "limitations": ["safe rejection payload only; no credentials or raw secret-bearing response"]
+    },
+    {
+      "scenario": "provider_timeout_before_confirmation",
+      "occurred_at": "2026-07-15T13:45:00+00:00",
+      "identifiers": {"package_id": "60000000-0000-4000-8000-000000000008", "claim_id": "70000000-0000-4000-8000-000000000008", "client_order_id": "80000000-0000-4000-8000-000000000008"},
+      "decimal_fields": {"requested_notional_usd": "5.00"},
+      "expected": {"action": "BUY", "reason_code": "ambiguous_submission", "explanation": ["submission_confirmation_not_received"], "transitions": ["BUY_PENDING", "RECONCILIATION_REQUIRED"], "events": ["provider_submission_attempted", "submission_outcome_uncertain"], "provider_submission_count": 1, "provider_outcome": "timeout_before_confirmation", "provider_submission_classification": "ambiguous_submission", "retry_policy": "reconcile_by_client_order_id_before_any_resubmit", "database_effects": ["live_order_uncertain_update", "reconciliation_required_audit_insert"], "external_side_effects": ["kraken_submit_order_attempted_once"]},
+      "limitations": ["transport timeout cannot prove whether Kraken received the request; therefore it is not permission to resubmit"]
+    },
+    {
+      "scenario": "ambiguous_provider_result",
+      "occurred_at": "2026-07-15T14:00:00+00:00",
+      "identifiers": {"package_id": "60000000-0000-4000-8000-000000000009", "claim_id": "70000000-0000-4000-8000-000000000009", "client_order_id": "80000000-0000-4000-8000-000000000009"},
+      "decimal_fields": {"requested_notional_usd": "5.00"},
+      "expected": {"action": "BUY", "reason_code": "missing_provider_order_id", "explanation": ["provider_response_missing_identity"], "transitions": ["BUY_PENDING", "RECONCILIATION_REQUIRED"], "events": ["provider_submission_attempted", "ambiguous_provider_result_recorded"], "provider_submission_count": 1, "provider_outcome": "ambiguous_after_possible_submission", "retry_policy": "lookup_by_client_order_id_and_reconcile; never_blind_resubmit", "database_effects": ["live_order_uncertain_update", "reconciliation_required_audit_insert"], "external_side_effects": ["kraken_submit_order_attempted_once"]},
+      "limitations": ["provider order ID is intentionally absent"]
+    },
+    {
+      "scenario": "partial_or_delayed_order",
+      "occurred_at": "2026-07-15T14:15:00+00:00",
+      "identifiers": {"live_order_id": "a0000000-0000-4000-8000-000000000010", "provider_order_id": "KRAKEN-ORDER-PARTIAL-10", "client_order_id": "80000000-0000-4000-8000-000000000010"},
+      "decimal_fields": {"requested_quantity": "0.00005000", "filled_quantity": "0.00002000", "remaining_quantity": "0.00003000", "average_fill_price": "100100.00", "fee_usd": "0.00500400"},
+      "expected": {"action": "BUY", "reason_code": "provider_order_partially_filled", "explanation": ["awaiting_remaining_fill"], "transitions": ["SUBMITTED", "PARTIALLY_FILLED", "RECONCILIATION_PENDING"], "events": ["order_reconciled_partial", "fill_reconciled"], "provider_submission_count": 0, "provider_query_count": 1, "provider_outcome": "partially_filled", "database_effects": ["reconciliation_event_insert", "partial_fill_accounting_insert", "fee_attribution_insert"], "external_side_effects": ["kraken_lookup_order_once", "kraken_list_fills_once"]},
+      "limitations": ["represents one observation; later polls may append newer events"]
+    },
+    {
+      "scenario": "reconciliation",
+      "occurred_at": "2026-07-15T14:30:00+00:00",
+      "identifiers": {"live_order_id": "a0000000-0000-4000-8000-000000000011", "reconciliation_id": "b0000000-0000-4000-8000-000000000011", "provider_order_id": "KRAKEN-ORDER-FILLED-11", "provider_fill_id": "KRAKEN-FILL-11"},
+      "decimal_fields": {"filled_quantity": "0.00005000", "average_fill_price": "100000.00", "gross_quote": "5.00000000", "fee_usd": "0.01250000"},
+      "expected": {"action": "BUY", "reason_code": "provider_order_filled", "explanation": ["provider_reality_confirmed"], "transitions": ["RECONCILIATION_PENDING", "FILLED", "RECONCILED"], "events": ["order_reconciled", "fill_reconciled"], "provider_submission_count": 0, "provider_query_count": 1, "provider_outcome": "filled", "idempotency": {"duplicate_fill_replays_existing_ids": true, "terminal_state_must_not_regress": true}, "database_effects": ["reconciliation_event_insert", "partial_fill_accounting_insert", "fee_attribution_insert"], "external_side_effects": ["kraken_lookup_order_once", "kraken_list_fills_once"]},
+      "limitations": ["Risk and approval lineage may be synthetic when absent upstream and must remain marked non-authoritative"]
+    },
+    {
+      "scenario": "accounting",
+      "occurred_at": "2026-07-15T14:45:00+00:00",
+      "identifiers": {"live_order_id": "a0000000-0000-4000-8000-000000000012", "reconciliation_id": "b0000000-0000-4000-8000-000000000012", "accounting_id": "c0000000-0000-4000-8000-000000000012", "provider_fill_id": "KRAKEN-FILL-12", "risk_event_id": "d0000000-0000-4000-8000-000000000012", "approval_event_id": "e0000000-0000-4000-8000-000000000012"},
+      "lineage_authority": {"risk_event_id": "synthetic_non_authoritative_when_upstream_missing", "approval_event_id": "synthetic_non_authoritative_when_upstream_missing"},
+      "decimal_fields": {"filled_quantity": "0.00005000", "fill_price": "100000.00", "gross_cash_impact": "-5.00000000", "fee_usd": "0.01250000", "net_cash_impact": "-5.01250000"},
+      "expected": {"action": "BUY", "reason_code": "fill_accounted", "explanation": ["accounting_uses_reconciled_fill_truth"], "transitions": ["FILL_RECONCILED", "ACCOUNTED"], "events": ["fill_reconciled", "accounting_recorded", "fee_attributed"], "provider_submission_count": 0, "provider_outcome": "not_called", "idempotency": {"duplicate_fill_replays_existing_ids": true}, "database_effects": ["reconciliation_event_insert", "partial_fill_accounting_insert", "fee_attribution_insert"], "external_side_effects": []},
+      "limitations": ["synthetic lineage values preserve a known gap and are not verified upstream authority"]
+    },
+    {
+      "scenario": "controlled_proof",
+      "occurred_at": "2026-07-15T15:00:00+00:00",
+      "identifiers": {"proof_id": "90000000-0000-4000-8000-000000000013", "campaign_id": "40000000-0000-4000-8000-000000000013", "mandate_id": "50000000-0000-4000-8000-000000000013", "buy_package_id": "61000000-0000-4000-8000-000000000013", "sell_package_id": "62000000-0000-4000-8000-000000000013", "buy_live_order_id": "a1000000-0000-4000-8000-000000000013", "sell_live_order_id": "a2000000-0000-4000-8000-000000000013"},
+      "decimal_fields": {"authorized_notional_usd": "5.00", "bought_quantity": "0.00005000", "sold_quantity": "0.00005000", "buy_fee_usd": "0.01250000", "sell_fee_usd": "0.01265625", "net_pnl_usd": "0.03734375"},
+      "expected": {"action": "ROUND_TRIP", "reason_code": "controlled_proof_completed", "explanation": ["exact_mandate_scope", "buy_reconciled", "sell_reconciled", "accounting_complete"], "transitions": ["REQUESTED", "CLAIMED", "ENTRY_PROPOSED", "BUY_SUBMITTED", "ACTIVE_POSITION", "SELL_SUBMITTED", "COMPLETED"], "events": ["proof_created", "proof_claimed", "buy_linked", "buy_reconciled", "sell_linked", "sell_reconciled", "terminal_verdict_recorded"], "provider_submission_count": 2, "provider_outcome": "fake_provider_buy_and_sell_acknowledged", "database_effects": ["proof_insert", "audit_inserts", "buy_and_sell_lineage_updates", "terminal_projection_update"], "external_side_effects": ["fake_kraken_submit_buy_once", "fake_kraken_submit_sell_once"]},
+      "limitations": ["fixture represents fake-provider lifecycle; PostgreSQL concurrency behavior stays in existing tests"]
+    },
+    {
+      "scenario": "exit_recovery",
+      "occurred_at": "2026-07-15T15:15:00+00:00",
+      "identifiers": {"proof_id": "90000000-0000-4000-8000-000000000014", "recovery_id": "f0000000-0000-4000-8000-000000000014", "sell_package_id": "62000000-0000-4000-8000-000000000014", "claim_id": "70000000-0000-4000-8000-000000000014", "sell_live_order_id": "a2000000-0000-4000-8000-000000000014", "provider_order_id": "KRAKEN-RECOVERY-SELL-14"},
+      "decimal_fields": {"owned_quantity": "0.00005000", "sold_quantity": "0.00005000", "net_pnl_usd": "0.17"},
+      "expected": {"action": "SELL", "reason_code": "exit_recovery_completed", "explanation": ["verified_owned_exposure", "governed_recovery_sell", "reconciled_filled_sell", "accounting_complete"], "transitions": ["AUTHORIZED", "IN_PROGRESS", "SELL_PACKAGE_LINKED", "SELL_SUBMITTED", "SELL_RECONCILED", "COMPLETED"], "events": ["recovery_authorized", "recovery_claimed", "sell_package_linked", "provider_submission_attempted", "sell_reconciled", "recovery_completed"], "provider_submission_count": 1, "provider_outcome": "fake_provider_acknowledged", "idempotency": {"authorization_replay_returns_same_recovery": true, "ambiguous_lineage_blocks_replacement": true}, "database_effects": ["recovery_insert", "audit_inserts", "sell_lineage_updates", "recovery_terminal_update", "proof_recovered_projection_update"], "external_side_effects": ["fake_kraken_submit_sell_once"]},
+      "limitations": ["does not exercise a worker, endpoint, or real provider; terminal proof history is preserved"]
+    }
+  ]
+}
