@@ -16,6 +16,9 @@ from uuid import UUID
 import pytest
 from pydantic import ValidationError
 
+import app.services.pipeline_contracts.btc_kraken as btc_kraken_module
+import app.services.pipeline_contracts.btc_kraken_adapters as adapters_module
+import app.services.pipeline_contracts.envelope as envelope_module
 from app.services.data.binance_client import NormalizedCandle
 from app.services.exchange_connections.providers.base import (
     ExchangeOrderSubmissionRequest,
@@ -287,26 +290,82 @@ def test_adapter_calls_have_no_external_or_generated_state(monkeypatch: pytest.M
     def forbidden(*_args, **_kwargs):
         raise AssertionError("adapter attempted external or generated state")
 
+    class ForbiddenEnviron(dict):
+        def __getitem__(self, _key):
+            raise AssertionError("adapter attempted environment access")
+        def get(self, _key, _default=None):
+            raise AssertionError("adapter attempted environment access")
+        def __contains__(self, _key):
+            raise AssertionError("adapter attempted environment access")
+        def __iter__(self):
+            raise AssertionError("adapter attempted environment access")
+        def __len__(self):
+            raise AssertionError("adapter attempted environment access")
+        def keys(self):
+            raise AssertionError("adapter attempted environment access")
+        def items(self):
+            raise AssertionError("adapter attempted environment access")
+        def values(self):
+            raise AssertionError("adapter attempted environment access")
+        def copy(self):
+            raise AssertionError("adapter attempted environment access")
+
+    class ForbiddenDateTime(datetime):
+        @classmethod
+        def now(cls, *_args, **_kwargs):
+            raise AssertionError("adapter attempted wall-clock access")
+        @classmethod
+        def utcnow(cls):
+            raise AssertionError("adapter attempted wall-clock access")
+        @classmethod
+        def today(cls):
+            raise AssertionError("adapter attempted wall-clock access")
+
     monkeypatch.setattr(os, "getenv", forbidden)
+    monkeypatch.setattr(os, "environ", ForbiddenEnviron())
     monkeypatch.setattr(socket, "socket", forbidden)
+    monkeypatch.setattr(socket, "create_connection", forbidden)
     monkeypatch.setattr(builtins, "open", forbidden)
-    monkeypatch.setattr("uuid.uuid4", forbidden)
+    monkeypatch.setattr(Path, "open", forbidden)
+    monkeypatch.setattr(Path, "read_text", forbidden)
+    monkeypatch.setattr(Path, "read_bytes", forbidden)
+    for uuid_factory in ("uuid1", "uuid3", "uuid4", "uuid5"):
+        monkeypatch.setattr(f"uuid.{uuid_factory}", forbidden)
     monkeypatch.setattr("time.time", forbidden)
-    candle = NormalizedCandle(
-        open_time=AT, close_time=datetime(2026, 7, 15, 12, 15, tzinfo=timezone.utc),
-        open=Decimal("1.00"), high=Decimal("2.00"), low=Decimal("1.00"),
-        close=Decimal("2.00"), volume=Decimal("3.00"), source="kraken_spot",
-    )
-    signal = Signal(action="hold", strength=Decimal("0.40"), reason="hold", indicators={}, timestamp=AT)
-    intent = _intent(_request())
-    fill = ExchangeProviderFill(
-        "fill-1", "order-1", "BTC-USD", Decimal("0.1"), Decimal("50000"), None, AT,
-    )
-    assert candle_observation_from_legacy(candle, envelope=_envelope(), instrument=_instrument(), interval="15m").volume == Decimal("3.00")
-    assert strategy_evaluation_from_legacy(signal, envelope=_envelope(), instrument=_instrument(), strategy_identity="s", strategy_version="1").action is StrategyAction.HOLD
-    assert intent.internal_client_order_id == "client-1"
-    assert provider_submission_result_from_legacy(_submission("ambiguous"), envelope=_envelope(), execution_intent=intent).outcome is ProviderOutcome.AMBIGUOUS
-    assert provider_fill_reference_from_legacy(fill).provider_fill_id == ProviderFillId(value="fill-1")
+    monkeypatch.setattr("time.time_ns", forbidden)
+    monkeypatch.setattr(btc_kraken_module, "datetime", ForbiddenDateTime)
+    monkeypatch.setattr(adapters_module, "datetime", ForbiddenDateTime)
+    monkeypatch.setattr(envelope_module, "datetime", ForbiddenDateTime)
+
+    def profile_clock_calls(frame, event, arg):
+        module_name = frame.f_globals.get("__name__", "")
+        if event == "c_call" and module_name.startswith("app.services.pipeline_contracts"):
+            if getattr(arg, "__self__", None) is datetime and getattr(arg, "__name__", "") in {
+                "now", "utcnow", "today",
+            }:
+                raise AssertionError("adapter attempted wall-clock access")
+        return profile_clock_calls
+
+    previous_profile = sys.getprofile()
+    sys.setprofile(profile_clock_calls)
+    try:
+        candle = NormalizedCandle(
+            open_time=AT, close_time=datetime(2026, 7, 15, 12, 15, tzinfo=timezone.utc),
+            open=Decimal("1.00"), high=Decimal("2.00"), low=Decimal("1.00"),
+            close=Decimal("2.00"), volume=Decimal("3.00"), source="kraken_spot",
+        )
+        signal = Signal(action="hold", strength=Decimal("0.40"), reason="hold", indicators={}, timestamp=AT)
+        intent = _intent(_request())
+        fill = ExchangeProviderFill(
+            "fill-1", "order-1", "BTC-USD", Decimal("0.1"), Decimal("50000"), None, AT,
+        )
+        assert candle_observation_from_legacy(candle, envelope=_envelope(), instrument=_instrument(), interval="15m").volume == Decimal("3.00")
+        assert strategy_evaluation_from_legacy(signal, envelope=_envelope(), instrument=_instrument(), strategy_identity="s", strategy_version="1").action is StrategyAction.HOLD
+        assert intent.internal_client_order_id == "client-1"
+        assert provider_submission_result_from_legacy(_submission("ambiguous"), envelope=_envelope(), execution_intent=intent).outcome is ProviderOutcome.AMBIGUOUS
+        assert provider_fill_reference_from_legacy(fill).provider_fill_id == ProviderFillId(value="fill-1")
+    finally:
+        sys.setprofile(previous_profile)
 
 
 def test_isolated_adapter_import_has_no_application_side_effects() -> None:
@@ -321,17 +380,68 @@ def test_isolated_adapter_import_has_no_application_side_effects() -> None:
         import sys
         import time
         import uuid
+        from collections.abc import MutableMapping
+        from datetime import datetime as RealDateTime
 
         package_name = "app.services.pipeline_contracts"
         adapter_name = f"{package_name}.btc_kraken_adapters"
 
+        def is_protected_caller(frame):
+            name = frame.f_globals.get("__name__", "")
+            return name == package_name or name.startswith(f"{package_name}.")
+
         def guard(original):
             def guarded(*args, **kwargs):
-                caller = sys._getframe(1).f_globals.get("__name__", "")
-                if caller == package_name or caller.startswith(f"{package_name}."):
+                if is_protected_caller(sys._getframe(1)):
                     raise AssertionError("application-level access during adapter import")
                 return original(*args, **kwargs)
             return guarded
+
+        class GuardedEnviron(MutableMapping):
+            def __init__(self, delegate):
+                self.delegate = delegate
+            def _check(self, frame):
+                if is_protected_caller(frame):
+                    raise AssertionError("application-level environment access")
+            def __getitem__(self, key):
+                self._check(sys._getframe(1))
+                return self.delegate[key]
+            def get(self, key, default=None):
+                self._check(sys._getframe(1))
+                return self.delegate.get(key, default)
+            def __contains__(self, key):
+                self._check(sys._getframe(1))
+                return key in self.delegate
+            def __iter__(self):
+                self._check(sys._getframe(1))
+                return iter(self.delegate)
+            def __len__(self):
+                self._check(sys._getframe(1))
+                return len(self.delegate)
+            def __setitem__(self, key, value):
+                self.delegate[key] = value
+            def __delitem__(self, key):
+                del self.delegate[key]
+            def keys(self):
+                self._check(sys._getframe(1))
+                return self.delegate.keys()
+            def items(self):
+                self._check(sys._getframe(1))
+                return self.delegate.items()
+            def values(self):
+                self._check(sys._getframe(1))
+                return self.delegate.values()
+            def copy(self):
+                self._check(sys._getframe(1))
+                return self.delegate.copy()
+
+        def profile_clock_calls(frame, event, arg):
+            if event == "c_call" and is_protected_caller(frame):
+                owner = getattr(arg, "__self__", None)
+                name = getattr(arg, "__name__", "")
+                if owner is RealDateTime and name in {"now", "utcnow", "today"}:
+                    raise AssertionError(f"application-level datetime.{name} access")
+            return profile_clock_calls
 
         class ForbiddenProductionImport(importlib.abc.MetaPathFinder):
             def find_spec(self, fullname, path=None, target=None):
@@ -350,16 +460,21 @@ def test_isolated_adapter_import_has_no_application_side_effects() -> None:
                 return None
 
         sys.meta_path.insert(0, ForbiddenProductionImport())
+        os.environ = GuardedEnviron(os.environ)
         os.getenv = guard(os.getenv)
         socket.socket = guard(socket.socket)
         socket.create_connection = guard(socket.create_connection)
         time.time = guard(time.time)
         time.time_ns = guard(time.time_ns)
+        uuid.uuid1 = guard(uuid.uuid1)
+        uuid.uuid3 = guard(uuid.uuid3)
         uuid.uuid4 = guard(uuid.uuid4)
+        uuid.uuid5 = guard(uuid.uuid5)
         builtins.open = guard(builtins.open)
         pathlib.Path.open = guard(pathlib.Path.open)
         pathlib.Path.read_text = guard(pathlib.Path.read_text)
         pathlib.Path.read_bytes = guard(pathlib.Path.read_bytes)
+        sys.setprofile(profile_clock_calls)
         assert package_name not in sys.modules
         assert adapter_name not in sys.modules
         package = importlib.import_module(package_name)

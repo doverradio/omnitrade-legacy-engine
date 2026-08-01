@@ -14,6 +14,8 @@ from uuid import UUID
 import pytest
 from pydantic import ValidationError
 
+import app.services.pipeline_contracts.btc_kraken as btc_kraken_module
+import app.services.pipeline_contracts.envelope as envelope_module
 from app.services.pipeline_contracts.btc_kraken import (
     ACCOUNTING_RESULT_REFERENCE_VERSION,
     BTC_KRAKEN_INSTRUMENT_VERSION,
@@ -352,6 +354,43 @@ def test_safe_error_fields_are_order_independent_hash_protected_and_json_compati
             ProviderSubmissionResultV1.model_validate({**_provider().model_dump(), "safe_error_fields": invalid})
 
 
+def test_canonical_json_safe_error_values_must_be_valid_exact_and_canonical() -> None:
+    base = _provider().model_dump(mode="python")
+    valid = ProviderSubmissionResultV1.model_validate({
+        **base,
+        "safe_error_fields": (
+            ("list", "canonical_json", '["descr"]'),
+            ("nested", "canonical_json", '{"a":{"b":[1,true,null,"1.2300"]}}'),
+            ("large_integer", "canonical_json", "123456789012345678901234567890"),
+            ("literal", "text", '["descr"]'),
+        ),
+    })
+    assert ("list", "canonical_json", '["descr"]') in valid.safe_error_fields
+    assert ("literal", "text", '["descr"]') in valid.safe_error_fields
+    assert valid.canonical_bytes() == ProviderSubmissionResultV1.model_validate(valid.model_dump()).canonical_bytes()
+
+    invalid_values = (
+        "not-json",
+        '{"b":2,"a":1}',
+        '{ "a": 1 }',
+        ' ["descr"]',
+        '["descr"] ',
+        '  ["descr"]  ',
+        "1.25",
+        "NaN",
+    )
+    for value in invalid_values:
+        with pytest.raises(ValidationError, match="canonical_json"):
+            ProviderSubmissionResultV1.model_validate({
+                **base, "safe_error_fields": (("detail", "canonical_json", value),),
+            })
+
+    exact_decimal_string = ProviderSubmissionResultV1.model_validate({
+        **base, "safe_error_fields": (("decimal", "canonical_json", '"1.2300"'),),
+    })
+    assert exact_decimal_string.safe_error_fields == (("decimal", "canonical_json", '"1.2300"'),)
+
+
 def test_reconciliation_statuses_fill_order_and_contradictions_are_preserved() -> None:
     assert {ReconciliationStatus.OPEN, ReconciliationStatus.PARTIALLY_FILLED, ReconciliationStatus.FILLED}.issubset(set(ReconciliationStatus))
     partial = _reconciliation()
@@ -433,12 +472,69 @@ def test_constructors_have_no_environment_filesystem_network_or_wall_clock_side_
     def _forbidden(*_args, **_kwargs):
         raise AssertionError("contract construction attempted external access")
 
+    class _ForbiddenEnviron(dict):
+        def __getitem__(self, _key):
+            raise AssertionError("contract construction attempted environment access")
+        def get(self, _key, _default=None):
+            raise AssertionError("contract construction attempted environment access")
+        def __contains__(self, _key):
+            raise AssertionError("contract construction attempted environment access")
+        def __iter__(self):
+            raise AssertionError("contract construction attempted environment access")
+        def __len__(self):
+            raise AssertionError("contract construction attempted environment access")
+        def keys(self):
+            raise AssertionError("contract construction attempted environment access")
+        def items(self):
+            raise AssertionError("contract construction attempted environment access")
+        def values(self):
+            raise AssertionError("contract construction attempted environment access")
+        def copy(self):
+            raise AssertionError("contract construction attempted environment access")
+
+    class _ForbiddenDateTime(datetime):
+        @classmethod
+        def now(cls, *_args, **_kwargs):
+            raise AssertionError("contract construction attempted wall-clock access")
+        @classmethod
+        def utcnow(cls):
+            raise AssertionError("contract construction attempted wall-clock access")
+        @classmethod
+        def today(cls):
+            raise AssertionError("contract construction attempted wall-clock access")
+
     monkeypatch.setattr(os, "getenv", _forbidden)
+    monkeypatch.setattr(os, "environ", _ForbiddenEnviron())
     monkeypatch.setattr(socket, "socket", _forbidden)
+    monkeypatch.setattr(socket, "create_connection", _forbidden)
     monkeypatch.setattr(builtins, "open", _forbidden)
-    assert _candle().open_time == AT
-    assert _intent().grants_authority is False
-    assert _accounting().recorded_at == AT
+    monkeypatch.setattr(Path, "open", _forbidden)
+    monkeypatch.setattr(Path, "read_text", _forbidden)
+    monkeypatch.setattr(Path, "read_bytes", _forbidden)
+    for uuid_factory in ("uuid1", "uuid3", "uuid4", "uuid5"):
+        monkeypatch.setattr(f"uuid.{uuid_factory}", _forbidden)
+    monkeypatch.setattr("time.time", _forbidden)
+    monkeypatch.setattr("time.time_ns", _forbidden)
+    monkeypatch.setattr(btc_kraken_module, "datetime", _ForbiddenDateTime)
+    monkeypatch.setattr(envelope_module, "datetime", _ForbiddenDateTime)
+
+    def _profile_clock_calls(frame, event, arg):
+        module_name = frame.f_globals.get("__name__", "")
+        if event == "c_call" and module_name.startswith("app.services.pipeline_contracts"):
+            if getattr(arg, "__self__", None) is datetime and getattr(arg, "__name__", "") in {
+                "now", "utcnow", "today",
+            }:
+                raise AssertionError("contract construction attempted wall-clock access")
+        return _profile_clock_calls
+
+    previous_profile = sys.getprofile()
+    sys.setprofile(_profile_clock_calls)
+    try:
+        assert _candle().open_time == AT
+        assert _intent().grants_authority is False
+        assert _accounting().recorded_at == AT
+    finally:
+        sys.setprofile(previous_profile)
 
 
 def test_isolated_module_import_has_no_application_side_effects() -> None:
@@ -453,17 +549,68 @@ def test_isolated_module_import_has_no_application_side_effects() -> None:
         import sys
         import time
         import uuid
+        from collections.abc import MutableMapping
+        from datetime import datetime as RealDateTime
 
         package_name = "app.services.pipeline_contracts"
         contract_name = f"{package_name}.btc_kraken"
 
+        def is_protected_caller(frame):
+            name = frame.f_globals.get("__name__", "")
+            return name == package_name or name.startswith(f"{package_name}.")
+
         def guard(original):
             def guarded(*args, **kwargs):
-                caller = sys._getframe(1).f_globals.get("__name__", "")
-                if caller == package_name or caller.startswith(f"{package_name}."):
+                if is_protected_caller(sys._getframe(1)):
                     raise AssertionError("application-level access during btc_kraken import")
                 return original(*args, **kwargs)
             return guarded
+
+        class GuardedEnviron(MutableMapping):
+            def __init__(self, delegate):
+                self.delegate = delegate
+            def _check(self, frame):
+                if is_protected_caller(frame):
+                    raise AssertionError("application-level environment access")
+            def __getitem__(self, key):
+                self._check(sys._getframe(1))
+                return self.delegate[key]
+            def get(self, key, default=None):
+                self._check(sys._getframe(1))
+                return self.delegate.get(key, default)
+            def __contains__(self, key):
+                self._check(sys._getframe(1))
+                return key in self.delegate
+            def __iter__(self):
+                self._check(sys._getframe(1))
+                return iter(self.delegate)
+            def __len__(self):
+                self._check(sys._getframe(1))
+                return len(self.delegate)
+            def __setitem__(self, key, value):
+                self.delegate[key] = value
+            def __delitem__(self, key):
+                del self.delegate[key]
+            def keys(self):
+                self._check(sys._getframe(1))
+                return self.delegate.keys()
+            def items(self):
+                self._check(sys._getframe(1))
+                return self.delegate.items()
+            def values(self):
+                self._check(sys._getframe(1))
+                return self.delegate.values()
+            def copy(self):
+                self._check(sys._getframe(1))
+                return self.delegate.copy()
+
+        def profile_clock_calls(frame, event, arg):
+            if event == "c_call" and is_protected_caller(frame):
+                owner = getattr(arg, "__self__", None)
+                name = getattr(arg, "__name__", "")
+                if owner is RealDateTime and name in {"now", "utcnow", "today"}:
+                    raise AssertionError(f"application-level datetime.{name} access")
+            return profile_clock_calls
 
         class ForbiddenApplicationImport(importlib.abc.MetaPathFinder):
             def find_spec(self, fullname, path=None, target=None):
@@ -477,16 +624,21 @@ def test_isolated_module_import_has_no_application_side_effects() -> None:
                 return None
 
         sys.meta_path.insert(0, ForbiddenApplicationImport())
+        os.environ = GuardedEnviron(os.environ)
         os.getenv = guard(os.getenv)
         socket.socket = guard(socket.socket)
         socket.create_connection = guard(socket.create_connection)
         time.time = guard(time.time)
         time.time_ns = guard(time.time_ns)
+        uuid.uuid1 = guard(uuid.uuid1)
+        uuid.uuid3 = guard(uuid.uuid3)
         uuid.uuid4 = guard(uuid.uuid4)
+        uuid.uuid5 = guard(uuid.uuid5)
         builtins.open = guard(builtins.open)
         pathlib.Path.open = guard(pathlib.Path.open)
         pathlib.Path.read_text = guard(pathlib.Path.read_text)
         pathlib.Path.read_bytes = guard(pathlib.Path.read_bytes)
+        sys.setprofile(profile_clock_calls)
         assert package_name not in sys.modules
         assert contract_name not in sys.modules
         package = importlib.import_module(package_name)
@@ -499,6 +651,21 @@ def test_isolated_module_import_has_no_application_side_effects() -> None:
             "ReconciliationResultReferenceV1", "AccountingResultReferenceV1",
         ):
             assert isinstance(getattr(package, name), type)
+
+        def assert_negative_control(source):
+            namespace = {"__name__": f"{package_name}.negative_control"}
+            sys.setprofile(profile_clock_calls)
+            try:
+                exec(source, namespace)
+            except AssertionError:
+                return
+            raise AssertionError(f"negative control was not blocked: {source}")
+
+        assert_negative_control("import os\\nos.environ['PHASE1_NEGATIVE_CONTROL']")
+        assert_negative_control("import os\\nos.environ.get('PHASE1_NEGATIVE_CONTROL')")
+        assert_negative_control("from datetime import datetime, timezone\\ndatetime.now(timezone.utc)")
+        assert_negative_control("from datetime import datetime\\ndatetime.utcnow()")
+        assert_negative_control("from datetime import datetime\\ndatetime.today()")
         """
     )
     completed = subprocess.run(

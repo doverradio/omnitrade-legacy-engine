@@ -8,6 +8,7 @@ They are not compatibility adapters and are not connected to production.
 
 from __future__ import annotations
 
+import json
 from datetime import datetime
 from decimal import Decimal
 from enum import Enum
@@ -35,7 +36,7 @@ from app.services.pipeline_contracts.identifiers import (
     ProviderOrderId,
     ReconciliationId,
 )
-from app.services.pipeline_contracts.serialization import canonical_json_bytes, integrity_sha256
+from app.services.pipeline_contracts.serialization import canonical_json, canonical_json_bytes, integrity_sha256
 
 
 NonEmptyText = Annotated[str, StringConstraints(strip_whitespace=True, min_length=1)]
@@ -332,9 +333,26 @@ class ProviderSubmissionResultV1(_Contract):
                 if value_type not in {"text", "canonical_json"}:
                     raise ValueError("safe error value type is unsupported")
                 key = key.strip()
-                item = item.strip()
+                if value_type == "text":
+                    item = item.strip()
                 if not key or not item:
                     raise ValueError("safe error keys and values must be non-empty")
+                if value_type == "canonical_json":
+                    def reject_json_float(token: str) -> object:
+                        raise ValueError(
+                            f"canonical JSON numeric token {token!r} would require binary-float parsing"
+                        )
+
+                    try:
+                        parsed = json.loads(
+                            item,
+                            parse_float=reject_json_float,
+                            parse_constant=reject_json_float,
+                        )
+                    except (json.JSONDecodeError, ValueError) as exc:
+                        raise ValueError("safe error canonical_json value must be valid exact JSON") from exc
+                    if canonical_json(parsed) != item:
+                        raise ValueError("safe error canonical_json value must already be canonical")
                 if key in seen:
                     raise ValueError("safe error keys must be unique")
                 seen.add(key)
