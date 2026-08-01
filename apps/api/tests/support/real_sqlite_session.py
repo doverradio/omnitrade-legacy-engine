@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+import asyncio
 import re
 import uuid
 from contextlib import asynccontextmanager
+from contextlib import suppress
 from datetime import datetime, timezone
 from typing import AsyncIterator, Iterable
 
@@ -65,6 +67,19 @@ def _parenthesize_function_defaults(self, column):  # type: ignore[no-untyped-de
 SQLiteDDLCompiler.get_column_default_string = _parenthesize_function_defaults
 
 
+async def _event_loop_heartbeat() -> None:
+    """Keep this test process responsive to aiosqlite worker completions.
+
+    In the supported test image's Python 3.10 event loop, aiosqlite's worker
+    completes its queued sqlite call and invokes call_soon_threadsafe, but the
+    selector is not awakened until another timer fires. A small test-only
+    timer preserves the real AsyncSession/aiosqlite behavior while preventing
+    an otherwise indefinite wait. Production never imports this test helper.
+    """
+    while True:
+        await asyncio.sleep(0.01)
+
+
 @asynccontextmanager
 async def real_sqlite_session(tables: Iterable[Table]) -> AsyncIterator[AsyncSession]:
     """A real, in-memory SQLAlchemy AsyncSession (sqlite+aiosqlite) with the production
@@ -72,6 +87,7 @@ async def real_sqlite_session(tables: Iterable[Table]) -> AsyncIterator[AsyncSes
     not a hand-rolled fake. Pass the exact list of model __table__s this test needs."""
     tables = list(tables)
     engine = create_async_engine("sqlite+aiosqlite:///:memory:", poolclass=StaticPool)
+    heartbeat = asyncio.create_task(_event_loop_heartbeat())
 
     @event.listens_for(engine.sync_engine, "connect")
     def _register_sqlite_functions(dbapi_conn, _record) -> None:
@@ -84,15 +100,18 @@ async def real_sqlite_session(tables: Iterable[Table]) -> AsyncIterator[AsyncSes
         # can never match, since they bind the .hex form -- so this must match it.
         dbapi_conn.create_function("gen_random_uuid", 0, lambda: uuid.uuid4().hex)
 
-    async with engine.begin() as conn:
-        await conn.run_sync(tables[0].metadata.create_all, tables=tables)
-
-    session_factory = async_sessionmaker(engine, expire_on_commit=False, class_=AsyncSession)
     try:
+        async with engine.begin() as conn:
+            await conn.run_sync(tables[0].metadata.create_all, tables=tables)
+
+        session_factory = async_sessionmaker(engine, expire_on_commit=False, class_=AsyncSession)
         async with session_factory() as session:
             yield session
     finally:
         await engine.dispose()
+        heartbeat.cancel()
+        with suppress(asyncio.CancelledError):
+            await heartbeat
 
 
 @asynccontextmanager
@@ -106,17 +125,21 @@ async def real_sqlite_session_factory(tables: Iterable[Table]) -> AsyncIterator[
     this factory until the engine is disposed at context exit."""
     tables = list(tables)
     engine = create_async_engine("sqlite+aiosqlite:///:memory:", poolclass=StaticPool)
+    heartbeat = asyncio.create_task(_event_loop_heartbeat())
 
     @event.listens_for(engine.sync_engine, "connect")
     def _register_sqlite_functions(dbapi_conn, _record) -> None:
         dbapi_conn.create_function("now", 0, lambda: datetime.now(timezone.utc).isoformat())
         dbapi_conn.create_function("gen_random_uuid", 0, lambda: uuid.uuid4().hex)
 
-    async with engine.begin() as conn:
-        await conn.run_sync(tables[0].metadata.create_all, tables=tables)
-
-    session_factory = async_sessionmaker(engine, expire_on_commit=False, class_=AsyncSession)
     try:
+        async with engine.begin() as conn:
+            await conn.run_sync(tables[0].metadata.create_all, tables=tables)
+
+        session_factory = async_sessionmaker(engine, expire_on_commit=False, class_=AsyncSession)
         yield session_factory
     finally:
         await engine.dispose()
+        heartbeat.cancel()
+        with suppress(asyncio.CancelledError):
+            await heartbeat

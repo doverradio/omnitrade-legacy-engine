@@ -686,6 +686,18 @@ async def release_execution_claim_scope_if_order_resolved(
     )
     observed_at = now or _utcnow()
     before = claim.claim_status
+    if resolved_outcome == "FILLED" and claim.side == "BUY":
+        from app.services.orchestration.autonomous_position_custody import (
+            establish_buy_custody,
+            requires_production_custody_handoff,
+        )
+
+        if await requires_production_custody_handoff(db=db, claim=claim):
+            # This flush must succeed before BUY_RECONCILED is written. The
+            # caller owns the surrounding reconciliation transaction, so a
+            # lineage/uniqueness/persistence failure rolls back both changes
+            # and leaves the claim nonterminal for restart recovery.
+            await establish_buy_custody(db=db, claim=claim, observed_at=observed_at)
     claim.claim_status = released_status
     claim.completed_at = observed_at
     claim.updated_at = observed_at

@@ -10172,9 +10172,14 @@ async def _gather_autonomous_supervisor_evidence(
 
 async def autonomous_profit_status(*, provider: str, environment: str, product: str) -> dict[str, Any]:
     from app.services.orchestration.autonomous_operations_supervisor import resolve_autonomous_profit_snapshot
+    from app.services.orchestration.autonomous_position_custody import custody_status
 
     evidence, _ = await _gather_autonomous_supervisor_evidence(provider=provider, environment=environment, product=product)
-    return resolve_autonomous_profit_snapshot(evidence)
+    snapshot = resolve_autonomous_profit_snapshot(evidence)
+    async with AsyncSessionLocal() as db:
+        custody = await custody_status(db=db, provider=provider, environment=environment, product=product)
+    snapshot["position_custody"] = custody
+    return snapshot
 
 
 async def autonomous_profit_report(*, provider: str, environment: str, product: str, since: timedelta) -> dict[str, Any]:

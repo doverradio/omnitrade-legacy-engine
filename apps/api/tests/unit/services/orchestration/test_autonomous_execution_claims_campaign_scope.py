@@ -272,7 +272,7 @@ async def test_same_package_replay_returns_existing_claim_without_a_second_inser
 # --- release_execution_claim_scope_if_order_resolved -----------------------------------
 
 @pytest.mark.asyncio
-async def test_filled_order_releases_scope_via_buy_reconciled() -> None:
+async def test_filled_order_releases_scope_via_buy_reconciled(monkeypatch: pytest.MonkeyPatch) -> None:
     """A genuinely successful BUY must eventually release its campaign
     scope -- before this existed, nothing in the codebase ever advanced a
     claim past SUBMISSION_PENDING, so a successful execution would have
@@ -280,6 +280,10 @@ async def test_filled_order_releases_scope_via_buy_reconciled() -> None:
     now = datetime.now(timezone.utc)
     campaign_id = uuid.uuid4()
     live_order_id = uuid.uuid4()
+    monkeypatch.setattr(
+        "app.services.orchestration.autonomous_position_custody.requires_production_custody_handoff",
+        AsyncMock(return_value=False),
+    )
     async with _real_session() as session:
         claim = _claim_row(campaign_id=campaign_id, campaign_version=1, claim_status="SUBMISSION_PENDING", now=now)
         claim.live_order_id = live_order_id
@@ -363,7 +367,9 @@ async def test_release_is_a_no_op_when_no_claim_references_the_order() -> None:
 
 
 @pytest.mark.asyncio
-async def test_released_claim_via_reconciliation_frees_scope_for_a_later_sequential_claim() -> None:
+async def test_released_claim_via_reconciliation_frees_scope_for_a_later_sequential_claim(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     """End-to-end proof of the full lifecycle fix: a genuinely successful
     BUY's claim, once reconciled, must free its campaign scope for a later,
     legitimate sequential Controlled Proof -- combining the schema-level
@@ -374,6 +380,10 @@ async def test_released_claim_via_reconciliation_frees_scope_for_a_later_sequent
     now = datetime.now(timezone.utc)
     campaign_id = uuid.uuid4()
     live_order_id = uuid.uuid4()
+    monkeypatch.setattr(
+        "app.services.orchestration.autonomous_position_custody.requires_production_custody_handoff",
+        AsyncMock(return_value=False),
+    )
     async with _real_session() as session:
         first = _claim_row(campaign_id=campaign_id, campaign_version=5, claim_status="SUBMISSION_PENDING", now=now)
         first.live_order_id = live_order_id
