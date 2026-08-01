@@ -72,10 +72,20 @@ class AutonomousPositionExitAuthority(Base):
     reserved_package_id: Mapped[uuid.UUID | None] = mapped_column(
         UUID(as_uuid=True), ForeignKey("canonical_preview_packages.package_id", ondelete="RESTRICT"), unique=True
     )
+    reserved_activation_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("canonical_proving_activations.activation_id", ondelete="RESTRICT"), unique=True
+    )
+    reserved_claim_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("autonomous_execution_claims.claim_id", ondelete="RESTRICT"), unique=True
+    )
     last_construction_failure_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     last_construction_failure_code: Mapped[str | None] = mapped_column(Text)
     last_construction_exception_class: Mapped[str | None] = mapped_column(Text)
     last_construction_failure_retryable: Mapped[bool | None] = mapped_column(Boolean)
+    last_activation_failure_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    last_activation_failure_code: Mapped[str | None] = mapped_column(Text)
+    last_activation_exception_class: Mapped[str | None] = mapped_column(Text)
+    last_activation_failure_retryable: Mapped[bool | None] = mapped_column(Boolean)
     consumed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     revoked_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     expired_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
