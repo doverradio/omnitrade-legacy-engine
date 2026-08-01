@@ -3,6 +3,7 @@ from __future__ import annotations
 import os
 import uuid
 from datetime import datetime, timezone
+from decimal import Decimal
 from typing import Any
 
 from sqlalchemy import func, select
@@ -31,6 +32,13 @@ from app.services.mandates.contracts import MANDATE_PURPOSE_PRODUCTION
 from app.services.strategies.identity import build_strategy_identity
 
 _PACKAGE_STATES = {"READY", "AUTHORIZED", "DRY_RUN_PASSED", "ACTIVATED"}
+
+
+def _capital_deployment_amount(package: CanonicalPreviewPackage) -> Decimal:
+    if package.side == "SELL":
+        return Decimal("0")
+    value = getattr(package, "capital_deployment_amount", None)
+    return Decimal(str(package.risk_approved_amount if value is None else value))
 
 
 async def inspect_mandate_evaluation_identity_propagation(
@@ -245,6 +253,7 @@ async def inspect_automatic_mandate_activation_readiness(
         connection = None if connection_id is None else await db.scalar(
             select(ExchangeConnection).where(ExchangeConnection.exchange_connection_id == connection_id).limit(1)
         )
+        capital_deployment = None if package is None else _capital_deployment_amount(package)
         comparisons = [] if package is None else [
             _comparison(field="package_mandate", mandate=mandate.mandate_id, package=package.mandate_id, source="autonomous_capital_mandates.mandate_id ↔ canonical_preview_packages.mandate_id", reason="package_mandate_mismatch"),
             _comparison(field="package_mandate_version", mandate=None if version is None else version.mandate_version_id, package=package.mandate_version_id, source="autonomous_capital_mandate_versions.mandate_version_id ↔ canonical_preview_packages.mandate_version_id", reason="package_mandate_version_mismatch"),
@@ -266,10 +275,10 @@ async def inspect_automatic_mandate_activation_readiness(
             _comparison(field="product", mandate=None if version is None else version.allowed_products, package=package.product, match=version is not None and package.product in version.allowed_products, source="autonomous_capital_mandate_versions.allowed_products ↔ canonical_preview_packages.product", reason="product_mismatch"),
             _comparison(field="side", mandate=None if version is None else version.allowed_order_sides, package=package.side, match=version is not None and package.side in version.allowed_order_sides, source="autonomous_capital_mandate_versions.allowed_order_sides ↔ canonical_preview_packages.side", reason="side_mismatch"),
             _comparison(field="strategy_identity", mandate=None if version is None else version.allowed_strategy_versions, package=strategy_identity, match=version is not None and strategy_identity in version.allowed_strategy_versions, source="strategies.slug+module_version ↔ autonomous_capital_mandate_versions.allowed_strategy_versions", reason="strategy_identity_mismatch"),
-            _comparison(field="max_order_notional", mandate=None if version is None else version.max_order_notional_usd, package=package.risk_approved_amount, match=version is not None and package.risk_approved_amount <= version.max_order_notional_usd, source="autonomous_capital_mandate_versions.max_order_notional_usd ↔ canonical_preview_packages.risk_approved_amount", reason="capital_limit_mismatch"),
-            _comparison(field="authorized_capital", mandate=None if version is None else version.authorized_capital_usd, package=package.risk_approved_amount, match=version is not None and package.risk_approved_amount <= version.authorized_capital_usd, source="autonomous_capital_mandate_versions.authorized_capital_usd ↔ canonical_preview_packages.risk_approved_amount", reason="capital_limit_mismatch"),
-            _comparison(field="max_open_exposure", mandate=None if version is None else version.max_open_exposure_usd, package=package.risk_approved_amount, match=version is not None and package.risk_approved_amount <= version.max_open_exposure_usd, source="autonomous_capital_mandate_versions.max_open_exposure_usd ↔ canonical_preview_packages.risk_approved_amount", reason="capital_limit_mismatch"),
-            _comparison(field="max_daily_deployed", mandate=None if version is None else version.max_daily_deployed_usd, package=package.risk_approved_amount, match=version is not None and package.risk_approved_amount <= version.max_daily_deployed_usd, source="autonomous_capital_mandate_versions.max_daily_deployed_usd ↔ canonical_preview_packages.risk_approved_amount", reason="capital_limit_mismatch"),
+            _comparison(field="max_order_notional", mandate=None if version is None else version.max_order_notional_usd, package=capital_deployment, match=version is not None and capital_deployment <= version.max_order_notional_usd, source="autonomous_capital_mandate_versions.max_order_notional_usd ↔ canonical_preview_packages.capital_deployment_amount", reason="capital_limit_mismatch"),
+            _comparison(field="authorized_capital", mandate=None if version is None else version.authorized_capital_usd, package=capital_deployment, match=version is not None and capital_deployment <= version.authorized_capital_usd, source="autonomous_capital_mandate_versions.authorized_capital_usd ↔ canonical_preview_packages.capital_deployment_amount", reason="capital_limit_mismatch"),
+            _comparison(field="max_open_exposure", mandate=None if version is None else version.max_open_exposure_usd, package=capital_deployment, match=version is not None and capital_deployment <= version.max_open_exposure_usd, source="autonomous_capital_mandate_versions.max_open_exposure_usd ↔ canonical_preview_packages.capital_deployment_amount", reason="capital_limit_mismatch"),
+            _comparison(field="max_daily_deployed", mandate=None if version is None else version.max_daily_deployed_usd, package=capital_deployment, match=version is not None and capital_deployment <= version.max_daily_deployed_usd, source="autonomous_capital_mandate_versions.max_daily_deployed_usd ↔ canonical_preview_packages.capital_deployment_amount", reason="capital_limit_mismatch"),
             _comparison(field="approval_policy", mandate="MANDATE_ALLOWED", package=None if version is None else version.approval_policy, source="autonomous_capital_mandate_versions.approval_policy", reason="mandate_approval_policy_mismatch"),
             _comparison(field="profile_paper_account", mandate=package.paper_account_id, package=None if profile is None else profile.paper_account_id, source="canonical_preview_packages.paper_account_id ↔ live_trading_profiles.paper_account_id", reason="profile_paper_account_mismatch"),
             _comparison(field="connection_provider", mandate=package.provider, package=None if connection is None else connection.provider, source="canonical_preview_packages.provider ↔ exchange_connections.provider", reason="connection_provider_mismatch"),
@@ -281,7 +290,7 @@ async def inspect_automatic_mandate_activation_readiness(
             _comparison(field="preview_product", mandate=package.product, package=None if preview is None else preview.product_id, source="canonical_preview_packages.product ↔ crypto_order_previews.product_id", reason="preview_product_mismatch"),
             _comparison(field="preview_side", mandate=package.side, package=None if preview is None else preview.side, source="canonical_preview_packages.side ↔ crypto_order_previews.side", reason="preview_side_mismatch"),
             _comparison(field="preview_strategy", mandate=package.strategy_id, package=None if preview is None else preview.strategy_id, source="canonical_preview_packages.strategy_id ↔ crypto_order_previews.strategy_id", reason="preview_strategy_mismatch"),
-            _comparison(field="preview_notional", mandate=package.proposed_order_amount, package=None if preview is None else preview.requested_amount, source="canonical_preview_packages.proposed_order_amount ↔ crypto_order_previews.requested_amount", reason="preview_notional_mismatch"),
+            _comparison(field="preview_notional", mandate=package.proposed_order_amount, package=None if preview is None else (preview.estimated_quote_size if package.side == "SELL" else preview.requested_amount), source="canonical_preview_packages.proposed_order_amount ↔ crypto_order_previews side-aware quote amount", reason="preview_notional_mismatch"),
         ]
         if mandate.revoked_at is not None or (mandate.expires_at is not None and mandate.expires_at <= now):
             reasons.append({"code": "mandate_expired_or_revoked", "action": "Renew or replace the mandate through governed lifecycle commands."})

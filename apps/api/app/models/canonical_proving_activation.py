@@ -24,10 +24,14 @@ class CanonicalProvingActivation(Base):
             ondelete="RESTRICT",
         ),
         CheckConstraint("environment IN ('production','sandbox')", name="ck_cpa_environment"),
-        CheckConstraint("max_order_amount <= 5", name="ck_cpa_max_order_cap"),
+        CheckConstraint("side = 'SELL' OR max_order_amount <= 5", name="ck_cpa_max_order_cap"),
         CheckConstraint("max_deployed_capital <= 5", name="ck_cpa_max_deployed_cap"),
         CheckConstraint("max_order_amount > 0", name="ck_cpa_max_order_positive"),
-        CheckConstraint("max_deployed_capital > 0", name="ck_cpa_deployed_positive"),
+        CheckConstraint(
+            "(side = 'BUY' AND max_deployed_capital > 0) OR "
+            "(side = 'SELL' AND max_deployed_capital = 0 AND maximum_authorized_base_quantity > 0)",
+            name="ck_cpa_deployed_positive",
+        ),
         CheckConstraint("no_leverage = true", name="ck_cpa_no_leverage"),
         CheckConstraint(
             "activation_state IN ('ACTIVE','PAUSED','REVOKED','EXPIRED','INVALIDATED','COMPLETED')",
@@ -58,8 +62,10 @@ class CanonicalProvingActivation(Base):
     provider: Mapped[str] = mapped_column(Text, nullable=False)
     environment: Mapped[str] = mapped_column(Text, nullable=False)
     product: Mapped[str] = mapped_column(Text, nullable=False)
+    side: Mapped[str] = mapped_column(Text, nullable=False, server_default=text("'BUY'"))
     max_order_amount: Mapped[Decimal] = mapped_column(Numeric, nullable=False)
     max_deployed_capital: Mapped[Decimal] = mapped_column(Numeric, nullable=False)
+    maximum_authorized_base_quantity: Mapped[Decimal | None] = mapped_column(Numeric)
     no_leverage: Mapped[bool] = mapped_column(Boolean, nullable=False, server_default=text("true"))
     activated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
     expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)

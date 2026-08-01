@@ -32,8 +32,21 @@ class CanonicalPreviewPackage(Base):
         CheckConstraint("proposed_order_amount > 0", name="ck_cpp_proposed_positive"),
         CheckConstraint("risk_approved_amount > 0", name="ck_cpp_approved_positive"),
         CheckConstraint("risk_approved_amount <= proposed_order_amount", name="ck_cpp_approved_lte_prop"),
-        CheckConstraint("proposed_order_amount <= 5", name="ck_cpp_proposed_cap"),
-        CheckConstraint("risk_approved_amount <= 5", name="ck_cpp_approved_cap"),
+        CheckConstraint("side = 'SELL' OR proposed_order_amount <= 5", name="ck_cpp_proposed_cap"),
+        CheckConstraint("side = 'SELL' OR risk_approved_amount <= 5", name="ck_cpp_approved_cap"),
+        CheckConstraint(
+            "capital_deployment_amount IS NULL OR "
+            "(side = 'BUY' AND capital_deployment_amount > 0 AND capital_deployment_amount <= 5) OR "
+            "(side = 'SELL' AND capital_deployment_amount = 0)", name="ck_cpp_side_aware_capital",
+        ),
+        CheckConstraint(
+            "(proposed_base_quantity IS NULL AND maximum_authorized_base_quantity IS NULL "
+            "AND expected_quote_proceeds IS NULL) OR "
+            "(side = 'BUY' AND proposed_base_quantity IS NULL AND maximum_authorized_base_quantity IS NULL) OR "
+            "(side = 'SELL' AND proposed_base_quantity > 0 AND maximum_authorized_base_quantity > 0 "
+            "AND proposed_base_quantity <= maximum_authorized_base_quantity AND expected_quote_proceeds > 0)",
+            name="ck_cpp_side_aware_quantity",
+        ),
         CheckConstraint(
             "package_state IN ('CREATED','READY','AUTHORIZED','DRY_RUN_PASSED','ACTIVATED','EXPIRED','INVALIDATED','SUPERSEDED','COMPLETED','FAILED_CLOSED')",
             name="ck_cpp_package_state",
@@ -71,6 +84,12 @@ class CanonicalPreviewPackage(Base):
     side: Mapped[str] = mapped_column(Text, nullable=False)
     proposed_order_amount: Mapped[Decimal] = mapped_column(Numeric, nullable=False)
     risk_approved_amount: Mapped[Decimal] = mapped_column(Numeric, nullable=False)
+    # Optional for packages created by legacy/Controlled Proof producers.  New
+    # side-aware producers populate the complete group atomically.
+    capital_deployment_amount: Mapped[Decimal | None] = mapped_column(Numeric)
+    proposed_base_quantity: Mapped[Decimal | None] = mapped_column(Numeric)
+    maximum_authorized_base_quantity: Mapped[Decimal | None] = mapped_column(Numeric)
+    expected_quote_proceeds: Mapped[Decimal | None] = mapped_column(Numeric)
     strategy_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), ForeignKey("strategies.id", ondelete="RESTRICT"), nullable=False)
     strategy_version: Mapped[str] = mapped_column(Text, nullable=False)
     parameter_set_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), ForeignKey("parameter_sets.id", ondelete="RESTRICT"), nullable=False)

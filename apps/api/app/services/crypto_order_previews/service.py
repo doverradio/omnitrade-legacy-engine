@@ -608,6 +608,8 @@ async def create_crypto_order_preview(
     db: AsyncSession,
     request: CryptoOrderPreviewCreateRequest,
     actor: str = "operator",
+    commit: bool = True,
+    defer_decision_linkage: bool = False,
 ) -> CryptoOrderPreviewResponse:
     settings = get_settings()
     connection = await _load_exchange_connection(db, request.exchange_connection_id)
@@ -797,7 +799,7 @@ async def create_crypto_order_preview(
             ),
         )
         record.risk_event_id = risk_result.risk_event_id
-        if record.decision_record_id is None:
+        if record.decision_record_id is None and not defer_decision_linkage:
             record.decision_record_id = await _create_preview_decision_record(
                 db=db,
                 preview=record,
@@ -825,14 +827,13 @@ async def create_crypto_order_preview(
             before_state={"status": "PREVIEW_REQUESTED"},
             after_state={"status": record.status, "reason_code": record.failure_reason},
         )
-        await guard_preview_linkage_integrity(
-            db=db,
-            actor=actor,
-            preview=record,
-            stage="risk_rejected",
-        )
-        await db.commit()
-        await db.refresh(record)
+        if not defer_decision_linkage:
+            await guard_preview_linkage_integrity(
+                db=db, actor=actor, preview=record, stage="risk_rejected",
+            )
+        if commit:
+            await db.commit()
+            await db.refresh(record)
         return _to_response(record)
 
     await _record_audit(
@@ -854,7 +855,7 @@ async def create_crypto_order_preview(
         ),
     )
     record.risk_event_id = risk_result.risk_event_id
-    if record.decision_record_id is None:
+    if record.decision_record_id is None and not defer_decision_linkage:
         record.decision_record_id = await _create_preview_decision_record(
             db=db,
             preview=record,
@@ -913,14 +914,13 @@ async def create_crypto_order_preview(
             before_state={"status": "PREVIEW_REQUESTED"},
             after_state={"status": record.status, "failure_reason": record.failure_reason},
         )
-        await guard_preview_linkage_integrity(
-            db=db,
-            actor=actor,
-            preview=record,
-            stage="provider_preview_failed",
-        )
-        await db.commit()
-        await db.refresh(record)
+        if not defer_decision_linkage:
+            await guard_preview_linkage_integrity(
+                db=db, actor=actor, preview=record, stage="provider_preview_failed",
+            )
+        if commit:
+            await db.commit()
+            await db.refresh(record)
         return _to_response(record)
 
     record.status = "PREVIEW_READY"
@@ -940,15 +940,14 @@ async def create_crypto_order_preview(
         },
     )
 
-    await guard_preview_linkage_integrity(
-        db=db,
-        actor=actor,
-        preview=record,
-        stage="preview_ready",
-    )
+    if not defer_decision_linkage:
+        await guard_preview_linkage_integrity(
+            db=db, actor=actor, preview=record, stage="preview_ready",
+        )
 
-    await db.commit()
-    await db.refresh(record)
+    if commit:
+        await db.commit()
+        await db.refresh(record)
     return _to_response(record)
 
 

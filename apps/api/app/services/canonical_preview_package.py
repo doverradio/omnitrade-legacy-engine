@@ -74,6 +74,7 @@ _FORCED_COMMISSIONING_MODE = "initial_proving_entry"
 # every real downstream gate unchanged" mechanism, never conflated with the
 # initial-entry mode's own guards, supersession logic, or provenance labels.
 _CONTROLLED_PROOF_MODE = "controlled_proof"
+_AUTONOMOUS_POSITION_EXIT_MODE = "autonomous_position_exit"
 _TERMINAL_PACKAGE_STATES = {"EXPIRED", "INVALIDATED", "SUPERSEDED", "COMPLETED", "FAILED_CLOSED"}
 _FORCED_REISSUE_RATIONALE = "expired_unused_initial_proving_entry_reissued"
 _MANDATE_PACKAGE_AUTHORITY_ACTOR = "system:mandate-package-authority"
@@ -114,6 +115,13 @@ class CanonicalPreviewPackageCreateRequest:
     forced_action: str | None = None
     controlled_proof_id: uuid.UUID | None = None
     controlled_proof_exit_recovery_id: uuid.UUID | None = None
+    autonomous_exit_custody_id: uuid.UUID | None = None
+    autonomous_exit_evaluation_hash: str | None = None
+    autonomous_exit_authority_id: uuid.UUID | None = None
+    autonomous_exit_authority_version: int | None = None
+    autonomous_exit_classification: str | None = None
+    autonomous_exit_proof_eligible: bool | None = None
+    autonomous_exit_maximum_quantity: Decimal | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -224,6 +232,27 @@ def _serialize_uuid(value: uuid.UUID | None) -> str | None:
     return str(value) if value is not None else None
 
 
+def _package_quote_notional(*, request: CanonicalPreviewPackageCreateRequest, preview: CryptoOrderPreview) -> Decimal:
+    """Canonical package amount is quote notional, never SELL base quantity.
+
+    Ordinary/Controlled-Proof behavior retains its established bounded amount.
+    Autonomous exits use the provider preview's actual estimated quote proceeds.
+    """
+    if (_is_autonomous_position_exit_mode(request) and preview.side == "SELL"
+            and preview.estimated_quote_size is not None):
+        return _decimal(preview.estimated_quote_size)
+    if preview.side == "SELL":
+        return request.max_proposed_order_amount
+    return _decimal(preview.requested_amount)
+
+
+def _package_capital_deployment(package: CanonicalPreviewPackage) -> Decimal:
+    if package.side == "SELL":
+        return Decimal("0")
+    value = getattr(package, "capital_deployment_amount", None)
+    return _decimal(package.risk_approved_amount if value is None else value)
+
+
 def _input_fingerprint(request: CanonicalPreviewPackageCreateRequest) -> str:
     payload = json.dumps(
         {
@@ -241,6 +270,16 @@ def _input_fingerprint(request: CanonicalPreviewPackageCreateRequest) -> str:
             "mandate_version_id": _serialize_uuid(request.mandate_version_id),
             "mandate_evaluation_id": _serialize_uuid(request.mandate_evaluation_id),
             "controlled_proof_exit_recovery_id": _serialize_uuid(request.controlled_proof_exit_recovery_id),
+            "autonomous_exit_custody_id": _serialize_uuid(request.autonomous_exit_custody_id),
+            "autonomous_exit_evaluation_hash": request.autonomous_exit_evaluation_hash,
+            "autonomous_exit_authority_id": _serialize_uuid(request.autonomous_exit_authority_id),
+            "autonomous_exit_authority_version": request.autonomous_exit_authority_version,
+            "autonomous_exit_classification": request.autonomous_exit_classification,
+            "autonomous_exit_proof_eligible": request.autonomous_exit_proof_eligible,
+            "autonomous_exit_maximum_quantity": (
+                None if request.autonomous_exit_maximum_quantity is None
+                else _serialize_decimal(request.autonomous_exit_maximum_quantity)
+            ),
         },
         sort_keys=True,
         separators=(",", ":"),
@@ -266,6 +305,10 @@ def _is_controlled_proof_mode(request: CanonicalPreviewPackageCreateRequest) -> 
     return value == _CONTROLLED_PROOF_MODE
 
 
+def _is_autonomous_position_exit_mode(request: CanonicalPreviewPackageCreateRequest) -> bool:
+    return str(request.commissioning_entry_mode or "").strip().lower() == _AUTONOMOUS_POSITION_EXIT_MODE
+
+
 def _forced_commissioning_guard_blocker(
     *,
     request: CanonicalPreviewPackageCreateRequest,
@@ -273,6 +316,14 @@ def _forced_commissioning_guard_blocker(
     runtime_campaign: CapitalCampaign,
     prior_packages: int,
 ) -> str | None:
+    if _is_autonomous_position_exit_mode(request):
+        if request.forced_action != "CLOSE_POSITION_PROPOSED" or request.expected_decision_record_id is None:
+            return "autonomous_exit_requires_canonical_sell_decision"
+        if not all((request.autonomous_exit_custody_id, request.autonomous_exit_evaluation_hash,
+                    request.autonomous_exit_authority_id, request.autonomous_exit_authority_version,
+                    request.autonomous_exit_classification, request.autonomous_exit_maximum_quantity)):
+            return "autonomous_exit_authority_evidence_incomplete"
+        return None
     if _is_controlled_proof_mode(request):
         # Deliberately minimal and deliberately NOT the initial-entry guard
         # below: a controlled proof is expected to run against an
@@ -883,6 +934,8 @@ async def _create_crypto_order_preview_for_package(
             actor=request.actor, strategy_identity=strategy_identity,
             controlled_proof_exit_recovery_id=request.controlled_proof_exit_recovery_id,
         )
+    elif _is_autonomous_position_exit_mode(request):
+        decision_record_id = request.expected_decision_record_id
     else:
         decision_record_id = _selected_decision_record_id(selected_decision)
         if decision_record_id is None:
@@ -918,6 +971,10 @@ async def _create_crypto_order_preview_for_package(
                 diagnostics=[_diagnostic(code="canonical_owned_sell_quantity_missing", stage="preview_resolution")]
             )
 
+    preview_call_kwargs: dict[str, Any] = {}
+    if _is_autonomous_position_exit_mode(request):
+        preview_call_kwargs["commit"] = False
+        preview_call_kwargs["defer_decision_linkage"] = decision_record_id is None
     preview_response = await create_crypto_order_preview(
         db=db,
         request=CryptoOrderPreviewCreateRequest(
@@ -941,6 +998,7 @@ async def _create_crypto_order_preview_for_package(
             paper_account_id=request.paper_account_id,
         ),
         actor=request.actor,
+        **preview_call_kwargs,
     )
 
     preview = await _load_preview_by_id(db=db, preview_id=preview_response.crypto_order_preview_id)
@@ -1010,6 +1068,10 @@ def _package_payload(package: CanonicalPreviewPackage) -> dict[str, Any]:
         "side": package.side,
         "proposed_order_amount": _serialize_decimal(_decimal(package.proposed_order_amount)),
         "risk_approved_amount": _serialize_decimal(_decimal(package.risk_approved_amount)),
+        "capital_deployment_amount": _serialize_decimal(_package_capital_deployment(package)),
+        "proposed_base_quantity": None if getattr(package, "proposed_base_quantity", None) is None else _serialize_decimal(_decimal(package.proposed_base_quantity)),
+        "maximum_authorized_base_quantity": None if getattr(package, "maximum_authorized_base_quantity", None) is None else _serialize_decimal(_decimal(package.maximum_authorized_base_quantity)),
+        "expected_quote_proceeds": None if getattr(package, "expected_quote_proceeds", None) is None else _serialize_decimal(_decimal(package.expected_quote_proceeds)),
         "strategy_id": str(package.strategy_id),
         "strategy_version": package.strategy_version,
         "parameter_set_id": str(package.parameter_set_id),
@@ -1125,7 +1187,7 @@ async def create_canonical_preview_package(
     if request.max_proposed_order_amount != Decimal("5"):
         raise ValueError("max proposed order amount must equal canonical bound of 5")
     mode_value = str(request.commissioning_entry_mode or "").strip().lower()
-    if mode_value and mode_value not in {_FORCED_COMMISSIONING_MODE, _CONTROLLED_PROOF_MODE}:
+    if mode_value and mode_value not in {_FORCED_COMMISSIONING_MODE, _CONTROLLED_PROOF_MODE, _AUTONOMOUS_POSITION_EXIT_MODE}:
         raise ValueError(f"unsupported commissioning_entry_mode: {request.commissioning_entry_mode}")
 
     existing = await _load_package_by_idempotency(db=db, idempotency_key=request.idempotency_key)
@@ -1183,7 +1245,7 @@ async def create_canonical_preview_package(
         )
 
     cycle = None
-    if _is_controlled_proof_mode(request):
+    if _is_controlled_proof_mode(request) or _is_autonomous_position_exit_mode(request):
         # RUN_CONTROLLED_PROOF is its own operator-issued candidate source.
         # It deliberately enters the canonical package seam here, after
         # authorization/evidence/risk/mandate evaluation, without asking an
@@ -1216,8 +1278,10 @@ async def create_canonical_preview_package(
         composition = {
             "proposed_action": proposed_action,
             "selected_decision": selected_decision,
-            "authority": "CONTROLLED_PROOF",
-            "controlled_proof_id": str(request.controlled_proof_id),
+            "authority": "AUTONOMOUS_POSITION_EXIT" if _is_autonomous_position_exit_mode(request) else "CONTROLLED_PROOF",
+            "controlled_proof_id": None if request.controlled_proof_id is None else str(request.controlled_proof_id),
+            "custody_id": None if request.autonomous_exit_custody_id is None else str(request.autonomous_exit_custody_id),
+            "exit_authority_id": None if request.autonomous_exit_authority_id is None else str(request.autonomous_exit_authority_id),
         }
     else:
         orchestration = await run_campaign_orchestration_preview_for_candle(
@@ -1275,7 +1339,7 @@ async def create_canonical_preview_package(
         # evaluation, risk event, strategy/parameter_set resolution) still
         # runs for real and can still reject it.
         can_force_controlled_proof = (
-            _is_controlled_proof_mode(request)
+            (_is_controlled_proof_mode(request) or _is_autonomous_position_exit_mode(request))
             and request.forced_action in {"OPEN_POSITION_PROPOSED", "CLOSE_POSITION_PROPOSED"}
         )
         if not (can_force_commissioning_entry or can_force_controlled_proof):
@@ -1328,7 +1392,9 @@ async def create_canonical_preview_package(
     # instead of completing.
     preview = await _load_preview_for_package(
         db=db, request=request,
-        observed_after=cycle.started_at if cycle is not None else _utcnow(),
+        observed_after=(cycle.started_at if cycle is not None else None)
+        if _is_autonomous_position_exit_mode(request)
+        else (cycle.started_at if cycle is not None else _utcnow()),
     )
     if preview is None:
         preview = await _create_crypto_order_preview_for_package(
@@ -1437,11 +1503,22 @@ async def create_canonical_preview_package(
         side=preview.side,
         # Package risk/notional fields remain quote-currency notional for
         # both sides; SELL base quantity lives truthfully on its preview.
-        proposed_order_amount=(
-            request.max_proposed_order_amount if preview.side == "SELL" else _decimal(preview.requested_amount)
+        proposed_order_amount=_package_quote_notional(request=request, preview=preview),
+        risk_approved_amount=_package_quote_notional(request=request, preview=preview),
+        capital_deployment_amount=(
+            Decimal("0") if preview.side == "SELL" else _decimal(preview.requested_amount)
         ),
-        risk_approved_amount=(
-            request.max_proposed_order_amount if preview.side == "SELL" else _decimal(preview.requested_amount)
+        proposed_base_quantity=(
+            _decimal(preview.base_size) if preview.side == "SELL" else None
+        ),
+        maximum_authorized_base_quantity=(
+            request.autonomous_exit_maximum_quantity
+            if _is_autonomous_position_exit_mode(request)
+            else _decimal(preview.base_size) if preview.side == "SELL" else None
+        ),
+        expected_quote_proceeds=(
+            _package_quote_notional(request=request, preview=preview)
+            if preview.side == "SELL" else None
         ),
         strategy_id=strategy.id,
         strategy_version=getattr(strategy, "module_version", "unknown"),
@@ -1461,11 +1538,13 @@ async def create_canonical_preview_package(
             # mode either -- CONTROLLED_PROOF is its own, distinct, always
             # truthful label, carrying the originating proof_id.
             "entry_authority": (
-                "OPERATOR_COMMISSIONED" if _is_forced_commissioning_mode(request) or _is_controlled_proof_mode(request)
+                "CONTINUING_EXIT_AUTHORITY" if _is_autonomous_position_exit_mode(request)
+                else "OPERATOR_COMMISSIONED" if _is_forced_commissioning_mode(request) or _is_controlled_proof_mode(request)
                 else "AUTONOMOUS_STRATEGY"
             ),
             "entry_reason": (
-                "INITIAL_PROVING_ENTRY" if _is_forced_commissioning_mode(request)
+                "AUTONOMOUS_POSITION_REDUCTION" if _is_autonomous_position_exit_mode(request)
+                else "INITIAL_PROVING_ENTRY" if _is_forced_commissioning_mode(request)
                 else "CONTROLLED_PROOF" if _is_controlled_proof_mode(request)
                 else "AUTONOMOUS_SELECTION"
             ),
@@ -1482,7 +1561,24 @@ async def create_canonical_preview_package(
                 if _is_controlled_proof_mode(request) and request.controlled_proof_exit_recovery_id is not None
                 else None
             ),
-            "requested_quote_size": _serialize_decimal(request.max_proposed_order_amount),
+            "autonomous_exit_custody_id": _serialize_uuid(request.autonomous_exit_custody_id),
+            "autonomous_exit_evaluation_hash": request.autonomous_exit_evaluation_hash,
+            "autonomous_exit_authority_id": _serialize_uuid(request.autonomous_exit_authority_id),
+            "autonomous_exit_authority_version": request.autonomous_exit_authority_version,
+            "autonomous_exit_classification": request.autonomous_exit_classification,
+            "autonomous_exit_proof_eligible": request.autonomous_exit_proof_eligible,
+            "autonomous_exit_exposure_effect": "REDUCE_ONLY" if _is_autonomous_position_exit_mode(request) else None,
+            "autonomous_exit_maximum_quantity": (
+                None if request.autonomous_exit_maximum_quantity is None
+                else _serialize_decimal(request.autonomous_exit_maximum_quantity)
+            ),
+            "requested_quote_size": (
+                _serialize_decimal(_decimal(preview.estimated_quote_size))
+                if (_is_autonomous_position_exit_mode(request) and preview.side == "SELL"
+                    and preview.estimated_quote_size is not None)
+                else _serialize_decimal(request.max_proposed_order_amount)
+            ),
+            "buy_entry_quote_cap": _serialize_decimal(request.max_proposed_order_amount),
             "requested_base_size": (
                 _serialize_decimal(_decimal(preview.base_size)) if preview.side == "SELL" else None
             ),
@@ -1568,8 +1664,13 @@ async def authorize_canonical_preview_package(
         raise LookupError("canonical preview package not found")
     if package.package_state in {"INVALIDATED", "SUPERSEDED", "COMPLETED", "FAILED_CLOSED"}:
         raise PermissionError("package is not eligible for authorization")
-    if request.max_order_usd > Decimal("5") or request.max_total_deployed_campaign_capital_usd > Decimal("5"):
+    if request.max_total_deployed_campaign_capital_usd > Decimal("5"):
         raise PermissionError("bounded proving amount exceeds canonical cap")
+    if package.side == "BUY" and request.max_order_usd > Decimal("5"):
+        raise PermissionError("bounded proving amount exceeds canonical cap")
+    if (package.side == "SELL" and request.max_order_usd
+            < _decimal(getattr(package, "expected_quote_proceeds", package.risk_approved_amount))):
+        raise PermissionError("SELL approval amount is below expected liquidation proceeds")
 
     approval_scope = {
         "canonical_preview_package_id": str(package.package_id),
@@ -1779,7 +1880,7 @@ async def authorize_canonical_preview_package_under_mandate(
     if strategy is None:
         raise PermissionError("package strategy identity missing")
     strategy_identity = build_strategy_identity(slug=strategy.slug, module_version=package.strategy_version)
-    amount = _decimal(package.risk_approved_amount)
+    amount = _package_capital_deployment(package)
     static_failures: list[str] = []
     if package.product not in version.allowed_products:
         static_failures.append("product mismatch")
@@ -2076,7 +2177,7 @@ async def _validate_canonical_package_authority(
     strategy_identity = build_strategy_identity(slug=strategy.slug, module_version=package.strategy_version)
     if strategy_identity not in version.allowed_strategy_versions:
         raise PermissionError("strategy mismatch")
-    amount = _decimal(package.risk_approved_amount)
+    amount = _package_capital_deployment(package)
     if any(
         amount > _decimal(limit)
         for limit in (
@@ -2110,7 +2211,7 @@ async def run_dry_run_for_canonical_preview_package(
     package = await _load_package(db=db, package_id=request.package_id)
     if package is None:
         raise LookupError("canonical preview package not found")
-    if _decimal(package.risk_approved_amount) > Decimal("5"):
+    if _package_capital_deployment(package) > Decimal("5"):
         raise PermissionError("bounded proving amount exceeds canonical cap")
     if package.package_state != "AUTHORIZED":
         raise PermissionError("package is not AUTHORIZED for dry run")
@@ -2230,7 +2331,7 @@ async def activate_canonical_proving_campaign(
     package = await _load_package(db=db, package_id=request.package_id)
     if package is None:
         raise LookupError("canonical preview package not found")
-    if _decimal(package.risk_approved_amount) > Decimal("5"):
+    if _package_capital_deployment(package) > Decimal("5"):
         raise PermissionError("bounded proving amount exceeds canonical cap")
     source = str(getattr(package, "authorization_source", None) or ("HUMAN" if package.approval_event_id else "")).upper()
     if source == "MANDATE" and package.package_state != "DRY_RUN_PASSED":
@@ -2351,8 +2452,10 @@ async def activate_canonical_proving_campaign(
         provider=package.provider,
         environment=package.environment,
         product=package.product,
+        side=package.side,
         max_order_amount=_decimal(package.risk_approved_amount),
-        max_deployed_capital=_decimal(package.risk_approved_amount),
+        max_deployed_capital=_package_capital_deployment(package),
+        maximum_authorized_base_quantity=getattr(package, "maximum_authorized_base_quantity", None),
         no_leverage=True,
         activated_at=_utcnow(),
         expires_at=activation_expires_at,

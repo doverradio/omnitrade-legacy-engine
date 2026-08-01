@@ -114,6 +114,7 @@ from app.services.orchestration.reconciliation_guard import (
 from app.services.orchestration.reconciliation_scheduler import poll_unresolved_live_orders
 from app.services.orchestration.autonomous_position_exit_evaluation import evaluate_due_custodies
 from app.services.orchestration.autonomous_position_exit_authority import issue_due_exit_authorities, revalidate_active_exit_authorities
+from app.services.orchestration.autonomous_position_exit_construction import construct_due_exit_paperwork
 from app.services.strategy_outcomes import score_due_strategy_roster_proposal_outcomes
 from app.services.strategy_roster import StrategyRosterRequest, run_strategy_roster_for_candle
 from app.services.strategy_roster.decision_aggregator import AGGREGATE_STRATEGY_SLUG
@@ -2480,6 +2481,7 @@ async def run_orchestration_cycle(
             custody_outcome = await evaluate_due_custodies(db=db)
             await revalidate_active_exit_authorities(db=db)
             authority_outcome = await issue_due_exit_authorities(db=db)
+            exit_paperwork_outcome = await construct_due_exit_paperwork(db=db)
             await db.commit()
             if custody_outcome.discovered:
                 logger.info(
@@ -2494,6 +2496,13 @@ async def run_orchestration_cycle(
                     "autonomous_custody_authority_cycle_completed discovered=%s armed=%s replayed=%s blocked=%s",
                     authority_outcome.discovered, authority_outcome.armed,
                     authority_outcome.replayed, authority_outcome.blocked,
+                )
+            if exit_paperwork_outcome.discovered:
+                logger.info(
+                    "autonomous_exit_paperwork_cycle_completed discovered=%s constructed=%s "
+                    "failed=%s activation_connected=false provider_submission_connected=false",
+                    exit_paperwork_outcome.discovered, exit_paperwork_outcome.constructed,
+                    exit_paperwork_outcome.failed,
                 )
         except Exception:
             await _rollback_active_session(db=db)

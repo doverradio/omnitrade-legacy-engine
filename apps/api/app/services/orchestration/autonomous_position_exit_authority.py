@@ -217,7 +217,8 @@ async def revalidate_active_exit_authorities(
         )
         if observed_at >= row.expires_at:
             target, reason = "EXPIRED", "authority_expired"
-        elif row.authority_state == "RESERVED" and row.reservation_expires_at is not None and observed_at >= row.reservation_expires_at:
+        elif (row.authority_state == "RESERVED" and getattr(row, "reserved_package_id", None) is None
+              and row.reservation_expires_at is not None and observed_at >= row.reservation_expires_at):
             target, reason = "ARMED", "abandoned_reservation_recovered"
         elif custody is None or custody.custody_state not in NONTERMINAL_CUSTODY_STATES:
             target, reason = "REVOKED", "custody_terminal_or_unavailable"
@@ -237,7 +238,9 @@ async def revalidate_active_exit_authorities(
         if target == "EXPIRED": row.expired_at = observed_at
         if target == "REVOKED": row.revoked_at = observed_at
         if target == "CONSUMED": row.consumed_at = observed_at
-        if target == "ARMED": row.reserved_at = None; row.reservation_expires_at = None
+        if target == "ARMED":
+            row.reserved_at = None; row.reservation_expires_at = None
+            row.reserved_decision_id = None; row.reserved_package_id = None
         if custody is not None: custody.continuing_exit_authority_state = target
         db.add(AuditLog(
             actor="system:autonomous_custody_authority", action=f"autonomous_position_exit_authority.{target.lower()}",

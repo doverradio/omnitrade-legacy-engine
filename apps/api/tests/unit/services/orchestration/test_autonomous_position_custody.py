@@ -306,9 +306,11 @@ async def test_status_reports_custody_and_sell_supervision_unconnected(monkeypat
 
     result = await custody.custody_status(db=db)
 
-    assert result["verdict"] == "SELL_SUPERVISION_NOT_IMPLEMENTED"
+    assert result["verdict"] == "SELL_PAPERWORK_ONLY"
     assert result["automatic_sell_submission"] is False
     assert result["items"][0]["sell_supervisor_connected"] is False
+    assert result["items"][0]["sell_decision_construction_connected"] is True
+    assert result["items"][0]["package_activation_connected"] is False
     assert result["items"][0]["authoritative_remaining_quantity"] == "0.00008"
     assert result["items"][0]["entry_campaign_status"] == "EXPIRED"
     assert result["items"][0]["entry_mandate_status"] == "EXPIRED"

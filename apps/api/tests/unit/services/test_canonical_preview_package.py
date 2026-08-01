@@ -3501,3 +3501,47 @@ async def test_hard_cap_rejects_over_five_on_authorize_dry_run_and_activation(mo
                 idempotency_key="act-1",
             ),
         )
+
+
+@pytest.mark.asyncio
+async def test_above_five_reduce_only_sell_is_not_rejected_as_deployed_capital(monkeypatch: pytest.MonkeyPatch) -> None:
+    package_id = uuid4(); approval_id = uuid4(); now = datetime.now(timezone.utc)
+    package = SimpleNamespace(
+        package_id=package_id, campaign_id=uuid4(), campaign_version=1, runtime_campaign_id=uuid4(),
+        paper_account_id=uuid4(), live_trading_profile_id=uuid4(), provider="kraken_spot",
+        environment="production", product="BTC-USD", side="SELL",
+        proposed_order_amount=Decimal("7.20"), risk_approved_amount=Decimal("7.20"),
+        capital_deployment_amount=Decimal("0"), proposed_base_quantity=Decimal("0.00008"),
+        maximum_authorized_base_quantity=Decimal("0.00008"), expected_quote_proceeds=Decimal("7.20"),
+        strategy_id=uuid4(), strategy_version="v1", parameter_set_id=uuid4(), parameter_set_version="v1",
+        decision_record_id=uuid4(), risk_event_id=uuid4(), crypto_order_preview_id=uuid4(),
+        market_evidence_identity={"exchange_connection_id": str(uuid4()), "requested_base_size": "0.00008", "provider_base_size": "0.00008"},
+        market_evidence_observed_at=now, preview_expires_at=now + timedelta(minutes=5), package_state="READY",
+        generated_at=now, idempotency_key="sell-7", input_fingerprint="fingerprint", approval_event_id=None,
+        authorization_source=None, mandate_id=None, mandate_version_id=None, mandate_evaluation_id=None,
+        authorization_expires_at=None, authority_audit_correlation_id=None,
+        dry_run_live_crypto_order_id=None, superseded_at=None, invalidated_reason=None,
+    )
+    monkeypatch.setattr(cpp, "_load_package", _async_return(package))
+    monkeypatch.setattr(cpp, "record_live_approval_checkpoint", _async_return(SimpleNamespace(
+        approval_event_id=approval_id, checkpoint_type="bounded_proving_entry",
+    )))
+    await cpp.authorize_canonical_preview_package(
+        db=_FakeDb(), request=cpp.CanonicalPreviewPackageAuthorizeRequest(
+            package_id=package_id, actor="operator:human", approver_role="risk_owner",
+            rationale="reduce owned position", expires_at=now + timedelta(minutes=5),
+            max_order_usd=Decimal("7.20"), max_total_deployed_campaign_capital_usd=Decimal("5"),
+            no_leverage=True, idempotency_key="sell-auth",
+        ),
+    )
+    assert package.package_state == "AUTHORIZED"
+    approval = _approval_event(package_id=package_id); approval.id = approval_id
+    monkeypatch.setattr(cpp, "_load_profile", _async_return(SimpleNamespace(id=package.live_trading_profile_id, paper_account_id=package.paper_account_id)))
+    result = await cpp.run_dry_run_for_canonical_preview_package(
+        db=_FakeDb(scalar_values=[approval]), request=cpp.CanonicalPreviewPackageDryRunRequest(
+            package_id=package_id, approval_event_id=approval_id,
+            operator_identity="operator:human", idempotency_token="sell-dry",
+        ),
+    )
+    assert result["dry_run_status"] == "DRY_RUN_READY"
+    assert package.package_state == "DRY_RUN_PASSED"

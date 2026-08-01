@@ -322,13 +322,21 @@ async def assess_commissioned_campaign_readiness(
 
     cap = _to_decimal(authority_metadata.get("maximum_entry_notional") if authority_ok else None)
     requested = request.requested_quote_amount
-    cap_ok = cap is not None and requested <= cap and requested > Decimal("0")
+    # The commissioned cap governs new BUY capital.  SELL quote amount is
+    # expected liquidation proceeds; its exposure boundary is owned base.
+    cap_ok = requested > Decimal("0") and (
+        request.side == "SELL" or (cap is not None and requested <= cap)
+    )
     checks.append(
         _check(
             code="capital_cap",
             passed=cap_ok,
             blocker_reason=None if cap_ok else "requested_quote_amount_above_authorized_cap",
-            detail={"requested_quote_amount": requested, "capital_cap": cap},
+            detail={
+                "requested_quote_amount": requested,
+                "capital_cap": cap,
+                "capital_deployment_amount": requested if request.side == "BUY" else Decimal("0"),
+            },
         )
     )
 

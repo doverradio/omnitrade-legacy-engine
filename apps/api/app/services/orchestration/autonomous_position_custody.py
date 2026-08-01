@@ -467,12 +467,23 @@ async def custody_status(
             "authority_issued_at": None if authority is None else authority.issued_at,
             "authority_expires_at": None if authority is None else authority.expires_at,
             "authority_reserved_at": None if authority is None else authority.reserved_at,
+            "authority_reservation_expires_at": None if authority is None else authority.reservation_expires_at,
+            "authority_reserved_decision_id": None if authority is None or authority.reserved_decision_id is None else str(authority.reserved_decision_id),
+            "authority_reserved_package_id": None if authority is None or authority.reserved_package_id is None else str(authority.reserved_package_id),
             "authority_revoked_at": None if authority is None else authority.revoked_at,
             "authority_consumed_at": None if authority is None else authority.consumed_at,
             "authority_policy_evidence": None if authority is None else authority.policy_evidence,
             "authority_risk_evidence": None if authority is None else authority.risk_evidence,
             "authority_blockers": [] if authority is None else authority.blockers,
-            "sell_decision_construction_connected": False,
+            "last_construction_failure_at": None if authority is None else authority.last_construction_failure_at,
+            "last_construction_failure_code": None if authority is None else authority.last_construction_failure_code,
+            "last_construction_exception_class": None if authority is None else authority.last_construction_exception_class,
+            "last_construction_failure_retryable": None if authority is None else authority.last_construction_failure_retryable,
+            "sell_decision_construction_connected": True,
+            "package_activation_connected": False,
+            "automatic_sell_execution_connected": False,
+            "provider_submission_connected": False,
+            "autonomous_proof_sell_ready": False,
             "blockers": [] if projection is None else list(projection.blockers),
             "positive_inventory_supervised": bool(
                 projection is not None
@@ -488,7 +499,7 @@ async def custody_status(
         db=db, provider=provider, environment=environment, product=product,
     )
     return {
-        "verdict": "SELL_SUPERVISION_NOT_IMPLEMENTED",
+        "verdict": "SELL_PAPERWORK_ONLY",
         "custody_count": len(items), "items": items,
         "uncustodied_positive_buy_count": len(uncustodied),
         "uncustodied_positive_buys": uncustodied,

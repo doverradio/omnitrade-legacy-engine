@@ -256,6 +256,45 @@ async def test_capital_cap_violation_blocks(monkeypatch: pytest.MonkeyPatch) -> 
 
 
 @pytest.mark.asyncio
+async def test_sell_proceeds_above_entry_cap_are_not_new_capital(monkeypatch: pytest.MonkeyPatch) -> None:
+    campaign_id = uuid4()
+    mandate = _mandate()
+    mandate_version = _mandate_version(mandate_id=mandate.mandate_id)
+    mandate_version.allowed_order_sides = ["SELL"]
+    definition = _definition(
+        campaign_id=campaign_id,
+        version=1,
+        status="ACTIVE",
+        metadata_evidence=_commissioned_metadata(state="ACTIVE_POSITION", cap="5"),
+    )
+    runtime = _runtime(campaign_id=campaign_id, version=1, status="ACTIVE")
+    request = _request(
+        campaign_id=campaign_id,
+        version=1,
+        mandate_id=mandate.mandate_id,
+        mandate_version_id=mandate_version.mandate_version_id,
+        live_profile_id=uuid4(),
+    )
+    request.side = "SELL"
+    request.requested_quote_amount = Decimal("7.20")
+    request.reconciliation_evidence = {"owned_base_quantity": "0.00008"}
+
+    _patch_ready_baseline(
+        monkeypatch,
+        definition=definition,
+        runtime=runtime,
+        mandate=mandate,
+        mandate_version=mandate_version,
+    )
+    readiness = await crp.assess_commissioned_campaign_readiness(db=_FakeDb(), request=request)
+
+    capital_check = next(item for item in readiness.checks if item["code"] == "capital_cap")
+    assert capital_check["status"] == "pass"
+    assert capital_check["detail"]["capital_deployment_amount"] == Decimal("0")
+    assert "requested_quote_amount_above_authorized_cap" not in readiness.blockers
+
+
+@pytest.mark.asyncio
 async def test_insufficient_balance_blocks(monkeypatch: pytest.MonkeyPatch) -> None:
     campaign_id = uuid4()
     mandate = _mandate()
