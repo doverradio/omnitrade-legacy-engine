@@ -19,6 +19,13 @@ from app.services.pipeline_contracts.btc_kraken import (
     StrategyAction,
     StrategyEvaluationResultV1,
 )
+from app.services.pipeline_contracts.btc_kraken_adapters import (
+    candle_observation_from_legacy,
+    execution_intent_from_legacy_request,
+    provider_fill_reference_from_legacy,
+    provider_submission_result_from_legacy,
+    strategy_evaluation_from_legacy,
+)
 
 from app.services.pipeline_contracts.context import (
     EXECUTION_CONTEXT_SCHEMA_VERSION,
@@ -67,4 +74,7 @@ __all__ = [
     "ReconciliationId", "ReconciliationResultReferenceV1", "ReconciliationStatus", "RiskDecisionReferenceV1",
     "RiskDisposition", "RunId", "StrategyAction", "StrategyEvaluationResultV1", "VersionManifest", "CanonicalEnvelopeV1",
     "canonical_json", "canonical_json_bytes", "integrity_sha256",
+    "candle_observation_from_legacy", "execution_intent_from_legacy_request",
+    "provider_fill_reference_from_legacy", "provider_submission_result_from_legacy",
+    "strategy_evaluation_from_legacy",
 ]
