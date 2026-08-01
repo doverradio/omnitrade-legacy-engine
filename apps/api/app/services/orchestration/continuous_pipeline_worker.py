@@ -339,6 +339,7 @@ async def _load_single_active_kraken_mandate(db: AsyncSession) -> AutonomousCapi
         .where(AutonomousCapitalMandate.status == "ACTIVE")
         .where(AutonomousCapitalMandate.provider == _AUTONOMOUS_CYCLE_PROVIDER)
         .where(AutonomousCapitalMandate.autonomy_level == AUTONOMY_LEVEL_2)
+        .where(AutonomousCapitalMandate.purpose == MANDATE_PURPOSE_PRODUCTION)
         .order_by(AutonomousCapitalMandate.updated_at.desc())
         .limit(2)
     )

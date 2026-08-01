@@ -187,18 +187,22 @@ class _MandateResolverDB:
             if row.status == "ACTIVE"
             and row.provider == "kraken_spot"
             and row.autonomy_level == "LEVEL_2"
+            and row.purpose == "PRODUCTION"
         ]
         matches.sort(key=lambda row: row.updated_at, reverse=True)
         limited = matches[:2]
         return SimpleNamespace(scalars=lambda: SimpleNamespace(all=lambda: limited))
 
 
-def _active_kraken_mandate(*, autonomy_level: str, updated_at: datetime | None = None) -> SimpleNamespace:
+def _active_kraken_mandate(
+    *, autonomy_level: str, purpose: str = "PRODUCTION", updated_at: datetime | None = None,
+) -> SimpleNamespace:
     return SimpleNamespace(
         mandate_id=uuid.uuid4(),
         status="ACTIVE",
         provider="kraken_spot",
         autonomy_level=autonomy_level,
+        purpose=purpose,
         updated_at=updated_at or datetime.now(timezone.utc),
     )
 
@@ -4131,6 +4135,20 @@ async def test_active_level1_and_level2_resolver_selects_level2() -> None:
     assert resolved is level2
     assert "autonomous_capital_mandates.autonomy_level = 'LEVEL_2'" in db.compiled_sql
     assert "LIMIT 2" in db.compiled_sql
+
+
+@pytest.mark.asyncio
+async def test_production_resolver_ignores_active_controlled_proof_mandate() -> None:
+    import app.services.orchestration.continuous_pipeline_worker as worker_module
+
+    production = _active_kraken_mandate(autonomy_level="LEVEL_2", purpose="PRODUCTION")
+    controlled_proof = _active_kraken_mandate(autonomy_level="LEVEL_2", purpose="CONTROLLED_PROOF")
+    db = _MandateResolverDB([production, controlled_proof])
+
+    resolved = await worker_module._load_single_active_kraken_mandate(db)
+
+    assert resolved is production
+    assert "autonomous_capital_mandates.purpose = 'PRODUCTION'" in db.compiled_sql
 
 
 @pytest.mark.asyncio
