@@ -27,9 +27,18 @@ class LiveCryptoOrder(Base):
             "AND normalized_base_quantity <= requested_base_quantity "
             "AND normalized_base_quantity <= maximum_authorized_base_quantity "
             "AND expected_quote_proceeds > 0 AND capital_deployment_amount = 0 "
-            "AND status = 'PENDING_CONFIRMATION' AND provider_order_id IS NULL "
-            "AND submitted_at IS NULL AND provider_submission_connected = false)",
-            name="ck_lco_reduce_only_constructed",
+            "AND ((proof_eligible = true AND disqualification_reason IS NULL) OR "
+            "(proof_eligible = false AND disqualification_reason IS NOT NULL)) "
+            "AND ((status = 'PENDING_CONFIRMATION' AND provider_order_id IS NULL "
+            "AND submitted_at IS NULL AND provider_submission_connected = false) "
+            "OR (status IN ('SUBMISSION_PENDING','REJECTED') AND provider_order_id IS NULL "
+            "AND submitted_at IS NOT NULL AND provider_submission_connected = true) "
+            "OR (status IN ('RECONCILIATION_REQUIRED','UNKNOWN') "
+            "AND submitted_at IS NOT NULL AND provider_submission_connected = true) "
+            "OR (status IN ('ACKNOWLEDGED','SUBMITTED','PARTIALLY_FILLED','FILLED','CANCELLED') "
+            "AND provider_order_id IS NOT NULL AND submitted_at IS NOT NULL "
+            "AND provider_submission_connected = true)))",
+            name="ck_lco_reduce_only_lifecycle",
         ),
         Index(
             "uq_lco_active_sell_custody_scope", "custody_id", unique=True,

@@ -62,6 +62,10 @@ class Settings(BaseSettings):
         default=False,
         validation_alias="LIVE_CRYPTO_ORDER_SUBMISSION_ENABLED",
     )
+    autonomous_position_exit_submission_enabled: bool = Field(
+        default=False,
+        validation_alias="AUTONOMOUS_POSITION_EXIT_SUBMISSION_ENABLED",
+    )
     automatic_mandate_package_activation_enabled: bool = Field(
         default=False,
         validation_alias="AUTOMATIC_MANDATE_PACKAGE_ACTIVATION_ENABLED",
