@@ -242,7 +242,7 @@ async def _activate_locked(*, db: AsyncSession, authority_id: uuid.UUID, now: da
             "originating_buy_package_id": str(custody.buy_package_id),
             "automatic_proof_sell_ready": False, "exchange_order_constructed": False,
             "provider_submission_connected": False, "kraken_contacted": False,
-        }, claim_status="CLAIMED", claimed_at=now,
+        }, provider_submission_connected=False, claim_status="CLAIMED", claimed_at=now,
         claim_owner="system:autonomous_position_exit_activation", recover_after=now + CLAIM_TTL,
         attempt_count=1,
     )

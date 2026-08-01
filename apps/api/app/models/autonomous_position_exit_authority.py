@@ -78,6 +78,9 @@ class AutonomousPositionExitAuthority(Base):
     reserved_claim_id: Mapped[uuid.UUID | None] = mapped_column(
         UUID(as_uuid=True), ForeignKey("autonomous_execution_claims.claim_id", ondelete="RESTRICT"), unique=True
     )
+    reserved_order_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("live_crypto_orders.live_crypto_order_id", ondelete="RESTRICT"), unique=True
+    )
     last_construction_failure_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     last_construction_failure_code: Mapped[str | None] = mapped_column(Text)
     last_construction_exception_class: Mapped[str | None] = mapped_column(Text)
@@ -86,6 +89,10 @@ class AutonomousPositionExitAuthority(Base):
     last_activation_failure_code: Mapped[str | None] = mapped_column(Text)
     last_activation_exception_class: Mapped[str | None] = mapped_column(Text)
     last_activation_failure_retryable: Mapped[bool | None] = mapped_column(Boolean)
+    last_order_failure_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    last_order_failure_code: Mapped[str | None] = mapped_column(Text)
+    last_order_exception_class: Mapped[str | None] = mapped_column(Text)
+    last_order_failure_retryable: Mapped[bool | None] = mapped_column(Boolean)
     consumed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     revoked_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     expired_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))

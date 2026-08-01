@@ -807,6 +807,14 @@ async def advance_claimed_execution(*, db: AsyncSession, claim: AutonomousExecut
     claimed_buy is even called."""
     if claim.claim_status not in _CLAIM_SCOPE_NONTERMINAL_STATES:
         return
+    # Custody-exit claims remain physically disconnected until a separately
+    # governed provider-submission phase explicitly enables that boundary.
+    if getattr(claim, "provider_submission_connected", True) is False:
+        logger.info(
+            "autonomous_execution_submission_disconnected claim_id=%s package_id=%s provider_call_made=false",
+            claim.claim_id, claim.package_id,
+        )
+        return
     try:
         prepared = await prepare_autonomous_claimed_order(db=db, claim_id=claim.claim_id)
     except InvalidRequestError as exc:

@@ -122,6 +122,7 @@ class AutonomousExecutionClaim(Base):
     disqualification_reason: Mapped[str | None] = mapped_column(Text)
     expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     authority_evidence: Mapped[dict[str, Any] | None] = mapped_column(JSONB)
+    provider_submission_connected: Mapped[bool] = mapped_column(Boolean, nullable=False, server_default=text("true"))
     claim_status: Mapped[str] = mapped_column(Text, nullable=False)
     claimed_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
     claim_owner: Mapped[str] = mapped_column(Text, nullable=False)
