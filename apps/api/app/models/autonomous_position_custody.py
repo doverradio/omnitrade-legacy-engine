@@ -39,7 +39,7 @@ class AutonomousPositionCustody(Base):
         CheckConstraint("original_acquired_quantity > 0", name="ck_apc_original_quantity_positive"),
         CheckConstraint("observed_remaining_quantity >= 0", name="ck_apc_remaining_quantity_nonnegative"),
         CheckConstraint(
-            "continuing_exit_authority_state IN ('UNARMED','PENDING','ARMED','EXPIRED','REVOKED')",
+            "continuing_exit_authority_state IN ('UNARMED','PENDING','ARMED','RESERVED','CONSUMED','EXPIRED','REVOKED','BLOCKED')",
             name="ck_apc_continuing_authority",
         ),
         CheckConstraint(

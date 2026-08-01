@@ -15,6 +15,7 @@ from app.models.autonomous_capital_mandate import AutonomousCapitalMandate
 from app.models.autonomous_cycle_run import AutonomousCycleRun
 from app.models.autonomous_execution_claim import AutonomousExecutionClaim
 from app.models.autonomous_position_custody import AutonomousPositionCustody
+from app.models.autonomous_position_exit_authority import AutonomousPositionExitAuthority
 from app.models.canonical_preview_package import CanonicalPreviewPackage
 from app.models.capital_campaign import CapitalCampaign
 from app.models.controlled_proof_run import ControlledProofRun
@@ -414,6 +415,12 @@ async def custody_status(
         mandate = await db.scalar(select(AutonomousCapitalMandate).where(
             AutonomousCapitalMandate.mandate_id == row.mandate_id,
         ).limit(1))
+        authority = await db.scalar(select(AutonomousPositionExitAuthority).where(
+            AutonomousPositionExitAuthority.custody_id == row.custody_id,
+        ).order_by(
+            AutonomousPositionExitAuthority.authority_version.desc(),
+            AutonomousPositionExitAuthority.created_at.desc(),
+        ).limit(1))
         items.append({
             "custody_id": str(row.custody_id), "state": row.custody_state,
             "originating_autonomous_cycle_id": str(row.originating_autonomous_cycle_id),
@@ -451,6 +458,21 @@ async def custody_status(
             "mandatory_safety_exit": bool(exit_evaluation.get("mandatory_safety_exit", False)),
             "evaluation_reason_codes": exit_evaluation.get("reason_codes", []),
             "automatic_sell_execution": False,
+            "continuing_authority_id": None if authority is None else str(authority.authority_id),
+            "continuing_authority_state": None if authority is None else authority.authority_state,
+            "continuing_authority_version": None if authority is None else authority.authority_version,
+            "continuing_authority_classification": None if authority is None else authority.classification,
+            "continuing_authority_evaluation_at": None if authority is None else authority.evaluation_at,
+            "authorized_maximum_sell_quantity": None if authority is None else format(authority.maximum_sell_quantity, "f"),
+            "authority_issued_at": None if authority is None else authority.issued_at,
+            "authority_expires_at": None if authority is None else authority.expires_at,
+            "authority_reserved_at": None if authority is None else authority.reserved_at,
+            "authority_revoked_at": None if authority is None else authority.revoked_at,
+            "authority_consumed_at": None if authority is None else authority.consumed_at,
+            "authority_policy_evidence": None if authority is None else authority.policy_evidence,
+            "authority_risk_evidence": None if authority is None else authority.risk_evidence,
+            "authority_blockers": [] if authority is None else authority.blockers,
+            "sell_decision_construction_connected": False,
             "blockers": [] if projection is None else list(projection.blockers),
             "positive_inventory_supervised": bool(
                 projection is not None

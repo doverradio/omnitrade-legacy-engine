@@ -301,7 +301,7 @@ async def test_status_reports_custody_and_sell_supervision_unconnected(monkeypat
         live_trading_profile_id=uuid.uuid4(), runtime_campaign_id=uuid.uuid4(),
         created_at=datetime.now(timezone.utc),
     )
-    db = _DB(rows=[[row], [row], []], scalars=[SimpleNamespace(status="EXPIRED"), SimpleNamespace(status="EXPIRED")])
+    db = _DB(rows=[[row], [row], []], scalars=[SimpleNamespace(status="EXPIRED"), SimpleNamespace(status="EXPIRED"), None])
     monkeypatch.setattr(custody, "compute_signed_owned_quantity", lambda **_kwargs: _async(Decimal("0.00008")))
 
     result = await custody.custody_status(db=db)

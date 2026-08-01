@@ -60,7 +60,7 @@ def _custody(*, profile_id: uuid.UUID, product: str = "BTC-USD", state: str = "A
 
 async def _reset(connection) -> None:
     await connection.execute(text("SET session_replication_role = replica"))
-    await connection.execute(text("TRUNCATE autonomous_position_custodies, autonomous_execution_claims"))
+    await connection.execute(text("TRUNCATE autonomous_position_exit_authorities, autonomous_position_custodies, autonomous_execution_claims"))
     await connection.execute(text("SET session_replication_role = origin"))
 
 
@@ -69,7 +69,7 @@ async def test_postgresql_schema_contains_expected_constraints_and_index() -> No
     try:
         async with engine.connect() as connection:
             revision = await connection.scalar(text("SELECT version_num FROM alembic_version"))
-            assert revision == "20260731_0057"
+            assert revision == "20260731_0058"
             constraints = set((await connection.execute(text("""
                 SELECT constraint_name FROM information_schema.table_constraints
                 WHERE table_schema='public' AND table_name='autonomous_position_custodies'
