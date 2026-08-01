@@ -88,7 +88,7 @@ def _case(*, proof=True, proceeds="7.20"):
         reserved_order_id=ids["order"], reserved_claim_id=ids["claim"], reserved_activation_id=ids["activation"],
         custody_id=ids["custody"], proof_eligible=proof, maximum_sell_quantity=qty,
     )
-    connection = SimpleNamespace(exchange_connection_id=ids["connection"])
+    connection = SimpleNamespace(exchange_connection_id=ids["connection"], balances=[{"currency": "USD", "available": "100"}])
     package = SimpleNamespace(package_id=ids["package"], package_state="ACTIVATED", superseded_at=None,
                               proposed_base_quantity=qty, crypto_order_preview_id=ids["preview"])
     activation = SimpleNamespace(activation_state="ACTIVE", package_id=ids["package"], expires_at=now + timedelta(minutes=2))
@@ -140,7 +140,7 @@ async def test_timeout_enters_recovery_and_retry_only_looks_up_by_client_identit
     assert first.status == "RECONCILIATION_REQUIRED" and len(provider.submits) == 1
     provider.error = None
     provider.recovered = ExchangeProviderOrder("KRAKEN-RECOVERED", order.client_order_id, "BTC-USD", "SELL", "OPEN", now, now, {})
-    replay_db = _Db([order, claim, custody, authority, SimpleNamespace(exchange_connection_id=order.exchange_connection_id)])
+    replay_db = _Db([order, claim, custody, authority, SimpleNamespace(exchange_connection_id=order.exchange_connection_id, balances=[{"currency": "USD", "available": "100"}])])
     replay = await subject.submit_autonomous_exit_order(db=replay_db, order_id=order.live_crypto_order_id, now=now,
                                                         provider_override=provider, credentials_override={})
     assert replay.recovered is True and replay.provider_order_id == "KRAKEN-RECOVERED"

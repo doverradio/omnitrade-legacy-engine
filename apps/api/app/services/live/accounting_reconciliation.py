@@ -499,6 +499,50 @@ async def reconcile_live_order_and_fills(
             "safe_provider_response": {"reason": "provider_client_order_id_conflict"},
         }
 
+    provider_product = str(provider_order.product_id or "").strip().upper()
+    provider_side = str(provider_order.side or "").strip().upper()
+    identity_conflict = (
+        "provider_product_conflict"
+        if provider_product and provider_product != live_order.product_id.upper()
+        else "provider_side_conflict"
+        if provider_side and provider_side != live_order.side.upper()
+        else None
+    )
+    if identity_conflict is not None:
+        live_order.status = "RECONCILIATION_REQUIRED"
+        live_order.failure_code = identity_conflict
+        live_order.failure_reason = json.dumps({
+            "expected_product": live_order.product_id,
+            "observed_product": provider_order.product_id,
+            "expected_side": live_order.side,
+            "observed_side": provider_order.side,
+        })
+        await record_live_order_reconciliation(
+            db=db,
+            request=LiveOrderReconciliationRequest(
+                live_trading_profile_id=profile.id,
+                source_execution_event_id=source_event.id,
+                provider_name=live_order.provider,
+                provider_order_id=provider_order.provider_order_id,
+                client_order_id=live_order.client_order_id,
+                reconciliation_status="conflict",
+                live_crypto_order_id=live_order.live_crypto_order_id,
+                capital_campaign_id=None if campaign is None else campaign.id,
+                provider_recorded_at=provider_order.submitted_at,
+                requested_by=operator_identity,
+                provenance_metadata={"reason": identity_conflict},
+                idempotency_key=f"lco-reconcile:{live_order.live_crypto_order_id}:{identity_conflict}",
+            ),
+        )
+        await db.flush()
+        return {
+            "reconciliation_status": live_order.status,
+            "provider_status": provider_order.status,
+            "provider_order_id": live_order.provider_order_id,
+            "provider_fill_observed": False,
+            "safe_provider_response": {"reason": identity_conflict},
+        }
+
     discovered_provider_order_id = provider_order.provider_order_id
     if discovered_provider_order_id and live_order.provider_order_id and live_order.provider_order_id != discovered_provider_order_id:
         if previous_status == _AUTHORITATIVE_FILLED_STATUS:

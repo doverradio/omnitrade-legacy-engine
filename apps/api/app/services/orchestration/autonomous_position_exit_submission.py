@@ -130,6 +130,13 @@ async def submit_autonomous_exit_order(
         _fail("Order claim, custody, or authority is unavailable")
 
     connection = await _load_exchange_connection(db=db, exchange_connection_id=order.exchange_connection_id)
+    pre_submit_quote_balance = next((
+        Decimal(str(item.get("available", item.get("balance", "0"))))
+        for item in (getattr(connection, "balances", None) or [])
+        if str(item.get("currency") or item.get("asset") or "").upper() in {"USD", "ZUSD"}
+    ), None)
+    if pre_submit_quote_balance is None or pre_submit_quote_balance < 0:
+        _fail("Fresh pre-submit USD balance evidence is unavailable")
     credentials = credentials_override if credentials_override is not None else _load_decrypted_credentials(connection)
     provider = provider_override or get_exchange_provider(order.provider, environment=order.environment)
 
@@ -228,7 +235,9 @@ async def submit_autonomous_exit_order(
     order.provider_submission_connected = True; claim.provider_submission_connected = True
     claim.claim_status = "SUBMISSION_PENDING"; claim.updated_at = observed_at
     order.safe_provider_response = {**(order.safe_provider_response or {}), "provider_call_made": False,
-                                    "submission_gate": "AUTONOMOUS_POSITION_EXIT_SUBMISSION_ENABLED"}
+                                    "submission_gate": "AUTONOMOUS_POSITION_EXIT_SUBMISSION_ENABLED",
+                                    "live_trading_profile_id": str(claim.profile_id),
+                                    "usd_available_before_submit": format(pre_submit_quote_balance, "f")}
     _audit(db=db, order_id=order_id, action="AUTONOMOUS_EXIT_SUBMISSION_STARTED", before=before,
            after={"status": order.status, "client_order_id": order.client_order_id,
                   "normalized_base_quantity": format(normalized, "f"), "capital_deployment_amount": "0",

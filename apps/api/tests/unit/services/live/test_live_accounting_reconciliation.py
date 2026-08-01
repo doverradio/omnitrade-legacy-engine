@@ -531,6 +531,41 @@ async def test_canonical_reconciliation_handles_duplicate_provider_fill_idempote
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("product,side,reason", [
+    ("ETH-USD", "BUY", "provider_product_conflict"),
+    ("BTC-USD", "SELL", "provider_side_conflict"),
+])
+async def test_canonical_reconciliation_rejects_provider_order_product_or_side_conflict_before_fills(
+    monkeypatch: pytest.MonkeyPatch, product: str, side: str, reason: str,
+) -> None:
+    from app.services.exchange_connections.providers.base import ExchangeProviderOrder
+
+    session, live_order = _build_reconciliation_fixture(monkeypatch)
+
+    class _Provider(_NoSubmitProvider):
+        async def lookup_order(self, **_kwargs):
+            return ExchangeProviderOrder(
+                provider_order_id="provider-order-1", client_order_id=live_order.client_order_id,
+                product_id=product, side=side, status="FILLED", submitted_at=datetime.now(timezone.utc),
+                acknowledged_at=datetime.now(timezone.utc), raw={},
+            )
+
+        async def list_fills(self, **_kwargs):
+            raise AssertionError("identity conflict must be rejected before fill lookup")
+
+    monkeypatch.setattr(
+        "app.services.live.accounting_reconciliation.get_exchange_provider",
+        lambda *_args, **_kwargs: _Provider(),
+    )
+    result = await reconcile_live_order_and_fills(
+        db=session, live_crypto_order_id=live_order.live_crypto_order_id, operator_identity="operator:test",
+    )
+    assert result["reconciliation_status"] == "RECONCILIATION_REQUIRED"
+    assert result["safe_provider_response"]["reason"] == reason
+    assert session.accounting_records == []
+
+
+@pytest.mark.asyncio
 async def test_order_reconciliation_can_record_unresolved_balance_mismatch_status() -> None:
     source = _execution_event("execution_intent_created")
     session = _FakeSession(execution_events=[source])

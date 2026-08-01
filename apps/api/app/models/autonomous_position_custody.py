@@ -47,6 +47,19 @@ class AutonomousPositionCustody(Base):
             "OR (proof_eligible = false AND disqualification_reason IS NOT NULL AND disqualified_at IS NOT NULL)",
             name="ck_apc_proof_disqualification",
         ),
+        CheckConstraint(
+            "realized_sold_quantity IS NULL OR (realized_sold_quantity >= 0 "
+            "AND residual_dust_quantity >= 0 AND realized_gross_sell_proceeds >= 0 "
+            "AND realized_sell_fees >= 0 AND realized_net_sell_proceeds = realized_gross_sell_proceeds - realized_sell_fees "
+            "AND allocated_buy_cost_basis >= 0 AND allocated_buy_fees >= 0)",
+            name="ck_apc_realized_exit_economics",
+        ),
+        CheckConstraint(
+            "autonomous_proof_sell_verified = false OR (custody_state = 'CLOSED' AND proof_eligible = true "
+            "AND exit_reconciliation_event_id IS NOT NULL AND exit_reconciled_at IS NOT NULL "
+            "AND realized_net_profit > 0 AND residual_dust_quantity = 0)",
+            name="ck_apc_proof_sell_verified",
+        ),
         Index("ix_apc_state_next_evaluation", "custody_state", "next_exit_evaluation_at"),
         Index("ix_apc_scope", "live_trading_profile_id", "provider", "environment", "product"),
         Index(
@@ -93,6 +106,20 @@ class AutonomousPositionCustody(Base):
     active_sell_package_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), ForeignKey("canonical_preview_packages.package_id", ondelete="RESTRICT"), nullable=True)
     active_sell_claim_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), ForeignKey("autonomous_execution_claims.claim_id", ondelete="RESTRICT"), nullable=True)
     active_sell_order_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), ForeignKey("live_crypto_orders.live_crypto_order_id", ondelete="RESTRICT"), nullable=True)
+    exit_reconciliation_event_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("live_reconciliation_events.id", ondelete="RESTRICT"), unique=True
+    )
+    exit_reconciled_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    realized_gross_sell_proceeds: Mapped[Decimal | None] = mapped_column(Numeric)
+    realized_sell_fees: Mapped[Decimal | None] = mapped_column(Numeric)
+    realized_net_sell_proceeds: Mapped[Decimal | None] = mapped_column(Numeric)
+    allocated_buy_cost_basis: Mapped[Decimal | None] = mapped_column(Numeric)
+    allocated_buy_fees: Mapped[Decimal | None] = mapped_column(Numeric)
+    realized_net_profit: Mapped[Decimal | None] = mapped_column(Numeric)
+    realized_return: Mapped[Decimal | None] = mapped_column(Numeric)
+    realized_sold_quantity: Mapped[Decimal | None] = mapped_column(Numeric)
+    residual_dust_quantity: Mapped[Decimal | None] = mapped_column(Numeric)
+    autonomous_proof_sell_verified: Mapped[bool] = mapped_column(Boolean, nullable=False, server_default=text("false"))
     continuing_exit_authority_state: Mapped[str] = mapped_column(Text, nullable=False, server_default=text("'UNARMED'"))
     terminal_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     audit_metadata: Mapped[dict[str, Any]] = mapped_column(JSONB, nullable=False, server_default=text("'{}'::jsonb"))
