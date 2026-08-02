@@ -15,7 +15,6 @@ from app.models.autonomous_capital_mandate_version import AutonomousCapitalManda
 from app.models.capital_campaign import CapitalCampaign
 from app.models.capital_campaign_definition import CapitalCampaignDefinition
 from app.models.live_crypto_order import LiveCryptoOrder
-from app.models.live_reconciliation_event import LiveReconciliationEvent
 from app.schemas.capital_campaign_domain import (
     CommissionedCampaignState,
     CommissionedPreviewResponse,
@@ -26,6 +25,7 @@ from app.services.capital_campaign_domain.commissioned_state_machine import comm
 from app.services.live.approval import evaluate_live_approval_gate
 from app.services.mandates.contracts import MandateVersionModel
 from app.services.mandates.validation import validate_mandate_version
+from app.services.orchestration.reconciliation_guard import has_unresolved_reconciliation_for_campaign
 from app.services.position_lifecycle.source_adapter import load_position_snapshots
 
 
@@ -181,16 +181,24 @@ async def _has_open_order_conflict(*, db: AsyncSession, runtime_campaign_id: int
 
 
 async def _has_reconciliation_conflict(*, db: AsyncSession, runtime_campaign_id: int | None) -> bool:
+    # live_reconciliation_events is append-only: an order accumulates a new
+    # row every time it is re-reconciled, so matching ANY historical row in
+    # a blocking state (the previous ORDER BY recorded_at/sequence_number
+    # DESC LIMIT 1 here) reports a conflict forever purely because of an
+    # order's own superseded history -- the same confirmed production defect
+    # already fixed for canonical campaign-binding's counters. Delegates to
+    # reconciliation_guard's shared authoritative "latest event per
+    # identified order, fail-closed for identityless events" definition,
+    # passing this module's own (deliberately narrower)
+    # _RECONCILIATION_BLOCKING_STATUSES vocabulary through unchanged rather
+    # than adopting reconciliation_guard's default status set.
     if runtime_campaign_id is None:
         return False
-    row = await db.scalar(
-        select(LiveReconciliationEvent)
-        .where(LiveReconciliationEvent.capital_campaign_id == runtime_campaign_id)
-        .where(LiveReconciliationEvent.reconciliation_status.in_(sorted(_RECONCILIATION_BLOCKING_STATUSES)))
-        .order_by(desc(LiveReconciliationEvent.recorded_at), desc(LiveReconciliationEvent.sequence_number))
-        .limit(1)
+    return await has_unresolved_reconciliation_for_campaign(
+        db=db,
+        capital_campaign_id=runtime_campaign_id,
+        unresolved_statuses=_RECONCILIATION_BLOCKING_STATUSES,
     )
-    return row is not None
 
 
 def _mandate_version_model(version: AutonomousCapitalMandateVersion) -> MandateVersionModel:

@@ -28,6 +28,10 @@ from app.models.paper_account import PaperAccount
 from app.models.trade import Trade
 from app.services.capital_campaign_orchestration.service import _eligible_for_orchestration
 from app.services.orchestration import asset_roster
+from app.services.orchestration.reconciliation_guard import (
+    count_unresolved_reconciliation_events_for_campaign as _shared_count_unresolved_reconciliation_events_for_campaign,
+    count_unresolved_reconciliation_events_for_profile as _shared_count_unresolved_reconciliation_events_for_profile,
+)
 
 # Mirrors the largest default lookback among the enabled strategy roster
 # (ma_crossover's slow_period=50, see strategy_roster/registry.py) plus one,
@@ -40,7 +44,6 @@ _MINIMUM_CANDLE_HISTORY_FOR_BINDING = 51
 
 
 _TERMINAL_LIVE_ORDER_STATUSES = {"DRY_RUN_READY", "DRY_RUN_BLOCKED", "FILLED", "CANCELLED", "FAILED", "REJECTED", "EXPIRED", "COMPLETED"}
-_UNRESOLVED_RECONCILIATION_STATUSES = {"open", "partially_filled", "reconciliation_required", "unknown", "conflict", "balance_mismatch"}
 _CANONICAL_SUCCESSOR_ELIGIBLE_STATUSES = {"DRAFT", "READY", "PAUSED", "RUNNING"}
 _TERMINAL_PACKAGE_STATES = {"COMPLETED", "FAILED_CLOSED", "EXPIRED", "INVALIDATED", "SUPERSEDED"}
 _TERMINAL_ACTIVATION_STATES = {"REVOKED", "EXPIRED", "INVALIDATED", "COMPLETED"}
@@ -1849,23 +1852,30 @@ async def _count_open_live_orders(*, db: AsyncSession, provider: str, environmen
 
 
 async def _count_unresolved_reconciliation_events(*, db: AsyncSession, live_trading_profile_id: UUID) -> int:
-    count = await db.scalar(
-        select(func.count())
-        .select_from(LiveReconciliationEvent)
-        .where(LiveReconciliationEvent.live_trading_profile_id == live_trading_profile_id)
-        .where(LiveReconciliationEvent.reconciliation_status.in_(sorted(_UNRESOLVED_RECONCILIATION_STATUSES)))
+    # live_reconciliation_events is append-only: an order accumulates a new
+    # row every time it is re-reconciled, so matching ANY historical row in
+    # an unresolved state reports an order unresolved forever purely because
+    # of its own superseded history -- a confirmed production defect that
+    # permanently blocked campaign promotion for orders that had already
+    # reached a later, resolving "filled" event. Delegates to
+    # reconciliation_guard's shared authoritative "latest event per
+    # identified order, fail-closed for identityless events" definition
+    # (the same one continuous_pipeline_worker._has_unresolved_reconciliation
+    # and Controlled Proof's stale-proof recovery check already use for the
+    # provider/environment/product-scoped case) rather than re-deriving a
+    # second, potentially divergent ordering rule here.
+    return await _shared_count_unresolved_reconciliation_events_for_profile(
+        db=db, live_trading_profile_id=live_trading_profile_id,
     )
-    return int(count or 0)
 
 
 async def _count_unresolved_reconciliation_events_for_campaign(*, db: AsyncSession, capital_campaign_id: int) -> int:
-    count = await db.scalar(
-        select(func.count())
-        .select_from(LiveReconciliationEvent)
-        .where(LiveReconciliationEvent.capital_campaign_id == capital_campaign_id)
-        .where(LiveReconciliationEvent.reconciliation_status.in_(sorted(_UNRESOLVED_RECONCILIATION_STATUSES)))
+    # Same rationale and shared implementation as
+    # _count_unresolved_reconciliation_events above, scoped to a campaign
+    # rather than a profile.
+    return await _shared_count_unresolved_reconciliation_events_for_campaign(
+        db=db, capital_campaign_id=capital_campaign_id,
     )
-    return int(count or 0)
 
 
 async def _count_pending_accounting_closure_for_campaign(*, db: AsyncSession, capital_campaign_id: int) -> int:

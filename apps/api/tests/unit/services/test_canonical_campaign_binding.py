@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import asyncio
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 from types import SimpleNamespace
 from uuid import UUID, uuid4
@@ -2450,3 +2450,342 @@ async def test_stale_eth_asset_missing_still_blocks_min_order_and_candle_checks_
         "instrument_minimum_order_feasible_at_proving_cap",
         "instrument_has_sufficient_candle_history",
     }.issubset(set(readiness.blockers))
+
+
+# --- _count_unresolved_reconciliation_events / _count_unresolved_reconciliation_events_for_campaign:
+# real-session latest-per-order regression coverage ---
+#
+# Confirmed production defect: campaign promotion was permanently blocked by
+# historical partially_filled/reconciliation_required rows for Kraken orders
+# that a later reconciliation pass had already recorded as filled.
+# live_reconciliation_events is append-only (see the before_update guard on
+# LiveReconciliationEvent) -- both counters matched ANY historical row in an
+# unresolved state, which is permanently true for any order that was ever
+# partially filled even after it fully resolved. Every test below in this
+# section drives the real functions against a real SQLite session (no
+# monkeypatching of the counters themselves, unlike every other test in this
+# file), the same style already used for the identical fix in
+# continuous_pipeline_worker's _has_unresolved_reconciliation
+# (test_has_unresolved_reconciliation_ignores_superseded_history_once_order_resolves
+# and its adjacent tests in tests/integration/test_continuous_pipeline_worker.py).
+
+
+def _install_sqlite_type_compilers_for_reconciliation_tests() -> None:
+    from sqlalchemy.dialects.postgresql import JSONB, UUID as PG_UUID
+    from sqlalchemy.ext.compiler import compiles
+
+    # @compiles registration is process-global (dispatches on the type
+    # class, not on any particular engine/session), so this only needs to
+    # run once at import time -- mirrors the equivalent registrations in
+    # tests/integration/test_continuous_pipeline_worker.py and
+    # tests/unit/services/capital_campaign_orchestration/
+    # test_strategy_decision_aggregator_integration.py, duplicated here
+    # rather than imported since those modules have their own unrelated,
+    # heavyweight import-time side effects this file should not take on.
+    @compiles(PG_UUID, "sqlite")
+    def _compile_uuid_sqlite(element, compiler, **kw) -> str:  # noqa: ANN001
+        return "CHAR(36)"
+
+    @compiles(JSONB, "sqlite")
+    def _compile_jsonb_sqlite(element, compiler, **kw) -> str:  # noqa: ANN001
+        return "JSON"
+
+
+_install_sqlite_type_compilers_for_reconciliation_tests()
+
+
+def _reconciliation_binding_sqlite_session():
+    from contextlib import contextmanager
+
+    from sqlalchemy import create_engine, event as sa_event, text
+    from sqlalchemy.orm import Session
+    from sqlalchemy.pool import StaticPool
+    from sqlalchemy.schema import DefaultClause
+    from sqlalchemy.sql.elements import TextClause
+
+    from app.models.live_crypto_order import LiveCryptoOrder
+    from app.models.live_reconciliation_event import LiveReconciliationEvent
+
+    @contextmanager
+    def _session():
+        engine = create_engine("sqlite:///:memory:", poolclass=StaticPool)
+
+        @sa_event.listens_for(engine, "connect")
+        def _register_functions(dbapi_conn, _record) -> None:  # noqa: ANN001
+            dbapi_conn.create_function("now", 0, lambda: datetime.now(timezone.utc).isoformat())
+            dbapi_conn.create_function("gen_random_uuid", 0, lambda: uuid4().hex)
+
+        tables = [LiveCryptoOrder.__table__, LiveReconciliationEvent.__table__]
+        for table in tables:
+            for column in table.columns:
+                default = column.server_default
+                if isinstance(default, DefaultClause) and isinstance(default.arg, TextClause):
+                    raw = default.arg.text.strip().split("::", 1)[0]
+                    if raw.endswith("()") and not raw.startswith("("):
+                        raw = f"({raw})"
+                    column.server_default = DefaultClause(text(raw))
+        LiveCryptoOrder.metadata.create_all(engine, tables=tables)
+        try:
+            with Session(engine) as session:
+                yield session, _AwaitableReconciliationSession(session)
+        finally:
+            engine.dispose()
+
+    return _session()
+
+
+class _AwaitableReconciliationSession:
+    """Minimal AsyncSession-shaped adapter over a real synchronous ORM
+    Session -- scoped to exactly what the two counters under test need
+    (db.scalar), mirroring _AwaitableActivationSession in
+    tests/integration/test_continuous_pipeline_worker.py."""
+
+    def __init__(self, session) -> None:  # noqa: ANN001
+        self._session = session
+
+    async def scalar(self, statement):
+        return self._session.scalar(statement)
+
+    async def execute(self, statement):
+        return self._session.execute(statement)
+
+
+def _seed_reconciliation_binding_order(
+    session,  # noqa: ANN001
+    *,
+    live_crypto_order_id: UUID,
+    provider: str = "kraken_spot",
+    environment: str = "production",
+    product: str = "BTC-USD",
+) -> None:
+    from app.models.live_crypto_order import LiveCryptoOrder
+
+    now = datetime(2026, 7, 21, 12, 0, tzinfo=timezone.utc)
+    session.add(
+        LiveCryptoOrder(
+            live_crypto_order_id=live_crypto_order_id,
+            crypto_order_preview_id=uuid4(),
+            exchange_connection_id=uuid4(),
+            provider=provider,
+            environment=environment,
+            product_id=product,
+            side="buy",
+            order_type="market",
+            requested_quote_size=Decimal("5"),
+            client_order_id=f"client-{live_crypto_order_id}",
+            status="PARTIALLY_FILLED",
+            risk_event_id=None,
+            decision_record_id=None,
+            validation_run_id=None,
+            provider_order_id=f"KRAKEN-{live_crypto_order_id}",
+            provider_status="partially_filled",
+            submitted_at=now - timedelta(minutes=10),
+            acknowledged_at=now - timedelta(minutes=9),
+            filled_at=None,
+            cancelled_at=None,
+            failure_code=None,
+            failure_reason=None,
+            safe_provider_response={},
+            audit_correlation_id=uuid4(),
+            operator_confirmation_id=None,
+            created_at=now - timedelta(minutes=10),
+            updated_at=now - timedelta(minutes=10),
+        )
+    )
+    session.commit()
+
+
+def _seed_reconciliation_binding_event(
+    session,  # noqa: ANN001
+    *,
+    live_trading_profile_id: UUID,
+    capital_campaign_id: int | None,
+    reconciliation_status: str,
+    sequence_number: int,
+    live_crypto_order_id: UUID | None = None,
+    recorded_at: datetime | None = None,
+) -> UUID:
+    from app.models.live_reconciliation_event import LiveReconciliationEvent
+
+    event_id = uuid4()
+    when = recorded_at or datetime(2026, 7, 21, 12, 0, tzinfo=timezone.utc)
+    session.add(
+        LiveReconciliationEvent(
+            id=event_id,
+            idempotency_key=f"idem-{event_id}",
+            event_hash=f"hash-{event_id}",
+            live_trading_profile_id=live_trading_profile_id,
+            live_crypto_order_id=live_crypto_order_id,
+            capital_campaign_id=capital_campaign_id,
+            source_execution_event_id=uuid4(),
+            source_execution_event_type="execution_intent_created",
+            sequence_number=sequence_number,
+            event_type="order_reconciled",
+            reconciliation_status=reconciliation_status,
+            provider_name="kraken_spot",
+            provider_order_id=None if live_crypto_order_id is None else f"KRAKEN-{live_crypto_order_id}",
+            provider_fill_id=None,
+            event_payload={},
+            provenance={},
+            immutable_contract_version="1.0.0",
+            provider_recorded_at=when,
+            recorded_at=when,
+            created_at=when,
+        )
+    )
+    session.commit()
+    return event_id
+
+
+@pytest.mark.asyncio
+async def test_count_unresolved_reconciliation_events_ignores_superseded_history_once_order_resolves() -> None:
+    """The exact production shape: an order accumulates partially_filled and
+    reconciliation_required events, then a later pass appends a resolving
+    'filled' event with a higher sequence_number. Both counters must follow
+    the order to its current (resolved) state, not its superseded history."""
+    profile_id = uuid4()
+    order_id = uuid4()
+
+    with _reconciliation_binding_sqlite_session() as (raw_session, db):
+        _seed_reconciliation_binding_order(raw_session, live_crypto_order_id=order_id)
+        _seed_reconciliation_binding_event(raw_session, live_trading_profile_id=profile_id, capital_campaign_id=7, live_crypto_order_id=order_id, reconciliation_status="partially_filled", sequence_number=1)
+        _seed_reconciliation_binding_event(raw_session, live_trading_profile_id=profile_id, capital_campaign_id=7, live_crypto_order_id=order_id, reconciliation_status="reconciliation_required", sequence_number=2)
+        _seed_reconciliation_binding_event(raw_session, live_trading_profile_id=profile_id, capital_campaign_id=7, live_crypto_order_id=order_id, reconciliation_status="filled", sequence_number=3)
+
+        profile_count = await binding._count_unresolved_reconciliation_events(db=db, live_trading_profile_id=profile_id)
+        campaign_count = await binding._count_unresolved_reconciliation_events_for_campaign(db=db, capital_campaign_id=7)
+
+    assert profile_count == 0
+    assert campaign_count == 0
+
+
+@pytest.mark.asyncio
+async def test_count_unresolved_reconciliation_events_still_blocks_when_latest_event_is_genuinely_unresolved() -> None:
+    """Fail-closed behavior must be preserved: when the LATEST event for an
+    order is still unresolved, both counters must keep counting it."""
+    profile_id = uuid4()
+    order_id = uuid4()
+
+    with _reconciliation_binding_sqlite_session() as (raw_session, db):
+        _seed_reconciliation_binding_order(raw_session, live_crypto_order_id=order_id)
+        _seed_reconciliation_binding_event(raw_session, live_trading_profile_id=profile_id, capital_campaign_id=7, live_crypto_order_id=order_id, reconciliation_status="partially_filled", sequence_number=1)
+        _seed_reconciliation_binding_event(raw_session, live_trading_profile_id=profile_id, capital_campaign_id=7, live_crypto_order_id=order_id, reconciliation_status="reconciliation_required", sequence_number=2)
+
+        profile_count = await binding._count_unresolved_reconciliation_events(db=db, live_trading_profile_id=profile_id)
+        campaign_count = await binding._count_unresolved_reconciliation_events_for_campaign(db=db, capital_campaign_id=7)
+
+    assert profile_count == 1
+    assert campaign_count == 1
+
+
+@pytest.mark.asyncio
+async def test_count_unresolved_reconciliation_events_one_resolved_order_does_not_mask_another_stuck_order() -> None:
+    """One order resolving must not hide a genuinely different, still-stuck
+    order in the same profile/campaign scope."""
+    profile_id = uuid4()
+    resolved_order, stuck_order = uuid4(), uuid4()
+
+    with _reconciliation_binding_sqlite_session() as (raw_session, db):
+        _seed_reconciliation_binding_order(raw_session, live_crypto_order_id=resolved_order)
+        _seed_reconciliation_binding_order(raw_session, live_crypto_order_id=stuck_order)
+        _seed_reconciliation_binding_event(raw_session, live_trading_profile_id=profile_id, capital_campaign_id=7, live_crypto_order_id=resolved_order, reconciliation_status="partially_filled", sequence_number=1)
+        _seed_reconciliation_binding_event(raw_session, live_trading_profile_id=profile_id, capital_campaign_id=7, live_crypto_order_id=resolved_order, reconciliation_status="filled", sequence_number=2)
+        # sequence_number is a monotonic counter per live_trading_profile_id
+        # (see the real uq_live_reconciliation_events_sequence constraint),
+        # never per order -- sequence_number=3 here, not 1, since this event
+        # shares a profile with the two above.
+        _seed_reconciliation_binding_event(raw_session, live_trading_profile_id=profile_id, capital_campaign_id=7, live_crypto_order_id=stuck_order, reconciliation_status="open", sequence_number=3)
+
+        profile_count = await binding._count_unresolved_reconciliation_events(db=db, live_trading_profile_id=profile_id)
+        campaign_count = await binding._count_unresolved_reconciliation_events_for_campaign(db=db, capital_campaign_id=7)
+
+    assert profile_count == 1
+    assert campaign_count == 1
+
+
+@pytest.mark.asyncio
+async def test_count_unresolved_reconciliation_events_profile_scoping_cannot_be_bypassed() -> None:
+    """An unresolved event that belongs to a DIFFERENT live trading profile
+    must never inflate this profile's count."""
+    this_profile, other_profile = uuid4(), uuid4()
+    this_order, other_order = uuid4(), uuid4()
+
+    with _reconciliation_binding_sqlite_session() as (raw_session, db):
+        _seed_reconciliation_binding_order(raw_session, live_crypto_order_id=this_order)
+        _seed_reconciliation_binding_order(raw_session, live_crypto_order_id=other_order)
+        _seed_reconciliation_binding_event(raw_session, live_trading_profile_id=this_profile, capital_campaign_id=None, live_crypto_order_id=this_order, reconciliation_status="filled", sequence_number=1)
+        _seed_reconciliation_binding_event(raw_session, live_trading_profile_id=other_profile, capital_campaign_id=None, live_crypto_order_id=other_order, reconciliation_status="open", sequence_number=1)
+
+        this_profile_count = await binding._count_unresolved_reconciliation_events(db=db, live_trading_profile_id=this_profile)
+        other_profile_count = await binding._count_unresolved_reconciliation_events(db=db, live_trading_profile_id=other_profile)
+
+    assert this_profile_count == 0
+    assert other_profile_count == 1
+
+
+@pytest.mark.asyncio
+async def test_count_unresolved_reconciliation_events_campaign_scoping_cannot_be_bypassed() -> None:
+    """An unresolved event that belongs to a DIFFERENT capital campaign must
+    never inflate this campaign's count -- BTC (campaign version 3) and ETH
+    (campaign version 4) must be able to promote independently."""
+    profile_id = uuid4()
+    btc_order, eth_order = uuid4(), uuid4()
+
+    with _reconciliation_binding_sqlite_session() as (raw_session, db):
+        _seed_reconciliation_binding_order(raw_session, live_crypto_order_id=btc_order, product="BTC-USD")
+        _seed_reconciliation_binding_order(raw_session, live_crypto_order_id=eth_order, product="ETH-USD")
+        _seed_reconciliation_binding_event(raw_session, live_trading_profile_id=profile_id, capital_campaign_id=3, live_crypto_order_id=btc_order, reconciliation_status="filled", sequence_number=1)
+        # Same profile_id as above (one live trading profile spans both
+        # campaign-scoped strategies) -- sequence_number=2, since the
+        # counter is per-profile, not per-order.
+        _seed_reconciliation_binding_event(raw_session, live_trading_profile_id=profile_id, capital_campaign_id=4, live_crypto_order_id=eth_order, reconciliation_status="open", sequence_number=2)
+
+        btc_campaign_count = await binding._count_unresolved_reconciliation_events_for_campaign(db=db, capital_campaign_id=3)
+        eth_campaign_count = await binding._count_unresolved_reconciliation_events_for_campaign(db=db, capital_campaign_id=4)
+
+    assert btc_campaign_count == 0
+    assert eth_campaign_count == 1
+
+
+@pytest.mark.asyncio
+async def test_count_unresolved_reconciliation_events_identityless_evidence_remains_blocking() -> None:
+    """A reconciliation event with no live_crypto_order_id can never be
+    proven superseded by a later event for the same order (there is no order
+    to follow) -- it must count unconditionally whenever its own status is
+    unresolved, and must never be silently dropped just because it cannot be
+    grouped into the latest-per-order rule."""
+    profile_id = uuid4()
+
+    with _reconciliation_binding_sqlite_session() as (raw_session, db):
+        _seed_reconciliation_binding_event(raw_session, live_trading_profile_id=profile_id, capital_campaign_id=7, live_crypto_order_id=None, reconciliation_status="reconciliation_required", sequence_number=1)
+
+        profile_count = await binding._count_unresolved_reconciliation_events(db=db, live_trading_profile_id=profile_id)
+        campaign_count = await binding._count_unresolved_reconciliation_events_for_campaign(db=db, capital_campaign_id=7)
+
+    assert profile_count == 1
+    assert campaign_count == 1
+
+
+@pytest.mark.asyncio
+async def test_count_unresolved_reconciliation_events_tie_break_uses_sequence_number_not_recorded_at() -> None:
+    """The authoritative ordering rule is the highest sequence_number, not
+    insertion order or recorded_at -- a later-appended but lower-sequenced
+    row (e.g. a delayed/out-of-order write) must never be treated as latest
+    just because it has a more recent recorded_at or was written last."""
+    profile_id = uuid4()
+    order_id = uuid4()
+    base = datetime(2026, 7, 21, 12, 0, tzinfo=timezone.utc)
+
+    with _reconciliation_binding_sqlite_session() as (raw_session, db):
+        _seed_reconciliation_binding_order(raw_session, live_crypto_order_id=order_id)
+        # sequence_number=2 (the true latest) is recorded_at an EARLIER wall-clock
+        # time than sequence_number=1, and is written to the session first --
+        # neither recorded_at nor insertion order may be used as the tie-break.
+        _seed_reconciliation_binding_event(raw_session, live_trading_profile_id=profile_id, capital_campaign_id=7, live_crypto_order_id=order_id, reconciliation_status="filled", sequence_number=2, recorded_at=base)
+        _seed_reconciliation_binding_event(raw_session, live_trading_profile_id=profile_id, capital_campaign_id=7, live_crypto_order_id=order_id, reconciliation_status="open", sequence_number=1, recorded_at=base + timedelta(minutes=30))
+
+        profile_count = await binding._count_unresolved_reconciliation_events(db=db, live_trading_profile_id=profile_id)
+        campaign_count = await binding._count_unresolved_reconciliation_events_for_campaign(db=db, capital_campaign_id=7)
+
+    assert profile_count == 0
+    assert campaign_count == 0

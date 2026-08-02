@@ -607,3 +607,246 @@ async def test_provider_order_submission_never_called(monkeypatch: pytest.Monkey
     await crp.generate_commissioned_campaign_preview(db=_FakeDb(), request=request)
 
     assert create_order_calls["count"] == 0
+
+
+# --- _has_reconciliation_conflict: real-session latest-per-order regression coverage ---
+#
+# Confirmed duplicate of the canonical campaign-binding production defect:
+# _has_reconciliation_conflict used to match ANY historical row in
+# _RECONCILIATION_BLOCKING_STATUSES for a campaign (ORDER BY recorded_at,
+# sequence_number DESC LIMIT 1, with no per-order grouping), so an order's
+# own superseded reconciliation_required/conflict history kept reporting a
+# conflict forever even after a later reconciliation pass recorded that same
+# order as filled. Now delegates to
+# reconciliation_guard.has_unresolved_reconciliation_for_campaign, the same
+# shared "latest event per identified order, fail-closed for identityless
+# events" helper canonical_campaign_binding's counters use -- these tests
+# exercise the real function against a real SQLite session (no
+# monkeypatching of _has_reconciliation_conflict itself, unlike every other
+# test in this file).
+
+
+def _install_sqlite_type_compilers_for_commissioned_readiness_tests() -> None:
+    from sqlalchemy.dialects.postgresql import JSONB, UUID as PG_UUID
+    from sqlalchemy.ext.compiler import compiles
+
+    # @compiles registration is process-global (dispatches on the type
+    # class, not any particular engine/session), so this only needs to run
+    # once at import time -- mirrors the equivalent registrations in
+    # tests/unit/services/test_canonical_campaign_binding.py and
+    # tests/integration/test_continuous_pipeline_worker.py, duplicated here
+    # rather than imported since those modules have their own unrelated,
+    # heavyweight import-time side effects this file should not take on.
+    @compiles(PG_UUID, "sqlite")
+    def _compile_uuid_sqlite(element, compiler, **kw) -> str:  # noqa: ANN001
+        return "CHAR(36)"
+
+    @compiles(JSONB, "sqlite")
+    def _compile_jsonb_sqlite(element, compiler, **kw) -> str:  # noqa: ANN001
+        return "JSON"
+
+
+_install_sqlite_type_compilers_for_commissioned_readiness_tests()
+
+
+def _reconciliation_conflict_sqlite_session():
+    from contextlib import contextmanager
+
+    from sqlalchemy import create_engine, event as sa_event, text
+    from sqlalchemy.orm import Session
+    from sqlalchemy.pool import StaticPool
+    from sqlalchemy.schema import DefaultClause
+    from sqlalchemy.sql.elements import TextClause
+
+    from app.models.live_crypto_order import LiveCryptoOrder
+    from app.models.live_reconciliation_event import LiveReconciliationEvent
+
+    @contextmanager
+    def _session():
+        engine = create_engine("sqlite:///:memory:", poolclass=StaticPool)
+
+        @sa_event.listens_for(engine, "connect")
+        def _register_functions(dbapi_conn, _record) -> None:  # noqa: ANN001
+            dbapi_conn.create_function("now", 0, lambda: datetime.now(timezone.utc).isoformat())
+            dbapi_conn.create_function("gen_random_uuid", 0, lambda: uuid4().hex)
+
+        tables = [LiveCryptoOrder.__table__, LiveReconciliationEvent.__table__]
+        for table in tables:
+            for column in table.columns:
+                default = column.server_default
+                if isinstance(default, DefaultClause) and isinstance(default.arg, TextClause):
+                    raw = default.arg.text.strip().split("::", 1)[0]
+                    if raw.endswith("()") and not raw.startswith("("):
+                        raw = f"({raw})"
+                    column.server_default = DefaultClause(text(raw))
+        LiveCryptoOrder.metadata.create_all(engine, tables=tables)
+        try:
+            with Session(engine) as session:
+                yield session, _AwaitableReconciliationConflictSession(session)
+        finally:
+            engine.dispose()
+
+    return _session()
+
+
+class _AwaitableReconciliationConflictSession:
+    """Minimal AsyncSession-shaped adapter over a real synchronous ORM
+    Session, scoped to exactly what _has_reconciliation_conflict (via
+    reconciliation_guard) needs (db.scalar)."""
+
+    def __init__(self, session) -> None:  # noqa: ANN001
+        self._session = session
+
+    async def scalar(self, statement):
+        return self._session.scalar(statement)
+
+    async def execute(self, statement):
+        return self._session.execute(statement)
+
+
+def _seed_reconciliation_conflict_order(session, *, live_crypto_order_id) -> None:  # noqa: ANN001
+    from app.models.live_crypto_order import LiveCryptoOrder
+
+    now = datetime(2026, 7, 21, 12, 0, tzinfo=timezone.utc)
+    session.add(
+        LiveCryptoOrder(
+            live_crypto_order_id=live_crypto_order_id,
+            crypto_order_preview_id=uuid4(),
+            exchange_connection_id=uuid4(),
+            provider="kraken_spot",
+            environment="production",
+            product_id="ETH-USD",
+            side="buy",
+            order_type="market",
+            requested_quote_size=Decimal("5"),
+            client_order_id=f"client-{live_crypto_order_id}",
+            status="PARTIALLY_FILLED",
+            risk_event_id=None,
+            decision_record_id=None,
+            validation_run_id=None,
+            provider_order_id=f"KRAKEN-{live_crypto_order_id}",
+            provider_status="partially_filled",
+            submitted_at=now - timedelta(minutes=10),
+            acknowledged_at=now - timedelta(minutes=9),
+            filled_at=None,
+            cancelled_at=None,
+            failure_code=None,
+            failure_reason=None,
+            safe_provider_response={},
+            audit_correlation_id=uuid4(),
+            operator_confirmation_id=None,
+            created_at=now - timedelta(minutes=10),
+            updated_at=now - timedelta(minutes=10),
+        )
+    )
+    session.commit()
+
+
+def _seed_reconciliation_conflict_event(
+    session,  # noqa: ANN001
+    *,
+    live_trading_profile_id,  # noqa: ANN001
+    capital_campaign_id: int | None,
+    reconciliation_status: str,
+    sequence_number: int,
+    live_crypto_order_id=None,  # noqa: ANN001
+):
+    from app.models.live_reconciliation_event import LiveReconciliationEvent
+
+    now = datetime(2026, 7, 21, 12, 0, tzinfo=timezone.utc)
+    event_id = uuid4()
+    session.add(
+        LiveReconciliationEvent(
+            id=event_id,
+            idempotency_key=f"idem-{event_id}",
+            event_hash=f"hash-{event_id}",
+            live_trading_profile_id=live_trading_profile_id,
+            live_crypto_order_id=live_crypto_order_id,
+            capital_campaign_id=capital_campaign_id,
+            source_execution_event_id=uuid4(),
+            source_execution_event_type="execution_intent_created",
+            sequence_number=sequence_number,
+            event_type="order_reconciled",
+            reconciliation_status=reconciliation_status,
+            provider_name="kraken_spot",
+            provider_order_id=None if live_crypto_order_id is None else f"KRAKEN-{live_crypto_order_id}",
+            provider_fill_id=None,
+            event_payload={},
+            provenance={},
+            immutable_contract_version="1.0.0",
+            provider_recorded_at=now,
+            recorded_at=now,
+            created_at=now,
+        )
+    )
+    session.commit()
+    return event_id
+
+
+@pytest.mark.asyncio
+async def test_has_reconciliation_conflict_ignores_superseded_history_once_order_resolves() -> None:
+    """Historical reconciliation_required evidence superseded by a later
+    'filled' event must not report a conflict."""
+    profile_id = uuid4()
+    order_id = uuid4()
+
+    with _reconciliation_conflict_sqlite_session() as (raw_session, db):
+        _seed_reconciliation_conflict_order(raw_session, live_crypto_order_id=order_id)
+        _seed_reconciliation_conflict_event(raw_session, live_trading_profile_id=profile_id, capital_campaign_id=4, live_crypto_order_id=order_id, reconciliation_status="reconciliation_required", sequence_number=1)
+        _seed_reconciliation_conflict_event(raw_session, live_trading_profile_id=profile_id, capital_campaign_id=4, live_crypto_order_id=order_id, reconciliation_status="filled", sequence_number=2)
+
+        result = await crp._has_reconciliation_conflict(db=db, runtime_campaign_id=4)
+
+    assert result is False
+
+
+@pytest.mark.asyncio
+async def test_has_reconciliation_conflict_true_when_latest_event_is_genuinely_unresolved() -> None:
+    """Fail-closed behavior must be preserved: a genuinely latest-unresolved
+    event still reports a conflict."""
+    profile_id = uuid4()
+    order_id = uuid4()
+
+    with _reconciliation_conflict_sqlite_session() as (raw_session, db):
+        _seed_reconciliation_conflict_order(raw_session, live_crypto_order_id=order_id)
+        _seed_reconciliation_conflict_event(raw_session, live_trading_profile_id=profile_id, capital_campaign_id=4, live_crypto_order_id=order_id, reconciliation_status="conflict", sequence_number=1)
+
+        result = await crp._has_reconciliation_conflict(db=db, runtime_campaign_id=4)
+
+    assert result is True
+
+
+@pytest.mark.asyncio
+async def test_has_reconciliation_conflict_identityless_evidence_remains_blocking() -> None:
+    """A blocking-status event with no live_crypto_order_id can never be
+    proven superseded -- it must keep reporting a conflict unconditionally."""
+    profile_id = uuid4()
+
+    with _reconciliation_conflict_sqlite_session() as (raw_session, db):
+        _seed_reconciliation_conflict_event(raw_session, live_trading_profile_id=profile_id, capital_campaign_id=4, live_crypto_order_id=None, reconciliation_status="unknown", sequence_number=1)
+
+        result = await crp._has_reconciliation_conflict(db=db, runtime_campaign_id=4)
+
+    assert result is True
+
+
+@pytest.mark.asyncio
+async def test_has_reconciliation_conflict_campaign_scoping_cannot_be_bypassed() -> None:
+    """An unresolved event that belongs to a DIFFERENT capital campaign must
+    never report a conflict for this campaign -- BTC (campaign version 3)
+    and ETH (campaign version 4) must be able to reach commissioned
+    readiness independently."""
+    profile_id = uuid4()
+    btc_order, eth_order = uuid4(), uuid4()
+
+    with _reconciliation_conflict_sqlite_session() as (raw_session, db):
+        _seed_reconciliation_conflict_order(raw_session, live_crypto_order_id=btc_order)
+        _seed_reconciliation_conflict_order(raw_session, live_crypto_order_id=eth_order)
+        _seed_reconciliation_conflict_event(raw_session, live_trading_profile_id=profile_id, capital_campaign_id=3, live_crypto_order_id=btc_order, reconciliation_status="conflict", sequence_number=1)
+        _seed_reconciliation_conflict_event(raw_session, live_trading_profile_id=profile_id, capital_campaign_id=4, live_crypto_order_id=eth_order, reconciliation_status="filled", sequence_number=2)
+
+        btc_result = await crp._has_reconciliation_conflict(db=db, runtime_campaign_id=3)
+        eth_result = await crp._has_reconciliation_conflict(db=db, runtime_campaign_id=4)
+
+    assert btc_result is True
+    assert eth_result is False
