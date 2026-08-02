@@ -1350,6 +1350,17 @@ async def resolve_or_create_strategy_aggregate_evidence(
     if decision_record is None or aggregate_row.decision_record_id is None:
         return None, "strategy_evidence_unavailable"
 
+    # _build_aggregate_evidence_dict/_resolve_scorecard_summary key their
+    # dominant-contributor lookup by strategy_slug (shared with the
+    # load_strategy_aggregate_evidence replay path above, which has no
+    # per-identity scorecard data). scorecard_by_identity is already scoped
+    # to exactly this roster run's product/version-exact strategy_identities
+    # (see the strategy_identities filter passed to fetch_strategy_scorecards
+    # above), so re-keying it by slug here carries that same product-and-
+    # version scoping through without loosening it -- it does not fall back
+    # to any cross-version or cross-product scorecard data.
+    scorecard_by_slug = {item.strategy_slug: item for item in scorecard_by_identity.values()}
+
     evidence = _build_aggregate_evidence_dict(
         roster_run_id=roster_run_id,
         candle_close_time=candle_close_time,

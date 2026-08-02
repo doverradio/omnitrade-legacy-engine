@@ -296,6 +296,7 @@ async def test_buy_evidence_profitability_uses_buy_scoped_history_not_blended_ag
         return [
             StrategyScorecard(
                 strategy_slug="breakout",
+                strategy_identity="breakout@1.0.0",
                 per_horizon=[],
                 aggregate=one_sided_bucket,
                 best_regime=None,
@@ -342,6 +343,7 @@ async def test_hold_evidence_profitability_is_none_when_no_hold_scoped_history_e
         return [
             StrategyScorecard(
                 strategy_slug="breakout",
+                strategy_identity="breakout@1.0.0",
                 per_horizon=[],
                 aggregate=one_sided_bucket,
                 best_regime=None,
@@ -365,6 +367,56 @@ async def test_hold_evidence_profitability_is_none_when_no_hold_scoped_history_e
         # silently backed by the BUY-scoped or blended figures.
         assert evidence["source_identity"]["scorecard_strategy_slug"] == "breakout"
         assert evidence["profitable_after_fees_performance"] is None
+
+
+# Reproduces the exact production defect from commit 313898a ("fix: complete
+# bounded multi-asset readiness wiring"): resolve_or_create_strategy_aggregate_evidence
+# was changed to key its scorecard lookup by strategy_identity
+# (scorecard_by_identity, product-and-version-scoped) instead of by slug, but
+# the _build_aggregate_evidence_dict call at the end of the fresh-computation
+# path was left referencing the old, now-nonexistent `scorecard_by_slug` name
+# -- a NameError on every real BUY/SELL/HOLD cycle that reached scorecard
+# enrichment, since fetch_strategy_scorecards is never mocked away here (a
+# real, non-empty scorecard result is returned, exercising the same rekeying
+# this call path performs in production). Also asserts the fix's rekeying
+# from scorecard_by_identity stays version-scoped: the dominant contributor's
+# own scorecard (matched on its exact strategy_identity) is what surfaces in
+# evidence, not an empty or mismatched lookup.
+@pytest.mark.asyncio
+async def test_fresh_computation_with_real_scorecard_data_does_not_raise_undefined_scorecard_by_slug(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _patch_flat_position(monkeypatch)
+
+    bucket = _one_sided_scorecard_bucket(
+        buy_avg=Decimal("2.2500"), sell_avg=Decimal("-5.0000"), blended_avg=Decimal("-1.0000")
+    )
+
+    async def _fake_scorecards(**_kwargs):
+        return [
+            StrategyScorecard(
+                strategy_slug="breakout",
+                strategy_identity="breakout@1.0.0",
+                per_horizon=[],
+                aggregate=bucket,
+                best_regime=None,
+                worst_regime=None,
+                regime_evidence_count=3,
+                regime_min_evidence_required=50,
+            )
+        ]
+
+    monkeypatch.setattr(authoritative, "fetch_strategy_scorecards", _fake_scorecards)
+
+    async with _real_session() as session:
+        await _seed_roster_run_and_proposals(session, actions={"ma_crossover": "BUY", "momentum": "BUY", "breakout": "BUY"})
+        evidence, reason = await _call_aggregator(session)
+
+        assert reason is None
+        assert evidence is not None
+        assert evidence["action"] == "BUY"
+        assert evidence["source_identity"]["scorecard_strategy_slug"] == "breakout"
+        assert evidence["profitable_after_fees_performance"] == "2.2500"
 
 
 # --- _resolve_regime_match: pure-function unit coverage ---
@@ -429,6 +481,7 @@ async def test_regime_match_flows_from_roster_run_and_scorecard_into_contributio
         return [
             StrategyScorecard(
                 strategy_slug="breakout",
+                strategy_identity="breakout@1.0.0",
                 per_horizon=[],
                 aggregate=bucket,
                 best_regime="TRENDING",
@@ -472,6 +525,7 @@ async def test_regime_mismatch_flows_into_contribution(monkeypatch: pytest.Monke
         return [
             StrategyScorecard(
                 strategy_slug="breakout",
+                strategy_identity="breakout@1.0.0",
                 per_horizon=[],
                 aggregate=bucket,
                 best_regime="TRENDING",
@@ -515,6 +569,7 @@ async def test_missing_current_regime_leaves_regime_match_none(monkeypatch: pyte
         return [
             StrategyScorecard(
                 strategy_slug="breakout",
+                strategy_identity="breakout@1.0.0",
                 per_horizon=[],
                 aggregate=bucket,
                 best_regime="TRENDING",
