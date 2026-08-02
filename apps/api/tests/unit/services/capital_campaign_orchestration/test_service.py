@@ -503,6 +503,8 @@ async def _real_candle_session():
     from app.models.asset import Asset as AssetModel
     from app.models.autonomous_cycle_run import AutonomousCycleRun as AutonomousCycleRunModel
     from app.models.candle import Candle as CandleModel
+    from app.models.capital_campaign import CapitalCampaign as CapitalCampaignModel
+    from app.models.capital_campaign_definition import CapitalCampaignDefinition as CapitalCampaignDefinitionModel
 
     engine = create_async_engine("sqlite+aiosqlite:///:memory:", poolclass=StaticPool)
 
@@ -511,7 +513,10 @@ async def _real_candle_session():
         dbapi_conn.create_function("now", 0, lambda: datetime.now(timezone.utc).isoformat())
         dbapi_conn.create_function("gen_random_uuid", 0, lambda: uuid4().hex)
 
-    tables = [AssetModel.__table__, CandleModel.__table__, AutonomousCycleRunModel.__table__]
+    tables = [
+        AssetModel.__table__, CandleModel.__table__, AutonomousCycleRunModel.__table__,
+        CapitalCampaignDefinitionModel.__table__, CapitalCampaignModel.__table__,
+    ]
     for table in tables:
         _fix_sqlite_server_defaults(table)
 
@@ -573,6 +578,42 @@ async def _seed_asset_and_candle(engine, *, asset_id: UUID, candle_id: int = 1) 
                 volume=Decimal("1.5"),
                 source="kraken",
                 created_at=now,
+            )
+        )
+        await session.commit()
+
+
+async def _seed_governing_and_draft_campaign(engine, *, campaign_id: UUID) -> None:  # noqa: ANN001
+    """The exact production shape: version 3 (READY, BTC-USD only) is the
+    real, still-governing definition -- the runtime is pinned to it -- while
+    an unpromoted version 4 successor (DRAFT, adding ETH-USD) also exists
+    with a higher version number. Mirrors _seed_campaign in
+    tests/unit/services/orchestration/test_asset_roster_campaign_db_discovery.py,
+    the equivalent seed for asset_roster's own (already-correct) governing
+    resolution."""
+    from app.models.capital_campaign import CapitalCampaign as CapitalCampaignModel
+    from app.models.capital_campaign_definition import CapitalCampaignDefinition as CapitalCampaignDefinitionModel
+
+    def _definition(*, version: int, status: str, allowed_instruments: list[str]) -> CapitalCampaignDefinitionModel:
+        return CapitalCampaignDefinitionModel(
+            campaign_id=campaign_id, version=version, name="test", owner_identity="operator:test", status=status,
+            capital_budget=Decimal("25"), remaining_unallocated_capital=Decimal("25"), base_currency="USD",
+            allowed_asset_classes=["crypto"], allowed_venues=["kraken_spot"], allowed_instruments=allowed_instruments,
+            campaign_modes=[], maximum_open_positions=1, maximum_position_size=Decimal("5"),
+            minimum_position_size=Decimal("1"), maximum_total_exposure=Decimal("5"),
+            profitability_policy_id="p", profitability_policy_version="1", risk_policy_id="r", risk_policy_version="1",
+            compounding_policy={"policy_type": "FIXED_CAPITAL"},
+        )
+
+    async with AsyncSession(engine) as session:
+        session.add(_definition(version=3, status="READY", allowed_instruments=["BTC-USD"]))
+        session.add(_definition(version=4, status="DRAFT", allowed_instruments=["BTC-USD", "ETH-USD"]))
+        await session.flush()
+        session.add(
+            CapitalCampaignModel(
+                uuid=campaign_id, owner="operator:test", name="test", status="READY", campaign_type="definition_pinned_runtime",
+                definition_campaign_id=campaign_id, definition_version=3,
+                starting_capital=Decimal("25"), current_equity=Decimal("25"),
             )
         )
         await session.commit()
@@ -655,6 +696,74 @@ async def test_candle_survives_real_orm_expiration_after_scorecard_timeout_rollb
             # that bridge is exercised for real, not simulated).
             assert payload["cycle_count"] == 1
             assert payload["cycles"][0]["termination_stage"] == "hold_no_package_created"
+
+
+# Confirmed production defect: once an unpromoted DRAFT successor (a higher
+# version number than the actual governing predecessor) existed for a
+# campaign_id, every candle cycle skipped ALL campaigns as
+# runtime_definition_version_mismatch -- including the still-governing
+# predecessor -- silently halting autonomous evaluation for the ENTIRE
+# campaign, not just the new instrument the successor was adding. Root
+# cause: the multi-campaign discovery branch of
+# run_campaign_orchestration_preview_for_candle joined raw_rows (always "the
+# highest version NUMBER that exists" per campaign_id) against
+# list_campaign_definitions' output by (campaign_id, version) -- a join that
+# structurally cannot match once list_campaign_definitions correctly starts
+# resolving through the runtime's actual pin instead of that same
+# highest-version-number row. Fixed by (1) list_campaign_definitions
+# re-resolving through runtime.definition_version instead of trusting the
+# raw "latest by number" row when latest_only=True and no status filter is
+# given, and (2) joining by campaign_id alone here, since the two views can
+# legitimately disagree on which version number is "the" one while a DRAFT
+# successor is in flight. Uses a real AsyncSession/aiosqlite session (not a
+# mock) so list_campaign_definitions' real SQL runs for real, proving the
+# join actually finds the governing row rather than assuming it would.
+@pytest.mark.asyncio
+async def test_preview_discovers_governing_predecessor_while_unpromoted_draft_successor_exists(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from app.services.capital_campaign_orchestration.service import run_campaign_orchestration_preview_for_candle
+
+    asset_id = UUID("eeeeeeee-eeee-eeee-eeee-eeeeeeeeeeee")
+    campaign_id = uuid4()
+    composed_with: list[Any] = []
+
+    async def _compose_campaign_authoritative_cycle(*, db, campaign_definition, trigger, candle):
+        _ = db, trigger, candle
+        composed_with.append(campaign_definition)
+        return SimpleNamespace(composition=_hold_veto_composition(), preview=None)
+
+    monkeypatch.setattr(
+        "app.services.capital_campaign_orchestration.service.compose_campaign_authoritative_cycle",
+        _compose_campaign_authoritative_cycle,
+    )
+
+    async with _real_candle_session() as engine:
+        await _seed_asset_and_candle(engine, asset_id=asset_id)
+        await _seed_governing_and_draft_campaign(engine, campaign_id=campaign_id)
+
+        async with AsyncSession(engine) as db:
+            payload = await run_campaign_orchestration_preview_for_candle(db=db, campaign_id=None, allow_draft_preview=False)
+
+    # The still-governing version 3 was actually submitted to composition --
+    # not skipped, and not silently swapped for the DRAFT version 4.
+    assert len(composed_with) == 1
+    assert composed_with[0].version == 3
+    assert composed_with[0].status == "READY"
+    assert payload["cycle_count"] == 1
+
+    assert payload["eligible_campaigns"] == [{"campaign_id": str(campaign_id), "version": 3}]
+    assert payload["skipped_campaigns"] == []
+
+    # The DRAFT successor still shows up in considered_campaigns (raw_rows
+    # always reflects "the highest version number that exists") for operator
+    # visibility, even though it correctly never itself becomes a candidate.
+    assert payload["considered_campaigns"] == [
+        {
+            "campaign_id": str(campaign_id), "version": 4, "status": "DRAFT",
+            "allowed_instruments": ["BTC-USD", "ETH-USD"], "allowed_venues": ["kraken_spot"],
+        }
+    ]
 
 
 @pytest.mark.asyncio

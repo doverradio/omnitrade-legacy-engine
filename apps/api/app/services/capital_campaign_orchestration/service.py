@@ -404,11 +404,26 @@ async def run_campaign_orchestration_preview_for_candle(
     if campaign_id is None:
         raw_rows = await CapitalCampaignDomainRepository(db).list(campaign_id=None, status=None, latest_only=True)
         campaigns = await list_campaign_definitions(db=db, campaign_id=None, status=None, latest_only=True)
-        domain_by_key = {(item.campaign_id, item.version): item for item in campaigns.items}
+        # Keyed by campaign_id alone, not (campaign_id, version): list_campaign_definitions
+        # (status=None, latest_only=True) now resolves each campaign_id to
+        # whatever version its runtime is CURRENTLY pinned to -- which can
+        # legitimately be a lower version number than raw_rows' own "highest
+        # version that exists" view whenever an unpromoted DRAFT successor
+        # is sitting alongside the real governing version. Joining on the
+        # version number too (the previous behavior) required both queries
+        # to agree on which version is "the" one, which they structurally
+        # cannot while a DRAFT successor exists -- confirmed production
+        # defect: every campaign was skipped as runtime_definition_version_mismatch
+        # and no candle ever reached composition again until the successor
+        # was promoted or removed. considered_campaigns below is left
+        # sourced from raw_rows on purpose, so a pending DRAFT successor
+        # still shows up there for operator visibility even while its
+        # still-governing predecessor is correctly evaluated below.
+        domain_by_campaign_id = {item.campaign_id: item for item in campaigns.items}
 
         for row in raw_rows:
             considered_campaigns.append(_considered_campaign_entry(row))
-            domain_item = domain_by_key.get((row.campaign_id, row.version))
+            domain_item = domain_by_campaign_id.get(row.campaign_id)
             if domain_item is None:
                 runtime = await _load_runtime_for_definition(db=db, campaign_id=row.campaign_id)
                 reason = "runtime_campaign_missing" if runtime is None else "runtime_definition_version_mismatch"

@@ -415,6 +415,35 @@ async def list_campaign_definitions(
         runtime = await _get_runtime_campaign(db=db, campaign_id=item.campaign_id)
         if runtime is None:
             continue
+        if latest_only and status is None:
+            # "Latest, with no status filter" means "whatever this
+            # campaign's runtime is CURRENTLY pinned to" -- resolved
+            # directly through the pin (runtime.definition_version), never
+            # through "the highest version number that happens to exist".
+            # repository.list(latest_only=True) returns the highest-
+            # version-NUMBER row per campaign_id regardless of governance;
+            # confirmed production defect: while an unpromoted DRAFT
+            # successor exists (a higher version number than the actual
+            # governing predecessor), `item` here is that DRAFT, and the
+            # plain version-equality check below then drops the campaign_id
+            # from this listing entirely -- even though the runtime pin
+            # never moved and a genuinely governing version still exists.
+            # run_campaign_orchestration_preview_for_candle calls this exact
+            # function/argument combination on every candle close; an empty
+            # result here silently halted autonomous evaluation for the
+            # whole campaign, not just the new instrument being added.
+            # Unlike get_governing_campaign_definition, this does not
+            # additionally require runtime.status == "READY": callers here
+            # (this orchestration preview, and the operator unattended-
+            # eligibility audit) must still see and correctly report
+            # PAUSED/RUNNING/etc. campaigns via their own status-aware skip
+            # logic, not have them silently vanish from the listing too.
+            if runtime.definition_version is None:
+                continue
+            pinned = await repository.get(campaign_id=item.campaign_id, version=runtime.definition_version)
+            if pinned is not None:
+                items.append(_to_response(pinned, runtime))
+            continue
         if runtime.definition_version != item.version:
             continue
         items.append(_to_response(item, runtime))

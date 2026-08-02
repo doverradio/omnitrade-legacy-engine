@@ -267,3 +267,143 @@ def test_no_provider_order_calls() -> None:
 
     assert "exchange_connections.providers" not in normalized
     assert "kraken_spot" not in normalized
+
+
+# --- list_campaign_definitions: governing resolution while a DRAFT successor exists ---
+#
+# Confirmed production defect: with latest_only=True and no status filter,
+# this function fetched only the highest version-NUMBER row per campaign_id
+# (repository.list(latest_only=True)), then checked whether THAT row
+# happened to be the runtime's governing pin -- dropping the campaign_id
+# from the listing entirely whenever it wasn't, which is exactly what
+# happens the moment an unpromoted DRAFT successor (a higher version number
+# than the actual governing predecessor) exists. Real callers of this exact
+# argument combination: run_campaign_orchestration_preview_for_candle (every
+# candle close) and the operator unattended-eligibility-audit CLI command --
+# both went blind to the still-governing version the instant a successor
+# was created. Real AsyncSession/aiosqlite session, not a mock, so the real
+# SQL (including repository.list's max-version-per-campaign_id subquery)
+# runs for real.
+
+
+def _real_campaign_session():
+    from app.models.capital_campaign import CapitalCampaign
+    from app.models.capital_campaign_definition import CapitalCampaignDefinition
+    from tests.support.real_sqlite_session import real_sqlite_session
+
+    return real_sqlite_session([CapitalCampaignDefinition.__table__, CapitalCampaign.__table__])
+
+
+async def _seed_definition(session, *, campaign_id: UUID, version: int, status: str, allowed_instruments: list[str]) -> None:  # noqa: ANN001
+    from app.models.capital_campaign_definition import CapitalCampaignDefinition
+
+    session.add(
+        CapitalCampaignDefinition(
+            campaign_id=campaign_id, version=version, name="test", owner_identity="operator:test", status=status,
+            capital_budget=Decimal("25"), remaining_unallocated_capital=Decimal("25"), base_currency="USD",
+            allowed_asset_classes=["crypto"], allowed_venues=["kraken_spot"], allowed_instruments=allowed_instruments,
+            campaign_modes=[], maximum_open_positions=1, maximum_position_size=Decimal("5"),
+            minimum_position_size=Decimal("1"), maximum_total_exposure=Decimal("5"),
+            profitability_policy_id="p", profitability_policy_version="1", risk_policy_id="r", risk_policy_version="1",
+            compounding_policy={"policy_type": "FIXED_CAPITAL"},
+        )
+    )
+
+
+async def _seed_runtime(session, *, campaign_id: UUID, definition_version: int, status: str = "READY") -> None:  # noqa: ANN001
+    from app.models.capital_campaign import CapitalCampaign
+
+    session.add(
+        CapitalCampaign(
+            uuid=campaign_id, owner="operator:test", name="test", status=status, campaign_type="definition_pinned_runtime",
+            definition_campaign_id=campaign_id, definition_version=definition_version,
+            starting_capital=Decimal("25"), current_equity=Decimal("25"),
+        )
+    )
+
+
+@pytest.mark.asyncio
+async def test_list_campaign_definitions_resolves_governing_version_while_draft_successor_exists() -> None:
+    from app.services.capital_campaign_domain.service import list_campaign_definitions
+
+    campaign_id = uuid4()
+    async with _real_campaign_session() as session:
+        await _seed_definition(session, campaign_id=campaign_id, version=3, status="READY", allowed_instruments=["BTC-USD"])
+        await _seed_definition(session, campaign_id=campaign_id, version=4, status="DRAFT", allowed_instruments=["BTC-USD", "ETH-USD"])
+        await _seed_runtime(session, campaign_id=campaign_id, definition_version=3)
+        await session.flush()
+
+        result = await list_campaign_definitions(db=session, campaign_id=None, status=None, latest_only=True)
+
+    assert len(result.items) == 1
+    assert result.items[0].version == 3
+    assert result.items[0].status == "READY"
+
+
+@pytest.mark.asyncio
+async def test_list_campaign_definitions_explicit_status_filter_path_is_unchanged() -> None:
+    """Scope check on the fix itself: passing an explicit `status` must keep
+    using the exact original version-equality path (item.version ==
+    runtime.definition_version), never the new pin-resolution branch. Using
+    a single-version campaign (no DRAFT-successor complication) isolates
+    that: the new branch only ever activates for latest_only=True AND
+    status=None, so this must still resolve normally."""
+    from app.services.capital_campaign_domain.service import list_campaign_definitions
+
+    campaign_id = uuid4()
+    async with _real_campaign_session() as session:
+        await _seed_definition(session, campaign_id=campaign_id, version=1, status="READY", allowed_instruments=["BTC-USD"])
+        await _seed_runtime(session, campaign_id=campaign_id, definition_version=1)
+        await session.flush()
+
+        result = await list_campaign_definitions(db=session, campaign_id=None, status="READY", latest_only=True)
+
+    assert len(result.items) == 1
+    assert result.items[0].version == 1
+    assert result.items[0].status == "READY"
+
+
+@pytest.mark.asyncio
+async def test_list_campaign_definitions_status_filter_combined_with_draft_successor_is_a_pre_existing_limitation() -> None:
+    """Documents, rather than fixes, a separate and genuinely pre-existing
+    limitation this task did not touch: CapitalCampaignDomainRepository.list's
+    latest_only subquery computes the max version per campaign_id BEFORE any
+    status filter is applied, so an explicit status query can only ever
+    match a row that is also the single highest-numbered version overall.
+    While a DRAFT successor (a higher version number) exists, an explicit
+    status query for the governing version's own status (here: "READY",
+    version 3's real status) returns nothing -- not because of this fix,
+    but because repository.list itself never even considers version 3 once
+    version 4 exists. Confirmed identical before and after this change since
+    this fix only touches the status=None branch."""
+    from app.services.capital_campaign_domain.service import list_campaign_definitions
+
+    campaign_id = uuid4()
+    async with _real_campaign_session() as session:
+        await _seed_definition(session, campaign_id=campaign_id, version=3, status="READY", allowed_instruments=["BTC-USD"])
+        await _seed_definition(session, campaign_id=campaign_id, version=4, status="DRAFT", allowed_instruments=["BTC-USD", "ETH-USD"])
+        await _seed_runtime(session, campaign_id=campaign_id, definition_version=3)
+        await session.flush()
+
+        result = await list_campaign_definitions(db=session, campaign_id=None, status="READY", latest_only=True)
+
+    assert result.items == []
+
+
+@pytest.mark.asyncio
+async def test_list_campaign_definitions_single_version_campaign_unaffected() -> None:
+    """Baseline: a campaign with no DRAFT successor at all must behave
+    exactly as before -- this fix only changes behavior when the raw
+    "latest by number" row and the runtime's actual pin diverge."""
+    from app.services.capital_campaign_domain.service import list_campaign_definitions
+
+    campaign_id = uuid4()
+    async with _real_campaign_session() as session:
+        await _seed_definition(session, campaign_id=campaign_id, version=1, status="READY", allowed_instruments=["BTC-USD"])
+        await _seed_runtime(session, campaign_id=campaign_id, definition_version=1)
+        await session.flush()
+
+        result = await list_campaign_definitions(db=session, campaign_id=None, status=None, latest_only=True)
+
+    assert len(result.items) == 1
+    assert result.items[0].version == 1
