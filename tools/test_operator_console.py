@@ -27,7 +27,78 @@ def test_journalctl_invoked_with_utc_flag() -> None:
     """Root cause of the display bug: journalctl without --utc renders in
     whatever timezone the VPS's OS happens to be configured with, which the
     console then displayed unconverted. --utc makes the source unambiguous."""
-    assert "--utc" in oc.JOURNAL_CMD
+    assert "--utc" in oc.JOURNAL_BASE_CMD
+    assert "--utc" in oc._build_journal_cmd(since_hours=None)
+
+
+# --- --hours replay window (catch up after the console wasn't running) ---
+
+
+def test_build_journal_cmd_without_since_hours_has_no_since_flag() -> None:
+    """Default behavior (no --hours) is unchanged: live-only, no backlog."""
+    cmd = oc._build_journal_cmd(since_hours=None)
+    assert "--since" not in cmd
+    assert cmd[-1] == "-f"
+
+
+def test_build_journal_cmd_with_since_hours_computes_absolute_utc_cutoff() -> None:
+    """The cutoff is an absolute UTC timestamp computed here, not a relative
+    string handed to journalctl to interpret in whatever timezone it's
+    running under -- same reasoning as the --utc fix above."""
+    from datetime import datetime, timedelta, timezone
+
+    before = datetime.now(timezone.utc) - timedelta(hours=8)
+    cmd = oc._build_journal_cmd(since_hours=8)
+    assert "--since" in cmd
+    since_value = cmd[cmd.index("--since") + 1]
+    assert since_value.endswith(" UTC")
+    parsed = datetime.strptime(since_value, "%Y-%m-%d %H:%M:%S UTC").replace(tzinfo=timezone.utc)
+    assert abs((parsed - before).total_seconds()) < 5
+    assert cmd[-1] == "-f"
+
+
+def test_hours_flag_is_parsed_and_forwarded_to_run(monkeypatch: pytest.MonkeyPatch) -> None:
+    captured: dict[str, object] = {}
+    monkeypatch.setattr(oc, "run", lambda *, since_hours=None: captured.update(since_hours=since_hours))
+    oc.main(["--hours", "8"])
+    assert captured["since_hours"] == 8.0
+
+
+def test_omitting_hours_flag_preserves_default_live_only_behavior(monkeypatch: pytest.MonkeyPatch) -> None:
+    captured: dict[str, object] = {}
+    monkeypatch.setattr(oc, "run", lambda *, since_hours=None: captured.update(since_hours=since_hours))
+    oc.main([])
+    assert captured["since_hours"] is None
+
+
+def test_nonpositive_hours_flag_is_rejected() -> None:
+    with pytest.raises(SystemExit):
+        oc.main(["--hours", "0"])
+    with pytest.raises(SystemExit):
+        oc.main(["--hours", "-5"])
+
+
+def test_replay_window_is_used_only_for_the_first_connection_attempt(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A transient reconnect after the initial replay must resume live from
+    'now', never re-replay the original overnight window again -- otherwise
+    every journald hiccup would reprint hours of already-seen cycle cards."""
+    seen_since_hours: list[float | None] = []
+    call_count = {"n": 0}
+
+    def _fake_follow_journal(on_line, *, since_hours=None) -> None:
+        _ = on_line
+        seen_since_hours.append(since_hours)
+        call_count["n"] += 1
+        if call_count["n"] >= 2:
+            raise KeyboardInterrupt
+        raise ConnectionError("simulated drop")
+
+    monkeypatch.setattr(oc, "follow_journal", _fake_follow_journal)
+    monkeypatch.setattr(oc.time, "sleep", lambda _seconds: None)
+
+    oc.run(since_hours=8)
+
+    assert seen_since_hours == [8, None]
 
 
 def test_respects_operator_configured_tz_env_var(monkeypatch: pytest.MonkeyPatch) -> None:

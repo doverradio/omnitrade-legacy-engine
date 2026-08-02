@@ -10,6 +10,10 @@ at any time; killing it (Ctrl-C) has zero effect on the orchestration worker.
 Run:
     python tools/operator_console.py --timezone America/New_York
 
+To catch up on activity that happened while the console wasn't running
+(e.g. overnight), replay a lookback window before it starts following live:
+    python tools/operator_console.py --hours 8
+
 The display timezone may also be supplied with
 OMNITRADE_OPERATOR_TIMEZONE (preferred) or the standard TZ environment
 variable. If none is configured, the VPS operating-system timezone is used.
@@ -24,7 +28,7 @@ import re
 import subprocess
 import time
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 SERVICE_UNIT = "omnitrade-orchestration.service"
@@ -32,8 +36,21 @@ SERVICE_UNIT = "omnitrade-orchestration.service"
 # timezone -- without it, journalctl renders in whatever local tz the box
 # happens to be configured with (commonly UTC on cloud images), and that
 # ambiguity was the actual root cause of the display bug: there was no way
-# to tell, from the line alone, what tz its digits were already in.
-JOURNAL_CMD = ["sudo", "journalctl", "-u", SERVICE_UNIT, "-f", "-o", "short-iso", "--utc"]
+# to tell, from the line alone, what tz its digits were already in. The same
+# reasoning applies to --since below: an absolute "YYYY-MM-DD HH:MM:SS UTC"
+# cutoff computed here, rather than a relative string handed to journalctl
+# to interpret in its own locale/timezone, so there is never any ambiguity
+# about which 8/24 hours were actually requested.
+JOURNAL_BASE_CMD = ["sudo", "journalctl", "-u", SERVICE_UNIT, "-o", "short-iso", "--utc"]
+
+
+def _build_journal_cmd(*, since_hours: float | None) -> list[str]:
+    cmd = list(JOURNAL_BASE_CMD)
+    if since_hours is not None:
+        cutoff = datetime.now(timezone.utc) - timedelta(hours=since_hours)
+        cmd += ["--since", cutoff.strftime("%Y-%m-%d %H:%M:%S UTC")]
+    cmd.append("-f")
+    return cmd
 
 # --- Colors ---
 RESET, BOLD, DIM = "\033[0m", "\033[1m", "\033[2m"
@@ -586,7 +603,7 @@ class Totals:
 _RECONNECT_DELAY_SECONDS = 5
 
 
-def print_startup_banner() -> None:
+def print_startup_banner(*, since_hours: float | None = None) -> None:
     bar = "═" * 49
     print(bar)
     print(c("OmniTrade Operator Console", BOLD))
@@ -597,6 +614,8 @@ def print_startup_banner() -> None:
     print("Status:")
     print(c("🟢 Connected", BRIGHT_GREEN))
     print(f"Display timezone: {_display_timezone_label()}")
+    if since_hours is not None:
+        print(c(f"Replaying the last {since_hours:g} hour(s), then following live...", YELLOW))
     print()
     print("Waiting for next trading cycle...")
     print()
@@ -605,10 +624,14 @@ def print_startup_banner() -> None:
     print()
 
 
-def follow_journal(on_line) -> None:
-    """Runs one journalctl -f session, feeding every line to on_line, until
-    the stream ends for any reason -- then raises so the caller reconnects."""
-    proc = subprocess.Popen(JOURNAL_CMD, stdout=subprocess.PIPE, text=True, bufsize=1)
+def follow_journal(on_line, *, since_hours: float | None = None) -> None:
+    """Runs one journalctl session, feeding every line to on_line, until the
+    stream ends for any reason -- then raises so the caller reconnects.
+    since_hours, when given, replays that lookback window before the -f tail
+    begins (journalctl supports --since together with -f natively: it prints
+    the matching backlog first, then continues following)."""
+    cmd = _build_journal_cmd(since_hours=since_hours)
+    proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, text=True, bufsize=1)
     try:
         assert proc.stdout is not None
         for line in proc.stdout:
@@ -618,8 +641,8 @@ def follow_journal(on_line) -> None:
         proc.terminate()
 
 
-def run() -> None:
-    print_startup_banner()
+def run(*, since_hours: float | None = None) -> None:
+    print_startup_banner(since_hours=since_hours)
 
     totals = Totals()
     current = Cycle()
@@ -668,16 +691,23 @@ def run() -> None:
         if event in _TERMINAL_EVENTS:
             flush()
 
+    # since_hours only applies to the very first connection -- once the
+    # backlog has been replayed, every later reconnect (worker restart,
+    # journald hiccup) must resume live from "now", never re-replay the same
+    # historical window again on top of an already-rendered run.
+    pending_since_hours = since_hours
     try:
         while True:
             try:
-                follow_journal(on_line)
+                follow_journal(on_line, since_hours=pending_since_hours)
             except KeyboardInterrupt:
                 raise
             except Exception as exc:
                 print(c(f"⚠ Lost journal stream: {exc}", BRIGHT_RED))
                 print(c(f"Reconnecting in {_RECONNECT_DELAY_SECONDS} seconds...", DIM))
                 time.sleep(_RECONNECT_DELAY_SECONDS)
+            finally:
+                pending_since_hours = None
     except KeyboardInterrupt:
         pass
     finally:
@@ -692,12 +722,26 @@ def main(argv: list[str] | None = None) -> None:
         metavar="IANA_ZONE",
         help="display timezone, e.g. America/New_York (overrides OMNITRADE_OPERATOR_TIMEZONE and TZ)",
     )
+    parser.add_argument(
+        "--hours",
+        type=float,
+        default=None,
+        metavar="N",
+        help=(
+            "replay journal entries from the last N hours (e.g. 8 or 24) before "
+            "following live -- use this to catch up after the console wasn't "
+            "running (overnight, PC off, etc). Omit for today's default "
+            "live-only behavior."
+        ),
+    )
     args = parser.parse_args(argv)
+    if args.hours is not None and args.hours <= 0:
+        parser.error("--hours must be a positive number")
     try:
         _configure_display_timezone(args.timezone)
     except ValueError as exc:
         parser.error(str(exc))
-    run()
+    run(since_hours=args.hours)
 
 
 if __name__ == "__main__":
