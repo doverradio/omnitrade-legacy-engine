@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import inspect
 from datetime import datetime, timezone
 from decimal import Decimal
 from types import SimpleNamespace
@@ -8,9 +9,14 @@ import uuid
 
 import pytest
 from cryptography.fernet import Fernet
+from pydantic import ValidationError
 
 from app.models.exchange_connection import ExchangeConnection
-from app.schemas.exchange_connections import SaveExchangeConnectionRequest, TestExchangeConnectionRequest as ExchangeTestConnectionRequest
+from app.schemas.exchange_connections import (
+    ExchangeBalanceResponse,
+    SaveExchangeConnectionRequest,
+    TestExchangeConnectionRequest as ExchangeTestConnectionRequest,
+)
 from app.services.exchange_connections import service
 from app.services.exchange_connections.crypto import decrypt_credential_payload, encrypt_credential_payload
 from app.services.exchange_connections.providers.base import ExchangeAuthResult
@@ -270,3 +276,134 @@ async def test_refresh_missing_usd_entry_remains_balance_unavailable(monkeypatch
     response = await service.refresh_exchange_balances(db=db, exchange_connection_id=connection.exchange_connection_id)
 
     assert response.readiness.verdict == "BALANCE_UNAVAILABLE"
+
+
+# --- ExchangeBalanceResponse.currency: generic asset-code validation ---
+#
+# Confirmed production defect: currency was a hard-coded
+# Literal["USD", "BTC", "ETH"], so a legitimate Kraken SOL balance made the
+# whole exchange-connection-refresh-balances response fail Pydantic
+# validation even though the provider adapter, transaction commit, and
+# persistence had already succeeded (kraken_spot.py's fetch_balances has
+# tracked SOL since the multi-asset readiness commit). Replaced with a
+# bounded, strictly-validated generic code, normalized the same way
+# kraken_spot.py's own _canonical_asset normalizes (stripped, upper-cased,
+# alphanumeric only) -- these tests exercise the real schema, not a mock.
+
+
+@pytest.mark.parametrize("currency", ["USD", "BTC", "ETH"])
+def test_exchange_balance_response_still_accepts_previously_supported_currencies(currency: str) -> None:
+    response = ExchangeBalanceResponse(currency=currency, available=Decimal("1.5"), reserved=Decimal("0"), total=Decimal("1.5"))
+    assert response.currency == currency
+
+
+def test_exchange_balance_response_accepts_legitimate_sol_currency() -> None:
+    response = ExchangeBalanceResponse(
+        currency="sol", available=Decimal("12.34567890"), reserved=Decimal("0"), total=Decimal("12.34567890")
+    )
+    # Normalized per the repository's established asset-code convention
+    # (kraken_spot._canonical_asset: strip + upper-case), same as USD/BTC/ETH.
+    assert response.currency == "SOL"
+    # Decimal precision is preserved exactly, not rounded or coerced to float.
+    assert response.available == Decimal("12.34567890")
+    assert response.total == Decimal("12.34567890")
+
+
+@pytest.mark.parametrize(
+    "malformed_currency",
+    [
+        "",
+        "   ",
+        "BTC/USD",
+        "BT C",
+        "USD.",
+        "A" * 13,
+    ],
+)
+def test_exchange_balance_response_rejects_malformed_or_unreasonable_currency_codes(malformed_currency: str) -> None:
+    with pytest.raises(ValidationError):
+        ExchangeBalanceResponse(currency=malformed_currency, available=Decimal("0"), reserved=Decimal("0"), total=Decimal("0"))
+
+
+def test_exchange_balance_response_json_serialization_contract_is_unchanged() -> None:
+    """Existing API/serialization contract (currency as a plain string,
+    Decimal amounts serialized as fixed-point strings) must remain
+    compatible for the currencies that already worked before this change."""
+    response = ExchangeBalanceResponse(currency="BTC", available=Decimal("0.001"), reserved=Decimal("0"), total=Decimal("0.001"))
+    payload = json.loads(response.model_dump_json())
+    assert payload == {"currency": "BTC", "available": "0.001", "reserved": "0", "total": "0.001"}
+
+    sol_response = ExchangeBalanceResponse(currency="SOL", available=Decimal("2.5"), reserved=Decimal("0"), total=Decimal("2.5"))
+    sol_payload = json.loads(sol_response.model_dump_json())
+    assert sol_payload == {"currency": "SOL", "available": "2.5", "reserved": "0", "total": "2.5"}
+
+
+@pytest.mark.asyncio
+async def test_refresh_kraken_multi_currency_response_including_sol_persists_all_balances(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A Kraken account holding USD, BTC, ETH, and SOL must have every
+    balance represented in the response and persisted -- none silently
+    discarded merely because SOL is present alongside the others."""
+    connection = _connection_for_refresh()
+
+    class _Provider:
+        async def test_authentication(self, *, credentials, environment):
+            _ = credentials, environment
+            return ExchangeAuthResult(
+                reachable=True, authenticated=True, account_status="active", permissions=["funds_query"],
+                heartbeat_at=datetime.now(timezone.utc), trade_permission_present=False, error=None,
+            )
+
+        async def fetch_balances(self, *, credentials, environment):
+            _ = credentials, environment
+            return SimpleNamespace(
+                balances=[
+                    SimpleNamespace(currency="USD", available=Decimal("100"), reserved=Decimal("0"), total=Decimal("100")),
+                    SimpleNamespace(currency="BTC", available=Decimal("0.01"), reserved=Decimal("0"), total=Decimal("0.01")),
+                    SimpleNamespace(currency="ETH", available=Decimal("0"), reserved=Decimal("0"), total=Decimal("0")),
+                    SimpleNamespace(currency="SOL", available=Decimal("3.5"), reserved=Decimal("0"), total=Decimal("3.5")),
+                ],
+                total_equity_usd=Decimal("100"),
+            )
+
+        async def fetch_product(self, *, credentials, environment, product_id):
+            _ = credentials, environment, product_id
+            return SimpleNamespace(available=True, trading_enabled=True)
+
+        async def create_order(self, **_kwargs):
+            raise AssertionError("create_order must not be called during a balance refresh")
+
+    async def _load_connection(*, db, exchange_connection_id):
+        _ = db, exchange_connection_id
+        return connection
+
+    monkeypatch.setattr(service, "_load_connection", _load_connection)
+    monkeypatch.setattr(service, "_decrypt_credentials", lambda _connection: {"api_key": "k", "api_secret": "s", "passphrase": ""})
+    monkeypatch.setattr(service, "get_exchange_provider", lambda _provider: _Provider())
+
+    db = _FakeDb()
+    response = await service.refresh_exchange_balances(db=db, exchange_connection_id=connection.exchange_connection_id)
+
+    currencies = {item.currency for item in response.balances}
+    assert currencies == {"USD", "BTC", "ETH", "SOL"}
+    sol_balance = next(item for item in response.balances if item.currency == "SOL")
+    assert sol_balance.available == Decimal("3.5")
+
+    # Persistence (connection.balances, the JSON column refresh_exchange_balances
+    # writes before commit) also retains all four -- nothing dropped en route
+    # to the database, only the response schema was ever the problem.
+    persisted_currencies = {item["currency"] for item in connection.balances}
+    assert persisted_currencies == {"USD", "BTC", "ETH", "SOL"}
+
+
+def test_refresh_exchange_balances_does_not_touch_campaign_mandate_or_roster_authorization() -> None:
+    """Accepting a balance currency as read-only evidence must never, by
+    itself, be capable of authorizing that asset for trading -- refresh_
+    exchange_balances must have no reference to campaign/mandate/roster
+    authorization state or order submission at all."""
+    source = inspect.getsource(service.refresh_exchange_balances)
+    forbidden_tokens = [
+        "asset_roster", "allowed_instruments", "allowed_products",
+        "capital_campaign", "mandate", "create_order", "ADDITIONAL_PRODUCT_ASSET_SYMBOLS",
+    ]
+    for token in forbidden_tokens:
+        assert token not in source, f"refresh_exchange_balances must not reference {token!r}"

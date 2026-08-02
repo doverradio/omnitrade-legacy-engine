@@ -1,11 +1,12 @@
 from __future__ import annotations
 
+import re
 from datetime import datetime
 from decimal import Decimal
 from typing import Literal
 from uuid import UUID
 
-from pydantic import BaseModel, Field, field_serializer
+from pydantic import BaseModel, Field, field_serializer, field_validator
 
 from app.schemas.live_crypto_orders import LiveCryptoOrderResponse
 
@@ -35,11 +36,36 @@ class ExchangeCredentialMaskResponse(BaseModel):
     passphrase: str | None
 
 
+# Balance evidence must reflect whatever asset codes a provider legitimately
+# reports an account holding -- it is not bounded to the currencies this
+# system has product/trading support for (that authorization lives entirely
+# in asset_roster.ADDITIONAL_PRODUCT_ASSET_SYMBOLS / campaign
+# allowed_instruments / mandate allowed_products, none of which this schema
+# touches). Confirmed production defect: a legitimate Kraken SOL balance was
+# rejected outright because this field was a hard-coded
+# Literal["USD", "BTC", "ETH"], failing the entire balance-refresh response
+# even though the provider adapter, transaction commit, and persistence all
+# already handled it correctly -- SOL was silently NOT the problem; the
+# response schema was. A bounded, strictly-validated generic code (normalized
+# the same way kraken_spot.py's own _canonical_asset normalizes: stripped,
+# upper-cased, alphanumeric only) replaces the Literal so a legitimate new
+# asset code never requires another schema edit to merely be *reported*.
+_ASSET_CURRENCY_CODE_PATTERN = re.compile(r"^[A-Z0-9]{1,12}$")
+
+
 class ExchangeBalanceResponse(BaseModel):
-    currency: Literal["USD", "BTC", "ETH"]
+    currency: str
     available: Decimal
     reserved: Decimal
     total: Decimal
+
+    @field_validator("currency", mode="before")
+    @classmethod
+    def _normalize_currency_code(cls, value: object) -> str:
+        normalized = str(value if value is not None else "").strip().upper()
+        if not _ASSET_CURRENCY_CODE_PATTERN.fullmatch(normalized):
+            raise ValueError(f"invalid or unreasonable balance currency code: {value!r}")
+        return normalized
 
     @field_serializer("available", "reserved", "total", when_used="json")
     def serialize_decimals(self, value: Decimal) -> str:
