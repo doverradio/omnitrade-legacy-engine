@@ -586,6 +586,7 @@ def _seed_outcome_row(
     mfe_pct: Decimal,
     mae_pct: Decimal,
     strategy_identity: str | None = None,
+    product_id: str = "BTC-USD",
 ) -> None:
     now = datetime(2026, 7, 21, 12, 0, tzinfo=timezone.utc)
     proposal_id = uuid.uuid4()
@@ -597,7 +598,7 @@ def _seed_outcome_row(
             roster_run_id=uuid.uuid4(),
             asset_id=uuid.uuid4(),
             provider="kraken_spot",
-            product_id="BTC-USD",
+            product_id=product_id,
             interval="15m",
             strategy_slug=strategy_slug,
             strategy_identity=strategy_identity or f"{strategy_slug}@1.0.0",
@@ -916,6 +917,51 @@ async def test_scorecard_query_does_not_mix_strategy_versions() -> None:
     assert scorecards[0].strategy_identity == "momentum@2.0.0"
     assert scorecards[0].aggregate.total_evaluated == 1
     assert scorecards[0].aggregate.buy_average_raw_return_pct == Decimal("-3.0000")
+
+
+# Multi-asset readiness (BTC-USD/ETH-USD/SOL-USD): fetch_strategy_scorecards
+# has always filtered by product_id at the SQL layer (see the identical
+# .where(StrategyRosterProposalOutcome.product_id == product_id) clause in
+# both the production query and the reference implementations in this file),
+# but no test previously asserted this against real seeded rows for two
+# different products sharing the same strategy_slug/strategy_identity --
+# the exact shape a second product going live introduces. Proves a BUY
+# decision for one product can never be economically justified by another
+# product's historical outcomes, mirroring the existing
+# does_not_mix_strategy_versions proof one axis over.
+@pytest.mark.asyncio
+async def test_scorecard_query_does_not_mix_products() -> None:
+    async with _real_outcomes_session() as raw_session:
+        for product_id, return_pct in (("BTC-USD", Decimal("2")), ("ETH-USD", Decimal("-3"))):
+            _seed_outcome_row(
+                raw_session,
+                strategy_slug="momentum",
+                strategy_identity="momentum@1.0.0",
+                action="BUY",
+                horizon_label="15m",
+                horizon_minutes=15,
+                regime_trend="TRENDING",
+                actual_action_correct=return_pct > 0,
+                actual_raw_return_pct=return_pct,
+                actual_fee_adjusted_return_pct=return_pct,
+                mfe_pct=Decimal("1"),
+                mae_pct=Decimal("-1"),
+                product_id=product_id,
+            )
+        raw_session.commit()
+
+        scorecards = await fetch_strategy_scorecards(
+            db=_AwaitableOutcomesSession(raw_session),
+            provider="kraken_spot",
+            product_id="BTC-USD",
+            interval="15m",
+            strategy_slugs=["momentum"],
+            strategy_identities=["momentum@1.0.0"],
+        )
+
+    assert len(scorecards) == 1
+    assert scorecards[0].aggregate.total_evaluated == 1
+    assert scorecards[0].aggregate.buy_average_raw_return_pct == Decimal("2.0000")
 
 
 async def _reference_fetch_strategy_scorecards_multi_pass(
