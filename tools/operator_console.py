@@ -36,19 +36,29 @@ SERVICE_UNIT = "omnitrade-orchestration.service"
 # timezone -- without it, journalctl renders in whatever local tz the box
 # happens to be configured with (commonly UTC on cloud images), and that
 # ambiguity was the actual root cause of the display bug: there was no way
-# to tell, from the line alone, what tz its digits were already in. The same
-# reasoning applies to --since below: an absolute "YYYY-MM-DD HH:MM:SS UTC"
-# cutoff computed here, rather than a relative string handed to journalctl
-# to interpret in its own locale/timezone, so there is never any ambiguity
-# about which 8/24 hours were actually requested.
+# to tell, from the line alone, what tz its digits were already in.
 JOURNAL_BASE_CMD = ["sudo", "journalctl", "-u", SERVICE_UNIT, "-o", "short-iso", "--utc"]
+
+
+def _resolve_since_cutoff(*, since_hours: float) -> datetime:
+    return datetime.now(timezone.utc) - timedelta(hours=since_hours)
 
 
 def _build_journal_cmd(*, since_hours: float | None) -> list[str]:
     cmd = list(JOURNAL_BASE_CMD)
     if since_hours is not None:
-        cutoff = datetime.now(timezone.utc) - timedelta(hours=since_hours)
-        cmd += ["--since", cutoff.strftime("%Y-%m-%d %H:%M:%S UTC")]
+        cutoff = _resolve_since_cutoff(since_hours=since_hours)
+        # "@<unix-seconds>" rather than a formatted "YYYY-MM-DD HH:MM:SS
+        # [tz]" string: an initial version of this used the latter with a
+        # trailing "UTC" suffix, which journalctl silently failed to
+        # interpret as intended on at least one VPS (systemd's --since
+        # parser accepts a bare "@<epoch>" unconditionally, with zero
+        # locale/timezone-name ambiguity, whereas the formatted-string form
+        # depends on systemd version and the box's own locale data) --
+        # producing zero replayed lines instead of an error. @<epoch> is
+        # computed here in Python from an unambiguous UTC instant, so there
+        # is nothing left for journalctl itself to interpret or get wrong.
+        cmd += ["--since", f"@{int(cutoff.timestamp())}"]
     cmd.append("-f")
     return cmd
 
@@ -615,7 +625,13 @@ def print_startup_banner(*, since_hours: float | None = None) -> None:
     print(c("🟢 Connected", BRIGHT_GREEN))
     print(f"Display timezone: {_display_timezone_label()}")
     if since_hours is not None:
-        print(c(f"Replaying the last {since_hours:g} hour(s), then following live...", YELLOW))
+        cutoff_local = _resolve_since_cutoff(since_hours=since_hours).astimezone(_display_timezone())
+        print(c(
+            f"Replaying the last {since_hours:g} hour(s) (since {cutoff_local.strftime('%Y-%m-%d %I:%M %p %Z')}), "
+            "then following live...",
+            YELLOW,
+        ))
+        print(c("If no cards appear below shortly, see the reconnect warning for the actual reason.", DIM))
     print()
     print("Waiting for next trading cycle...")
     print()
@@ -629,13 +645,25 @@ def follow_journal(on_line, *, since_hours: float | None = None) -> None:
     stream ends for any reason -- then raises so the caller reconnects.
     since_hours, when given, replays that lookback window before the -f tail
     begins (journalctl supports --since together with -f natively: it prints
-    the matching backlog first, then continues following)."""
+    the matching backlog first, then continues following).
+
+    stderr is captured (rather than left to inherit the terminal) so that if
+    journalctl itself rejects its arguments -- a bad --since value, a
+    permissions problem, an unrecognized flag on an older journalctl -- the
+    caller's reconnect warning can report the real reason instead of the
+    generic "stream ended", which previously left a silently-empty replay
+    indistinguishable from a genuinely quiet 8 hours."""
     cmd = _build_journal_cmd(since_hours=since_hours)
-    proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, text=True, bufsize=1)
+    proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, bufsize=1)
+    lines_read = 0
     try:
         assert proc.stdout is not None
         for line in proc.stdout:
+            lines_read += 1
             on_line(line)
+        stderr_text = proc.stderr.read().strip() if proc.stderr is not None else ""
+        if lines_read == 0 and stderr_text:
+            raise ConnectionError(f"journalctl produced no output and reported: {stderr_text}")
         raise ConnectionError("journalctl stream ended")
     finally:
         proc.terminate()

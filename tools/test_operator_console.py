@@ -41,20 +41,52 @@ def test_build_journal_cmd_without_since_hours_has_no_since_flag() -> None:
     assert cmd[-1] == "-f"
 
 
-def test_build_journal_cmd_with_since_hours_computes_absolute_utc_cutoff() -> None:
-    """The cutoff is an absolute UTC timestamp computed here, not a relative
-    string handed to journalctl to interpret in whatever timezone it's
-    running under -- same reasoning as the --utc fix above."""
+def test_build_journal_cmd_with_since_hours_computes_absolute_epoch_cutoff() -> None:
+    """The cutoff is an absolute Unix-epoch instant computed here in Python,
+    not a formatted date/timezone string handed to journalctl for it to
+    parse itself. An earlier version used a "YYYY-MM-DD HH:MM:SS UTC"
+    string; on at least one real VPS journalctl silently failed to honor
+    that trailing "UTC" suffix and replayed nothing, with no error --
+    "@<epoch>" removes that entire class of ambiguity (systemd's --since
+    parser treats a leading '@' as an unambiguous Unix timestamp)."""
     from datetime import datetime, timedelta, timezone
 
     before = datetime.now(timezone.utc) - timedelta(hours=8)
     cmd = oc._build_journal_cmd(since_hours=8)
     assert "--since" in cmd
     since_value = cmd[cmd.index("--since") + 1]
-    assert since_value.endswith(" UTC")
-    parsed = datetime.strptime(since_value, "%Y-%m-%d %H:%M:%S UTC").replace(tzinfo=timezone.utc)
+    assert since_value.startswith("@")
+    parsed = datetime.fromtimestamp(int(since_value[1:]), tz=timezone.utc)
     assert abs((parsed - before).total_seconds()) < 5
     assert cmd[-1] == "-f"
+
+
+def test_resolve_since_cutoff_is_exactly_n_hours_before_now() -> None:
+    from datetime import datetime, timedelta, timezone
+
+    before = datetime.now(timezone.utc) - timedelta(hours=24)
+    cutoff = oc._resolve_since_cutoff(since_hours=24)
+    assert cutoff.tzinfo is not None
+    assert abs((cutoff - before).total_seconds()) < 5
+
+
+def test_follow_journal_surfaces_stderr_when_no_lines_were_produced(monkeypatch: pytest.MonkeyPatch) -> None:
+    """If journalctl rejects its own arguments (bad --since value, missing
+    permission, unsupported flag on an older version) and exits without
+    emitting any lines, the reconnect warning must report journalctl's
+    actual stderr -- not the generic 'stream ended' message that made a
+    silently-broken --since indistinguishable from a genuinely quiet
+    window."""
+    monkeypatch.setattr(
+        oc,
+        "_build_journal_cmd",
+        lambda *, since_hours=None: [
+            "python3", "-c",
+            "import sys; sys.stderr.write('boom: bad --since value\\n'); sys.exit(1)",
+        ],
+    )
+    with pytest.raises(ConnectionError, match="boom: bad --since value"):
+        oc.follow_journal(lambda _line: None, since_hours=8)
 
 
 def test_hours_flag_is_parsed_and_forwarded_to_run(monkeypatch: pytest.MonkeyPatch) -> None:
