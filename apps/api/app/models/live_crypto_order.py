@@ -21,6 +21,15 @@ class LiveCryptoOrder(Base):
         Index("idx_live_crypto_orders_exchange_created", "exchange_connection_id", "created_at"),
         Index("idx_live_crypto_orders_status", "status"),
         CheckConstraint("exposure_effect IS NULL OR exposure_effect = 'REDUCE_ONLY'", name="ck_lco_exposure_effect"),
+        # UPPER(order_type) rather than an exact-case match: order_type has
+        # been an unconstrained free-text column since its introduction,
+        # and existing fixtures/call sites use both "MARKET" and lowercase
+        # "market" -- this constraint must not newly reject rows that were
+        # always valid before LIMIT support existed.
+        CheckConstraint(
+            "(UPPER(order_type) = 'MARKET' AND limit_price IS NULL) OR (UPPER(order_type) = 'LIMIT' AND limit_price > 0)",
+            name="ck_lco_limit_price_matches_order_type",
+        ),
         CheckConstraint(
             "execution_claim_id IS NULL OR (side = 'SELL' AND exposure_effect = 'REDUCE_ONLY' "
             "AND requested_base_quantity > 0 AND normalized_base_quantity > 0 "
@@ -55,6 +64,8 @@ class LiveCryptoOrder(Base):
     product_id: Mapped[str] = mapped_column(Text, nullable=False)
     side: Mapped[str] = mapped_column(Text, nullable=False)
     order_type: Mapped[str] = mapped_column(Text, nullable=False)
+    limit_price: Mapped[Decimal | None] = mapped_column(Numeric, nullable=True)
+    time_in_force: Mapped[str | None] = mapped_column(Text, nullable=True)
     requested_quote_size: Mapped[Decimal] = mapped_column(Numeric, nullable=False)
     client_order_id: Mapped[str] = mapped_column(Text, nullable=False)
     status: Mapped[str] = mapped_column(Text, nullable=False)

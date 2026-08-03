@@ -705,6 +705,23 @@ async def _reference_fetch_strategy_scorecards_full_entity(
                     return None
                 return sum((item.actual_raw_return_pct or Decimal("0") for item in items), Decimal("0")) / Decimal(len(items))
 
+            def _raw_stdev(items: list[Any]) -> Decimal | None:
+                # Mirrors service.py's _sample_stdev exactly (Bessel-corrected
+                # sample stdev via sum/sum-of-squares), independently derived
+                # here from the raw item list rather than accumulated sums,
+                # so this reference implementation cannot share a bug with
+                # the production accumulator.
+                if len(items) < 2:
+                    return None
+                values = [item.actual_raw_return_pct or Decimal("0") for item in items]
+                n = len(values)
+                mean = sum(values, Decimal("0")) / Decimal(n)
+                sum_sq = sum((value * value for value in values), Decimal("0"))
+                variance = (sum_sq / Decimal(n)) - (mean * mean)
+                if variance <= Decimal("0"):
+                    return Decimal("0")
+                return variance.sqrt() * (Decimal(n) / Decimal(n - 1)).sqrt()
+
             overall_correct_pct = None
             raw_avg = None
             fee_avg = None
@@ -737,6 +754,9 @@ async def _reference_fetch_strategy_scorecards_full_entity(
                 buy_average_raw_return_pct=_round(_raw_average(buy_items)),
                 sell_average_raw_return_pct=_round(_raw_average(sell_items)),
                 hold_average_raw_return_pct=_round(_raw_average(hold_items)),
+                buy_raw_return_stdev_pct=_round(_raw_stdev(buy_items)),
+                sell_raw_return_stdev_pct=_round(_raw_stdev(sell_items)),
+                hold_raw_return_stdev_pct=_round(_raw_stdev(hold_items)),
             )
 
         per_horizon: list[StrategyScorecardBucket] = []
@@ -761,6 +781,16 @@ async def _reference_fetch_strategy_scorecards_full_entity(
             best_regime = max(regime_avg, key=lambda key: regime_avg[key])
             worst_regime = min(regime_avg, key=lambda key: regime_avg[key])
 
+        regime_conditioned_buckets: dict[str, dict[str, StrategyScorecardBucket]] = {}
+        for horizon_label, _horizon_minutes in HORIZONS:
+            horizon_items = [item for item in scored_items if item.horizon_label == horizon_label]
+            regimes_present = sorted({item.regime_trend for item in horizon_items})
+            for regime in regimes_present:
+                regime_items = [item for item in horizon_items if item.regime_trend == regime]
+                regime_conditioned_buckets.setdefault(horizon_label, {})[regime] = _bucket(
+                    f"{horizon_label}:{regime}", regime_items
+                )
+
         scorecards.append(
             StrategyScorecard(
                 strategy_slug=strategy_slug,
@@ -771,6 +801,7 @@ async def _reference_fetch_strategy_scorecards_full_entity(
                 worst_regime=worst_regime,
                 regime_evidence_count=regime_evidence_count,
                 regime_min_evidence_required=regime_min_evidence_required,
+                regime_conditioned_buckets=regime_conditioned_buckets,
             )
         )
 
@@ -1046,6 +1077,23 @@ async def _reference_fetch_strategy_scorecards_multi_pass(
                     return None
                 return sum((item.actual_raw_return_pct or Decimal("0") for item in items), Decimal("0")) / Decimal(len(items))
 
+            def _raw_stdev(items: list[Any]) -> Decimal | None:
+                # Mirrors service.py's _sample_stdev exactly (Bessel-corrected
+                # sample stdev via sum/sum-of-squares), independently derived
+                # here from the raw item list rather than accumulated sums,
+                # so this reference implementation cannot share a bug with
+                # the production accumulator.
+                if len(items) < 2:
+                    return None
+                values = [item.actual_raw_return_pct or Decimal("0") for item in items]
+                n = len(values)
+                mean = sum(values, Decimal("0")) / Decimal(n)
+                sum_sq = sum((value * value for value in values), Decimal("0"))
+                variance = (sum_sq / Decimal(n)) - (mean * mean)
+                if variance <= Decimal("0"):
+                    return Decimal("0")
+                return variance.sqrt() * (Decimal(n) / Decimal(n - 1)).sqrt()
+
             overall_correct_pct = None
             raw_avg = None
             fee_avg = None
@@ -1078,6 +1126,9 @@ async def _reference_fetch_strategy_scorecards_multi_pass(
                 buy_average_raw_return_pct=_round(_raw_average(buy_items)),
                 sell_average_raw_return_pct=_round(_raw_average(sell_items)),
                 hold_average_raw_return_pct=_round(_raw_average(hold_items)),
+                buy_raw_return_stdev_pct=_round(_raw_stdev(buy_items)),
+                sell_raw_return_stdev_pct=_round(_raw_stdev(sell_items)),
+                hold_raw_return_stdev_pct=_round(_raw_stdev(hold_items)),
             )
 
         per_horizon: list[StrategyScorecardBucket] = []
@@ -1102,6 +1153,16 @@ async def _reference_fetch_strategy_scorecards_multi_pass(
             best_regime = max(regime_avg, key=lambda key: regime_avg[key])
             worst_regime = min(regime_avg, key=lambda key: regime_avg[key])
 
+        regime_conditioned_buckets: dict[str, dict[str, StrategyScorecardBucket]] = {}
+        for horizon_label, _horizon_minutes in HORIZONS:
+            horizon_items = [item for item in scored_items if item.horizon_label == horizon_label]
+            regimes_present = sorted({item.regime_trend for item in horizon_items})
+            for regime in regimes_present:
+                regime_items = [item for item in horizon_items if item.regime_trend == regime]
+                regime_conditioned_buckets.setdefault(horizon_label, {})[regime] = _bucket(
+                    f"{horizon_label}:{regime}", regime_items
+                )
+
         scorecards.append(
             StrategyScorecard(
                 strategy_slug=strategy_slug,
@@ -1112,6 +1173,7 @@ async def _reference_fetch_strategy_scorecards_multi_pass(
                 worst_regime=worst_regime,
                 regime_evidence_count=regime_evidence_count,
                 regime_min_evidence_required=regime_min_evidence_required,
+                regime_conditioned_buckets=regime_conditioned_buckets,
             )
         )
 

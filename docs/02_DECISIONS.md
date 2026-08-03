@@ -778,3 +778,236 @@ binding and terminalization were corrected. Not yet production-deployed
 or production-validated as of this writing; see
 `docs/00_OPERATIONS_MAP.md`'s Controlled Proof Exit Recovery section for
 the next validation step.
+
+---
+
+## 2026-08-03
+
+### Entry Intelligence and Adaptive Limit-Order Decision Layer (Phases 1-5 only)
+
+Decision
+
+Added a strictly additive "entry intelligence" layer
+(`app/services/entry_intelligence/{evidence,decision}.py`) that runs ONLY
+after the existing net-edge gate (authoritative.py's
+`compose_campaign_authoritative_cycle`) has already rejected a market-entry
+BUY with `non_positive_net_edge`. It never changes that gate's own
+accept/reject boundary or `historical_gross_return_pct` sourcing for the
+market-entry decision. It answers a strictly additional question: does a
+bounded, economically-derived LOWER entry price make the setup viable
+instead? Produces one of BUY_LIMIT / WAIT / REJECT (BUY_NOW is reserved for
+the case where a positive market edge is passed in, for API completeness;
+the wired call site only ever invokes this after market-entry was already
+rejected). Attached to the same `rejected_candidates` record
+(`entry_intelligence_decision`, `entry_intelligence_reason`) and logged as
+one explainable line (`entry_intelligence_decision_evaluated`), surfaced in
+`tools/operator_console.py`.
+
+Also added a narrower context-specific evidence hierarchy
+(`resolve_context_specific_edge_evidence`): exact strategy + asset +
+timeframe (matching the campaign's own candle interval) + regime, falling
+back to exact strategy + asset + timeframe (any regime), falling back to
+today's existing blended-aggregate figure (byte-identical to current
+production behavior when neither narrower tier has enough samples), failing
+closed ("unavailable") only when no tier has any evidence. Each of the two
+new, narrower tiers requires its own minimum sample size
+(`ENTRY_INTELLIGENCE_MIN_HORIZON_REGIME_SAMPLE_SIZE`=20,
+`ENTRY_INTELLIGENCE_MIN_HORIZON_SAMPLE_SIZE`=10) before being trusted; the
+selected tier's mean is then reduced by an uncertainty penalty
+(`z * standard_error`, `z`=`ENTRY_INTELLIGENCE_UNCERTAINTY_PENALTY_Z`=1.0)
+before being used as the "conservative_gross_edge" that BUY_LIMIT math is
+based on. Added action-scoped sample standard deviation
+(`buy/sell/hold_raw_return_stdev_pct`) and (horizon, regime)-conditioned
+buckets (`StrategyScorecard.regime_conditioned_buckets`) to
+`strategy_outcomes/service.py` to support this.
+
+Maximum profitable entry price is derived, not arbitrary: solved directly
+from the SAME expected-exit-price evidence already used for the
+market-entry evaluation (`expected_exit_price = market_price * (1 +
+conservative_gross_edge_pct/100)`), then
+`max_price = expected_exit_price / (1 + total_cost_pct/100)`, rounded DOWN
+to a configured price precision. A proposal is only made when the implied
+discount from market is within a bounded safety cap
+(`ENTRY_INTELLIGENCE_MAX_LIMIT_DISCOUNT_PCT`=1.0%) and the limit-priced
+notional (using the SAME base quantity Risk already approved at market
+price -- no second Risk evaluation was run this session) still clears
+`asset.min_order_notional`.
+
+Reason
+
+Production evidence (repeated `buy_agreement_threshold_met` BUY candidates
+immediately terminated with `non_positive_net_edge`, aggregate BUY scores
+up to 3.33 alongside gross edges of roughly -0.02% to -0.18%) was traced
+and found consistent with the net-edge gate correctly rejecting genuinely
+non-positive expected edge AT MARKET PRICE, using the SAME evidence
+pipeline already hardened across the "First Autonomous Profit" gate's prior
+seven rounds of fixes (action-scoping, raw-vs-fee-adjusted sourcing,
+double-fee-count correction — see `docs/00_PROJECT_STATE.md` project
+memory). No further defect was found in that gate itself. The remaining
+architectural gap was that only market-entry was ever evaluated: the
+system had no way to express "this specific setup is not attractive right
+now at market, but would be at a bounded lower price" — exactly the mission
+of `docs/OMNITRADE_ENTRY_INTELLIGENCE_AND_LIMIT_ORDERS_PROMPT.md`.
+
+Alternatives Considered
+
+Change the existing market-entry gate itself to use the new, narrower
+(regime/timeframe-conditioned, uncertainty-penalized) evidence directly,
+potentially flipping some existing rejections to acceptances. Rejected
+this session: doing so would retroactively change a live, already
+multiply-hardened safety gate's outcome under evidence that, while
+directionally sound, has not yet been shadow-validated (Phase 10 of the
+governing prompt) against real forward outcomes. The chosen design gets
+the same tighter evidence to the SAME final economic question (is there a
+profitable entry for this setup) through a new, clearly-labeled, strictly
+additive decision (BUY_LIMIT) instead of silently reinterpreting the old
+one.
+
+Wire BUY_LIMIT decisions through to live Kraken order submission this
+session. Rejected: `app/services/exchange_connections/providers/kraken_spot.py::submit_order`
+explicitly supports only MARKET orders in the current execution profile
+(`request.order_type.upper() != "MARKET"` is rejected outright), and no
+limit-order lifecycle/supervision worker exists yet. Building and
+live-wiring full limit-order execution against a real exchange without
+that adapter support, untested, in one session was judged higher-risk than
+the value of shipping it half-built. This session delivers the fully
+tested, audited decision layer and defers live submission explicitly (see
+`06_NEXT_SESSION.md`).
+
+Consequences
+
+The existing net-edge gate's tests, log lines, and accept/reject outcomes
+are provably unchanged (full existing unit + integration suites re-run
+before and after this change with identical pre-existing failures only).
+Every `non_positive_net_edge` rejection now additionally carries a
+BUY_LIMIT/WAIT/REJECT decision with full provenance, visible in
+`rejected_candidates`, one log line, and the operator console. No live
+order is submitted for BUY_LIMIT decisions yet — Phases 6-11 of the
+governing prompt (real limit-order construction/submission, lifecycle
+state machine, continuous supervision worker, shadow counterfactual
+validation, bounded live proving lane) remain unimplemented, tracked as
+the explicit next task in `06_NEXT_SESSION.md`. Small-account/$5-notional
+interaction proven and tested: a limit price below market, using the SAME
+base quantity Risk approved at market, always implies a lower notional
+than the original approved notional, so a campaign approved right at
+`asset.min_order_notional` will correctly REJECT rather than propose an
+undersized order — this is a real economic constraint, not a bug, and
+must be considered before enabling BUY_LIMIT with production position
+sizing.
+
+---
+
+## 2026-08-03 (continuation)
+
+### Real Kraken LIMIT execution path, authoritative pre-execution attempt lifecycle, shadow validation
+
+Decision
+
+Completed the execution path the prior round of this same day deferred:
+BUY_LIMIT is no longer diagnostic-only. `app/services/exchange_connections/providers/kraken_spot.py::submit_order`
+now genuinely supports `order_type="LIMIT"` for both sides (real
+`/private/AddOrder` payload with `ordertype=limit`, `price`, base-unit
+`volume`, GTC/IOC `timeinforce`; no ticker fetch — the limit price is
+caller-supplied, never derived from a market reference), plus a new
+`cancel_order` method (`/private/CancelOrder`, distinguishing `success` /
+`already_resolved` / `ambiguous` / `rejected`). Provider precision
+(`pair_decimals`/`lot_decimals`/`ordermin`/`costmin`) is sourced from the
+SAME `/public/AssetPairs` call the MARKET path already uses — no longer a
+placeholder for the LIMIT path specifically, though the entry-intelligence
+decision layer's `price_decimals` setting is still a placeholder at
+proposal time (see prior entry) since the real precision is only fetched
+at submission.
+
+A new authoritative, persisted state machine (`AutonomousLimitEntryAttempt`,
+migration `20260803_0065`) makes a BUY_LIMIT decision a genuine
+pre-execution gate: `entry_intelligence_decision_evaluated` (unchanged)
+→ `propose_and_risk_evaluate_limit_entry` creates a `PROPOSED` row and runs
+a REAL Risk Engine evaluation (`evaluate_signal_risk`/`persist_risk_decision`,
+same functions the market-entry path uses) at the proposed limit
+price/quantity → `READY` or `REJECTED`. A new supervisor
+(`app/services/orchestration/autonomous_limit_entry_worker.py`,
+`advance_due_limit_entry_attempts`, wired into
+`continuous_pipeline_worker.py`'s per-cycle loop the same way
+`poll_unresolved_live_orders`/`advance_one_autonomous_proof_sell_stage`
+already are) advances `READY → SUBMITTED → OPEN/PARTIALLY_FILLED → FILLED`,
+handles expiration and invalidation by requesting cancellation
+(`CANCEL_REQUESTED`), confirms cancellation via `lookup_order` re-verification
+(never trusts the cancel response alone) before marking `CANCELLED`, and
+creates at most one bounded `REPLACED` chain (new price capped at
+`maximum_profitable_entry_price`, a DB `CHECK` constraint
+(`ck_alea_never_chase_above_max`) makes "never chase above" a data
+invariant, not just application logic).
+
+Also added `replay_rejected_buy_candidate_counterfactual`
+(`app/services/entry_intelligence/shadow_validation.py`, Phase 10): a
+pure, read-only replay of a candidate against already-stored candle data
+answering whether the proposed limit would have filled, time-to-fill,
+MFE/MAE, and net P&L at 15m/30m/1h/2h/4h for both the market-entry and
+limit-entry alternatives, plus missed-opportunity/avoided-loss framing
+when the limit never fills. Reuses `strategy_outcomes/service.py`'s own
+`_load_close_at_or_before`/`_load_window_candles` rather than a competing
+replay implementation.
+
+Reason
+
+The prior round's own explicit "not yet built" list named exactly this:
+Kraken adapter MARKET-only, no persisted lifecycle, no supervisor, no
+shadow validation. This round closes each of those in the smallest way
+that is genuinely real (actually calls the provider, actually evaluates
+Risk, actually persists restart-safe state) rather than expanding the
+diagnostic-only surface further.
+
+Alternatives Considered
+
+Build the LIMIT execution path on top of the existing canonical-package /
+`AutonomousExecutionClaim` machinery (the same one market BUYs use), so
+BUY_LIMIT and BUY_NOW share one execution lineage. Rejected for this
+round: that machinery's `LiveCryptoOrder.execution_claim_id` column is
+constrained (`ck_lco_reduce_only_lifecycle`) to SELL/reduce-only rows
+only, and BUY claims link the other way (`AutonomousExecutionClaim.live_order_id`
+points at the order) via a deeper chain
+(`autonomous_order_preparation.py` → `commissioned_entry_execution.py` →
+`LiveCryptoOrderService.submit`) that assumes a canonical package/dry-run
+order already exists. Retrofitting LIMIT through that whole chain in this
+session was judged materially riskier than a new, narrower, BUY-only lane
+that reuses the same provider adapter, Risk Engine, and reconciliation
+primitive but not the claim/package layer. This is why custody is not yet
+established for a filled BUY_LIMIT — see Consequences.
+
+Give the CHECK constraint added to `live_crypto_orders`
+(`ck_lco_limit_price_matches_order_type`) an exact-case comparison
+(`order_type = 'MARKET'`). Rejected after it broke `test_reconciliation_scheduler.py`
+in the real (non-mocked) test run: several existing fixtures use lowercase
+`"market"`, which was always valid since `order_type` was unconstrained
+free text before this change. Used `UPPER(order_type) = 'MARKET'` instead
+— same invariant, tolerant of pre-existing case variance.
+
+Consequences
+
+A real Kraken LIMIT order can now be proposed, Risk-evaluated, packaged
+(the attempt row + a `CryptoOrderPreview` + a `LiveCryptoOrder` row),
+submitted, observed OPEN, partially filled, filled, cancelled (with
+provider re-verification), and replaced exactly once within the
+economic bound — all with real unit test coverage (Kraken payload/
+precision/cancel, Risk approval/rejection, submit/poll/partial-fill/
+expire/cancel/replace/restart-recovery/unknown-provider-state,
+shadow-fill/no-fill/avoided-loss). **Custody is explicitly NOT
+established** for a filled BUY_LIMIT — `establish_buy_custody` is never
+called from the new worker (asserted by a dedicated test); a fill is
+reconciled and accounted for via the existing `reconcile_live_order_and_fills`,
+but does not yet transition into `AutonomousPositionCustody`. Also not
+yet wired: a live per-instrument reference price feed into the
+supervisor's `current_reference_price` (so replacement, while implemented
+and tested, will not fire automatically in production yet), and real
+provider-precision (`pair_decimals`) informing the entry-intelligence
+decision layer's `preferred_limit_price` before submission time (the
+Kraken adapter now fetches real precision at SUBMISSION time and
+requotes/rejects there, so no incorrect price is ever actually sent — the
+gap is only that the proposal-time price shown in diagnostics may not yet
+match final submission precision exactly). No live proving-lane
+enablement, and no bounded live BUY_LIMIT capital deployment, has
+occurred — this remains explicitly a code-and-test-only round. Full
+existing unit (2805 passed) and integration (233 passed) suites re-run
+before and after; the same 17 unit + 9 integration pre-existing failures
+(confirmed via `git stash` against unmodified `master`) are unchanged,
+no new failures.

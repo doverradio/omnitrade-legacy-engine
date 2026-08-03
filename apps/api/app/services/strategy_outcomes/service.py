@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 from collections.abc import Collection
@@ -69,6 +69,17 @@ class StrategyScorecardBucket:
     buy_average_raw_return_pct: Decimal | None = None
     sell_average_raw_return_pct: Decimal | None = None
     hold_average_raw_return_pct: Decimal | None = None
+    # Action-specific sample standard deviation of the RAW return, over the
+    # same population as the *_average_raw_return_pct fields above. None
+    # when fewer than 2 samples exist for that action (sample stdev is
+    # undefined below n=2) -- callers must treat that as "no variance
+    # evidence available", never as zero variance. Used by
+    # app.services.entry_intelligence to compute a conservative
+    # (uncertainty-penalized) estimate of expected edge rather than trusting
+    # a raw mean of unknown reliability.
+    buy_raw_return_stdev_pct: Decimal | None = None
+    sell_raw_return_stdev_pct: Decimal | None = None
+    hold_raw_return_stdev_pct: Decimal | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -81,6 +92,15 @@ class StrategyScorecard:
     worst_regime: str | None
     regime_evidence_count: int
     regime_min_evidence_required: int
+    # Action-scoped bucket conditioned on BOTH the exact horizon label AND
+    # the regime_trend recorded on each outcome row at evaluation time --
+    # e.g. regime_conditioned_buckets["15m"]["TRENDING"]. This is the
+    # narrowest evidence tier app.services.entry_intelligence's hierarchy
+    # will use, and is only ever populated for (horizon, regime)
+    # combinations that actually occurred in the scored outcome rows. Empty
+    # dict, never used, for any caller that predates this tier (per_horizon
+    # and aggregate above are unchanged and remain independently valid).
+    regime_conditioned_buckets: dict[str, dict[str, "StrategyScorecardBucket"]] = field(default_factory=dict)
 
 
 def _utc(value: datetime) -> datetime:
@@ -415,9 +435,9 @@ class _StrategyBucketAccumulator:
         "total", "buy_count", "buy_correct", "sell_count", "sell_correct",
         "hold_count", "hold_correct",
         "sum_raw", "sum_fee", "sum_mfe", "sum_mae",
-        "buy_sum_raw", "buy_sum_fee",
-        "sell_sum_raw", "sell_sum_fee",
-        "hold_sum_raw", "hold_sum_fee",
+        "buy_sum_raw", "buy_sum_fee", "buy_sum_raw_sq",
+        "sell_sum_raw", "sell_sum_fee", "sell_sum_raw_sq",
+        "hold_sum_raw", "hold_sum_fee", "hold_sum_raw_sq",
     )
 
     def __init__(self) -> None:
@@ -434,10 +454,13 @@ class _StrategyBucketAccumulator:
         self.sum_mae = Decimal("0")
         self.buy_sum_raw = Decimal("0")
         self.buy_sum_fee = Decimal("0")
+        self.buy_sum_raw_sq = Decimal("0")
         self.sell_sum_raw = Decimal("0")
         self.sell_sum_fee = Decimal("0")
+        self.sell_sum_raw_sq = Decimal("0")
         self.hold_sum_raw = Decimal("0")
         self.hold_sum_fee = Decimal("0")
+        self.hold_sum_raw_sq = Decimal("0")
 
     def add(self, item: Any) -> None:
         raw = item.actual_raw_return_pct or Decimal("0")
@@ -458,18 +481,21 @@ class _StrategyBucketAccumulator:
             self.buy_count += 1
             self.buy_sum_raw += raw
             self.buy_sum_fee += fee
+            self.buy_sum_raw_sq += raw * raw
             if correct:
                 self.buy_correct += 1
         elif action == "SELL":
             self.sell_count += 1
             self.sell_sum_raw += raw
             self.sell_sum_fee += fee
+            self.sell_sum_raw_sq += raw * raw
             if correct:
                 self.sell_correct += 1
         elif action == "HOLD":
             self.hold_count += 1
             self.hold_sum_raw += raw
             self.hold_sum_fee += fee
+            self.hold_sum_raw_sq += raw * raw
             if correct:
                 self.hold_correct += 1
 
@@ -494,6 +520,19 @@ class _StrategyBucketAccumulator:
                 return None
             return total_value / Decimal(count)
 
+        def _sample_stdev(sum_value: Decimal, sum_sq: Decimal, count: int) -> Decimal | None:
+            # Sample standard deviation (Bessel-corrected, n-1 denominator).
+            # Undefined below n=2 -- returns None, never 0, so callers cannot
+            # mistake "no variance evidence" for "zero variance" (which would
+            # wrongly zero out the uncertainty penalty for a single sample).
+            if count < 2:
+                return None
+            mean = sum_value / Decimal(count)
+            variance = (sum_sq / Decimal(count)) - (mean * mean)
+            if variance <= Decimal("0"):
+                return Decimal("0")
+            return variance.sqrt() * (Decimal(count) / Decimal(count - 1)).sqrt()
+
         return StrategyScorecardBucket(
             horizon_label=horizon_label,
             total_evaluated=total,
@@ -514,6 +553,9 @@ class _StrategyBucketAccumulator:
             buy_average_raw_return_pct=_round(_avg(self.buy_sum_raw, self.buy_count)),
             sell_average_raw_return_pct=_round(_avg(self.sell_sum_raw, self.sell_count)),
             hold_average_raw_return_pct=_round(_avg(self.hold_sum_raw, self.hold_count)),
+            buy_raw_return_stdev_pct=_round(_sample_stdev(self.buy_sum_raw, self.buy_sum_raw_sq, self.buy_count)),
+            sell_raw_return_stdev_pct=_round(_sample_stdev(self.sell_sum_raw, self.sell_sum_raw_sq, self.sell_count)),
+            hold_raw_return_stdev_pct=_round(_sample_stdev(self.hold_sum_raw, self.hold_sum_raw_sq, self.hold_count)),
         )
 
 
@@ -644,6 +686,11 @@ async def fetch_strategy_scorecards(
         aggregate_accumulator = _StrategyBucketAccumulator()
         regime_sums: dict[str, Decimal] = {}
         regime_counts: dict[str, int] = {}
+        # Keyed [horizon_label][regime_trend] -- the narrowest evidence tier
+        # entry_intelligence's hierarchy consumes (see
+        # StrategyScorecard.regime_conditioned_buckets). Only allocated for
+        # combinations actually observed in scored_items.
+        horizon_regime_accumulators: dict[str, dict[str, _StrategyBucketAccumulator]] = {}
 
         for item in scored_items:
             aggregate_accumulator.add(item)
@@ -655,11 +702,22 @@ async def fetch_strategy_scorecards(
             regime_sums[regime] = regime_sums.get(regime, Decimal("0")) + (item.actual_fee_adjusted_return_pct or Decimal("0"))
             regime_counts[regime] = regime_counts.get(regime, 0) + 1
 
+            horizon_regime_accumulators.setdefault(item.horizon_label, {}).setdefault(
+                regime, _StrategyBucketAccumulator()
+            ).add(item)
+
         per_horizon: list[StrategyScorecardBucket] = [
             horizon_accumulators[horizon_label].to_bucket(horizon_label)
             for horizon_label, _horizon_minutes in HORIZONS
         ]
         aggregate = aggregate_accumulator.to_bucket("aggregate")
+        regime_conditioned_buckets: dict[str, dict[str, StrategyScorecardBucket]] = {
+            horizon_label: {
+                regime: accumulator.to_bucket(f"{horizon_label}:{regime}")
+                for regime, accumulator in regime_accumulators.items()
+            }
+            for horizon_label, regime_accumulators in horizon_regime_accumulators.items()
+        }
 
         best_regime = None
         worst_regime = None
@@ -682,6 +740,7 @@ async def fetch_strategy_scorecards(
                 worst_regime=worst_regime,
                 regime_evidence_count=regime_evidence_count,
                 regime_min_evidence_required=regime_min_evidence_required,
+                regime_conditioned_buckets=regime_conditioned_buckets,
             )
         )
 

@@ -115,6 +115,7 @@ from app.services.orchestration.reconciliation_scheduler import poll_unresolved_
 from app.services.orchestration.autonomous_position_exit_evaluation import evaluate_due_custodies
 from app.services.orchestration.autonomous_position_exit_authority import revalidate_active_exit_authorities
 from app.services.orchestration.autonomous_proof_sell_worker import advance_one_autonomous_proof_sell_stage
+from app.services.orchestration.autonomous_limit_entry_worker import advance_due_limit_entry_attempts
 from app.services.strategy_outcomes import score_due_strategy_roster_proposal_outcomes
 from app.services.strategy_roster import StrategyRosterRequest, run_strategy_roster_for_candle
 from app.services.strategy_roster.decision_aggregator import AGGREGATE_STRATEGY_SLUG
@@ -2472,6 +2473,28 @@ async def run_orchestration_cycle(
         except Exception:
             await _rollback_active_session(db=db)
             logger.exception("live_order_reconciliation_cycle_failed")
+
+    # Bounded BUY_LIMIT entry-intelligence supervisor (docs/
+    # OMNITRADE_ENTRY_INTELLIGENCE_AND_LIMIT_ORDERS_PROMPT.md Phase 8):
+    # advances every due autonomous_limit_entry_attempts row by exactly one
+    # stage-step (submit / poll / expire / cancel / bounded replace).
+    # current_reference_prices is intentionally omitted (None) as of this
+    # change -- replacement (Phase 9) therefore does not yet fire
+    # automatically in production until a live per-instrument reference
+    # price feed is wired here; every other stage transition (submit,
+    # poll, partial fill, expiration, cancellation) is unaffected by this.
+    if hasattr(db, "scalars") and hasattr(db, "scalar") and hasattr(db, "commit"):
+        try:
+            advanced = await advance_due_limit_entry_attempts(db=db, now=datetime.now(timezone.utc))
+            await db.commit()
+            if advanced:
+                logger.info(
+                    "limit_entry_supervisor_cycle_completed advanced=%s stages=%s",
+                    len(advanced), [item.stage for item in advanced],
+                )
+        except Exception:
+            await _rollback_active_session(db=db)
+            logger.exception("limit_entry_supervisor_cycle_failed")
 
     # Restart-safe, advisory-only custody evaluation. This runs after BUY
     # reconciliation may have established custody and before new campaign

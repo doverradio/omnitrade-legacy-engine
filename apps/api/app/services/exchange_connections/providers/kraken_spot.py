@@ -7,7 +7,7 @@ import hmac
 import json
 import time
 from datetime import datetime, timezone
-from decimal import Decimal, ROUND_DOWN
+from decimal import Decimal, ROUND_DOWN, ROUND_UP
 import os
 import urllib.parse
 from typing import Any
@@ -21,6 +21,7 @@ from app.services.exchange_connections.providers.base import (
     ExchangeAuthResult,
     ExchangeBalanceItem,
     ExchangeBalanceSnapshot,
+    ExchangeCancelResult,
     ExchangeOrderSubmissionRequest,
     ExchangeOrderSubmissionResult,
     ExchangePermissionSnapshot,
@@ -67,6 +68,23 @@ def _to_decimal(value: str | int | float | Decimal | None) -> Decimal:
 def _quantize(value: Decimal, places: int) -> Decimal:
     quantum = Decimal("1") if places <= 0 else Decimal("1").scaleb(-places)
     return value.quantize(quantum, rounding=ROUND_DOWN)
+
+
+# The only statuses lookup_order ever returns as a passthrough (i.e. not
+# already mapped to CANCELLED/FILLED/PARTIALLY_FILLED/CLOSED by the
+# fill-progress logic in each branch below). Any raw Kraken status string
+# outside this set is a genuinely unrecognized provider state -- callers
+# (the limit-entry supervisor in particular) must fail closed on it rather
+# than have it silently pass through as a plausible-looking uppercased
+# string that happens not to match any known handling.
+_KNOWN_KRAKEN_PASSTHROUGH_STATUSES = {"open", "pending"}
+
+
+def _normalize_unmapped_kraken_status(raw_status: str) -> str:
+    normalized = raw_status.strip().lower()
+    if normalized in _KNOWN_KRAKEN_PASSTHROUGH_STATUSES:
+        return normalized.upper()
+    return "UNKNOWN"
 
 
 def _kraken_execution_progress(row: dict[str, Any]) -> tuple[Decimal, Decimal]:
@@ -561,6 +579,8 @@ class KrakenSpotClient:
             "price_evidence",
             "preview_market_order",
             "create_order",
+            "limit_order",
+            "cancel_order",
             "stable_client_order_id",
             "order_lookup_provider_id",
             "order_lookup_client_id",
@@ -1001,13 +1021,14 @@ class KrakenSpotClient:
         request: ExchangeOrderSubmissionRequest,
     ) -> ExchangeOrderSubmissionResult:
         side = request.side.upper()
-        if side not in {"BUY", "SELL"} or request.order_type.upper() != "MARKET":
+        order_type = request.order_type.upper()
+        if side not in {"BUY", "SELL"} or order_type not in {"MARKET", "LIMIT"}:
             return ExchangeOrderSubmissionResult(
                 classification="rejected",
                 order=None,
                 rejection=ExchangeProviderRejection(
                     code="unsupported_order_shape",
-                    message="Kraken submission supports only MARKET BUY/SELL in this execution profile",
+                    message="Kraken submission supports only MARKET or LIMIT BUY/SELL in this execution profile",
                     retryable=False,
                     provider_status=None,
                     safe_details={"side": request.side, "order_type": request.order_type},
@@ -1016,36 +1037,71 @@ class KrakenSpotClient:
                 raw_response={},
                 safe_headers={},
             )
-        if side == "BUY" and (request.quote_size is None or request.quote_size <= Decimal("0")):
-            return ExchangeOrderSubmissionResult(
-                classification="rejected",
-                order=None,
-                rejection=ExchangeProviderRejection(
-                    code="invalid_quote_size",
-                    message="Kraken market buy submission requires quote_size > 0",
-                    retryable=False,
-                    provider_status=None,
-                    safe_details={"quote_size": None if request.quote_size is None else format(request.quote_size, "f")},
-                ),
-                ambiguous=None,
-                raw_response={},
-                safe_headers={},
-            )
-        if side == "SELL" and (request.base_size is None or request.base_size <= Decimal("0")):
-            return ExchangeOrderSubmissionResult(
-                classification="rejected",
-                order=None,
-                rejection=ExchangeProviderRejection(
-                    code="invalid_base_size",
-                    message="Kraken market sell submission requires base_size > 0",
-                    retryable=False,
-                    provider_status=None,
-                    safe_details={"base_size": None if request.base_size is None else format(request.base_size, "f")},
-                ),
-                ambiguous=None,
-                raw_response={},
-                safe_headers={},
-            )
+        if order_type == "MARKET":
+            if side == "BUY" and (request.quote_size is None or request.quote_size <= Decimal("0")):
+                return ExchangeOrderSubmissionResult(
+                    classification="rejected",
+                    order=None,
+                    rejection=ExchangeProviderRejection(
+                        code="invalid_quote_size",
+                        message="Kraken market buy submission requires quote_size > 0",
+                        retryable=False,
+                        provider_status=None,
+                        safe_details={"quote_size": None if request.quote_size is None else format(request.quote_size, "f")},
+                    ),
+                    ambiguous=None,
+                    raw_response={},
+                    safe_headers={},
+                )
+            if side == "SELL" and (request.base_size is None or request.base_size <= Decimal("0")):
+                return ExchangeOrderSubmissionResult(
+                    classification="rejected",
+                    order=None,
+                    rejection=ExchangeProviderRejection(
+                        code="invalid_base_size",
+                        message="Kraken market sell submission requires base_size > 0",
+                        retryable=False,
+                        provider_status=None,
+                        safe_details={"base_size": None if request.base_size is None else format(request.base_size, "f")},
+                    ),
+                    ambiguous=None,
+                    raw_response={},
+                    safe_headers={},
+                )
+        else:
+            # LIMIT: always specified in base volume + an explicit price,
+            # for BOTH sides -- Kraken has no quote-currency-volume concept
+            # for limit orders (that's MARKET-only, via oflags=viqc below).
+            if request.base_size is None or request.base_size <= Decimal("0"):
+                return ExchangeOrderSubmissionResult(
+                    classification="rejected",
+                    order=None,
+                    rejection=ExchangeProviderRejection(
+                        code="invalid_base_size",
+                        message="Kraken limit order submission requires base_size > 0",
+                        retryable=False,
+                        provider_status=None,
+                        safe_details={"base_size": None if request.base_size is None else format(request.base_size, "f")},
+                    ),
+                    ambiguous=None,
+                    raw_response={},
+                    safe_headers={},
+                )
+            if request.limit_price is None or request.limit_price <= Decimal("0"):
+                return ExchangeOrderSubmissionResult(
+                    classification="rejected",
+                    order=None,
+                    rejection=ExchangeProviderRejection(
+                        code="invalid_limit_price",
+                        message="Kraken limit order submission requires limit_price > 0",
+                        retryable=False,
+                        provider_status=None,
+                        safe_details={"limit_price": None if request.limit_price is None else format(request.limit_price, "f")},
+                    ),
+                    ambiguous=None,
+                    raw_response={},
+                    safe_headers={},
+                )
 
         normalized_product, target_pair = _normalize_intent_product(request.product_id)
         pair_info = await self._load_pair_info(environment=environment, normalized_pair=target_pair)
@@ -1073,7 +1129,8 @@ class KrakenSpotClient:
 
         quote_size: Decimal | None = None
         base_size: Decimal | None = None
-        if side == "BUY":
+        limit_price: Decimal | None = None
+        if order_type == "MARKET" and side == "BUY":
             quote_size = _quantize(request.quote_size, pair_decimals)
             if quote_size <= Decimal("0"):
                 return ExchangeOrderSubmissionResult(
@@ -1109,7 +1166,7 @@ class KrakenSpotClient:
                     raw_response={},
                     safe_headers={},
                 )
-        else:
+        elif order_type == "MARKET":
             base_size = _quantize(request.base_size, lot_decimals)
             if base_size <= Decimal("0"):
                 return ExchangeOrderSubmissionResult(
@@ -1145,6 +1202,198 @@ class KrakenSpotClient:
                     raw_response={},
                     safe_headers={},
                 )
+        else:
+            # LIMIT (both sides): quantize base_size (lot precision) and
+            # limit_price (pair precision) directly -- no ticker/best_ask
+            # fetch needed since the caller supplies the price explicitly.
+            # Reject (never silently round) if either quantization would
+            # move the requested amount/price in the caller's favor beyond
+            # what was actually authorized -- same "never chase" discipline
+            # as the MARKET precision checks above, applied to price too:
+            # rounding a BUY limit price UP would submit a worse (higher)
+            # price than the caller's maximum_profitable_entry_price allows.
+            base_size = _quantize(request.base_size, lot_decimals)
+            if base_size <= Decimal("0"):
+                return ExchangeOrderSubmissionResult(
+                    classification="rejected",
+                    order=None,
+                    rejection=ExchangeProviderRejection(
+                        code="base_size_quantized_to_zero",
+                        message="Kraken base_size underflows provider precision",
+                        retryable=False,
+                        provider_status=None,
+                        safe_details={"requested_base_size": format(request.base_size, "f"), "lot_decimals": lot_decimals},
+                    ),
+                    ambiguous=None,
+                    raw_response={},
+                    safe_headers={},
+                )
+            if base_size > request.base_size:
+                return ExchangeOrderSubmissionResult(
+                    classification="rejected",
+                    order=None,
+                    rejection=ExchangeProviderRejection(
+                        code="base_size_precision_conflict",
+                        message="Kraken base_size precision would increase requested amount",
+                        retryable=False,
+                        provider_status=None,
+                        safe_details={
+                            "requested_base_size": format(request.base_size, "f"),
+                            "quantized_base_size": format(base_size, "f"),
+                            "lot_decimals": lot_decimals,
+                        },
+                    ),
+                    ambiguous=None,
+                    raw_response={},
+                    safe_headers={},
+                )
+            # Quantize toward whichever direction is conservative for this
+            # side: DOWN for BUY (never pay more per unit than authorized),
+            # UP for SELL (never accept less per unit than authorized).
+            # _quantize() itself is always ROUND_DOWN (shared with the
+            # volume-quantization above, where flooring is always the
+            # conservative direction for both sides), so SELL needs its own
+            # ROUND_UP quantization here rather than reusing it.
+            price_quantum = Decimal("1") if pair_decimals <= 0 else Decimal("1").scaleb(-pair_decimals)
+            if side == "BUY":
+                limit_price = request.limit_price.quantize(price_quantum, rounding=ROUND_DOWN)
+            else:
+                limit_price = request.limit_price.quantize(price_quantum, rounding=ROUND_UP)
+            if limit_price <= Decimal("0"):
+                return ExchangeOrderSubmissionResult(
+                    classification="rejected",
+                    order=None,
+                    rejection=ExchangeProviderRejection(
+                        code="limit_price_quantized_to_zero",
+                        message="Kraken limit_price underflows provider precision",
+                        retryable=False,
+                        provider_status=None,
+                        safe_details={"requested_limit_price": format(request.limit_price, "f"), "pair_decimals": pair_decimals},
+                    ),
+                    ambiguous=None,
+                    raw_response={},
+                    safe_headers={},
+                )
+            if side == "BUY" and limit_price > request.limit_price:
+                return ExchangeOrderSubmissionResult(
+                    classification="rejected",
+                    order=None,
+                    rejection=ExchangeProviderRejection(
+                        code="limit_price_precision_conflict",
+                        message="Kraken limit_price precision would raise a BUY price above the requested maximum",
+                        retryable=False,
+                        provider_status=None,
+                        safe_details={
+                            "requested_limit_price": format(request.limit_price, "f"),
+                            "quantized_limit_price": format(limit_price, "f"),
+                            "pair_decimals": pair_decimals,
+                        },
+                    ),
+                    ambiguous=None,
+                    raw_response={},
+                    safe_headers={},
+                )
+            if side == "SELL" and limit_price < request.limit_price:
+                return ExchangeOrderSubmissionResult(
+                    classification="rejected",
+                    order=None,
+                    rejection=ExchangeProviderRejection(
+                        code="limit_price_precision_conflict",
+                        message="Kraken limit_price precision would lower a SELL price below the requested minimum",
+                        retryable=False,
+                        provider_status=None,
+                        safe_details={
+                            "requested_limit_price": format(request.limit_price, "f"),
+                            "quantized_limit_price": format(limit_price, "f"),
+                            "pair_decimals": pair_decimals,
+                        },
+                    ),
+                    ambiguous=None,
+                    raw_response={},
+                    safe_headers={},
+                )
+
+        if order_type == "LIMIT":
+            # No ticker fetch needed -- ordermin/costmin are checked
+            # directly against the caller-supplied price, never a market
+            # reference price.
+            if ordermin > Decimal("0") and base_size < ordermin:
+                return ExchangeOrderSubmissionResult(
+                    classification="rejected",
+                    order=None,
+                    rejection=ExchangeProviderRejection(
+                        code="below_min_order_size",
+                        message="Kraken base size below ordermin",
+                        retryable=False,
+                        provider_status=None,
+                        safe_details={
+                            "base_size": format(base_size, "f"),
+                            "ordermin": format(ordermin, "f"),
+                            "lot_decimals": lot_decimals,
+                        },
+                    ),
+                    ambiguous=None,
+                    raw_response={},
+                    safe_headers={},
+                )
+            limit_notional = base_size * limit_price
+            if costmin > Decimal("0") and limit_notional < costmin:
+                return ExchangeOrderSubmissionResult(
+                    classification="rejected",
+                    order=None,
+                    rejection=ExchangeProviderRejection(
+                        code="below_min_order_cost",
+                        message="Kraken limit notional below costmin",
+                        retryable=False,
+                        provider_status=None,
+                        safe_details={"limit_notional": format(limit_notional, "f"), "costmin": format(costmin, "f")},
+                    ),
+                    ambiguous=None,
+                    raw_response={},
+                    safe_headers={},
+                )
+            provider_client_order_id = _kraken_client_order_id(request.client_order_id)
+            payload = {
+                "ordertype": "limit",
+                "type": side.lower(),
+                "pair": altname,
+                "volume": format(base_size, "f"),
+                "price": format(limit_price, "f"),
+                "cl_ord_id": provider_client_order_id,
+            }
+            # Explicit time-in-force is intentionally narrow: GTC (Kraken's
+            # own default -- omit the param) or IOC. GTD/expiretm is not
+            # implemented here; this session's expiration model is enforced
+            # by OUR OWN supervisor cancelling a stale resting order (see
+            # autonomous_limit_entry_worker.py), not by relying on
+            # exchange-side expiry semantics that were not validated against
+            # a live Kraken account in this session.
+            requested_tif = (request.time_in_force or "GTC").upper()
+            if requested_tif == "IOC":
+                payload["timeinforce"] = "IOC"
+            elif requested_tif != "GTC":
+                return ExchangeOrderSubmissionResult(
+                    classification="rejected",
+                    order=None,
+                    rejection=ExchangeProviderRejection(
+                        code="unsupported_time_in_force",
+                        message="Kraken limit submission supports only GTC or IOC in this execution profile",
+                        retryable=False,
+                        provider_status=None,
+                        safe_details={"time_in_force": request.time_in_force},
+                    ),
+                    ambiguous=None,
+                    raw_response={},
+                    safe_headers={},
+                )
+            return await self._submit_add_order(
+                environment=environment,
+                credentials=credentials,
+                payload=payload,
+                request=request,
+                side=side,
+                normalized_product=normalized_product,
+            )
 
         ticker_payload = await self._public_request(path="/public/Ticker", environment=environment, params={"pair": altname})
         ticker_result = ticker_payload.get("result") if isinstance(ticker_payload.get("result"), dict) else {}
@@ -1223,6 +1472,30 @@ class KrakenSpotClient:
         if side == "BUY":
             payload["oflags"] = "fciq,viqc"
 
+        return await self._submit_add_order(
+            environment=environment,
+            credentials=credentials,
+            payload=payload,
+            request=request,
+            side=side,
+            normalized_product=normalized_product,
+        )
+
+    async def _submit_add_order(
+        self,
+        *,
+        environment: str,
+        credentials: dict[str, str],
+        payload: dict[str, str],
+        request: ExchangeOrderSubmissionRequest,
+        side: str,
+        normalized_product: str,
+    ) -> ExchangeOrderSubmissionResult:
+        """Shared AddOrder call + response classification for both MARKET
+        and LIMIT submissions -- the request/response contract with Kraken
+        (nonce, signing, HTTP error handling, txid parsing) is identical
+        regardless of ordertype; only the payload construction differs
+        (built by each caller before this is invoked)."""
         try:
             provider_response = await self._private_request(
                 path="/private/AddOrder",
@@ -1360,6 +1633,128 @@ class KrakenSpotClient:
             safe_headers={},
         )
 
+    async def cancel_order(
+        self,
+        *,
+        credentials: dict[str, str],
+        environment: str,
+        provider_order_id: str | None,
+        client_order_id: str | None,
+    ) -> ExchangeCancelResult:
+        """Kraken /private/CancelOrder. Accepts either the provider order id
+        (txid) or our client_order_id (mapped to Kraken's cl_ord_id form) --
+        provider_order_id is preferred when both are available since it is
+        unambiguous, matching lookup_order's own precedence."""
+        if not provider_order_id and not client_order_id:
+            return ExchangeCancelResult(
+                classification="rejected",
+                provider_status=None,
+                rejection=ExchangeProviderRejection(
+                    code="missing_order_identifier",
+                    message="cancel_order requires provider_order_id or client_order_id",
+                    retryable=False,
+                ),
+            )
+        payload: dict[str, str] = {}
+        if provider_order_id:
+            payload["txid"] = provider_order_id
+        else:
+            payload["cl_ord_id"] = _kraken_client_order_id(client_order_id)  # type: ignore[arg-type]
+
+        try:
+            provider_response = await self._private_request(
+                path="/private/CancelOrder",
+                environment=environment,
+                credentials=credentials,
+                payload=payload,
+            )
+        except InvalidRequestError as exc:
+            details = exc.details if isinstance(exc.details, dict) else {}
+            errors = details.get("errors") if isinstance(details.get("errors"), list) else []
+            status_code = details.get("status_code")
+            response_body = details.get("response_body")
+            if not errors and isinstance(response_body, dict) and isinstance(response_body.get("error"), list):
+                errors = response_body["error"]
+            # Kraken returns "EOrder:Unknown order" when the order has
+            # already been filled/cancelled/expired -- this is a SAFE
+            # terminal outcome (nothing left to cancel), not a failure, so
+            # callers can proceed to re-verify via lookup_order rather than
+            # retrying the cancel indefinitely.
+            if any("unknown order" in str(item).lower() for item in errors):
+                return ExchangeCancelResult(
+                    classification="already_resolved",
+                    provider_status=None,
+                    raw_response={"provider_errors": [str(item) for item in errors[:10]]},
+                )
+            if isinstance(status_code, int) and status_code >= 500:
+                return ExchangeCancelResult(
+                    classification="ambiguous",
+                    provider_status=None,
+                    ambiguous=ExchangeProviderAmbiguousResponse(
+                        reason="provider_http_5xx",
+                        safe_details={"status_code": status_code},
+                    ),
+                    raw_response={"provider_errors": [str(item) for item in errors[:10]], "http_status": status_code},
+                )
+            return ExchangeCancelResult(
+                classification="rejected",
+                provider_status=None,
+                rejection=ExchangeProviderRejection(
+                    code="provider_rejected",
+                    message=str(errors[0]) if errors else "Kraken cancel rejected",
+                    retryable=False,
+                    safe_details={"provider_errors": [str(item) for item in errors[:10]]},
+                ),
+                raw_response={"provider_errors": [str(item) for item in errors[:10]]},
+            )
+        except ServiceUnavailableError as exc:
+            return ExchangeCancelResult(
+                classification="ambiguous",
+                provider_status=None,
+                ambiguous=ExchangeProviderAmbiguousResponse(
+                    reason="provider_transport_unavailable",
+                    safe_details={"error_type": exc.__class__.__name__},
+                ),
+            )
+        except Exception as exc:
+            return ExchangeCancelResult(
+                classification="ambiguous",
+                provider_status=None,
+                ambiguous=ExchangeProviderAmbiguousResponse(
+                    reason="provider_exception_before_classification",
+                    safe_details={"error_type": exc.__class__.__name__, "message": str(exc)},
+                ),
+            )
+
+        result = provider_response.get("result") if isinstance(provider_response.get("result"), dict) else {}
+        # Kraken's CancelOrder result: {"count": <int>, "pending": <bool, optional>}.
+        # count==0 means nothing matched (already resolved); pending=true
+        # means the cancel is queued, not yet confirmed -- callers must
+        # re-verify via lookup_order rather than assuming cancellation.
+        count = result.get("count") if isinstance(result, dict) else None
+        pending = bool(result.get("pending")) if isinstance(result, dict) else False
+        if isinstance(count, int) and count == 0:
+            return ExchangeCancelResult(
+                classification="already_resolved",
+                provider_status=None,
+                raw_response=_redact_sensitive(provider_response),
+            )
+        if pending:
+            return ExchangeCancelResult(
+                classification="ambiguous",
+                provider_status="CANCEL_QUEUED",
+                ambiguous=ExchangeProviderAmbiguousResponse(
+                    reason="cancel_pending_confirmation",
+                    safe_details={"count": count},
+                ),
+                raw_response=_redact_sensitive(provider_response),
+            )
+        return ExchangeCancelResult(
+            classification="success",
+            provider_status="CANCELLED",
+            raw_response=_redact_sensitive(provider_response),
+        )
+
     async def lookup_order(
         self,
         *,
@@ -1403,7 +1798,7 @@ class KrakenSpotClient:
                 elif raw_status in {"pending", "open"}:
                     status = raw_status.upper()
                 else:
-                    status = raw_status.upper() if raw_status else "UNKNOWN"
+                    status = _normalize_unmapped_kraken_status(raw_status)
                 close_timestamp = _parse_kraken_timestamp(
                     {"closetm": exact_row.get("closetm"), "time": exact_row.get("time")}
                 )
@@ -1436,7 +1831,13 @@ class KrakenSpotClient:
                 pair = str((row.get("descr") or {}).get("pair") or "") if isinstance(row.get("descr"), dict) else ""
                 if not _kraken_pair_matches(actual=pair, expected=normalized_pair):
                     continue
-                status = str(row.get("status") or "open").upper()
+                # OpenOrders only ever contains genuinely open orders in
+                # normal operation, but the "status" field is still
+                # provider-supplied text -- normalize it the same way as
+                # the QueryOrders/ClosedOrders branches so an unexpected
+                # value (a new Kraken status this code doesn't know about
+                # yet) fails closed to UNKNOWN instead of passing through.
+                status = _normalize_unmapped_kraken_status(str(row.get("status") or "open"))
                 return ExchangeProviderOrder(
                     provider_order_id=str(txid),
                     client_order_id=client_order_id or str(row.get("cl_ord_id") or "") or None,
@@ -1485,7 +1886,7 @@ class KrakenSpotClient:
             elif raw_status == "open":
                 status = "OPEN"
             else:
-                status = raw_status.upper() if raw_status else "UNKNOWN"
+                status = _normalize_unmapped_kraken_status(raw_status)
             return ExchangeProviderOrder(
                 provider_order_id=str(txid),
                 client_order_id=client_order_id or str(row.get("cl_ord_id") or "") or None,

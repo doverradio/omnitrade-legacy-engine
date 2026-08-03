@@ -2096,6 +2096,88 @@ async def test_non_positive_net_edge_rejection_explained_log_contains_every_comp
 
 
 @pytest.mark.asyncio
+async def test_entry_intelligence_decision_attached_to_non_positive_net_edge_rejection(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """docs/OMNITRADE_ENTRY_INTELLIGENCE_AND_LIMIT_ORDERS_PROMPT.md: a
+    market-entry BUY rejected by the existing (unchanged) net-edge gate must
+    additionally receive an entry-intelligence decision (BUY_LIMIT/WAIT/
+    REJECT) with full provenance, attached to the SAME rejected_candidates
+    record and logged as a single explainable line -- without changing the
+    gate's own reason code or accept/reject outcome."""
+    from app.services.capital_campaign_orchestration.authoritative import compose_campaign_authoritative_cycle
+    from app.services.entry_intelligence.evidence import ContextSpecificEdgeEvidence
+
+    campaign, db, candle = _net_edge_authoritative_mocks(
+        monkeypatch, profitable_after_fees_performance="-0.0948", approved_quantity=Decimal("0.05")
+    )
+
+    context_evidence = ContextSpecificEdgeEvidence(
+        available=True,
+        fallback_path="strategy_asset_timeframe",
+        source_strategy_slug="ma_crossover",
+        source_horizon_label="15m",
+        source_regime="TRENDING",
+        mean_raw_return_pct=Decimal("-0.05"),
+        sample_size=30,
+        stdev_pct=Decimal("0.10"),
+        standard_error_pct=Decimal("0.018"),
+        uncertainty_penalty_pct=Decimal("0.018"),
+        conservative_gross_edge_pct=Decimal("-0.05"),
+        confidence_lower_bound_pct=Decimal("-0.068"),
+        confidence_upper_bound_pct=Decimal("-0.032"),
+        missing_input_flags=(),
+    )
+    strategy_with_evidence = {
+        "authority_class": "AUTHORITATIVE",
+        "strategy_identity": "ma_crossover@1",
+        "strategy_version": "1",
+        "action": "BUY",
+        "confidence": "0.8",
+        "sample_size": 12,
+        "profitable_after_fees_performance": "-0.0948",
+        "historical_gross_return_pct": "-0.0948",
+        "expected_value": None,
+        "evidence_timestamp": "2026-07-15T00:15:00+00:00",
+        "source_identity": {"decision_record_id": "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa"},
+        "current_regime_trend": "TRENDING",
+        "score": "0.97",
+        "aggregate_evidence": {
+            "dominant_contributor_identity": "ma_crossover@1",
+            "contributions": [{"strategy_slug": "ma_crossover"}],
+        },
+        "_context_specific_edge_evidence_obj": context_evidence,
+    }
+    monkeypatch.setattr(
+        "app.services.capital_campaign_orchestration.authoritative.resolve_and_persist_strategy_aggregate_evidence",
+        _async_return((strategy_with_evidence, None)),
+    )
+
+    with caplog.at_level(logging.INFO, logger="app.services.capital_campaign_orchestration.authoritative"):
+        result = await compose_campaign_authoritative_cycle(db=db, campaign_definition=campaign, trigger="kraken_btc_15m_candle_close", candle=candle)
+
+    # The existing gate's own outcome is completely unchanged.
+    assert result.composition["selected_decision"]["reason"] == "non_positive_net_edge"
+    rejected = result.composition["rejected_candidates"][0]
+    assert rejected["reason"] == "non_positive_net_edge"
+
+    decision = rejected["entry_intelligence_decision"]
+    assert decision in {"BUY_LIMIT", "WAIT", "REJECT"}
+    assert rejected["entry_intelligence_reason"]
+
+    entry_intelligence_records = [
+        record for record in caplog.records if record.getMessage().startswith("entry_intelligence_decision_evaluated ")
+    ]
+    assert len(entry_intelligence_records) == 1
+    message = entry_intelligence_records[0].getMessage()
+    assert "instrument=BTC-USD" in message
+    assert "strategy_identity=ma_crossover@1" in message
+    assert "evidence_fallback_path=strategy_asset_timeframe" in message
+    assert "evidence_sample_size=30" in message
+    assert f"decision={decision}" in message
+
+
+@pytest.mark.asyncio
 async def test_market_evidence_15m_freshness_boundaries(monkeypatch: pytest.MonkeyPatch) -> None:
     from app.services.capital_campaign_orchestration.authoritative import _load_market_evidence
 

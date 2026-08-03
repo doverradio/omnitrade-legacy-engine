@@ -241,6 +241,69 @@ class Settings(BaseSettings):
         le=1000,
         validation_alias="OUTCOME_SCORECARDS_MAX_SAMPLES_PER_ACTION_HORIZON",
     )
+    # Entry Intelligence evidence-hierarchy tiers (see
+    # app/services/entry_intelligence/evidence.py). Each tier requires at
+    # least this many action-scoped outcome samples before its mean is
+    # trusted; below the threshold the hierarchy falls back to the next
+    # broader (already-existing) tier rather than silently treating a thin
+    # sample as authoritative.
+    entry_intelligence_min_horizon_regime_sample_size: int = Field(
+        default=20,
+        ge=1,
+        validation_alias="ENTRY_INTELLIGENCE_MIN_HORIZON_REGIME_SAMPLE_SIZE",
+    )
+    entry_intelligence_min_horizon_sample_size: int = Field(
+        default=10,
+        ge=1,
+        validation_alias="ENTRY_INTELLIGENCE_MIN_HORIZON_SAMPLE_SIZE",
+    )
+    # Conservative-estimate multiplier applied to the standard error of the
+    # selected tier's mean (conservative_gross_edge = mean - z * standard_error).
+    # z=1.0 is a one-sigma conservative haircut; there is no repository
+    # precedent for a specific value, so this is deliberately named and
+    # configurable rather than a silent inline constant.
+    entry_intelligence_uncertainty_penalty_z: Decimal = Field(
+        default=Decimal("1.0"),
+        validation_alias="ENTRY_INTELLIGENCE_UNCERTAINTY_PENALTY_Z",
+    )
+    # Bounded safety cap: a BUY_LIMIT proposal is only considered when its
+    # economically-derived maximum profitable entry price sits within this
+    # many percent below the current reference price. This does not create
+    # or lower the edge requirement -- it rejects proposals whose only path
+    # to profitability requires an extrapolation-risk price move too large
+    # to trust the same historical-return evidence for.
+    entry_intelligence_max_limit_discount_pct: Decimal = Field(
+        default=Decimal("1.0"),
+        validation_alias="ENTRY_INTELLIGENCE_MAX_LIMIT_DISCOUNT_PCT",
+    )
+    entry_intelligence_limit_order_max_age_minutes: int = Field(
+        default=60,
+        ge=1,
+        validation_alias="ENTRY_INTELLIGENCE_LIMIT_ORDER_MAX_AGE_MINUTES",
+    )
+    entry_intelligence_max_replacement_count: int = Field(
+        default=1,
+        ge=0,
+        validation_alias="ENTRY_INTELLIGENCE_MAX_REPLACEMENT_COUNT",
+    )
+    entry_intelligence_min_repricing_interval_minutes: int = Field(
+        default=15,
+        ge=1,
+        validation_alias="ENTRY_INTELLIGENCE_MIN_REPRICING_INTERVAL_MINUTES",
+    )
+    # Placeholder price-rounding precision for the maximum-profitable-entry-
+    # price calculation, used only for computing/logging a proposed
+    # BUY_LIMIT decision. NOT sourced from live provider precision (Kraken's
+    # actual pair_decimals) -- no live limit-order submission path exists
+    # yet (app.services.exchange_connections.providers.kraken_spot.submit_order
+    # supports MARKET orders only), so nothing currently depends on this
+    # being exactly provider-correct. Must be replaced with a real
+    # provider-precision lookup before any live BUY_LIMIT submission is built.
+    entry_intelligence_default_price_decimals: int = Field(
+        default=2,
+        ge=0,
+        validation_alias="ENTRY_INTELLIGENCE_DEFAULT_PRICE_DECIMALS",
+    )
     strategy_aggregator_config_version: str = Field(
         default="v1", validation_alias="STRATEGY_AGGREGATOR_CONFIG_VERSION"
     )

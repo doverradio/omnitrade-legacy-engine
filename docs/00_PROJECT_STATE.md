@@ -412,3 +412,52 @@ by construction (separate `SimulationBase`, separate
 `OT_SIMULATION_DATABASE_URL`, `IsolationGuard`) and must never delay or
 alter the live proving campaign. See `02_DECISIONS.md` (2026-07 —
 "Parallel Authorized Lanes").
+
+✓ Entry Intelligence decision layer, Phases 1-5 only (2026-08-03): traced
+and confirmed the net-edge gate itself (`compose_campaign_authoritative_cycle`
+in authoritative.py) has no further defect — repeated production
+`non_positive_net_edge` rejections (aggregate BUY scores up to 3.33,
+gross edges ~-0.02% to -0.18%) reflect genuinely non-positive edge AT
+MARKET PRICE using the same evidence pipeline already hardened across
+First Autonomous Profit's prior seven fix rounds. Added a strictly
+additive decision layer (`app/services/entry_intelligence/`) that runs
+only after that gate already rejected a market-entry BUY, and asks
+whether a bounded, economically-derived LOWER entry price is instead
+viable — producing BUY_LIMIT / WAIT / REJECT with full provenance,
+attached to `rejected_candidates` and logged as
+`entry_intelligence_decision_evaluated` (visible in
+`tools/operator_console.py`). The existing gate's own math, log lines,
+and accept/reject outcomes are unchanged and unit/integration-tested
+unchanged. See `02_DECISIONS.md` (2026-08-03 — "Entry Intelligence and
+Adaptive Limit-Order Decision Layer").
+
+✓ Real Kraken LIMIT execution path + authoritative attempt lifecycle
+(2026-08-03, continuation): closed the gap the entry above deferred.
+`kraken_spot.py::submit_order` now genuinely supports LIMIT orders (both
+sides), plus a new `cancel_order` method — both call real Kraken
+endpoints (`/private/AddOrder` ordertype=limit, `/private/CancelOrder`).
+A new persisted state machine (`AutonomousLimitEntryAttempt`, migration
+`20260803_0065`) makes BUY_LIMIT an authoritative pre-execution gate: a
+REAL Risk Engine evaluation runs at the proposed limit price/quantity
+before anything can submit. A new supervisor
+(`autonomous_limit_entry_worker.py`, wired into
+`continuous_pipeline_worker.py`) advances submit → poll → partial-fill →
+fill/expire/cancel(provider-reconfirmed)/bounded-replace, reusing the
+existing `reconcile_live_order_and_fills` for accounting. A deterministic
+shadow counterfactual replay (`shadow_validation.py`, Phase 10) is
+implemented and tested against real (SQLite) candle data. See
+`02_DECISIONS.md` (2026-08-03 continuation).
+
+**Still not done / explicitly deferred**:
+- **Custody**: a filled BUY_LIMIT reconciles and accounts for the
+  position but does NOT establish `AutonomousPositionCustody` — that
+  requires the `AutonomousExecutionClaim`-based lineage this new,
+  narrower lane does not build. Asserted by a dedicated test that the
+  worker never calls `establish_buy_custody`.
+- No live per-instrument reference-price feed is wired into the
+  supervisor yet, so bounded replacement (implemented and tested) will
+  not fire automatically in production until that feed exists.
+- No live capital has been deployed and no bounded live proving lane
+  (governing prompt Phase 11) has been enabled — this remains a
+  code-and-test-only round. Next session should pick this up — see
+  `06_NEXT_SESSION.md`.

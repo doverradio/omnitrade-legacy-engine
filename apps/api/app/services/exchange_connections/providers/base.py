@@ -17,6 +17,8 @@ ProviderCapability = Literal[
     "price_evidence",
     "preview_market_order",
     "create_order",
+    "limit_order",
+    "cancel_order",
     "stable_client_order_id",
     "order_lookup_provider_id",
     "order_lookup_client_id",
@@ -161,6 +163,11 @@ class ExchangeOrderSubmissionRequest:
     client_order_id: str
     idempotency_key: str
     raw_payload: dict[str, Any]
+    # LIMIT-only fields. None for MARKET orders (every existing caller
+    # constructs this without them, so both default to None -- adding LIMIT
+    # support must never change MARKET-order construction at any call site).
+    limit_price: Decimal | None = None
+    time_in_force: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -201,6 +208,22 @@ class ExchangeOrderSubmissionResult:
     ambiguous: ExchangeProviderAmbiguousResponse | None
     raw_response: dict[str, Any] = field(default_factory=dict)
     safe_headers: dict[str, str] = field(default_factory=dict)
+
+
+@dataclass(frozen=True, slots=True)
+class ExchangeCancelResult:
+    # "already_resolved" covers the race where the order filled or was
+    # already cancelled by the provider before this cancel request reached
+    # it -- distinct from "success" (this call caused the cancellation) so
+    # callers can tell "I cancelled it" from "there was nothing left to
+    # cancel", both of which are safe outcomes; only "rejected"/"ambiguous"
+    # require caller-side re-verification before treating the order as
+    # inactive.
+    classification: Literal["success", "already_resolved", "rejected", "ambiguous"]
+    provider_status: str | None
+    rejection: ExchangeProviderRejection | None = None
+    ambiguous: ExchangeProviderAmbiguousResponse | None = None
+    raw_response: dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass(frozen=True, slots=True)
@@ -290,6 +313,16 @@ class ExchangeProviderClient(Protocol):
         client_order_id: str | None,
         product_id: str | None,
     ) -> ExchangeProviderOrder | None:
+        ...
+
+    async def cancel_order(
+        self,
+        *,
+        credentials: dict[str, str],
+        environment: str,
+        provider_order_id: str | None,
+        client_order_id: str | None,
+    ) -> ExchangeCancelResult:
         ...
 
     async def list_fills(

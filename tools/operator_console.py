@@ -82,6 +82,7 @@ EVENT_NAMES = (
     "strategy_aggregate_completed",
     "net_edge_evaluated",
     "non_positive_net_edge_rejection_explained",
+    "entry_intelligence_decision_evaluated",
     "campaign_cycle_termination_resolved",
     "automatic_ready_package_created",
     "automatic_ready_package_skipped",
@@ -223,6 +224,11 @@ class Cycle:
     underlying_reason: str | None = None
     rejection_reasons: str | None = None
     reconciliation_triggered: bool = False
+    entry_intelligence_decision: str | None = None
+    entry_intelligence_reason: str | None = None
+    preferred_limit_price: str | None = None
+    maximum_profitable_entry_price: str | None = None
+    expected_net_edge_at_limit_pct: str | None = None
     reconciliation_records: int = 0
     mandate_authorized: bool = False
     dry_run_passed: bool = False
@@ -251,6 +257,18 @@ class Cycle:
             self.expected_net_profit = f.get("expected_net_profit") or f.get("expected_net_dollars") or self.expected_net_profit
             self.fees_amount = f.get("round_trip_fee_amount") or f.get("fees_dollars") or self.fees_amount
             self.final_reason_code = f.get("final_reason_code") or self.final_reason_code
+        elif event == "entry_intelligence_decision_evaluated":
+            self.instrument = f.get("instrument") or self.instrument
+            self.strategy_identity = f.get("strategy_identity") or self.strategy_identity
+            self.entry_intelligence_decision = f.get("decision") or self.entry_intelligence_decision
+            self.entry_intelligence_reason = f.get("reason") or self.entry_intelligence_reason
+            self.preferred_limit_price = f.get("preferred_limit_price") or self.preferred_limit_price
+            self.maximum_profitable_entry_price = (
+                f.get("maximum_profitable_entry_price") or self.maximum_profitable_entry_price
+            )
+            self.expected_net_edge_at_limit_pct = (
+                f.get("expected_net_edge_at_limit_pct") or self.expected_net_edge_at_limit_pct
+            )
         elif event == "campaign_cycle_termination_resolved":
             self.decision_kind = f.get("decision_kind") or self.decision_kind
             self.proposed_action = f.get("proposed_action") or self.proposed_action
@@ -371,6 +389,16 @@ def _status_lines(cycle: Cycle) -> list[str]:
         lines.append(c("❌ Reconciliation Blocked", BRIGHT_RED))
     elif _final_reason(cycle):
         lines.append(c(f"❌ {_final_reason(cycle)}", BRIGHT_RED))
+    if cycle.entry_intelligence_decision == "BUY_LIMIT":
+        lines.append(
+            c(
+                f"🟨 Entry Intelligence: BUY_LIMIT @ {cycle.preferred_limit_price or '?'} "
+                f"(net edge {cycle.expected_net_edge_at_limit_pct or '?'}%)",
+                YELLOW,
+            )
+        )
+    elif cycle.entry_intelligence_decision in {"WAIT", "REJECT"}:
+        lines.append(c(f"🟨 Entry Intelligence: {cycle.entry_intelligence_decision} ({cycle.entry_intelligence_reason or '-'})", DIM))
     if cycle.mandate_authorized:
         lines.append(c("✅ Mandate Authorized", BRIGHT_GREEN))
     if cycle.dry_run_passed:

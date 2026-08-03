@@ -29,6 +29,12 @@ from app.models.strategy_roster_proposal import StrategyRosterProposal
 from app.models.strategy_roster_proposal_outcome import StrategyRosterProposalOutcome
 from app.models.strategy_roster_run import StrategyRosterRun
 from app.services.decisions.ingestion import DECISION_ENGINE_VERSION
+from app.services.entry_intelligence.decision import BUY_LIMIT, evaluate_entry_decision
+from app.services.orchestration.autonomous_limit_entry_worker import propose_and_risk_evaluate_limit_entry
+from app.services.entry_intelligence.evidence import (
+    ContextSpecificEdgeEvidence,
+    resolve_context_specific_edge_evidence,
+)
 from app.services.position_lifecycle.contracts import PositionLifecycleEvaluation
 from app.schemas.capital_campaign_domain import (
     CapitalCampaignDefinitionResponse,
@@ -643,6 +649,7 @@ def _build_aggregate_evidence_dict(
     strategy_contributions: list[dict[str, Any]],
     scorecard_by_slug: dict[str, Any],
     current_regime_trend: str | None = None,
+    candle_interval: str | None = None,
 ) -> dict[str, Any]:
     scorecard_summary = _resolve_scorecard_summary(scorecard_by_slug=scorecard_by_slug, dominant_contributor_identity=dominant_contributor_identity)
     score = None
@@ -682,6 +689,25 @@ def _build_aggregate_evidence_dict(
             action_scoped_raw_profitability = scorecard_summary.aggregate.sell_average_raw_return_pct
         elif final_action == "HOLD":
             action_scoped_raw_profitability = scorecard_summary.aggregate.hold_average_raw_return_pct
+
+    # Context-specific edge evidence (entry-intelligence hierarchy: exact
+    # strategy+asset+timeframe+regime -> exact strategy+asset+timeframe ->
+    # today's existing blended aggregate fallback above). Computed here,
+    # never inside the net-edge gate itself -- this is read-only, additional
+    # evidence for the entry-intelligence decision layer
+    # (app.services.entry_intelligence.decision), which runs strictly after
+    # and never overrides the existing gate's own accept/reject boundary.
+    entry_intelligence_settings = get_settings()
+    context_specific_edge_evidence = resolve_context_specific_edge_evidence(
+        scorecard=scorecard_summary,
+        final_action=final_action,
+        candle_interval=candle_interval or "",
+        current_regime_trend=current_regime_trend,
+        min_horizon_regime_sample_size=entry_intelligence_settings.entry_intelligence_min_horizon_regime_sample_size,
+        min_horizon_sample_size=entry_intelligence_settings.entry_intelligence_min_horizon_sample_size,
+        uncertainty_penalty_z=entry_intelligence_settings.entry_intelligence_uncertainty_penalty_z,
+    )
+
     return {
         "authority_class": "AUTHORITATIVE",
         "source_type": "strategy_decision_aggregator",
@@ -777,6 +803,40 @@ def _build_aggregate_evidence_dict(
                 for item in strategy_contributions
             ],
         },
+        "context_specific_edge_evidence": {
+            "available": context_specific_edge_evidence.available,
+            "fallback_path": context_specific_edge_evidence.fallback_path,
+            "source_strategy_slug": context_specific_edge_evidence.source_strategy_slug,
+            "source_horizon_label": context_specific_edge_evidence.source_horizon_label,
+            "source_regime": context_specific_edge_evidence.source_regime,
+            "mean_raw_return_pct": None
+            if context_specific_edge_evidence.mean_raw_return_pct is None
+            else format(context_specific_edge_evidence.mean_raw_return_pct, "f"),
+            "sample_size": context_specific_edge_evidence.sample_size,
+            "stdev_pct": None
+            if context_specific_edge_evidence.stdev_pct is None
+            else format(context_specific_edge_evidence.stdev_pct, "f"),
+            "standard_error_pct": None
+            if context_specific_edge_evidence.standard_error_pct is None
+            else format(context_specific_edge_evidence.standard_error_pct, "f"),
+            "uncertainty_penalty_pct": format(context_specific_edge_evidence.uncertainty_penalty_pct, "f"),
+            "conservative_gross_edge_pct": None
+            if context_specific_edge_evidence.conservative_gross_edge_pct is None
+            else format(context_specific_edge_evidence.conservative_gross_edge_pct, "f"),
+            "confidence_lower_bound_pct": None
+            if context_specific_edge_evidence.confidence_lower_bound_pct is None
+            else format(context_specific_edge_evidence.confidence_lower_bound_pct, "f"),
+            "confidence_upper_bound_pct": None
+            if context_specific_edge_evidence.confidence_upper_bound_pct is None
+            else format(context_specific_edge_evidence.confidence_upper_bound_pct, "f"),
+            "missing_input_flags": list(context_specific_edge_evidence.missing_input_flags),
+        },
+        # Internal-only: the raw dataclass, for same-process reuse by the
+        # entry-intelligence decision layer without re-parsing the
+        # stringified evidence dict above. Never serialized to a client
+        # response or log line directly -- callers needing a safe/loggable
+        # representation must use "context_specific_edge_evidence" instead.
+        "_context_specific_edge_evidence_obj": context_specific_edge_evidence,
     }
 
 
@@ -1055,6 +1115,7 @@ async def load_strategy_aggregate_evidence(
         strategy_contributions=contributions,
         scorecard_by_slug=scorecard_by_slug,
         current_regime_trend=current_regime_trend,
+        candle_interval=interval,
     )
     return evidence, None
 
@@ -1379,6 +1440,7 @@ async def resolve_or_create_strategy_aggregate_evidence(
         strategy_contributions=list(result.contributions),
         scorecard_by_slug=scorecard_by_slug,
         current_regime_trend=current_regime_trend,
+        candle_interval=interval,
     )
     return evidence, None
 
@@ -2674,7 +2736,133 @@ async def compose_campaign_authoritative_cycle(
                 has_position_pnl_override,
                 "non_positive_net_edge",
             )
-            rejected_candidates.append({"instrument": instrument, "reason": "non_positive_net_edge", "market": market, "strategy": strategy, "position": position, "risk": risk_summary, "decision_record_id": decision_record_id})
+
+            # Entry Intelligence (docs/OMNITRADE_ENTRY_INTELLIGENCE_AND_LIMIT_ORDERS_PROMPT.md):
+            # market-entry BUY was just rejected above by the existing,
+            # unchanged net-edge gate. This asks a strictly additional
+            # question -- does a bounded, economically-derived LOWER entry
+            # price make the setup viable instead -- and never overrides the
+            # rejection above. SELL/CLOSE_CANDIDATE and position-add
+            # candidates (has_position_pnl_override) are out of scope: this
+            # is specifically about proposing a new bounded BUY entry.
+            entry_intelligence_decision = None
+            entry_intelligence_reason = None
+            if side == "buy" and not has_position_pnl_override:
+                entry_intelligence_settings = get_settings()
+                context_evidence_obj = strategy.get("_context_specific_edge_evidence_obj")
+                if not isinstance(context_evidence_obj, ContextSpecificEdgeEvidence):
+                    context_evidence_obj = resolve_context_specific_edge_evidence(
+                        scorecard=None,
+                        final_action="BUY",
+                        candle_interval=candle_item.interval,
+                        current_regime_trend=None,
+                        min_horizon_regime_sample_size=entry_intelligence_settings.entry_intelligence_min_horizon_regime_sample_size,
+                        min_horizon_sample_size=entry_intelligence_settings.entry_intelligence_min_horizon_sample_size,
+                        uncertainty_penalty_z=entry_intelligence_settings.entry_intelligence_uncertainty_penalty_z,
+                    )
+                contributing_strategies = tuple(
+                    str(item.get("strategy_slug"))
+                    for item in strategy.get("aggregate_evidence", {}).get("contributions", [])
+                    if item.get("strategy_slug")
+                )
+                entry_intelligence_candidate = evaluate_entry_decision(
+                    instrument=instrument,
+                    venue=str(market.get("provider") or asset.exchange),
+                    side=side.upper(),
+                    signal_time=now,
+                    candle_close=candle_item.close_time,
+                    timeframe=candle_item.interval,
+                    campaign_id=str(campaign_definition.campaign_id),
+                    campaign_version=campaign_definition.version,
+                    strategy_identity=strategy_identity,
+                    strategy_coalition=strategy.get("aggregate_evidence", {}).get("dominant_contributor_identity"),
+                    contributing_strategies=contributing_strategies,
+                    signal_strength=strategy.get("score"),
+                    market_regime=strategy.get("current_regime_trend"),
+                    volatility_regime=None,
+                    market_entry_price=price,
+                    expected_gross_edge_at_market_pct=expected_gross_edge_pct,
+                    expected_net_edge_at_market_pct=expected_net_edge,
+                    evidence=context_evidence_obj,
+                    round_trip_fee_pct=round_trip_fee_pct,
+                    slippage_pct=slippage_pct,
+                    required_profit_buffer_pct=required_profit_buffer_pct,
+                    price_decimals=entry_intelligence_settings.entry_intelligence_default_price_decimals,
+                    min_order_notional=asset.min_order_notional,
+                    approved_notional=approved_notional,
+                    max_limit_discount_pct=entry_intelligence_settings.entry_intelligence_max_limit_discount_pct,
+                    limit_order_max_age_minutes=entry_intelligence_settings.entry_intelligence_limit_order_max_age_minutes,
+                    max_replacement_count=entry_intelligence_settings.entry_intelligence_max_replacement_count,
+                    min_repricing_interval_minutes=entry_intelligence_settings.entry_intelligence_min_repricing_interval_minutes,
+                )
+                entry_intelligence_decision = entry_intelligence_candidate.decision
+                entry_intelligence_reason = entry_intelligence_candidate.reason
+                logger.info(
+                    "entry_intelligence_decision_evaluated campaign_id=%s campaign_version=%s decision_record_id=%s "
+                    "instrument=%s strategy_identity=%s strategy_coalition=%s contributing_strategies=%s "
+                    "signal_strength=%s market_regime=%s market_entry_price=%s expected_gross_edge_at_market_pct=%s "
+                    "expected_net_edge_at_market_pct=%s evidence_fallback_path=%s evidence_sample_size=%s "
+                    "evidence_mean_raw_return_pct=%s evidence_stdev_pct=%s uncertainty_penalty_pct=%s "
+                    "conservative_gross_edge_pct=%s expected_exit_price=%s maximum_profitable_entry_price=%s "
+                    "preferred_limit_price=%s expected_gross_edge_at_limit_pct=%s expected_net_edge_at_limit_pct=%s "
+                    "expiration_time=%s maximum_replacement_count=%s decision=%s reason=%s missing_input_flags=%s",
+                    campaign_definition.campaign_id, campaign_definition.version, decision_record_id,
+                    instrument, strategy_identity, entry_intelligence_candidate.strategy_coalition,
+                    list(contributing_strategies), entry_intelligence_candidate.signal_strength,
+                    entry_intelligence_candidate.market_regime, entry_intelligence_candidate.market_entry_price,
+                    entry_intelligence_candidate.expected_gross_edge_at_market_pct,
+                    entry_intelligence_candidate.expected_net_edge_at_market_pct,
+                    context_evidence_obj.fallback_path, context_evidence_obj.sample_size,
+                    context_evidence_obj.mean_raw_return_pct, context_evidence_obj.stdev_pct,
+                    context_evidence_obj.uncertainty_penalty_pct, context_evidence_obj.conservative_gross_edge_pct,
+                    entry_intelligence_candidate.expected_exit_price,
+                    entry_intelligence_candidate.maximum_profitable_entry_price,
+                    entry_intelligence_candidate.preferred_limit_price,
+                    entry_intelligence_candidate.expected_gross_edge_at_limit_pct,
+                    entry_intelligence_candidate.expected_net_edge_at_limit_pct,
+                    entry_intelligence_candidate.expiration_time,
+                    entry_intelligence_candidate.maximum_replacement_count,
+                    entry_intelligence_candidate.decision, entry_intelligence_candidate.reason,
+                    list(context_evidence_obj.missing_input_flags),
+                )
+
+                if entry_intelligence_candidate.decision == BUY_LIMIT:
+                    # Authoritative pre-execution stage, not diagnostic:
+                    # this creates (or idempotently returns) a persisted
+                    # AutonomousLimitEntryAttempt row and runs a REAL Risk
+                    # Engine evaluation at the proposed limit price/quantity
+                    # before anything can be submitted to the provider. A
+                    # failure here must never silently drop the BUY_LIMIT
+                    # candidate -- fail closed to RECONCILIATION_REQUIRED-
+                    # visible-only-via-exception is worse than surfacing it,
+                    # so exceptions are logged and the cycle continues
+                    # (matching the fail-closed-but-non-fatal pattern used
+                    # elsewhere in this function for best-effort evidence).
+                    try:
+                        limit_entry_attempt = await propose_and_risk_evaluate_limit_entry(
+                            db=db,
+                            campaign_id=campaign_definition.campaign_id,
+                            campaign_version=campaign_definition.version,
+                            instrument=instrument,
+                            environment="production",
+                            decision_record_id=decision_record_id,
+                            candidate=entry_intelligence_candidate,
+                            paper_account_id=runtime_campaign.paper_account_id,
+                            asset_id=asset.id,
+                            asset_min_order_notional=asset.min_order_notional,
+                            asset_qty_step_size=asset.qty_step_size,
+                            asset_supports_fractional=asset.supports_fractional,
+                            risk_context=risk_context,
+                            now=now,
+                        )
+                        entry_intelligence_reason = f"{entry_intelligence_reason}:attempt_stage={limit_entry_attempt.stage}"
+                    except Exception:
+                        logger.exception(
+                            "limit_entry_attempt_proposal_failed campaign_id=%s instrument=%s decision_record_id=%s",
+                            campaign_definition.campaign_id, instrument, decision_record_id,
+                        )
+
+            rejected_candidates.append({"instrument": instrument, "reason": "non_positive_net_edge", "market": market, "strategy": strategy, "position": position, "risk": risk_summary, "decision_record_id": decision_record_id, "entry_intelligence_decision": entry_intelligence_decision, "entry_intelligence_reason": entry_intelligence_reason})
             continue
 
         candidate_rows.append(

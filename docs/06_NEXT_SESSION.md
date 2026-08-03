@@ -486,3 +486,115 @@ and Exit Recovery outcomes.
 
 Do not re-investigate external reconciliation or PACKAGE_ONLY retry
 unless new runtime evidence directly contradicts the established findings.
+
+---
+
+# Additional Tracked Thread: Entry Intelligence / Adaptive Limit Orders
+
+This is a SEPARATE thread from the Controlled Proof Exit Recovery work
+above, which remains the higher-priority production blocker. Do not let
+this thread override or delay it.
+
+Session 2026-08-03 executed
+`docs/OMNITRADE_ENTRY_INTELLIGENCE_AND_LIMIT_ORDERS_PROMPT.md` Phases 1-5
+only. Delivered (not yet committed/deployed as of end of session — see
+that session's own report for exact commands):
+
+- Confirmed (Phase 1) the net-edge gate itself has no further defect;
+  production `non_positive_net_edge` rejections reflect genuinely
+  non-positive edge at market price.
+- `app/services/entry_intelligence/evidence.py` — context-specific
+  evidence hierarchy (strategy+asset+timeframe+regime -> strategy+asset+
+  timeframe -> today's existing blended fallback -> fail closed), with an
+  uncertainty penalty derived from action-scoped sample standard
+  deviation (new fields on `StrategyScorecardBucket`/`StrategyScorecard`
+  in `strategy_outcomes/service.py`).
+- `app/services/entry_intelligence/decision.py` — BUY_NOW/BUY_LIMIT/WAIT/
+  REJECT decision model, maximum-profitable-entry-price derivation
+  (never an arbitrary discount), candidate entry object.
+- Wired into `authoritative.py`'s existing `non_positive_net_edge`
+  branch as a strictly additive analysis (the legacy gate's own
+  accept/reject boundary is byte-for-byte unchanged) — attaches
+  `entry_intelligence_decision`/`entry_intelligence_reason` to
+  `rejected_candidates` and logs one
+  `entry_intelligence_decision_evaluated` line, surfaced in
+  `tools/operator_console.py`.
+- Full test coverage: `tests/unit/services/entry_intelligence/` (evidence
+  hierarchy, decision model, production-shaped regression case) plus one
+  new integration test in
+  `tests/unit/services/capital_campaign_orchestration/test_service.py`.
+  Full existing unit + integration suites re-verified unchanged (same
+  pre-existing failures only, none new).
+
+**Next task for this thread**: Phases 6-11 (NOT built this session):
+
+1. Give the Kraken adapter real limit-order submission
+   (`app/services/exchange_connections/providers/kraken_spot.py::submit_order`
+   currently rejects any non-MARKET `order_type` outright) — this is the
+   hard blocker before anything below can go live.
+2. Limit-order lifecycle state machine (PROPOSED -> READY -> ACTIVATED ->
+   SUBMITTED -> OPEN -> PARTIALLY_FILLED -> FILLED -> EXPIRED ->
+   CANCEL_REQUESTED -> CANCELLED -> REPLACED -> REJECTED ->
+   RECONCILIATION_REQUIRED), restart-safe and idempotent.
+3. A bounded continuous-supervision worker (provider status, fills,
+   current net edge, expiration, replacement eligibility).
+4. Cancellation/invalidation/replacement policy enforcement (max 1
+   replacement for the initial proving lane, per governing prompt Phase
+   11, unless evidence supports another value).
+5. Phase 10 shadow counterfactual validation BEFORE any live enablement —
+   replay historically-rejected BUY candidates against the new BUY_LIMIT
+   proposals to measure fill rate, time-to-fill, and realized P&L before
+   trusting this model with real capital.
+6. Only after (5) passes: the bounded $5-notional, 1-instrument (BTC-USD),
+   1-pending-entry, 1-open-position, 1-replacement live proving lane
+   (Phase 11).
+
+Do not skip the Kraken adapter change or shadow validation to reach a
+"live BUY_LIMIT" milestone faster — both are explicit governing
+constraints, not optional steps.
+
+---
+
+## Update (2026-08-03, same-day continuation): Phases 6-10 now real, not diagnostic
+
+Items 1, 2 (partially), 3, 4, 5 above are done:
+
+- Kraken adapter genuinely submits/cancels LIMIT orders (real endpoints).
+- `AutonomousLimitEntryAttempt` (migration `20260803_0065`) is a real,
+  persisted, restart-safe state machine — PROPOSED/READY/REJECTED/
+  SUBMITTED/OPEN/PARTIALLY_FILLED/FILLED/EXPIRED/CANCEL_REQUESTED/
+  CANCELLED/REPLACED/RECONCILIATION_REQUIRED (ACTIVATED was dropped —
+  not needed since Risk evaluation happens synchronously at proposal
+  time, before ACTIVATED would have meant anything).
+- `autonomous_limit_entry_worker.py` supervises it every orchestration
+  cycle: submit, poll, partial fill, expire, cancel (provider-
+  reconfirmed), bounded replace (DB-enforced never-chase-above-max).
+- Shadow validation (`shadow_validation.py`) is implemented and tested
+  against real candle data, but has NOT yet been run against actual
+  recent production rejection history — no operator command/report
+  exists yet to do that. This should be the FIRST thing the next
+  session does before considering any live enablement.
+
+**Still not done — the real next task**:
+
+1. **Custody integration.** A filled BUY_LIMIT reconciles/accounts for
+   the position but does not establish `AutonomousPositionCustody`. This
+   requires wiring the new lane into (or alongside)
+   `AutonomousExecutionClaim`/`establish_buy_custody` — deliberately not
+   attempted this round; read `02_DECISIONS.md`'s "Alternatives
+   Considered" for exactly why, before choosing an approach.
+2. **Live reference-price feed into the supervisor.** `advance_due_limit_entry_attempts`
+   currently calls with `current_reference_prices=None`, so replacement
+   (implemented, tested) cannot fire in production yet. Needs a cheap
+   per-instrument latest-price lookup wired in at the
+   `continuous_pipeline_worker.py` call site.
+3. **Run shadow validation against real history** (item above) and
+   review the results with the operator before touching Phase 11 (the
+   bounded $5/BTC-USD/1-pending/1-replacement live lane) at all.
+4. Only after 1-3: Phase 11 itself, and only with explicit operator
+   sign-off — this is a real-money-adjacent change, not a code change.
+
+Do not claim BUY_LIMIT is "fully live" — proposal, Risk approval,
+submission, OPEN, partial fill, fill, cancellation, and bounded
+replacement are all real and tested; custody handoff and live
+replacement-price data are not.

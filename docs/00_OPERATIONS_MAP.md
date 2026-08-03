@@ -680,10 +680,85 @@ cd /home/eric/omnitrade-legacy-engine && ./operator automatic-mandate-activation
 
 ---
 
+## Entry Intelligence (Decision Layer)
+
+**[REPO]** Added 2026-08-03 (`app/services/entry_intelligence/`). Runs
+strictly after the existing net-edge gate
+(`compose_campaign_authoritative_cycle` in
+`capital_campaign_orchestration/authoritative.py`) has already rejected a
+market-entry BUY with `non_positive_net_edge`; never changes that gate's
+own accept/reject boundary.
+
+```text
+strategy_aggregate BUY  -> net-edge gate (unchanged) -> non_positive_net_edge
+    -> resolve_context_specific_edge_evidence (evidence.py)
+       tiers: strategy+asset+timeframe+regime
+              -> strategy+asset+timeframe
+              -> today's blended aggregate (existing historical_gross_return_pct)
+              -> unavailable (fail closed)
+    -> evaluate_entry_decision (decision.py)
+       -> maximum_profitable_entry_price (derived from expected_exit_price + costs)
+       -> BUY_LIMIT / WAIT / REJECT (BUY_NOW reserved, not reachable from this call site)
+    -> attached to rejected_candidates + one `entry_intelligence_decision_evaluated` log line
+```
+
+New settings (`config.py`, `ENTRY_INTELLIGENCE_*`): minimum sample sizes
+per evidence tier, uncertainty-penalty `z`, bounded max limit discount
+from market, limit-order max age/replacement/repricing bounds.
+
+### Real execution path (added 2026-08-03, continuation)
+
+`kraken_spot.py::submit_order` now genuinely supports `order_type="LIMIT"`
+(both sides — real `/private/AddOrder` payload, GTC/IOC only, provider
+precision from `/public/AssetPairs`, no ticker fetch); a new
+`cancel_order` method calls `/private/CancelOrder`. A persisted state
+machine (`app/models/autonomous_limit_entry_attempt.py`, migration
+`20260803_0065`) and supervisor
+(`app/services/orchestration/autonomous_limit_entry_worker.py`, wired
+into `continuous_pipeline_worker.py`'s per-cycle loop) carry a BUY_LIMIT
+decision from proposal through real Risk evaluation, submission, polling,
+fill/expire/cancel/bounded-replace:
+
+```text
+entry_intelligence_decision_evaluated (BUY_LIMIT)
+    -> propose_and_risk_evaluate_limit_entry
+       creates AutonomousLimitEntryAttempt(stage=PROPOSED)
+       -> evaluate_signal_risk / persist_risk_decision (REAL Risk Engine call)
+       -> stage=READY or REJECTED
+    -> advance_due_limit_entry_attempts (continuous_pipeline_worker.py, every cycle)
+       READY       -> submit_order (LIMIT) -> CryptoOrderPreview + LiveCryptoOrder -> SUBMITTED
+       SUBMITTED/OPEN/PARTIALLY_FILLED -> lookup_order + list_fills poll
+                      -> FILLED (reconcile_live_order_and_fills)
+                      -> expired/invalidated -> CANCEL_REQUESTED
+                      -> unrecognized provider status -> RECONCILIATION_REQUIRED (fail closed)
+       CANCEL_REQUESTED -> cancel_order, then lookup_order re-verification -> CANCELLED
+       CANCELLED   -> at most one REPLACED chain, capped at maximum_profitable_entry_price
+                      (DB CHECK ck_alea_never_chase_above_max enforces this as a data invariant)
+```
+
+**Known, explicit gap**: a FILLED attempt is reconciled/accounted for but
+does **not** establish `AutonomousPositionCustody` — that requires the
+`AutonomousExecutionClaim`-based lineage this lane deliberately does not
+build (see `02_DECISIONS.md`). No live per-instrument reference-price
+feed is wired into the supervisor yet, so replacement does not fire
+automatically in production although it is implemented and tested.
+
+Shadow validation (Phase 10): `app/services/entry_intelligence/shadow_validation.py::replay_rejected_buy_candidate_counterfactual`
+— pure, read-only replay against stored candle data (reuses
+`strategy_outcomes/service.py`'s `_load_close_at_or_before`/
+`_load_window_candles`). Not yet run against real production rejection
+history as of this writing — the function is implemented and tested,
+but no operator command or report using it against live data exists yet.
+
+---
+
 ## Logs and Search Terms
 
 | Term | Status | Where |
 |---|---|---|
+| `entry_intelligence_decision_evaluated` | **[REPO]** | `capital_campaign_orchestration/authoritative.py`, inside the `non_positive_net_edge` branch — full BUY_LIMIT/WAIT/REJECT provenance for the entry-intelligence decision layer. Surfaced in `tools/operator_console.py`. |
+| `limit_entry_attempt_proposed` / `limit_entry_submitted` / `limit_entry_filled` / `limit_entry_cancellation_confirmed` | **[REPO]** | `autonomous_limit_entry_worker.py` — attempt lifecycle stage transitions. |
+| `limit_entry_attempt_proposal_failed` / `limit_entry_supervisor_cycle_failed` | **[REPO]** | `authoritative.py` / `continuous_pipeline_worker.py` — non-fatal failures in the entry-intelligence execution path (cycle continues; row remains for retry). |
 | `automatic_package_progression_result` | **[REPO]** | `continuous_pipeline_worker.py`, after every package-activation attempt. Its `live_submission_called`/`provider_submission_called` fields are hardcoded log literals, not real state — don't treat them as submission evidence. |
 | `automatic_ready_package_created` | **[REPO]** | `continuous_pipeline_worker.py` — new canonical preview package created. |
 | `automatic_ready_package_replayed` | **[REPO]** | `continuous_pipeline_worker.py` — idempotent replay of an existing package. |

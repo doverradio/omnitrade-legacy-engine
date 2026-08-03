@@ -23,6 +23,7 @@ from app.models.autonomous_capital_mandate_evaluation import AutonomousCapitalMa
 from app.models.autonomous_capital_mandate_version import AutonomousCapitalMandateVersion
 from app.models.autonomous_cycle_run import AutonomousCycleRun
 from app.models.autonomous_execution_claim import AutonomousExecutionClaim
+from app.models.autonomous_limit_entry_attempt import AutonomousLimitEntryAttempt
 from app.models.autonomous_position_custody import AutonomousPositionCustody
 from app.models.autonomous_position_exit_authority import AutonomousPositionExitAuthority
 from app.models.autonomous_proof_sell_attempt import AutonomousProofSellAttempt
@@ -108,6 +109,7 @@ __all__ = [
 	"AutonomousCapitalMandateVersion",
 	"AutonomousCycleRun",
 	"AutonomousExecutionClaim",
+	"AutonomousLimitEntryAttempt",
 	"AutonomousPositionCustody",
 	"AutonomousPositionExitAuthority",
 	"AutonomousProofSellAttempt",
