@@ -118,7 +118,7 @@ def _build_arg_parser() -> argparse.ArgumentParser:
 
 async def _export(args: argparse.Namespace) -> ExportReport:
     from sqlalchemy import select
-    from sqlalchemy.ext.asyncio import create_async_engine
+    from sqlalchemy.ext.asyncio import AsyncSession, create_async_engine
 
     from app.models.asset import Asset
     from app.models.candle import Candle
@@ -131,7 +131,7 @@ async def _export(args: argparse.Namespace) -> ExportReport:
 
     engine = create_async_engine(database_url, future=True)
     try:
-        async with engine.connect() as conn:
+        async with AsyncSession(engine) as session:
             query = (
                 select(Candle, Asset.symbol, Asset.exchange)
                 .join(Asset, Candle.asset_id == Asset.id)
@@ -145,7 +145,7 @@ async def _export(args: argparse.Namespace) -> ExportReport:
             if args.end is not None:
                 query = query.where(Candle.open_time < datetime.fromisoformat(args.end))
 
-            result = await conn.execute(query)
+            result = await session.execute(query)
             rows = result.all()
     finally:
         await engine.dispose()
