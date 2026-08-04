@@ -7,17 +7,22 @@ from app.schemas.strategy_lab_offline import PatternIntelligenceRequest, Pattern
 from app.services.strategy_lab_offline import load_dataset, run_replay
 
 from strategy_lab.pattern_intelligence import AnalysisContext, analyze
-from strategy_lab.pattern_intelligence.models import json_value
+from strategy_lab.pattern_intelligence.models import AnalysisResult, json_value
 
 
 def analyze_selection(payload: PatternIntelligenceRequest) -> dict[str, object]:
+    result, _, _ = build_selection_analysis(payload)
+    return json_value(result)
+
+
+def build_selection_analysis(payload: PatternIntelligenceRequest) -> tuple[AnalysisResult, dict[str, object], None]:
     candles = load_dataset(payload.dataset_id)
     end = len(candles) - 1 if payload.selected_end_index is None else payload.selected_end_index
     if payload.selected_start_index > end or end >= len(candles):
         raise InvalidRequestError(message="Pattern Intelligence selection is outside the dataset")
     replay = _replay(payload.dataset_id, payload.strategy_version, payload.parameters)
     context = _context(payload.dataset_id, payload.strategy_version, payload.partition, payload.selected_start_index, end, replay)
-    return json_value(analyze(candles, context))
+    return analyze(candles, context), replay, None
 
 
 def analyze_visible_window(payload: PatternIntelligenceRequest) -> dict[str, object]:
@@ -25,6 +30,11 @@ def analyze_visible_window(payload: PatternIntelligenceRequest) -> dict[str, obj
 
 
 def analyze_trade(payload: PatternIntelligenceTradeRequest) -> dict[str, object]:
+    result, _, _ = build_trade_analysis(payload)
+    return json_value(result)
+
+
+def build_trade_analysis(payload: PatternIntelligenceTradeRequest) -> tuple[AnalysisResult, dict[str, object], dict[str, object]]:
     candles = load_dataset(payload.dataset_id)
     replay = _replay(payload.dataset_id, payload.strategy_version, payload.parameters)
     trades = replay["trades"]
@@ -34,7 +44,7 @@ def analyze_trade(payload: PatternIntelligenceTradeRequest) -> dict[str, object]
     start = int(trade["entry_candle_index"])
     end = int(trade["exit_candle_index"])
     context = _context(payload.dataset_id, payload.strategy_version, payload.partition, start, end, replay, trade)
-    return json_value(analyze(candles, context))
+    return analyze(candles, context), replay, trade
 
 
 def _replay(dataset_id: str, strategy_version: str, parameters) -> dict[str, object]:

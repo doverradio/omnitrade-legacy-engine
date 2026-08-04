@@ -75,16 +75,37 @@ const patternAnalysis = {
   }],
 };
 
+const researchExplanation = {
+  analysis_type: "EXPLAIN_SELECTION", provider: "DeterministicTemplateProvider", provider_version: "1.0.0", template_version: "1.0.0",
+  source_analysis_id: "analysis_test", content_hash: "research-hash",
+  statements: [{
+    statement_id: "statement_0001", label: "OBSERVATION", section: "VOLATILITY",
+    text: "Volatility Contraction was detected from candles 0 through 2.", source_finding_ids: ["finding_0001"],
+    measurements: { range_contraction_pct: "42.6" },
+  }],
+  primary_cause: { classification: "LATE_ENTRY", supporting_finding_ids: ["finding_0001"], measurements: { move_consumed_before_entry: "0.78" }, historical_recurrence: [], confidence: "LIMITED", alternatives_considered: [], limitations: ["Classification is associative."] },
+  counterfactual_improvement: null,
+  candidate_experiments: [{ experiment_id: "CE-001", question: "Would one controlled condition improve expected-cost results?", suggested_controlled_change: "Change exactly one entry condition.", required_tests: ["Training", "Validation", "Final Test"], source_finding_ids: ["finding_0001"], status: "PROPOSED", executable_rule: false }],
+  evidence: {
+    source_findings: patternAnalysis.findings, detector_versions: patternAnalysis.detector_versions, selected_candles: [0, 2],
+    recurrence_evidence: { finding_0001: patternAnalysis.findings[0].recurrence }, partition: "training",
+    cost_model: { fee_pct: "0.002", slippage_pct: "0.0005" }, configuration: patternAnalysis.configuration,
+  },
+};
+
 function installFetchMock() {
   vi.stubGlobal("fetch", vi.fn(async (input: string | URL | Request) => {
     const rawUrl = typeof input === "string" ? input : input instanceof URL ? input.toString() : input.url;
     const path = new URL(rawUrl).pathname;
-    const body = path === "/strategy-lab/datasets" ? { items: [dataset] } : path.includes("pattern-intelligence") ? patternAnalysis : replay;
+    const body = path === "/strategy-lab/datasets" ? { items: [dataset] } : path.includes("research-copilot") ? researchExplanation : path.includes("pattern-intelligence") ? patternAnalysis : replay;
     return new Response(JSON.stringify(body), { status: 200, headers: { "Content-Type": "application/json" } });
   }));
 }
 
-afterEach(() => vi.unstubAllGlobals());
+afterEach(() => {
+  vi.unstubAllGlobals();
+  window.localStorage.clear();
+});
 
 describe("Visual Strategy Laboratory Phase 2B", () => {
   it("explains chart objects and metrics in the Help dialog", async () => {
@@ -199,5 +220,47 @@ describe("Visual Strategy Laboratory Phase 2B", () => {
     const fetchMock = vi.mocked(fetch);
     const analysisCall = fetchMock.mock.calls.find(([input]) => String(input).includes("analyze-selection"));
     expect(JSON.parse(String(analysisCall?.[1]?.body))).toMatchObject({ selected_start_index: 0, selected_end_index: 2, dataset_id: "btc_15m" });
+  });
+
+  it("renders accessible Copilot tabs and expands authoritative evidence", async () => {
+    installFetchMock();
+    const user = userEvent.setup();
+    render(<StrategyLabPage />);
+    await waitFor(() => expect(screen.getByRole("button", { name: "Drag select candles" })).toBeInTheDocument());
+
+    const tablist = screen.getByRole("tablist", { name: "Research Copilot views" });
+    for (const tab of ["Observed Patterns", "Missed Opportunities", "Failure Analysis", "Success Analysis", "Candidate Experiments", "Overfitting Warnings", "Research Notes"]) {
+      expect(within(tablist).getByRole("tab", { name: tab })).toBeInTheDocument();
+    }
+    await user.click(screen.getByRole("button", { name: "Drag select candles" }));
+    await user.click(screen.getByRole("button", { name: "Explain Selection" }));
+    await waitFor(() => expect(screen.getByText("Volatility Contraction was detected from candles 0 through 2.")).toBeInTheDocument());
+    expect(screen.getByText("OBSERVATION")).toBeInTheDocument();
+    await user.click(screen.getByText("View Evidence"));
+    expect(screen.getByText(/finding_0001 · volatility_contraction_v1 · v1.0.0/)).toBeInTheDocument();
+    expect(screen.getByText("maximum range ratio: 0.75")).toBeInTheDocument();
+    expect(screen.getByText("Cost model: fee 0.002 · slippage 0.0005")).toBeInTheDocument();
+  });
+
+  it("runs loss analysis and persists research notes locally", async () => {
+    installFetchMock();
+    const user = userEvent.setup();
+    render(<StrategyLabPage />);
+    await waitFor(() => expect(screen.getByRole("button", { name: "Select first chart trade" })).toBeInTheDocument());
+    await user.click(screen.getByRole("button", { name: "Select first chart trade" }));
+    const lossAction = screen.getByRole("button", { name: "Explain This Loss" });
+    expect(lossAction).toBeEnabled();
+    expect(screen.getByRole("button", { name: "Why Did This Work?" })).toBeDisabled();
+    await user.click(lossAction);
+    await waitFor(() => expect(screen.getByText(/PRIMARY CLASSIFICATION · LATE ENTRY · LIMITED/)).toBeInTheDocument());
+
+    await user.click(screen.getByRole("tab", { name: "Research Notes" }));
+    const note = screen.getByRole("textbox", { name: "Local research note" });
+    await user.type(note, "Review the linked late-entry evidence.");
+    await user.click(screen.getByRole("button", { name: "Save Local Note" }));
+    const savedNote = JSON.parse(String(Object.values(window.localStorage)[0]));
+    expect(savedNote).toMatchObject({ note: "Review the linked late-entry evidence.", dataset_id: "btc_15m", selected_range: [0, 2], trade_index: 0 });
+    expect(savedNote.explanation_hashes).toContain("research-hash");
+    expect(savedNote.candidate_experiment_ids).toContain("CE-001");
   });
 });

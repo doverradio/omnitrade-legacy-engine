@@ -195,6 +195,59 @@ export type PatternAnalysisRequest = {
   parameters: StrategyLabParameters;
 };
 
+export type ResearchStatementLabel = "OBSERVATION" | "STATISTICAL EVIDENCE" | "HYPOTHESIS" | "RECOMMENDATION" | "WARNING" | "INSUFFICIENT EVIDENCE";
+
+export type ResearchStatement = {
+  statement_id: string;
+  label: ResearchStatementLabel;
+  section: string;
+  text: string;
+  source_finding_ids: string[];
+  measurements: Record<string, unknown>;
+};
+
+export type CandidateExperiment = {
+  experiment_id: string;
+  question: string;
+  suggested_controlled_change: string;
+  required_tests: string[];
+  source_finding_ids: string[];
+  status: "PROPOSED";
+  executable_rule: false;
+};
+
+export type ResearchExplanation = {
+  analysis_type: "EXPLAIN_SELECTION" | "SHOW_MISSED" | "EXPLAIN_TRADE" | "EXPLAIN_SUCCESS" | "OVERFITTING_WARNINGS";
+  provider: "DeterministicTemplateProvider";
+  provider_version: string;
+  template_version: string;
+  source_analysis_id: string;
+  statements: ResearchStatement[];
+  primary_cause: null | {
+    classification: string;
+    supporting_finding_ids: string[];
+    measurements: Record<string, unknown>;
+    historical_recurrence: Array<Record<string, unknown>>;
+    confidence: string;
+    alternatives_considered: string[];
+    limitations: string[];
+  };
+  counterfactual_improvement: null | Record<string, unknown>;
+  candidate_experiments: CandidateExperiment[];
+  content_hash: string;
+  evidence: {
+    source_findings: PatternFinding[];
+    detector_versions: Record<string, string>;
+    selected_candles: [number, number];
+    recurrence_evidence: Record<string, PatternRecurrence[]>;
+    partition: string;
+    cost_model: Record<string, string>;
+    configuration: Record<string, unknown>;
+  };
+};
+
+export type ResearchTradeRequest = Omit<PatternAnalysisRequest, "selected_start_index" | "selected_end_index"> & { trade_index: number };
+
 const API_BASE_URL = process.env.NEXT_PUBLIC_API_BASE_URL ?? "http://localhost:8000";
 
 async function requestJson<T>(path: string, init?: RequestInit): Promise<T> {
@@ -249,3 +302,15 @@ export function analyzePatternTrade(payload: Omit<PatternAnalysisRequest, "selec
     method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(payload),
   });
 }
+
+function researchRequest(path: string, payload: PatternAnalysisRequest | ResearchTradeRequest): Promise<ResearchExplanation> {
+  return requestJson<ResearchExplanation>(`/strategy-lab/research-copilot/${path}`, {
+    method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(payload),
+  });
+}
+
+export const explainResearchSelection = (payload: PatternAnalysisRequest) => researchRequest("explain-selection", payload);
+export const showResearchMissed = (payload: PatternAnalysisRequest) => researchRequest("show-missed", payload);
+export const explainResearchTrade = (payload: ResearchTradeRequest) => researchRequest("explain-trade", payload);
+export const explainResearchSuccess = (payload: ResearchTradeRequest) => researchRequest("explain-success", payload);
+export const getResearchOverfittingWarnings = (payload: PatternAnalysisRequest) => researchRequest("overfitting-warnings", payload);

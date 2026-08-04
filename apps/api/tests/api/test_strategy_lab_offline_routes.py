@@ -1,4 +1,5 @@
 from datetime import timedelta
+from pathlib import Path
 
 from fastapi.testclient import TestClient
 
@@ -162,3 +163,67 @@ def test_pattern_intelligence_dataset_identifier_is_path_safe() -> None:
 
     assert response.status_code == 400
     assert response.json()["error"]["message"] == "Invalid dataset identifier"
+
+
+def test_research_copilot_explains_selection_deterministically() -> None:
+    payload = {"dataset_id": "btc_15m", "selected_start_index": 2565, "selected_end_index": 2584}
+    with TestClient(create_app()) as client:
+        first = client.post("/strategy-lab/research-copilot/explain-selection", json=payload)
+        second = client.post("/strategy-lab/research-copilot/explain-selection", json=payload)
+
+    assert first.status_code == 200
+    assert first.json() == second.json()
+    body = first.json()
+    valid_ids = {finding["finding_id"] for finding in body["evidence"]["source_findings"]}
+    assert body["provider"] == "DeterministicTemplateProvider"
+    assert all(set(statement["source_finding_ids"]) <= valid_ids for statement in body["statements"])
+    assert all(statement["measurements"] for statement in body["statements"] if statement["label"] == "OBSERVATION")
+
+
+def test_research_copilot_explains_real_losing_trade_and_gates_counterfactual() -> None:
+    with TestClient(create_app()) as client:
+        response = client.post("/strategy-lab/research-copilot/explain-trade", json={"dataset_id": "btc_15m", "trade_index": 0})
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["primary_cause"]["classification"] != "INSUFFICIENT_EVIDENCE"
+    assert body["counterfactual_improvement"] is None
+    assert any(statement["section"] == "COUNTERFACTUAL IMPROVEMENT" and statement["label"] == "INSUFFICIENT EVIDENCE" for statement in body["statements"])
+
+
+def test_research_copilot_missed_requires_replay_evidence() -> None:
+    with TestClient(create_app()) as client:
+        response = client.post("/strategy-lab/research-copilot/show-missed", json={"dataset_id": "btc_15m", "selected_start_index": 180, "selected_end_index": 188})
+
+    assert response.status_code == 200
+    body = response.json()
+    missed_ids = {finding["finding_id"] for finding in body["evidence"]["source_findings"] if finding["detector_id"] == "missed_entry_v1"}
+    assert missed_ids
+    assert any(missed_ids.intersection(statement["source_finding_ids"]) for statement in body["statements"])
+    assert body["candidate_experiments"][0]["executable_rule"] is False
+
+
+def test_research_copilot_overfitting_and_path_safety() -> None:
+    with TestClient(create_app()) as client:
+        warning = client.post("/strategy-lab/research-copilot/overfitting-warnings", json={"dataset_id": "btc_15m", "selected_start_index": 100, "selected_end_index": 140, "final_test_used_for_development": True})
+        unsafe = client.post("/strategy-lab/research-copilot/explain-selection", json={"dataset_id": "../btc_15m"})
+
+    assert warning.status_code == 200
+    assert any(item["section"] == "FINAL TEST CONTAMINATION" for item in warning.json()["statements"])
+    assert unsafe.status_code == 400
+    assert unsafe.json()["error"]["message"] == "Invalid dataset identifier"
+
+
+def test_research_copilot_does_not_modify_strategy_files() -> None:
+    root = Path(__file__).resolve().parents[4]
+    paths = [
+        root / "strategy_lab/strategies/trailing_limit_v1.py",
+        root / "strategy_lab/strategies/trailing_limit_v2.py",
+    ]
+    before = {path: path.read_bytes() for path in paths}
+
+    with TestClient(create_app()) as client:
+        response = client.post("/strategy-lab/research-copilot/explain-selection", json={"dataset_id": "btc_15m", "selected_start_index": 74, "selected_end_index": 77})
+
+    assert response.status_code == 200
+    assert {path: path.read_bytes() for path in paths} == before

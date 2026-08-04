@@ -98,3 +98,15 @@ class PatternIntelligenceTradeRequest(BaseModel):
     trade_index: int = Field(ge=0)
     partition: Literal["training", "validation", "final_test", "entire_dataset"] = "entire_dataset"
     parameters: StrategyLabParameters = Field(default_factory=StrategyLabParameters)
+
+
+class ResearchCopilotRequest(PatternIntelligenceRequest):
+    final_test_used_for_development: bool = False
+    hypotheses_tested_on_partition: int = Field(default=0, ge=0, le=100_000)
+    sensitivity_results: list[dict[str, str | int | float | bool | None]] = Field(default_factory=list, max_length=100)
+
+
+class ResearchCopilotTradeRequest(PatternIntelligenceTradeRequest):
+    final_test_used_for_development: bool = False
+    hypotheses_tested_on_partition: int = Field(default=0, ge=0, le=100_000)
+    sensitivity_results: list[dict[str, str | int | float | bool | None]] = Field(default_factory=list, max_length=100)

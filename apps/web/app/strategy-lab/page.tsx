@@ -5,6 +5,7 @@ import { useEffect, useMemo, useRef, useState } from "react";
 
 import { CHART_LAYERS, DEFAULT_VISIBLE_LAYERS, layerForEvent, type ChartLayerId } from "@/components/strategy-lab/chartLayers";
 import DatasetUploadDialog from "@/components/strategy-lab/DatasetUploadDialog";
+import ResearchCopilotPanel from "@/components/strategy-lab/ResearchCopilotPanel";
 import {
   analyzePatternSelection,
   analyzePatternTrade,
@@ -293,6 +294,13 @@ export default function StrategyLabPage() {
   const visibleLayerCount = CHART_LAYERS.filter((layer) => visibleLayers[layer.id]).length;
   const visibleCandleCount = run ? (viewMode === "instant" ? run.candles.length : Math.max(1, playbackIndex)) : 0;
   const visibleTrades = run?.trades.filter((trade) => trade.exit_candle_index < visibleCandleCount) ?? [];
+  const selectedTradeIndex = run && selectedTrade ? run.trades.indexOf(selectedTrade) : -1;
+  const researchSelectionPayload = analysisRange ? patternPayload(analysisRange) : null;
+  const researchVisiblePayload = run && visibleCandleCount ? patternPayload([0, visibleCandleCount - 1]) : null;
+  const researchTradePayload = selectedTradeIndex >= 0 ? {
+    dataset_id: datasetId, strategy_version: strategyVersion, trade_index: selectedTradeIndex,
+    partition: analysisPartition, parameters,
+  } : null;
   const currentPlaybackEvents = run?.events.filter((event) => event.candle_index === visibleCandleCount - 1) ?? [];
   const fullTradeTrace = useMemo(() => {
     if (!run || !selectedTrade) return [];
@@ -458,6 +466,13 @@ export default function StrategyLabPage() {
               {analysisError && <p role="alert" className="mt-2 font-mono text-[10px] text-[#ef6b5f]">{analysisError}</p>}
             </div>
             {patternAnalysis && <PatternIntelligencePanel analysis={patternAnalysis} selected={selectedFinding} onSelect={setSelectedFinding} />}
+            <ResearchCopilotPanel
+              selectionPayload={researchSelectionPayload}
+              visiblePayload={researchVisiblePayload}
+              tradePayload={researchTradePayload}
+              tradeIsLoss={number(selectedTrade?.net_return_pct) < 0}
+              tradeIsWin={number(selectedTrade?.net_return_pct) > 0}
+            />
             <div className="my-5 border-t border-[#294139]" />
             <SectionTitle index="05" title="Evidence" />
             {run ? <>
