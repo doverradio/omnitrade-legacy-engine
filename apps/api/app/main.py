@@ -27,6 +27,7 @@ from app.api.routes.paper import router as paper_router
 from app.api.routes.research import router as research_router
 from app.api.routes.risk import router as risk_router
 from app.api.routes.strategies import router as strategies_router
+from app.api.routes.strategy_lab_offline import router as strategy_lab_offline_router
 from app.api.routes.validation_runs import router as validation_runs_router
 from app.config import get_settings
 from app.core.errors import register_error_handlers
@@ -57,6 +58,7 @@ def create_app() -> FastAPI:
     app.include_router(markets_router)
     app.include_router(operations_router)
     app.include_router(strategies_router)
+    app.include_router(strategy_lab_offline_router)
     app.include_router(parameter_sets_router)
     app.include_router(backtests_router)
     app.include_router(crypto_order_previews_router)

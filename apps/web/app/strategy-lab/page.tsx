@@ -1,2511 +1,598 @@
 "use client";
 
-import { useEffect, useMemo, useState } from "react";
-import { useRouter } from "next/navigation";
+import dynamic from "next/dynamic";
+import { useEffect, useMemo, useRef, useState } from "react";
 
-import { ContextualHelp } from "@/components/domain/ContextualHelp";
-import EquityCurveChart from "@/components/charts/EquityCurveChart";
-import { GlossaryTermTooltip } from "@/components/domain/GlossaryTermTooltip";
-import { ApiRequestError, getBacktests, runBacktest, type BacktestListItem } from "@/lib/api/backtests";
-import { getParameterSets, saveParameterSet, type ParameterSetItem } from "@/lib/api/parameterSets";
-import { getStrategies, type StrategyItem } from "@/lib/api/strategies";
-import { ConfigurationCoach } from "@/components/domain/ConfigurationCoach";
+import { CHART_LAYERS, DEFAULT_VISIBLE_LAYERS, layerForEvent, type ChartLayerId } from "@/components/strategy-lab/chartLayers";
+import DatasetUploadDialog from "@/components/strategy-lab/DatasetUploadDialog";
 import {
-  getBehaviorSummary,
-  getBeginnerTopObservations,
-  getHealthState,
-  getReadinessLabel,
-  getReadinessScore,
-} from "@/lib/configurationCoach";
-import {
-  getParameterDefinitions,
-  validateParameterValue,
-  validateParameterValues,
-  type ParameterDefinition,
-} from "@/lib/parameterDefinitions";
+  analyzePatternSelection,
+  analyzePatternTrade,
+  analyzePatternVisibleWindow,
+  getOfflineDatasets,
+  replayOfflineStrategy,
+  type PatternAnalysis,
+  type PatternAnalysisRequest,
+  type PatternFinding,
+  type ReplayRequest,
+  type ReplayResult,
+  type ReplayTrade,
+  type ResearchPeriod,
+  type StrategyLabDataset,
+  type StrategyLabParameters,
+  type StrategyVersion,
+} from "@/lib/api/strategyLabOffline";
 
-type PlaceholderSectionProps = {
-  id: string;
-  title: string;
-  description: string;
-  placeholder: string;
-  tone?: "empty" | "loading";
+const ReplayChart = dynamic(() => import("@/components/strategy-lab/ReplayChart"), { ssr: false });
+const CapitalChart = dynamic(() => import("@/components/strategy-lab/CapitalChart"), { ssr: false });
+
+type ViewMode = "instant" | "playback";
+type PlaybackSpeed = 1 | 5 | 20 | 100;
+type SavedExperiment = { run: ReplayResult; replayDate: string; parameterSet: string };
+
+const DEFAULT_PARAMETERS: StrategyLabParameters = {
+  entry_offset_pct: "0.01",
+  initial_stop_pct: "0.01",
+  profit_activation_pct: "0.03",
+  trailing_distance_pct: "0.01",
+  required_declining_candles: 2,
+  fee_pct: "0.002",
+  slippage_pct: "0.0005",
+  initial_capital: "100",
+  trade_deployment_pct: "100",
+  profit_compound_pct: "100",
+  profit_withdrawal_pct: "0",
+  profit_tax_reserve_pct: "0",
 };
 
-type StrategyMetadata = {
-  description: string;
-  difficulty: string;
-  primaryStyle: string;
-  worksBestIn: string;
-  worksPoorlyIn: string;
-  tradeFrequency: string;
-  beginnerExplanation: string;
-};
+const PARAMETER_FIELDS: Array<{ key: keyof StrategyLabParameters; label: string; step: string }> = [
+  { key: "entry_offset_pct", label: "Entry offset", step: "0.001" },
+  { key: "initial_stop_pct", label: "Initial stop", step: "0.001" },
+  { key: "profit_activation_pct", label: "Profit activation", step: "0.001" },
+  { key: "trailing_distance_pct", label: "Trailing distance", step: "0.001" },
+  { key: "required_declining_candles", label: "Declining candles", step: "1" },
+  { key: "fee_pct", label: "Fee rate", step: "0.0001" },
+  { key: "slippage_pct", label: "Slippage rate", step: "0.0001" },
+  { key: "initial_capital", label: "Starting capital", step: "10" },
+  { key: "trade_deployment_pct", label: "Capital deployed %", step: "1" },
+  { key: "profit_compound_pct", label: "Profit compounded %", step: "1" },
+  { key: "profit_withdrawal_pct", label: "Profit withdrawn %", step: "1" },
+  { key: "profit_tax_reserve_pct", label: "Tax reserve %", step: "1" },
+];
 
-type ExpectedEffectNotes = {
-  increasing?: string[];
-  decreasing?: string[];
-  enabled?: string[];
-  disabled?: string[];
-  options?: Record<string, string[]>;
-};
+const number = (value: string | number | null | undefined) => Number(value ?? 0);
+const money = (value: string | number | null | undefined) => `$${number(value).toFixed(2)}`;
+const percent = (value: string | number | null | undefined) => `${number(value).toFixed(2)}%`;
 
-type BeginnerWhyChangeNotes = {
-  title: string;
-  lines: string[];
-};
-
-type ParameterValues = Record<string, string | number | boolean>;
-
-type SnapshotMeta = {
-  notes?: string;
-  createdAt?: string;
-};
-
-type ReviewChecklistItem = {
-  key: string;
-  label: string;
-  complete: boolean;
-  optional?: boolean;
-};
-
-type ComparisonMetricKey = "totalReturn" | "winRate" | "maxDrawdown" | "feeDrag";
-
-type HighlightedComparisonWinners = {
-  bestTotalReturnRunId: string | null;
-  highestWinRateRunId: string | null;
-  lowestDrawdownRunId: string | null;
-  lowestFeeDragRunId: string | null;
-};
-
-type InsightObservation = {
-  text: string;
-  beginnerText: string;
-};
-
-type ExperimentLogEntry = {
-  id: string;
-  createdAt: string;
-  comparedRuns: string[];
-  strategies: string[];
-  snapshots: string[];
-  keyDifferences: string[];
-  observations: string[];
-  notes?: string;
-  beginnerSummary?: string;
-};
-
-const DEFAULT_BACKTEST_INTERVAL: "1h" = "1h";
-const DEFAULT_BACKTEST_INITIAL_CAPITAL = "25";
-const DEFAULT_BACKTEST_FEE_BPS = "10";
-const DEFAULT_BACKTEST_SLIPPAGE_BPS = "5";
-const DEFAULT_BACKTEST_ASSET_ID = process.env.NEXT_PUBLIC_DEFAULT_BACKTEST_ASSET_ID ?? "00000000-0000-0000-0000-000000000000";
-
-const GLOSSARY_DEFINITIONS = {
-  winRate: "Win rate is the share of completed trades that were profitable.",
-  feeDrag: "Fee drag is performance reduction caused by fees and execution costs.",
-  maxDrawdown: "Max drawdown is the largest drop from a peak equity value during a run.",
-  sharpeLike: "Sharpe-like is a simplified risk-adjusted return metric where higher is generally better.",
-  slippage: "Slippage is the difference between expected price and actual fill price in the model.",
-  startingCapital: "Starting capital is the amount of money a backtest starts with.",
-  endingEquity: "Ending equity is the total account value at the end of a run.",
-  configurationReadiness: "Configuration readiness summarizes how prepared your current setup is for backtesting.",
-};
-
-const IMPROVED_EMPTY_STATE_COPY = {
-  noSnapshots: "No snapshots yet. Save your current configuration to create your first reusable preset.",
-  noComparisons: "No comparisons selected. Choose completed runs above to compare evidence side-by-side.",
-  noExperimentLogs: "No experiment log entries yet. Create one from your current comparison to preserve your research context.",
-};
-
-const BEGINNER_METRIC_EXPLANATIONS: Record<ComparisonMetricKey, string> = {
-  totalReturn: "Total return shows overall performance as dollars and percentage from the starting capital.",
-  winRate: "Win rate is the share of completed trades that were profitable.",
-  maxDrawdown: "Max drawdown is the largest drop from a peak equity value during the run.",
-  feeDrag: "Fee drag shows how much performance was reduced by fees and execution costs.",
-};
-
-const PARAMETER_EFFECT_NOTES: Record<string, ExpectedEffectNotes> = {
-  fast_period: {
-    increasing: ["Produces fewer signals", "Reacts more slowly to price changes", "Smooths market noise"],
-    decreasing: ["Produces more signals", "Reacts faster", "May increase false signals"],
-  },
-  slow_period: {
-    increasing: ["Uses a longer trend baseline", "Generates fewer crossover events", "Reduces short-term noise"],
-    decreasing: ["Uses a shorter trend baseline", "Can react sooner to trend changes", "Can increase whipsaw risk"],
-  },
-  rsi_period: {
-    increasing: ["Makes RSI smoother", "Reduces short-term RSI swings"],
-    decreasing: ["Makes RSI react faster", "Can produce more threshold crossings"],
-  },
-  oversold: {
-    increasing: ["Makes buy entries more conservative", "Can reduce total trade count"],
-    decreasing: ["Allows earlier oversold entries", "Can increase trade frequency"],
-  },
-  overbought: {
-    increasing: ["Delays overbought exits", "Can hold positions longer"],
-    decreasing: ["Triggers overbought exits earlier", "Can increase exit frequency"],
-  },
-  lookback: {
-    increasing: ["Requires larger range breaks", "May reduce false breakout entries"],
-    decreasing: ["Allows faster breakout triggers", "Can increase noisy breakout signals"],
-  },
-  min_volume_multiple: {
-    increasing: ["Requires stronger volume confirmation", "Filters out weaker breakouts"],
-    decreasing: ["Allows more breakout entries", "Can increase false-breakout exposure"],
-  },
-  volume_confirmation: {
-    enabled: ["Requires volume evidence before triggering breakouts", "May reduce low-conviction entries"],
-    disabled: ["Allows breakout entries without volume confirmation", "Can increase trigger frequency"],
-  },
-  conflict_resolution: {
-    options: {
-      net_strength: ["Resolves conflicts using signed strength balance", "Can react quickly to strong minority signals"],
-      majority_vote: ["Resolves conflicts by vote count", "Prefers consensus and ignores small strength differences"],
-    },
-  },
-};
-
-const PARAMETER_BEGINNER_WHY_CHANGE: Record<string, BeginnerWhyChangeNotes> = {
-  fast_period: {
-    title: "Fast Moving Average",
-    lines: [
-      "A smaller value reacts faster to recent price changes.",
-      "A larger value reacts more slowly but ignores more short-term market noise.",
-    ],
-  },
-  slow_period: {
-    title: "Slow Moving Average",
-    lines: [
-      "A larger value tracks the broader market trend.",
-      "A smaller value reacts sooner but can switch direction more often.",
-    ],
-  },
-  rsi_period: {
-    title: "RSI Period",
-    lines: [
-      "A smaller value makes RSI react faster to price changes.",
-      "A larger value smooths RSI and reduces short-term noise.",
-    ],
-  },
-  oversold: {
-    title: "Oversold Threshold",
-    lines: [
-      "Lower values wait for deeper pullbacks before signaling potential entries.",
-      "Higher values allow earlier entries but may trigger more often.",
-    ],
-  },
-  overbought: {
-    title: "Overbought Threshold",
-    lines: [
-      "Lower values can lock in exits sooner.",
-      "Higher values hold longer before signaling overbought conditions.",
-    ],
-  },
-  lookback: {
-    title: "Breakout Lookback",
-    lines: [
-      "A shorter value reacts to newer ranges quickly.",
-      "A longer value waits for larger, more established breakouts.",
-    ],
-  },
-};
-
-const STRATEGY_METADATA: Record<string, Partial<StrategyMetadata>> = {
-  ma_crossover: {
-    description: "Tracks short-term and long-term moving averages to identify directional trend shifts.",
-    difficulty: "Beginner",
-    primaryStyle: "Trend Following",
-    worksBestIn: "Clear directional trends",
-    worksPoorlyIn: "Choppy sideways markets",
-    tradeFrequency: "Not yet available",
-    beginnerExplanation:
-      "This strategy compares short-term and long-term price averages. When the short-term average rises above the long-term average, it suggests a possible upward trend. When it falls below, it suggests the trend may be weakening.",
-  },
-  rsi_mean_reversion: {
-    description: "Uses RSI threshold behavior to look for potential reversals after stretched moves.",
-    difficulty: "Intermediate",
-    primaryStyle: "Mean Reversion",
-    worksBestIn: "Range-bound markets",
-    worksPoorlyIn: "Strong one-direction trends",
-    tradeFrequency: "Not yet available",
-    beginnerExplanation: "Coming Soon",
-  },
-  breakout: {
-    description: "Looks for price breaking above or below recent ranges to capture momentum continuation.",
-    difficulty: "Intermediate",
-    primaryStyle: "Breakout",
-    worksBestIn: "Expanding volatility with follow-through",
-    worksPoorlyIn: "False breakout periods",
-    tradeFrequency: "Not yet available",
-    beginnerExplanation: "Coming Soon",
-  },
-  volatility_filter: {
-    description: "Filters signals based on whether current volatility conditions are acceptable.",
-    difficulty: "Advanced",
-    primaryStyle: "Volatility",
-    worksBestIn: "Risk control and signal filtering workflows",
-    worksPoorlyIn: "As a standalone trading strategy",
-    tradeFrequency: "Not yet available",
-    beginnerExplanation: "Coming Soon",
-  },
-  trend_regime_filter: {
-    description: "Classifies broad market regime to help determine when certain strategies should act.",
-    difficulty: "Advanced",
-    primaryStyle: "Trend Following",
-    worksBestIn: "Regime-aware strategy selection",
-    worksPoorlyIn: "As a standalone trading strategy",
-    tradeFrequency: "Not yet available",
-    beginnerExplanation: "Coming Soon",
-  },
-  ensemble_scorer: {
-    description: "Combines multiple strategy signals into one blended decision path.",
-    difficulty: "Advanced",
-    primaryStyle: "Not yet available",
-    worksBestIn: "Multi-strategy portfolios",
-    worksPoorlyIn: "Single-strategy-only workflows",
-    tradeFrequency: "Not yet available",
-    beginnerExplanation: "Coming Soon",
-  },
-};
-
-function normalizeStrategyMetadata(strategy: StrategyItem): StrategyMetadata {
-  const mapped = STRATEGY_METADATA[strategy.slug] ?? {};
-  return {
-    description: mapped.description ?? "Not yet available",
-    difficulty: mapped.difficulty ?? "Not yet available",
-    primaryStyle: mapped.primaryStyle ?? "Not yet available",
-    worksBestIn: mapped.worksBestIn ?? "Not yet available",
-    worksPoorlyIn: mapped.worksPoorlyIn ?? "Not yet available",
-    tradeFrequency: mapped.tradeFrequency ?? "Not yet available",
-    beginnerExplanation: mapped.beginnerExplanation ?? "Coming Soon",
-  };
+function download(name: string, body: string, type: string) {
+  const url = URL.createObjectURL(new Blob([body], { type }));
+  const anchor = document.createElement("a");
+  anchor.href = url;
+  anchor.download = name;
+  anchor.click();
+  URL.revokeObjectURL(url);
 }
 
-function formatDefaultParamsSummary(defaultParams: StrategyItem["default_params"]): string {
-  if (!defaultParams || Object.keys(defaultParams).length === 0) {
-    return "Not yet available";
-  }
-
-  return Object.entries(defaultParams)
-    .map(([key, value]) => `${key}: ${String(value)}`)
-    .join(", ");
-}
-
-function getErrorMessage(error: unknown, fallback = "Could not load strategies right now."): string {
-  if (error instanceof ApiRequestError) {
-    return error.message;
-  }
-
-  return fallback;
-}
-
-function formatCurrentValue(value: string | number | boolean, definition: ParameterDefinition): string {
-  if (typeof value === "boolean") {
-    return value ? "Enabled" : "Disabled";
-  }
-
-  if (definition.type === "percentage") {
-    return `${value}${definition.units ?? "%"}`;
-  }
-
-  return String(value);
-}
-
-function formatDateLabel(value?: string): string {
-  if (!value) {
-    return "Not yet available";
-  }
-
-  const timestamp = Date.parse(value);
-  if (Number.isNaN(timestamp)) {
-    return "Not yet available";
-  }
-
-  return new Date(timestamp).toLocaleDateString();
-}
-
-function formatSignedCurrency(value: number | null): string {
-  if (value === null || !Number.isFinite(value)) {
-    return "Not available";
-  }
-
-  const sign = value > 0 ? "+" : "";
-  return `${sign}$${value.toFixed(2)}`;
-}
-
-function formatCurrency(value: number | null): string {
-  if (value === null || !Number.isFinite(value)) {
-    return "Not available";
-  }
-
-  return `$${value.toFixed(2)}`;
-}
-
-function formatPercentFromRatio(value: number | null): string {
-  if (value === null || !Number.isFinite(value)) {
-    return "Not available";
-  }
-
-  const percent = value * 100;
-  const sign = percent > 0 ? "+" : "";
-  return `${sign}${percent.toFixed(2)}%`;
-}
-
-function formatBpsLabel(value: string): string {
-  const numeric = Number(value);
-  if (!Number.isFinite(numeric)) {
-    return "Not available";
-  }
-
-  return `${numeric.toFixed(0)} bps`;
-}
-
-function parseFiniteNumber(value: string | number | null | undefined): number | null {
-  if (typeof value === "number") {
-    return Number.isFinite(value) ? value : null;
-  }
-
-  if (typeof value === "string") {
-    const parsed = Number(value);
-    return Number.isFinite(parsed) ? parsed : null;
-  }
-
-  return null;
-}
-
-function toRunCode(index: number): string {
-  const codes = ["A", "B", "C"];
-  return `Run ${codes[index] ?? String(index + 1)}`;
-}
-
-function getConfigurationReadinessValue(item: BacktestListItem): string {
-  const withReadiness = item as BacktestListItem & {
-    configuration_readiness?: unknown;
-    run_metadata?: { configuration_readiness?: unknown };
-  };
-
-  const direct = withReadiness.configuration_readiness;
-  if (typeof direct === "number" && Number.isFinite(direct)) {
-    return `${direct} / 100`;
-  }
-  if (typeof direct === "string" && direct.trim().length > 0) {
-    return direct;
-  }
-
-  const nested = withReadiness.run_metadata?.configuration_readiness;
-  if (typeof nested === "number" && Number.isFinite(nested)) {
-    return `${nested} / 100`;
-  }
-  if (typeof nested === "string" && nested.trim().length > 0) {
-    return nested;
-  }
-
-  return "Not available";
-}
-
-function getMetricToneClass(metric: ComparisonMetricKey, value: number | null): string {
-  if (value === null || !Number.isFinite(value)) {
-    return "text-foreground/80";
-  }
-
-  if (metric === "totalReturn" || metric === "winRate") {
-    if (value > 0) {
-      return "text-emerald-200";
-    }
-    if (value < 0) {
-      return "text-red-200";
-    }
-    return "text-foreground/80";
-  }
-
-  if (metric === "maxDrawdown" || metric === "feeDrag") {
-    if (value < 0.1) {
-      return "text-emerald-200";
-    }
-    if (value >= 0.25) {
-      return "text-red-200";
-    }
-    return "text-foreground/80";
-  }
-
-  return "text-foreground/80";
-}
-
-function pickWinner(
-  runs: BacktestListItem[],
-  extractor: (item: BacktestListItem) => number | null,
-  mode: "max" | "min",
-): string | null {
-  const ranked = runs
-    .map((item) => ({ id: item.id, value: extractor(item) }))
-    .filter((entry) => entry.value !== null) as Array<{ id: string; value: number }>;
-
-  if (ranked.length === 0) {
-    return null;
-  }
-
-  ranked.sort((a, b) => (mode === "max" ? b.value - a.value : a.value - b.value));
-  return ranked[0]?.id ?? null;
-}
-
-function formatSignedNumber(value: number): string {
-  const sign = value > 0 ? "+" : "";
-  return `${sign}${value.toFixed(2)}`;
-}
-
-function formatPercentPointDelta(value: number): string {
-  const sign = value > 0 ? "+" : "";
-  return `${sign}${(value * 100).toFixed(2)} percentage points`;
-}
-
-function formatTrendPercentValue(value: number | null): string {
-  if (value === null || !Number.isFinite(value)) {
-    return "Not available";
-  }
-  return `${(value * 100).toFixed(2)}%`;
-}
-
-function normalizeWidths(values: Array<number | null>): number[] {
-  const finite = values.filter((value) => value !== null) as number[];
-  if (finite.length === 0) {
-    return values.map(() => 0);
-  }
-
-  const max = Math.max(...finite.map((value) => Math.abs(value)));
-  if (!Number.isFinite(max) || max === 0) {
-    return values.map(() => 0);
-  }
-
-  return values.map((value) => {
-    if (value === null || !Number.isFinite(value)) {
-      return 0;
-    }
-
-    return Math.max(8, Math.round((Math.abs(value) / max) * 100));
-  });
-}
-
-function formatDateTimeLabel(value: string): string {
-  const parsed = new Date(value);
-  if (Number.isNaN(parsed.getTime())) {
-    return "Not available";
-  }
-
-  return parsed.toLocaleString();
-}
-
-function coerceParameterValue(definition: ParameterDefinition, rawValue: unknown): string | number | boolean {
-  if (rawValue === undefined || rawValue === null) {
-    return definition.defaultValue;
-  }
-
-  if (definition.type === "boolean") {
-    if (typeof rawValue === "boolean") {
-      return rawValue;
-    }
-
-    if (typeof rawValue === "string") {
-      return rawValue.toLowerCase() === "true";
-    }
-
-    return Boolean(rawValue);
-  }
-
-  if (definition.type === "enum") {
-    return String(rawValue);
-  }
-
-  const numeric = typeof rawValue === "number" ? rawValue : Number(rawValue);
-  if (!Number.isFinite(numeric)) {
-    return definition.defaultValue;
-  }
-
-  if (definition.type === "integer") {
-    return Math.round(numeric);
-  }
-
-  return numeric;
-}
-
-function parameterSummary(definitions: ParameterDefinition[], values: Record<string, string | number | boolean>): string {
-  if (definitions.length === 0) {
-    return "No parameter metadata available.";
-  }
-
-  return definitions
-    .map((definition) => `${definition.label}: ${String(values[definition.key] ?? definition.defaultValue)}`)
-    .join(" • ");
-}
-
-function renderExpectedEffects(
-  definition: ParameterDefinition,
-  currentValue: string | number | boolean,
-): React.JSX.Element {
-  const notes = PARAMETER_EFFECT_NOTES[definition.key];
-
-  if (!notes) {
-    return (
-      <p className="text-sm text-foreground/75">Expected effects for this parameter are not yet documented.</p>
-    );
-  }
-
-  if (definition.type === "boolean") {
-    const selected = currentValue === true ? notes.enabled : notes.disabled;
-    if (!selected || selected.length === 0) {
-      return (
-        <p className="text-sm text-foreground/75">Expected effects for this parameter are not yet documented.</p>
-      );
-    }
-
-    return (
-      <ul className="mt-2 space-y-1 text-sm text-foreground/80">
-        {selected.map((line) => (
-          <li key={line}>- {line}</li>
-        ))}
-      </ul>
-    );
-  }
-
-  if (definition.type === "enum") {
-    const selected = typeof currentValue === "string" ? notes.options?.[currentValue] : undefined;
-    if (!selected || selected.length === 0) {
-      return (
-        <p className="text-sm text-foreground/75">Expected effects for this parameter are not yet documented.</p>
-      );
-    }
-
-    return (
-      <ul className="mt-2 space-y-1 text-sm text-foreground/80">
-        {selected.map((line) => (
-          <li key={line}>- {line}</li>
-        ))}
-      </ul>
-    );
-  }
-
-  const increasing = notes.increasing ?? [];
-  const decreasing = notes.decreasing ?? [];
-
-  if (increasing.length === 0 && decreasing.length === 0) {
-    return <p className="text-sm text-foreground/75">Expected effects for this parameter are not yet documented.</p>;
-  }
-
-  return (
-    <div className="grid gap-3 sm:grid-cols-2">
-      <div>
-        <p className="text-sm font-medium text-foreground/90">Increasing {definition.label}</p>
-        <ul className="mt-2 space-y-1 text-sm text-foreground/80">
-          {increasing.map((line) => (
-            <li key={line}>- {line}</li>
-          ))}
-        </ul>
-      </div>
-      <div>
-        <p className="text-sm font-medium text-foreground/90">Decreasing {definition.label}</p>
-        <ul className="mt-2 space-y-1 text-sm text-foreground/80">
-          {decreasing.map((line) => (
-            <li key={line}>- {line}</li>
-          ))}
-        </ul>
-      </div>
-    </div>
-  );
-}
-
-function renderControl(
-  definition: ParameterDefinition,
-  value: string | number | boolean,
-  onChange: (nextValue: string | number | boolean) => void,
-): React.JSX.Element {
-  if (definition.type === "integer") {
-    return (
-      <div className="space-y-2">
-        <label htmlFor={`range-${definition.key}`} className="text-sm font-medium text-foreground/90">
-          {definition.label} slider
-        </label>
-        <input
-          id={`range-${definition.key}`}
-          aria-label={`${definition.label} slider`}
-          type="range"
-          min={definition.minimum}
-          max={definition.maximum}
-          step={definition.step ?? 1}
-          value={Number(value)}
-          onChange={(event) => onChange(Number(event.target.value))}
-          className="w-full"
-        />
-        <label htmlFor={`input-${definition.key}`} className="text-sm font-medium text-foreground/90">
-          {definition.label} value
-        </label>
-        <input
-          id={`input-${definition.key}`}
-          aria-label={`${definition.label} value`}
-          type="number"
-          inputMode="numeric"
-          min={definition.minimum}
-          max={definition.maximum}
-          step={definition.step ?? 1}
-          value={Number(value)}
-          onChange={(event) => onChange(Number(event.target.value))}
-          className="w-full rounded-md border border-border bg-background px-3 py-2 text-sm"
-        />
-      </div>
-    );
-  }
-
-  if (definition.type === "decimal") {
-    return (
-      <div className="space-y-2">
-        <label htmlFor={`input-${definition.key}`} className="text-sm font-medium text-foreground/90">
-          {definition.label}
-        </label>
-        <input
-          id={`input-${definition.key}`}
-          aria-label={`${definition.label} value`}
-          type="number"
-          inputMode="decimal"
-          min={definition.minimum}
-          max={definition.maximum}
-          step={definition.step ?? 0.01}
-          value={Number(value)}
-          onChange={(event) => onChange(Number(event.target.value))}
-          className="w-full rounded-md border border-border bg-background px-3 py-2 text-sm"
-        />
-      </div>
-    );
-  }
-
-  if (definition.type === "percentage") {
-    return (
-      <div className="space-y-2">
-        <label htmlFor={`range-${definition.key}`} className="text-sm font-medium text-foreground/90">
-          {definition.label}
-        </label>
-        <input
-          id={`range-${definition.key}`}
-          aria-label={`${definition.label} slider`}
-          type="range"
-          min={definition.minimum}
-          max={definition.maximum}
-          step={definition.step ?? 0.1}
-          value={Number(value)}
-          onChange={(event) => onChange(Number(event.target.value))}
-          className="w-full"
-        />
-        <p className="text-sm text-foreground/80" aria-live="polite">
-          {Number(value)}{definition.units ?? "%"}
-        </p>
-      </div>
-    );
-  }
-
-  if (definition.type === "boolean") {
-    return (
-      <div className="space-y-2">
-        <span className="text-sm font-medium text-foreground/90">{definition.label}</span>
-        <button
-          type="button"
-          role="switch"
-          aria-label={`${definition.label} switch`}
-          aria-checked={Boolean(value)}
-          onClick={() => onChange(!Boolean(value))}
-          className="inline-flex min-h-11 min-w-28 items-center justify-center rounded-md border border-border bg-muted px-4 py-2 text-sm font-medium transition hover:bg-foreground/10 focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-accent"
-        >
-          {Boolean(value) ? "Enabled" : "Disabled"}
-        </button>
-      </div>
-    );
-  }
-
-  return (
-    <div className="space-y-2">
-      <label htmlFor={`select-${definition.key}`} className="text-sm font-medium text-foreground/90">
-        {definition.label}
-      </label>
-      <select
-        id={`select-${definition.key}`}
-        aria-label={`${definition.label} select`}
-        value={String(value)}
-        onChange={(event) => onChange(event.target.value)}
-        className="w-full rounded-md border border-border bg-background px-3 py-2 text-sm"
-      >
-        {definition.allowedValues?.map((allowedValue) => (
-          <option key={allowedValue} value={allowedValue}>
-            {allowedValue}
-          </option>
-        ))}
-      </select>
-    </div>
-  );
-}
-
-function PlaceholderSection({ id, title, description, placeholder, tone = "empty" }: PlaceholderSectionProps) {
-  return (
-    <section
-      aria-labelledby={id}
-      className="rounded-xl border border-border bg-muted/30 p-4"
-      data-testid={`strategy-lab-section-${id}`}
-    >
-      <h2 id={id} className="text-base font-semibold sm:text-lg">
-        {title}
-      </h2>
-      <p className="mt-1 text-sm text-foreground/75">{description}</p>
-      {tone === "loading" ? (
-        <div className="mt-3 space-y-2" role="status" aria-live="polite" aria-label={`${title} loading placeholder`}>
-          <div className="h-3 w-3/4 animate-pulse rounded bg-foreground/20" />
-          <div className="h-3 w-2/3 animate-pulse rounded bg-foreground/20" />
-        </div>
-      ) : (
-        <p className="mt-3 rounded-md border border-dashed border-border bg-background/30 px-3 py-2 text-sm text-foreground/70">
-          {placeholder}
-        </p>
-      )}
-    </section>
-  );
-}
-
-function ResearchJourney() {
-  const steps = [
-    "Choose Strategy",
-    "Configure Parameters",
-    "Configuration Intelligence",
-    "Run Backtest",
-    "Compare Results",
-    "Learn Why",
-  ];
-
-  return (
-    <nav aria-label="Research Journey" className="rounded-xl border border-border bg-background/40 p-4" data-testid="research-journey">
-      <h2 className="text-sm font-semibold uppercase tracking-wide text-foreground/80">Research Journey</h2>
-      <ol className="mt-3 grid gap-2 sm:grid-cols-2 lg:grid-cols-3">
-        {steps.map((step, index) => {
-          const isCurrent = index === 0;
-          return (
-            <li
-              key={step}
-              className={[
-                "rounded-md border px-3 py-2 text-sm",
-                isCurrent ? "border-emerald-500/40 bg-emerald-500/15 text-emerald-200" : "border-border bg-muted/20 text-foreground/75",
-              ].join(" ")}
-              aria-current={isCurrent ? "step" : undefined}
-            >
-              <span className="mr-2" aria-hidden="true">{isCurrent ? "✓" : "○"}</span>
-              <span>{step}</span>
-            </li>
-          );
-        })}
-      </ol>
-    </nav>
-  );
+function reportText(run: ReplayResult) {
+  return [
+    "OFFLINE STRATEGY LABORATORY REPORT",
+    `Dataset: ${run.dataset.id} (${run.dataset.candle_count} candles)`,
+    `Strategy: #${run.strategy_version}`,
+    `Period: ${run.dataset.first_timestamp} to ${run.dataset.last_timestamp}`,
+    `Verdict: ${run.metrics.verdict}`,
+    `Net return: ${percent(run.metrics.net_return_pct)}`,
+    `Buy & hold: ${percent(run.metrics.buy_and_hold_return_pct)}`,
+    `Trades: ${run.metrics.total_trades}`,
+    `Max drawdown: ${percent(run.metrics.max_drawdown_pct)}`,
+    "",
+    "This report is deterministic offline research evidence, not a production trading instruction.",
+  ].join("\n");
 }
 
 export default function StrategyLabPage() {
-  const router = useRouter();
-  const [isBeginnerMode, setIsBeginnerMode] = useState(true);
-  const [strategies, setStrategies] = useState<StrategyItem[]>([]);
-  const [selectedStrategyId, setSelectedStrategyId] = useState<string | null>(null);
-  const [isLoadingStrategies, setIsLoadingStrategies] = useState(true);
-  const [strategiesError, setStrategiesError] = useState<string | null>(null);
-  const [parameterValues, setParameterValues] = useState<ParameterValues>({});
-  const [parameterSets, setParameterSets] = useState<ParameterSetItem[]>([]);
-  const [isLoadingParameterSets, setIsLoadingParameterSets] = useState(true);
-  const [parameterSetsError, setParameterSetsError] = useState<string | null>(null);
-  const [completedBacktests, setCompletedBacktests] = useState<BacktestListItem[]>([]);
-  const [isLoadingBacktests, setIsLoadingBacktests] = useState(true);
-  const [backtestsError, setBacktestsError] = useState<string | null>(null);
-  const [selectedComparisonIds, setSelectedComparisonIds] = useState<string[]>([]);
-  const [experimentLogEntries, setExperimentLogEntries] = useState<ExperimentLogEntry[]>([]);
-  const [experimentNotes, setExperimentNotes] = useState("");
-  const [snapshotName, setSnapshotName] = useState("");
-  const [snapshotNotes, setSnapshotNotes] = useState("");
-  const [saveSnapshotError, setSaveSnapshotError] = useState<string | null>(null);
-  const [isSavingSnapshot, setIsSavingSnapshot] = useState(false);
-  const [snapshotMetaById, setSnapshotMetaById] = useState<Record<string, SnapshotMeta>>({});
-  const [selectedSnapshotId, setSelectedSnapshotId] = useState<string | null>(null);
-  const [startingCapital, setStartingCapital] = useState(DEFAULT_BACKTEST_INITIAL_CAPITAL);
-  const [feeBps, setFeeBps] = useState(DEFAULT_BACKTEST_FEE_BPS);
-  const [slippageBps, setSlippageBps] = useState(DEFAULT_BACKTEST_SLIPPAGE_BPS);
-  const [launchError, setLaunchError] = useState<string | null>(null);
-  const [isLaunchingBacktest, setIsLaunchingBacktest] = useState(false);
+  const [datasets, setDatasets] = useState<StrategyLabDataset[]>([]);
+  const [datasetId, setDatasetId] = useState("");
+  const [strategyVersion, setStrategyVersion] = useState<StrategyVersion>("002");
+  const [researchPeriod, setResearchPeriod] = useState<ResearchPeriod>("training");
+  const [parameters, setParameters] = useState(DEFAULT_PARAMETERS);
+  const [run, setRun] = useState<ReplayResult | null>(null);
+  const [savedRuns, setSavedRuns] = useState<SavedExperiment[]>([]);
+  const [hoveredTrade, setHoveredTrade] = useState<ReplayTrade | null>(null);
+  const [selectedTrade, setSelectedTrade] = useState<ReplayTrade | null>(null);
+  const [currentCandle, setCurrentCandle] = useState<string | null>(null);
+  const [status, setStatus] = useState<"loading" | "replaying" | "ready" | "error">("loading");
+  const [error, setError] = useState("");
+  const [visibleLayers, setVisibleLayers] = useState(DEFAULT_VISIBLE_LAYERS);
+  const [showComparison, setShowComparison] = useState(false);
+  const [showHelp, setShowHelp] = useState(false);
+  const [showUpload, setShowUpload] = useState(false);
+  const [viewMode, setViewMode] = useState<ViewMode>("instant");
+  const [isPlaying, setIsPlaying] = useState(false);
+  const [playbackIndex, setPlaybackIndex] = useState(0);
+  const [playbackSpeed, setPlaybackSpeed] = useState<PlaybackSpeed>(5);
+  const [inspectorMode, setInspectorMode] = useState<"summary" | "trace">("summary");
+  const [analysisRange, setAnalysisRange] = useState<[number, number] | null>(null);
+  const [patternAnalysis, setPatternAnalysis] = useState<PatternAnalysis | null>(null);
+  const [selectedFinding, setSelectedFinding] = useState<PatternFinding | null>(null);
+  const [analysisStatus, setAnalysisStatus] = useState<"idle" | "analyzing" | "error">("idle");
+  const [analysisError, setAnalysisError] = useState("");
+  const viewModeRef = useRef(viewMode);
+
+  useEffect(() => { viewModeRef.current = viewMode; }, [viewMode]);
 
   useEffect(() => {
-    let cancelled = false;
-
-    const loadStrategies = async () => {
-      setIsLoadingStrategies(true);
-      setStrategiesError(null);
-
-      try {
-        const items = await getStrategies();
-        if (cancelled) {
-          return;
-        }
-        setStrategies(items);
-        setSelectedStrategyId((previous) => previous ?? items[0]?.id ?? null);
-      } catch (error) {
-        if (cancelled) {
-          return;
-        }
-        setStrategiesError(getErrorMessage(error));
-      } finally {
-        if (!cancelled) {
-          setIsLoadingStrategies(false);
-        }
-      }
-    };
-
-    void loadStrategies();
-
-    return () => {
-      cancelled = true;
-    };
+    getOfflineDatasets()
+      .then((items) => {
+        setDatasets(items);
+        setDatasetId(items[0]?.id ?? "");
+        if (!items.length) setStatus("error");
+      })
+      .catch((reason: unknown) => {
+        setStatus("error");
+        setError(reason instanceof Error ? reason.message : "Offline dataset catalog unavailable");
+      });
   }, []);
 
+  const selectedDataset = datasets.find((item) => item.id === datasetId);
+  const allocationTotal = number(parameters.profit_compound_pct) + number(parameters.profit_withdrawal_pct) + number(parameters.profit_tax_reserve_pct);
+  const replayPayload = useMemo<ReplayRequest | null>(() => {
+    if (!datasetId || !selectedDataset || allocationTotal !== 100) return null;
+    const first = Date.parse(selectedDataset.first_timestamp);
+    const last = Date.parse(selectedDataset.last_timestamp);
+    const oneThird = (last - first) / 3;
+    const range = researchPeriod === "entire_dataset" ? {}
+      : researchPeriod === "training"
+      ? { start_time: selectedDataset.first_timestamp, end_time: new Date(first + oneThird).toISOString() }
+      : researchPeriod === "validation"
+        ? { start_time: new Date(first + oneThird).toISOString(), end_time: new Date(first + oneThird * 2).toISOString() }
+        : { start_time: new Date(first + oneThird * 2).toISOString(), end_time: selectedDataset.last_timestamp };
+    return { dataset_id: datasetId, strategy_version: strategyVersion, research_period: researchPeriod, parameters, ...range };
+  }, [allocationTotal, datasetId, parameters, researchPeriod, selectedDataset, strategyVersion]);
+
   useEffect(() => {
-    let cancelled = false;
-
-    const loadCompletedBacktests = async () => {
-      setIsLoadingBacktests(true);
-      setBacktestsError(null);
-
-      try {
-        const items = await getBacktests();
-        if (cancelled) {
-          return;
-        }
-
-        setCompletedBacktests(items.filter((item) => item.status === "completed"));
-      } catch (error) {
-        if (cancelled) {
-          return;
-        }
-        setBacktestsError(getErrorMessage(error, "Could not load completed backtests right now."));
-      } finally {
-        if (!cancelled) {
-          setIsLoadingBacktests(false);
-        }
-      }
-    };
-
-    void loadCompletedBacktests();
-
+    if (!replayPayload) return;
+    const controller = new AbortController();
+    const timer = window.setTimeout(() => {
+      setStatus("replaying");
+      setError("");
+      replayOfflineStrategy(replayPayload, controller.signal)
+        .then((result) => {
+          setRun(result);
+          setSelectedTrade(null);
+          setAnalysisRange(null);
+          setPatternAnalysis(null);
+          setSelectedFinding(null);
+          setCurrentCandle(null);
+          setPlaybackIndex(viewModeRef.current === "instant" ? result.candles.length : 0);
+          setIsPlaying(false);
+          setStatus("ready");
+        })
+        .catch((reason: unknown) => {
+          if (reason instanceof DOMException && reason.name === "AbortError") return;
+          setStatus("error");
+          setError(reason instanceof Error ? reason.message : "Replay failed");
+        });
+    }, 350);
     return () => {
-      cancelled = true;
+      window.clearTimeout(timer);
+      controller.abort();
     };
-  }, []);
+  }, [replayPayload]);
 
   useEffect(() => {
-    let cancelled = false;
-
-    const loadParameterSets = async () => {
-      setIsLoadingParameterSets(true);
-      setParameterSetsError(null);
-
-      try {
-        const items = await getParameterSets();
-        if (cancelled) {
-          return;
-        }
-        setParameterSets(items);
-      } catch (error) {
-        if (cancelled) {
-          return;
-        }
-        setParameterSetsError(getErrorMessage(error));
-      } finally {
-        if (!cancelled) {
-          setIsLoadingParameterSets(false);
-        }
-      }
-    };
-
-    void loadParameterSets();
-
-    return () => {
-      cancelled = true;
-    };
-  }, []);
-
-  const selectedStrategy = useMemo(() => {
-    if (!selectedStrategyId) {
-      return null;
-    }
-    return strategies.find((item) => item.id === selectedStrategyId) ?? null;
-  }, [selectedStrategyId, strategies]);
-
-  const selectedMetadata = selectedStrategy ? normalizeStrategyMetadata(selectedStrategy) : null;
-  const parameterDefinitions = useMemo(() => {
-    if (!selectedStrategy) {
-      return [];
-    }
-
-    return getParameterDefinitions(selectedStrategy.slug);
-  }, [selectedStrategy]);
-
-  useEffect(() => {
-    if (!selectedStrategy) {
-      setParameterValues({});
-      setSelectedSnapshotId(null);
-      return;
-    }
-
-    const definitions = getParameterDefinitions(selectedStrategy.slug);
-    const defaults: ParameterValues = {};
-    for (const definition of definitions) {
-      defaults[definition.key] = definition.defaultValue;
-    }
-    setParameterValues(defaults);
-    setSelectedSnapshotId(null);
-  }, [selectedStrategy]);
-
-  const perFieldValidation = useMemo(() => {
-    const map: Record<string, ReturnType<typeof validateParameterValue>> = {};
-    for (const definition of parameterDefinitions) {
-      map[definition.key] = validateParameterValue(definition, parameterValues[definition.key]);
-    }
-    return map;
-  }, [parameterDefinitions, parameterValues]);
-
-  const formValidation = useMemo(() => {
-    if (!selectedStrategy) {
-      return { valid: true, warnings: [], errors: [] };
-    }
-
-    return validateParameterValues(selectedStrategy.slug, parameterValues);
-  }, [parameterValues, selectedStrategy]);
-
-  const strategyParameterSets = useMemo(() => {
-    if (!selectedStrategy) {
-      return [];
-    }
-
-    return parameterSets.filter((item) => item.strategy_id === selectedStrategy.id);
-  }, [parameterSets, selectedStrategy]);
-
-  const normalizedSnapshotName = snapshotName.trim().toLowerCase();
-  const hasDuplicateSnapshotName = useMemo(() => {
-    if (!normalizedSnapshotName) {
-      return false;
-    }
-
-    return strategyParameterSets.some((item) => item.name.trim().toLowerCase() === normalizedSnapshotName);
-  }, [normalizedSnapshotName, strategyParameterSets]);
-
-  const selectedSnapshot = useMemo(() => {
-    if (!selectedSnapshotId) {
-      return null;
-    }
-
-    return strategyParameterSets.find((item) => item.id === selectedSnapshotId) ?? null;
-  }, [selectedSnapshotId, strategyParameterSets]);
-
-  const launchParameterSetId = selectedSnapshot?.id ?? strategyParameterSets[0]?.id ?? null;
-  const strategyHealth = getHealthState(formValidation);
-  const readinessScore = getReadinessScore(parameterDefinitions, parameterValues, formValidation);
-  const readinessLabel = getReadinessLabel(strategyHealth);
-  const estimatedBehavior = selectedStrategy ? getBehaviorSummary(selectedStrategy.slug, parameterValues) : null;
-  const beginnerChecklistSummary = getBeginnerTopObservations(strategyHealth, readinessScore, [], estimatedBehavior);
-
-  const numericStartingCapital = Number(startingCapital);
-  const hasValidStartingCapital = Number.isFinite(numericStartingCapital) && numericStartingCapital >= 25;
-  const hasRequiredLaunchFields = Boolean(selectedStrategy && launchParameterSetId && hasValidStartingCapital);
-  const hasValidConfigurationForLaunch = formValidation.errors.length === 0;
-
-  const reviewChecklist: ReviewChecklistItem[] = [
-    {
-      key: "strategy",
-      label: "Strategy selected",
-      complete: Boolean(selectedStrategy),
-    },
-    {
-      key: "parameters",
-      label: "Parameters valid",
-      complete: formValidation.errors.length === 0,
-    },
-    {
-      key: "readiness",
-      label: "Configuration ready",
-      complete: hasValidConfigurationForLaunch,
-    },
-    {
-      key: "capital",
-      label: "Starting capital specified",
-      complete: hasValidStartingCapital,
-    },
-    {
-      key: "snapshot",
-      label: "Snapshot applied",
-      complete: Boolean(selectedSnapshot),
-      optional: true,
-    },
-  ];
-
-  const missingRequiredChecklistItems = reviewChecklist.filter((item) => !item.optional && !item.complete);
-
-  const strategyNameById = useMemo(() => {
-    const mapping = new Map<string, string>();
-    for (const strategy of strategies) {
-      mapping.set(strategy.id, strategy.name || strategy.slug);
-    }
-    return mapping;
-  }, [strategies]);
-
-  const snapshotNameById = useMemo(() => {
-    const mapping = new Map<string, string>();
-    for (const parameterSet of parameterSets) {
-      mapping.set(parameterSet.id, parameterSet.name);
-    }
-    return mapping;
-  }, [parameterSets]);
-
-  const selectedComparisonRuns = useMemo(() => {
-    return completedBacktests.filter((item) => selectedComparisonIds.includes(item.id));
-  }, [completedBacktests, selectedComparisonIds]);
-
-  const highlightedWinners = useMemo<HighlightedComparisonWinners>(() => {
-    const getReturn = (item: BacktestListItem) => parseFiniteNumber(item.metrics?.total_return_pct);
-    const getWinRate = (item: BacktestListItem) => parseFiniteNumber(item.metrics?.win_rate);
-    const getDrawdown = (item: BacktestListItem) => parseFiniteNumber(item.metrics?.max_drawdown);
-    const getFeeDrag = (item: BacktestListItem) => parseFiniteNumber(item.metrics?.fee_drag_pct);
-
-    return {
-      bestTotalReturnRunId: pickWinner(selectedComparisonRuns, getReturn, "max"),
-      highestWinRateRunId: pickWinner(selectedComparisonRuns, getWinRate, "max"),
-      lowestDrawdownRunId: pickWinner(selectedComparisonRuns, getDrawdown, "min"),
-      lowestFeeDragRunId: pickWinner(selectedComparisonRuns, getFeeDrag, "min"),
-    };
-  }, [selectedComparisonRuns]);
-
-  const keyDifferences = useMemo(() => {
-    if (selectedComparisonRuns.length < 2) {
-      return [] as string[];
-    }
-
-    const statements: string[] = [];
-
-    const runsWithTrades = selectedComparisonRuns
-      .map((run, index) => ({ code: toRunCode(index), trades: run.metrics?.trade_count }))
-      .filter((entry) => typeof entry.trades === "number") as Array<{ code: string; trades: number }>;
-
-    if (runsWithTrades.length >= 2) {
-      const sorted = [...runsWithTrades].sort((a, b) => b.trades - a.trades);
-      if (sorted[0].trades > sorted[sorted.length - 1].trades) {
-        statements.push(`${sorted[0].code} produced more trades.`);
-      }
-    }
-
-    const runsWithDrawdown = selectedComparisonRuns
-      .map((run, index) => ({ code: toRunCode(index), drawdown: parseFiniteNumber(run.metrics?.max_drawdown) }))
-      .filter((entry) => entry.drawdown !== null) as Array<{ code: string; drawdown: number }>;
-
-    if (runsWithDrawdown.length >= 2) {
-      const sorted = [...runsWithDrawdown].sort((a, b) => a.drawdown - b.drawdown);
-      if (sorted[0].drawdown < sorted[sorted.length - 1].drawdown) {
-        statements.push(`${sorted[0].code} experienced lower drawdown.`);
-      }
-    }
-
-    const runsWithFeeDrag = selectedComparisonRuns
-      .map((run, index) => ({ code: toRunCode(index), feeDrag: parseFiniteNumber(run.metrics?.fee_drag_pct) }))
-      .filter((entry) => entry.feeDrag !== null) as Array<{ code: string; feeDrag: number }>;
-
-    if (runsWithFeeDrag.length >= 2) {
-      const sorted = [...runsWithFeeDrag].sort((a, b) => b.feeDrag - a.feeDrag);
-      if (sorted[0].feeDrag > sorted[sorted.length - 1].feeDrag) {
-        statements.push(`${sorted[0].code} paid higher fees.`);
-      }
-    }
-
-    return statements;
-  }, [selectedComparisonRuns]);
-
-  const insightsObservations = useMemo(() => {
-    if (selectedComparisonRuns.length === 0) {
-      return [] as InsightObservation[];
-    }
-
-    const observations: InsightObservation[] = [];
-
-    const runWithHighestReturn = selectedComparisonRuns
-      .map((run, index) => ({ runCode: toRunCode(index), value: parseFiniteNumber(run.metrics?.total_return_pct) }))
-      .filter((entry) => entry.value !== null)
-      .sort((a, b) => (b.value as number) - (a.value as number))[0];
-
-    if (runWithHighestReturn && runWithHighestReturn.value !== null) {
-      observations.push({
-        text: `${runWithHighestReturn.runCode} produced the highest return (${formatTrendPercentValue(runWithHighestReturn.value)}).`,
-        beginnerText: "Higher total return means that run grew the starting capital more over the test period.",
+    if (!isPlaying || !run || viewMode !== "playback") return;
+    const delay = { 1: 600, 5: 120, 20: 30, 100: 8 }[playbackSpeed];
+    const timer = window.setInterval(() => {
+      setPlaybackIndex((current) => {
+        const next = Math.min(run.candles.length, current + 1);
+        if (next >= run.candles.length) setIsPlaying(false);
+        setCurrentCandle(run.candles[Math.max(0, next - 1)]?.timestamp ?? null);
+        return next;
       });
-    }
+    }, delay);
+    return () => window.clearInterval(timer);
+  }, [isPlaying, playbackSpeed, run, viewMode]);
 
-    const runWithLowestDrawdown = selectedComparisonRuns
-      .map((run, index) => ({ runCode: toRunCode(index), value: parseFiniteNumber(run.metrics?.max_drawdown) }))
-      .filter((entry) => entry.value !== null)
-      .sort((a, b) => (a.value as number) - (b.value as number))[0];
-
-    if (runWithLowestDrawdown && runWithLowestDrawdown.value !== null) {
-      observations.push({
-        text: `${runWithLowestDrawdown.runCode} experienced the smallest drawdown (${formatTrendPercentValue(runWithLowestDrawdown.value)}).`,
-        beginnerText: "Smaller drawdown means the run had a shallower drop from its peak equity.",
-      });
-    }
-
-    const runWithMostTrades = selectedComparisonRuns
-      .map((run, index) => ({ runCode: toRunCode(index), value: run.metrics?.trade_count }))
-      .filter((entry) => typeof entry.value === "number")
-      .sort((a, b) => (b.value as number) - (a.value as number))[0];
-
-    if (runWithMostTrades && typeof runWithMostTrades.value === "number") {
-      observations.push({
-        text: `${runWithMostTrades.runCode} traded most frequently (${runWithMostTrades.value} trades).`,
-        beginnerText: "More trades means this run entered and exited positions more often in the same period.",
-      });
-    }
-
-    return observations;
-  }, [selectedComparisonRuns]);
-
-  const whatImprovedFacts = useMemo(() => {
-    if (selectedComparisonRuns.length < 2) {
-      return [] as string[];
-    }
-
-    const baseline = selectedComparisonRuns[0];
-    const candidate = selectedComparisonRuns[1];
-
-    const baselineParams = parameterSets.find((item) => item.id === baseline.parameter_set_id)?.parameters ?? {};
-    const candidateParams = parameterSets.find((item) => item.id === candidate.parameter_set_id)?.parameters ?? {};
-
-    const paramKeys = Array.from(new Set([...Object.keys(baselineParams), ...Object.keys(candidateParams)])).sort();
-    const changedParameterLines = paramKeys
-      .filter((key) => baselineParams[key] !== candidateParams[key])
-      .map((key) => `${key}: ${String(baselineParams[key] ?? "Not available")} -> ${String(candidateParams[key] ?? "Not available")}`);
-
-    const lines: string[] = [];
-    lines.push(`Parameter changes: ${changedParameterLines.length > 0 ? changedParameterLines.join("; ") : "None"}.`);
-
-    const baselineTrades = baseline.metrics?.trade_count;
-    const candidateTrades = candidate.metrics?.trade_count;
-    if (typeof baselineTrades === "number" && typeof candidateTrades === "number") {
-      lines.push(`Trade count change: ${baselineTrades} -> ${candidateTrades} (${formatSignedNumber(candidateTrades - baselineTrades)}).`);
-    } else {
-      lines.push("Trade count change: Not available.");
-    }
-
-    const baselineDrawdown = parseFiniteNumber(baseline.metrics?.max_drawdown);
-    const candidateDrawdown = parseFiniteNumber(candidate.metrics?.max_drawdown);
-    if (baselineDrawdown !== null && candidateDrawdown !== null) {
-      lines.push(`Drawdown change: ${formatTrendPercentValue(baselineDrawdown)} -> ${formatTrendPercentValue(candidateDrawdown)} (${formatPercentPointDelta(candidateDrawdown - baselineDrawdown)}).`);
-    } else {
-      lines.push("Drawdown change: Not available.");
-    }
-
-    const baselineFeeDrag = parseFiniteNumber(baseline.metrics?.fee_drag_pct);
-    const candidateFeeDrag = parseFiniteNumber(candidate.metrics?.fee_drag_pct);
-    if (baselineFeeDrag !== null && candidateFeeDrag !== null) {
-      lines.push(`Fee drag change: ${formatTrendPercentValue(baselineFeeDrag)} -> ${formatTrendPercentValue(candidateFeeDrag)} (${formatPercentPointDelta(candidateFeeDrag - baselineFeeDrag)}).`);
-    } else {
-      lines.push("Fee drag change: Not available.");
-    }
-
-    const baselineReturn = parseFiniteNumber(baseline.metrics?.total_return_pct);
-    const candidateReturn = parseFiniteNumber(candidate.metrics?.total_return_pct);
-    if (baselineReturn !== null && candidateReturn !== null) {
-      lines.push(`Return change: ${formatTrendPercentValue(baselineReturn)} -> ${formatTrendPercentValue(candidateReturn)} (${formatPercentPointDelta(candidateReturn - baselineReturn)}).`);
-    } else {
-      lines.push("Return change: Not available.");
-    }
-
-    return lines;
-  }, [parameterSets, selectedComparisonRuns]);
-
-  const metricTrendVisuals = useMemo(() => {
-    const totalReturnValues = selectedComparisonRuns.map((run) => parseFiniteNumber(run.metrics?.total_return_pct));
-    const winRateValues = selectedComparisonRuns.map((run) => parseFiniteNumber(run.metrics?.win_rate));
-    const drawdownValues = selectedComparisonRuns.map((run) => parseFiniteNumber(run.metrics?.max_drawdown));
-    const feeDragValues = selectedComparisonRuns.map((run) => parseFiniteNumber(run.metrics?.fee_drag_pct));
-
-    return {
-      totalReturn: { values: totalReturnValues, widths: normalizeWidths(totalReturnValues) },
-      winRate: { values: winRateValues, widths: normalizeWidths(winRateValues) },
-      maxDrawdown: { values: drawdownValues, widths: normalizeWidths(drawdownValues) },
-      feeDrag: { values: feeDragValues, widths: normalizeWidths(feeDragValues) },
-    };
-  }, [selectedComparisonRuns]);
-
-  const toggleComparisonSelection = (runId: string) => {
-    setSelectedComparisonIds((previous) => {
-      if (previous.includes(runId)) {
-        return previous.filter((id) => id !== runId);
-      }
-
-      if (previous.length >= 3) {
-        return previous;
-      }
-
-      return [...previous, runId];
-    });
+  const updateParameter = (key: keyof StrategyLabParameters, value: string) => {
+    setIsPlaying(false);
+    setPlaybackIndex(0);
+    setParameters((current) => ({ ...current, [key]: key === "required_declining_candles" ? Math.max(2, Math.round(Number(value))) : value }));
   };
 
-  const createExperimentLogEntry = () => {
-    if (selectedComparisonRuns.length === 0) {
-      return;
-    }
-
-    const comparedRuns = selectedComparisonRuns.map((run, index) => `${toRunCode(index)} (${run.id})`);
-    const strategies = Array.from(
-      new Set(
-        selectedComparisonRuns.map((run) => strategyNameById.get(run.strategy_id) ?? `Strategy ID: ${run.strategy_id}`),
-      ),
-    );
-    const snapshots = Array.from(
-      new Set(
-        selectedComparisonRuns.map((run) => snapshotNameById.get(run.parameter_set_id) ?? "Not available"),
-      ),
-    );
-
-    const nextEntry: ExperimentLogEntry = {
-      id: `experiment-log-${Date.now()}`,
-      createdAt: new Date().toISOString(),
-      comparedRuns,
-      strategies,
-      snapshots,
-      keyDifferences: keyDifferences.length > 0 ? keyDifferences : ["Not enough completed metric differences are available yet."],
-      observations: insightsObservations.length > 0 ? insightsObservations.map((item) => item.text) : ["Not enough metrics are available to generate observations."],
-      notes: experimentNotes.trim() || undefined,
-      beginnerSummary: isBeginnerMode ? insightsObservations.map((item) => item.beginnerText).join(" ") || "Not enough metrics are available for beginner summary." : undefined,
-    };
-
-    setExperimentLogEntries((previous) => [nextEntry, ...previous]);
-    setExperimentNotes("");
+  const saveRun = () => {
+    if (!run) return;
+    const saved = { run, replayDate: new Date().toISOString(), parameterSet: `Entry ${run.parameters.entry_offset_pct} · Stop ${run.parameters.initial_stop_pct} · Trail ${run.parameters.trailing_distance_pct}` };
+    setSavedRuns((current) => [saved, ...current.filter((item) => JSON.stringify(item.run.parameters) !== JSON.stringify(run.parameters) || item.run.dataset.id !== run.dataset.id)].slice(0, 8));
   };
 
-  const handleLaunchBacktest = async () => {
-    if (!selectedStrategy || !launchParameterSetId || !hasValidStartingCapital) {
-      setLaunchError("Complete all required checklist items before launch.");
-      return;
-    }
+  const reopenRun = (saved: SavedExperiment) => {
+    setIsPlaying(false);
+    setDatasetId(saved.run.dataset.id);
+    setStrategyVersion(saved.run.strategy_version);
+    setResearchPeriod(saved.run.dataset.research_period);
+    setParameters(saved.run.parameters);
+    setRun(saved.run);
+    setPlaybackIndex(saved.run.candles.length);
+    setViewMode("instant");
+    setShowComparison(false);
+  };
 
-    const endDate = new Date();
-    const startDate = new Date(endDate);
-    startDate.setDate(startDate.getDate() - 180);
+  const changeViewMode = (mode: ViewMode) => {
+    setIsPlaying(false);
+    setViewMode(mode);
+    setPlaybackIndex(mode === "instant" ? run?.candles.length ?? 0 : 0);
+  };
 
-    setLaunchError(null);
-    setIsLaunchingBacktest(true);
+  const startOrStopSimulation = () => {
+    if (!run) return;
+    if (isPlaying) { setIsPlaying(false); return; }
+    const start = playbackIndex >= run.candles.length ? 0 : playbackIndex;
+    setPlaybackIndex(Math.max(1, start));
+    setIsPlaying(true);
+  };
 
+  const stepPlayback = (delta: number) => {
+    if (!run) return;
+    setIsPlaying(false);
+    setPlaybackIndex((current) => Math.max(1, Math.min(run.candles.length, current + delta)));
+  };
+
+  const toggleLayer = (layer: ChartLayerId) => {
+    setVisibleLayers((current) => ({ ...current, [layer]: !current[layer] }));
+  };
+
+  const analysisPartition: PatternAnalysisRequest["partition"] = researchPeriod === "out_of_sample" ? "final_test" : researchPeriod;
+  const patternPayload = (range: [number, number]): PatternAnalysisRequest => ({
+    dataset_id: datasetId,
+    strategy_version: strategyVersion,
+    selected_start_index: range[0],
+    selected_end_index: range[1],
+    partition: analysisPartition,
+    parameters,
+  });
+  const runPatternAnalysis = async (request: () => Promise<PatternAnalysis>) => {
+    setIsPlaying(false);
+    setAnalysisStatus("analyzing");
+    setAnalysisError("");
     try {
-      await runBacktest({
-        strategy_id: selectedStrategy.id,
-        parameter_set_id: launchParameterSetId,
-        asset_id: DEFAULT_BACKTEST_ASSET_ID,
-        interval: DEFAULT_BACKTEST_INTERVAL,
-        start_time: startDate.toISOString(),
-        end_time: endDate.toISOString(),
-        initial_capital: startingCapital,
-        fee_bps: feeBps,
-        slippage_bps: slippageBps,
-      });
-
-      router.push("/backtests");
-    } catch (error) {
-      setLaunchError(getErrorMessage(error));
-    } finally {
-      setIsLaunchingBacktest(false);
+      const result = await request();
+      setPatternAnalysis(result);
+      setAnalysisRange(result.selected_range);
+      setSelectedFinding(result.findings[0] ?? null);
+      setAnalysisStatus("idle");
+    } catch (reason: unknown) {
+      setAnalysisStatus("error");
+      setAnalysisError(reason instanceof Error ? reason.message : "Pattern analysis failed");
     }
   };
-
-  const applySnapshot = (snapshot: ParameterSetItem) => {
-    if (!selectedStrategy) {
-      return;
-    }
-
-    const nextValues: ParameterValues = {};
-    for (const definition of parameterDefinitions) {
-      nextValues[definition.key] = coerceParameterValue(definition, snapshot.parameters[definition.key]);
-    }
-
-    setParameterValues(nextValues);
-    setSelectedSnapshotId(snapshot.id);
-    setSaveSnapshotError(null);
+  const selectAnalysisRange = (range: [number, number]) => {
+    setIsPlaying(false);
+    setAnalysisRange(range);
+    setPatternAnalysis(null);
+    setSelectedFinding(null);
   };
-
-  const handleSaveSnapshot = async () => {
-    if (!selectedStrategy) {
-      return;
-    }
-
-    const trimmedName = snapshotName.trim();
-    if (!trimmedName) {
-      setSaveSnapshotError("Snapshot name is required.");
-      return;
-    }
-
-    if (hasDuplicateSnapshotName) {
-      setSaveSnapshotError("A snapshot with this name already exists for the selected strategy.");
-      return;
-    }
-
-    setIsSavingSnapshot(true);
-    setSaveSnapshotError(null);
-
-    try {
-      const saved = await saveParameterSet(selectedStrategy.id, {
-        name: trimmedName,
-        parameters: parameterValues,
-      });
-
-      setParameterSets((previous) => [...previous, saved]);
-      setSnapshotMetaById((previous) => ({
-        ...previous,
-        [saved.id]: {
-          notes: snapshotNotes.trim() || undefined,
-          createdAt: saved.created_at ?? new Date().toISOString(),
-        },
-      }));
-      setSnapshotName("");
-      setSnapshotNotes("");
-      setSelectedSnapshotId(saved.id);
-    } catch (error) {
-      if (error instanceof ApiRequestError && error.status === 409) {
-        setSaveSnapshotError("A snapshot with this name already exists. Choose a different name.");
-      } else {
-        setSaveSnapshotError(getErrorMessage(error));
-      }
-    } finally {
-      setIsSavingSnapshot(false);
-    }
+  const analyzeSelection = () => {
+    if (analysisRange) void runPatternAnalysis(() => analyzePatternSelection(patternPayload(analysisRange)));
   };
-
-  const handleValueChange = (key: string, nextValue: string | number | boolean) => {
-    setParameterValues((previous) => ({
-      ...previous,
-      [key]: nextValue,
+  const analyzeVisibleWindow = () => {
+    if (run && visibleCandleCount) void runPatternAnalysis(() => analyzePatternVisibleWindow(patternPayload([0, visibleCandleCount - 1])));
+  };
+  const analyzeTrade = () => {
+    if (!run || !selectedTrade) return;
+    const tradeIndex = run.trades.indexOf(selectedTrade);
+    void runPatternAnalysis(() => analyzePatternTrade({
+      dataset_id: datasetId, strategy_version: strategyVersion, trade_index: tradeIndex,
+      partition: analysisPartition, parameters,
     }));
+  };
+  const openAnnotation = (detailsRef: string) => {
+    const finding = patternAnalysis?.findings.find((item) => item.finding_id === detailsRef) ?? null;
+    setSelectedFinding(finding);
+  };
+
+  const visibleLayerCount = CHART_LAYERS.filter((layer) => visibleLayers[layer.id]).length;
+  const visibleCandleCount = run ? (viewMode === "instant" ? run.candles.length : Math.max(1, playbackIndex)) : 0;
+  const visibleTrades = run?.trades.filter((trade) => trade.exit_candle_index < visibleCandleCount) ?? [];
+  const currentPlaybackEvents = run?.events.filter((event) => event.candle_index === visibleCandleCount - 1) ?? [];
+  const fullTradeTrace = useMemo(() => {
+    if (!run || !selectedTrade) return [];
+    const tradeIndex = run.trades.indexOf(selectedTrade);
+    const previousExit = tradeIndex > 0 ? run.trades[tradeIndex - 1].exit_candle_index : -1;
+    return run.events
+      .filter((event) => event.candle_index > previousExit && event.candle_index <= selectedTrade.exit_candle_index)
+      .map((event, index) => ({ event, label: traceLabel(event.kind, index === 0) }));
+  }, [run, selectedTrade]);
+  const tradeTimeline = useMemo(() => {
+    if (!run || !selectedTrade) return [];
+    const tradeIndex = run.trades.indexOf(selectedTrade);
+    const previousExit = tradeIndex > 0 ? run.trades[tradeIndex - 1].exit_candle_index : -1;
+    let limitCount = 0;
+    let stopShown = false;
+    let priorTrailingPrice: string | null = null;
+    return run.events.flatMap((event) => {
+      if (event.candle_index <= previousExit || event.candle_index > selectedTrade.exit_candle_index) return [];
+      if (event.kind === "buy_limit") limitCount += 1;
+      if (event.kind === "protective_stop") {
+        if (stopShown) return [];
+        stopShown = true;
+      }
+      if (event.kind === "trailing_floor") {
+        if (event.price === priorTrailingPrice) return [];
+        priorTrailingPrice = event.price;
+      }
+      if (event.kind === "entry") return [];
+      return [{
+        event,
+        label: event.kind === "buy_limit" ? (limitCount === 1 ? "BUY LIMIT" : "BUY LIMIT REPLACED")
+          : event.kind === "cancelled_order" ? "BUY CANCELLED"
+            : event.kind === "filled_order" ? "BUY FILLED"
+              : event.kind === "protective_stop" ? "STOP INITIALIZED"
+                : event.kind === "profit_activation" ? "PROFIT MODE"
+                  : event.kind === "trailing_floor" ? "TRAILING UPDATED"
+                    : event.kind === "exit" ? "SELL FILLED"
+                      : "TRACE EVENT",
+      }];
+    });
+  }, [run, selectedTrade]);
+
+  const exportTrades = () => {
+    if (!run) return;
+    const fields = ["entry_timestamp", "exit_timestamp", "effective_entry_price", "effective_exit_price", "net_pnl", "net_return_pct", "mfe_pct", "mae_pct", "holding_candles", "exit_reason"];
+    download("strategy-lab-trades.csv", [fields.join(","), ...run.trades.map((trade) => fields.map((field) => String(trade[field] ?? "")).join(","))].join("\n"), "text/csv");
   };
 
   return (
-    <div className="mx-auto w-full max-w-7xl space-y-4 sm:space-y-6" data-testid="strategy-lab-mobile-wrapper">
-      <ResearchJourney />
-
-      <header className="space-y-2 rounded-xl border border-border bg-background/40 p-4 sm:p-5">
-        <div className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
+    <>
+      <div className="strategy-lab -m-4 min-h-screen bg-[#08110f] text-[#e6eee9] sm:-m-6">
+        <header className="flex flex-wrap items-center justify-between gap-3 border-b border-[#294139] bg-[#0c1714] px-4 py-3">
           <div>
-            <h1 className="text-2xl font-semibold">Strategy Lab Research Workspace</h1>
-            <p className="mt-1 text-sm text-foreground/75">
-              Build confidence with historical testing first, then review results before any execution phase.
-            </p>
+            <p className="font-mono text-[11px] uppercase tracking-[0.2em] text-[#6fa78f]">Offline deterministic research</p>
+            <h1 className="font-serif text-2xl">Visual Strategy Laboratory</h1>
           </div>
-          <button
-            type="button"
-            role="switch"
-            aria-checked={isBeginnerMode}
-            aria-label="Beginner Mode"
-            onClick={() => setIsBeginnerMode((previous) => !previous)}
-            className="inline-flex items-center justify-center rounded-md border border-border bg-muted px-3 py-2 text-sm font-medium transition hover:bg-foreground/10"
-          >
-            Beginner Mode: {isBeginnerMode ? "On" : "Off"}
-          </button>
-        </div>
-      </header>
-
-      {isBeginnerMode ? (
-        <section className="rounded-xl border border-emerald-500/30 bg-emerald-500/10 p-4" data-testid="beginner-welcome-card">
-          <h2 className="text-base font-semibold sm:text-lg">Welcome</h2>
-          <p className="mt-1 text-sm text-foreground/85">
-            This workspace helps you safely experiment with trading strategies using historical data before risking real money.
-          </p>
-          <ul className="mt-3 space-y-2 text-sm text-foreground/80">
-            <li>
-              <strong>Strategy:</strong> A rule set that decides when to buy, sell, or hold.
-            </li>
-            <li>
-              <strong>Backtest:</strong> A simulation showing how a strategy would have behaved in historical data.
-            </li>
-            <li>
-              <strong>Parameter:</strong> A setting value that changes how a strategy behaves.
-            </li>
-            <li>
-              <strong>Starting Capital:</strong> The amount a backtest starts with, such as $25.
-            </li>
-          </ul>
-        </section>
-      ) : null}
-
-      <div className="grid gap-4 lg:grid-cols-2" data-testid="strategy-lab-sections-grid">
-        <section
-          aria-labelledby="choose-strategy"
-          className="rounded-xl border border-border bg-muted/30 p-4"
-          data-testid="strategy-lab-section-choose-strategy"
-        >
-          <h2 id="choose-strategy" className="text-base font-semibold sm:text-lg">
-            1) Choose Strategy
-          </h2>
-          <p className="mt-1 text-sm text-foreground/75">Pick a strategy card to start this research workflow.</p>
-          <ContextualHelp
-            title="choose-strategy"
-            body="This section helps you pick a strategy before changing parameters or running backtests. Start here, then move through the workflow from top to bottom."
-          />
-
-          {isLoadingStrategies ? (
-            <div className="mt-3 space-y-3" role="status" aria-live="polite" aria-label="Strategies loading">
-              <div className="h-24 animate-pulse rounded-lg bg-foreground/15" />
-              <div className="h-24 animate-pulse rounded-lg bg-foreground/15" />
-            </div>
-          ) : null}
-
-          {!isLoadingStrategies && strategiesError ? (
-            <div className="mt-3 rounded-md border border-red-500/40 bg-red-500/10 px-3 py-2 text-sm text-red-100" data-testid="strategy-error-state">
-              {strategiesError}
-            </div>
-          ) : null}
-
-          {!isLoadingStrategies && !strategiesError && strategies.length === 0 ? (
-            <p className="mt-3 rounded-md border border-dashed border-border bg-background/30 px-3 py-2 text-sm text-foreground/70" data-testid="strategy-empty-state">
-              No strategies registered yet. Strategy cards will appear here when available.
-            </p>
-          ) : null}
-
-          {!isLoadingStrategies && !strategiesError && strategies.length > 0 ? (
-            <div className="mt-3 grid gap-3" data-testid="strategy-cards-wrapper">
-              {strategies.map((strategy) => {
-                const metadata = normalizeStrategyMetadata(strategy);
-                const isSelected = selectedStrategyId === strategy.id;
-
-                return (
-                  <article
-                    key={strategy.id}
-                    className={[
-                      "rounded-lg border bg-background/35 p-3",
-                      isSelected ? "border-accent ring-1 ring-accent/50" : "border-border",
-                    ].join(" ")}
-                  >
-                    <button
-                      type="button"
-                      onClick={() => setSelectedStrategyId(strategy.id)}
-                      className="w-full text-left"
-                      aria-pressed={isSelected}
-                      aria-label={`Select strategy ${strategy.name}`}
-                    >
-                      <div className="flex items-start justify-between gap-3">
-                        <h3 className="text-base font-semibold" data-testid={`strategy-card-title-${strategy.slug}`}>
-                          {strategy.name}
-                        </h3>
-                        <span
-                          className={[
-                            "rounded-full border px-2 py-0.5 text-xs font-medium",
-                            strategy.is_active
-                              ? "border-emerald-500/40 bg-emerald-500/15 text-emerald-200"
-                              : "border-border bg-muted/30 text-foreground/75",
-                          ].join(" ")}
-                        >
-                          {strategy.is_active ? "Active" : "Inactive"}
-                        </span>
-                      </div>
-
-                      <p className="mt-1 text-sm text-foreground/80">{metadata.description}</p>
-
-                      <dl className="mt-3 grid gap-2 text-sm sm:grid-cols-2">
-                        <div>
-                          <dt className="text-foreground/60">Difficulty</dt>
-                          <dd>{metadata.difficulty}</dd>
-                        </div>
-                        <div>
-                          <dt className="text-foreground/60">Primary Style</dt>
-                          <dd>{metadata.primaryStyle}</dd>
-                        </div>
-                        <div>
-                          <dt className="text-foreground/60">Works Best In</dt>
-                          <dd>{metadata.worksBestIn}</dd>
-                        </div>
-                        <div>
-                          <dt className="text-foreground/60">Works Poorly In</dt>
-                          <dd>{metadata.worksPoorlyIn}</dd>
-                        </div>
-                        <div>
-                          <dt className="text-foreground/60">Typical Trade Frequency</dt>
-                          <dd>{metadata.tradeFrequency}</dd>
-                        </div>
-                        <div>
-                          <dt className="text-foreground/60">Default Parameters</dt>
-                          <dd>{formatDefaultParamsSummary(strategy.default_params)}</dd>
-                        </div>
-                      </dl>
-
-                      {isBeginnerMode ? (
-                        <div className="mt-3 rounded-md border border-border bg-muted/20 px-3 py-2 text-sm text-foreground/80">
-                          <p className="font-medium">What does this strategy do?</p>
-                          <p className="mt-1">{metadata.beginnerExplanation}</p>
-                        </div>
-                      ) : null}
-                    </button>
-                  </article>
-                );
-              })}
-
-              {selectedStrategy && selectedMetadata ? (
-                <section
-                  className="rounded-lg border border-border bg-background/25 p-4"
-                  aria-label="Strategy Detail"
-                  data-testid="strategy-detail-panel"
-                >
-                  <h3 className="text-base font-semibold">Strategy Detail</h3>
-                  <p className="mt-1 text-sm text-foreground/80">{selectedMetadata.description}</p>
-                  <p className="mt-2 text-sm text-foreground/80">
-                    <span className="font-medium">Beginner explanation:</span> {selectedMetadata.beginnerExplanation}
-                  </p>
-                  <p className="mt-2 text-sm text-foreground/80">
-                    <span className="font-medium">Default parameters:</span> {formatDefaultParamsSummary(selectedStrategy.default_params)}
-                  </p>
-                </section>
-              ) : null}
-            </div>
-          ) : null}
-        </section>
-
-        <section
-          aria-labelledby="configure-parameters"
-          className="rounded-xl border border-border bg-muted/30 p-4"
-          data-testid="strategy-lab-section-configure-parameters"
-        >
-          <h2 id="configure-parameters" className="text-base font-semibold sm:text-lg">
-            2) Configure Parameters
-          </h2>
-          <p className="mt-1 text-sm text-foreground/75">Adjust strategy settings with generated controls and live validation.</p>
-          <ContextualHelp
-            title="configure-parameters"
-            body="Parameters control how a strategy behaves. Update values here and watch validation and coaching update in real time."
-          />
-
-          {!selectedStrategy ? (
-            <p className="mt-3 rounded-md border border-dashed border-border bg-background/30 px-3 py-2 text-sm text-foreground/70">
-              Select a strategy to view its parameter editor.
-            </p>
-          ) : null}
-
-          {selectedStrategy && parameterDefinitions.length === 0 ? (
-            <p className="mt-3 rounded-md border border-dashed border-border bg-background/30 px-3 py-2 text-sm text-foreground/70">
-              No parameter metadata available for this strategy.
-            </p>
-          ) : null}
-
-          {selectedStrategy && parameterDefinitions.length > 0 ? (
-            <div className="mt-3 space-y-3" data-testid="generated-parameter-editor">
-              <div
-                className={[
-                  "rounded-md border px-3 py-2 text-sm",
-                  formValidation.valid ? "border-emerald-500/40 bg-emerald-500/10 text-emerald-100" : "border-amber-500/40 bg-amber-500/10 text-amber-100",
-                ].join(" ")}
-                role="status"
-                aria-live="polite"
-                data-testid="parameter-form-validation"
-              >
-                {formValidation.valid
-                  ? "All current parameter values are valid."
-                  : `${formValidation.errors.length} validation issue(s) require attention.`}
-              </div>
-
-              {parameterDefinitions.map((definition) => {
-                const currentValue = parameterValues[definition.key] ?? definition.defaultValue;
-                const validation = perFieldValidation[definition.key] ?? { valid: true, warnings: [], errors: [] };
-                const beginnerWhyChange = PARAMETER_BEGINNER_WHY_CHANGE[definition.key];
-
-                return (
-                  <article
-                    key={definition.key}
-                    className="rounded-lg border border-border bg-background/30 p-4"
-                    data-testid={`parameter-card-${definition.key}`}
-                  >
-                    <div className="flex flex-col gap-2 sm:flex-row sm:items-start sm:justify-between">
-                      <div>
-                        <h3 className="text-base font-semibold" id={`parameter-label-${definition.key}`}>
-                          {definition.label}
-                        </h3>
-                        <p className="text-sm text-foreground/80">
-                          Current Value: <span className="font-medium">{formatCurrentValue(currentValue, definition)}</span>
-                        </p>
-                      </div>
-                      <span className="rounded-full border border-border bg-muted/40 px-2 py-1 text-xs uppercase tracking-wide text-foreground/75">
-                        {definition.type}
-                      </span>
-                    </div>
-
-                    <div className="mt-3">{renderControl(definition, currentValue, (nextValue) => handleValueChange(definition.key, nextValue))}</div>
-
-                    <section className="mt-4 rounded-md border border-border/80 bg-muted/20 p-3" aria-label={`What it controls ${definition.label}`}>
-                      <h4 className="text-sm font-semibold">What it Controls</h4>
-                      <p className="mt-1 text-sm text-foreground/80">{definition.description}</p>
-                    </section>
-
-                    {isBeginnerMode ? (
-                      <section className="mt-3 rounded-md border border-border/80 bg-muted/20 p-3" data-testid={`beginner-why-change-${definition.key}`}>
-                        <h4 className="text-sm font-semibold">Why would I change this?</h4>
-                        {beginnerWhyChange ? (
-                          <>
-                            <p className="mt-1 text-sm font-medium text-foreground/90">{beginnerWhyChange.title}</p>
-                            <p className="mt-1 text-sm text-foreground/80">{beginnerWhyChange.lines[0]}</p>
-                            <p className="mt-1 text-sm text-foreground/80">{beginnerWhyChange.lines[1]}</p>
-                          </>
-                        ) : (
-                          <p className="mt-1 text-sm text-foreground/80">{definition.beginnerDescription}</p>
-                        )}
-                      </section>
-                    ) : (
-                      <details className="mt-3 rounded-md border border-border/80 bg-muted/20 p-3" data-testid={`advanced-beginner-collapsed-${definition.key}`}>
-                        <summary className="cursor-pointer text-sm font-semibold">Why would I change this?</summary>
-                        {beginnerWhyChange ? (
-                          <>
-                            <p className="mt-2 text-sm font-medium text-foreground/90">{beginnerWhyChange.title}</p>
-                            <p className="mt-1 text-sm text-foreground/80">{beginnerWhyChange.lines[0]}</p>
-                            <p className="mt-1 text-sm text-foreground/80">{beginnerWhyChange.lines[1]}</p>
-                          </>
-                        ) : (
-                          <p className="mt-2 text-sm text-foreground/80">{definition.beginnerDescription}</p>
-                        )}
-                      </details>
-                    )}
-
-                    {isBeginnerMode ? (
-                      <section className="mt-3 rounded-md border border-border/80 bg-muted/20 p-3" data-testid={`expected-effect-${definition.key}`}>
-                        <h4 className="text-sm font-semibold">Expected Effect</h4>
-                        <div className="mt-1">{renderExpectedEffects(definition, currentValue)}</div>
-                      </section>
-                    ) : (
-                      <details className="mt-3 rounded-md border border-border/80 bg-muted/20 p-3" data-testid={`advanced-effect-collapsed-${definition.key}`}>
-                        <summary className="cursor-pointer text-sm font-semibold">Expected Effect</summary>
-                        <div className="mt-2">{renderExpectedEffects(definition, currentValue)}</div>
-                      </details>
-                    )}
-
-                    <section className="mt-3 rounded-md border border-border/80 bg-muted/20 p-3" data-testid={`recommended-range-${definition.key}`}>
-                      <h4 className="text-sm font-semibold">Recommended Range</h4>
-                      <p className="mt-1 text-sm text-foreground/80">
-                        {definition.recommendedRange
-                          ? `Recommended: ${definition.recommendedRange.minimum}-${definition.recommendedRange.maximum}`
-                          : "No recommended range available."}
-                      </p>
-                    </section>
-
-                    <section className="mt-3" aria-live="polite" data-testid={`validation-${definition.key}`}>
-                      {validation.errors.map((error) => (
-                        <p key={error} className="mt-1 rounded-md border border-red-500/40 bg-red-500/10 px-2 py-1 text-sm text-red-100">
-                          {error}
-                        </p>
-                      ))}
-                      {validation.warnings.map((warning) => (
-                        <p key={warning} className="mt-1 rounded-md border border-amber-500/40 bg-amber-500/10 px-2 py-1 text-sm text-amber-100">
-                          {warning}
-                        </p>
-                      ))}
-                      {validation.valid && validation.warnings.length === 0 ? (
-                        <p className="mt-1 rounded-md border border-emerald-500/40 bg-emerald-500/10 px-2 py-1 text-sm text-emerald-100">
-                          Value looks valid.
-                        </p>
-                      ) : null}
-                    </section>
-                  </article>
-                );
-              })}
-            </div>
-          ) : null}
-        </section>
-
-        {selectedStrategy && parameterDefinitions.length > 0 ? (
-          <ConfigurationCoach
-            strategySlug={selectedStrategy.slug}
-            isBeginnerMode={isBeginnerMode}
-            definitions={parameterDefinitions}
-            values={parameterValues}
-            fieldValidation={perFieldValidation}
-            formValidation={formValidation}
-          />
-        ) : (
-          <PlaceholderSection
-            id="configuration-intelligence"
-            title="3) Configuration Intelligence"
-            description="Review a plain-language readiness summary before running a backtest."
-            placeholder="Select a strategy and load parameter metadata to view the Configuration Coach."
-          />
-        )}
-
-        <section
-          aria-labelledby="configuration-snapshots"
-          className="rounded-xl border border-border bg-muted/30 p-4"
-          data-testid="strategy-lab-section-configuration-snapshots"
-        >
-          <h2 id="configuration-snapshots" className="text-base font-semibold sm:text-lg">
-            4) Configuration Snapshots & Saved Presets
-          </h2>
-          <p className="mt-1 text-sm text-foreground/75">
-            Save the current configuration as a reusable snapshot, then view, select, or apply saved presets.
-          </p>
-          <ContextualHelp
-            title="configuration-snapshots"
-            body="Snapshots let you save and reuse parameter sets so you can compare experiments consistently without re-entering values."
-          />
-
-          {!selectedStrategy ? (
-            <p className="mt-3 rounded-md border border-dashed border-border bg-background/30 px-3 py-2 text-sm text-foreground/70">
-              Select a strategy to save and apply snapshots.
-            </p>
-          ) : (
-            <>
-              <div className="mt-3 rounded-lg border border-border bg-background/30 p-3" data-testid="snapshot-save-form">
-                <h3 className="text-sm font-semibold">Save Snapshot</h3>
-                <div className="mt-2 grid gap-2">
-                  <label htmlFor="snapshot-name" className="text-sm font-medium text-foreground/90">
-                    Snapshot Name
-                  </label>
-                  <input
-                    id="snapshot-name"
-                    aria-label="Snapshot Name"
-                    type="text"
-                    value={snapshotName}
-                    onChange={(event) => setSnapshotName(event.target.value)}
-                    className="w-full rounded-md border border-border bg-background px-3 py-2 text-sm"
-                    placeholder="e.g. conservative-v2"
-                  />
-
-                  <label htmlFor="snapshot-notes" className="text-sm font-medium text-foreground/90">
-                    Notes (optional)
-                  </label>
-                  <textarea
-                    id="snapshot-notes"
-                    aria-label="Snapshot Notes"
-                    value={snapshotNotes}
-                    onChange={(event) => setSnapshotNotes(event.target.value)}
-                    className="w-full rounded-md border border-border bg-background px-3 py-2 text-sm"
-                    rows={3}
-                    placeholder="Add context for what this setup is designed for."
-                  />
-                </div>
-
-                {hasDuplicateSnapshotName ? (
-                  <p className="mt-2 rounded-md border border-amber-500/40 bg-amber-500/10 px-2 py-1 text-sm text-amber-100" data-testid="snapshot-duplicate-warning">
-                    A snapshot with this name already exists for this strategy.
-                  </p>
-                ) : null}
-
-                {saveSnapshotError ? (
-                  <p className="mt-2 rounded-md border border-red-500/40 bg-red-500/10 px-2 py-1 text-sm text-red-100" data-testid="snapshot-save-error">
-                    {saveSnapshotError}
-                  </p>
-                ) : null}
-
-                <button
-                  type="button"
-                  aria-label="Save snapshot"
-                  onClick={() => void handleSaveSnapshot()}
-                  disabled={isSavingSnapshot || hasDuplicateSnapshotName}
-                  className="mt-3 inline-flex min-h-11 items-center justify-center rounded-md border border-border bg-muted px-4 py-2 text-sm font-medium transition hover:bg-foreground/10 focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-accent disabled:cursor-not-allowed disabled:opacity-60"
-                >
-                  {isSavingSnapshot ? "Saving..." : "Save Snapshot"}
-                </button>
-              </div>
-
-              <div className="mt-3" data-testid="snapshot-library">
-                <h3 className="text-sm font-semibold">Preset Library</h3>
-
-                {isLoadingParameterSets ? (
-                  <div className="mt-2 space-y-2" role="status" aria-live="polite" aria-label="Preset library loading">
-                    <div className="h-20 animate-pulse rounded-lg bg-foreground/15" />
-                    <div className="h-20 animate-pulse rounded-lg bg-foreground/15" />
-                  </div>
-                ) : null}
-
-                {!isLoadingParameterSets && parameterSetsError ? (
-                  <p className="mt-2 rounded-md border border-red-500/40 bg-red-500/10 px-2 py-1 text-sm text-red-100" data-testid="snapshot-library-error">
-                    {parameterSetsError}
-                  </p>
-                ) : null}
-
-                {!isLoadingParameterSets && !parameterSetsError && strategyParameterSets.length === 0 ? (
-                  <p className="mt-2 rounded-md border border-dashed border-border bg-background/30 px-3 py-2 text-sm text-foreground/70" data-testid="snapshot-library-empty">
-                    {IMPROVED_EMPTY_STATE_COPY.noSnapshots}
-                  </p>
-                ) : null}
-
-                {!isLoadingParameterSets && !parameterSetsError && strategyParameterSets.length > 0 ? (
-                  <div className="mt-2 space-y-3" data-testid="snapshot-cards">
-                    {strategyParameterSets.map((snapshot) => {
-                      const isSelectedSnapshot = selectedSnapshotId === snapshot.id;
-                      const snapshotValues: ParameterValues = {};
-                      for (const definition of parameterDefinitions) {
-                        snapshotValues[definition.key] = coerceParameterValue(definition, snapshot.parameters[definition.key]);
-                      }
-
-                      const snapshotValidation = validateParameterValues(selectedStrategy.slug, snapshotValues);
-                      const snapshotHealth = getHealthState(snapshotValidation);
-                      const snapshotReadiness = getReadinessScore(parameterDefinitions, snapshotValues, snapshotValidation);
-                      const snapshotReadinessLabel = getReadinessLabel(snapshotHealth);
-                      const snapshotBehavior = getBehaviorSummary(selectedStrategy.slug, snapshotValues);
-                      const snapshotCreatedAt = snapshotMetaById[snapshot.id]?.createdAt ?? snapshot.created_at;
-                      const snapshotNotesValue = snapshotMetaById[snapshot.id]?.notes;
-                      const snapshotSummary = parameterSummary(parameterDefinitions, snapshotValues);
-
-                      const beginnerSummary = getBeginnerTopObservations(
-                        snapshotHealth,
-                        snapshotReadiness,
-                        [],
-                        snapshotBehavior,
-                      );
-
-                      return (
-                        <article
-                          key={snapshot.id}
-                          className={[
-                            "rounded-lg border bg-background/30 p-3",
-                            isSelectedSnapshot ? "border-accent ring-1 ring-accent/60" : "border-border",
-                          ].join(" ")}
-                          data-testid={`snapshot-card-${snapshot.id}`}
-                        >
-                          <div className="flex flex-col gap-2 sm:flex-row sm:items-start sm:justify-between">
-                            <div>
-                              <h4 className="text-base font-semibold">{snapshot.name}</h4>
-                              <p className="text-sm text-foreground/80">Strategy: {selectedStrategy.name}</p>
-                            </div>
-                            <span className="rounded-full border border-border bg-muted/30 px-2 py-0.5 text-xs font-medium text-foreground/80">
-                              {snapshotReadiness} / 100 • {snapshotReadinessLabel}
-                            </span>
-                          </div>
-
-                          <p className="mt-2 text-sm text-foreground/80">Parameter Summary: {snapshotSummary}</p>
-                          <p className="mt-1 text-sm text-foreground/80">
-                            Estimated Behavior: {snapshotBehavior
-                              ? `Trade Frequency ${snapshotBehavior.tradeFrequency}, Responsiveness ${snapshotBehavior.responsiveness}, Noise Filtering ${snapshotBehavior.noiseFiltering}, Trend Sensitivity ${snapshotBehavior.trendSensitivity}`
-                              : "Behavior estimates are not yet available for this strategy."}
-                          </p>
-                          <p className="mt-1 text-sm text-foreground/75">Created Date: {formatDateLabel(snapshotCreatedAt)}</p>
-                          <p className="mt-1 text-sm text-foreground/75">Notes: {snapshotNotesValue || "No notes provided."}</p>
-
-                          {isBeginnerMode ? (
-                            <div className="mt-2 rounded-md border border-border bg-muted/20 px-3 py-2 text-sm text-foreground/80" data-testid={`snapshot-beginner-summary-${snapshot.id}`}>
-                              <p className="font-medium">What was this configuration designed for?</p>
-                              <p className="mt-1">{beginnerSummary[0]}</p>
-                            </div>
-                          ) : null}
-
-                          <div className="mt-3 flex flex-wrap gap-2">
-                            <button
-                              type="button"
-                              aria-label={`View snapshot ${snapshot.name}`}
-                              onClick={() => setSelectedSnapshotId(snapshot.id)}
-                              className="inline-flex min-h-11 items-center justify-center rounded-md border border-border bg-muted px-3 py-2 text-sm font-medium transition hover:bg-foreground/10 focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-accent"
-                            >
-                              View
-                            </button>
-                            <button
-                              type="button"
-                              aria-label={`Select snapshot ${snapshot.name}`}
-                              onClick={() => setSelectedSnapshotId(snapshot.id)}
-                              className="inline-flex min-h-11 items-center justify-center rounded-md border border-border bg-muted px-3 py-2 text-sm font-medium transition hover:bg-foreground/10 focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-accent"
-                            >
-                              Select
-                            </button>
-                            <button
-                              type="button"
-                              aria-label={`Apply snapshot ${snapshot.name}`}
-                              onClick={() => applySnapshot(snapshot)}
-                              className="inline-flex min-h-11 items-center justify-center rounded-md border border-border bg-muted px-3 py-2 text-sm font-medium transition hover:bg-foreground/10 focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-accent"
-                            >
-                              Apply
-                            </button>
-                          </div>
-                        </article>
-                      );
-                    })}
-                  </div>
-                ) : null}
-              </div>
-            </>
-          )}
-        </section>
-
-        <section
-          aria-labelledby="review-configuration"
-          className="rounded-xl border border-border bg-muted/30 p-4"
-          data-testid="strategy-lab-section-review-configuration"
-        >
-          <h2 id="review-configuration" className="text-base font-semibold sm:text-lg">
-            5) Review Configuration
-          </h2>
-          <p className="mt-1 text-sm text-foreground/75">
-            Confirm your setup details before launching a backtest run.
-          </p>
-          <ContextualHelp
-            title="review-configuration"
-            body="Review confirms exactly what will be tested so you can catch mistakes before launch."
-          />
-
-          {isBeginnerMode ? (
-            <div className="mt-3 rounded-md border border-emerald-500/40 bg-emerald-500/10 px-3 py-2 text-sm text-emerald-100" data-testid="beginner-launch-message">
-              You&apos;re about to test this strategy using historical market data. No real money will be used.
-            </div>
-          ) : null}
-
-          <dl className="mt-3 grid gap-2 text-sm sm:grid-cols-2" data-testid="review-configuration-summary">
-            <div>
-              <dt className="text-foreground/60">Strategy</dt>
-              <dd className="font-medium text-foreground/90">{selectedStrategy?.name ?? "Not selected"}</dd>
-            </div>
-            <div>
-              <dt className="text-foreground/60">Selected Snapshot</dt>
-              <dd className="font-medium text-foreground/90">{selectedSnapshot?.name ?? "None selected"}</dd>
-            </div>
-            <div className="sm:col-span-2">
-              <dt className="text-foreground/60">Parameter Summary</dt>
-              <dd className="font-medium text-foreground/90">
-                {parameterDefinitions.length > 0 ? parameterSummary(parameterDefinitions, parameterValues) : "No parameter metadata available."}
-              </dd>
-            </div>
-            <div>
-              <dt className="text-foreground/60">
-                <GlossaryTermTooltip term="Starting Capital" definition={GLOSSARY_DEFINITIONS.startingCapital} />
-              </dt>
-              <dd className="font-medium text-foreground/90">${startingCapital}</dd>
-            </div>
-            <div>
-              <dt className="text-foreground/60">Fee Settings</dt>
-              <dd className="font-medium text-foreground/90">{feeBps} bps</dd>
-            </div>
-            <div>
-              <dt className="text-foreground/60">
-                <GlossaryTermTooltip term="Slippage Settings" definition={GLOSSARY_DEFINITIONS.slippage} />
-              </dt>
-              <dd className="font-medium text-foreground/90">{slippageBps} bps</dd>
-            </div>
-            <div>
-              <dt className="text-foreground/60">
-                <GlossaryTermTooltip term="Configuration Readiness" definition={GLOSSARY_DEFINITIONS.configurationReadiness} />
-              </dt>
-              <dd className="font-medium text-foreground/90">{readinessScore} / 100 • {readinessLabel}</dd>
-            </div>
-            <div className="sm:col-span-2">
-              <dt className="text-foreground/60">Estimated Behavior</dt>
-              <dd className="font-medium text-foreground/90">
-                {estimatedBehavior
-                  ? `Trade Frequency ${estimatedBehavior.tradeFrequency}, Responsiveness ${estimatedBehavior.responsiveness}, Noise Filtering ${estimatedBehavior.noiseFiltering}, Trend Sensitivity ${estimatedBehavior.trendSensitivity}`
-                  : "Behavior estimates are not yet available for this strategy."}
-              </dd>
-            </div>
-            {isBeginnerMode ? (
-              <div className="sm:col-span-2" data-testid="review-beginner-summary">
-                <dt className="text-foreground/60">Beginner Summary</dt>
-                <dd className="font-medium text-foreground/90">{beginnerChecklistSummary[0] ?? "Not yet available."}</dd>
-              </div>
-            ) : null}
-          </dl>
-        </section>
-
-        <section
-          aria-labelledby="launch-backtest"
-          className="rounded-xl border border-border bg-muted/30 p-4"
-          data-testid="strategy-lab-section-launch-backtest"
-        >
-          <h2 id="launch-backtest" className="text-base font-semibold sm:text-lg">
-            6) Launch Backtest
-          </h2>
-          <p className="mt-1 text-sm text-foreground/75">
-            Complete the checklist, then launch with the existing backtest workflow.
-          </p>
-          <ContextualHelp
-            title="launch-backtest"
-            body="Launch starts a historical simulation only. This does not place live or paper trading orders."
-          />
-
-          <div className="mt-3 grid gap-2 sm:grid-cols-3" data-testid="launch-settings-form">
-            <label className="space-y-1 text-sm">
-              <span className="text-foreground/80">
-                <GlossaryTermTooltip term="Starting Capital" definition={GLOSSARY_DEFINITIONS.startingCapital} />
-              </span>
-              <input
-                aria-label="Launch starting capital"
-                type="number"
-                min={25}
-                step={1}
-                value={startingCapital}
-                onChange={(event) => setStartingCapital(event.target.value)}
-                className="w-full rounded-md border border-border bg-background px-3 py-2 text-sm"
-              />
-            </label>
-            <label className="space-y-1 text-sm">
-              <span className="text-foreground/80">Fee (bps)</span>
-              <input
-                aria-label="Launch fee bps"
-                type="number"
-                min={0}
-                step={1}
-                value={feeBps}
-                onChange={(event) => setFeeBps(event.target.value)}
-                className="w-full rounded-md border border-border bg-background px-3 py-2 text-sm"
-              />
-            </label>
-            <label className="space-y-1 text-sm">
-              <span className="text-foreground/80">
-                <GlossaryTermTooltip term="Slippage (bps)" definition={GLOSSARY_DEFINITIONS.slippage} />
-              </span>
-              <input
-                aria-label="Launch slippage bps"
-                type="number"
-                min={0}
-                step={1}
-                value={slippageBps}
-                onChange={(event) => setSlippageBps(event.target.value)}
-                className="w-full rounded-md border border-border bg-background px-3 py-2 text-sm"
-              />
-            </label>
+          <div className="flex items-center gap-3 font-mono text-xs">
+            <button className="lab-button" type="button" onClick={() => setShowHelp(true)}>What am I looking at?</button>
+            <span className={`h-2 w-2 rounded-full ${status === "error" ? "bg-[#d95d54]" : status === "ready" ? "bg-[#31c48d]" : "animate-pulse bg-[#e0b34c]"}`} />
+            <span>{status === "replaying" ? "REPLAYING" : status.toUpperCase()}</span>
+            <span className="border-l border-[#294139] pl-3">DB FREE</span>
           </div>
+        </header>
 
-          <div className="mt-3 rounded-lg border border-border bg-background/30 p-3" data-testid="review-checklist">
-            <h3 className="text-sm font-semibold">Review Checklist</h3>
-            <ul className="mt-2 space-y-2 text-sm">
-              {reviewChecklist.map((item) => (
-                <li key={item.key} className="flex items-center justify-between rounded-md border border-border bg-muted/20 px-3 py-2">
-                  <span>{item.label}{item.optional ? " (Optional)" : ""}</span>
-                  <span className={item.complete ? "text-emerald-200" : "text-amber-100"}>
-                    {item.complete ? "Complete" : "Incomplete"}
-                  </span>
-                </li>
+        <div className="grid min-h-[calc(100vh-73px)] grid-cols-1 xl:grid-cols-[320px_minmax(600px,1fr)_300px]">
+          <aside className="border-b border-[#294139] bg-[#0c1714] p-4 xl:border-b-0 xl:border-r">
+            <SectionTitle index="01" title="Experiment controls" />
+            <Field label="Dataset">
+              <select value={datasetId} onChange={(event) => { setIsPlaying(false); setDatasetId(event.target.value); }} className="lab-input">
+                {datasets.map((dataset) => <option key={dataset.id} value={dataset.id}>{dataset.name}</option>)}
+              </select>
+            </Field>
+            <button className="lab-button mb-3 w-full" type="button" onClick={() => setShowUpload(true)}>Upload Candle CSV</button>
+            {selectedDataset && <div className="mb-4 grid grid-cols-2 gap-x-3 gap-y-1 border-l-2 border-[#416357] pl-3 font-mono text-[10px] leading-5 text-[#82978e]"><span>{selectedDataset.candle_count.toLocaleString()} candles</span><span>{selectedDataset.asset} · {selectedDataset.interval}</span><span>{selectedDataset.first_timestamp.slice(0, 10)}</span><span>→ {selectedDataset.last_timestamp.slice(0, 10)}</span><span>Missing {selectedDataset.missing_candles}</span><span>Duplicates {selectedDataset.duplicate_timestamps}</span></div>}
+            <Field label="Strategy version">
+              <div className="grid grid-cols-2 gap-1" role="group" aria-label="Strategy version">
+                {(["001", "002"] as StrategyVersion[]).map((version) => <button key={version} onClick={() => { setIsPlaying(false); setStrategyVersion(version); }} className={`lab-segment ${strategyVersion === version ? "lab-segment-active" : ""}`}>#{version}</button>)}
+              </div>
+            </Field>
+            <Field label="Historical Test Period">
+              <select value={researchPeriod} onChange={(event) => { setIsPlaying(false); setResearchPeriod(event.target.value as ResearchPeriod); }} className="lab-input" aria-describedby="period-help">
+                <option value="training">Training · develop strategies</option>
+                <option value="validation">Validation · unseen history</option>
+                <option value="out_of_sample">Final Test · out-of-sample</option>
+                <option value="entire_dataset">Entire Dataset · exploratory only</option>
+              </select>
+              <span id="period-help" className="mt-1 block font-mono text-[9px] leading-4 text-[#82978e]" title="Separating development, validation, and final test periods reduces overfitting by preventing repeated tuning against the same historical evidence.">Training is for development; Validation checks unseen data; Final Test is reserved verification. Separation reduces overfitting.</span>
+            </Field>
+            <Field label="Visualization mode">
+              <div className="grid grid-cols-2 gap-1" role="group" aria-label="Visualization mode"><button className={`lab-segment ${viewMode === "instant" ? "lab-segment-active" : ""}`} onClick={() => changeViewMode("instant")}>Instant Results</button><button className={`lab-segment ${viewMode === "playback" ? "lab-segment-active" : ""}`} onClick={() => changeViewMode("playback")}>Playback Mode</button></div>
+            </Field>
+            {viewMode === "playback" && <div className="mb-4 border border-[#294139] bg-[#08110f] p-3">
+              <button className={`lab-button w-full ${isPlaying ? "border-[#d95d54] text-[#ef8b82]" : "border-[#31c48d] text-[#8ee5bd]"}`} type="button" onClick={startOrStopSimulation}>{isPlaying ? "Stop Simulation" : "Run Simulation"}</button>
+              <div className="mt-2 grid grid-cols-5 gap-1"><TransportButton label="Beginning" symbol="|◀" onClick={() => { setIsPlaying(false); setPlaybackIndex(1); }} /><TransportButton label="Previous Candle" symbol="◀" onClick={() => stepPlayback(-1)} /><TransportButton label={isPlaying ? "Pause" : "Play"} symbol={isPlaying ? "Ⅱ" : "▶"} onClick={() => setIsPlaying((value) => !value)} /><TransportButton label="Next Candle" symbol="▶" onClick={() => stepPlayback(1)} /><TransportButton label="End" symbol="▶|" onClick={() => { setIsPlaying(false); setPlaybackIndex(run?.candles.length ?? 1); }} /></div>
+              <div className="mt-2 grid grid-cols-4 gap-1" role="group" aria-label="Replay speed">{([1, 5, 20, 100] as PlaybackSpeed[]).map((speed) => <button key={speed} className={`lab-segment min-h-7 text-[10px] ${playbackSpeed === speed ? "lab-segment-active" : ""}`} onClick={() => setPlaybackSpeed(speed)}>{speed}×</button>)}</div>
+              <div className="mt-2 flex justify-between font-mono text-[9px] text-[#82978e]"><span>Candle {visibleCandleCount.toLocaleString()}</span><span>{run?.candles.length.toLocaleString() ?? 0}</span></div>
+              <div className="mt-2 min-h-10 border-t border-[#294139] pt-2 font-mono text-[9px] leading-4 text-[#9fb0aa]" aria-live="polite"><span className="text-[#6fa78f]">EVENTS · </span>{currentPlaybackEvents.length ? currentPlaybackEvents.map((event) => `${traceLabel(event.kind)} ${money(event.price)}`).join(" · ") : "Candle closed · no strategy event"}</div>
+            </div>}
+            <div className="my-5 border-t border-[#294139]" />
+            <SectionTitle index="02" title="Parameters" />
+            <div className="grid grid-cols-2 gap-x-3 gap-y-2 xl:grid-cols-1">
+              {PARAMETER_FIELDS.map((field) => (
+                <label key={field.key} className="grid grid-cols-[1fr_92px] items-center gap-2 text-xs text-[#aebdb7]">
+                  <span>{field.label}</span>
+                  <input className="lab-input text-right font-mono" type="number" min="0" step={field.step} value={parameters[field.key]} onChange={(event) => updateParameter(field.key, event.target.value)} />
+                </label>
               ))}
-            </ul>
-          </div>
+            </div>
+            {allocationTotal !== 100 && <p role="alert" className="mt-3 border-l-2 border-[#d95d54] pl-2 text-xs text-[#ef8b82]">Profit allocation is {allocationTotal}%. It must equal 100%.</p>}
+            <button className="lab-button mt-4 w-full" onClick={() => { setIsPlaying(false); setParameters(DEFAULT_PARAMETERS); }}>Reset parameters</button>
+          </aside>
 
-          {missingRequiredChecklistItems.length > 0 ? (
-            <p className="mt-3 rounded-md border border-amber-500/40 bg-amber-500/10 px-3 py-2 text-sm text-amber-100" data-testid="launch-gating-message">
-              Complete all required checklist items before launching.
-            </p>
-          ) : null}
-
-          {!hasRequiredLaunchFields ? (
-            <p className="mt-3 rounded-md border border-amber-500/40 bg-amber-500/10 px-3 py-2 text-sm text-amber-100" data-testid="launch-required-fields-message">
-              Strategy, parameter set, and starting capital of at least $25 are required.
-            </p>
-          ) : null}
-
-          {launchError ? (
-            <p className="mt-3 rounded-md border border-red-500/40 bg-red-500/10 px-3 py-2 text-sm text-red-100" data-testid="launch-backtest-error">
-              {launchError}
-            </p>
-          ) : null}
-
-          <button
-            type="button"
-            aria-label="Launch backtest"
-            onClick={() => void handleLaunchBacktest()}
-            disabled={isLaunchingBacktest || !hasRequiredLaunchFields || missingRequiredChecklistItems.length > 0}
-            className="mt-3 inline-flex min-h-11 items-center justify-center rounded-md border border-border bg-muted px-4 py-2 text-sm font-medium transition hover:bg-foreground/10 focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-accent disabled:cursor-not-allowed disabled:opacity-60"
-          >
-            {isLaunchingBacktest ? "Launching..." : "Launch Backtest"}
-          </button>
-        </section>
-
-        <section
-          aria-labelledby="research-results-workspace"
-          className="rounded-xl border border-border bg-muted/30 p-4 lg:col-span-2"
-          data-testid="strategy-lab-section-research-results-workspace"
-        >
-          <h2 id="research-results-workspace" className="text-base font-semibold sm:text-lg">
-            7) Research Results Workspace
-          </h2>
-          <p className="mt-1 text-sm text-foreground/75">
-            Compare up to three completed backtests to understand why outcomes differ.
-          </p>
-          <ContextualHelp
-            title="research-results-workspace"
-            body="Use this workspace to compare completed runs side-by-side and inspect differences in outcomes and configuration quality."
-          />
-
-          <div className="mt-3 rounded-lg border border-border bg-background/30 p-3" data-testid="comparison-selection-list">
-            <h3 className="text-sm font-semibold">Comparison Selection</h3>
-            <p className="mt-1 text-xs text-foreground/70">Select up to three completed runs.</p>
-
-            {isLoadingBacktests ? (
-              <div className="mt-2 space-y-2" role="status" aria-live="polite" aria-label="Comparison runs loading">
-                <div className="h-10 animate-pulse rounded bg-foreground/15" />
-                <div className="h-10 animate-pulse rounded bg-foreground/15" />
+          <main className="min-w-0 border-b border-[#294139] bg-[#08110f] xl:border-b-0 xl:border-r">
+            <div className="grid grid-cols-2 gap-px border-b border-[#294139] bg-[#294139] sm:grid-cols-3 lg:grid-cols-6">
+              <ChartHeaderDatum label="Dataset" value={selectedDataset ? `${selectedDataset.asset} · ${selectedDataset.interval}` : "—"} />
+              <ChartHeaderDatum label="Strategy version" value={`#${strategyVersion}`} />
+              <ChartHeaderDatum label="Replay speed" value={viewMode === "instant" ? "Instant · 350ms" : `${playbackSpeed}× · ${visibleCandleCount}/${run?.candles.length ?? 0}`} />
+              <ChartHeaderDatum label="Visible layers" value={`${visibleLayerCount} / ${CHART_LAYERS.length}`} />
+              <ChartHeaderDatum label="Current candle" value={currentCandle ? currentCandle.slice(0, 16).replace("T", " ") : "Move crosshair"} />
+              <ChartHeaderDatum label="Replay status" value={isPlaying ? "PLAYING" : viewMode === "playback" && playbackIndex < (run?.candles.length ?? 0) ? "PAUSED" : status.toUpperCase()} accent={status === "ready" && !isPlaying} />
+            </div>
+            {run ? <><ReplayChart candles={run.candles} events={run.events} trades={visibleTrades} visibleLayers={visibleLayers} selectedTrade={selectedTrade} visibleCandleCount={visibleCandleCount} cursorTimestamp={currentCandle} showAllEvents={viewMode === "playback"} patternAnnotations={patternAnalysis?.annotations ?? []} analysisRange={analysisRange} onLayerToggle={toggleLayer} onTradeHover={setHoveredTrade} onTradeSelect={setSelectedTrade} onCurrentCandleChange={setCurrentCandle} onAnalysisRangeChange={selectAnalysisRange} onAnnotationSelect={openAnnotation} /><CapitalChart run={run} visibleCandleCount={visibleCandleCount} cursorTimestamp={currentCandle} selectedTrade={selectedTrade} onCursorChange={setCurrentCandle} /></> : (
+              <div className="flex h-[420px] items-center justify-center font-mono text-sm text-[#82978e]">{error || "Loading offline candles…"}</div>
+            )}
+            <div className="border-t border-[#294139] p-4">
+              <div className="mb-3 flex items-center justify-between">
+                <SectionTitle index="03" title="Trade ledger" />
+                <span className="font-mono text-xs text-[#82978e]">{visibleTrades.length} completed</span>
               </div>
-            ) : null}
-
-            {!isLoadingBacktests && backtestsError ? (
-              <p className="mt-2 rounded-md border border-red-500/40 bg-red-500/10 px-2 py-1 text-sm text-red-100" data-testid="comparison-selection-error">
-                {backtestsError}
-              </p>
-            ) : null}
-
-            {!isLoadingBacktests && !backtestsError && completedBacktests.length === 0 ? (
-              <p className="mt-2 rounded-md border border-dashed border-border bg-background/20 px-3 py-2 text-sm text-foreground/70" data-testid="comparison-selection-empty">
-                No completed backtests are available yet.
-              </p>
-            ) : null}
-
-            {!isLoadingBacktests && !backtestsError && completedBacktests.length > 0 ? (
-              <ul className="mt-2 space-y-2">
-                {completedBacktests.map((run) => {
-                  const isSelected = selectedComparisonIds.includes(run.id);
-                  const disableCheckbox = !isSelected && selectedComparisonIds.length >= 3;
-
-                  return (
-                    <li key={run.id} className="rounded-md border border-border bg-muted/20 px-3 py-2">
-                      <label className="flex cursor-pointer items-start gap-2 text-sm">
-                        <input
-                          type="checkbox"
-                          aria-label={`Select comparison run ${run.id}`}
-                          checked={isSelected}
-                          disabled={disableCheckbox}
-                          onChange={() => toggleComparisonSelection(run.id)}
-                          className="mt-1"
-                        />
-                        <span>
-                          {strategyNameById.get(run.strategy_id) ?? `Strategy ID: ${run.strategy_id}`} · {run.interval} · {formatDateLabel(run.start_time)} to {formatDateLabel(run.end_time)}
-                        </span>
-                      </label>
-                    </li>
-                  );
-                })}
-              </ul>
-            ) : null}
-          </div>
-
-          {selectedComparisonRuns.length === 0 ? (
-            <p className="mt-3 rounded-md border border-dashed border-border bg-background/20 px-3 py-2 text-sm text-foreground/70" data-testid="comparison-workspace-empty">
-              {IMPROVED_EMPTY_STATE_COPY.noComparisons}
-            </p>
-          ) : (
-            <>
-              <div className="mt-3 grid gap-3 lg:grid-cols-3" data-testid="comparison-workspace-cards">
-                {selectedComparisonRuns.map((run, index) => {
-                  const runCode = toRunCode(index);
-                  const totalReturnRatio = parseFiniteNumber(run.metrics?.total_return_pct);
-                  const winRateRatio = parseFiniteNumber(run.metrics?.win_rate);
-                  const maxDrawdownRatio = parseFiniteNumber(run.metrics?.max_drawdown);
-                  const feeDragRatio = parseFiniteNumber(run.metrics?.fee_drag_pct);
-                  const sharpeLikeValue = parseFiniteNumber(run.metrics?.sharpe_like);
-                  const netProfitValue = parseFiniteNumber(run.metrics?.total_return_usd);
-                  const initialCapitalValue = parseFiniteNumber(run.initial_capital);
-                  const endingEquityValue =
-                    netProfitValue !== null && initialCapitalValue !== null ? initialCapitalValue + netProfitValue : null;
-
-                  const bestTotalReturn = highlightedWinners.bestTotalReturnRunId === run.id;
-                  const highestWinRate = highlightedWinners.highestWinRateRunId === run.id;
-                  const lowestDrawdown = highlightedWinners.lowestDrawdownRunId === run.id;
-                  const lowestFeeDrag = highlightedWinners.lowestFeeDragRunId === run.id;
-
-                  return (
-                    <article key={run.id} className="overflow-x-auto rounded-lg border border-border bg-background/25 p-3" data-testid={`comparison-card-${run.id}`}>
-                      <h4 className="text-base font-semibold">{runCode}</h4>
-                      <dl className="mt-2 space-y-1 text-sm">
-                        <div>
-                          <dt className="text-foreground/60">Strategy</dt>
-                          <dd>{strategyNameById.get(run.strategy_id) ?? `Strategy ID: ${run.strategy_id}`}</dd>
-                        </div>
-                        <div>
-                          <dt className="text-foreground/60">Snapshot Name</dt>
-                          <dd>{snapshotNameById.get(run.parameter_set_id) ?? "Not available"}</dd>
-                        </div>
-                        <div>
-                          <dt className="text-foreground/60">Asset</dt>
-                          <dd>{run.asset_id}</dd>
-                        </div>
-                        <div>
-                          <dt className="text-foreground/60">Timeframe</dt>
-                          <dd>{run.interval}</dd>
-                        </div>
-                        <div>
-                          <dt className="text-foreground/60">Date Range</dt>
-                          <dd>{formatDateLabel(run.start_time)} to {formatDateLabel(run.end_time)}</dd>
-                        </div>
-                        <div>
-                          <dt className="text-foreground/60">
-                            <GlossaryTermTooltip term="Starting Capital" definition={GLOSSARY_DEFINITIONS.startingCapital} />
-                          </dt>
-                          <dd>{formatCurrency(initialCapitalValue)}</dd>
-                        </div>
-                        <div>
-                          <dt className="text-foreground/60">
-                            <GlossaryTermTooltip term="Ending Equity" definition={GLOSSARY_DEFINITIONS.endingEquity} />
-                          </dt>
-                          <dd>{formatCurrency(endingEquityValue)}</dd>
-                        </div>
-                        <div>
-                          <dt className="text-foreground/60">Net Profit / Loss</dt>
-                          <dd className={getMetricToneClass("totalReturn", totalReturnRatio)}>{formatSignedCurrency(netProfitValue)}</dd>
-                        </div>
-                        <div>
-                          <dt className="text-foreground/60">Total Return</dt>
-                          <dd className={getMetricToneClass("totalReturn", totalReturnRatio)}>
-                            {netProfitValue !== null && totalReturnRatio !== null
-                              ? `${formatSignedCurrency(netProfitValue)} (${formatPercentFromRatio(totalReturnRatio)})`
-                              : "Not available"}
-                          </dd>
-                          {bestTotalReturn ? <p className="text-xs text-emerald-200">Best Total Return</p> : null}
-                          {isBeginnerMode ? <p className="text-xs text-foreground/70">{BEGINNER_METRIC_EXPLANATIONS.totalReturn}</p> : null}
-                        </div>
-                        <div>
-                          <dt className="text-foreground/60">
-                            <GlossaryTermTooltip term="Win Rate" definition={GLOSSARY_DEFINITIONS.winRate} />
-                          </dt>
-                          <dd className={getMetricToneClass("winRate", winRateRatio)}>
-                            {winRateRatio !== null ? formatPercentFromRatio(winRateRatio) : "Not available"}
-                          </dd>
-                          {highestWinRate ? <p className="text-xs text-emerald-200">Highest Win Rate</p> : null}
-                          {isBeginnerMode ? <p className="text-xs text-foreground/70">{BEGINNER_METRIC_EXPLANATIONS.winRate}</p> : null}
-                        </div>
-                        <div>
-                          <dt className="text-foreground/60">
-                            <GlossaryTermTooltip term="Max Drawdown" definition={GLOSSARY_DEFINITIONS.maxDrawdown} />
-                          </dt>
-                          <dd className={getMetricToneClass("maxDrawdown", maxDrawdownRatio)}>
-                            {maxDrawdownRatio !== null ? formatPercentFromRatio(maxDrawdownRatio) : "Not available"}
-                          </dd>
-                          {lowestDrawdown ? <p className="text-xs text-emerald-200">Lowest Drawdown</p> : null}
-                          {isBeginnerMode ? <p className="text-xs text-foreground/70">{BEGINNER_METRIC_EXPLANATIONS.maxDrawdown}</p> : null}
-                        </div>
-                        <div>
-                          <dt className="text-foreground/60">
-                            <GlossaryTermTooltip term="Fee Drag" definition={GLOSSARY_DEFINITIONS.feeDrag} />
-                          </dt>
-                          <dd className={getMetricToneClass("feeDrag", feeDragRatio)}>
-                            {feeDragRatio !== null ? formatPercentFromRatio(feeDragRatio) : "Not available"}
-                          </dd>
-                          {lowestFeeDrag ? <p className="text-xs text-emerald-200">Lowest Fee Drag</p> : null}
-                          {isBeginnerMode ? <p className="text-xs text-foreground/70">{BEGINNER_METRIC_EXPLANATIONS.feeDrag}</p> : null}
-                        </div>
-                        <div>
-                          <dt className="text-foreground/60">
-                            <GlossaryTermTooltip term="Configuration Readiness" definition={GLOSSARY_DEFINITIONS.configurationReadiness} />
-                          </dt>
-                          <dd>{getConfigurationReadinessValue(run)}</dd>
-                        </div>
-                        <div>
-                          <dt className="text-foreground/60">Fee Setting</dt>
-                          <dd>{formatBpsLabel(run.fee_bps)}</dd>
-                        </div>
-                        <div>
-                          <dt className="text-foreground/60">
-                            <GlossaryTermTooltip term="Slippage Setting" definition={GLOSSARY_DEFINITIONS.slippage} />
-                          </dt>
-                          <dd>{formatBpsLabel(run.slippage_bps)}</dd>
-                        </div>
-                        <div>
-                          <dt className="text-foreground/60">
-                            <GlossaryTermTooltip term="Sharpe-like" definition={GLOSSARY_DEFINITIONS.sharpeLike} />
-                          </dt>
-                          <dd>{sharpeLikeValue !== null ? formatSignedNumber(sharpeLikeValue) : "Not available"}</dd>
-                        </div>
-                      </dl>
-                    </article>
-                  );
-                })}
-              </div>
-
-              <section className="mt-3 rounded-lg border border-border bg-background/30 p-3" data-testid="key-differences-panel">
-                <h3 className="text-sm font-semibold">Key Differences</h3>
-                {keyDifferences.length === 0 ? (
-                  <p className="mt-2 text-sm text-foreground/70">
-                    Not enough completed metric differences are available yet.
-                  </p>
-                ) : (
-                  <ul className="mt-2 space-y-1 text-sm text-foreground/85">
-                    {keyDifferences.map((line) => (
-                      <li key={line}>- {line}</li>
-                    ))}
-                  </ul>
-                )}
-              </section>
-            </>
-          )}
-        </section>
-
-        <section
-          aria-labelledby="insights-workspace"
-          className="rounded-xl border border-border bg-muted/30 p-4 lg:col-span-2"
-          data-testid="strategy-lab-section-insights-workspace"
-        >
-          <h2 id="insights-workspace" className="text-base font-semibold sm:text-lg">
-            8) Insights Workspace
-          </h2>
-          <p className="mt-1 text-sm text-foreground/75">
-            Visualize evidence from selected backtests without predictions or recommendations.
-          </p>
-          <ContextualHelp
-            title="insights-workspace"
-            body="Insights summarizes what changed across runs using existing metrics only. It does not predict future performance."
-          />
-
-          {selectedComparisonRuns.length === 0 ? (
-            <p className="mt-3 rounded-md border border-dashed border-border bg-background/20 px-3 py-2 text-sm text-foreground/70" data-testid="insights-workspace-empty">
-              Select runs in the Research Results Workspace to view insights.
-            </p>
-          ) : (
-            <>
-              <section className="mt-3 rounded-lg border border-border bg-background/30 p-3" data-testid="equity-curve-comparison">
-                <h3 className="text-sm font-semibold">Equity Curve Comparison</h3>
-                <div className="mt-2 grid gap-3 lg:grid-cols-3">
-                  {selectedComparisonRuns.map((run, index) => {
-                    const runCode = toRunCode(index);
-                    const equityCurve = run.metrics?.equity_curve ?? [];
-                    const curveData = equityCurve
-                      .map((point) => ({ time: point.time, equity: typeof point.equity === "number" ? point.equity : Number(point.equity) }))
-                      .filter((point) => Number.isFinite(point.equity));
-
-                    return (
-                      <div key={run.id} className="rounded-md border border-border bg-muted/20 p-3" tabIndex={0}>
-                        <p className="text-sm font-medium">{runCode} Equity Curve</p>
-                        {curveData.length > 0 ? (
-                          <div className="mt-2" data-testid={`equity-curve-${run.id}`}>
-                            <EquityCurveChart data={curveData} />
-                          </div>
-                        ) : (
-                          <p className="mt-2 text-sm text-foreground/70" data-testid={`equity-curve-missing-${run.id}`}>Not available</p>
-                        )}
-                      </div>
-                    );
+              {hoveredTrade && <div className="mb-3 grid grid-cols-3 gap-3 border-l-2 border-[#e0b34c] bg-[#0c1714] p-3 font-mono text-xs sm:grid-cols-6">
+                <Datum label="Entry" value={money(hoveredTrade.effective_entry_price)} /><Datum label="Exit" value={money(hoveredTrade.effective_exit_price)} /><Datum label="Net P&L" value={money(hoveredTrade.net_pnl)} /><Datum label="MFE" value={percent(hoveredTrade.mfe_pct)} /><Datum label="MAE" value={percent(hoveredTrade.mae_pct)} /><Datum label="Hold" value={`${hoveredTrade.holding_candles} bars`} />
+              </div>}
+              {selectedTrade && <div className="mb-3 border border-[#416357] bg-[#0c1714]">
+                <div className="flex flex-wrap items-center justify-between gap-2 border-b border-[#294139] px-3 py-2"><div><p className="font-mono text-[9px] uppercase text-[#6fa78f]">Trade Inspector</p><p className="mt-1 font-mono text-xs">{selectedTrade.entry_timestamp.slice(0, 16).replace("T", " ")} → {selectedTrade.exit_timestamp.slice(0, 16).replace("T", " ")}</p></div><div className="flex gap-1"><button className={`lab-segment min-h-7 px-2 text-[9px] ${inspectorMode === "summary" ? "lab-segment-active" : ""}`} onClick={() => setInspectorMode("summary")}>Trade Summary</button><button className={`lab-segment min-h-7 px-2 text-[9px] ${inspectorMode === "trace" ? "lab-segment-active" : ""}`} onClick={() => setInspectorMode("trace")}>Complete Engine Trace</button><button className="lab-button" type="button" onClick={() => setSelectedTrade(null)}>Show all</button></div></div>
+                {inspectorMode === "summary" && <TradeSummary trade={selectedTrade} timeline={tradeTimeline} />}
+                {inspectorMode === "trace" && <ol className="flex max-h-44 gap-0 overflow-auto p-3">
+                  {fullTradeTrace.map(({ event, label }, index) => {
+                    const layer = layerForEvent(event.kind);
+                    return <li key={`${event.kind}-${event.candle_index}-${index}`} className="min-w-[150px] border-l-2 pl-3 pr-4 font-mono" style={{ borderColor: layer?.color ?? "#82978e" }}><p className="text-[9px] font-semibold" style={{ color: layer?.color ?? "#aebdb7" }}>{label}</p><p className="mt-1 text-xs text-[#e6eee9]">{money(event.price)}</p><p className="mt-1 text-[9px] text-[#82978e]">{event.timestamp.slice(5, 16).replace("T", " ")}</p>{event.reason && <p className="mt-1 text-[9px] text-[#aebdb7]">{event.reason.replaceAll("_", " ")}</p>}</li>;
                   })}
-                </div>
-              </section>
+                </ol>}
+              </div>}
+              <div className="max-h-48 overflow-auto">
+                <table className="w-full min-w-[680px] border-collapse font-mono text-xs">
+                  <thead className="sticky top-0 bg-[#08110f] text-left text-[#82978e]"><tr><th>Entry</th><th>Exit</th><th>P&L</th><th>Return</th><th>MFE</th><th>MAE</th><th>Reason</th></tr></thead>
+                  <tbody>{visibleTrades.map((trade, index) => <tr key={`${trade.entry_timestamp}-${index}`} role="button" tabIndex={0} aria-pressed={selectedTrade === trade} onClick={() => { setInspectorMode("summary"); setSelectedTrade(selectedTrade === trade ? null : trade); }} onKeyDown={(event) => { if (event.key === "Enter" || event.key === " ") setSelectedTrade(selectedTrade === trade ? null : trade); }} className={`cursor-pointer border-t border-[#1c2e28] hover:bg-[#12231e] ${selectedTrade === trade ? "bg-[#183228] outline outline-1 outline-[#31c48d]" : ""}`}><td>{trade.entry_timestamp.slice(0, 16).replace("T", " ")}</td><td>{trade.exit_timestamp.slice(0, 16).replace("T", " ")}</td><td className={number(trade.net_pnl) >= 0 ? "text-[#31c48d]" : "text-[#ef6b5f]"}>{money(trade.net_pnl)}</td><td>{percent(number(trade.net_return_pct) * 100)}</td><td>{percent(trade.mfe_pct)}</td><td>{percent(trade.mae_pct)}</td><td>{trade.exit_reason}</td></tr>)}</tbody>
+                </table>
+              </div>
+            </div>
+          </main>
 
-              <section className="mt-3 overflow-x-auto rounded-lg border border-border bg-background/30 p-3" data-testid="metric-trend-visuals">
-                <h3 className="text-sm font-semibold">Metric Trend Visuals</h3>
-                <div className="mt-2 grid gap-3 md:grid-cols-2">
-                  {([
-                    { key: "totalReturn", label: "Total Return", data: metricTrendVisuals.totalReturn },
-                    { key: "winRate", label: "Win Rate", data: metricTrendVisuals.winRate },
-                    { key: "maxDrawdown", label: "Max Drawdown", data: metricTrendVisuals.maxDrawdown },
-                    { key: "feeDrag", label: "Fee Drag", data: metricTrendVisuals.feeDrag },
-                  ] as const).map((metric) => (
-                    <div key={metric.key} className="rounded-md border border-border bg-muted/20 p-3" data-testid={`metric-trend-${metric.key}`}>
-                      <p className="text-sm font-medium">{metric.label}</p>
-                      <div className="mt-2 space-y-2">
-                        {selectedComparisonRuns.map((run, index) => {
-                          const width = metric.data.widths[index] ?? 0;
-                          const value = metric.data.values[index] ?? null;
-                          return (
-                            <div key={`${metric.key}-${run.id}`} className="space-y-1">
-                              <div className="flex items-center justify-between text-xs text-foreground/75">
-                                <span>{toRunCode(index)}</span>
-                                <span>{formatTrendPercentValue(value)}</span>
-                              </div>
-                              <div className="h-2 rounded bg-background/60">
-                                <div
-                                  className="h-2 rounded bg-accent"
-                                  style={{ width: `${width}%` }}
-                                  aria-label={`${metric.label} trend ${toRunCode(index)}`}
-                                />
-                              </div>
-                            </div>
-                          );
-                        })}
-                      </div>
-                    </div>
-                  ))}
-                </div>
-              </section>
+          <aside className="bg-[#0c1714] p-4">
+            <SectionTitle index="04" title="Pattern Intelligence" />
+            <div className="mb-4 border border-[#294139] bg-[#08110f] p-3">
+              <p className="font-mono text-[9px] leading-4 text-[#82978e]">Drag across the candle chart to select a range. Selection pauses playback.</p>
+              <p className="mt-2 font-mono text-[10px] text-[#dce7e1]">{analysisRange ? `Candles ${analysisRange[0]}–${analysisRange[1]}` : "No candle range selected"}</p>
+              <div className="mt-3 grid grid-cols-2 gap-2">
+                <button className="lab-button" disabled={!analysisRange || analysisStatus === "analyzing"} onClick={analyzeSelection}>Analyze Selection</button>
+                <button className="lab-button" disabled={!run || analysisStatus === "analyzing"} onClick={analyzeVisibleWindow}>Visible Window</button>
+                <button className="lab-button col-span-2" disabled={!selectedTrade || analysisStatus === "analyzing"} onClick={analyzeTrade}>Analyze Selected Trade</button>
+              </div>
+              {analysisStatus === "analyzing" && <p className="mt-2 font-mono text-[10px] text-[#e0b34c]">ANALYZING LOCAL CANDLES…</p>}
+              {analysisError && <p role="alert" className="mt-2 font-mono text-[10px] text-[#ef6b5f]">{analysisError}</p>}
+            </div>
+            {patternAnalysis && <PatternIntelligencePanel analysis={patternAnalysis} selected={selectedFinding} onSelect={setSelectedFinding} />}
+            <div className="my-5 border-t border-[#294139]" />
+            <SectionTitle index="05" title="Evidence" />
+            {run ? <>
+              <div className={`mb-4 border-l-4 p-3 ${run.metrics.verdict === "PROFITABLE" ? "border-[#31c48d] bg-[#10251e]" : run.metrics.verdict === "UNPROFITABLE" ? "border-[#d95d54] bg-[#261514]" : "border-[#e0b34c] bg-[#272214]"}`}>
+                <p className="font-mono text-[10px] uppercase text-[#82978e]">Scientific verdict</p>
+                <p className="mt-1 font-serif text-xl">{run.metrics.verdict}</p>
+              </div>
+              <div className="grid grid-cols-2 gap-px bg-[#294139]">
+                <Metric label="Net return" value={percent(run.metrics.net_return_pct)} /><Metric label="Buy & hold" value={percent(run.metrics.buy_and_hold_return_pct)} /><Metric label="Economic value" value={money(run.metrics.total_economic_value)} /><Metric label="Outperformance" value={money(run.metrics.outperformance)} /><Metric label="Win rate" value={percent(run.metrics.win_rate_pct)} /><Metric label="Max drawdown" value={percent(run.metrics.max_drawdown_pct)} /><Metric label="Fees" value={money(run.metrics.fees_paid)} /><Metric label="Slippage" value={money(run.metrics.estimated_slippage)} />
+              </div>
+              <div className="mt-4 space-y-2 border-y border-[#294139] py-3 font-mono text-xs">
+                <Row label="Trading capital" value={money(run.metrics.ending_trading_capital)} /><Row label="Withdrawn" value={money(run.metrics.withdrawn_profit)} /><Row label="Tax reserve" value={money(run.metrics.tax_reserve)} /><Row label="Wins / losses" value={`${run.metrics.winning_trades} / ${run.metrics.losing_trades}`} />
+              </div>
+              <div className="mt-4 grid grid-cols-2 gap-2">
+                <button className="lab-button" onClick={saveRun}>Save run</button>
+                <button className="lab-button" disabled={savedRuns.length < 2} onClick={() => setShowComparison((value) => !value)}>Compare ({savedRuns.length})</button>
+                <button className="lab-button" onClick={exportTrades}>Trades CSV</button>
+                <button className="lab-button" onClick={() => download("strategy-lab-run.json", JSON.stringify(run, null, 2), "application/json")}>Run JSON</button>
+                <button className="lab-button col-span-2" onClick={() => download("strategy-lab-report.txt", reportText(run), "text/plain")}>Research report</button>
+              </div>
+              {savedRuns.length > 0 && <div className="mt-5 border-t border-[#294139] pt-4"><SectionTitle index="05" title="Research journal" /><div className="space-y-2">{savedRuns.map((saved) => <button key={saved.replayDate} className="w-full border border-[#294139] bg-[#08110f] p-2 text-left hover:border-[#6fa78f]" onClick={() => reopenRun(saved)}><span className="block font-mono text-[9px] text-[#6fa78f]">{new Date(saved.replayDate).toLocaleString()}</span><span className="mt-1 block font-mono text-[10px] text-[#dce7e1]">{saved.run.dataset.asset} · #{saved.run.strategy_version} · {saved.run.metrics.verdict}</span><span className="mt-1 block truncate font-mono text-[9px] text-[#82978e]">{saved.parameterSet}</span></button>)}</div></div>}
+            </> : <p className="text-sm text-[#82978e]">Evidence appears after the first deterministic replay.</p>}
+          </aside>
+        </div>
 
-              <section className="mt-3 rounded-lg border border-border bg-background/30 p-3" data-testid="observations-panel">
-                <h3 className="text-sm font-semibold">Observations</h3>
-                {insightsObservations.length === 0 ? (
-                  <p className="mt-2 text-sm text-foreground/70">Not enough metrics are available to generate observations.</p>
-                ) : (
-                  <ul className="mt-2 space-y-2 text-sm text-foreground/85">
-                    {insightsObservations.map((observation) => (
-                      <li key={observation.text}>
-                        <p>- {observation.text}</p>
-                        {isBeginnerMode ? <p className="text-xs text-foreground/70">{observation.beginnerText}</p> : null}
-                      </li>
-                    ))}
-                  </ul>
-                )}
-              </section>
-
-              <section className="mt-3 rounded-lg border border-border bg-background/30 p-3" data-testid="what-improved-panel">
-                <h3 className="text-sm font-semibold">What Improved?</h3>
-                {selectedComparisonRuns.length < 2 ? (
-                  <p className="mt-2 text-sm text-foreground/70">Select at least two runs to compare factual changes.</p>
-                ) : (
-                  <ul className="mt-2 space-y-1 text-sm text-foreground/85">
-                    {whatImprovedFacts.map((line) => (
-                      <li key={line}>- {line}</li>
-                    ))}
-                  </ul>
-                )}
-              </section>
-
-              <section className="mt-3 rounded-lg border border-border bg-background/30 p-3" data-testid="experiment-log-section">
-                <h3 className="text-sm font-semibold">Experiment Log</h3>
-                <p className="mt-1 text-xs text-foreground/70" data-testid="experiment-log-local-session-notice">
-                  Local session log — persistence will be added in a later phase.
-                </p>
-
-                <div className="mt-2 space-y-2">
-                  <label htmlFor="experiment-notes" className="text-sm font-medium text-foreground/90">
-                    Optional notes
-                  </label>
-                  <textarea
-                    id="experiment-notes"
-                    aria-label="Experiment log notes"
-                    value={experimentNotes}
-                    onChange={(event) => setExperimentNotes(event.target.value)}
-                    className="w-full rounded-md border border-border bg-background px-3 py-2 text-sm"
-                    rows={3}
-                    placeholder="Capture context for why you compared these runs."
-                  />
-                  <button
-                    type="button"
-                    aria-label="Create experiment log entry"
-                    onClick={createExperimentLogEntry}
-                    disabled={selectedComparisonRuns.length === 0}
-                    className="inline-flex min-h-11 items-center justify-center rounded-md border border-border bg-muted px-4 py-2 text-sm font-medium transition hover:bg-foreground/10 focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-accent disabled:cursor-not-allowed disabled:opacity-60"
-                  >
-                    Create Log Entry
-                  </button>
-                </div>
-
-                {experimentLogEntries.length === 0 ? (
-                  <p className="mt-3 text-sm text-foreground/70" data-testid="experiment-log-empty">
-                    {IMPROVED_EMPTY_STATE_COPY.noExperimentLogs}
-                  </p>
-                ) : (
-                  <div className="mt-3 space-y-3" data-testid="experiment-log-list">
-                    {experimentLogEntries.map((entry) => (
-                      <article key={entry.id} className="rounded-md border border-border bg-muted/20 p-3" data-testid={`experiment-log-entry-${entry.id}`}>
-                        <p className="text-xs text-foreground/70">Created: {formatDateTimeLabel(entry.createdAt)}</p>
-                        <p className="mt-1 text-sm"><span className="font-medium">Compared Runs:</span> {entry.comparedRuns.join(", ")}</p>
-                        <p className="mt-1 text-sm"><span className="font-medium">Strategies:</span> {entry.strategies.join(", ")}</p>
-                        <p className="mt-1 text-sm"><span className="font-medium">Snapshots:</span> {entry.snapshots.join(", ")}</p>
-
-                        <div className="mt-2 text-sm">
-                          <p className="font-medium">Key Differences Summary</p>
-                          <ul className="mt-1 space-y-1 text-foreground/85">
-                            {entry.keyDifferences.map((line) => (
-                              <li key={`${entry.id}-difference-${line}`}>- {line}</li>
-                            ))}
-                          </ul>
-                        </div>
-
-                        <div className="mt-2 text-sm">
-                          <p className="font-medium">Observations Summary</p>
-                          <ul className="mt-1 space-y-1 text-foreground/85">
-                            {entry.observations.map((line) => (
-                              <li key={`${entry.id}-observation-${line}`}>- {line}</li>
-                            ))}
-                          </ul>
-                        </div>
-
-                        <p className="mt-2 text-sm"><span className="font-medium">Notes:</span> {entry.notes ?? "None"}</p>
-                        {entry.beginnerSummary ? (
-                          <p className="mt-2 text-xs text-foreground/70" data-testid={`experiment-log-beginner-summary-${entry.id}`}>
-                            Beginner Summary: {entry.beginnerSummary}
-                          </p>
-                        ) : null}
-                      </article>
-                    ))}
-                  </div>
-                )}
-              </section>
-            </>
-          )}
-        </section>
+        {showComparison && savedRuns.length >= 2 && <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/70 p-4" role="dialog" aria-modal="true" aria-label="Saved run comparison">
+          <div className="max-h-[85vh] w-full max-w-5xl overflow-auto border border-[#416357] bg-[#0c1714] p-5 shadow-2xl">
+            <div className="mb-5 flex items-center justify-between"><h2 className="font-serif text-2xl">Saved run comparison</h2><button className="lab-button" onClick={() => setShowComparison(false)}>Close</button></div>
+            <div className="grid gap-3 md:grid-cols-2 xl:grid-cols-4">{savedRuns.map((saved, index) => <div key={saved.replayDate} className="border border-[#294139] p-3"><p className="font-mono text-xs text-[#6fa78f]">RUN {index + 1} · #{saved.run.strategy_version}</p><p className="mt-2 text-lg">{saved.run.metrics.verdict}</p><div className="mt-3 space-y-2"><Row label="Replay date" value={new Date(saved.replayDate).toLocaleDateString()} /><Row label="Dataset" value={saved.run.dataset.asset} /><Row label="Partition" value={saved.run.dataset.research_period} /><Row label="Return" value={percent(saved.run.metrics.net_return_pct)} /><Row label="B&H" value={percent(saved.run.metrics.buy_and_hold_return_pct)} /><Row label="Drawdown" value={percent(saved.run.metrics.max_drawdown_pct)} /><Row label="Trades" value={String(saved.run.metrics.total_trades)} /></div><button className="lab-button mt-3 w-full" onClick={() => reopenRun(saved)}>Reopen</button></div>)}</div>
+            <button className="lab-button mt-4" onClick={() => download("strategy-lab-comparison.json", JSON.stringify(savedRuns, null, 2), "application/json")}>Download comparison</button>
+          </div>
+        </div>}
+        {showHelp && <HelpDialog onClose={() => setShowHelp(false)} />}
+        {showUpload && <DatasetUploadDialog onClose={() => setShowUpload(false)} onCreated={(dataset) => { setDatasets((current) => [...current, dataset]); setDatasetId(dataset.id); setShowUpload(false); }} />}
       </div>
-    </div>
+      <style jsx global>{`
+        .strategy-lab { font-family: Georgia, "Times New Roman", serif; }
+        .strategy-lab button, .strategy-lab input, .strategy-lab select, .strategy-lab table, .strategy-lab label { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; letter-spacing: 0; }
+        .lab-input { width: 100%; border: 1px solid #294139; border-radius: 2px; background: #08110f; padding: 7px 8px; color: #e6eee9; outline: none; }
+        .lab-input:focus { border-color: #6fa78f; box-shadow: 0 0 0 1px #6fa78f; }
+        .lab-button { min-height: 34px; border: 1px solid #416357; border-radius: 2px; background: #12231e; padding: 7px 10px; color: #dce7e1; font-size: 11px; text-transform: uppercase; }
+        .lab-button:hover:not(:disabled) { background: #1a332a; border-color: #6fa78f; }
+        .lab-button:disabled { cursor: not-allowed; opacity: .35; }
+        .lab-segment { min-height: 34px; border: 1px solid #294139; border-radius: 2px; background: #08110f; font: 12px ui-monospace, monospace; color: #82978e; }
+        .lab-segment-active { border-color: #6fa78f; background: #183228; color: #e6eee9; }
+        .strategy-lab th, .strategy-lab td { padding: 8px 6px; white-space: nowrap; }
+      `}</style>
+    </>
   );
+}
+
+function SectionTitle({ index, title }: { index: string; title: string }) { return <div className="mb-3 flex items-center gap-2"><span className="font-mono text-[10px] text-[#6fa78f]">{index}</span><h2 className="font-mono text-xs uppercase text-[#dce7e1]">{title}</h2></div>; }
+function Field({ label, children }: { label: string; children: React.ReactNode }) { return <label className="mb-3 block text-xs text-[#aebdb7]"><span className="mb-1 block font-mono">{label}</span>{children}</label>; }
+function Datum({ label, value }: { label: string; value: string }) { return <div><p className="text-[9px] uppercase text-[#82978e]">{label}</p><p className="mt-1 text-[#e6eee9]">{value}</p></div>; }
+function Metric({ label, value }: { label: string; value: string }) { return <div className="bg-[#0c1714] p-3"><p className="font-mono text-[9px] uppercase text-[#82978e]">{label}</p><p className="mt-1 font-mono text-base">{value}</p></div>; }
+function Row({ label, value }: { label: string; value: string }) { return <div className="flex items-center justify-between gap-3"><span className="text-[#82978e]">{label}</span><span className="text-right text-[#dce7e1]">{value}</span></div>; }
+function ChartHeaderDatum({ label, value, accent = false }: { label: string; value: string; accent?: boolean }) { return <div className="min-w-0 bg-[#0c1714] px-3 py-2"><p className="font-mono text-[8px] uppercase text-[#6f817a]">{label}</p><p className={`mt-1 truncate font-mono text-[10px] ${accent ? "text-[#31c48d]" : "text-[#dce7e1]"}`} title={value}>{value}</p></div>; }
+function TransportButton({ label, symbol, onClick }: { label: string; symbol: string; onClick: () => void }) { return <button className="lab-segment min-h-8 text-[10px]" type="button" title={label} aria-label={label} onClick={onClick}>{symbol}</button>; }
+function traceLabel(kind: ReplayResult["events"][number]["kind"], firstLimit = false) { return kind === "buy_limit" ? (firstLimit ? "BUY LIMIT" : "BUY LIMIT REPLACED") : kind === "cancelled_order" ? "BUY CANCELLED" : kind === "filled_order" ? "BUY FILLED" : kind === "entry" ? "POSITION OPENED" : kind === "protective_stop" ? "STOP INITIALIZED" : kind === "profit_activation" ? "PROFIT MODE" : kind === "trailing_floor" ? "TRAILING UPDATED" : "SELL FILLED"; }
+
+function TradeSummary({ trade, timeline }: { trade: ReplayTrade; timeline: Array<{ event: ReplayResult["events"][number]; label: string }> }) {
+  const replacements = timeline.filter((item) => item.label === "BUY LIMIT REPLACED").length;
+  const trailingUpdates = timeline.filter((item) => item.label === "TRAILING UPDATED").length;
+  const activated = timeline.some((item) => item.label === "PROFIT MODE");
+  return <div className="grid grid-cols-2 gap-px bg-[#294139] sm:grid-cols-4">
+    <DatumCell label="BUY LIMIT" value={`${replacements} replacements`} /><DatumCell label="Position" value={`Held ${trade.holding_candles} candles`} /><DatumCell label="Profit Mode" value={activated ? "Activated" : "Not activated"} /><DatumCell label="Trailing" value={`${trailingUpdates} updates`} /><DatumCell label="Exit" value={trade.exit_reason.replaceAll("_", " ")} /><DatumCell label="Net P&L" value={money(trade.net_pnl)} accent={number(trade.net_pnl) >= 0} />
+  </div>;
+}
+function DatumCell({ label, value, accent }: { label: string; value: string; accent?: boolean }) { return <div className="bg-[#08110f] p-3"><p className="font-mono text-[9px] uppercase text-[#82978e]">{label}</p><p className={`mt-1 font-mono text-xs ${accent === undefined ? "text-[#dce7e1]" : accent ? "text-[#31c48d]" : "text-[#ef6b5f]"}`}>{value}</p></div>; }
+
+const PATTERN_GROUPS: PatternFinding["group"][] = ["Price Structure", "Volatility", "Momentum", "Volume", "Breakouts", "Strategy Behavior"];
+
+function PatternIntelligencePanel({ analysis, selected, onSelect }: { analysis: PatternAnalysis; selected: PatternFinding | null; onSelect: (finding: PatternFinding) => void }) {
+  const cost = analysis.configuration.fee_pct !== undefined && analysis.configuration.slippage_pct !== undefined
+    ? `fee ${analysis.configuration.fee_pct} + slippage ${analysis.configuration.slippage_pct} per side`
+    : "configured replay costs";
+  return <div className="mb-5 space-y-4" aria-label="Pattern Intelligence findings">
+    <div className="flex justify-between font-mono text-[9px] text-[#82978e]"><span>{analysis.findings.length} findings</span><span>{number(analysis.elapsed_ms).toFixed(1)} ms</span></div>
+    {PATTERN_GROUPS.map((group) => {
+      const findings = analysis.findings.filter((item) => item.group === group);
+      return <section key={group} aria-label={group}>
+        <h3 className="mb-1 font-mono text-[10px] uppercase text-[#6fa78f]">{group} · {findings.length}</h3>
+        {findings.length === 0 ? <p className="border-l border-[#294139] pl-2 font-mono text-[9px] text-[#6f817a]">No supported finding</p> : <div className="space-y-1">{findings.slice(0, 8).map((finding) => {
+          const occurrence = finding.recurrence.find((item) => item.partition === "entire_dataset" && item.forward_horizon === 4);
+          return <button key={finding.finding_id} type="button" onClick={() => onSelect(finding)} className={`w-full border p-2 text-left ${selected?.finding_id === finding.finding_id ? "border-[#58b8d8] bg-[#112a30]" : "border-[#294139] bg-[#08110f] hover:border-[#416357]"}`}>
+            <span className="block font-mono text-[10px] text-[#dce7e1]">{finding.pattern_name}</span>
+            <span className="mt-1 flex justify-between font-mono text-[8px] text-[#82978e]"><span>{finding.start_index}–{finding.end_index}</span><span>{occurrence?.occurrence_count ?? 0} matches · 4 bars</span></span>
+            <span className={`mt-1 block font-mono text-[8px] ${finding.sufficient_evidence ? "text-[#31c48d]" : "text-[#e0b34c]"}`}>{finding.category.replaceAll("_", " ")}</span>
+          </button>;
+        })}{findings.length > 8 && <p className="border-l border-[#294139] py-1 pl-2 font-mono text-[8px] text-[#82978e]">{findings.length - 8} additional chart annotations</p>}</div>}
+      </section>;
+    })}
+    {selected && <div className="border-l-2 border-[#58b8d8] bg-[#08110f] p-3">
+      <p className="font-serif text-base text-[#e6eee9]">{selected.pattern_name}</p>
+      <p className="mt-1 font-mono text-[8px] text-[#82978e]">{selected.detector_id} · v{selected.detector_version}</p>
+      <p className="mt-3 font-mono text-[9px] uppercase text-[#6fa78f]">Why was this detected?</p>
+      <ul className="mt-1 space-y-1">{selected.conditions.map((condition) => <li key={condition} className="font-mono text-[9px] leading-4 text-[#c7d4ce]">{condition}</li>)}</ul>
+      <EvidenceMap title="Measurements" values={selected.measurements} />
+      <EvidenceMap title="Thresholds" values={selected.thresholds} />
+      <div className="mt-3 border-t border-[#294139] pt-2 font-mono text-[9px] leading-4 text-[#9fb0aa]">
+        <p>Selected candles: {selected.start_index}–{selected.end_index}</p>
+        <p>Partition: {analysis.partition.replaceAll("_", " ")}</p>
+        <p>Cost assumption: {cost}</p>
+        {[1, 2, 4, 8, 16].map((horizon) => {
+          const recurrence = selected.recurrence.find((item) => item.partition === "entire_dataset" && item.forward_horizon === horizon);
+          return <p key={horizon}>{horizon} bars · {recurrence?.occurrence_count ?? 0} matches · avg {recurrence?.average_forward_return === null || recurrence?.average_forward_return === undefined ? "n/a" : percent(number(recurrence.average_forward_return) * 100)} · net positive {recurrence?.net_positive_frequency === null || recurrence?.net_positive_frequency === undefined ? "n/a" : percent(number(recurrence.net_positive_frequency) * 100)}</p>;
+        })}
+      </div>
+      <div className="mt-3 grid grid-cols-3 gap-1 font-mono text-[8px] text-[#82978e]">{(["training", "validation", "final_test"] as const).map((partition) => {
+        const evidence = selected.recurrence.find((item) => item.partition === partition && item.forward_horizon === 4);
+        return <div key={partition} className="border border-[#294139] p-1.5"><span className="block uppercase">{partition.replace("_", " ")}</span><span className="mt-1 block text-[#dce7e1]">{evidence?.occurrence_count ?? 0} cases</span></div>;
+      })}</div>
+    </div>}
+  </div>;
+}
+
+function EvidenceMap({ title, values }: { title: string; values: Record<string, string | number | boolean | null> }) {
+  return <div className="mt-3"><p className="font-mono text-[9px] uppercase text-[#6fa78f]">{title}</p>{Object.entries(values).map(([key, value]) => <div key={key} className="mt-1 flex justify-between gap-2 font-mono text-[8px] text-[#9fb0aa]"><span>{key.replaceAll("_", " ")}</span><span className="text-right text-[#dce7e1]">{String(value)}</span></div>)}</div>;
+}
+
+function HelpDialog({ onClose }: { onClose: () => void }) {
+  const metrics = [
+    ["Net return", "Strategy capital change after fees and simulated slippage."], ["Buy & hold", "The same starting capital held in the asset over this replay period."], ["Economic value", "Ending trading capital plus withdrawals and tax reserve."], ["Outperformance", "Economic value minus the buy-and-hold ending value."], ["Win rate", "Completed trades with positive net P&L divided by all completed trades."], ["Max drawdown", "Largest peak-to-trough decline in simulated equity."], ["MFE / MAE", "Best favorable and worst adverse price excursion during one trade."],
+  ];
+  return <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/75 p-4" role="dialog" aria-modal="true" aria-labelledby="strategy-lab-help-title">
+    <div className="max-h-[88vh] w-full max-w-4xl overflow-auto border border-[#416357] bg-[#0c1714] p-5 shadow-2xl">
+      <div className="flex items-start justify-between gap-4"><div><p className="font-mono text-[10px] uppercase text-[#6fa78f]">Chart field guide</p><h2 id="strategy-lab-help-title" className="mt-1 font-serif text-2xl">What am I looking at?</h2></div><button className="lab-button" type="button" onClick={onClose}>Close</button></div>
+      <p className="mt-4 max-w-3xl text-sm leading-6 text-[#aebdb7]">This is a deterministic replay of historical candles. Every order, stop, activation, and exit comes from the Python engine trace. The browser explains and filters that evidence; it does not infer trades.</p>
+      <h3 className="mt-6 font-mono text-xs uppercase text-[#dce7e1]">Price chart lines, markers, and colors</h3>
+      <div className="mt-2 grid gap-px bg-[#294139] sm:grid-cols-2">{CHART_LAYERS.map((layer) => <div key={layer.id} className="flex gap-3 bg-[#08110f] p-3"><span className="w-5 text-center text-lg" style={{ color: layer.color }}>{layer.symbol}</span><div><p className="font-mono text-xs" style={{ color: layer.color }}>{layer.name}</p><p className="mt-1 text-xs leading-5 text-[#9fb0aa]">{layer.purpose}</p></div></div>)}</div>
+      <h3 className="mt-6 font-mono text-xs uppercase text-[#dce7e1]">Trade timeline</h3>
+      <p className="mt-2 text-xs leading-5 text-[#9fb0aa]">Select a completed ledger row or click inside a trade on the chart. The chart focuses its order-to-exit interval and reveals BUY placement, replacements, cancellations, fill, initialized stop, Profit Mode, changed trailing floors, and SELL exit in engine order.</p>
+      <h3 className="mt-6 font-mono text-xs uppercase text-[#dce7e1]">Evidence metrics</h3>
+      <div className="mt-2 grid gap-3 sm:grid-cols-2">{metrics.map(([name, description]) => <div key={name} className="border-l-2 border-[#416357] pl-3"><p className="font-mono text-xs text-[#dce7e1]">{name}</p><p className="mt-1 text-xs leading-5 text-[#9fb0aa]">{description}</p></div>)}</div>
+      <p className="mt-6 border-t border-[#294139] pt-4 font-mono text-[10px] leading-5 text-[#82978e]">All price objects use the right-hand price axis. Capital and equity are intentionally kept out of this price chart and reported separately in Evidence.</p>
+    </div>
+  </div>;
 }

@@ -78,7 +78,7 @@ DETERMINISTIC FILL POLICY (documented, applied consistently):
 """
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from decimal import Decimal
 from typing import List, Optional, Sequence
 
@@ -86,6 +86,7 @@ from .candles import Candle
 from .config import SimulationConfig
 from .costs import CostModel
 from .strategy import (
+    ExitReason,
     ExitResult,
     FillResult,
     LimitOrder,
@@ -104,6 +105,20 @@ class SimulationResult:
     initial_capital: Decimal
     final_equity: Decimal
     ended_in_position: bool
+    profit_mode_activations: int = 0
+    initial_stop_exits: int = 0
+    trailing_exits: int = 0
+    declining_close_exits: int = 0
+    replay_events: List["ReplayEvent"] = field(default_factory=list)
+
+
+@dataclass(frozen=True)
+class ReplayEvent:
+    candle_index: int
+    timestamp: object
+    kind: str
+    price: Decimal
+    reason: Optional[str] = None
 
 
 def run_simulation(
@@ -123,6 +138,11 @@ def run_simulation(
     resting_order: Optional[LimitOrder] = None
     position: Optional[PositionState] = None
     open_trade: Optional["_OpenTrade"] = None
+    profit_mode_activations = 0
+    initial_stop_exits = 0
+    trailing_exits = 0
+    declining_close_exits = 0
+    replay_events: List[ReplayEvent] = []
 
     pessimistic = config.intra_candle_ambiguity_policy == "pessimistic"
 
@@ -132,13 +152,36 @@ def run_simulation(
             open_trade.lowest_seen = min(open_trade.lowest_seen, candle.low)
 
             prior_closes = tuple(c.close for c in seen_candles)
+            replay_events.append(
+                ReplayEvent(
+                    candle_index=index,
+                    timestamp=candle.timestamp,
+                    kind="trailing_floor" if position.trailing_active else "protective_stop",
+                    price=position.trailing_floor,
+                )
+            )
             if not pessimistic:
                 # OPTIMISTIC: give the benefit of the doubt that a favorable
                 # trailing update happened before any adverse breach.
+                was_trailing_active = position.trailing_active
                 position = strategy.update_position_state(position, candle)
+                if not was_trailing_active and position.trailing_active:
+                    profit_mode_activations += 1
+                    replay_events.append(
+                        ReplayEvent(index, candle.timestamp, "profit_activation", position.profit_activation_price)
+                    )
 
             exit_result = strategy.check_exit(position, candle, prior_closes)
             if exit_result is not None:
+                if exit_result.reason == ExitReason.DECLINING_CLOSES:
+                    declining_close_exits += 1
+                elif position.trailing_active:
+                    trailing_exits += 1
+                else:
+                    initial_stop_exits += 1
+                replay_events.append(
+                    ReplayEvent(index, candle.timestamp, "exit", exit_result.exit_price, exit_result.reason.value)
+                )
                 trade, equity = _finalize_trade(
                     open_trade=open_trade,
                     exit_result=exit_result,
@@ -151,7 +194,13 @@ def run_simulation(
                 position = None
                 open_trade = None
             elif pessimistic:
+                was_trailing_active = position.trailing_active
                 position = strategy.update_position_state(position, candle)
+                if not was_trailing_active and position.trailing_active:
+                    profit_mode_activations += 1
+                    replay_events.append(
+                        ReplayEvent(index, candle.timestamp, "profit_activation", position.profit_activation_price)
+                    )
 
         if position is None:
             filled: Optional[FillResult] = None
@@ -159,6 +208,13 @@ def run_simulation(
                 if candle.low <= resting_order.price:
                     raw_fill_price = min(candle.open, resting_order.price)
                     filled = FillResult(fill_price=raw_fill_price, candle_index=index)
+                    replay_events.append(
+                        ReplayEvent(index, candle.timestamp, "filled_order", raw_fill_price)
+                    )
+                else:
+                    replay_events.append(
+                        ReplayEvent(index, candle.timestamp, "cancelled_order", resting_order.price)
+                    )
 
             history_including_this_candle = tuple(seen_candles) + (candle,)
             if filled is not None:
@@ -170,12 +226,29 @@ def run_simulation(
                     equity_before=equity,
                     cost_model=cost_model,
                 )
+                replay_events.extend([
+                    ReplayEvent(index, candle.timestamp, "entry", filled.fill_price),
+                    ReplayEvent(index, candle.timestamp, "protective_stop", position.initial_stop),
+                ])
                 resting_order = None
 
                 if pessimistic:
                     prior_closes = tuple(c.close for c in seen_candles)
                     same_candle_exit = strategy.check_exit(position, candle, prior_closes)
                     if same_candle_exit is not None:
+                        if same_candle_exit.reason == ExitReason.DECLINING_CLOSES:
+                            declining_close_exits += 1
+                        else:
+                            initial_stop_exits += 1
+                        replay_events.append(
+                            ReplayEvent(
+                                index,
+                                candle.timestamp,
+                                "exit",
+                                same_candle_exit.exit_price,
+                                same_candle_exit.reason.value,
+                            )
+                        )
                         trade, equity = _finalize_trade(
                             open_trade=open_trade,
                             exit_result=same_candle_exit,
@@ -190,6 +263,7 @@ def run_simulation(
             else:
                 new_price = strategy.propose_entry_price(history_including_this_candle)
                 resting_order = LimitOrder(price=new_price, placed_after_candle_index=index)
+                replay_events.append(ReplayEvent(index, candle.timestamp, "buy_limit", new_price))
 
         seen_candles.append(candle)
         equity_curve.append(equity)
@@ -200,6 +274,11 @@ def run_simulation(
         initial_capital=config.initial_capital,
         final_equity=equity,
         ended_in_position=position is not None,
+        profit_mode_activations=profit_mode_activations,
+        initial_stop_exits=initial_stop_exits,
+        trailing_exits=trailing_exits,
+        declining_close_exits=declining_close_exits,
+        replay_events=replay_events,
     )
 
 

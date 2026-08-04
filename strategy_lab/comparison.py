@@ -25,6 +25,7 @@ from .costs import CostModel
 from .engine import SimulationResult, run_simulation
 from .metrics import SimulationMetrics, compute_metrics
 from .strategies.trailing_limit_v1 import TrailingLimitV1Strategy
+from .strategies.trailing_limit_v2 import TrailingLimitV2Strategy
 
 PathLike = Union[str, Path]
 _HUNDRED = Decimal("100")
@@ -99,6 +100,7 @@ class RunOutcome:
     capital: CapitalSimulationResult
     buy_and_hold_ending_value: Decimal
     beat_buy_and_hold: bool
+    strategy_version: str = "001"
 
 
 def run_one(
@@ -131,6 +133,40 @@ def run_one(
         capital=capital,
         buy_and_hold_ending_value=bnh_ending_value,
         beat_buy_and_hold=capital.total_economic_value_final > bnh_ending_value,
+    )
+
+
+def run_one_v2(
+    candles: Sequence[Candle],
+    timeframe: str,
+    cost_scenario: CostScenario,
+    policy: CapitalPolicy,
+    initial_capital: Decimal = Decimal("100"),
+) -> RunOutcome:
+    config = SimulationConfig(
+        fee_pct=cost_scenario.fee_pct,
+        slippage_pct=cost_scenario.slippage_pct,
+        initial_capital=initial_capital,
+        candle_interval=timeframe,
+        **V1_SIGNAL_PARAMS,
+    )
+    strategy = TrailingLimitV2Strategy(config=config)
+    result = run_simulation(candles, strategy, config, CostModel.from_config(config))
+    metrics = compute_metrics(result)
+    capital = apply_capital_policy(result.trades, initial_capital, policy)
+    bnh_ending_value = buy_and_hold_ending_value(candles, initial_capital, cost_scenario)
+
+    return RunOutcome(
+        timeframe=timeframe,
+        cost_scenario=cost_scenario,
+        policy=policy,
+        config=config,
+        result=result,
+        metrics=metrics,
+        capital=capital,
+        buy_and_hold_ending_value=bnh_ending_value,
+        beat_buy_and_hold=capital.total_economic_value_final > bnh_ending_value,
+        strategy_version="002",
     )
 
 
@@ -227,12 +263,19 @@ def _json_default(value):
 
 def _write_summary_json(outcome: RunOutcome, path: PathLike) -> None:
     summary = {
+    "strategy_version": outcome.strategy_version,
         "timeframe": outcome.timeframe,
         "cost_scenario": asdict(outcome.cost_scenario),
         "capital_policy": asdict(outcome.policy),
         "config": asdict(outcome.config),
         "candle_count": len(outcome.result.equity_curve),
         "metrics": asdict(outcome.metrics),
+        "event_counts": {
+            "initial_stop_exits": outcome.result.initial_stop_exits,
+            "declining_close_exits": outcome.result.declining_close_exits,
+            "trailing_exits": outcome.result.trailing_exits,
+            "profit_mode_activations": outcome.result.profit_mode_activations,
+        },
         "capital": {
             "initial_capital": outcome.capital.initial_capital,
             "trading_capital_final": outcome.capital.trading_capital_final,
@@ -258,7 +301,7 @@ def _render_report(outcome: RunOutcome) -> str:
         return "n/a" if value is None else f"{value}{suffix}"
 
     lines = [
-        "Strategy #001 Evidence Run",
+        f"Strategy #{outcome.strategy_version} Evidence Run",
         "===========================",
         f"Timeframe:               {outcome.timeframe}",
         f"Cost scenario:           {outcome.cost_scenario.name} -- {outcome.cost_scenario.description}",
@@ -271,8 +314,15 @@ def _render_report(outcome: RunOutcome) -> str:
         "-----------------------------------------------------------------",
         f"Total Trades:            {m.total_trades}",
         f"Win Rate:                {fmt(m.win_rate_pct, '%')}",
+        f"Average Holding:         {fmt(m.average_holding_candles, ' candles')}",
+        f"Initial Stop Exits:      {outcome.result.initial_stop_exits}",
+        f"Declining-Close Exits:   {outcome.result.declining_close_exits}",
+        f"Trailing Exits:          {outcome.result.trailing_exits}",
+        f"Profit Activations:      {outcome.result.profit_mode_activations}",
         f"Gross Return:            {m.gross_return_pct:.4f}%",
         f"Net Return (full compounding): {m.net_return_pct:.4f}%",
+        f"Fees:                    {m.fees_paid}",
+        f"Slippage:                {m.estimated_slippage}",
         f"Raw strategy net return (always full compounding, for comparison): {c.raw_strategy_net_return_pct:.4f}%",
         f"Maximum Drawdown:        {m.max_drawdown_pct:.4f}%",
         f"Profit Factor:           {fmt(m.profit_factor)}",
@@ -304,14 +354,22 @@ def build_comparison_rows(outcomes: List[RunOutcome]) -> List[Dict[str, object]]
         c = o.capital
         rows.append(
             {
+                "strategy_version": o.strategy_version,
                 "timeframe": o.timeframe,
                 "cost_scenario": o.cost_scenario.name,
                 "capital_policy": o.policy.name,
                 "candle_count": len(o.result.equity_curve),
                 "trades": m.total_trades,
                 "win_rate_pct": m.win_rate_pct,
+                "average_holding_candles": m.average_holding_candles,
+                "initial_stop_exits": o.result.initial_stop_exits,
+                "declining_close_exits": o.result.declining_close_exits,
+                "trailing_exits": o.result.trailing_exits,
+                "profit_mode_activations": o.result.profit_mode_activations,
                 "gross_return_pct": m.gross_return_pct,
                 "net_return_pct": m.net_return_pct,
+                "fees": m.fees_paid,
+                "slippage": m.estimated_slippage,
                 "raw_strategy_net_return_pct": c.raw_strategy_net_return_pct,
                 "ending_trading_capital": c.trading_capital_final,
                 "withdrawn_profit": c.cumulative_withdrawn_final,
@@ -344,7 +402,9 @@ def write_comparison_outputs(outcomes: List[RunOutcome], output_dir: PathLike) -
         json.dump(rows, handle, indent=2, default=_json_default)
         handle.write("\n")
 
-    lines = ["Strategy #001 Evidence Run -- Comparison Table", "=" * 47, ""]
+    versions = sorted({outcome.strategy_version for outcome in outcomes})
+    title = f"Strategy #{versions[0]} Evidence Run" if len(versions) == 1 else "Strategy Evidence Run"
+    lines = [f"{title} -- Comparison Table", "=" * 47, ""]
     header = (
         f"{'timeframe':>9} {'cost':>10} {'policy':>15} {'candles':>8} {'trades':>7} "
         f"{'win%':>7} {'gross%':>9} {'net%':>9} {'endTEV':>10} {'maxDD%':>7} {'PF':>6} "
