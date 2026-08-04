@@ -248,6 +248,33 @@ export type ResearchExplanation = {
 
 export type ResearchTradeRequest = Omit<PatternAnalysisRequest, "selected_start_index" | "selected_end_index"> & { trade_index: number };
 
+export type RuleCondition = { feature: string; operator: string; value?: string | [string, string]; reference?: string; lookback: number };
+export type RuleDocument = {
+  schema_version: "1.0.0";
+  when: { all: RuleCondition[] } | { any: RuleCondition[] };
+  then: { action: string; value?: string };
+  risk_controls: { minimum_occurrences: number; maximum_drawdown_pct: string; final_test_used_for_tuning: boolean };
+};
+export type CandidateRuleRecord = {
+  candidate_rule_id: string; name: string; description: string; status: string; source_analysis_id: string;
+  source_finding_ids: string[]; source_candidate_experiment_id: string; parent_strategy_version: StrategyVersion;
+  conditions: RuleDocument["when"]; action: RuleDocument["then"]; risk_controls: RuleDocument["risk_controls"];
+  created_by: string; created_at: string; rule_schema_version: string; content_hash: string; research_notes: string;
+  evidence: Record<string, unknown>;
+};
+export type StrategyBranchRecord = { strategy_branch_id: string; parent_strategy_version: StrategyVersion; candidate_rule_id: string; content_hash: string; simulator_version: string };
+export type BranchReplayReport = {
+  partition: "training" | "validation" | "final_test" | "entire_dataset"; rule_match_count: number; rule_action_count: number;
+  parent: Record<string, string | number | null>; candidate: Record<string, string | number | null>; buy_and_hold: Record<string, string>;
+  parent_delta: Record<string, string>; buy_and_hold_delta: string; content_hash: string;
+};
+export type BranchComparison = {
+  strategy_branch_id: string; dataset_id: string; reports: Record<string, BranchReplayReport>;
+  overfitting_warnings: Array<{ code: string; message: string }>;
+  promotion: { eligible: boolean; status: "PROMOTABLE" | "REJECTED"; checks: Record<string, boolean> };
+};
+export type StrategyPackageExport = { strategy_package: Record<string, unknown> & { content_hash: string; promotion_status: string }; certificate: Record<string, unknown> & { content_hash: string } };
+
 const API_BASE_URL = process.env.NEXT_PUBLIC_API_BASE_URL ?? "http://localhost:8000";
 
 async function requestJson<T>(path: string, init?: RequestInit): Promise<T> {
@@ -314,3 +341,13 @@ export const showResearchMissed = (payload: PatternAnalysisRequest) => researchR
 export const explainResearchTrade = (payload: ResearchTradeRequest) => researchRequest("explain-trade", payload);
 export const explainResearchSuccess = (payload: ResearchTradeRequest) => researchRequest("explain-success", payload);
 export const getResearchOverfittingWarnings = (payload: PatternAnalysisRequest) => researchRequest("overfitting-warnings", payload);
+
+const ruleRequest = <T>(path: string, init?: RequestInit) => requestJson<T>(`/api/v1/strategy-lab${path}`, init);
+const jsonPost = (body: unknown): RequestInit => ({ method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) });
+
+export const validateRuleDocument = (ruleDocument: RuleDocument) => ruleRequest<{ valid: true; normalized_rule: RuleDocument }>("/rules/validate-document", jsonPost({ rule_document: ruleDocument }));
+export const createCandidateRule = (payload: Record<string, unknown>) => ruleRequest<CandidateRuleRecord>("/rules", jsonPost(payload));
+export const createStrategyBranch = (ruleId: string) => ruleRequest<StrategyBranchRecord>(`/rules/${encodeURIComponent(ruleId)}/create-branch`, jsonPost({}));
+export const replayStrategyBranch = (branchId: string, datasetId: string, partition: BranchReplayReport["partition"], parameters: StrategyLabParameters) => ruleRequest<BranchReplayReport>(`/branches/${encodeURIComponent(branchId)}/replay`, jsonPost({ dataset_id: datasetId, partition, parameters }));
+export const getBranchComparison = (branchId: string, datasetId: string) => ruleRequest<BranchComparison>(`/branches/${encodeURIComponent(branchId)}/comparison?dataset_id=${encodeURIComponent(datasetId)}`);
+export const getStrategyPackage = (branchId: string, datasetId: string) => ruleRequest<StrategyPackageExport>(`/branches/${encodeURIComponent(branchId)}/package?dataset_id=${encodeURIComponent(datasetId)}`);

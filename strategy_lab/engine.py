@@ -119,6 +119,12 @@ class ReplayEvent:
     kind: str
     price: Decimal
     reason: Optional[str] = None
+    candidate_rule_id: Optional[str] = None
+    strategy_branch: Optional[str] = None
+    condition_values: Optional[dict] = None
+    thresholds: Optional[dict] = None
+    result: Optional[bool] = None
+    action: Optional[str] = None
 
 
 def run_simulation(
@@ -261,9 +267,43 @@ def run_simulation(
                         position = None
                         open_trade = None
             else:
-                new_price = strategy.propose_entry_price(history_including_this_candle)
-                resting_order = LimitOrder(price=new_price, placed_after_candle_index=index)
-                replay_events.append(ReplayEvent(index, candle.timestamp, "buy_limit", new_price))
+                evaluation_hook = getattr(strategy, "evaluate_entry_rule", None)
+                evaluation = evaluation_hook(history_including_this_candle, capital=equity) if evaluation_hook else None
+                if evaluation is not None:
+                    candidate_rule_id = strategy.candidate_rule.candidate_rule_id
+                    strategy_branch = strategy.branch.strategy_branch_id
+                    replay_events.append(ReplayEvent(
+                        index, candle.timestamp, "RULE_EVALUATED", candle.close,
+                        candidate_rule_id=candidate_rule_id, strategy_branch=strategy_branch,
+                        condition_values=evaluation.condition_values, thresholds=evaluation.thresholds,
+                        result=evaluation.matched, action=evaluation.action,
+                    ))
+                    replay_events.append(ReplayEvent(
+                        index, candle.timestamp, "RULE_MATCHED" if evaluation.matched else "RULE_NOT_MATCHED", candle.close,
+                        candidate_rule_id=candidate_rule_id, strategy_branch=strategy_branch,
+                        condition_values=evaluation.condition_values, thresholds=evaluation.thresholds,
+                        result=evaluation.matched, action=evaluation.action,
+                    ))
+                entry_allowed = evaluation is None or strategy.entry_allowed(evaluation)
+                if entry_allowed:
+                    new_price = strategy.propose_entry_price(history_including_this_candle)
+                    resting_order = LimitOrder(price=new_price, placed_after_candle_index=index)
+                    replay_events.append(ReplayEvent(index, candle.timestamp, "buy_limit", new_price))
+                    if evaluation is not None and evaluation.matched:
+                        replay_events.append(ReplayEvent(
+                            index, candle.timestamp, "RULE_ACTION_APPLIED", new_price,
+                            candidate_rule_id=candidate_rule_id, strategy_branch=strategy_branch,
+                            condition_values=evaluation.condition_values, thresholds=evaluation.thresholds,
+                            result=True, action=evaluation.action,
+                        ))
+                else:
+                    resting_order = None
+                    replay_events.append(ReplayEvent(
+                        index, candle.timestamp, "RULE_ACTION_APPLIED", candle.close,
+                        candidate_rule_id=candidate_rule_id, strategy_branch=strategy_branch,
+                        condition_values=evaluation.condition_values, thresholds=evaluation.thresholds,
+                        result=True, action=evaluation.action,
+                    ))
 
         seen_candles.append(candle)
         equity_curve.append(equity)

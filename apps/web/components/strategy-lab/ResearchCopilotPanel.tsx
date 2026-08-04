@@ -14,6 +14,7 @@ import {
   type ResearchStatement,
   type ResearchTradeRequest,
 } from "@/lib/api/strategyLabOffline";
+import RuleBuilder from "./RuleBuilder";
 
 type Tab = "Observed Patterns" | "Missed Opportunities" | "Failure Analysis" | "Success Analysis" | "Candidate Experiments" | "Overfitting Warnings" | "Research Notes";
 
@@ -94,7 +95,7 @@ export default function ResearchCopilotPanel({ selectionPayload, visiblePayload,
           <textarea id="research-copilot-note" className="lab-input mt-2 min-h-24 resize-y font-mono text-[10px]" value={note} onChange={(event) => setNote(event.target.value)} />
           <button className="lab-button mt-2" type="button" onClick={saveNote}>Save Local Note</button>
           <p className="mt-2 font-mono text-[8px] text-[#82978e]">Stored in this browser and linked to the current range, trade, analysis, and experiment context.</p>
-        </div> : activeTab === "Candidate Experiments" ? <ExperimentList result={current} /> : activeTab === "Overfitting Warnings" && !current && payload ? <button className="lab-button" onClick={() => void run("Overfitting Warnings", () => getResearchOverfittingWarnings(payload))}>Check Overfitting Warnings</button> : current ? <StatementList result={current} /> : <p className="border-l border-[#294139] pl-2 font-mono text-[9px] leading-4 text-[#82978e]">Run the relevant action to generate a reproducible explanation.</p>}
+        </div> : activeTab === "Candidate Experiments" ? <ExperimentList result={current} payload={payload} /> : activeTab === "Overfitting Warnings" && !current && payload ? <button className="lab-button" onClick={() => void run("Overfitting Warnings", () => getResearchOverfittingWarnings(payload))}>Check Overfitting Warnings</button> : current ? <StatementList result={current} /> : <p className="border-l border-[#294139] pl-2 font-mono text-[9px] leading-4 text-[#82978e]">Run the relevant action to generate a reproducible explanation.</p>}
       </div>
     </div>
   </details>;
@@ -136,13 +137,16 @@ function EvidenceValues({ title, values }: { title: string; values: Record<strin
   return <div><p className="mt-1 text-[#6fa78f]">{title}</p>{Object.entries(values).map(([key, value]) => <p key={key}>{key.replaceAll("_", " ")}: {String(value)}</p>)}</div>;
 }
 
-function ExperimentList({ result }: { result: ResearchExplanation | undefined }) {
+function ExperimentList({ result, payload }: { result: ResearchExplanation | undefined; payload: PatternAnalysisRequest | null }) {
+  const [selectedExperimentId, setSelectedExperimentId] = useState<string | null>(null);
   if (!result?.candidate_experiments.length) return <p className="border-l border-[#294139] pl-2 font-mono text-[9px] text-[#82978e]">No evidence-linked candidate experiment has been proposed.</p>;
+  const selected = result.candidate_experiments.find((experiment) => experiment.experiment_id === selectedExperimentId);
   return <div className="space-y-2">{result.candidate_experiments.map((experiment) => <article key={experiment.experiment_id} className="border border-[#294139] p-3">
     <p className="font-mono text-[9px] text-[#6fa78f]">Candidate Experiment {experiment.experiment_id}</p>
     <p className="mt-2 text-xs text-[#dce7e1]">{experiment.question}</p>
     <p className="mt-2 font-mono text-[8px] uppercase text-[#82978e]">Suggested controlled change</p>
     <p className="mt-1 text-xs text-[#c7d4ce]">{experiment.suggested_controlled_change}</p>
     <p className="mt-2 font-mono text-[8px] text-[#e0b34c]">NOT AN EXECUTABLE RULE · Required: {experiment.required_tests.join(" · ")}</p>
-  </article>)}</div>;
+    <button className="lab-button mt-3" type="button" disabled={!payload} onClick={() => { window.localStorage.setItem(`omnitrade.ruleDiscovery.experiments.${experiment.experiment_id}`, JSON.stringify({ experiment, source_analysis_id: result.source_analysis_id, content_hash: result.content_hash })); setSelectedExperimentId(experiment.experiment_id); }}>Review as Candidate Rule</button>
+  </article>)}{selected && payload && <RuleBuilder experiment={selected} result={result} payload={payload} onClose={() => setSelectedExperimentId(null)} />}</div>;
 }

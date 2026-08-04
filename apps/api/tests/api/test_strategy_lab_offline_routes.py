@@ -6,6 +6,7 @@ from fastapi.testclient import TestClient
 from app.main import create_app
 from app.services.strategy_lab_offline import load_dataset
 from app.services import strategy_lab_offline
+from app.services import rule_discovery
 
 
 def test_lists_cached_offline_datasets() -> None:
@@ -227,3 +228,92 @@ def test_research_copilot_does_not_modify_strategy_files() -> None:
 
     assert response.status_code == 200
     assert {path: path.read_bytes() for path in paths} == before
+
+
+def _ce_001_rule_payload() -> dict:
+    return {
+        "name": "Block entries during negative short-window momentum",
+        "description": "CE-001 controlled entry gate derived from the linked negative-slope evidence.",
+        "source_analysis_id": "analysis_ce_001_btc",
+        "source_finding_ids": ["finding_0001"],
+        "source_candidate_experiment_id": "CE-001",
+        "parent_strategy_version": "002",
+        "rule_document": {
+            "schema_version": "1.0.0",
+            "when": {"all": [{"feature": "short_window_momentum", "operator": "<", "value": "0", "lookback": 3}]},
+            "then": {"action": "BLOCK_LONG_ENTRY"},
+            "risk_controls": {"minimum_occurrences": 5, "maximum_drawdown_pct": "10", "final_test_used_for_tuning": False},
+        },
+        "created_by": "human_with_copilot",
+        "research_notes": "Review required before branch creation.",
+        "evidence": {
+            "suggested_by": "Research Copilot",
+            "detector_versions": {"negative_slope_v1": "1.0.0"},
+            "measurements": {"least_squares_slope": "-228.1542857142857142857142857"},
+            "why": "The linked loss explanation classified negative slope before a declining-close exit.",
+        },
+    }
+
+
+def test_rule_discovery_full_local_workflow_is_idempotent_and_hashed(tmp_path, monkeypatch) -> None:
+    monkeypatch.setattr(rule_discovery, "_ARTIFACT_ROOT", tmp_path)
+    root = Path(__file__).resolve().parents[4]
+    strategy_paths = [
+        root / "strategy_lab/strategies/trailing_limit_v1.py",
+        root / "strategy_lab/strategies/trailing_limit_v2.py",
+    ]
+    parent_before = {path: path.read_bytes() for path in strategy_paths}
+
+    with TestClient(create_app()) as client:
+        created = client.post("/api/v1/strategy-lab/rules", json=_ce_001_rule_payload())
+        repeated = client.post("/api/v1/strategy-lab/rules", json=_ce_001_rule_payload())
+        assert created.status_code == 201
+        assert repeated.status_code == 201
+        assert created.json() == repeated.json()
+        rule_id = created.json()["candidate_rule_id"]
+        assert client.get("/api/v1/strategy-lab/rules").json()["items"][0]["candidate_rule_id"] == rule_id
+        assert client.post(f"/api/v1/strategy-lab/rules/{rule_id}/validate").json()["valid"] is True
+
+        branch = client.post(f"/api/v1/strategy-lab/rules/{rule_id}/create-branch")
+        repeated_branch = client.post(f"/api/v1/strategy-lab/rules/{rule_id}/create-branch")
+        assert branch.status_code == 200
+        assert branch.json() == repeated_branch.json()
+        branch_id = branch.json()["strategy_branch_id"]
+
+        reports = {}
+        for partition in ("training", "validation", "final_test", "entire_dataset"):
+            response = client.post(f"/api/v1/strategy-lab/branches/{branch_id}/replay", json={"dataset_id": "btc_15m", "partition": partition})
+            assert response.status_code == 200
+            reports[partition] = response.json()
+        assert reports["training"]["rule_events"]
+        assert reports["training"]["rule_match_count"] >= reports["training"]["rule_action_count"]
+
+        comparison = client.get(f"/api/v1/strategy-lab/branches/{branch_id}/comparison", params={"dataset_id": "btc_15m"})
+        package = client.get(f"/api/v1/strategy-lab/branches/{branch_id}/package", params={"dataset_id": "btc_15m"})
+        package_again = client.get(f"/api/v1/strategy-lab/branches/{branch_id}/package", params={"dataset_id": "btc_15m"})
+        assert comparison.status_code == 200
+        assert set(comparison.json()["reports"]) == {"training", "validation", "final_test", "entire_dataset"}
+        assert package.status_code == 200
+        assert package.json()["strategy_package"]["content_hash"] == package_again.json()["strategy_package"]["content_hash"]
+        assert package.json()["certificate"]["strategy_package_content_hash"] == package.json()["strategy_package"]["content_hash"]
+
+    assert {path: path.read_bytes() for path in strategy_paths} == parent_before
+    assert (tmp_path / "rules" / f"{rule_id}.json").is_file()
+    assert (tmp_path / "branches" / f"{branch_id}.json").is_file()
+
+
+def test_rule_discovery_rejects_code_lookahead_and_unsafe_paths(tmp_path, monkeypatch) -> None:
+    monkeypatch.setattr(rule_discovery, "_ARTIFACT_ROOT", tmp_path)
+    code_payload = _ce_001_rule_payload()
+    code_payload["rule_document"]["python"] = "__import__('os').system('id')"
+    lookahead_payload = _ce_001_rule_payload()
+    lookahead_payload["rule_document"]["when"] = {"all": [{"feature": "close", "operator": ">", "reference": "next_close"}]}
+    with TestClient(create_app()) as client:
+        code = client.post("/api/v1/strategy-lab/rules", json=code_payload)
+        lookahead = client.post("/api/v1/strategy-lab/rules", json=lookahead_payload)
+        unsafe_rule = client.get("/api/v1/strategy-lab/rules/..%2Fsecret")
+        unsafe_branch = client.get("/api/v1/strategy-lab/branches/..%2Fsecret/comparison", params={"dataset_id": "btc_15m"})
+    assert code.status_code == 400
+    assert lookahead.status_code == 400
+    assert unsafe_rule.status_code in {400, 404}
+    assert unsafe_branch.status_code in {400, 404}

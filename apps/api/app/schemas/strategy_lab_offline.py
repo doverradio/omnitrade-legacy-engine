@@ -110,3 +110,33 @@ class ResearchCopilotTradeRequest(PatternIntelligenceTradeRequest):
     final_test_used_for_development: bool = False
     hypotheses_tested_on_partition: int = Field(default=0, ge=0, le=100_000)
     sensitivity_results: list[dict[str, str | int | float | bool | None]] = Field(default_factory=list, max_length=100)
+
+
+class CandidateRuleCreateRequest(BaseModel):
+    name: str = Field(min_length=1, max_length=160)
+    description: str = Field(min_length=1, max_length=2000)
+    source_analysis_id: str = Field(min_length=1, max_length=160)
+    source_finding_ids: list[str] = Field(min_length=1, max_length=100)
+    source_candidate_experiment_id: str = Field(min_length=1, max_length=80)
+    parent_strategy_version: Literal["001", "002"] = "002"
+    rule_document: dict
+    created_by: Literal["human", "human_with_copilot"] = "human_with_copilot"
+    research_notes: str = Field(default="", max_length=10000)
+    evidence: dict = Field(default_factory=dict)
+
+
+class RuleDocumentValidationRequest(BaseModel):
+    rule_document: dict
+
+
+class CandidateRuleUpdateRequest(BaseModel):
+    name: str = Field(min_length=1, max_length=160)
+    description: str = Field(min_length=1, max_length=2000)
+    rule_document: dict
+    research_notes: str = Field(default="", max_length=10000)
+
+
+class BranchReplayRequest(BaseModel):
+    dataset_id: str = Field(min_length=1, max_length=120)
+    partition: Literal["training", "validation", "final_test", "entire_dataset"]
+    parameters: StrategyLabParameters = Field(default_factory=StrategyLabParameters)
