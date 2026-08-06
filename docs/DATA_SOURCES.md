@@ -2,6 +2,8 @@
 
 ## OmniTrade Legacy Engine — Data Sources
 
+> **Correction (architecture reconciliation, 2026-08-06):** This document does not mention Kraken or Coinbase anywhere, yet Kraken is the platform's primary production execution and market-data provider today, and Coinbase is the secondary execution provider (`apps/api/app/services/data/kraken_client.py`, `apps/api/app/services/exchange_connections/providers/kraken_spot.py` and `coinbase_advanced.py`; see `docs/00_OPERATIONS_MAP.md`'s External Systems table and `docs/PROJECT_STATUS.md`'s Execution Provider Status section for current status). Binance's role has narrowed to market-data-only ("no order-execution integration found" per `00_OPERATIONS_MAP.md`); Alpaca's role has narrowed to paper-trading-only. The candidate sources documented below remain present in the codebase in those narrower roles, but are no longer the platform's primary data/execution dependency — a future revision of this document should document Kraken and Coinbase as the current primary sources, per `docs/DOCUMENTATION_DRIFT_REPORT.md` §2.7.
+
 ### 1. Goals
 
 - Start with free or low-cost data.

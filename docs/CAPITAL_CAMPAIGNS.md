@@ -1,5 +1,7 @@
 # Capital Campaigns Foundation (Phase 1 + Phase 2)
 
+> **Scope correction (architecture reconciliation, 2026-08-06):** This document accurately describes `apps/api/app/services/capital_campaigns/` (plural) — the CRUD/lifecycle service and its API surface below. It does not mention a second, larger, real service layer — `apps/api/app/services/capital_campaign_domain/` (singular) and `apps/api/app/services/capital_campaign_orchestration/` — that governs the *same* `capital_campaigns` table via a "runtime pin" mechanism, and which is the layer that actually authorizes and submits real live orders (`commissioned_entry_execution.py` → `LiveCryptoOrderService`). **The "It does not: enable live automation" claim below is therefore accurate only for the CRUD layer this document describes, not for Capital Campaigns as a platform-wide concept.** See `docs/adr/ADR-0019-canonical-capital-campaign-governance-layer.md` for the full picture and `docs/CANONICAL_ARCHITECTURE_MAP.md` §11 for how this relates to (and differs from) ADR-0008's separate, unimplemented "Capital Allocation Engine" concept.
+
 ## Scope
 
 Capital Campaigns Foundation introduces campaign-scoped capital domain models.
@@ -8,9 +10,9 @@ Phase 1 delivered campaign CRUD and lifecycle management.
 
 Phase 2 adds profit policy configuration and profit-cycle accounting recommendations.
 
-It does not:
+**This document's scope — the CRUD/lifecycle layer described below —** does not:
 
-- enable live automation
+- enable live automation *(true for this CRUD layer; not true for Capital Campaigns as a whole — see correction above)*
 - enable automatic withdrawals
 - execute withdrawals or transfers
 - enable multi-user custody

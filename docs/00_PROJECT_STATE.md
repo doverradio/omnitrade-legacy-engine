@@ -461,3 +461,36 @@ implemented and tested against real (SQLite) candle data. See
   (governing prompt Phase 11) has been enabled — this remains a
   code-and-test-only round. Next session should pick this up — see
   `06_NEXT_SESSION.md`.
+
+✓ **Update (2026-08-04, branch `feature/entry-intelligence-limit-orders`,
+on top of commit `3580c3b`): the custody gap above is closed.** A
+provider-confirmed FILLED BUY_LIMIT now reaches the exact same
+authoritative `AutonomousPositionCustody` a FILLED market BUY reaches, via
+a new `commissioning_entry_mode="autonomous_limit_entry"` added to
+`create_canonical_preview_package` (reusing 100% of the existing package/
+mandate-authorization/dry-run/activation machinery unchanged) plus a new
+`_establish_claim_lineage` step in `autonomous_limit_entry_worker.py` that
+calls the real, unmodified `claim_activated_package`, and a new
+`_resolve_claim_scope_and_custody` step that calls the real, unmodified
+`release_execution_claim_scope_if_order_resolved` (the function that
+itself calls `establish_buy_custody`). See `02_DECISIONS.md` (2026-08-04)
+for the full root cause, design, and safety review.
+
+**Still not done / explicitly deferred (updated list)**:
+- Partial-fill-then-cancel does NOT establish custody for the partial
+  quantity — `establish_buy_custody`'s exact-match `reconciliation_status
+  == "filled"` requirement (shared with the market-BUY path) is
+  deliberately not weakened; this surfaces as `RECONCILIATION_REQUIRED`
+  instead, a real, proven, pre-existing gap in the shared function
+  (confirmed via `accounting_reconciliation.py`), not something unique to
+  this lane.
+- Live submission remains gated by a new, dedicated,
+  default-`False` `AUTONOMOUS_LIMIT_ENTRY_SUBMISSION_ENABLED` flag; no
+  live capital has been deployed and the migration
+  (`20260804_0066_add_limit_entry_claim_lineage`) has not been applied to
+  any real database.
+- Shadow validation against REAL production rejection history has not
+  been run (no local DB/VPS access this session) — `tools/shadow_validate_recent_rejections.py`
+  is implemented, its log-parsing logic is tested, and the exact VPS
+  command to run it is documented, but it has not yet been executed
+  against production data.

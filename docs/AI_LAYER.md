@@ -15,10 +15,15 @@ Its four jobs:
 ### 2. Components
 
 #### 2.1 Regime Classifier
-- **Input:** Recent OHLCV history, realized volatility, trend-strength indicators (e.g., ADX), and the rules-based `trend_regime_filter` output as a baseline signal.
-- **Output:** A regime label (`trending_up`, `trending_down`, `ranging`, `high_volatility`, `low_liquidity`) with a confidence score, written to `signals.regime_tag` and `model_outputs`.
-- **MVP implementation approach:** Start with an interpretable model (e.g., gradient-boosted trees or logistic regression over engineered features) rather than a deep/black-box model — interpretability is a hard requirement (see §4). A more complex model can be considered later, but only alongside a feature-attribution method (e.g., SHAP) so explanations remain grounded.
-- **Validation:** Regime labels are back-tested against known historical regime periods and cross-checked against the deterministic `trend_regime_filter` to catch classifier drift.
+
+> **Correction (architecture reconciliation, 2026-08-06):** No AI/ML regime classifier of the kind described below has ever been built. Full evidence in `docs/DOCUMENTATION_DRIFT_REPORT.md` §2.3 and `docs/MARKET_STATE_AND_REGIME_IMPLEMENTATION_AUDIT.md`. The section below is retained as a record of original intent; see the "What actually exists" note beneath it for the real, canonical mechanism.
+
+- **Input (as originally planned, not built):** Recent OHLCV history, realized volatility, trend-strength indicators (e.g., ADX), and the rules-based `trend_regime_filter` output as a baseline signal.
+- **Output (as originally planned, not built):** A regime label (`trending_up`, `trending_down`, `ranging`, `high_volatility`, `low_liquidity`) with a confidence score, written to `signals.regime_tag` and `model_outputs`.
+- **MVP implementation approach (as originally planned, not built):** Start with an interpretable model (e.g., gradient-boosted trees or logistic regression over engineered features) rather than a deep/black-box model — interpretability is a hard requirement (see §4). A more complex model can be considered later, but only alongside a feature-attribution method (e.g., SHAP) so explanations remain grounded.
+- **Validation (as originally planned, not built):** Regime labels are back-tested against known historical regime periods and cross-checked against the deterministic `trend_regime_filter` to catch classifier drift. This cross-checking relationship has never existed in code — `trend_regime_filter.py` is registered but excluded from the live strategy roster and has no wiring to any classifier.
+
+**What actually exists:** The platform's real, live, production regime classification is `apps/api/app/services/strategy_outcomes/service.py::classify_regime_labels` — a deterministic (not AI/ML) three-axis classifier (trend: TRENDING/RANGING; volatility: HIGH/LOW; range: EXPANSION/COMPRESSION), consumed by `strategy_roster/decision_aggregator.py::_strategy_weight` to nudge live strategy ensemble weight ±0.1 within a [0.5, 1.5] band. This is the canonical implementation per `docs/adr/ADR-0018-canonical-deterministic-regime-classifier.md`; `trend_regime_filter.py` and `strategy_lab`'s pattern-intelligence volatility detector remain real but non-authoritative research/backtest-only alternatives — see `docs/CANONICAL_ARCHITECTURE_MAP.md` §1 for the full comparison. Any future work building the AI/ML classifier originally envisioned above should extend this canonical implementation, per that ADR, rather than build a fourth parallel classifier.
 
 #### 2.2 Signal Confidence Scorer
 - **Input:** The raw `Signal` from a strategy (or ensemble), current regime classification, recent strategy performance (win rate, recent drawdown), and volatility context.

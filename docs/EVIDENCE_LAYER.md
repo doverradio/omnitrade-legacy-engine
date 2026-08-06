@@ -247,15 +247,17 @@ Lifecycle interpretation:
 - Paper Performance Summary
 - Paper Trade History
 
-#### Future
+#### Future (status corrected 2026-08-06 — every item below has since shipped)
 
-- Replay Engine
-- Replay Evidence
-- Decision Quality Engine
-- Decision Arena
-- AI Coach Learning
-- Decision Intelligence
-- Capital Allocation
+> **Correction:** Every item in this "Future" list was implemented the same day this document was originally written (2026-07-09, git commits `6885e44`, `3771497`, `c2f7b07`, `8278efc`) and has been live in production since. This status table was accurate on the day it was written and was never revisited. See `docs/DOCUMENTATION_DRIFT_REPORT.md` §2.9.
+
+- ~~Replay Engine~~ → **Implemented**: `apps/api/app/services/replay/default_agent.py::DefaultReplayAgent.replay()`, exposed via `POST /arena/replay`.
+- ~~Replay Evidence~~ → **Implemented**: `apps/api/app/services/decisions/replay_candidates.py`, `replay_context.py`, `package.py`.
+- ~~Decision Quality Engine~~ → **Implemented**: `apps/api/app/services/decision_quality/deterministic.py`, exposed via `POST /arena/evaluate-replay`.
+- ~~Decision Arena~~ → **Implemented**: `apps/api/app/api/routes/arena.py` (760 lines: tournament, replay, capital-allocation, coach-review, strategy-health).
+- ~~AI Coach Learning~~ → **Implemented**: `apps/api/app/services/ai_coach/deterministic.py`, exposed via `POST /arena/coach-review`.
+- ~~Decision Intelligence~~ → **Implemented**: `apps/api/app/services/decision_intelligence/deterministic.py`, exposed via `GET /arena/decision-intelligence` (note: this is a narrower replay-quality-ranking module, distinct from the full Decision Intelligence Engine described in `DECISION_INTELLIGENCE_ENGINE.md` — see `docs/CANONICAL_ARCHITECTURE_MAP.md` §4).
+- ~~Capital Allocation~~ → **Implemented**: `apps/api/app/services/capital_allocation/deterministic.py`, exposed via `GET /arena/capital-allocation` (a narrow Strategy Arena paper-allocation helper — see `docs/CANONICAL_ARCHITECTURE_MAP.md` §11 for how this relates to, and differs from, ADR-0008's unrelated "Capital Allocation Engine" concept).
 
 ---
 

@@ -1,5 +1,7 @@
 # Execution Provider Layer
 
+> **Correction (architecture reconciliation, 2026-08-06):** The "What EP-1 does not do" list below states "no Kraken implementation in this prompt" and frames Kraken as future/additive. This is now factually false: `apps/api/app/services/exchange_connections/providers/registry.py` registers both `kraken_spot` and `coinbase_advanced` today, and Kraken is the platform's **primary** production execution provider (Coinbase is secondary) — see `docs/PROJECT_STATUS.md`'s Execution Provider Status section and `00_PROJECT_STATE.md`. The list below is retained as a historical record of EP-1's original scope at the time it shipped; it should not be read as describing current provider-registration status. See `docs/DOCUMENTATION_DRIFT_REPORT.md` §2.10.
+
 ## EP-1 Status
 
 EP-1 completed a controlled architectural extraction for execution providers without changing live-order behavior.

@@ -2,6 +2,8 @@
 
 ## OmniTrade Legacy Engine — Initial API Contracts
 
+> **Scope correction (architecture reconciliation, 2026-08-06):** This document describes the platform's original MVP-era API surface and remains a reasonably accurate description of *that* narrower surface — the endpoints below still exist largely as documented. It is, however, no longer close to a complete API index: `apps/api/app/main.py` registers roughly 24 routers today, and this document (together with `RISK_AND_AUDIT_API_CONTRACTS.md`) covers well under half of them. Entirely undocumented here: `/decisions/*` (Decision Records, timeline, explainability, counterfactuals, quality, replay), `/arena/*` (Strategy Arena tournaments, replay, capital-allocation, coach-review), `/capital-campaigns/*`, `/autonomous-capital-mandates/*`, `/controlled-proofs/*`, `/live/*`, `/live-crypto-orders/*`, `/instant-trades/*`, `/exchange-connections/*`, `/asset-commissioning/*`, `/research/*`, `/strategy-lab/*`, `/mission-control/*`, `/operator/actions/*`, `/validation-runs/*`. For the current, real route inventory, see `docs/00_OPERATIONS_MAP.md`'s "Notable service/domain modules" listing, or `apps/api/app/api/routes/` directly. A full rewrite of this document to cover the live surface is flagged as a dedicated follow-up task in `docs/REPOSITORY_RECONCILIATION_SUMMARY.md` — out of scope for a documentation-reconciliation pass to attempt in one sitting.
+
 ### Conventions
 
 - Base URL (local): `http://localhost:8000`

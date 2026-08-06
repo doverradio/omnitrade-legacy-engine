@@ -79,7 +79,13 @@ ADRs are numbered sequentially (`ADR-0001`, `ADR-0002`, ...) in the order they w
 | [ADR-0014](./ADR-0014-synthetic-evidence-provenance-and-persistence-isolation.md) | Synthetic Evidence Provenance and Persistence Isolation | Accepted |
 | [ADR-0015](./ADR-0015-point-in-time-knowledge-boundary.md) | Point-in-Time Knowledge Boundary | Accepted |
 | [ADR-0016](./ADR-0016-immutable-historical-dataset-requirement.md) | Immutable Historical Dataset Requirement | Accepted |
+| [ADR-0017](./ADR-0017-canonical-market-slot-and-event-identity.md) | Canonical Market Slot and Event Identity | Accepted |
+| [ADR-0018](./ADR-0018-canonical-deterministic-regime-classifier.md) | Canonical Deterministic Regime Classifier | Accepted |
+| [ADR-0019](./ADR-0019-canonical-capital-campaign-governance-layer.md) | Canonical Capital Campaign Governance Layer | Accepted |
+| [ADR-0020](./ADR-0020-replay-terminology-and-boundaries.md) | Replay Terminology and Boundaries | Accepted |
 
 This index must be updated whenever a new ADR is added or an existing one's status changes.
 
 Note: `IMPLEMENTATION_MASTER_PLAN.md` Phase 3 refers to these as ADR-0008–0012; those numbers were already taken (Capital Allocation Engine, Execution Price Evidence Boundary, Decision Linkage Integrity Guard, Autonomous Capital Mandate Engine) by the time this phase was implemented, so they were assigned the next available numbers, ADR-0012–0016, per this file's own numbering rule (never renumber or reuse).
+
+ADR-0018–0020 were added by a repository-wide architecture reconciliation pass (see `docs/DOCUMENTATION_DRIFT_REPORT.md`, `docs/CANONICAL_ARCHITECTURE_MAP.md`, `docs/REPOSITORY_RECONCILIATION_SUMMARY.md`) to record canonical-ownership decisions for architectural responsibilities that had accumulated more than one implementation without any document naming which was authoritative. They are documentation-reconciliation ADRs — they name an existing authority, they do not introduce new subsystems.

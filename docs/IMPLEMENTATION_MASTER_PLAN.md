@@ -36,6 +36,8 @@ Authority: Subordinate to the five constitutional documents and to `00_PROJECT_S
 
 ## Phase 1 — First Autonomous Profit Unblock (Risk Path Completion) · **CRITICAL PATH**
 
+> **Superseded notice (architecture reconciliation, 2026-08-06):** This phase's diagnosis is already retracted by the project's own append-only decision log. `02_DECISIONS.md`'s "Parallel Authorized Lanes" entry (2026-07) states explicitly: *"`IMPLEMENTATION_MASTER_PLAN.md` Phase 1's original diagnosis (unwired Risk Engine inputs — `campaign_authorized_notional`, stop-loss, loss-history) is superseded by runtime evidence. The actual blocker observed in production is package-progression/mandate authorization, downstream of a BUY candidate that already passed Strategy, Economics, and Risk. Phase 1's original risk-input changes were explicitly NOT implemented as part of this lane."* Do not act on the diagnosis below without first reading that decision entry and `06_NEXT_SESSION.md`'s current, evidenced blocker description (Controlled Proof Exit Recovery authority propagation, as of this writing). This phase's deliverables and acceptance criteria are retained below only as a historical record of the earlier diagnosis, not as current guidance.
+
 ### Objective
 Make a commissioned autonomous campaign produce a risk-**APPROVED** (or correctly **RESIZED**) production BUY candidate on the $25 proving ground, by first proving the exact current rejection cause and then surgically wiring the unwired risk inputs — without altering the pure Risk Engine's math.
 

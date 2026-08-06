@@ -1011,3 +1011,116 @@ existing unit (2805 passed) and integration (233 passed) suites re-run
 before and after; the same 17 unit + 9 integration pre-existing failures
 (confirmed via `git stash` against unmodified `master`) are unchanged,
 no new failures.
+
+---
+
+## 2026-08-04 — Branch `feature/entry-intelligence-limit-orders` (continuation on top of commit `3580c3b`)
+
+### FILLED BUY_LIMIT now reaches the exact same authoritative AutonomousPositionCustody as a FILLED market BUY
+
+Decision
+
+Closed the exact gap `3580c3b` documented as the reason this branch could
+not merge: a provider-confirmed BUY_LIMIT fill was reconciled and
+accounted for, but never converted into `AutonomousPositionCustody`. Traced
+the full canonical lineage first (LiveCryptoOrder → provider reconciliation
+→ accounting → `AutonomousExecutionClaim` → `AutonomousPositionCustody` →
+exit authority → autonomous SELL construction/submission/reconciliation →
+realized accounting) and confirmed both `AutonomousExecutionClaim` and
+`AutonomousPositionCustody` are schema-hard-wired (NOT NULL FKs, plus
+`ck_aec_reduce_only_custody_claim`) to a real `CanonicalPreviewPackage` +
+`CanonicalProvingActivation` — there is no schema-legal way to reach
+custody without them, confirming (not assuming) that "the smallest safe
+correction" requires reusing that exact machinery, not building a parallel
+one.
+
+Added a fourth `commissioning_entry_mode` to `create_canonical_preview_package`
+(`canonical_preview_package.py`) — `"autonomous_limit_entry"` — alongside
+the three that already exist (`initial_proving_entry`, `controlled_proof`,
+`autonomous_position_exit`). It reuses 100% of the existing package
+creation, mandate-authorization, dry-run, and activation machinery
+UNCHANGED; the mode only supplies its own already-computed `DecisionRecord`
++ `forced_action="OPEN_POSITION_PROPOSED"` in place of re-deriving a
+(necessarily HOLD) decision from a fresh preview cycle — deliberately
+distinct from `controlled_proof`, since `establish_buy_custody` explicitly
+refuses any Controlled-Proof-linked package.
+
+`autonomous_limit_entry_worker.py` gained `_establish_claim_lineage`
+(idempotent: package → mandate authorization → dry run → activation →
+`claim_activated_package`, called once per attempt before submission, with
+package/activation/claim ids persisted on the attempt row for restart
+safety) and `_resolve_claim_scope_and_custody` (calls the SAME, unmodified
+`release_execution_claim_scope_if_order_resolved` — the one function that
+already calls `establish_buy_custody` for a fully-reconciled FILLED BUY —
+then observes and records the resulting `custody_id`, never establishing
+custody itself).
+
+Reason
+
+`3580c3b`'s own report named this as the reason the branch could not be
+merged or deployed. This round proves the full chain end-to-end (with
+tests, not just code) rather than leaving it as a documented gap.
+
+Alternatives Considered
+
+Build a parallel, narrower custody concept scoped to this lane only.
+Rejected outright — this is exactly the "competing custody architecture"
+the task explicitly prohibited, and the schema itself (NOT NULL FKs on
+both `AutonomousExecutionClaim` and `AutonomousPositionCustody`) makes it
+structurally impossible to reach the real custody table any other way.
+
+Weaken `establish_buy_custody`'s `reconciliation_status == "filled"`
+exact-match requirement so a partial-fill-then-cancel scenario could
+establish custody for the partial quantity. Rejected: that invariant is
+shared, unmodified, with the market-BUY path; loosening it would change
+behavior for BOTH lanes and was judged an unacceptable risk to accept
+silently. Confirmed (via `accounting_reconciliation.py:820-837`) that this
+exact scenario — cancel-with-partial-fill — has NO existing mechanism to
+reach custody even for a market BUY (IOC market orders essentially never
+partially fill then sit cancelled, so the gap was previously latent, never
+exercised). The chosen behavior: `reconcile_live_order_and_fills` itself
+already sets the order's authoritative status to `PARTIALLY_FILLED` (never
+`CANCELLED`) whenever some quantity filled before cancellation;
+`release_execution_claim_scope_if_order_resolved` has no resolution
+mapping for that status, so this lane surfaces it explicitly as
+`RECONCILIATION_REQUIRED` (preserving the exact reconciled fill quantity
+for manual review) rather than either fabricating custody or silently
+discarding the claim as a bare `CANCELLED` release.
+
+Wire the reference-price/replacement safety requirement by reading candle
+data. Rejected per the task's own explicit instruction ("never reprice
+from stale candle data") — wired `app.services.execution_price_evidence.load_current_execution_price_evidence`
+against `KrakenSpotClient.fetch_price_evidence` instead (a real, live
+`/public/Ticker` call), with a bounded freshness check
+(`AUTONOMOUS_LIMIT_ENTRY_REFERENCE_PRICE_MAX_AGE_MINUTES`, default 2
+minutes) that fails closed (no replacement, not a stale price) on any
+mismatch, staleness, or provider failure.
+
+Consequences
+
+The full chain — BUY_LIMIT proposed → Risk-approved → claimed (real
+`AutonomousExecutionClaim` via the real, unmodified `claim_activated_package`)
+→ packaged (real `CanonicalPreviewPackage`, `CanonicalProvingActivation`)
+→ submitted → observed OPEN → partially filled → filled → reconciled →
+accounted → converted into `AutonomousPositionCustody` → eligible for the
+existing autonomous exit-management chain (`evaluate_due_custodies` /
+`issue_exit_authority` / `revalidate_active_exit_authorities`, all
+completely unmodified and already running every orchestration cycle) — is
+now real and tested (37 new/updated tests across the worker, the migration,
+and the canonical package mode; 125 pre-existing `canonical_preview_package.py`
+tests re-verified unchanged). A new, dedicated, default-`False`
+`AUTONOMOUS_LIMIT_ENTRY_SUBMISSION_ENABLED` flag gates only the live
+provider-submission step — proposal, Risk evaluation, claim/package
+construction, and shadow evaluation all continue to operate regardless
+(diagnostics are never gated). No live capital has been deployed; no
+migration has been applied to any real database; nothing was committed
+beyond this session's own working tree. Full unit (2830 passed) and
+integration (233 passed) suites re-run before and after this round's
+changes; the same 17 unit + 9 integration pre-existing failures (confirmed
+via `git stash` against unmodified `master`) are unchanged, no new
+failures. Added `tools/shadow_validate_recent_rejections.py`
+(read-only; journal-log-driven, since `non_positive_net_edge_rejection_explained`
+is not persisted to any DB table) for running Phase 10 shadow validation
+against real production history once deployed — not run against real
+production data this round, since no local database or VPS access exists
+in this environment; the script's own log-parsing logic is unit-tested.

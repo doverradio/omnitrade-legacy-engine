@@ -2,6 +2,8 @@
 
 ## OmniTrade Legacy Engine — Monorepo Structure
 
+> **Scope correction (architecture reconciliation, 2026-08-06):** The layout below describes the platform's original MVP-era structure and is no longer close to complete. The real `apps/api/app/services/` tree today includes dozens of additional packages not listed anywhere below: `orchestration/`, `capital_campaign_domain/`, `capital_campaign_orchestration/`, `capital_campaigns/`, `capital_allocation/`, `mandates/`, `controlled_proof/`, `entry_intelligence/`, `decisions/`, `decision_intelligence/`, `decision_quality/`, `ai_coach/`, `exchange_connections/`, `autonomous_cycle/`, `strategy_roster/`, `strategy_outcomes/`, `replay/`, `research_agents/`, `arena/`, `tournament/`, `pipeline_contracts/`, `historical_simulation/`, `asset_commissioning/`, and `live/`, among others. `docs/` itself now contains 160+ files, not the ~24 listed in §5 below — `docs/DOCS_AUDIT_REPORT.md`'s 2026-07-04 pass updated that listing once; it has not been revisited since and most of the doc set's growth postdates it. Rather than hand-maintain an exhaustive listing at this scale (the likely root cause of this drift recurring), prefer `ls apps/api/app/services/` and `ls docs/*.md` directly, or `docs/00_OPERATIONS_MAP.md`'s "Repository Layout" section, which is actively maintained with verification tags.
+
 ### 1. Top-Level Layout
 
 ```

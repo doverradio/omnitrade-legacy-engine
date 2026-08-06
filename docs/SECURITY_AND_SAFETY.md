@@ -4,14 +4,21 @@
 
 These rules apply to every phase, every environment, and every contributor (human or Copilot-assisted). They are not suggestions — a PR that violates any rule below should not be merged.
 
-## Governance Boundary: MVP Restrictions vs Future Live Trading Initiative
+## Current-State Correction (added by architecture reconciliation, 2026-08-06)
+
+**The governance transition this document's own "Governance Boundary" section below anticipates has occurred.** Live trading is real, governed, and in production today — `00_PROJECT_STATE.md` (Authority: Highest) records proven live Kraken authentication, live production BUY, live production SELL, and live production reconciliation, and `02_DECISIONS.md` records the governance work (Capital Campaigns, Autonomous Capital Mandates per `docs/adr/ADR-0011-autonomous-capital-mandate-engine.md`, Controlled Proof, Exit Recovery) that authorized it. **§1's "No Live Trading" rule below, and every claim beneath it, describes the platform's original MVP starting point — it is no longer an accurate description of the current system as a whole and must not be relied on to conclude that no real capital is at risk.**
+
+This correction does not weaken, delete, or supersede the safety rules below. They remain the correct description of what a genuinely paper-only environment must guarantee, and the underlying principles (audit logging, kill switches, human-only re-arm, no committed secrets) remain fully in force and, per current evidence, are the actual controls governing live capital today — see `RISK_ENGINE.md` and `00_OPERATIONS_MAP.md` for the current, accurate description of those controls in their live-trading form. The correction exists only so this document cannot be read as evidence that live trading has not happened. For the current, authoritative safety and governance posture, start with `00_PROJECT_STATE.md`, `00_OPERATIONS_MAP.md`, and `docs/adr/ADR-0011-autonomous-capital-mandate-engine.md`.
+
+## Governance Boundary: MVP Restrictions vs Future Live Trading Initiative (historical — see correction above)
 
 - The constraints in this document are MVP safety guarantees and remain fully in force unless and until a future live-trading initiative is explicitly approved through governance.
 - "Future live trading" in planning documents does not authorize immediate implementation or deployment in MVP environments.
 - Any future Phase 9 implementation must start only after all prior phases are complete, explicit human approval is granted, Risk Engine final authority is preserved, and governance approval is documented.
 - Until that governance transition is explicitly approved, MVP remains paper-only and no live-routing code path is permitted.
+- **This governance transition has since occurred** — Phase 9 (Live Trading Foundation) is recorded complete in `docs/PROJECT_STATUS.md`, and live capital is now genuinely at risk under the campaign/mandate governance described in `docs/adr/ADR-0011-autonomous-capital-mandate-engine.md`. The bullets above describe the gate that was passed, not a gate still standing.
 
-### 1. No Live Trading
+### 1. No Live Trading (historical MVP baseline — see Current-State Correction above; no longer true platform-wide)
 
 - The MVP contains **no code path** capable of placing a real, capital-at-risk order.
 - Alpaca integration uses only the paper trading base URL (`https://paper-api.alpaca.markets`), configured via `ALPACA_BASE_URL` in `app/config.py`. This value must never be overridden to point at Alpaca's live trading endpoint anywhere in MVP code, config, or environment templates.

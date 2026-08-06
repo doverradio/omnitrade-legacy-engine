@@ -598,3 +598,56 @@ Do not claim BUY_LIMIT is "fully live" — proposal, Risk approval,
 submission, OPEN, partial fill, fill, cancellation, and bounded
 replacement are all real and tested; custody handoff and live
 replacement-price data are not.
+
+---
+
+## Update (2026-08-04, branch `feature/entry-intelligence-limit-orders`, on top of commit `3580c3b`): custody + reference-price items above are DONE
+
+Items 1 and 2 from the list directly above are now done:
+
+1. **Custody integration** — a FILLED BUY_LIMIT now reaches the exact
+   same `AutonomousPositionCustody` a FILLED market BUY reaches, via a
+   new `commissioning_entry_mode="autonomous_limit_entry"` on
+   `create_canonical_preview_package` and a new
+   `_establish_claim_lineage`/`_resolve_claim_scope_and_custody` pair in
+   `autonomous_limit_entry_worker.py`, both calling the real, unmodified
+   `claim_activated_package` / `release_execution_claim_scope_if_order_resolved`
+   / `establish_buy_custody`. See `02_DECISIONS.md` (2026-08-04).
+2. **Live reference-price feed** — `advance_due_limit_entry_attempts`
+   now resolves a real, live Kraken price (`fetch_price_evidence` via
+   `load_current_execution_price_evidence`) for CANCELLED-stage rows
+   automatically, bounded by a 2-minute (configurable) freshness check,
+   failing closed (no replacement) on staleness or provider failure.
+
+New feature flag this round: `AUTONOMOUS_LIMIT_ENTRY_SUBMISSION_ENABLED`
+(default `False`) — read this before assuming submission is live anywhere;
+it isn't, by default, and nothing in this round changed that default.
+
+New migration: `20260804_0066_add_limit_entry_claim_lineage` — NOT applied
+to any real database this round (no VPS/DB access in this environment).
+
+**Still not done — the real next task, in order**:
+
+1. **Run `python3 -m alembic upgrade head` on the VPS** (after reviewing
+   the diff and merging this branch — see this session's own report for
+   the exact commands) before anything else in this list.
+2. **Run `tools/shadow_validate_recent_rejections.py` against real
+   production history** (exact command in this session's final report) —
+   this has NEVER been run against real data, only unit-tested for its
+   log-parsing logic. Do this BEFORE considering any live enablement.
+3. **Review the partial-fill-then-cancel gap** (`RECONCILIATION_REQUIRED`,
+   never custody) — confirm this is an acceptable operational posture for
+   the proving lane, or decide whether the shared `establish_buy_custody`
+   invariant should eventually be extended (carefully, with its own
+   dedicated review — it is shared with the market-BUY path).
+4. Only after 1-3, and only with explicit operator sign-off: enable
+   `AUTONOMOUS_LIMIT_ENTRY_SUBMISSION_ENABLED` for the bounded
+   $5/BTC-USD/1-pending/1-replacement live lane (governing prompt Phase
+   11) — this is a real-money-adjacent change, not a code change, and
+   must not be done as part of a routine deploy.
+
+Do not claim BUY_LIMIT → custody → autonomous SELL eligibility is
+"production-proven" — it is code-proven and test-proven (unit tests only,
+no real database or provider exercised this round). The first REAL
+production evidence this chain has ever produced still does not exist
+until steps 1-2 above happen on the VPS.

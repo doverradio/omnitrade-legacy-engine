@@ -4,9 +4,12 @@
 
 ### 1. Design Contract
 
-Every strategy module implements a common interface so the backtester, paper trader, and live engine (future) can all call strategies identically:
+> **Correction (architecture reconciliation, 2026-08-06):** The code blocks below described the original design intent. The real, live implementation (`apps/api/app/services/strategies/base.py:23-116`) has a different signature than shown here — see the "Actual implementation" block immediately after. Full evidence in `docs/DOCUMENTATION_DRIFT_REPORT.md` §2.4. The rules stated at the end of this section (pure functions, mandatory `reason`/`indicators`) remain accurate and are honored by the real code.
+
+Every strategy module implements a common interface so the backtester, paper trader, and live engine can all call strategies identically:
 
 ```python
+# As originally designed (not the real signature — see "Actual implementation" below):
 class Strategy(Protocol):
     slug: str
     default_params: dict
@@ -21,6 +24,7 @@ class Strategy(Protocol):
 ```
 
 ```python
+# As originally designed (not the real shape — see "Actual implementation" below):
 @dataclass
 class Signal:
     action: Literal["buy", "sell", "hold"]
@@ -29,10 +33,22 @@ class Signal:
     indicators: dict           # key indicator values used, for logging/explainability
 ```
 
+**Actual implementation** (`apps/api/app/services/strategies/base.py:23-116`):
+
+```python
+class Strategy(Protocol):
+    slug: str
+
+    def generate_signal(self, context: StrategyContext) -> Signal:
+        ...
+```
+
+`candles` and `params` are no longer separate arguments — they are fields *on* `StrategyContext` itself (a frozen dataclass). `candles` is `tuple[MappingProxyType[str, Any], ...]` (frozen dict tuples), never a pandas `DataFrame`. `Signal` is a frozen `pydantic.BaseModel`, not a plain `@dataclass`: `strength` is a `Decimal` bounded `[0, 1]` via `Field`, there is an additional required `timestamp: datetime` field not shown above, and field validators enforce non-empty `reason` and non-null `indicators` at construction time rather than by convention. Strategy files live under `apps/api/app/services/strategies/<slug>.py` — the `backend/strategies/` path referenced in §5 below does not exist in this repository.
+
 Rules:
-- Strategies are **pure functions of their inputs** — no hidden state, no direct DB or network access. This makes them trivially testable and reusable across backtest/paper/live.
-- Every `Signal` must include a non-empty `reason` and the `indicators` that produced it — this feeds both the audit log and the AI explanation layer.
-- Strategies never place orders directly; they only emit signals, which flow through the AI layer and risk engine (see `SYSTEM_ARCHITECTURE.md` §3).
+- Strategies are **pure functions of their inputs** — no hidden state, no direct DB or network access. This makes them trivially testable and reusable across backtest/paper/live. (Confirmed accurate: `ma_crossover.py`, `trend_regime_filter.py`, `volatility_filter.py` are all pure functions of `StrategyContext`.)
+- Every `Signal` must include a non-empty `reason` and the `indicators` that produced it — this feeds both the audit log and the AI explanation layer. (Confirmed accurate and now enforced by pydantic validators, not just convention.)
+- Strategies never place orders directly; they only emit signals, which flow through downstream advisory modules and the risk engine (see `docs/CANONICAL_ARCHITECTURE_MAP.md` §15 for the current, real advisory-layer module set, which has diverged from `AI_LAYER.md`'s originally-documented `app/services/ai/` shape).
 
 ### 2. MVP Strategy Modules
 

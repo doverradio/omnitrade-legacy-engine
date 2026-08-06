@@ -2,13 +2,15 @@
 
 ## OmniTrade Legacy Engine — Risk, Audit, Settings & AI Review API Contracts
 
+> **Scope correction (architecture reconciliation, 2026-08-06):** Like `API_CONTRACTS.md`, this document describes the platform's original MVP-era API surface and does not cover the live-trading-era route modules (`/decisions/*`, `/arena/*`, `/capital-campaigns/*`, `/controlled-proofs/*`, `/live/*`, and more — see the correction note at the top of `API_CONTRACTS.md` for the full list). Its "paper trading only, no live-trading code paths" framing below is also stale — see `SECURITY_AND_SAFETY.md`'s current-state correction. The real, live `apps/api/app/api/routes/risk.py` now governs live campaigns, not only paper accounts; `docs/00_OPERATIONS_MAP.md` is the current source of truth for the live route surface.
+
 This document fills the endpoint gaps flagged between `FRONTEND_PAGE_SPECS.md` (Risk Monitor, Settings, AI Review pages) and the original `API_CONTRACTS.md`. It follows the same conventions.
 
 ### Conventions (inherited from `API_CONTRACTS.md`)
 
 - Base URL (local): `http://localhost:8000`
 - Error envelope, auth requirement (Supabase JWT), numeric-fields-as-strings, ISO 8601 UTC timestamps — all identical to `API_CONTRACTS.md`'s conventions section. Refer there rather than duplicating.
-- Every endpoint below is subject to `SECURITY_AND_SAFETY.md`: paper trading only, no live-trading code paths, audit logging on every state change.
+- Every endpoint below is subject to `SECURITY_AND_SAFETY.md`: paper trading only, no live-trading code paths, audit logging on every state change. *(Historical MVP-era framing — live trading is now real and governed; see the correction note above and `SECURITY_AND_SAFETY.md`'s current-state correction. Audit logging on every state change remains accurate and enforced today.)*
 
 ---
 

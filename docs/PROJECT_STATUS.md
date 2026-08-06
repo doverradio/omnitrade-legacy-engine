@@ -2,6 +2,8 @@
 
 Last Updated: 2026-07-23
 
+> **Superseded notice (architecture reconciliation, 2026-08-06):** `docs/00_PROJECT_STATE.md` (Version 2.0, Last Updated 2026-07-25, "Authority: Highest") is the platform's designated single source of truth for current status — it explicitly states "If this document conflicts with conversation history, this document is considered authoritative." This document predates it by two days and has not been updated since; its "Current Runtime Blocker" section below (describing a Risk Engine position-sizing rejection) is stale — the blocker has since moved through several more specific, evidenced diagnoses entirely unrelated to that theory (see `06_NEXT_SESSION.md` for the current one). This document's Phase 1–9 completion record below remains an accurate and useful historical summary of what shipped and is not affected by this notice. For current status, read `00_PROJECT_STATE.md` first.
+
 ---
 
 # Current Status

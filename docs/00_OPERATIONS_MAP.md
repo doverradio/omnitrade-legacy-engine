@@ -750,6 +750,81 @@ Shadow validation (Phase 10): `app/services/entry_intelligence/shadow_validation
 history as of this writing — the function is implemented and tested,
 but no operator command or report using it against live data exists yet.
 
+### Custody integration (added 2026-08-04, branch `feature/entry-intelligence-limit-orders`)
+
+The "known, explicit gap" immediately above is closed. A FILLED BUY_LIMIT
+now reaches the exact same `AutonomousPositionCustody` a FILLED market BUY
+reaches:
+
+```text
+entry_intelligence_decision_evaluated (BUY_LIMIT)
+    -> propose_and_risk_evaluate_limit_entry -> stage=READY
+    -> advance_due_limit_entry_attempts -> _submit_ready_attempt
+       -> _establish_claim_lineage (idempotent, restart-safe):
+          create_canonical_preview_package(commissioning_entry_mode="autonomous_limit_entry")
+          -> authorize_canonical_preview_package_under_mandate (UNCHANGED)
+          -> run_dry_run_for_canonical_preview_package (UNCHANGED)
+          -> activate_canonical_proving_campaign (UNCHANGED)
+          -> claim_activated_package (UNCHANGED) -> real AutonomousExecutionClaim
+       -> submit_order (LIMIT) -> claim.live_order_id set, claim_status=SUBMISSION_PENDING
+    -> poll -> FILLED -> reconcile_live_order_and_fills
+       -> _resolve_claim_scope_and_custody
+          -> release_execution_claim_scope_if_order_resolved (UNCHANGED)
+             -> establish_buy_custody (UNCHANGED) -> AutonomousPositionCustody
+    -> evaluate_due_custodies / issue_exit_authority / revalidate_active_exit_authorities
+       (UNCHANGED, already running every cycle -- no wiring needed)
+```
+
+New commissioning mode in `canonical_preview_package.py`:
+`_AUTONOMOUS_LIMIT_ENTRY_MODE = "autonomous_limit_entry"` — added
+alongside the existing three (`initial_proving_entry`, `controlled_proof`,
+`autonomous_position_exit`); reuses all mandate/strategy/parameter-set
+resolution and package/dry-run/activation logic unchanged, only supplying
+its own pre-computed `DecisionRecord` instead of re-deriving one from a
+fresh (necessarily HOLD) preview cycle.
+
+New migration `20260804_0066_add_limit_entry_claim_lineage`: adds
+`paper_account_id`, `package_id`, `activation_id`, `claim_id`, `custody_id`
+to `autonomous_limit_entry_attempts` (all nullable; unique on
+`package_id`/`claim_id`). **Verified (2026-08-04, continuation session)
+via offline SQL rendering** — `alembic upgrade/downgrade --sql` against
+the `omnitrade311` env (no live DB connection required in offline mode)
+confirms both directions render syntactically valid Postgres DDL, and
+`alembic heads`/`history` confirm `20260804_0066` is the sole head with a
+single, unforked chain back through `20260803_0065`. Still **not applied**
+to any real database — this only proves the DDL is well-formed, not that
+it has been run.
+
+New feature flag: `AUTONOMOUS_LIMIT_ENTRY_SUBMISSION_ENABLED` (default
+`False`) — gates ONLY the live provider-submission step in
+`_submit_ready_attempt`; `propose_and_risk_evaluate_limit_entry` (Risk
+evaluation) and shadow validation both continue to operate regardless.
+Deliberately separate from the existing, broader
+`live_crypto_order_submission_enabled` (market-BUY) and
+`autonomous_position_exit_submission_enabled` (SELL) flags.
+
+Reference-price safety: `_load_fresh_reference_price` calls
+`app.services.execution_price_evidence.load_current_execution_price_evidence`
+against `KrakenSpotClient.fetch_price_evidence` (real `/public/Ticker`),
+bounded by `AUTONOMOUS_LIMIT_ENTRY_REFERENCE_PRICE_MAX_AGE_MINUTES`
+(default 2 minutes) — fails closed (no replacement) on staleness,
+mismatch, or provider failure. Never sourced from candle data or the
+attempt's own prior limit price.
+
+**Still-known, deliberate gap**: partial-fill-then-cancel does not
+establish custody for the partial quantity (surfaces as
+`RECONCILIATION_REQUIRED` instead) — `establish_buy_custody`'s exact-match
+`reconciliation_status == "filled"` requirement is shared with the
+market-BUY path and was deliberately not weakened. See `02_DECISIONS.md`
+(2026-08-04) for the full reasoning.
+
+Read-only shadow-validation-against-production-history script:
+`tools/shadow_validate_recent_rejections.py` (journal-log-driven, since
+`non_positive_net_edge_rejection_explained` is not persisted to any DB
+table). Not yet run against real production data — no local DB/VPS access
+in this environment; its log-parsing logic is unit-tested
+(`tools/test_shadow_validate_recent_rejections.py`).
+
 ---
 
 ## Logs and Search Terms

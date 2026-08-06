@@ -25,9 +25,11 @@ The platform is built around four permanent foundational engines: the **Market I
 
 ### 3. Non-Goals
 
+> **Current-state note (added by architecture reconciliation, 2026-08-06):** The first bullet below described the platform's original MVP phase. That phase has since ended: live trading with real capital is now real, governed, and in production (`00_PROJECT_STATE.md`, `docs/MASTER_PRODUCT_ROADMAP.md` §4, `docs/adr/ADR-0011-autonomous-capital-mandate-engine.md`), reached under the explicit human-approval and Risk Engine-authority guarantees this document's Safety Principles (§4) always required for that transition — this is the platform behaving as designed, not a deviation from this vision. The remaining non-goals below (no HFT/market-making, no margin/leverage/derivatives, no promised returns, no automatic kill-switch re-arm) remain fully in force and are not affected by this note.
+
 OmniTrade Legacy Engine explicitly does **not**:
 
-- Execute live trades with real money in its MVP phase.
+- Execute live trades with real money in its MVP phase. *(Historical — see current-state note above; live trading is now real and governed. See `00_PROJECT_STATE.md` for current proven capabilities.)*
 - Promise, imply, or guarantee any rate of return, win rate, or profitability.
 - Act as a substitute for licensed financial, tax, or legal advice.
 - Attempt high-frequency trading, market making, or latency-sensitive arbitrage.
