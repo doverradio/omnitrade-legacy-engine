@@ -1208,3 +1208,98 @@ this classifier into an actual replay/backtest pipeline as a live consumer,
 and any future walk-forward validation of its threshold defaults, remain
 explicitly out of scope for this entry and available for separate,
 future authorization.
+
+---
+
+## 2026-08-06 (same-day continuation)
+
+### Deterministic Walk-Forward Market State Evaluation Harness
+
+Decision
+
+Added `apps/api/app/services/market_state/walk_forward_contracts.py` and
+`walk_forward_evaluator.py`: a deterministic walk-forward evaluation
+harness that measures the canonical research/replay Market State
+Classifier's state frequencies, persistence, state-to-state transitions,
+and forward close-to-close return distributions (each compared against an
+unconditional baseline) over a caller-supplied chronological OHLCV history.
+The harness calls the existing `classify_market_state` for every evaluation
+point; it does not reimplement, approximate, or duplicate any of its
+direction/volatility/participation math, and no defect was found in that
+classifier during this task. It exists solely in the research/replay layer
+-- confirmed by repository-wide import search, no production module
+references it, and no existing production file was modified.
+
+Reason
+
+`docs/MARKET_STATE_CLASSIFIER.md` established a canonical deterministic
+classifier but left open whether it has measurable research value. This
+task commissioned the harness needed to find out: how often each state
+occurs, how persistent it is, how it transitions, and what forward returns
+follow it, compared honestly against an unconditional baseline -- per
+`docs/MARKET_STATE_AND_REGIME_INTELLIGENCE_ARCHITECTURE.md` §15 (Walk-Forward
+Validation) and §16 (Baselines and Ablation Testing). It also exposes both
+single-axis and joint-axis forward-return summaries side by side so a
+future researcher can compare direction-alone against the full joint state,
+without the harness itself asserting which is better -- consistent with the
+explicit instruction not to claim predictive value from a positive average
+return alone.
+
+Alternatives Considered
+
+Suppress or omit forward-return summary rows when zero observations are
+available (e.g. too little supplied data, or a horizon with no data at
+all). Rejected: per this task's own "do not suppress the data" instruction,
+a baseline row is emitted for every configured horizon even at zero
+samples, marked `INSUFFICIENT_EVIDENCE` -- an empty result is a fact worth
+reporting explicitly, not a reason to omit the row. (A test asserting the
+opposite, stricter-looking behavior was written first and then corrected
+once this inconsistency with a sibling test was noticed -- recorded here so
+a future session does not "fix" this back to suppression believing it a
+bug.)
+
+Extend `contracts.OHLCVBar` with an optional timestamp field so the
+walk-forward evaluator could reuse it directly. Rejected: the canonical
+classifier's own contracts and math were explicitly out of scope to modify
+absent a genuine defect. Instead, `walk_forward_contracts.py` defines its
+own `WalkForwardBar` (OHLCV plus `open_time`) with a `to_ohlcv_bar()`
+conversion method, leaving `contracts.py`/`deterministic_classifier.py`
+byte-for-byte unchanged.
+
+Reimplement chronology validation permissively (tolerate non-increasing
+timestamps by sorting, or ignore ordering like `contracts.OHLCVBar` does).
+Rejected: the walk-forward evaluator's entire no-future-leakage guarantee
+depends on genuine chronological order in a way the stateless classifier's
+own contracts do not, so `run_walk_forward_evaluation` explicitly validates
+strictly increasing `open_time` and fails closed rather than silently
+trusting or repairing the input.
+
+Consequences
+
+The platform now has a tested, documented way to answer whether the
+deterministic classifier's states carry information beyond an unconditional
+baseline, without persisting anything or touching any production path. 40
+new unit tests (84 total for the `market_state` package) cover chronological
+evaluation, no-lookahead behavior (a paired-timeline test plus a
+window-content inspection test), exact forward-horizon indexing and
+unavailable-horizon handling, hand-verified frequency/transition/persistence
+counts and probabilities (with denominators always present), hand-verified
+forward-return statistics (mean/median/positive%/min/max), minimum-sample
+evidence marking, determinism, input validation, and confirmation (via both
+a black-box equivalence test and a call-count spy test) that the harness
+delegates to the canonical classifier rather than duplicating it. The full
+existing `apps/api` unit test suite was re-run before and after this change:
+2874 passed both times prior to this addition, 2914 passed after (2874 +
+40 new tests); the same 17 pre-existing failures, in files this change never
+touched, are unchanged.
+
+Future Impact
+
+Any future HMM, Bayesian, or neural regime candidate must be measurable
+against this harness's baseline-comparison output, not merely against raw
+profitability, before being considered for promotion. This entry's own
+"Known Limitations" section (`docs/MARKET_STATE_WALK_FORWARD_EVALUATION.md`)
+records what this harness deliberately does not yet guard against --
+overlapping-window sample non-independence, data-snooping across repeated
+runs, and secular base-rate contamination -- so a future session does not
+mistake its output for a validated research conclusion on its own.

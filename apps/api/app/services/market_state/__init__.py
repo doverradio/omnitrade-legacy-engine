@@ -27,16 +27,46 @@ from .deterministic_classifier import (
     InsufficientMarketDataError,
     classify_market_state,
 )
+from .walk_forward_contracts import (
+    EvidenceStatus,
+    MarketStateForwardReturnSummary,
+    MarketStateFrequency,
+    MarketStatePersistence,
+    MarketStateTransition,
+    StateDimension,
+    WalkForwardBar,
+    WalkForwardEvaluationParams,
+    WalkForwardEvaluationResult,
+    WalkForwardStateObservation,
+)
+from .walk_forward_evaluator import (
+    DEFAULT_WALK_FORWARD_PARAMS,
+    EVALUATOR_VERSION,
+    run_walk_forward_evaluation,
+)
 
 __all__ = [
     "CLASSIFIER_VERSION",
     "DEFAULT_PARAMS",
+    "DEFAULT_WALK_FORWARD_PARAMS",
+    "EVALUATOR_VERSION",
     "DirectionState",
+    "EvidenceStatus",
     "InsufficientMarketDataError",
     "MarketState",
     "MarketStateClassifierParams",
+    "MarketStateForwardReturnSummary",
+    "MarketStateFrequency",
+    "MarketStatePersistence",
+    "MarketStateTransition",
     "OHLCVBar",
     "ParticipationState",
+    "StateDimension",
     "VolatilityState",
+    "WalkForwardBar",
+    "WalkForwardEvaluationParams",
+    "WalkForwardEvaluationResult",
+    "WalkForwardStateObservation",
     "classify_market_state",
+    "run_walk_forward_evaluation",
 ]
