@@ -1124,3 +1124,87 @@ is not persisted to any DB table) for running Phase 10 shadow validation
 against real production history once deployed — not run against real
 production data this round, since no local database or VPS access exists
 in this environment; the script's own log-parsing logic is unit-tested.
+
+---
+
+## 2026-08-06
+
+### Canonical Deterministic Market State Classifier (Research/Replay Layer)
+
+Decision
+
+Added `apps/api/app/services/market_state/` (`contracts.py`,
+`deterministic_classifier.py`): a pure, deterministic, OHLCV-only Market
+State Classifier producing `direction_state` (trending_up/trending_down/
+ranging), `volatility_state` (low/normal/high), `participation_state`
+(volume_contracting/volume_normal/volume_expanding), a blended confidence
+score, and per-axis human-readable reason codes. This is Phase 1 of the
+research track authorized by the repository audit
+(`docs/MARKET_STATE_AND_REGIME_IMPLEMENTATION_AUDIT.md`) and the subsequent
+architecture-reconciliation pass (`docs/DOCUMENTATION_DRIFT_REPORT.md`,
+`docs/CANONICAL_ARCHITECTURE_MAP.md`, `docs/adr/ADR-0018-canonical-deterministic-regime-classifier.md`).
+It exists solely in the research/replay layer: no production module imports
+it, confirmed by repository-wide search at implementation time, and no
+existing file was modified to build it.
+
+Reason
+
+`docs/adr/ADR-0018-canonical-deterministic-regime-classifier.md` established
+`app.services.strategy_outcomes.service.classify_regime_labels` as the
+platform's canonical production regime classifier and stated that any
+future regime-classification work must be "a clearly-labeled research-only
+alternative to it — not a fourth parallel implementation." This task
+directly commissioned that alternative: a single, canonical, richer
+(three-value axes, an added participation/volume axis, explicit confidence
+and reason codes) baseline against which future HMM, Bayesian, or neural
+regime research can be evaluated once such work is separately authorized,
+per `docs/MARKET_STATE_AND_REGIME_INTELLIGENCE_ARCHITECTURE.md` §16's
+baseline/ablation-testing principle. Neither HMMs nor machine learning were
+implemented, per the commissioning task's explicit constraints.
+
+Alternatives Considered
+
+Extend `classify_regime_labels` in place instead of building a separate
+module. Rejected because the commissioning task explicitly required the new
+classifier to exist only in the research/replay layer, produce a richer
+output shape (three-value axes plus a new participation axis, confidence,
+and reason codes) than the production function's two-value axes, and remain
+fully decoupled from anything a live decision path imports — extending the
+production function in place would have risked exactly the coupling
+ADR-0018 was written to keep separate.
+
+Wire the new classifier into an existing replay/backtest module (e.g.
+`app/services/replay/` or `app/services/backtesting/`) as part of this task.
+Rejected: the commissioning task's own minimalism instruction ("create only
+the minimum code necessary") and its explicit prohibition on changing
+existing execution/strategy behavior made touching any existing, tested
+module an unnecessary risk. The classifier is built and exported ready for
+a future replay/backtest consumer to call; wiring a concrete consumer is
+left to a future, separately-scoped task.
+
+Consequences
+
+The platform now has a documented, tested, versioned research-layer
+baseline for market-state classification, distinct from and non-competing
+with the production classifier. No production behavior, Risk Engine
+authority, or live trading path was changed — verified by full-repository
+import search (zero production references to the new package) and by
+re-running the complete existing `apps/api` unit test suite before and
+after this change (2874 passed both times; the same 17 pre-existing
+failures, all in files this change never touched, are unchanged). 44 new
+unit tests cover trend/volatility/participation classification, edge cases,
+exact boundary conditions, parameter validation, replay determinism, and
+no-lookahead verification. Threshold defaults are explicitly documented as
+unvalidated hypotheses, not conclusions, per
+`docs/MARKET_STATE_AND_REGIME_INTELLIGENCE_ARCHITECTURE.md` §7.2.
+
+Future Impact
+
+Future work building an HMM, Bayesian model, or neural regime model must
+evaluate itself against this baseline (or a documented successor version)
+before being considered for promotion, per the baseline/ablation-testing
+principle this task's governing architecture document establishes. Wiring
+this classifier into an actual replay/backtest pipeline as a live consumer,
+and any future walk-forward validation of its threshold defaults, remain
+explicitly out of scope for this entry and available for separate,
+future authorization.

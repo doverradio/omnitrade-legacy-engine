@@ -251,6 +251,8 @@ These are recommendations for future, separately-authorized work — nothing in 
 
 # Phase 1 Implementation Scope
 
+> **Update (2026-08-06, same-day follow-up session):** A different Phase 1 was subsequently commissioned directly by the project owner and implemented: the canonical deterministic Market State Classifier (`apps/api/app/services/market_state/`, see `docs/MARKET_STATE_CLASSIFIER.md` and `docs/adr/ADR-0018-canonical-deterministic-regime-classifier.md`), rather than the scorecard-extension scope proposed below. That implementation is complete, tested (44 unit tests, all passing), confirmed to touch no production code path, and confirmed to leave the full existing test suite's pass/fail results unchanged. The scope proposed below was not implemented and remains available for a future session if still wanted; it is retained here as a record of this audit's own recommendation, not as a description of what actually happened next.
+
 Consistent with `docs/00_PROJECT_STATE.md`'s "Current Development Philosophy" (small, bounded, independently valuable tasks) and the prior architectural review's recommendation that only Phase 0 is currently authorized, the following is proposed as the next small, self-contained, low-risk unit of work — **not implemented by this audit**, offered for separate authorization. It is deliberately not "Phase 1" of the new architecture document's own 9-phase plan (that plan's Phase 1 assumes a new `market_state/` module this audit recommends against building yet); it is a Phase 1 sized to roughly one engineering day that acts directly on this audit's own findings.
 
 **Proposed scope: extend `regime_conditioned_buckets` to use the two already-captured, currently-unused regime axes.**

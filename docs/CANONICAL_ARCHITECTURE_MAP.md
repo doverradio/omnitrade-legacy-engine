@@ -12,12 +12,15 @@
 
 ## 1. Market State / Regime Classification
 
+This responsibility now has **two** canonical implementations, deliberately, because they serve two different, non-competing scopes — production strategy weighting vs. a research/replay baseline. Per `docs/adr/ADR-0018-canonical-deterministic-regime-classifier.md`, the research/replay baseline exists explicitly as "a clearly-labeled research-only alternative," not a fourth parallel production classifier.
+
 | | |
 |---|---|
-| **Canonical** | `apps/api/app/services/strategy_outcomes/service.py::classify_regime_labels` (lines 153-193) — deterministic trend/volatility/range classification, live in production, consumed by `strategy_roster/decision_aggregator.py::_strategy_weight`. |
+| **Canonical (production)** | `apps/api/app/services/strategy_outcomes/service.py::classify_regime_labels` (lines 153-193) — deterministic trend/volatility/range classification, live in production, consumed by `strategy_roster/decision_aggregator.py::_strategy_weight`. |
+| **Canonical (research/replay baseline)** | `apps/api/app/services/market_state/deterministic_classifier.py::classify_market_state` — a separate, pure, OHLCV-only classifier producing `direction_state`/`volatility_state`/`participation_state` plus confidence and reason codes. Implemented 2026-08-06 as Phase 1 of the research track this ADR and `docs/MARKET_STATE_AND_REGIME_INTELLIGENCE_ARCHITECTURE.md` anticipate. **Not consumed by any production path** — confirmed by repository-wide import search at implementation time. See `docs/MARKET_STATE_CLASSIFIER.md`. |
 | **Non-canonical candidates** | `apps/api/app/services/strategies/trend_regime_filter.py` (ADX-proxy + MA slope; registered but excluded from the live strategy roster — research/backtest-only). `strategy_lab/pattern_intelligence/detectors/volatility.py` (percentile-band volatility "findings"; scoped to the offline research tool, feeds `research_copilot`, never the live path). |
-| **Status** | Live/production for the canonical implementation. The two non-canonical candidates are real, tested code, just not authoritative for production decisions. |
-| **Governing decision** | `docs/adr/ADR-0018-canonical-deterministic-regime-classifier.md` (new, this session). |
+| **Status** | Live/production for the production canonical implementation. The research/replay canonical implementation is built, tested (44 unit tests), and available for future replay/backtest/HMM-baseline consumption, but not yet wired into any replay pipeline as a consumer. The two non-canonical candidates are real, tested code, just not authoritative for either canonical use. |
+| **Governing decision** | `docs/adr/ADR-0018-canonical-deterministic-regime-classifier.md`. |
 | **Documented-but-nonexistent** | `AI_LAYER.md` §2.1's AI/ML regime classifier — no code anywhere; see `DOCUMENTATION_DRIFT_REPORT.md` §2.3. Not listed as a "candidate" above because it does not exist to be one. |
 
 ---
