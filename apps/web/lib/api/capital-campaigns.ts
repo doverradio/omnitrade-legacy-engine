@@ -218,13 +218,23 @@ type ErrorEnvelope = {
 const API_BASE_URL = process.env.NEXT_PUBLIC_API_BASE_URL ?? "http://localhost:8000";
 
 async function requestJson<T>(path: string, init?: RequestInit): Promise<T> {
+  const headers: Record<string, string> = {
+    Accept: "application/json",
+    ...(init?.headers as Record<string, string> | undefined),
+  };
+  // A bodyless GET has nothing to describe as JSON -- setting Content-Type
+  // on it anyway takes the request outside the CORS-safelisted header set
+  // and forces the browser into an unnecessary preflight OPTIONS round trip
+  // for every read-only call this client makes (including /workflow's
+  // trace reads). Only advertise a JSON body when one is actually sent.
+  if (init?.body !== undefined && headers["Content-Type"] === undefined) {
+    headers["Content-Type"] = "application/json";
+  }
+
   const response = await fetch(`${API_BASE_URL}${path}`, {
     cache: "no-store",
-    headers: {
-      "Content-Type": "application/json",
-      ...(init?.headers ?? {}),
-    },
     ...init,
+    headers,
   });
 
   if (!response.ok) {
