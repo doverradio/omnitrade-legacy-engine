@@ -52,6 +52,8 @@ class AutonomousLimitEntryAttempt(Base):
             name="fk_alea_campaign_definition", ondelete="RESTRICT",
         ),
         UniqueConstraint("idempotency_key", name="uq_alea_idempotency_key"),
+        UniqueConstraint("claim_id", name="uq_alea_claim_id"),
+        UniqueConstraint("package_id", name="uq_alea_package_id"),
         CheckConstraint("side = 'BUY'", name="ck_alea_side_buy_only"),
         CheckConstraint(
             "stage IN ('PROPOSED','READY','REJECTED','SUBMITTED','OPEN','PARTIALLY_FILLED',"
@@ -87,6 +89,18 @@ class AutonomousLimitEntryAttempt(Base):
     expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
     risk_event_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True))
     live_crypto_order_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), ForeignKey("live_crypto_orders.live_crypto_order_id", ondelete="RESTRICT"))
+    # Canonical claim/custody lineage -- established once the attempt
+    # reaches submission (see autonomous_limit_entry_worker.py's
+    # _establish_claim_lineage). Reuses the EXACT SAME
+    # CanonicalPreviewPackage / CanonicalProvingActivation /
+    # AutonomousExecutionClaim / AutonomousPositionCustody machinery the
+    # market-BUY path uses -- this table has no competing custody concept
+    # of its own, only observational pointers into that authoritative system.
+    paper_account_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True))
+    package_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), ForeignKey("canonical_preview_packages.package_id", ondelete="RESTRICT"))
+    activation_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), ForeignKey("canonical_proving_activations.activation_id", ondelete="RESTRICT"))
+    claim_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), ForeignKey("autonomous_execution_claims.claim_id", ondelete="RESTRICT"))
+    custody_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), ForeignKey("autonomous_position_custodies.custody_id", ondelete="RESTRICT"))
     replaces_attempt_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), ForeignKey("autonomous_limit_entry_attempts.attempt_id", ondelete="RESTRICT"))
     replacement_count: Mapped[int] = mapped_column(Integer, nullable=False, server_default=text("0"))
     max_replacement_count: Mapped[int] = mapped_column(Integer, nullable=False)

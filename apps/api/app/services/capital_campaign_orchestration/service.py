@@ -216,6 +216,34 @@ def build_campaign_orchestration_idempotency_key(
     return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
 
 
+_INTERNAL_ONLY_COMPOSITION_KEY = "_context_specific_edge_evidence_obj"
+
+
+def _persistence_safe_composition(value: Any) -> Any:
+    """Returns a copy of an authoritative-composition value with the
+    internal-only _context_specific_edge_evidence_obj cache key removed
+    from every dict it appears in, without mutating the input.
+
+    authoritative.py's _build_aggregate_evidence_dict stashes the raw
+    (non-JSON-safe) ContextSpecificEdgeEvidence dataclass under that key
+    purely for same-process reuse within compose_campaign_authoritative_cycle
+    (see the comment there: "Never serialized to a client response or log
+    line directly"); the JSON-safe "context_specific_edge_evidence" sibling
+    it sits next to already carries the same evidence and is what belongs in
+    persisted output. composition is still read from after this call (e.g.
+    composition.get("failed_closed")), so this must not mutate it in place.
+    """
+    if isinstance(value, dict):
+        return {
+            key: _persistence_safe_composition(item)
+            for key, item in value.items()
+            if key != _INTERNAL_ONLY_COMPOSITION_KEY
+        }
+    if isinstance(value, (list, tuple)):
+        return [_persistence_safe_composition(item) for item in value]
+    return value
+
+
 def _campaign_cycle_summary(cycle: AutonomousCycleRun | None) -> dict[str, Any]:
     if cycle is None:
         return {
@@ -511,7 +539,7 @@ async def run_campaign_orchestration_preview_for_candle(
                     "close_time": candle_close_time.isoformat(),
                 },
                 "campaign_preview": composition_result.preview.model_dump(mode="json") if composition_result.preview is not None else None,
-                "authoritative_composition": composition,
+                "authoritative_composition": _persistence_safe_composition(composition),
                 "supported_trigger": {
                     "provider": _SUPPORTED_TRIGGER_PROVIDER,
                     "product_id": _SUPPORTED_TRIGGER_PRODUCT,

@@ -2791,3 +2791,168 @@ async def test_campaign_strategy_authority_healthy_path_unaffected_by_savepoint(
     assert result["historical_strategy_identity"] == "ma_crossover@1.0.0"
     assert db.savepoint_rollback_count == 0
     assert not any("lookup_failed" in record.getMessage() for record in caplog.records)
+
+
+# --- _persistence_safe_composition / cycle_context JSON-safety regression ---
+#
+# Production defect: ContextSpecificEdgeEvidence (a frozen dataclass holding
+# Decimal fields and a tuple, apps/api/app/services/entry_intelligence/
+# evidence.py) is stashed by authoritative.py's _build_aggregate_evidence_dict
+# under the internal-only "_context_specific_edge_evidence_obj" cache key,
+# alongside a fully JSON-safe "context_specific_edge_evidence" sibling. That
+# raw object was reaching AutonomousCycleRun.cycle_context (JSONB) unfiltered,
+# raising "TypeError: Object of type ContextSpecificEdgeEvidence is not JSON
+# serializable" at commit time and preventing every fresh cycle -- including
+# plain HOLD cycles -- from persisting.
+
+
+def _composition_with_raw_evidence_object(*, context_evidence: Any) -> dict[str, Any]:
+    """A composition shaped like compose_campaign_authoritative_cycle's real
+    output: the raw evidence object nested inside a rejected_candidates
+    entry's "strategy" dict (exactly where authoritative.py puts it), a
+    JSON-safe "context_specific_edge_evidence" sibling next to it, and a
+    process_trace list -- so the test proves sanitization removes only the
+    internal key without touching either of those."""
+    return {
+        "failed_closed": False,
+        "decision_record_id": None,
+        "termination_stage": "hold_no_package_created",
+        "failure_reason": None,
+        "proposed_action": "HOLD",
+        "selected_decision": {"decision_kind": "HOLD", "reason": "strategy_hold_signal", "risk_verdict": "NOT_APPLICABLE"},
+        "deterministic_explanation": ["weak_or_conflicting_agreement"],
+        "candidate_instruments": ["BTC-USD"],
+        "risk_outputs": {},
+        "process_trace": [
+            {"gate": "strategy_aggregate_completed", "instrument": "BTC-USD", "process_stage": "DETERMINE_OPPORTUNITY", "verdict": "NO_OPPORTUNITY", "action": "HOLD", "reason": "weak_or_conflicting_agreement"},
+            {"gate": "campaign_cycle_termination_resolved", "instrument": "BTC-USD", "termination_stage": "hold_no_package_created", "selected_decision_reason": "strategy_hold_signal"},
+        ],
+        "rejected_candidates": [
+            {
+                "instrument": "BTC-USD",
+                "reason": "non_positive_net_edge",
+                "strategy": {
+                    "strategy_identity": "ma_crossover@1",
+                    "context_specific_edge_evidence": {
+                        "available": True,
+                        "fallback_path": "strategy_asset_timeframe",
+                        "mean_raw_return_pct": "-0.05",
+                    },
+                    "_context_specific_edge_evidence_obj": context_evidence,
+                },
+            }
+        ],
+    }
+
+
+def test_persistence_safe_composition_strips_only_the_internal_evidence_object() -> None:
+    from app.services.capital_campaign_orchestration.service import _persistence_safe_composition
+    from app.services.entry_intelligence.evidence import ContextSpecificEdgeEvidence
+
+    context_evidence = ContextSpecificEdgeEvidence(
+        available=True, fallback_path="strategy_asset_timeframe", source_strategy_slug="ma_crossover",
+        source_horizon_label="15m", source_regime="TRENDING", mean_raw_return_pct=Decimal("-0.05"),
+        sample_size=30, stdev_pct=Decimal("0.10"), standard_error_pct=Decimal("0.018"),
+        uncertainty_penalty_pct=Decimal("0.018"), conservative_gross_edge_pct=Decimal("-0.05"),
+        confidence_lower_bound_pct=Decimal("-0.068"), confidence_upper_bound_pct=Decimal("-0.032"),
+        missing_input_flags=(),
+    )
+    composition = _composition_with_raw_evidence_object(context_evidence=context_evidence)
+
+    sanitized = _persistence_safe_composition(composition)
+
+    # The raw object is gone...
+    strategy = sanitized["rejected_candidates"][0]["strategy"]
+    assert "_context_specific_edge_evidence_obj" in composition["rejected_candidates"][0]["strategy"]  # original untouched
+    assert "_context_specific_edge_evidence_obj" not in strategy
+    # ...but its JSON-safe sibling survives untouched.
+    assert strategy["context_specific_edge_evidence"]["mean_raw_return_pct"] == "-0.05"
+    # process_trace is preserved exactly, in both content and order.
+    assert sanitized["process_trace"] == composition["process_trace"]
+    # HOLD composition fields untouched.
+    assert sanitized["termination_stage"] == "hold_no_package_created"
+    assert sanitized["proposed_action"] == "HOLD"
+
+    # And the result actually survives real JSON serialization now.
+    import json
+
+    encoded = json.dumps(sanitized)
+    assert "_context_specific_edge_evidence_obj" not in encoded
+    assert "context_specific_edge_evidence" in encoded
+
+
+@pytest.mark.asyncio
+async def test_hold_cycle_with_raw_evidence_object_persists_json_safe_cycle_context(monkeypatch: pytest.MonkeyPatch) -> None:
+    """End-to-end regression for the production incident: a HOLD cycle whose
+    composition carries the raw ContextSpecificEdgeEvidence object must
+    still reach a persisted AutonomousCycleRun row through the real
+    service-layer write path (not just a direct call to
+    compose_campaign_authoritative_cycle), against a real async session so
+    the JSONB bind actually executes -- previously this raised
+    "TypeError: Object of type ContextSpecificEdgeEvidence is not JSON
+    serializable" at db.commit() and no cycle was ever written."""
+    from app.services.capital_campaign_orchestration.service import run_campaign_orchestration_preview_for_candle
+    from app.services.entry_intelligence.evidence import ContextSpecificEdgeEvidence
+
+    asset_id = UUID("eeeeeeee-eeee-eeee-eeee-eeeeeeeeeeee")
+    campaign = SimpleNamespace(
+        campaign_id=UUID("aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa"),
+        version=1,
+        status="READY",
+        runtime_campaign_uuid=UUID("bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb"),
+        allowed_instruments=["BTC-USD"],
+        allowed_venues=["kraken_spot"],
+        campaign_modes=[],
+        aggression_mode="BALANCED",
+        accounting_state=SimpleNamespace(model_dump=lambda **_kwargs: {}),
+        remaining_unallocated_capital=Decimal("5"),
+    )
+
+    context_evidence = ContextSpecificEdgeEvidence(
+        available=True, fallback_path="strategy_asset_timeframe", source_strategy_slug="ma_crossover",
+        source_horizon_label="15m", source_regime="TRENDING", mean_raw_return_pct=Decimal("-0.05"),
+        sample_size=30, stdev_pct=Decimal("0.10"), standard_error_pct=Decimal("0.018"),
+        uncertainty_penalty_pct=Decimal("0.018"), conservative_gross_edge_pct=Decimal("-0.05"),
+        confidence_lower_bound_pct=Decimal("-0.068"), confidence_upper_bound_pct=Decimal("-0.032"),
+        missing_input_flags=(),
+    )
+
+    async def _get_campaign_definition(**_kwargs):
+        return campaign
+
+    async def _compose_campaign_authoritative_cycle(*, db, campaign_definition, trigger, candle):
+        return SimpleNamespace(composition=_composition_with_raw_evidence_object(context_evidence=context_evidence), preview=None)
+
+    monkeypatch.setattr("app.services.capital_campaign_orchestration.service.get_campaign_definition", _get_campaign_definition)
+    monkeypatch.setattr("app.services.capital_campaign_orchestration.service.compose_campaign_authoritative_cycle", _compose_campaign_authoritative_cycle)
+
+    async with _real_candle_session() as engine:
+        await _seed_asset_and_candle(engine, asset_id=asset_id)
+
+        async with AsyncSession(engine) as db:
+            payload = await run_campaign_orchestration_preview_for_candle(
+                db=db, campaign_id=campaign.campaign_id, version=campaign.version, allow_draft_preview=False,
+            )
+
+        assert payload["cycle_count"] == 1
+        assert payload["cycles"][0]["termination_stage"] == "hold_no_package_created"
+
+        from sqlalchemy import select
+
+        from app.models.autonomous_cycle_run import AutonomousCycleRun as AutonomousCycleRunModel
+
+        async with AsyncSession(engine) as verify_db:
+            persisted = (await verify_db.execute(select(AutonomousCycleRunModel))).scalars().first()
+
+        assert persisted is not None
+        composition = persisted.cycle_context["authoritative_composition"]
+        strategy = composition["rejected_candidates"][0]["strategy"]
+        assert "_context_specific_edge_evidence_obj" not in strategy
+        assert strategy["context_specific_edge_evidence"]["mean_raw_return_pct"] == "-0.05"
+        assert composition["process_trace"] == _composition_with_raw_evidence_object(context_evidence=context_evidence)["process_trace"]
+
+        # The stored payload really is JSON-safe end to end, not merely
+        # absent the one known bad key.
+        import json
+
+        json.dumps(persisted.cycle_context)
