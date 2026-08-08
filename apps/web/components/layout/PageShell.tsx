@@ -3,6 +3,7 @@ import type { ReactNode } from "react";
 
 const navItems = [
   { href: "/mission-control", label: "Mission Control" },
+  { href: "/workflow", label: "Trade Workflow" },
   { href: "/crypto-order-preview", label: "Order Preview" },
   { href: "/exchange-connections", label: "Exchange Connections" },
   { href: "/capital-campaigns", label: "Capital Campaigns" },
