@@ -276,6 +276,47 @@ async def test_campaign_status_and_history_surface_legacy_policy_blocker_without
     assert status_payload["campaign_snapshot"]["paper_account_id"] == str(runtime.paper_account_id)
     assert history_payload["blockers"] == ["compounding_policy_missing_policy_type"]
     assert history_payload["items"][0]["failure_reason"] == "legacy_compounding_policy_payload"
+    # An empty/absent cycle_context (as here) must degrade to an empty list,
+    # never raise -- this read path must stay observational-only.
+    assert status_payload["latest_cycle"]["process_trace"] == []
+    assert history_payload["items"][0]["process_trace"] == []
+
+
+@pytest.mark.asyncio
+async def test_campaign_status_surfaces_process_trace_from_authoritative_composition() -> None:
+    """The PROCESS trace compose_campaign_authoritative_cycle writes into
+    cycle_context["authoritative_composition"]["process_trace"] must reach
+    the existing orchestration/status and orchestration/history read
+    surfaces without a new endpoint -- this is what /workflow (or any other
+    read-only consumer) would query."""
+    campaign_id = UUID("aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa")
+    definition = SimpleNamespace(
+        campaign_id=campaign_id, version=1, status="READY", owner_identity="operator:human",
+        capital_budget=Decimal("25"), remaining_unallocated_capital=Decimal("25"),
+        maximum_position_size=Decimal("5"), maximum_total_exposure=Decimal("5"),
+        allowed_instruments=["BTC-USD"], allowed_venues=["kraken_spot"], compounding_policy={},
+        metadata_evidence={}, created_at=datetime.now(timezone.utc),
+    )
+    runtime = SimpleNamespace(id=7, exchange="kraken_spot", paper_account_id=UUID("bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb"), updated_at=datetime.now(timezone.utc), uuid=campaign_id)
+    asset = SimpleNamespace(id=UUID("cccccccc-cccc-cccc-cccc-cccccccccccc"), symbol="BTC", exchange="kraken_spot", created_at=datetime.now(timezone.utc))
+    example_trace_event = {
+        "process_stage": "DETERMINE_OPPORTUNITY", "gate": "net_edge_gate", "verdict": "REJECT",
+        "reason": "non_positive_net_edge", "instrument": "BTC-USD",
+    }
+    cycle = SimpleNamespace(
+        cycle_id=UUID("dddddddd-dddd-dddd-dddd-dddddddddddd"), state="COMPLETE", cycle_kind="campaign",
+        capital_campaign_id=campaign_id, capital_campaign_version=1,
+        started_at=datetime(2026, 7, 16, 12, 0, tzinfo=timezone.utc), completed_at=datetime(2026, 7, 16, 12, 1, tzinfo=timezone.utc),
+        termination_stage="hold_no_package_created", failure_reason=None, deterministic_explanation=[],
+        cycle_context={"authoritative_composition": {"process_trace": [example_trace_event]}},
+    )
+    db = _OrchestrationReadOnlyDb(definition=definition, runtime=runtime, asset=asset, cycles=[cycle])
+
+    status_payload = await fetch_campaign_orchestration_status(db=db, campaign_id=campaign_id, version=1)
+    history_payload = await fetch_campaign_orchestration_history(db=db, campaign_id=campaign_id, version=1, limit=50)
+
+    assert status_payload["latest_cycle"]["process_trace"] == [example_trace_event]
+    assert history_payload["items"][0]["process_trace"] == [example_trace_event]
 
 
 @pytest.mark.asyncio
@@ -831,6 +872,27 @@ async def test_authoritative_open_candidate_selects_best(monkeypatch: pytest.Mon
     assert result.composition["decision_record_id"] == "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa"
     assert result.composition["selected_decision"]["sizing_trace"]["minimum_viable_amount"] == "5"
 
+    # PROCESS trace: the winning BTC-USD candidate should show an unbroken
+    # PASS chain from OBSERVE_MARKET through to being SELECTED in ranking --
+    # no silent gap for a candidate that actually went the distance.
+    trace = result.composition["process_trace"]
+    btc_stages = [event["process_stage"] for event in trace if event["instrument"] == "BTC-USD"]
+    assert btc_stages == [
+        "OBSERVE_MARKET",
+        "DETERMINE_MARKET_STATE",
+        "DETERMINE_OPPORTUNITY",
+        "DETERMINE_OPPORTUNITY",
+        "CONSTRUCT_TRADE",
+        "AUTHORIZE_TRADE",
+        "DETERMINE_OPPORTUNITY",
+        "CONSTRUCT_TRADE",
+        "CONSTRUCT_TRADE",
+    ]
+    assert all(event["verdict"] not in {"REJECT", "BLOCKED"} for event in trace if event["instrument"] == "BTC-USD")
+    assert all(event["candidate_id"] for event in trace if event["instrument"] == "BTC-USD")
+    ranking_events = [event for event in trace if event["gate"] == "candidate_ranking_gate"]
+    assert any(event["verdict"] == "SELECTED" and event["instrument"] == "BTC-USD" for event in ranking_events)
+
 
 @pytest.mark.asyncio
 async def test_authoritative_risk_veto_is_preserved(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -862,6 +924,15 @@ async def test_authoritative_risk_veto_is_preserved(monkeypatch: pytest.MonkeyPa
     result = await compose_campaign_authoritative_cycle(db=_Db(), campaign_definition=campaign, trigger="kraken_btc_15m_candle_close", candle=candle)
     assert result.composition["risk_outputs"]["BTC-USD"]["verdict"] == "VETO"
     assert result.composition["selected_decision"]["decision_kind"] == "HOLD"
+
+    # The Risk Engine's own REJECT verdict must be visible, at the
+    # AUTHORIZE_TRADE stage, as the terminal reason for this candidate --
+    # not silently absorbed into the generic HOLD outcome.
+    risk_gate_events = [event for event in result.composition["process_trace"] if event["gate"] == "risk_engine_gate"]
+    assert any(
+        event["process_stage"] == "AUTHORIZE_TRADE" and event["verdict"] == "REJECT" and event["reason"] == "global_kill_switch_engaged" and event["next"] == "terminal"
+        for event in risk_gate_events
+    )
 
 
 @pytest.mark.asyncio
@@ -918,6 +989,16 @@ async def test_authoritative_risk_unavailable_fails_closed(monkeypatch: pytest.M
     assert result.composition["failed_closed"] is True
     assert result.composition["selected_decision"]["decision_kind"] == "MANUAL_REVIEW_REQUIRED"
 
+    # An exception from the Risk Engine itself must be visible as a BLOCKED
+    # AUTHORIZE_TRADE event, not just a generic failed_closed flag -- this is
+    # exactly the kind of gate a candidate could otherwise "disappear" at
+    # without an explicit terminal reason.
+    risk_gate_events = [event for event in result.composition["process_trace"] if event["gate"] == "risk_engine_gate"]
+    assert any(
+        event["process_stage"] == "AUTHORIZE_TRADE" and event["verdict"] == "BLOCKED" and event["next"] == "terminal"
+        for event in risk_gate_events
+    )
+
 
 @pytest.mark.asyncio
 async def test_authoritative_stale_market_rejected(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -939,6 +1020,17 @@ async def test_authoritative_stale_market_rejected(monkeypatch: pytest.MonkeyPat
     result = await compose_campaign_authoritative_cycle(db=_Db(), campaign_definition=campaign, trigger="kraken_btc_15m_candle_close", candle=candle)
     assert result.composition["failed_closed"] is True
     assert result.composition["selected_decision"]["decision_kind"] == "MANUAL_REVIEW_REQUIRED"
+
+    # Stale market data must terminate the candidate visibly at
+    # OBSERVE_MARKET -- the very first PROCESS stage -- rather than simply
+    # vanishing from eligible_candidates with no trace of where it stopped.
+    trace = result.composition["process_trace"]
+    assert len(trace) == 1
+    assert trace[0]["process_stage"] == "OBSERVE_MARKET"
+    assert trace[0]["gate"] == "market_evidence_gate"
+    assert trace[0]["verdict"] == "REJECT"
+    assert trace[0]["reason"] == "stale_market_data"
+    assert trace[0]["next"] == "terminal"
 
 
 @pytest.mark.asyncio
@@ -964,6 +1056,16 @@ async def test_authoritative_missing_strategy_rejected(monkeypatch: pytest.Monke
     result = await compose_campaign_authoritative_cycle(db=_Db(), campaign_definition=campaign, trigger="kraken_btc_15m_candle_close", candle=candle)
     assert result.composition["failed_closed"] is True
     assert result.composition["selected_decision"]["decision_kind"] == "MANUAL_REVIEW_REQUIRED"
+
+    # Missing strategy evidence must terminate visibly at
+    # DETERMINE_MARKET_STATE, one stage past the (passing) market-evidence
+    # check -- proving the candidate got past OBSERVE_MARKET before stopping.
+    trace = result.composition["process_trace"]
+    assert [event["process_stage"] for event in trace] == ["OBSERVE_MARKET", "DETERMINE_MARKET_STATE"]
+    assert trace[0]["verdict"] == "PASS"
+    assert trace[1]["gate"] == "strategy_evidence_gate"
+    assert trace[1]["verdict"] == "REJECT"
+    assert trace[1]["reason"] == "strategy_evidence_unavailable"
 
 
 @pytest.mark.asyncio
@@ -1687,6 +1789,14 @@ async def test_authoritative_strategy_hold_signal_returns_hold_no_package_create
     assert result.composition["selected_decision"]["decision_kind"] == "HOLD"
     assert result.composition["selected_decision"]["decision_record_id"] == "facbd8a9-7784-4cdd-b689-06d4a1d7ebe7"
 
+    # The trigger scopes evaluation to BTC-USD only (see
+    # _scoped_instruments_for_trigger) even though 3 instruments are
+    # allowed; its HOLD signal must show up as a DETERMINE_OPPORTUNITY /
+    # NO_OPPORTUNITY event, not just the composition-level HOLD summary.
+    action_gate_events = [event for event in result.composition["process_trace"] if event["gate"] == "strategy_action_gate"]
+    assert {event["instrument"] for event in action_gate_events} == {"BTC-USD"}
+    assert all(event["process_stage"] == "DETERMINE_OPPORTUNITY" and event["verdict"] == "NO_OPPORTUNITY" for event in action_gate_events)
+
 
 @pytest.mark.asyncio
 async def test_authoritative_incoherent_strategy_identity_fails_closed(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -1875,6 +1985,20 @@ async def test_net_edge_positive_gross_but_negative_after_costs_rejects(monkeypa
     assert result.composition["eligible_candidates"] == []
     assert result.composition["rejected_candidates"][0]["reason"] == "non_positive_net_edge"
 
+    # The conceptual net_edge_gate example from the PROCESS trace design:
+    # DETERMINE_OPPORTUNITY, REJECT, with the exact observed dollar value
+    # evaluated against the (zero) threshold -- an operator should never
+    # need to re-derive this from logs.
+    net_edge_events = [event for event in result.composition["process_trace"] if event["gate"] == "net_edge_gate"]
+    assert len(net_edge_events) == 1
+    event = net_edge_events[0]
+    assert event["process_stage"] == "DETERMINE_OPPORTUNITY"
+    assert event["verdict"] == "REJECT"
+    assert event["reason"] == "non_positive_net_edge"
+    assert event["threshold"] == "0"
+    assert Decimal(event["observed_value"]) < Decimal("0")
+    assert event["next"] == "terminal"
+
 
 @pytest.mark.asyncio
 async def test_net_edge_positive_above_threshold_permits_continuation(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -1888,6 +2012,12 @@ async def test_net_edge_positive_above_threshold_permits_continuation(monkeypatc
     assert result.composition["failed_closed"] is False
     candidate = result.composition["eligible_candidates"][0]
     assert Decimal(candidate["expected_net_dollars"]) == Decimal("0.2085")
+
+    net_edge_events = [event for event in result.composition["process_trace"] if event["gate"] == "net_edge_gate"]
+    assert len(net_edge_events) == 1
+    assert net_edge_events[0]["verdict"] == "PASS"
+    assert net_edge_events[0]["reason"] == "accepted"
+    assert Decimal(net_edge_events[0]["observed_value"]) == Decimal("0.2085")
 
 
 @pytest.mark.asyncio
@@ -1920,6 +2050,13 @@ async def test_net_edge_missing_expected_edge_fails_closed_with_distinct_reason(
     assert result.composition["selected_decision"]["decision_kind"] == "MANUAL_REVIEW_REQUIRED"
     assert result.composition["selected_decision"]["reason"] == "expected_edge_unavailable"
     assert result.composition["rejected_candidates"][0]["reason"] == "expected_edge_unavailable"
+
+    # "Unknown" must trace as BLOCKED, distinct from a genuine REJECT --
+    # collapsing the two would hide the double-fee-count-style defect class
+    # this gate exists to catch.
+    net_edge_events = [event for event in result.composition["process_trace"] if event["gate"] == "net_edge_gate"]
+    assert net_edge_events[0]["verdict"] == "BLOCKED"
+    assert net_edge_events[0]["reason"] == "expected_edge_unavailable"
 
 
 @pytest.mark.asyncio
@@ -1967,6 +2104,70 @@ async def test_net_edge_does_not_fall_back_to_fee_adjusted_figure_when_raw_is_mi
     )
     result = await compose_campaign_authoritative_cycle(db=db, campaign_definition=campaign, trigger="kraken_btc_15m_candle_close", candle=candle)
     assert result.composition["selected_decision"]["reason"] == "expected_edge_unavailable"
+
+
+@pytest.mark.asyncio
+async def test_limit_entry_attempt_proposal_failure_is_traced_not_silently_swallowed(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A market-entry BUY was rejected on net edge, entry intelligence found
+    a bounded BUY_LIMIT viable, but constructing the real
+    AutonomousLimitEntryAttempt (propose_and_risk_evaluate_limit_entry) then
+    raised. authoritative.py's own try/except already prevents this from
+    crashing the cycle (logger.exception + continue) -- but before this
+    instrumentation pass, that failure was otherwise invisible in the
+    composition itself: exactly the kind of "candidate disappears with no
+    terminal reason" gap this task exists to close."""
+    from app.services.capital_campaign_orchestration.authoritative import compose_campaign_authoritative_cycle
+
+    campaign, db, candle = _net_edge_authoritative_mocks(
+        monkeypatch, profitable_after_fees_performance="-0.0948", approved_quantity=Decimal("0.05")
+    )
+
+    entry_intelligence_candidate = SimpleNamespace(
+        decision="BUY_LIMIT",
+        reason="bounded_limit_entry_creates_positive_expected_net_edge",
+        strategy_coalition=None,
+        signal_strength=None,
+        market_regime=None,
+        market_entry_price=Decimal("100"),
+        expected_gross_edge_at_market_pct=Decimal("-0.09"),
+        expected_net_edge_at_market_pct=Decimal("-0.0948"),
+        expected_exit_price=Decimal("99.9"),
+        maximum_profitable_entry_price=Decimal("99.85"),
+        preferred_limit_price=Decimal("99.85"),
+        expected_gross_edge_at_limit_pct=Decimal("0.05"),
+        expected_net_edge_at_limit_pct=Decimal("0.02"),
+        expiration_time=datetime(2026, 7, 15, 1, 15, tzinfo=timezone.utc),
+        maximum_replacement_count=1,
+        invalidation_price=None,
+    )
+    monkeypatch.setattr(
+        "app.services.capital_campaign_orchestration.authoritative.evaluate_entry_decision",
+        lambda **_kwargs: entry_intelligence_candidate,
+    )
+
+    async def _raise_on_propose(**_kwargs):
+        raise RuntimeError("simulated attempt-construction failure")
+
+    monkeypatch.setattr(
+        "app.services.capital_campaign_orchestration.authoritative.propose_and_risk_evaluate_limit_entry",
+        _raise_on_propose,
+    )
+
+    result = await compose_campaign_authoritative_cycle(db=db, campaign_definition=campaign, trigger="kraken_btc_15m_candle_close", candle=candle)
+
+    # The gate's own outcome (rejected on net edge) is unaffected.
+    assert result.composition["selected_decision"]["reason"] == "non_positive_net_edge"
+
+    entry_gate_events = [event for event in result.composition["process_trace"] if event["gate"] == "entry_intelligence_gate"]
+    assert entry_gate_events[0]["verdict"] == "BUY_LIMIT"
+    assert entry_gate_events[0]["process_stage"] == "CONSTRUCT_TRADE"
+
+    attempt_gate_events = [event for event in result.composition["process_trace"] if event["gate"] == "limit_entry_attempt_gate"]
+    assert len(attempt_gate_events) == 1
+    assert attempt_gate_events[0]["process_stage"] == "CONSTRUCT_TRADE"
+    assert attempt_gate_events[0]["verdict"] == "BLOCKED"
+    assert attempt_gate_events[0]["reason"] == "limit_entry_attempt_proposal_failed"
+    assert attempt_gate_events[0]["next"] == "terminal"
 
 
 @pytest.mark.asyncio

@@ -230,9 +230,23 @@ def _campaign_cycle_summary(cycle: AutonomousCycleRun | None) -> dict[str, Any]:
             "failure_reason": None,
             "deterministic_explanation": [],
             "preview": None,
+            "process_trace": [],
         }
 
     preview = cycle.cycle_context.get("campaign_preview") if isinstance(cycle.cycle_context, dict) else None
+    # PROCESS trace (see process_trace.py / docs on the INPUT -> PROCESS ->
+    # OUTPUT debugging plan): compose_campaign_authoritative_cycle already
+    # writes this into cycle_context["authoritative_composition"] as part of
+    # the composition it always builds -- surfaced here, read-only, so the
+    # existing orchestration/status and orchestration/history endpoints
+    # (already returning _campaign_cycle_summary) carry it too, with no new
+    # route or schema. Covers OBSERVE_MARKET..CONSTRUCT_TRADE for this
+    # cycle; the EXECUTE/MONITOR/EXIT continuation lives on the
+    # AutonomousLimitEntryAttempt this cycle may have delegated to (see its
+    # own evidence_provenance["process_trace"]), which has no read endpoint
+    # yet -- a distinct, bounded follow-up.
+    authoritative_composition = cycle.cycle_context.get("authoritative_composition") if isinstance(cycle.cycle_context, dict) else None
+    process_trace = authoritative_composition.get("process_trace") if isinstance(authoritative_composition, dict) else None
     return {
         "cycle_id": cycle.cycle_id,
         "state": cycle.state,
@@ -245,6 +259,7 @@ def _campaign_cycle_summary(cycle: AutonomousCycleRun | None) -> dict[str, Any]:
         "failure_reason": cycle.failure_reason,
         "deterministic_explanation": list(cycle.deterministic_explanation or []),
         "preview": preview,
+        "process_trace": list(process_trace or []),
     }
 
 

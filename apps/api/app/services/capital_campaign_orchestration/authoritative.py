@@ -35,6 +35,14 @@ from app.services.entry_intelligence.evidence import (
     ContextSpecificEdgeEvidence,
     resolve_context_specific_edge_evidence,
 )
+from app.services.orchestration.process_trace import (
+    STAGE_AUTHORIZE_TRADE,
+    STAGE_CONSTRUCT_TRADE,
+    STAGE_DETERMINE_MARKET_STATE,
+    STAGE_DETERMINE_OPPORTUNITY,
+    STAGE_OBSERVE_MARKET,
+    build_process_trace_event,
+)
 from app.services.position_lifecycle.contracts import PositionLifecycleEvaluation
 from app.schemas.capital_campaign_domain import (
     CapitalCampaignDefinitionResponse,
@@ -2079,6 +2087,7 @@ async def compose_campaign_authoritative_cycle(
             "deterministic_explanation": ["runtime_campaign_or_paper_account_unavailable"],
             "candidate_instruments": list(campaign_definition.allowed_instruments),
             "decision_evidence": {},
+            "process_trace": [],
         }
         return CampaignAuthoritativeCycleResult(composition=composition, preview=None)
 
@@ -2103,6 +2112,7 @@ async def compose_campaign_authoritative_cycle(
             "deterministic_explanation": ["paper_account_unavailable"],
             "candidate_instruments": list(campaign_definition.allowed_instruments),
             "decision_evidence": {},
+            "process_trace": [],
         }
         return CampaignAuthoritativeCycleResult(composition=composition, preview=None)
 
@@ -2123,6 +2133,12 @@ async def compose_campaign_authoritative_cycle(
     risk_outputs: dict[str, Any] = {}
     candidate_rows: list[dict[str, Any]] = []
     rejected_candidates: list[dict[str, Any]] = []
+    # Observational PROCESS trace (see process_trace.py): mirrors, but never
+    # influences, every accept/reject decision this loop already makes.
+    # Scoped to the BUY/OPEN/ADD-candidate path per this instrumentation
+    # pass -- CLOSE_CANDIDATE (selling out of an existing position) is not
+    # yet covered, see the module-level note near the net-edge gate below.
+    process_trace: list[dict[str, Any]] = []
 
     # Snapshotted once, before the loop: with more than one instrument in
     # scope, an earlier instrument's scorecard-fetch timeout (inside
@@ -2134,6 +2150,10 @@ async def compose_campaign_authoritative_cycle(
     candle_interval = candle.interval
 
     for instrument in allowed_instruments:
+        # Fallback candidate identity for stages that run before a real
+        # decision_record_id is resolved -- once one is resolved below, it
+        # is used directly (and reused, never replaced, per instrument).
+        candidate_id = f"{instrument}:{campaign_definition.campaign_id}:{campaign_definition.version}:{now.isoformat()}"
         market, asset, candle_item = await _load_market_evidence(
             db=db,
             symbol=instrument,
@@ -2144,7 +2164,17 @@ async def compose_campaign_authoritative_cycle(
         market_evidence[instrument] = market
         if asset is None or candle_item is None or market.get("reason") in {"asset_mapping_unavailable", "provider_product_unsupported", "ambiguous_market_source", "market_data_unavailable", "stale_market_data"}:
             rejected_candidates.append({"instrument": instrument, "reason": market.get("reason", "market_data_unavailable"), "market": market})
+            process_trace.append(build_process_trace_event(
+                process_stage=STAGE_OBSERVE_MARKET, gate="market_evidence_gate", verdict="REJECT",
+                reason=market.get("reason", "market_data_unavailable"), now=now, instrument=instrument,
+                candidate_id=candidate_id, next_step="terminal",
+            ))
             continue
+        process_trace.append(build_process_trace_event(
+            process_stage=STAGE_OBSERVE_MARKET, gate="market_evidence_gate", verdict="PASS",
+            reason=market.get("freshness_verdict") or market.get("freshness"), now=now, instrument=instrument,
+            candidate_id=candidate_id, next_step="determine_market_state",
+        ))
 
         strategy, strategy_reason = await resolve_and_persist_strategy_aggregate_evidence(
             db=db,
@@ -2166,6 +2196,11 @@ async def compose_campaign_authoritative_cycle(
         if strategy is None:
             rejected_candidates.append({"instrument": instrument, "reason": strategy_reason or "strategy_evidence_unavailable", "market": market})
             strategy_evidence[instrument] = {"authority_class": "UNAVAILABLE", "reason": strategy_reason or "strategy_evidence_unavailable"}
+            process_trace.append(build_process_trace_event(
+                process_stage=STAGE_DETERMINE_MARKET_STATE, gate="strategy_evidence_gate", verdict="REJECT",
+                reason=strategy_reason or "strategy_evidence_unavailable", now=now, instrument=instrument,
+                candidate_id=candidate_id, next_step="terminal",
+            ))
             continue
         strategy_identity = str(strategy.get("strategy_identity") or "").strip()
         strategy_version = str(strategy.get("strategy_version") or "").strip()
@@ -2185,6 +2220,11 @@ async def compose_campaign_authoritative_cycle(
                 "strategy_identity": strategy_identity,
                 "strategy_version": strategy_version,
             }
+            process_trace.append(build_process_trace_event(
+                process_stage=STAGE_DETERMINE_MARKET_STATE, gate="strategy_identity_coherence_gate", verdict="REJECT",
+                reason="strategy_identity_incoherent", now=now, instrument=instrument, candidate_id=candidate_id,
+                decision_record_id=decision_record_id or None, next_step="terminal",
+            ))
             continue
         historical_identity = str(strategy_authority.get("historical_strategy_identity") or "").strip()
         if historical_identity and historical_identity != strategy_identity:
@@ -2204,6 +2244,11 @@ async def compose_campaign_authoritative_cycle(
                 "strategy_identity": strategy_identity,
                 "historical_strategy_identity": historical_identity,
             }
+            process_trace.append(build_process_trace_event(
+                process_stage=STAGE_DETERMINE_MARKET_STATE, gate="strategy_continuity_gate", verdict="REJECT",
+                reason="strategy_continuity_conflict", now=now, instrument=instrument, candidate_id=candidate_id,
+                decision_record_id=decision_record_id or None, next_step="terminal",
+            ))
             continue
         if not decision_record_id:
             rejected_candidates.append(
@@ -2220,7 +2265,17 @@ async def compose_campaign_authoritative_cycle(
                 "strategy_identity": strategy_identity,
                 "strategy_version": strategy_version,
             }
+            process_trace.append(build_process_trace_event(
+                process_stage=STAGE_DETERMINE_MARKET_STATE, gate="decision_record_linkage_gate", verdict="REJECT",
+                reason="decision_record_linkage_missing", now=now, instrument=instrument, candidate_id=candidate_id,
+                next_step="terminal",
+            ))
             continue
+        process_trace.append(build_process_trace_event(
+            process_stage=STAGE_DETERMINE_MARKET_STATE, gate="strategy_evidence_gate", verdict="PASS",
+            reason=f"strategy_identity={strategy_identity}", now=now, instrument=instrument,
+            candidate_id=candidate_id, decision_record_id=decision_record_id, next_step="determine_opportunity",
+        ))
         action = str(strategy.get("action") or "").strip().upper()
         if action in {"HOLD", "NO_ACTION", "NONE"}:
             rejected_candidates.append(
@@ -2235,8 +2290,18 @@ async def compose_campaign_authoritative_cycle(
                 }
             )
             strategy_evidence[instrument] = strategy
+            process_trace.append(build_process_trace_event(
+                process_stage=STAGE_DETERMINE_OPPORTUNITY, gate="strategy_action_gate", verdict="NO_OPPORTUNITY",
+                reason="strategy_hold_signal", now=now, instrument=instrument, candidate_id=candidate_id,
+                decision_record_id=decision_record_id, next_step="terminal",
+            ))
             continue
         strategy_evidence[instrument] = strategy
+        process_trace.append(build_process_trace_event(
+            process_stage=STAGE_DETERMINE_OPPORTUNITY, gate="strategy_action_gate", verdict="PASS",
+            reason=f"action={action}", now=now, instrument=instrument, candidate_id=candidate_id,
+            decision_record_id=decision_record_id, next_step="position_transition_gate",
+        ))
 
         position = await _load_position_evidence(
             db=db,
@@ -2283,7 +2348,17 @@ async def compose_campaign_authoritative_cycle(
                     "strategy_version": strategy_version,
                 }
             )
+            process_trace.append(build_process_trace_event(
+                process_stage=STAGE_DETERMINE_OPPORTUNITY, gate="position_transition_gate", verdict="NO_OPPORTUNITY",
+                reason=f"action_position_transition_hold:action={action}:position_state={position_state}", now=now,
+                instrument=instrument, candidate_id=candidate_id, decision_record_id=decision_record_id, next_step="terminal",
+            ))
             continue
+        process_trace.append(build_process_trace_event(
+            process_stage=STAGE_DETERMINE_OPPORTUNITY, gate="position_transition_gate", verdict="PASS",
+            reason=f"transition={transition}", now=now, instrument=instrument, candidate_id=candidate_id,
+            decision_record_id=decision_record_id, next_step="authorize_trade",
+        ))
 
         risk_result = None
         risk_reason = None
@@ -2300,6 +2375,11 @@ async def compose_campaign_authoritative_cycle(
                 "reason": "risk_unavailable",
             }
             rejected_candidates.append({"instrument": instrument, "reason": "risk_unavailable", "market": market, "strategy": strategy, "position": position, "decision_record_id": decision_record_id})
+            process_trace.append(build_process_trace_event(
+                process_stage=STAGE_AUTHORIZE_TRADE, gate="risk_context_gate", verdict="BLOCKED",
+                reason="risk_unavailable", now=now, instrument=instrument, candidate_id=candidate_id,
+                decision_record_id=decision_record_id, next_step="terminal",
+            ))
             continue
 
         risk_context = await resolve_execution_risk_context(db=db, paper_account=paper_account, asset=asset)
@@ -2408,7 +2488,19 @@ async def compose_campaign_authoritative_cycle(
                         },
                     }
                 )
+                process_trace.append(build_process_trace_event(
+                    process_stage=STAGE_CONSTRUCT_TRADE, gate="capital_sizing_gate", verdict="BLOCKED",
+                    reason="position_below_minimum_order_size", now=now, instrument=instrument,
+                    candidate_id=candidate_id, decision_record_id=decision_record_id,
+                    observed_value=proposed_allocation, threshold=minimum_viable_amount, next_step="terminal",
+                ))
                 continue
+            process_trace.append(build_process_trace_event(
+                process_stage=STAGE_CONSTRUCT_TRADE, gate="capital_sizing_gate", verdict="PASS",
+                reason="proposed_allocation_meets_minimum_viable_amount", now=now, instrument=instrument,
+                candidate_id=candidate_id, decision_record_id=decision_record_id,
+                observed_value=proposed_allocation, threshold=minimum_viable_amount, next_step="authorize_trade",
+            ))
             quantity = proposed_allocation / price
 
         try:
@@ -2538,8 +2630,20 @@ async def compose_campaign_authoritative_cycle(
             }
             rejected_candidates.append({"instrument": instrument, "reason": "risk_unavailable", "market": market, "strategy": strategy, "position": position, "risk": risk_summary, "decision_record_id": decision_record_id})
             risk_outputs[instrument] = risk_summary
+            process_trace.append(build_process_trace_event(
+                process_stage=STAGE_AUTHORIZE_TRADE, gate="risk_engine_gate", verdict="BLOCKED",
+                reason=risk_summary["reason"], now=now, instrument=instrument, candidate_id=candidate_id,
+                decision_record_id=decision_record_id, next_step="terminal",
+            ))
             continue
         risk_outputs[instrument] = risk_summary
+        process_trace.append(build_process_trace_event(
+            process_stage=STAGE_AUTHORIZE_TRADE, gate="risk_engine_gate",
+            verdict={"ALLOW": "APPROVE", "REDUCE": "RESIZE", "VETO": "REJECT"}.get(risk_summary["verdict"], risk_summary["verdict"]),
+            reason=risk_summary["reason"], now=now, instrument=instrument, candidate_id=candidate_id,
+            decision_record_id=decision_record_id, observed_value=quantity, threshold=risk_result.approved_quantity,
+            next_step="terminal" if risk_summary["verdict"] == "VETO" else "determine_opportunity",
+        ))
 
         if risk_summary["verdict"] == "VETO":
             if risk_summary["reason"] == "position_below_minimum_order_size":
@@ -2653,6 +2757,19 @@ async def compose_campaign_authoritative_cycle(
             final_reason_code = "non_positive_net_edge"
         else:
             final_reason_code = "accepted"
+
+        # CLOSE_CANDIDATE (selling out of an existing position) is out of
+        # scope for this instrumentation pass -- see the module-level note
+        # near process_trace's initialization above. Only the BUY/OPEN/ADD
+        # net-edge outcome is traced here.
+        if transition != "CLOSE_CANDIDATE":
+            process_trace.append(build_process_trace_event(
+                process_stage=STAGE_DETERMINE_OPPORTUNITY, gate="net_edge_gate",
+                verdict={"accepted": "PASS", "non_positive_net_edge": "REJECT", "expected_edge_unavailable": "BLOCKED"}.get(final_reason_code, final_reason_code),
+                reason=final_reason_code, now=now, instrument=instrument, candidate_id=candidate_id,
+                decision_record_id=decision_record_id, observed_value=expected_net_dollars, threshold=Decimal("0"),
+                next_step="terminal" if final_reason_code != "accepted" else "construct_trade",
+            ))
 
         logger.info(
             "net_edge_evaluated campaign_id=%s campaign_version=%s instrument=%s side=%s strategy_identity=%s "
@@ -2825,6 +2942,14 @@ async def compose_campaign_authoritative_cycle(
                     entry_intelligence_candidate.decision, entry_intelligence_candidate.reason,
                     list(context_evidence_obj.missing_input_flags),
                 )
+                process_trace.append(build_process_trace_event(
+                    process_stage=STAGE_CONSTRUCT_TRADE, gate="entry_intelligence_gate",
+                    verdict=entry_intelligence_candidate.decision, reason=entry_intelligence_candidate.reason,
+                    now=now, instrument=instrument, candidate_id=candidate_id, decision_record_id=decision_record_id,
+                    observed_value=entry_intelligence_candidate.preferred_limit_price,
+                    threshold=entry_intelligence_candidate.maximum_profitable_entry_price,
+                    next_step="limit_entry_attempt_gate" if entry_intelligence_candidate.decision == BUY_LIMIT else "terminal",
+                ))
 
                 if entry_intelligence_candidate.decision == BUY_LIMIT:
                     # Authoritative pre-execution stage, not diagnostic:
@@ -2856,11 +2981,22 @@ async def compose_campaign_authoritative_cycle(
                             now=now,
                         )
                         entry_intelligence_reason = f"{entry_intelligence_reason}:attempt_stage={limit_entry_attempt.stage}"
+                        process_trace.append(build_process_trace_event(
+                            process_stage=STAGE_CONSTRUCT_TRADE, gate="limit_entry_attempt_gate", verdict="PASS",
+                            reason=f"delegated_to_limit_entry_worker:stage={limit_entry_attempt.stage}", now=now,
+                            instrument=instrument, candidate_id=candidate_id, decision_record_id=decision_record_id,
+                            attempt_id=limit_entry_attempt.attempt_id, next_step="execute",
+                        ))
                     except Exception:
                         logger.exception(
                             "limit_entry_attempt_proposal_failed campaign_id=%s instrument=%s decision_record_id=%s",
                             campaign_definition.campaign_id, instrument, decision_record_id,
                         )
+                        process_trace.append(build_process_trace_event(
+                            process_stage=STAGE_CONSTRUCT_TRADE, gate="limit_entry_attempt_gate", verdict="BLOCKED",
+                            reason="limit_entry_attempt_proposal_failed", now=now, instrument=instrument,
+                            candidate_id=candidate_id, decision_record_id=decision_record_id, next_step="terminal",
+                        ))
 
             rejected_candidates.append({"instrument": instrument, "reason": "non_positive_net_edge", "market": market, "strategy": strategy, "position": position, "risk": risk_summary, "decision_record_id": decision_record_id, "entry_intelligence_decision": entry_intelligence_decision, "entry_intelligence_reason": entry_intelligence_reason})
             continue
@@ -2893,10 +3029,27 @@ async def compose_campaign_authoritative_cycle(
                 "risk_evidence": risk_summary,
             }
         )
+        if candidate_kind in {"ADD_POSITION_PROPOSED", "OPEN_POSITION_PROPOSED"}:
+            process_trace.append(build_process_trace_event(
+                process_stage=STAGE_CONSTRUCT_TRADE, gate="candidate_constructed", verdict="PASS",
+                reason=candidate_kind, now=now, instrument=instrument, candidate_id=candidate_id,
+                decision_record_id=decision_record_id, observed_value=expected_net_dollars,
+                next_step="candidate_ranking_gate",
+            ))
 
     candidate_rows.sort(key=lambda item: (Decimal(str(item["expected_net_dollars"])), Decimal(str(item["risk_adjusted_score"])), item["instrument"]), reverse=True)
     for index, item in enumerate(candidate_rows, start=1):
         item["rank"] = index
+        if item["decision_kind"] in {"ADD_POSITION_PROPOSED", "OPEN_POSITION_PROPOSED"}:
+            ranked_candidate_id = f"{item['instrument']}:{campaign_definition.campaign_id}:{campaign_definition.version}:{now.isoformat()}"
+            process_trace.append(build_process_trace_event(
+                process_stage=STAGE_CONSTRUCT_TRADE, gate="candidate_ranking_gate",
+                verdict="SELECTED" if index == 1 else "NOT_SELECTED",
+                reason=None if index == 1 else "ranked_below_selected_candidate", now=now,
+                instrument=item["instrument"], candidate_id=ranked_candidate_id,
+                decision_record_id=item.get("decision_record_id"), observed_value=index,
+                next_step="cycle_selected" if index == 1 else "terminal",
+            ))
 
     selected = candidate_rows[0] if candidate_rows else None
     critical_rejections = {
@@ -2988,6 +3141,7 @@ async def compose_campaign_authoritative_cycle(
         ],
         "decision_evidence": selected_decision,
         "candidate_instruments": allowed_instruments,
+        "process_trace": process_trace,
     }
     logger.info(
         "campaign_cycle_termination_resolved campaign_id=%s campaign_version=%s termination_stage=%s failed_closed=%s "
