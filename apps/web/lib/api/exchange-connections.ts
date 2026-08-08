@@ -1,7 +1,11 @@
 import { ApiRequestError } from "@/lib/api/arena";
 import { getOperatorAuthHeaders } from "@/lib/api/operator-auth";
 
-export type ExchangeProvider = "coinbase_advanced";
+// Mirrors the backend's authoritative provider vocabulary exactly
+// (apps/api/app/schemas/exchange_connections.py::ExchangeProvider /
+// exchange_connections.provider CHECK constraint) -- both providers are
+// real, persisted, runtime-valid values, not a hypothetical future one.
+export type ExchangeProvider = "coinbase_advanced" | "kraken_spot";
 export type ExchangeEnvironment = "sandbox" | "production";
 export type ExchangeConnectionStatus = "connected" | "disconnected" | "error";
 export type ExchangeReadinessVerdict
