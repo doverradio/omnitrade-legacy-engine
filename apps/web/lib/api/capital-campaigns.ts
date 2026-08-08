@@ -145,6 +145,70 @@ export type CapitalCampaignCreateRequest = {
   fees?: string;
 };
 
+// --- Campaign domain definitions + orchestration read paths (worker PROCESS trace) ---
+
+export type CapitalCampaignDomainDefinition = {
+  campaign_id: string;
+  version: number;
+  name: string;
+  status: string;
+  allowed_instruments: string[];
+  created_at: string;
+};
+
+export type CapitalCampaignDomainDefinitionListResponse = {
+  items: CapitalCampaignDomainDefinition[];
+};
+
+// Mirrors app/services/orchestration/process_trace.py::build_process_trace_event's
+// return shape exactly -- this is real, persisted worker evidence, never
+// recomputed or simulated by the frontend.
+export type ProcessTraceEvent = {
+  schema_version: string;
+  process_stage: string;
+  gate: string;
+  verdict: string;
+  reason: string | null;
+  instrument: string | null;
+  candidate_id: string | null;
+  decision_record_id: string | null;
+  attempt_id: string | null;
+  cycle_id: string | null;
+  observed_value: string | null;
+  threshold: string | null;
+  next: string | null;
+  timestamp: string;
+};
+
+export type CampaignOrchestrationCycleSummary = {
+  cycle_id: string | null;
+  state: string | null;
+  cycle_kind: string | null;
+  capital_campaign_id: string | null;
+  capital_campaign_version: number | null;
+  started_at: string | null;
+  completed_at: string | null;
+  termination_stage: string | null;
+  failure_reason: string | null;
+  deterministic_explanation: string[];
+  process_trace: ProcessTraceEvent[];
+};
+
+export type CampaignOrchestrationCampaignSnapshot = {
+  campaign_id: string;
+  status: string;
+  allowed_instruments: string[];
+};
+
+export type CampaignOrchestrationHistoryResponse = {
+  mode: string;
+  campaign_id: string;
+  version: number;
+  count: number;
+  campaign_snapshot: CampaignOrchestrationCampaignSnapshot;
+  items: CampaignOrchestrationCycleSummary[];
+};
+
 type ErrorEnvelope = {
   error?: {
     message?: string;
@@ -245,4 +309,26 @@ export async function rejectCapitalCampaignProfitCycle(campaignUuid: string, cyc
     method: "POST",
     body: JSON.stringify({ actor: "operator", reason: reason ?? null }),
   });
+}
+
+// listCapitalCampaignDomainDefinitions with no arguments reuses the exact
+// same "governing campaign" resolution the real orchestration worker itself
+// uses (list_campaign_definitions, default latest_only=true) -- this is how
+// a read-only viewer discovers the current campaign without ever hard-coding
+// an id.
+export async function listCapitalCampaignDomainDefinitions(): Promise<CapitalCampaignDomainDefinition[]> {
+  const payload = await requestJson<CapitalCampaignDomainDefinitionListResponse>("/capital-campaigns/domain");
+  return payload.items;
+}
+
+export async function getCampaignOrchestrationHistory(campaignId: string, params?: { version?: number; limit?: number }): Promise<CampaignOrchestrationHistoryResponse> {
+  const query = new URLSearchParams();
+  if (params?.version !== undefined) {
+    query.set("version", String(params.version));
+  }
+  if (params?.limit !== undefined) {
+    query.set("limit", String(params.limit));
+  }
+  const suffix = query.toString() ? `?${query.toString()}` : "";
+  return requestJson<CampaignOrchestrationHistoryResponse>(`/capital-campaigns/domain/${encodeURIComponent(campaignId)}/orchestration/history${suffix}`);
 }

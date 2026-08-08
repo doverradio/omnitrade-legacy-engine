@@ -2,24 +2,14 @@
 
 import { useState } from "react";
 
+import ProcessTraceView from "@/components/workflow/ProcessTraceView";
+
 type TabId = "input" | "process" | "output";
 
 const TABS: Array<{ id: TabId; label: string }> = [
   { id: "input", label: "Input" },
   { id: "process", label: "Process" },
   { id: "output", label: "Output" },
-];
-
-const PROCESS_STAGES = [
-  "Observe Market",
-  "Determine Market State",
-  "Determine Opportunity",
-  "Construct Trade",
-  "Authorize Trade",
-  "Execute",
-  "Monitor",
-  "Exit",
-  "Return Capital",
 ];
 
 export default function WorkflowPage() {
@@ -79,26 +69,7 @@ function InputPanel() {
 }
 
 function ProcessPanel() {
-  return (
-    <ol className="space-y-3">
-      {PROCESS_STAGES.map((stage, index) => (
-        <li key={stage} className="flex items-start gap-3">
-          <span
-            className="mt-3 flex h-7 w-7 shrink-0 items-center justify-center rounded-full border border-border bg-background/60 text-xs font-semibold text-foreground/75"
-            aria-hidden="true"
-          >
-            {index + 1}
-          </span>
-          <details className="w-full rounded-lg border border-border bg-muted/30">
-            <summary className="cursor-pointer px-4 py-3 text-sm font-medium text-foreground/90 focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-accent">
-              {stage}
-            </summary>
-            <p className="border-t border-border px-4 py-3 text-sm text-foreground/55">Not configured yet.</p>
-          </details>
-        </li>
-      ))}
-    </ol>
-  );
+  return <ProcessTraceView />;
 }
 
 function OutputPanel() {

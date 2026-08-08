@@ -1,8 +1,32 @@
 import { render, screen } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
-import { describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 
 import WorkflowPage from "@/app/workflow/page";
+
+function jsonResponse(status: number, body: unknown): Response {
+  return new Response(JSON.stringify(body), {
+    status,
+    headers: { "Content-Type": "application/json" },
+  });
+}
+
+function installEmptyOrchestrationFetchMock() {
+  const fetchMock = vi.fn(async (input: string | URL | Request) => {
+    const rawUrl = typeof input === "string" ? input : input instanceof URL ? input.toString() : input.url;
+    const url = new URL(rawUrl);
+    if (url.pathname === "/capital-campaigns/domain") {
+      return jsonResponse(200, { items: [] });
+    }
+    return jsonResponse(404, { error: { message: `unhandled route in test: ${url.pathname}` } });
+  });
+  vi.stubGlobal("fetch", fetchMock);
+  return fetchMock;
+}
+
+afterEach(() => {
+  vi.unstubAllGlobals();
+});
 
 describe("WorkflowPage", () => {
   it("renders the three primary tabs with Input active by default", () => {
@@ -15,34 +39,17 @@ describe("WorkflowPage", () => {
     expect(screen.getByRole("heading", { name: "Capital" })).toBeInTheDocument();
   });
 
-  it("switches to the Process tab and lists all nine stages as collapsed accordions", async () => {
+  it("switches to the Process tab and renders the nine stage accordions from the real trace view, honestly reporting no campaign found", async () => {
+    installEmptyOrchestrationFetchMock();
     const user = userEvent.setup();
     render(<WorkflowPage />);
 
     await user.click(screen.getByRole("tab", { name: "Process" }));
 
-    const stages = [
-      "Observe Market",
-      "Determine Market State",
-      "Determine Opportunity",
-      "Construct Trade",
-      "Authorize Trade",
-      "Execute",
-      "Monitor",
-      "Exit",
-      "Return Capital",
-    ];
-
-    for (const stage of stages) {
-      expect(screen.getByText(stage)).toBeInTheDocument();
-    }
-
-    const detailsElements = document.querySelectorAll("details");
-    expect(detailsElements).toHaveLength(9);
-    detailsElements.forEach((details) => expect(details.open).toBe(false));
-
-    await user.click(screen.getByText("Observe Market"));
-    expect(detailsElements[0].open).toBe(true);
+    // No fabricated demo data: with no governing campaign returned by the
+    // real API, the page must say so plainly rather than show stage
+    // accordions with invented content.
+    expect(await screen.findByText(/No governing campaign found/)).toBeInTheDocument();
   });
 
   it("switches to the Output tab", async () => {
